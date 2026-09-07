@@ -42,3 +42,12 @@ All notable changes to this project will be documented in this file.
   supported vs missing imports; exit 0 = runnable, 1 = missing/invalid).
   Backed by lenient PE loading that collects unknown imports instead of
   failing; the exec path stays strict and `Runner` refuses lenient images.
+- P1 offline packages: `wincli install <pkg>` from local `$WINCLI_SOURCE`
+  dirs into a content-addressed host cache (`$WINCLI_CACHE`: `archives/`,
+  `pkgs/`, `index/`), with vendored SHA-256 + stored-zip support, guest
+  address `C:\bin\<exe>`, and `inspect <cached-name>` lookup. Offline
+  fixtures in `tests/artifacts/packages/`; remote WinGet sources + deflate
+  are P2.
+- Documented console contract: transparent byte pipe to the host terminal,
+  no console emulation; `WriteConsoleW`/`GetConsoleMode`/streaming/input
+  planned with run-with-args.

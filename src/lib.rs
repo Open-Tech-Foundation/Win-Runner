@@ -1,4 +1,5 @@
 pub mod inspect;
+pub mod install;
 pub mod pe;
 pub mod ps1;
 pub mod winapi;

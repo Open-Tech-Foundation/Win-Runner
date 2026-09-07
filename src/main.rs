@@ -1,18 +1,24 @@
 use std::io::Write;
 use std::path::Path;
-use wincli::{inspect, pe, winapi, winfs::WinFs};
+use wincli::{inspect, install, pe, winapi, winfs::WinFs};
 
 fn usage() -> ! {
     eprintln!("usage:");
     eprintln!("  wincli <app.exe|script.ps1>   run a Windows program or script");
-    eprintln!("  wincli inspect <app.exe>      report PE imports vs supported APIs");
+    eprintln!("  wincli inspect <app.exe|pkg>  report PE imports vs supported APIs");
+    eprintln!("  wincli install <pkg>          install a package into the cache");
+    eprintln!("env: WINCLI_CACHE (default ~/.cache/wincli), WINCLI_SOURCE (package dir)");
     std::process::exit(2);
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() == 3 && args[1] == "inspect" {
-        inspect_file(&args[2]);
+        inspect_target(&args[2]);
+    }
+    if args.len() == 3 && args[1] == "install" {
+        install_pkg(&args[2]);
+        return;
     }
     if args.len() != 2 {
         usage();
@@ -91,13 +97,14 @@ fn run_ps1_file(path: &str) {
     }
 }
 
-/// `wincli inspect <app.exe>`: print the compatibility report.
+/// `wincli inspect <app.exe|pkg>`: print the compatibility report.
+/// A host file path wins; otherwise the package cache is consulted.
 /// Exit 0 = runnable, 1 = missing imports or invalid file.
-fn inspect_file(path: &str) {
-    let data = match std::fs::read(path) {
+fn inspect_target(target: &str) {
+    let data = match read_inspect_target(target) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("wincli: cannot read {path}: {e}");
+            eprintln!("wincli: {e}");
             std::process::exit(1);
         }
     };
@@ -107,7 +114,45 @@ fn inspect_file(path: &str) {
             std::process::exit(if report.runnable() { 0 } else { 1 });
         }
         Err(e) => {
-            eprintln!("wincli: cannot inspect {path}: {e}");
+            eprintln!("wincli: cannot inspect {target}: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn read_inspect_target(target: &str) -> Result<Vec<u8>, String> {
+    if Path::new(target).is_file() {
+        return std::fs::read(target).map_err(|e| format!("cannot read {target}: {e}"));
+    }
+    let cache = install::cache_dir();
+    if let Some(p) = install::find_cached(&cache, target) {
+        return std::fs::read(&p).map_err(|e| format!("cannot read {}: {e}", p.display()));
+    }
+    Err(format!(
+        "nothing to inspect: {target} (no such file; try `wincli install {target}`)"
+    ))
+}
+
+/// `wincli install <pkg>`: resolve from `$WINCLI_SOURCE` into the cache.
+/// Guest-logical address is `C:\bin\<exe>`; bytes live in the host cache.
+fn install_pkg(name: &str) {
+    let cache = install::cache_dir();
+    let source = match install::source_dir() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("wincli: {e}");
+            std::process::exit(1);
+        }
+    };
+    match install::install(name, &source, &cache) {
+        Ok(inst) => {
+            println!(
+                "Installed {} {} → {}",
+                inst.name, inst.version, inst.guest_path
+            );
+        }
+        Err(e) => {
+            eprintln!("wincli: install failed: {e}");
             std::process::exit(1);
         }
     }

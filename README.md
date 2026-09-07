@@ -70,6 +70,22 @@ drives emulator growth (so far: `xorps`/`movaps`/`movups`, `CMP r/m8,imm8`,
 cargo test   # unit tests + CLI end-to-end tests against tests/artifacts/
 ```
 
+## Packages
+
+```bash
+wincli install demo     # needs WINCLI_SOURCE (a package dir for now)
+wincli inspect demo     # inspect the cached package
+```
+
+`install` resolves `<source>/<name>.json` + `<name>.zip`, stores the blob
+content-addressed under `$WINCLI_CACHE/archives/`, extracts the exe to
+`pkgs/<name>.exe`, and reports the guest-logical address (`C:\bin\demo.exe`;
+bytes live in the host cache, the guest FS stays in-memory per run).
+Remote WinGet-catalog sources, hash verification, and deflate land in P2;
+until then only local directories (`WINCLI_SOURCE=./dir`, stored zips).
+`tests/artifacts/packages/` holds offline fixtures built by
+`cargo run --example gen_artifacts`.
+
 ## Compatibility harness
 
 `wincli inspect` statically reports which imports a real Windows binary needs
@@ -84,3 +100,17 @@ Planned next step is `wincli install <name>`: resolve portable Windows x64
 releases (preferred source: the WinGet catalog, portable EXE / ZIP only —
 no MSI/MSIX/setup emulation), cache the PE on the host, and run it through
 the runtime with its filesystem activity landing in WinFS.
+
+## Console contract
+
+Guest output is a transparent byte pipe to the host terminal — same content,
+no console emulation (no conpty): programs emitting ANSI escapes render via
+the host terminal, and pipes (`wincli rg … | head`) behave identically.
+
+- Console writes are forwarded to host stdout (buffered per run today;
+  streaming lands with run-with-args).
+- `WriteFile` bytes pass through bit-identical; `WriteConsoleW`/`GetConsoleMode`
+  are planned shims (UTF-16→UTF-8 transcode; TTY-aware success so
+  `--color=auto` works); input is planned as line-buffered reads from stdin.
+- Cursor/screen-buffer APIs and Ctrl-C handling are non-goals; unsupported
+  console APIs fail clearly so guests fall back.

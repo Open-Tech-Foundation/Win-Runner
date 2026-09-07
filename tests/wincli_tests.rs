@@ -542,3 +542,112 @@ fn test_inspect_invalid_file() {
     assert_eq!(code, 1);
     assert!(stderr.contains("cannot inspect"), "stderr: {stderr}");
 }
+
+// ---------- P1: offline install loop (no network) ----------
+
+fn run_wincli_env(args: &[&str], envs: &[(&str, &str)]) -> (i32, String, String) {
+    let bin = env!("CARGO_BIN_EXE_wincli");
+    let mut cmd = std::process::Command::new(bin);
+    cmd.args(args);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    // never inherit a real source/cache from the developer machine
+    let output = cmd.output().expect("spawn wincli");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+fn isolated_cache(tag: &str) -> std::path::PathBuf {
+    let p = std::env::temp_dir().join(format!(
+        "wincli-cli-cache-{}-{}-{tag}",
+        std::process::id(),
+        counter()
+    ));
+    std::fs::create_dir_all(&p).unwrap();
+    p
+}
+
+#[test]
+fn test_install_inspect_run_offline_loop() {
+    let cache = isolated_cache("loop");
+    let src = artifact("packages").to_string_lossy().to_string();
+    let cc = cache.to_string_lossy().to_string();
+    let envs = [
+        ("WINCLI_CACHE", cc.as_ref()),
+        ("WINCLI_SOURCE", src.as_ref()),
+    ];
+
+    // install from the local fixture source (no network anywhere)
+    let (code, stdout, stderr) = run_wincli_env(&["install", "demo"], &envs);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "Installed demo 0.1.0 → C:\\bin\\demo.exe\n");
+
+    // cache layout: content-addressed blob + runnable + index
+    assert!(cache.join("pkgs").join("demo.exe").is_file());
+    assert!(cache.join("index").join("demo.json").is_file());
+    let blobs: Vec<_> = std::fs::read_dir(cache.join("archives"))
+        .unwrap()
+        .collect();
+    assert_eq!(blobs.len(), 1);
+
+    // inspect by cached package name
+    let (code, stdout, _) = run_wincli_env(&["inspect", "demo"], &envs);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("Supported imports: 3"));
+
+    // run the cached exe through the real CLI
+    let exe = cache.join("pkgs").join("demo.exe");
+    let (code, stdout, _) = run_wincli_env(&[exe.to_str().unwrap()], &envs);
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "demo 0.1.0");
+
+    std::fs::remove_dir_all(&cache).ok();
+}
+
+#[test]
+fn test_install_unknown_package() {
+    let cache = isolated_cache("unknown");
+    let src = artifact("packages").to_string_lossy().to_string();
+    let cc = cache.to_string_lossy().to_string();
+    let (code, _, stderr) = run_wincli_env(
+        &["install", "nope"],
+        &[("WINCLI_CACHE", cc.as_ref()), ("WINCLI_SOURCE", src.as_ref())],
+    );
+    assert_eq!(code, 1);
+    assert!(stderr.contains("package not found: nope"), "stderr: {stderr}");
+    std::fs::remove_dir_all(&cache).ok();
+}
+
+#[test]
+fn test_install_no_source_configured() {
+    let cache = isolated_cache("nosrc");
+    let cc = cache.to_string_lossy().to_string();
+    let bin = env!("CARGO_BIN_EXE_wincli");
+    let output = std::process::Command::new(bin)
+        .args(["install", "demo"])
+        .env("WINCLI_CACHE", &cc)
+        .env_remove("WINCLI_SOURCE")
+        .output()
+        .expect("spawn wincli");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(stderr.contains("no package source"), "stderr: {stderr}");
+    std::fs::remove_dir_all(&cache).ok();
+}
+
+#[test]
+fn test_inspect_cache_miss_suggests_install() {
+    let cache = isolated_cache("miss");
+    let cc = cache.to_string_lossy().to_string();
+    let (code, _, stderr) = run_wincli_env(
+        &["inspect", "ghost-pkg"],
+        &[("WINCLI_CACHE", cc.as_ref())],
+    );
+    assert_eq!(code, 1);
+    assert!(stderr.contains("wincli install ghost-pkg"), "stderr: {stderr}");
+    std::fs::remove_dir_all(&cache).ok();
+}
