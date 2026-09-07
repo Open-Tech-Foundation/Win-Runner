@@ -41,6 +41,14 @@ pub const SUPPORTED_APIS: &[(&str, &str)] = &[
     ("KERNEL32.DLL", "DeleteFileW"),
     ("KERNEL32.DLL", "MoveFileW"),
     ("KERNEL32.DLL", "CopyFileW"),
+    ("KERNEL32.DLL", "GetCommandLineW"),
+    ("KERNEL32.DLL", "GetCommandLineA"),
+    ("KERNEL32.DLL", "GetConsoleMode"),
+    ("KERNEL32.DLL", "SetConsoleMode"),
+    ("KERNEL32.DLL", "WriteConsoleW"),
+    ("KERNEL32.DLL", "GetConsoleOutputCP"),
+    ("KERNEL32.DLL", "SetConsoleTextAttribute"),
+    ("KERNEL32.DLL", "ReadConsoleW"),
 ];
 
 pub fn is_supported(dll: &str, func: &str) -> bool {

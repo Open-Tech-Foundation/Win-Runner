@@ -37,12 +37,21 @@ pub struct Emu {
     pub stubs: HashMap<u64, usize>,
     pub imports: Vec<Import>,
     pub stdout: Vec<u8>,
+    /// Guest VA of the NUL-terminated UTF-16 command line (`GetCommandLineW`),
+    /// 0 when unset. The ANSI block (`GetCommandLineA`, UTF-8 bytes) sits
+    /// right after it. See `alloc_cmdline`.
+    pub cmdline_va: u64,
+    pub cmdline_ansi_va: u64,
+    cmdline_base: u64,
     steps: u64,
 }
 
+/// Reserved guest command-line area (UTF-16 block + ANSI block).
+pub const CMDLINE_SIZE: usize = 0x10000;
+
 impl Emu {
     pub fn new(img: &PeImage) -> Result<Self, String> {
-        let total = img.size_of_image as usize + STACK_SIZE + 0x1000;
+        let total = img.size_of_image as usize + CMDLINE_SIZE + STACK_SIZE + 0x1000;
         let base = img.image_base;
         let mut mem = vec![0u8; total];
         mem[..img.image.len()].copy_from_slice(&img.image);
@@ -61,6 +70,9 @@ impl Emu {
             stubs: HashMap::new(),
             imports: img.imports.clone(),
             stdout: Vec::new(),
+            cmdline_va: 0,
+            cmdline_ansi_va: 0,
+            cmdline_base: base + img.size_of_image as u64,
             steps: 0,
         };
         // Reserve stub addresses and patch IAT slots.
@@ -73,6 +85,35 @@ impl Emu {
         e.regs[4] = stack_top;
         e.push_u64(ENTRY_SENTINEL)?;
         Ok(e)
+    }
+
+    /// Build the Windows command line `prog arg...` (MSVC quoting rules) and
+    /// lay out UTF-16 + ANSI blocks. `prog` is argv0 as typed on the host CLI.
+    pub fn alloc_cmdline(&mut self, prog: &str, args: &[String]) -> Result<(), String> {
+        let mut cmd = String::new();
+        cmd.push_str(&quote_arg(prog));
+        for a in args {
+            cmd.push(' ');
+            cmd.push_str(&quote_arg(a));
+        }
+        let wide: Vec<u16> = cmd.encode_utf16().chain(std::iter::once(0)).collect();
+        let ansi = cmd.as_bytes();
+        // layout: [wide + NUL][ansi + NUL], must fit CMDLINE_SIZE
+        let need = wide.len() * 2 + ansi.len() + 1;
+        if need > CMDLINE_SIZE {
+            return Err("command line too long (64K guest block)".to_string());
+        }
+        let base_va = self.cmdline_base;
+        let wide_va = base_va;
+        for (i, u) in wide.iter().enumerate() {
+            self.write_u16(wide_va + i as u64 * 2, *u)?;
+        }
+        let ansi_va = wide_va + wide.len() as u64 * 2;
+        self.write_bytes(ansi_va, ansi)?;
+        self.write_u8(ansi_va + ansi.len() as u64, 0)?;
+        self.cmdline_va = wide_va;
+        self.cmdline_ansi_va = ansi_va;
+        Ok(())
     }
 
     // ---------- memory ----------
@@ -353,6 +394,7 @@ impl Emu {
         if is_reg {
             Ok(match width {
                 8 => self.regs[rm] & 0xFF,
+                16 => self.regs[rm] & 0xFFFF,
                 32 => self.regs[rm] & 0xFFFF_FFFF,
                 64 => self.regs[rm],
                 _ => return Err("bad width".to_string()),
@@ -360,6 +402,7 @@ impl Emu {
         } else {
             Ok(match width {
                 8 => self.read_u8(ea)? as u64,
+                16 => self.read_u16(ea)? as u64,
                 32 => self.read_u32(ea)? as u64,
                 64 => self.read_u64(ea)?,
                 _ => return Err("bad width".to_string()),
@@ -373,6 +416,10 @@ impl Emu {
                 8 => {
                     self.regs[rm] = (self.regs[rm] & !0xFF) | (val & 0xFF);
                 }
+                16 => {
+                    // 16-bit writes preserve the upper bits (no zero-extension)
+                    self.regs[rm] = (self.regs[rm] & !0xFFFF) | (val & 0xFFFF);
+                }
                 32 => {
                     self.regs[rm] = val & 0xFFFF_FFFF; // zero-extend
                 }
@@ -385,6 +432,7 @@ impl Emu {
         } else {
             match width {
                 8 => self.write_u8(ea, val as u8),
+                16 => self.write_u16(ea, val as u16),
                 32 => self.write_u32(ea, val as u32),
                 64 => self.write_u64(ea, val),
                 _ => Err("bad width".to_string()),
@@ -406,6 +454,7 @@ impl Emu {
         let mut rex_x = false;
         let mut rex_b = false;
         let mut rex_present = false;
+        let mut opsz16 = false;
         loop {
             let b = self.read_u8(ip + off as u64)?;
             if (0x40..=0x4F).contains(&b) {
@@ -419,7 +468,16 @@ impl Emu {
                     // only one REX expected; keep last
                 }
             } else if b == 0x66 {
-                return Err(format!("unsupported 0x66 operand-size prefix at 0x{ip:016x}"));
+                opsz16 = true; // repeatable; 16-bit only for whitelisted ops below
+                off += 1;
+            } else if b == 0x2E || b == 0x36 || b == 0x3E || b == 0x26 {
+                // CS/DS/ES/SS overrides are no-ops in the flat 64-bit model
+                // (appear in rustc alignment padding)
+                off += 1;
+            } else if b == 0x64 || b == 0x65 {
+                return Err(format!(
+                    "unsupported FS/GS segment access at 0x{ip:016x} (thread-local storage)"
+                ));
             } else if b == 0xF0 || b == 0xF2 || b == 0xF3 {
                 return Err(format!("unsupported lock/rep prefix at 0x{ip:016x}"));
             } else {
@@ -428,7 +486,20 @@ impl Emu {
         }
         let _ = rex_present;
         let op = self.read_u8(ip + off as u64)?;
-        let w: u32 = if rex_w { 64 } else { 32 };
+        let w: u32 = if rex_w {
+            64
+        } else if opsz16 {
+            // 16-bit operand size: only TEST/MOV/NOP are implemented; the rest
+            // fail clearly in the match arms via the gate below.
+            16
+        } else {
+            32
+        };
+        if w == 16 && !matches!(op, 0x84 | 0x85 | 0x88 | 0x89 | 0x8A | 0x8B | 0x90 | 0x0F | 0xB8..=0xBF) {
+            return Err(format!(
+                "unsupported 16-bit opcode 0x{op:02X} at 0x{ip:016x}"
+            ));
+        }
 
         // two-byte opcodes
         if op == 0x0F {
@@ -445,7 +516,13 @@ impl Emu {
                 return Ok(StepResult::Continue);
             }
             if op2 == 0xB6 || op2 == 0xB7 {
-                // movzx r, r/m8(16)
+                // movzx r, r/m8(16). A 0x66 prefix would narrow the
+                // destination to 16 bits; refuse rather than mis-emulate.
+                if opsz16 {
+                    return Err(format!(
+                        "unsupported 16-bit movzx at 0x{ip:016x}"
+                    ));
+                }
                 let srcw = if op2 == 0xB6 { 8 } else { 16 };
                 let (reg, is_reg, rm, ea_raw, ml) =
                     self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
@@ -481,6 +558,12 @@ impl Emu {
             if matches!(op2, 0x10 | 0x11 | 0x28 | 0x29 | 0x57) {
                 // Packed moves / xorps. Bitwise only: no flags, no FP, no MXCSR.
                 // (Demanded by rustc memset expansion: xorps + movaps/movups.)
+                // A 0x66 prefix selects unaligned variants; refuse explicitly.
+                if opsz16 {
+                    return Err(format!(
+                        "unsupported 0x66 SSE opcode 0F {op2:02X} at 0x{ip:016x}"
+                    ));
+                }
                 let (reg, is_reg, rm, ea_raw, ml) =
                     self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
                 let next = ip + (off + 2 + ml) as u64;
@@ -525,6 +608,31 @@ impl Emu {
                 let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
                 let v = if self.jcc_taken(op2 & 0xF)? { 1 } else { 0 };
                 self.write_rm(is_reg, rm, ea, 8, v)?;
+                self.rip = next;
+                return Ok(StepResult::Continue);
+            }
+            if op2 == 0x1F {
+                // Multi-byte NOP Ev (rustc alignment padding). Decode the
+                // operand only to advance RIP; no other effect. /0 required.
+                let (reg_field, _, _, _, ml) =
+                    self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
+                if reg_field != 0 {
+                    return Err(format!("unsupported 0F 1F /{reg_field} at 0x{ip:016x}"));
+                }
+                self.rip = ip + (off + 2 + ml) as u64;
+                return Ok(StepResult::Continue);
+            }
+            if (0x40..=0x4F).contains(&op2) {
+                // CMOVcc r, r/m (demanded by rustc branchless selects).
+                // Flags untouched; 32-bit dest zero-extends, 16-bit preserves.
+                let (reg, is_reg, rm, ea_raw, ml) =
+                    self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
+                let next = ip + (off + 2 + ml) as u64;
+                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                if self.jcc_taken(op2 & 0xF)? {
+                    let v = self.read_rm(is_reg, rm, ea, w)?;
+                    self.write_rm(true, reg, 0, w, v)?;
+                }
                 self.rip = next;
                 return Ok(StepResult::Continue);
             }
@@ -587,6 +695,10 @@ impl Emu {
                     let imm = self.read_u64(ip + off as u64 + 1)?;
                     self.regs[r] = imm;
                     self.rip = ip + off as u64 + 9;
+                } else if w == 16 {
+                    let imm = self.read_u16(ip + off as u64 + 1)?;
+                    self.regs[r] = (self.regs[r] & !0xFFFF) | imm as u64;
+                    self.rip = ip + off as u64 + 3;
                 } else {
                     let imm = self.read_u32(ip + off as u64 + 1)?;
                     self.regs[r] = imm as u64;
@@ -671,19 +783,23 @@ impl Emu {
                         self.regs[reg] = (self.regs[reg] & !0xFF) | v;
                     }
                     0x89 => {
-                        let v = if width == 64 {
-                            self.regs[reg]
-                        } else {
-                            self.regs[reg] & 0xFFFF_FFFF
+                        let v = match width {
+                            64 => self.regs[reg],
+                            32 => self.regs[reg] & 0xFFFF_FFFF,
+                            _ => self.regs[reg] & 0xFFFF,
                         };
                         self.write_rm(is_reg, rm, ea, width, v)?;
                     }
                     0x8B => {
                         let v = self.read_rm(is_reg, rm, ea, width)?;
-                        if width == 64 {
-                            self.regs[reg] = v;
-                        } else {
-                            self.regs[reg] = v & 0xFFFF_FFFF;
+                        match width {
+                            64 => self.regs[reg] = v,
+                            32 => self.regs[reg] = v & 0xFFFF_FFFF,
+                            // 16-bit: upper bits preserved
+                            _ => {
+                                self.regs[reg] =
+                                    (self.regs[reg] & !0xFFFF) | (v & 0xFFFF)
+                            }
                         }
                     }
                     0x8D => {
@@ -703,20 +819,18 @@ impl Emu {
                         self.regs[reg] = v;
                     }
                     0x84 | 0x85 => {
-                        let a = if width == 64 {
-                            self.regs[reg]
-                        } else if width == 32 {
-                            self.regs[reg] & 0xFFFF_FFFF
-                        } else {
-                            self.regs[reg] & 0xFF
+                        let a = match width {
+                            64 => self.regs[reg],
+                            32 => self.regs[reg] & 0xFFFF_FFFF,
+                            16 => self.regs[reg] & 0xFFFF,
+                            _ => self.regs[reg] & 0xFF,
                         };
                         let b = self.read_rm(is_reg, rm, ea, width)?;
-                        let mask = if width == 64 {
-                            u64::MAX
-                        } else if width == 32 {
-                            0xFFFF_FFFF
-                        } else {
-                            0xFF
+                        let mask = match width {
+                            64 => u64::MAX,
+                            32 => 0xFFFF_FFFF,
+                            16 => 0xFFFF,
+                            _ => 0xFF,
                         };
                         self.set_logic_flags((a & mask) & b, width);
                     }
@@ -1082,6 +1196,45 @@ impl Emu {
     }
 }
 
+/// Quote one argv element per MSVC `CommandLineToArgvW` rules, so a guest
+/// parsing `GetCommandLineW` recovers the original args.
+pub fn quote_arg(arg: &str) -> String {
+    if arg.is_empty() {
+        return "\"\"".to_string();
+    }
+    if !arg.chars().any(|c| c == ' ' || c == '\t' || c == '"' || c == '\n') {
+        return arg.to_string();
+    }
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('"');
+    let mut backslashes = 0usize;
+    for c in arg.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                for _ in 0..backslashes * 2 + 1 {
+                    out.push('\\');
+                }
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                for _ in 0..backslashes {
+                    out.push('\\');
+                }
+                backslashes = 0;
+                out.push(c);
+            }
+        }
+    }
+    // trailing backslashes are doubled before the closing quote
+    for _ in 0..backslashes * 2 {
+        out.push('\\');
+    }
+    out.push('"');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1185,4 +1338,103 @@ mod tests {
         assert_eq!(e.regs[3] & 0xFF, 0);
         assert!(!e.zf);
     }
+
+    #[test]
+    fn quote_arg_rules() {
+        assert_eq!(quote_arg("abc"), "abc");
+        assert_eq!(quote_arg(""), "\"\"");
+        assert_eq!(quote_arg("a b"), "\"a b\"");
+        assert_eq!(quote_arg("a\tb"), "\"a\tb\"");
+        assert_eq!(quote_arg("a\"b"), "\"a\\\"b\"");
+        assert_eq!(quote_arg("a\\"), "a\\"); // no quoting needed
+        assert_eq!(quote_arg("a\\ b"), "\"a\\ b\"");
+        assert_eq!(quote_arg("a\\"), "a\\");
+    }
+
+    #[test]
+    fn quote_arg_trailing_backslash_doubled() {
+        // backslashes immediately before the closing quote are doubled
+        assert_eq!(quote_arg("a b\\"), "\"a b\\\\\"");
+        // ...but not backslashes followed by other chars
+        assert_eq!(quote_arg("C:\\x\\ "), "\"C:\\x\\ \"");
+    }
+
+    #[test]
+    fn cmdline_layout_roundtrip() {
+        let mut e = emu_with(&[0x90]); // nop; we only need memory
+        e.alloc_cmdline("prog.exe", &["a".to_string(), "b c".to_string()])
+            .unwrap();
+        assert_eq!(e.read_utf16(e.cmdline_va).unwrap(), "prog.exe a \"b c\"");
+        // ANSI block follows the wide block + NUL
+        let wide_len = "prog.exe a \"b c\"".encode_utf16().count() + 1;
+        let ansi_va = e.cmdline_va + wide_len as u64 * 2;
+        assert_eq!(e.cmdline_ansi_va, ansi_va);
+        assert_eq!(
+            e.read_bytes(ansi_va, "prog.exe a \"b c\"".len()).unwrap(),
+            b"prog.exe a \"b c\""
+        );
+    }
+
+    #[test]
+    fn test16_sets_flags() {
+        // 66 85 C0  test ax,ax  (after xor eax,eax -> ZF=1)
+        let mut e = emu_with(&[0x31, 0xC0, 0x66, 0x85, 0xC0]);
+        e.step().unwrap();
+        assert!(e.zf);
+        e.step().unwrap();
+        assert!(e.zf); // ax == 0
+    }
+
+    #[test]
+    fn mov16_preserves_upper() {
+        // mov ecx,0x12345678 ; mov cx,0x00FF -> ecx == 0x123400FF
+        let mut e = emu_with(&[0xB9, 0x78, 0x56, 0x34, 0x12, 0x66, 0xB9, 0xFF, 0x00]);
+        e.step().unwrap();
+        e.step().unwrap();
+        assert_eq!(e.regs[1], 0x1234_00FF);
+    }
+
+    #[test]
+    fn cmov_taken_and_not_taken() {
+        // xor eax,eax (ZF=1); mov ecx,7; cmovz edx,ecx (->7); cmovnz ebx,ecx (stays 0)
+        let mut e = emu_with(&[
+            0x31, 0xC0, // xor eax,eax
+            0xB9, 0x07, 0x00, 0x00, 0x00, // mov ecx,7
+            0x0F, 0x44, 0xD1, // cmovz edx,ecx
+            0x0F, 0x45, 0xD9, // cmovnz ebx,ecx
+        ]);
+        for _ in 0..4 {
+            e.step().unwrap();
+        }
+        assert_eq!(e.regs[2], 7);
+        assert_eq!(e.regs[3], 0);
+    }
+
+    #[test]
+    fn multibyte_nop_skips_operand() {
+        // 0F 1F 40 00 (nopl [rax]) then ret would pop sentinel; just check RIP
+        let mut e = emu_with(&[0x0F, 0x1F, 0x40, 0x00, 0x90]);
+        e.step().unwrap();
+        assert_eq!(e.rip, e.base + 0x1000 + 4);
+    }
+
+    #[test]
+    fn seg_override_skipped_but_fs_errors() {
+        // 2E 90 = CS nop -> fine
+        let mut e = emu_with(&[0x2E, 0x90]);
+        e.step().unwrap();
+        // 64 90 = FS nop -> clear TLS error
+        let mut e = emu_with(&[0x64, 0x90]);
+        let err = e.step().unwrap_err();
+        assert!(err.contains("thread-local"), "{err}");
+    }
+
+    #[test]
+    fn unsupported_16bit_alu_fails_clearly() {
+        // 66 01 C0 = 16-bit add eax,eax
+        let mut e = emu_with(&[0x66, 0x01, 0xC0]);
+        let err = e.step().unwrap_err();
+        assert!(err.contains("16-bit"), "{err}");
+    }
+
 }

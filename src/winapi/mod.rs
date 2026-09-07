@@ -1,14 +1,17 @@
 //! Minimal Win32 API shims over [`WinFs`](crate::winfs::WinFs).
 //!
-//! Same `WinFs` API as `ps1` uses (requirement 9). Supported:
-//! ExitProcess, GetStdHandle, WriteFile, CreateFileW, ReadFile, CloseHandle,
-//! CreateDirectoryW, RemoveDirectoryW, DeleteFileW, MoveFileW, CopyFileW.
+//! Same `WinFs` API as `ps1` uses (requirement 9). Supported: ExitProcess,
+//! GetStdHandle, WriteFile, CreateFileW, ReadFile, CloseHandle,
+//! CreateDirectoryW, RemoveDirectoryW, DeleteFileW, MoveFileW, CopyFileW,
+//! GetCommandLineW/A, GetConsoleMode, SetConsoleMode, WriteConsoleW,
+//! GetConsoleOutputCP, SetConsoleTextAttribute, ReadConsoleW.
 //! Anything else fails at load time (`pe::load` rejects unknown imports).
 
 use crate::pe::emu::{Emu, StepResult};
 use crate::pe::PeImage;
 use crate::winfs::WinFs;
 use std::collections::HashMap;
+use std::io::IsTerminal;
 
 pub const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6; // -10
 pub const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5; // -11
@@ -32,23 +35,55 @@ pub struct Runner {
     handles: HashMap<u64, FileHandle>,
     next_handle: u64,
     pub exit_code: Option<u32>,
+    /// Called with every console write as it happens (streaming). When unset
+    /// (tests), output stays buffered in `emu.stdout` until `run` returns.
+    console_sink: Option<Box<dyn FnMut(&[u8])>>,
+    /// Whether host stdout is a TTY (drives `GetConsoleMode`).
+    console_is_tty: bool,
 }
 
 impl Runner {
     pub fn new(img: &PeImage, fs: WinFs) -> Result<Self, String> {
+        Self::with_argv(img, fs, "<exe>", &[])
+    }
+
+    /// `prog` is argv0 as typed; `args` are the guest arguments.
+    pub fn with_argv(
+        img: &PeImage,
+        fs: WinFs,
+        prog: &str,
+        args: &[String],
+    ) -> Result<Self, String> {
         if let Some(first) = img.unsupported.first() {
             return Err(format!(
                 "unsupported import: {}!{} (image came from lenient load; refusing to execute)",
                 first.dll, first.func
             ));
         }
+        let mut emu = Emu::new(img)?;
+        emu.alloc_cmdline(prog, args)?;
         Ok(Self {
-            emu: Emu::new(img)?,
+            emu,
             fs,
             handles: HashMap::new(),
             next_handle: 0x100,
             exit_code: None,
+            console_sink: None,
+            console_is_tty: std::io::stdout().is_terminal(),
         })
+    }
+
+    pub fn with_console_sink(mut self, sink: Box<dyn FnMut(&[u8])>) -> Self {
+        self.console_sink = Some(sink);
+        self
+    }
+
+    /// Emit guest console bytes: buffer (returned by `run`) + stream to sink.
+    fn console_out(&mut self, data: &[u8]) {
+        self.emu.stdout.extend_from_slice(data);
+        if let Some(sink) = self.console_sink.as_mut() {
+            sink(data);
+        }
     }
 
     fn alloc_handle(&mut self, path: String, offset: u64) -> u64 {
@@ -133,7 +168,7 @@ impl Runner {
                 }
                 let data = self.emu.read_bytes(buf, n)?;
                 if h == 1 || h == 2 {
-                    self.emu.stdout.extend_from_slice(&data);
+                    self.console_out(&data);
                     if p_written != 0 {
                         self.emu.write_u32(p_written, n as u32)?;
                     }
@@ -320,6 +355,90 @@ impl Runner {
                     Err(_) => ret_bool!(0),
                 }
             }
+            "GetCommandLineW" => {
+                if self.emu.cmdline_va == 0 {
+                    ret_bool!(0);
+                }
+                ret_bool!(self.emu.cmdline_va);
+            }
+            "GetCommandLineA" => {
+                if self.emu.cmdline_ansi_va == 0 {
+                    ret_bool!(0);
+                }
+                ret_bool!(self.emu.cmdline_ansi_va);
+            }
+            "GetConsoleMode" => {
+                // Succeeds for console handles iff host stdout is a TTY,
+                // mirroring Windows (pipes fail) so `--color=auto` works.
+                let h = rcx;
+                let p_mode = rdx;
+                if (h == 1 || h == 2) && self.console_is_tty {
+                    // ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT
+                    if p_mode != 0 {
+                        self.emu.write_u32(p_mode, 0x3)?;
+                    }
+                    ret_bool!(1);
+                } else {
+                    ret_bool!(0);
+                }
+            }
+            "SetConsoleMode" => {
+                // Modes are not tracked (byte-pipe model); succeed for
+                // console handles so VT-capable guests proceed.
+                let h = rcx;
+                ret_bool!(u64::from(h == 1 || h == 2));
+            }
+            "WriteConsoleW" => {
+                // BOOL WriteConsoleW(HANDLE, LPCVOID, DWORD nchars, LPDWORD, LPVOID)
+                let h = rcx;
+                let buf = rdx;
+                let n = (r8 & 0xFFFF_FFFF) as usize;
+                let p_written = r9;
+                if h != 1 && h != 2 {
+                    ret_bool!(0);
+                }
+                if n > 4 * 1024 * 1024 {
+                    ret_bool!(0);
+                }
+                let mut units = Vec::with_capacity(n);
+                for i in 0..n {
+                    units.push(self.emu.read_u16(buf + i as u64 * 2)?);
+                }
+                let text = String::from_utf16_lossy(&units);
+                self.console_out(text.as_bytes());
+                if p_written != 0 {
+                    self.emu.write_u32(p_written, n as u32)?;
+                }
+                ret_bool!(1);
+            }
+            "GetConsoleOutputCP" => {
+                // UTF-8, matching our transcode behavior.
+                ret_bool!(65001);
+            }
+            "SetConsoleTextAttribute" => {
+                // Colors are passed through as bytes; nothing to store.
+                let h = rcx;
+                ret_bool!(u64::from(h == 1 || h == 2));
+            }
+            "ReadConsoleW" => {
+                // Line-buffered read from host stdin, UTF-8 decoded lossily.
+                let h = rcx;
+                let buf = rdx;
+                let n = (r8 & 0xFFFF_FFFF) as usize;
+                let p_read = r9;
+                if h != 0 || n == 0 {
+                    ret_bool!(0);
+                }
+                let line = read_stdin_line().unwrap_or_default();
+                let wide: Vec<u16> = line.encode_utf16().take(n).collect();
+                for (i, u) in wide.iter().enumerate() {
+                    self.emu.write_u16(buf + i as u64 * 2, *u)?;
+                }
+                if p_read != 0 {
+                    self.emu.write_u32(p_read, wide.len() as u32)?;
+                }
+                ret_bool!(1);
+            }
             other => {
                 return Err(format!(
                     "unsupported import at runtime: {}!{other}",
@@ -330,8 +449,151 @@ impl Runner {
     }
 }
 
+/// One line from host stdin (no trailing newline), lossy UTF-8.
+fn read_stdin_line() -> Option<String> {
+    use std::io::BufRead;
+    let stdin = std::io::stdin();
+    let mut line = String::new();
+    match stdin.lock().read_line(&mut line) {
+        Ok(0) => Some(String::new()), // EOF -> empty
+        Ok(_) => {
+            while line.ends_with('\n') || line.ends_with('\r') {
+                line.pop();
+            }
+            Some(line)
+        }
+        Err(_) => None,
+    }
+}
+
 /// Convenience: load bytes + run with a fresh or given FS.
 pub fn run_exe(data: &[u8], fs: WinFs) -> Result<(u32, WinFs, Vec<u8>), String> {
+    run_exe_argv(data, fs, "<exe>", &[])
+}
+
+/// Load bytes + run with guest argv (`prog` is argv0 as typed).
+pub fn run_exe_argv(
+    data: &[u8],
+    fs: WinFs,
+    prog: &str,
+    args: &[String],
+) -> Result<(u32, WinFs, Vec<u8>), String> {
     let img = crate::pe::load(data)?;
-    Runner::new(&img, fs)?.run()
+    Runner::with_argv(&img, fs, prog, args)?.run()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pe::builder::{build, Asm};
+
+    /// Probe guest: GetConsoleOutputCP==65001, SetConsoleMode/TextAttribute ok,
+    /// WriteConsoleW transcodes UTF-16 (é + lone surrogate) to UTF-8.
+    /// Exit 0 = all good, 1 = any step failed.
+    fn console_probe() -> Vec<u8> {
+        // imports: GetStdHandle WriteConsoleW GetConsoleOutputCP
+        //          SetConsoleMode SetConsoleTextAttribute ExitProcess
+        const GH: usize = 0;
+        const WC: usize = 1;
+        const CP: usize = 2;
+        const SM: usize = 3;
+        const TA: usize = 4;
+        const XP: usize = 5;
+        let mut a = Asm::new();
+        // msg = U+00E9, lone surrogate U+D800, 'B', '\n'
+        let mut msg = Vec::new();
+        for u in [0x00E9u16, 0xD800, 0x0042, 0x000A] {
+            msg.extend_from_slice(&u.to_le_bytes());
+        }
+        let d_msg = a.add_data(msg);
+        let d_written = a.add_zeroed(8);
+        let lbl_fail = a.fresh_label();
+        a.sub_rsp(0x28);
+        // h = GetStdHandle(-11)
+        a.mov_ecx_imm(0xFFFF_FFF5);
+        a.call_import(GH);
+        a.mov_rspoff_rax(0x28); // save handle
+        // GetConsoleOutputCP == 65001?
+        a.call_import(CP);
+        a.cmp_eax_imm(65001);
+        a.jnz(lbl_fail);
+        // SetConsoleMode(h, 3)?
+        a.mov_reg_rspoff(1, 0x28);
+        a.mov_edx_imm(3);
+        a.call_import(SM);
+        a.test_eax_eax();
+        a.jz(lbl_fail);
+        // SetConsoleTextAttribute(h, 7)?
+        a.mov_reg_rspoff(1, 0x28);
+        a.mov_edx_imm(7);
+        a.call_import(TA);
+        a.test_eax_eax();
+        a.jz(lbl_fail);
+        // WriteConsoleW(h, msg, 4, &written, 0)?
+        a.mov_reg_rspoff(1, 0x28);
+        a.lea_reg_rip(2, d_msg);
+        a.mov_r32_imm(8, 4);
+        a.lea_reg_rip(9, d_written);
+        a.xor_eax();
+        a.mov_rspoff_rax(0x20);
+        a.call_import(WC);
+        a.test_eax_eax();
+        a.jz(lbl_fail);
+        a.mov_ecx_imm(0);
+        a.call_import(XP);
+        a.add_rsp(0x28);
+        a.ret();
+        a.mark(lbl_fail);
+        a.mov_ecx_imm(1);
+        a.call_import(XP);
+        a.add_rsp(0x28);
+        a.ret();
+        build(
+            a,
+            &[
+                ("KERNEL32.dll", "GetStdHandle"),
+                ("KERNEL32.dll", "WriteConsoleW"),
+                ("KERNEL32.dll", "GetConsoleOutputCP"),
+                ("KERNEL32.dll", "SetConsoleMode"),
+                ("KERNEL32.dll", "SetConsoleTextAttribute"),
+                ("KERNEL32.dll", "ExitProcess"),
+            ],
+        )
+    }
+
+    #[test]
+    fn console_shims_transcode_and_report() {
+        let (code, _, out) = run_exe(&console_probe(), WinFs::new()).unwrap();
+        assert_eq!(code, 0);
+        // é -> C3 A9, lone surrogate -> EF BF BD (U+FFFD), then B \n
+        assert_eq!(out, b"\xc3\xa9\xef\xbf\xbdB\n");
+    }
+
+    #[test]
+    fn streaming_sink_sees_console_writes() {
+        let exe = crate::pe::builder::hello("stream-me");
+        let img = crate::pe::load(&exe).unwrap();
+        let runner = Runner::new(&img, WinFs::new()).unwrap();
+        // borrow dance: collect via Rc<RefCell>
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::<u8>::new()));
+        let seen2 = seen.clone();
+        let runner = runner.with_console_sink(Box::new(move |c: &[u8]| {
+            seen2.borrow_mut().extend_from_slice(c);
+        }));
+        let (code, _, out) = runner.run().unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(&*seen.borrow(), b"stream-me");
+        assert_eq!(out, b"stream-me");
+    }
+
+    #[test]
+    fn runner_is_non_tty_under_test_harness() {
+        // cargo test captures stdout -> not a TTY. Pins the deterministic half
+        // of GetConsoleMode (succeeds iff TTY); the TTY-true path is trivial
+        // (`mode=3`, return 1) and covered by inspection.
+        let exe = crate::pe::builder::hello("x");
+        let img = crate::pe::load(&exe).unwrap();
+        let r = Runner::new(&img, WinFs::new()).unwrap();
+        assert!(!r.console_is_tty);
+    }
 }

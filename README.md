@@ -5,9 +5,10 @@ against a fully in-memory Windows-style filesystem. No Wine, VM, Windows DLLs,
 or host filesystem backing.
 
 ```bash
-wincli app.exe        # minimal x86_64 PE execution (PE32+, native console apps)
-wincli script.ps1     # minimal PowerShell-like script execution
-wincli inspect app.exe  # PE compatibility report: supported vs missing imports
+wincli app.exe [args...]  # minimal x86_64 PE execution (PE32+, native console apps)
+wincli rg --version       # cached package by bare name (or C:\bin\rg.exe)
+wincli script.ps1         # minimal PowerShell-like script execution
+wincli inspect app.exe    # PE compatibility report: supported vs missing imports
 ```
 
 Both share the exact same in-memory `WinFS`: case-insensitive lookup with
@@ -20,7 +21,10 @@ src/winfs/   in-memory Windows filesystem (shared by EXE shims and PS1)
 src/pe/      PE32+ loader, minimal x86_64 interpreter, test-EXE builder
 src/winapi/  Win32 shims: ExitProcess, GetStdHandle, WriteFile,
              CreateFileW, ReadFile, CloseHandle, CreateDirectoryW,
-             RemoveDirectoryW, DeleteFileW, MoveFileW, CopyFileW
+             RemoveDirectoryW, DeleteFileW, MoveFileW, CopyFileW,
+             GetCommandLineW/A, GetConsoleMode, SetConsoleMode,
+             WriteConsoleW, GetConsoleOutputCP, SetConsoleTextAttribute,
+             ReadConsoleW
 src/ps1/     minimal interpreter: New-Item, Set-Content, Add-Content,
              Get-Content, Get-ChildItem, Remove-Item, Copy-Item,
              Move-Item, Test-Path
@@ -82,6 +86,9 @@ wincli inspect rg        # inspect the cached package
 content-addressed under `$WINCLI_CACHE/archives/`, extracts the exe to
 `pkgs/<name>.exe`, and reports the guest-logical address (`C:\bin\demo.exe`;
 bytes live in the host cache, the guest FS stays in-memory per run).
+Run targets resolve as: host path first, then cached package
+(`name`, `name.exe`, or `C:\bin\name.exe`); guest argv after the target
+reaches the program via `GetCommandLineW/A` (MSVC quoting).
 Remote WinGet-catalog sources, hash verification, and deflate land in P2;
 until then only local directories (`WINCLI_SOURCE=./dir`, stored zips).
 `tests/artifacts/packages/` holds offline fixtures built by
@@ -114,10 +121,11 @@ Guest output is a transparent byte pipe to the host terminal — same content,
 no console emulation (no conpty): programs emitting ANSI escapes render via
 the host terminal, and pipes (`wincli rg … | head`) behave identically.
 
-- Console writes are forwarded to host stdout (buffered per run today;
-  streaming lands with run-with-args).
-- `WriteFile` bytes pass through bit-identical; `WriteConsoleW`/`GetConsoleMode`
-  are planned shims (UTF-16→UTF-8 transcode; TTY-aware success so
-  `--color=auto` works); input is planned as line-buffered reads from stdin.
+- Console writes are forwarded to host stdout (buffered per run;
+  streamed live in CLI runs via a sink).
+- `WriteFile` bytes pass through bit-identical; `WriteConsoleW` transcodes
+  UTF-16→UTF-8 (invalid sequences → U+FFFD); `GetConsoleMode` succeeds iff
+  host stdout is a TTY (so `--color=auto` works); `GetConsoleOutputCP`
+  reports UTF-8; input is line-buffered (`ReadConsoleW`).
 - Cursor/screen-buffer APIs and Ctrl-C handling are non-goals; unsupported
   console APIs fail clearly so guests fall back.

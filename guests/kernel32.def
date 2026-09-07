@@ -14,3 +14,11 @@ RemoveDirectoryW
 DeleteFileW
 MoveFileW
 CopyFileW
+GetCommandLineW
+GetCommandLineA
+GetConsoleMode
+SetConsoleMode
+WriteConsoleW
+GetConsoleOutputCP
+SetConsoleTextAttribute
+ReadConsoleW

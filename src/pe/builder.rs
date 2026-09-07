@@ -60,6 +60,12 @@ impl Asm {
         self.labels.insert(id, self.code.len());
         id
     }
+    /// Fresh label id without marking (mark later with [`Asm::mark`]).
+    pub fn fresh_label(&mut self) -> usize {
+        let id = self.next_label;
+        self.next_label += 1;
+        id
+    }
     pub fn mark(&mut self, id: usize) {
         self.labels.insert(id, self.code.len());
     }

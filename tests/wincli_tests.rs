@@ -708,3 +708,70 @@ fn live_install_ripgrep() {
     assert!(stdout.contains("Missing:\n"), "{stdout}");
     std::fs::remove_dir_all(&cache).ok();
 }
+
+// ---------- P3: argv + name resolution ----------
+
+#[test]
+fn test_argv_echo_lib_level() {
+    // controlled argv0 through the library
+    let bytes = std::fs::read(artifact("exe/rust_argv.exe")).unwrap();
+    let args = ["hello".to_string(), "a b".to_string(), "--version".to_string()];
+    let (code, _, out) =
+        wincli::winapi::run_exe_argv(&bytes, WinFs::new(), "myprog.exe", &args).unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(out, b"myprog.exe hello \"a b\" --version\n");
+}
+
+#[test]
+fn test_argv_echo_cli() {
+    let p = artifact("exe/rust_argv.exe");
+    let ps = p.to_string_lossy().to_string();
+    let (code, stdout, stderr) = run_wincli_env(&[ps.as_str(), "hello", "a b", "--version"], &[]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, format!("{ps} hello \"a b\" --version\n"));
+}
+
+#[test]
+fn test_bare_name_and_guest_path_resolution() {
+    let cache = isolated_cache("resolve");
+    let src = artifact("packages").to_string_lossy().to_string();
+    let cc = cache.to_string_lossy().to_string();
+    let envs = [
+        ("WINCLI_CACHE", cc.as_ref()),
+        ("WINCLI_SOURCE", src.as_ref()),
+    ];
+    // install demoz from fixtures, then run by bare name and guest path
+    let (code, _, stderr) = run_wincli_env(&["install", "demoz"], &envs);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let (code, stdout, stderr) = run_wincli_env(&["demoz"], &envs);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "demoz 0.1.0");
+    let (code, stdout, stderr) = run_wincli_env(&["C:\\bin\\demoz.exe"], &envs);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "demoz 0.1.0");
+    // argv0 reflects what was typed
+    let (code, stdout, _) = run_wincli_env(&["install", "demo"], &envs);
+    assert_eq!(code, 0);
+    std::fs::remove_dir_all(&cache).ok();
+}
+
+#[test]
+fn test_run_unknown_name_suggests_install() {
+    let cache = isolated_cache("runknown");
+    let cc = cache.to_string_lossy().to_string();
+    let (code, _, stderr) =
+        run_wincli_env(&["ghost-tool"], &[("WINCLI_CACHE", cc.as_ref())]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("wincli install ghost-tool"), "stderr: {stderr}");
+    std::fs::remove_dir_all(&cache).ok();
+}
+
+#[test]
+fn test_ps1_with_args_rejected() {
+    let (code, _, stderr) = run_wincli_env(
+        &[artifact("ps1/fs_dots.ps1").to_str().unwrap(), "extra"],
+        &[],
+    );
+    assert_eq!(code, 2);
+    assert!(stderr.contains("script args not supported"), "stderr: {stderr}");
+}

@@ -58,3 +58,15 @@ All notable changes to this project will be documented in this file.
 - Documented console contract: transparent byte pipe to the host terminal,
   no console emulation; `WriteConsoleW`/`GetConsoleMode`/streaming/input
   planned with run-with-args.
+- P3 run-with-args: `wincli <exe|pkg> [args...]` with guest argv via
+  `GetCommandLineW/A` (64K guest block, MSVC quoting, unit-tested),
+  bare-name and `C:\bin\` resolution through the package cache, and a
+  `rust_argv.exe` echo guest proving it with real rustc output.
+- Console shims demanded by real tools: `GetConsoleMode` (TTY-aware),
+  `SetConsoleMode`, `WriteConsoleW` (UTF-16→UTF-8), `GetConsoleOutputCP`
+  (UTF-8), `SetConsoleTextAttribute`, line-buffered `ReadConsoleW`, plus
+  live-streaming console sink (buffered behavior preserved for tests).
+- Emulator, trace-driven by the argv guest: 16-bit `TEST`/`MOV`/`MOV imm`,
+  `CMOVcc`, multi-byte `NOP`, segment-override-tolerant prefixes with a
+  clear FS/GS (TLS) error. Guest rule documented: no unproven bounds
+  checks (`panic_bounds_check` is undefined under `/NODEFAULTLIB`).
