@@ -24,3 +24,8 @@ All notable changes to this project will be documented in this file.
   `tests/artifacts/exe/*.exe` self-verifying PE32+ guest programs, and the
   `examples/gen_artifacts.rs` Rust generator that builds them. Black-box CLI
   tests run `wincli` against every artifact.
+- Rust guest lane (`guests/`): real `no_std` programs for
+  `x86_64-pc-windows-msvc` built offline with `rustc` + `rust-lld`
+  (`guests/build.sh`, `guests/kernel32.def` pinned to the supported API set),
+  starting with `rust_hello.exe` plus a CLI test that also asserts the guest
+  imports stay within the supported set.

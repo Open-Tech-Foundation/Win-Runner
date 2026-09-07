@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Build the Rust guest programs (x86_64-pc-windows-msvc, no_std) into real
+# PE32+ binaries using only rustup parts: rustc + rust-lld, no mingw/xwin.
+# Output: guests/out/*.exe, copied to tests/artifacts/exe/rust_*.exe.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+OUT="$ROOT/guests/out"
+ART="$ROOT/tests/artifacts/exe"
+TARGET="x86_64-pc-windows-msvc"
+
+if ! rustup target list --installed 2>/dev/null | grep -q "^${TARGET}$"; then
+    echo "error: rust target '${TARGET}' not installed." >&2
+    echo "run: rustup target add ${TARGET}" >&2
+    exit 1
+fi
+
+SYSROOT="$(rustc --print sysroot)"
+HOST_TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
+LLD="$SYSROOT/lib/rustlib/$HOST_TRIPLE/bin/rust-lld"
+if [[ ! -x "$LLD" ]]; then
+    echo "error: rust-lld not found at $LLD" >&2
+    exit 1
+fi
+
+mkdir -p "$OUT"
+# Import library for exactly the APIs WinCLI implements.
+"$LLD" -flavor link \
+    "/DEF:$ROOT/guests/kernel32.def" \
+    "/OUT:$OUT/kernel32.lib" \
+    /MACHINE:x64
+
+build_guest() {
+    local src="$1" entry="$2" dest="$3"
+    local obj="$OUT/$(basename "$src" .rs).o"
+    rustc --target "$TARGET" --crate-type lib --emit obj \
+        -C panic=abort -C opt-level=2 --edition 2021 \
+        "$ROOT/guests/$src" -o "$obj"
+    "$LLD" -flavor link \
+        "/OUT:$obj.exe" \
+        "/ENTRY:$entry" \
+        /NODEFAULTLIB /SUBSYSTEM:CONSOLE /DYNAMICBASE:NO \
+        "$obj" "$OUT/kernel32.lib"
+    cp "$obj.exe" "$ART/$dest"
+    echo "built $ART/$dest"
+}
+
+build_guest hello.rs guest_entry rust_hello.exe

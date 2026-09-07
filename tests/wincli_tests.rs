@@ -449,3 +449,24 @@ fn test_art_exe_bad_import() {
         "stderr: {stderr}"
     );
 }
+
+#[test]
+fn test_art_exe_rust_hello() {
+    // Real rustc-built guest (guests/hello.rs, x86_64-pc-windows-msvc).
+    // Its imports must stay within the supported API set...
+    let bytes = std::fs::read(artifact("exe/rust_hello.exe")).unwrap();
+    let img = pe::load(&bytes).expect("rust guest must load");
+    assert!(!img.imports.is_empty());
+    for imp in &img.imports {
+        assert!(
+            pe::is_supported(&imp.dll, &imp.func),
+            "unsupported import in rust guest: {}!{}",
+            imp.dll,
+            imp.func
+        );
+    }
+    // ...and it must run through the real CLI.
+    let (code, stdout, stderr) = run_cli(&artifact("exe/rust_hello.exe"));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "Hello from Rust");
+}

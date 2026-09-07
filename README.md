@@ -44,6 +44,21 @@ of silently succeeding.
 cargo run --example gen_artifacts
 ```
 
+## Rust guests (`guests/`)
+
+Real Rust programs targeting `x86_64-pc-windows-msvc`, written `no_std` +
+`no_main` with a custom entry so they need no CRT startup and only the Win32
+APIs WinCLI implements. Built with rustup parts only (`rustc` + `rust-lld`,
+no mingw/xwin):
+
+```bash
+./guests/build.sh   # needs: rustup target add x86_64-pc-windows-msvc
+```
+
+This compiles `guests/*.rs`, links with `guests/kernel32.def` (exactly the
+supported API set — keep in sync with `pe::SUPPORTED_APIS`), and copies the
+result to `tests/artifacts/exe/rust_*.exe`.
+
 ## Tests
 
 ```bash
