@@ -46,3 +46,4 @@ build_guest() {
 }
 
 build_guest hello.rs guest_entry rust_hello.exe
+build_guest fs_selftest.rs guest_entry rust_fs.exe

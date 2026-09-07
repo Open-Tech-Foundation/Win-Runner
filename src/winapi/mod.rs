@@ -165,9 +165,10 @@ impl Runner {
             }
             "CreateFileW" => {
                 // HANDLE CreateFileW(path, access, share, sec, creation, flags, template)
-                // Win x64: arg1-4 in rcx,rdx,r8,r9; creation is the 5th STACK arg.
+                // Win x64: arg1-4 in rcx,rdx,r8,r9; creation is the 5th arg,
+                // i.e. the first stack slot (index 4).
                 let p_path = rcx;
-                let creation = self.emu.stack_arg(5).unwrap_or(OPEN_EXISTING as u64) as u32;
+                let creation = self.emu.stack_arg(4).unwrap_or(OPEN_EXISTING as u64) as u32;
                 let path = self.emu.read_utf16(p_path)?;
                 let exists = self.fs.exists(&path);
                 let is_dir = self.fs.is_dir(&path);

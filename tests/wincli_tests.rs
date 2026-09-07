@@ -470,3 +470,25 @@ fn test_art_exe_rust_hello() {
     assert_eq!(code, 0, "stderr: {stderr}");
     assert_eq!(stdout, "Hello from Rust");
 }
+
+#[test]
+fn test_art_exe_rust_fs_selftest() {
+    // Real rustc-built FS guest (guests/fs_selftest.rs). Imports must stay
+    // within the supported API set...
+    let bytes = std::fs::read(artifact("exe/rust_fs.exe")).unwrap();
+    let img = pe::load(&bytes).expect("rust guest must load");
+    assert!(!img.imports.is_empty());
+    for imp in &img.imports {
+        assert!(
+            pe::is_supported(&imp.dll, &imp.func),
+            "unsupported import in rust guest: {}!{}",
+            imp.dll,
+            imp.func
+        );
+    }
+    // ...and the guest must verify itself through the real CLI: it echoes the
+    // bytes it wrote/read/moved, then PASS.
+    let (code, stdout, stderr) = run_cli(&artifact("exe/rust_fs.exe"));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "rust-fs-bytes-7PASS\n");
+}

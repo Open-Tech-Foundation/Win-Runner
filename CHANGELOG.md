@@ -29,3 +29,12 @@ All notable changes to this project will be documented in this file.
   (`guests/build.sh`, `guests/kernel32.def` pinned to the supported API set),
   starting with `rust_hello.exe` plus a CLI test that also asserts the guest
   imports stay within the supported set.
+- `guests/fs_selftest.rs` + `rust_fs.exe`: real Rust guest exercising every
+  FS shim (write/read/byte-compare/copy/move/delete, mkdir/rmdir plus
+  negative cases, mixed-case paths), self-reporting `PASS`/exit 0.
+- Emulator: XMM state with `xorps`/`movaps`/`movups`, group-1 `Eb,Ib`
+  (`CMP r/m8,imm8` etc.), `SETcc`, 8-bit `TEST` — each demanded by rustc
+  output (trace-driven, with unit tests).
+- Fixed a real Win-x64 ABI bug the Rust guest exposed: `CreateFileW`
+  `creation` is the 5th arg (first stack slot); shim and test-EXE builder
+  were both off by one slot in the same direction, masking each other.

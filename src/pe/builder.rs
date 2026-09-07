@@ -524,12 +524,11 @@ pub fn write_file(path: &str, content: &[u8]) -> Vec<u8> {
     a.mov_r8d_imm(0);
     a.mov_r9d_imm(0);
     a.xor_eax();
-    a.mov_rspoff_rax(0x20); // lpSecurity = NULL
+    a.emit(&[0xC7, 0x44, 0x24, 0x20]);
+    a.emit(&2u32.to_le_bytes()); // creation = CREATE_ALWAYS at [rsp+0x20]
     a.emit(&[0xC7, 0x44, 0x24, 0x28]);
-    a.emit(&2u32.to_le_bytes()); // creation = CREATE_ALWAYS
-    a.emit(&[0xC7, 0x44, 0x24, 0x30]);
     a.emit(&0x80u32.to_le_bytes()); // flags
-    a.mov_rspoff_rax(0x38); // hTemplate = NULL
+    a.mov_rspoff_rax(0x30); // hTemplate = NULL
     a.call_import(0);
     a.cmp_rax_m1();
     a.jz(lbl_fail);
@@ -591,12 +590,11 @@ pub fn read_file_to_stdout(path: &str) -> Vec<u8> {
     a.mov_r8d_imm(0);
     a.mov_r9d_imm(0);
     a.xor_eax();
-    a.mov_rspoff_rax(0x20);
+    a.emit(&[0xC7, 0x44, 0x24, 0x20]);
+    a.emit(&3u32.to_le_bytes()); // creation = OPEN_EXISTING at [rsp+0x20]
     a.emit(&[0xC7, 0x44, 0x24, 0x28]);
-    a.emit(&3u32.to_le_bytes());
-    a.emit(&[0xC7, 0x44, 0x24, 0x30]);
-    a.emit(&0u32.to_le_bytes());
-    a.mov_rspoff_rax(0x38);
+    a.emit(&0u32.to_le_bytes()); // flags
+    a.mov_rspoff_rax(0x30); // hTemplate = NULL
     a.call_import(0);
     a.cmp_rax_m1();
     a.jz(lbl_fail);
@@ -784,7 +782,9 @@ const WF: usize = 1; // WriteFile
 const CH: usize = 2; // CloseHandle
 
 /// Emit `handle = CreateFileW(path_data, access, creation)`.
-/// Frame: caller must have `sub rsp` with room; uses [rsp+0x20..0x38].
+/// Win x64 layout: arg1-4 in rcx,rdx,r8,r9; creation is the 5th arg at
+/// [rsp+0x20], flags at [rsp+0x28], template at [rsp+0x30].
+/// Frame: caller must have `sub rsp` with room; uses [rsp+0x20..0x30].
 /// On return, rax = handle or INVALID_HANDLE_VALUE.
 fn emit_create(a: &mut Asm, d_path: usize, access: u64, creation: u32, call_idx: usize) {
     a.lea_reg_rip(1, d_path); // rcx = path
@@ -793,10 +793,9 @@ fn emit_create(a: &mut Asm, d_path: usize, access: u64, creation: u32, call_idx:
     a.mov_r8d_imm(0); // share
     a.mov_r9d_imm(0); // security
     a.xor_eax();
-    a.mov_rspoff_rax(0x20); // lpSecurity = NULL
-    a.mov_rspoff_imm32(0x28, creation);
-    a.mov_rspoff_imm32(0x30, 0x80); // flags
-    a.mov_rspoff_rax(0x38); // hTemplate = NULL
+    a.mov_rspoff_imm32(0x20, creation);
+    a.mov_rspoff_imm32(0x28, 0x80); // flags
+    a.mov_rspoff_rax(0x30); // hTemplate = NULL
     a.call_import(call_idx);
 }
 

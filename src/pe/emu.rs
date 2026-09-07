@@ -25,6 +25,10 @@ pub struct Emu {
     pub base: u64,
     pub mem: Vec<u8>,
     pub regs: [u64; 16],
+    /// XMM0-15 as raw 128-bit lanes. Only bitwise/packed-integer moves are
+    /// supported (movaps/movups/xorps); no FP arithmetic, no MXCSR, and no
+    /// alignment faulting on movaps (guests are compiler-aligned).
+    pub xmm: [u128; 16],
     pub rip: u64,
     pub zf: bool,
     pub sf: bool,
@@ -48,6 +52,7 @@ impl Emu {
             base,
             mem,
             regs: [0u64; 16],
+            xmm: [0u128; 16],
             rip: base + img.entry_rva as u64,
             zf: false,
             sf: false,
@@ -128,6 +133,17 @@ impl Emu {
     pub fn write_u64(&mut self, va: u64, v: u64) -> Result<(), String> {
         let o = self.check_va(va, 8)?;
         self.mem[o..o + 8].copy_from_slice(&v.to_le_bytes());
+        Ok(())
+    }
+    pub fn read_u128(&self, va: u64) -> Result<u128, String> {
+        let o = self.check_va(va, 16)?;
+        let mut b = [0u8; 16];
+        b.copy_from_slice(&self.mem[o..o + 16]);
+        Ok(u128::from_le_bytes(b))
+    }
+    pub fn write_u128(&mut self, va: u64, v: u128) -> Result<(), String> {
+        let o = self.check_va(va, 16)?;
+        self.mem[o..o + 16].copy_from_slice(&v.to_le_bytes());
         Ok(())
     }
     pub fn read_bytes(&self, va: u64, len: usize) -> Result<Vec<u8>, String> {
@@ -462,6 +478,56 @@ impl Emu {
                 self.rip = ip + (off + 2 + ml) as u64;
                 return Ok(StepResult::Continue);
             }
+            if matches!(op2, 0x10 | 0x11 | 0x28 | 0x29 | 0x57) {
+                // Packed moves / xorps. Bitwise only: no flags, no FP, no MXCSR.
+                // (Demanded by rustc memset expansion: xorps + movaps/movups.)
+                let (reg, is_reg, rm, ea_raw, ml) =
+                    self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
+                let next = ip + (off + 2 + ml) as u64;
+                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                match op2 {
+                    0x10 | 0x28 => {
+                        // movups/movaps xmm, xmm/m128
+                        self.xmm[reg] = if is_reg {
+                            self.xmm[rm]
+                        } else {
+                            self.read_u128(ea)?
+                        };
+                    }
+                    0x11 | 0x29 => {
+                        // movups/movaps xmm/m128, xmm
+                        if is_reg {
+                            self.xmm[rm] = self.xmm[reg];
+                        } else {
+                            self.write_u128(ea, self.xmm[reg])?;
+                        }
+                    }
+                    0x57 => {
+                        // xorps xmm, xmm/m128
+                        let b = if is_reg {
+                            self.xmm[rm]
+                        } else {
+                            self.read_u128(ea)?
+                        };
+                        self.xmm[reg] ^= b;
+                    }
+                    _ => unreachable!(),
+                }
+                self.rip = next;
+                return Ok(StepResult::Continue);
+            }
+            if (0x90..=0x9F).contains(&op2) {
+                // SETcc r/m8 (demanded by rustc bool materialization, e.g. SETNZ).
+                // ModRM.reg is ignored by hardware; the condition is op2 & 0xF.
+                let (_, is_reg, rm, ea_raw, ml) =
+                    self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
+                let next = ip + (off + 2 + ml) as u64;
+                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let v = if self.jcc_taken(op2 & 0xF)? { 1 } else { 0 };
+                self.write_rm(is_reg, rm, ea, 8, v)?;
+                self.rip = next;
+                return Ok(StepResult::Continue);
+            }
             return Err(format!("unsupported 2-byte opcode 0F {op2:02X} at 0x{ip:016x}"));
         }
 
@@ -587,8 +653,8 @@ impl Emu {
                 Ok(StepResult::Continue)
             }
             0x88 | 0x89 | 0x8A | 0x8B | 0x8D | 0x01 | 0x03 | 0x29 | 0x2B | 0x31 | 0x33
-            | 0x39 | 0x3B | 0x09 | 0x0B | 0x21 | 0x23 | 0x85 | 0x63 => {
-                let is_8 = op == 0x88 || op == 0x8A;
+            | 0x39 | 0x3B | 0x09 | 0x0B | 0x21 | 0x23 | 0x84 | 0x85 | 0x63 => {
+                let is_8 = op == 0x88 || op == 0x8A || op == 0x84;
                 let (reg, is_reg, rm, ea_raw, ml) =
                     self.decode_modrm(ip, off + 1, rex_r, rex_x, rex_b, true)?;
                 let next = ip + (off + 1 + ml) as u64;
@@ -636,15 +702,23 @@ impl Emu {
                         let v = self.read_rm(is_reg, rm, ea, 32)? as u32 as i32 as i64 as u64;
                         self.regs[reg] = v;
                     }
-                    0x85 => {
+                    0x84 | 0x85 => {
                         let a = if width == 64 {
                             self.regs[reg]
-                        } else {
+                        } else if width == 32 {
                             self.regs[reg] & 0xFFFF_FFFF
+                        } else {
+                            self.regs[reg] & 0xFF
                         };
                         let b = self.read_rm(is_reg, rm, ea, width)?;
-                        let r = (a & if width == 64 { u64::MAX } else { 0xFFFF_FFFF }) & b;
-                        self.set_logic_flags(r, width);
+                        let mask = if width == 64 {
+                            u64::MAX
+                        } else if width == 32 {
+                            0xFFFF_FFFF
+                        } else {
+                            0xFF
+                        };
+                        self.set_logic_flags((a & mask) & b, width);
                     }
                     _ => {
                         // ALU r/m,r or r,r/m
@@ -854,6 +928,40 @@ impl Emu {
                 self.rip = next;
                 Ok(StepResult::Continue)
             }
+            0x80 => {
+                // Grp1 Eb,Ib (demanded by rustc byte compares: 80 /7 ib = CMP).
+                let (reg_field, is_reg, rm, ea_raw, ml) =
+                    self.decode_modrm(ip, off + 1, rex_r, rex_x, rex_b, true)?;
+                let imm = self.read_u8(ip + (off + 1 + ml) as u64)? as u64;
+                let next = ip + (off + 1 + ml + 1) as u64;
+                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let a = self.read_rm(is_reg, rm, ea, 8)?;
+                let res = match reg_field {
+                    0 => a.wrapping_add(imm),
+                    1 => a | imm,
+                    4 => a & imm,
+                    5 => a.wrapping_sub(imm),
+                    6 => a ^ imm,
+                    7 => a.wrapping_sub(imm),
+                    _ => {
+                        return Err(format!(
+                            "unsupported group1b sub-op /{} at 0x{ip:016x} (only ADD/OR/AND/SUB/XOR/CMP)",
+                            reg_field
+                        ))
+                    }
+                };
+                match reg_field {
+                    0 => self.set_add_flags(a, imm, res, 8),
+                    1 | 4 | 6 => self.set_logic_flags(res, 8),
+                    5 | 7 => self.set_sub_flags(a, imm, res, 8),
+                    _ => unreachable!(),
+                }
+                if reg_field != 7 {
+                    self.write_rm(is_reg, rm, ea, 8, res & 0xFF)?;
+                }
+                self.rip = next;
+                Ok(StepResult::Continue)
+            }
             0xC6 | 0xC7 => {
                 let (reg_field, is_reg, rm, ea_raw, ml) =
                     self.decode_modrm(ip, off + 1, rex_r, rex_x, rex_b, true)?;
@@ -971,5 +1079,109 @@ impl Emu {
             }
             _ => Err(format!("unsupported opcode 0x{op:02X} at 0x{ip:016x}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pe::PeImage;
+
+    const BASE: u64 = 0x1400_0000_000;
+
+    fn emu_with(code: &[u8]) -> Emu {
+        let mut image = vec![0u8; 0x3000];
+        image[0x1000..0x1000 + code.len()].copy_from_slice(code);
+        let img = PeImage {
+            image_base: BASE,
+            entry_rva: 0x1000,
+            size_of_image: 0x3000,
+            image,
+            imports: vec![],
+            iat_slots: vec![],
+        };
+        Emu::new(&img).unwrap()
+    }
+
+    /// RIP-relative disp32 for an instruction at `pos` with `len`, targeting `target_off`.
+    fn rel32(pos: usize, len: usize, target_off: usize) -> [u8; 4] {
+        ((target_off as i64 - (pos + len) as i64) as i32).to_le_bytes()
+    }
+
+    #[test]
+    fn sse_xorps_movaps_movups_roundtrip() {
+        // cell at code offset 64.
+        let cell = 64usize;
+        // xorps xmm0,xmm0; movaps [rip+cell],xmm0  (insn at 3, len 7)
+        let mut code = vec![0x0F, 0x57, 0xC0, 0x0F, 0x29, 0x05];
+        code.extend_from_slice(&rel32(3, 7, cell));
+        let mut e = emu_with(&code);
+        e.xmm[0] = 0x1122_3344_5566_7788_99AA_BBCC_DDEE_FF00;
+        // preset a nonzero sentinel next to the cell to catch off-by-one stores
+        e.write_u128(BASE + 0x1000 + cell as u64, 0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF)
+            .unwrap();
+        // step xorps -> zero
+        assert!(matches!(e.step().unwrap(), StepResult::Continue));
+        assert_eq!(e.xmm[0], 0);
+        // step movaps store -> cell zeroed
+        assert!(matches!(e.step().unwrap(), StepResult::Continue));
+        assert_eq!(e.read_u128(BASE + 0x1000 + cell as u64).unwrap(), 0);
+
+        // movups store of preset xmm1, movaps load back into xmm2.
+        let mut code = vec![];
+        code.extend_from_slice(&[0x0F, 0x11, 0x0D]); // movups [rip+cell],xmm1
+        code.extend_from_slice(&rel32(0, 7, cell));
+        code.extend_from_slice(&[0x0F, 0x28, 0x15]); // movaps xmm2,[rip+cell]
+        code.extend_from_slice(&rel32(7, 7, cell));
+        let mut e = emu_with(&code);
+        e.xmm[1] = 0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF;
+        assert!(matches!(e.step().unwrap(), StepResult::Continue));
+        assert_eq!(
+            e.read_u128(BASE + 0x1000 + cell as u64).unwrap(),
+            0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF
+        );
+        assert!(matches!(e.step().unwrap(), StepResult::Continue));
+        assert_eq!(e.xmm[2], 0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF);
+    }
+
+    #[test]
+    fn grp1b_cmp8_flags() {
+        // cmp byte [rip+cell], imm8  (80 3D disp32 ib)
+        let cell = 64usize;
+        let mut code = vec![0x80, 0x3D];
+        code.extend_from_slice(&rel32(0, 7, cell));
+        code.push(0x41);
+        let mut e = emu_with(&code);
+        e.write_u8(BASE + 0x1000 + cell as u64, 0x41).unwrap();
+        assert!(matches!(e.step().unwrap(), StepResult::Continue));
+        assert!(e.zf); // equal
+
+        let mut code = vec![0x80, 0x3D];
+        code.extend_from_slice(&rel32(0, 7, cell));
+        code.push(0x42);
+        let mut e = emu_with(&code);
+        e.write_u8(BASE + 0x1000 + cell as u64, 0x41).unwrap();
+        assert!(matches!(e.step().unwrap(), StepResult::Continue));
+        assert!(!e.zf);
+        assert!(e.cf); // 0x41 < 0x42 borrows
+    }
+
+    #[test]
+    fn setcc_and_test8() {
+        // xor eax,eax (ZF=1); setz al (->1); setnz bl (->0, flags untouched);
+        // test al,al (->ZF=0).
+        let code = vec![
+            0x31, 0xC0, // xor eax,eax
+            0x0F, 0x94, 0xC0, // setz al
+            0x0F, 0x95, 0xC3, // setnz bl
+            0x84, 0xC0, // test al,al
+        ];
+        let mut e = emu_with(&code);
+        for _ in 0..4 {
+            assert!(matches!(e.step().unwrap(), StepResult::Continue));
+        }
+        assert_eq!(e.regs[0] & 0xFF, 1);
+        assert_eq!(e.regs[3] & 0xFF, 0);
+        assert!(!e.zf);
     }
 }
