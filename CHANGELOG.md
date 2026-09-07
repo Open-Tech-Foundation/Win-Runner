@@ -38,3 +38,7 @@ All notable changes to this project will be documented in this file.
 - Fixed a real Win-x64 ABI bug the Rust guest exposed: `CreateFileW`
   `creation` is the 5th arg (first stack slot); shim and test-EXE builder
   were both off by one slot in the same direction, masking each other.
+- `wincli inspect <app.exe`: static compatibility report (arch, entry,
+  supported vs missing imports; exit 0 = runnable, 1 = missing/invalid).
+  Backed by lenient PE loading that collects unknown imports instead of
+  failing; the exec path stays strict and `Runner` refuses lenient images.

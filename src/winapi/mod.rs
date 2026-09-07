@@ -36,6 +36,12 @@ pub struct Runner {
 
 impl Runner {
     pub fn new(img: &PeImage, fs: WinFs) -> Result<Self, String> {
+        if let Some(first) = img.unsupported.first() {
+            return Err(format!(
+                "unsupported import: {}!{} (image came from lenient load; refusing to execute)",
+                first.dll, first.func
+            ));
+        }
         Ok(Self {
             emu: Emu::new(img)?,
             fs,

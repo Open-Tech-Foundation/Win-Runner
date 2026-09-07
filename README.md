@@ -5,8 +5,9 @@ against a fully in-memory Windows-style filesystem. No Wine, VM, Windows DLLs,
 or host filesystem backing.
 
 ```bash
-wincli app.exe     # minimal x86_64 PE execution (PE32+, native console apps)
-wincli script.ps1  # minimal PowerShell-like script execution
+wincli app.exe        # minimal x86_64 PE execution (PE32+, native console apps)
+wincli script.ps1     # minimal PowerShell-like script execution
+wincli inspect app.exe  # PE compatibility report: supported vs missing imports
 ```
 
 Both share the exact same in-memory `WinFS`: case-insensitive lookup with
@@ -68,3 +69,18 @@ drives emulator growth (so far: `xorps`/`movaps`/`movups`, `CMP r/m8,imm8`,
 ```bash
 cargo test   # unit tests + CLI end-to-end tests against tests/artifacts/
 ```
+
+## Compatibility harness
+
+`wincli inspect` statically reports which imports a real Windows binary needs
+versus what WinCLI implements (exit 0 = runnable, 1 = missing APIs). Point it
+at portable Windows CLI tools to drive expansion one program at a time:
+
+```bash
+wincli inspect rg.exe
+```
+
+Planned next step is `wincli install <name>`: resolve portable Windows x64
+releases (preferred source: the WinGet catalog, portable EXE / ZIP only —
+no MSI/MSIX/setup emulation), cache the PE on the host, and run it through
+the runtime with its filesystem activity landing in WinFS.

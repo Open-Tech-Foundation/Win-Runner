@@ -1,14 +1,19 @@
 use std::io::Write;
 use std::path::Path;
-use wincli::{pe, winapi, winfs::WinFs};
+use wincli::{inspect, pe, winapi, winfs::WinFs};
 
 fn usage() -> ! {
-    eprintln!("usage: wincli <app.exe|script.ps1>");
+    eprintln!("usage:");
+    eprintln!("  wincli <app.exe|script.ps1>   run a Windows program or script");
+    eprintln!("  wincli inspect <app.exe>      report PE imports vs supported APIs");
     std::process::exit(2);
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.len() == 3 && args[1] == "inspect" {
+        inspect_file(&args[2]);
+    }
     if args.len() != 2 {
         usage();
     }
@@ -29,8 +34,7 @@ fn main() {
     }
 }
 
-fn run_exe_file(path: &str) {
-    // NOTE: this reads the *Linux host* file as the PE container only.
+fn run_exe_file(path: &str) {    // NOTE: this reads the *Linux host* file as the PE container only.
     // The Windows guest filesystem stays purely in memory (WinFs).
     let data = match std::fs::read(path) {
         Ok(d) => d,
@@ -82,6 +86,28 @@ fn run_ps1_file(path: &str) {
         }
         Err(e) => {
             eprintln!("wincli: script error: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `wincli inspect <app.exe>`: print the compatibility report.
+/// Exit 0 = runnable, 1 = missing imports or invalid file.
+fn inspect_file(path: &str) {
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("wincli: cannot read {path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    match inspect::inspect_pe(&data) {
+        Ok(report) => {
+            print!("{}", inspect::render(&report));
+            std::process::exit(if report.runnable() { 0 } else { 1 });
+        }
+        Err(e) => {
+            eprintln!("wincli: cannot inspect {path}: {e}");
             std::process::exit(1);
         }
     }

@@ -21,6 +21,9 @@ pub struct PeImage {
     /// `image[rva] == byte at image_base + rva`.
     pub image: Vec<u8>,
     pub imports: Vec<Import>,
+    /// Imports outside `SUPPORTED_APIS`. Always empty from `load` (strict);
+    /// populated by `load_lenient` for `inspect`. Never executable.
+    pub unsupported: Vec<Import>,
     /// (iat_rva -> import index)
     pub iat_slots: Vec<u32>,
 }
@@ -89,6 +92,17 @@ fn rva_to_file_off(sections: &[(u32, u32, u32)], rva: u32) -> Option<usize> {
 }
 
 pub fn load(data: &[u8]) -> Result<PeImage, String> {
+    load_inner(data, true)
+}
+
+/// Parse without rejecting unknown imports: they land in
+/// [`PeImage::unsupported`] for reporting by `inspect`.
+/// The result must not be executed (`Runner::new` refuses it).
+pub fn load_lenient(data: &[u8]) -> Result<PeImage, String> {
+    load_inner(data, false)
+}
+
+fn load_inner(data: &[u8], strict: bool) -> Result<PeImage, String> {
     if data.len() < 0x40 {
         return Err("file too small for DOS header".to_string());
     }
@@ -191,6 +205,7 @@ pub fn load(data: &[u8]) -> Result<PeImage, String> {
 
     // Parse imports (from file offsets via RVA->file mapping)
     let mut imports: Vec<Import> = Vec::new();
+    let mut unsupported: Vec<Import> = Vec::new();
     if import_rva != 0 {
         if import_size == 0 {
             return Err("invalid import directory".to_string());
@@ -237,14 +252,22 @@ pub fn load(data: &[u8]) -> Result<PeImage, String> {
                     return Err("truncated hint/name".to_string());
                 }
                 let func = cstr_ascii(data, hn_off + 2)?;
-                if !is_supported(&dll, &func) {
-                    return Err(format!("unsupported import: {dll}!{func}"));
-                }
-                imports.push(Import {
+                let imp = Import {
                     iat_rva: ft + idx * 8,
                     dll: dll.clone(),
                     func,
-                });
+                };
+                if !is_supported(&imp.dll, &imp.func) {
+                    if strict {
+                        return Err(format!(
+                            "unsupported import: {}!{}",
+                            imp.dll, imp.func
+                        ));
+                    }
+                    unsupported.push(imp);
+                } else {
+                    imports.push(imp);
+                }
                 idx += 1;
                 if idx > 256 {
                     return Err("too many imports".to_string());
@@ -264,6 +287,7 @@ pub fn load(data: &[u8]) -> Result<PeImage, String> {
         size_of_image,
         image,
         imports,
+        unsupported,
         iat_slots,
     })
 }

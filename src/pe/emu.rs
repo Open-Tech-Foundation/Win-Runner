@@ -1098,6 +1098,7 @@ mod tests {
             size_of_image: 0x3000,
             image,
             imports: vec![],
+            unsupported: vec![],
             iat_slots: vec![],
         };
         Emu::new(&img).unwrap()

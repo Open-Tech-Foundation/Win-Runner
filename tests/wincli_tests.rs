@@ -492,3 +492,53 @@ fn test_art_exe_rust_fs_selftest() {
     assert_eq!(code, 0, "stderr: {stderr}");
     assert_eq!(stdout, "rust-fs-bytes-7PASS\n");
 }
+
+fn run_inspect(file: &std::path::Path) -> (i32, String, String) {
+    let bin = env!("CARGO_BIN_EXE_wincli");
+    let output = std::process::Command::new(bin)
+        .arg("inspect")
+        .arg(file)
+        .output()
+        .expect("spawn wincli inspect");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+#[test]
+fn test_inspect_runnable_binary() {
+    let (code, stdout, _) = run_inspect(&artifact("exe/hello.exe"));
+    assert_eq!(code, 0);
+    assert!(stdout.contains("PE: x86_64"));
+    assert!(stdout.contains("Supported imports: 3"));
+    assert!(stdout.contains("Missing imports:   0"));
+    assert!(!stdout.contains("Missing:\n"));
+}
+
+#[test]
+fn test_inspect_missing_imports() {
+    let (code, stdout, _) = run_inspect(&artifact("exe/bad_import.exe"));
+    assert_eq!(code, 1);
+    assert!(stdout.contains("Missing imports:   1"));
+    assert!(stdout.contains("Missing:\n"));
+    assert!(stdout.contains("NoSuchApiForTest"));
+}
+
+#[test]
+fn test_inspect_rust_guest() {
+    let (code, stdout, _) = run_inspect(&artifact("exe/rust_fs.exe"));
+    assert_eq!(code, 0);
+    assert!(stdout.contains("Supported imports: 11"));
+}
+
+#[test]
+fn test_inspect_invalid_file() {
+    let p = tmp_path("junk.exe");
+    std::fs::write(&p, b"definitely not a PE file................").unwrap();
+    let (code, _, stderr) = run_inspect(&p);
+    std::fs::remove_file(&p).ok();
+    assert_eq!(code, 1);
+    assert!(stderr.contains("cannot inspect"), "stderr: {stderr}");
+}
