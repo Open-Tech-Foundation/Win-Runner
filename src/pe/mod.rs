@@ -1,0 +1,269 @@
+//! Minimal PE32+ (x86_64) loader: parse + validate, extract imports.
+//! Execution lives in `emu`; Win32 shims live in `winapi`.
+
+pub mod builder;
+pub mod emu;
+
+#[derive(Debug, Clone)]
+pub struct Import {
+    /// RVA of the IAT slot that will hold the resolved address
+    pub iat_rva: u32,
+    pub dll: String,
+    pub func: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PeImage {
+    pub image_base: u64,
+    pub entry_rva: u32,
+    pub size_of_image: u32,
+    /// Raw image bytes sized `size_of_image`, with sections copied to their VAs.
+    /// `image[rva] == byte at image_base + rva`.
+    pub image: Vec<u8>,
+    pub imports: Vec<Import>,
+    /// (iat_rva -> import index)
+    pub iat_slots: Vec<u32>,
+}
+
+/// APIs WinCLI implements. Anything else must fail clearly.
+pub const SUPPORTED_APIS: &[(&str, &str)] = &[
+    ("KERNEL32.DLL", "ExitProcess"),
+    ("KERNEL32.DLL", "GetStdHandle"),
+    ("KERNEL32.DLL", "WriteFile"),
+    ("KERNEL32.DLL", "CreateFileW"),
+    ("KERNEL32.DLL", "ReadFile"),
+    ("KERNEL32.DLL", "CloseHandle"),
+    ("KERNEL32.DLL", "CreateDirectoryW"),
+    ("KERNEL32.DLL", "RemoveDirectoryW"),
+    ("KERNEL32.DLL", "DeleteFileW"),
+    ("KERNEL32.DLL", "MoveFileW"),
+    ("KERNEL32.DLL", "CopyFileW"),
+];
+
+pub fn is_supported(dll: &str, func: &str) -> bool {
+    SUPPORTED_APIS
+        .iter()
+        .any(|(d, f)| d.eq_ignore_ascii_case(dll) && *f == func)
+}
+
+fn u16le(b: &[u8], off: usize) -> Result<u16, String> {
+    b.get(off..off + 2)
+        .ok_or_else(|| "truncated PE".to_string())
+        .map(|s| u16::from_le_bytes([s[0], s[1]]))
+}
+fn u32le(b: &[u8], off: usize) -> Result<u32, String> {
+    b.get(off..off + 4)
+        .ok_or_else(|| "truncated PE".to_string())
+        .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+}
+fn u64le(b: &[u8], off: usize) -> Result<u64, String> {
+    b.get(off..off + 8)
+        .ok_or_else(|| "truncated PE".to_string())
+        .map(|s| u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]))
+}
+
+fn cstr_ascii(b: &[u8], off: usize) -> Result<String, String> {
+    let mut end = off;
+    while b.get(end).copied().unwrap_or(0) != 0 {
+        end += 1;
+        if end - off > 512 {
+            return Err("import name too long".to_string());
+        }
+        if end >= b.len() {
+            return Err("truncated import name".to_string());
+        }
+    }
+    std::str::from_utf8(&b[off..end])
+        .map(|s| s.to_string())
+        .map_err(|_| "invalid import name encoding".to_string())
+}
+
+fn rva_to_file_off(sections: &[(u32, u32, u32)], rva: u32) -> Option<usize> {
+    for (vaddr, vsize, foff) in sections {
+        let size = (*vsize).max(1);
+        if rva >= *vaddr && rva < vaddr + size {
+            return Some((*foff + (rva - *vaddr)) as usize);
+        }
+    }
+    None
+}
+
+pub fn load(data: &[u8]) -> Result<PeImage, String> {
+    if data.len() < 0x40 {
+        return Err("file too small for DOS header".to_string());
+    }
+    if &data[0..2] != b"MZ" {
+        return Err("not a PE file (missing MZ)".to_string());
+    }
+    let e_lfanew = u32le(data, 0x3C)? as usize;
+    if data.len() < e_lfanew + 6 {
+        return Err("truncated PE header".to_string());
+    }
+    if &data[e_lfanew..e_lfanew + 4] != b"PE\0\0" {
+        return Err("not a PE file (missing PE signature)".to_string());
+    }
+    let coff = e_lfanew + 4;
+    let machine = u16le(data, coff)?;
+    if machine != 0x8664 {
+        return Err(format!("unsupported machine 0x{machine:04x}: only x86_64 (0x8664) supported"));
+    }
+    let num_sections = u16le(data, coff + 2)? as usize;
+    let opt_size = u16le(data, coff + 16)? as usize;
+    let opt = coff + 20;
+    if num_sections == 0 || num_sections > 32 {
+        return Err("invalid number of sections".to_string());
+    }
+    if data.len() < opt + opt_size {
+        return Err("truncated optional header".to_string());
+    }
+    let magic = u16le(data, opt)?;
+    if magic != 0x20b {
+        return Err("only PE32+ (x86_64) supported, not PE32".to_string());
+    }
+    let entry_rva = u32le(data, opt + 16)?;
+    let image_base = u64le(data, opt + 24)?;
+    let section_align = u32le(data, opt + 32)?;
+    let file_align = u32le(data, opt + 36)?;
+    let size_of_image = u32le(data, opt + 56)?;
+    let size_of_headers = u32le(data, opt + 60)?;
+    let num_rva_sizes = u32le(data, opt + 108)? as usize;
+    if num_rva_sizes < 2 {
+        return Err("truncated data directories".to_string());
+    }
+    let import_rva = u32le(data, opt + 112 + 8)?;
+    let import_size = u32le(data, opt + 112 + 12)?;
+    let _ = (section_align, file_align, size_of_headers);
+
+    if size_of_image == 0 || size_of_image > 64 * 1024 * 1024 {
+        return Err("invalid SizeOfImage".to_string());
+    }
+
+    // Section headers
+    let sec_off = opt + opt_size;
+    let mut sections: Vec<(u32, u32, u32, u32, u32)> = Vec::new(); // vaddr, vsize, raw_ptr, raw_size
+    // (vaddr, vsize, foff, fsize, characteristics)
+    struct Sec {
+        vaddr: u32,
+        vsize: u32,
+        foff: u32,
+        fsize: u32,
+    }
+    let mut secs: Vec<Sec> = Vec::new();
+    for i in 0..num_sections {
+        let o = sec_off + i * 40;
+        if data.len() < o + 40 {
+            return Err("truncated section headers".to_string());
+        }
+        let vsize = u32le(data, o + 8)?;
+        let vaddr = u32le(data, o + 12)?;
+        let fsize = u32le(data, o + 16)?;
+        let foff = u32le(data, o + 20)?;
+        secs.push(Sec {
+            vaddr,
+            vsize,
+            foff,
+            fsize,
+        });
+        sections.push((vaddr, vsize.max(fsize), foff, fsize, 0));
+    }
+
+    // Build loaded image
+    let mut image = vec![0u8; size_of_image as usize];
+    // headers
+    let hdr_copy = (size_of_headers as usize).min(data.len()).min(image.len());
+    image[..hdr_copy].copy_from_slice(&data[..hdr_copy]);
+    for s in &secs {
+        if s.fsize == 0 {
+            continue;
+        }
+        let src_off = s.foff as usize;
+        let src_end = src_off + s.fsize as usize;
+        if src_end > data.len() {
+            return Err("section raw data out of bounds".to_string());
+        }
+        let dst_off = s.vaddr as usize;
+        let dst_end = dst_off + s.fsize as usize;
+        if dst_end > image.len() {
+            return Err("section virtual address out of bounds".to_string());
+        }
+        image[dst_off..dst_end].copy_from_slice(&data[src_off..src_end]);
+    }
+
+    // Parse imports (from file offsets via RVA->file mapping)
+    let mut imports: Vec<Import> = Vec::new();
+    if import_rva != 0 {
+        if import_size == 0 {
+            return Err("invalid import directory".to_string());
+        }
+        let rva_map: Vec<(u32, u32, u32)> = secs
+            .iter()
+            .map(|s| (s.vaddr, s.vsize.max(s.fsize), s.foff))
+            .collect();
+        let to_off = |rva: u32| -> Result<usize, String> {
+            rva_to_file_off(&rva_map, rva)
+                .ok_or_else(|| format!("import RVA out of bounds: 0x{rva:08x}"))
+        };
+        let mut desc_off = to_off(import_rva)?;
+        loop {
+            if desc_off + 20 > data.len() {
+                return Err("truncated import descriptor".to_string());
+            }
+            let oft = u32le(data, desc_off)?;
+            let _ts = u32le(data, desc_off + 4)?;
+            let _fc = u32le(data, desc_off + 8)?;
+            let name_rva = u32le(data, desc_off + 12)?;
+            let ft = u32le(data, desc_off + 16)?;
+            if oft == 0 && name_rva == 0 && ft == 0 {
+                break;
+            }
+            let dll = cstr_ascii(data, to_off(name_rva)?)?;
+            let thunk_rva = if oft != 0 { oft } else { ft };
+            // walk thunks
+            let mut idx = 0u32;
+            loop {
+                let ent_off = to_off(thunk_rva + idx * 8)?;
+                if ent_off + 8 > data.len() {
+                    return Err("truncated import thunk".to_string());
+                }
+                let ent = u64le(data, ent_off)?;
+                if ent == 0 {
+                    break;
+                }
+                if ent & 0x8000_0000_0000_0000 != 0 {
+                    return Err(format!("ordinal imports not supported: {dll} ordinal {}", ent & 0xffff));
+                }
+                let hn_off = to_off(ent as u32)?;
+                if hn_off + 2 > data.len() {
+                    return Err("truncated hint/name".to_string());
+                }
+                let func = cstr_ascii(data, hn_off + 2)?;
+                if !is_supported(&dll, &func) {
+                    return Err(format!("unsupported import: {dll}!{func}"));
+                }
+                imports.push(Import {
+                    iat_rva: ft + idx * 8,
+                    dll: dll.clone(),
+                    func,
+                });
+                idx += 1;
+                if idx > 256 {
+                    return Err("too many imports".to_string());
+                }
+            }
+            desc_off += 20;
+            if desc_off > to_off(import_rva)? + import_size as usize {
+                break;
+            }
+        }
+    }
+
+    let iat_slots = imports.iter().map(|i| i.iat_rva).collect();
+    Ok(PeImage {
+        image_base,
+        entry_rva,
+        size_of_image,
+        image,
+        imports,
+        iat_slots,
+    })
+}

@@ -1,0 +1,13 @@
+[package]
+name = "wincli"
+version = "0.1.0"
+edition = "2021"
+description = "WinCLI: minimal in-memory Windows-style FS + PE32+ runner + PS1 interpreter (no Wine/VM)"
+license = "Apache-2.0"
+
+[[bin]]
+name = "wincli"
+path = "src/main.rs"
+
+[profile.release]
+strip = true
