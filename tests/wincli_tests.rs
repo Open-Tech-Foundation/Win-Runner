@@ -775,3 +775,22 @@ fn test_ps1_with_args_rejected() {
     assert_eq!(code, 2);
     assert!(stderr.contains("script args not supported"), "stderr: {stderr}");
 }
+
+#[test]
+fn test_art_exe_rust_fp() {
+    // Real rustc-built FP guest (guests/fp.rs): scalar-double arithmetic,
+    // CMPLTSD select lowering, UCOMISD branches incl. NaN.
+    let bytes = std::fs::read(artifact("exe/rust_fp.exe")).unwrap();
+    let img = pe::load(&bytes).expect("rust guest must load");
+    for imp in img.imports.iter().chain(img.stubs.iter()) {
+        assert!(
+            pe::is_supported(&imp.dll, &imp.func),
+            "unsupported import in rust guest: {}!{}",
+            imp.dll,
+            imp.func
+        );
+    }
+    let (code, stdout, stderr) = run_cli(&artifact("exe/rust_fp.exe"));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "FP-OK\n");
+}

@@ -40,6 +40,20 @@ pub struct Runner {
     console_sink: Option<Box<dyn FnMut(&[u8])>>,
     /// Whether host stdout is a TTY (drives `GetConsoleMode`).
     console_is_tty: bool,
+    /// Last-error code (`GetLastError`/`SetLastError`).
+    last_error: u32,
+    /// Guest env overrides (`SetEnvironmentVariableW`); host env is never
+    /// mutated, reads fall through to it.
+    env_overlay: HashMap<String, Option<String>>,
+    /// Fiber-local slots (`FlsAlloc` family; index+1 is the DWORD value so
+    /// slot 0 stays a valid index).
+    fls: Vec<Option<u64>>,
+    /// argv0 as typed (for `GetModuleFileNameW` approximation).
+    prog: String,
+    /// QPC epoch.
+    start: std::time::Instant,
+    /// Cached `GetEnvironmentStringsW` block (0 = not built yet).
+    env_block: u64,
 }
 
 impl Runner {
@@ -62,6 +76,7 @@ impl Runner {
         }
         let mut emu = Emu::new(img)?;
         emu.alloc_cmdline(prog, args)?;
+        setup_tls(&mut emu, img)?;
         Ok(Self {
             emu,
             fs,
@@ -70,12 +85,44 @@ impl Runner {
             exit_code: None,
             console_sink: None,
             console_is_tty: std::io::stdout().is_terminal(),
+            last_error: 0,
+            env_overlay: HashMap::new(),
+            fls: Vec::new(),
+            prog: prog.to_string(),
+            start: std::time::Instant::now(),
+            env_block: 0,
         })
     }
 
     pub fn with_console_sink(mut self, sink: Box<dyn FnMut(&[u8])>) -> Self {
         self.console_sink = Some(sink);
         self
+    }
+
+    /// Hexdump around RIP, the stack top, and likely pointer regs.
+    fn post_mortem(&self) -> String {
+        let mut s = String::from("\n-- post-mortem --");
+        let hex = |va: u64, n: usize| {
+            self.emu
+                .read_bytes(va, n)
+                .map(|b| {
+                    b.iter()
+                        .map(|x| format!("{x:02x}"))
+                        .collect::<Vec<_>>()
+                        .join("")
+                })
+                .unwrap_or_else(|_| "(unmapped)".to_string())
+        };
+        s.push_str(&format!("\nrip-32: {}", hex(self.emu.rip.wrapping_sub(32), 64)));
+        s.push_str(&format!("\nrsp:    {}", hex(self.emu.rsp(), 64)));
+        for (name, r) in [("rsi", 6), ("rdi", 7), ("r14", 14), ("r15", 15)] {
+            s.push_str(&format!("\n{name}:    {}", hex(self.emu.regs[r], 64)));
+        }
+        s.push_str(&format!("\nr15+64: {}", hex(self.emu.regs[15] + 64, 192)));
+        for (i, x) in self.emu.xmm.iter().enumerate() {
+            s.push_str(&format!("\nxmm{i}:   {:032x}", x & 0xFFFF_FFFF_FFFF_FFFF));
+        }
+        s
     }
 
     /// Emit guest console bytes: buffer (returned by `run`) + stream to sink.
@@ -94,16 +141,48 @@ impl Runner {
     }
 
     pub fn run(mut self) -> Result<(u32, WinFs, Vec<u8>), String> {
+        let trace = std::env::var("WINCLI_TRACE").map(|v| v == "1").unwrap_or(false);
+        let dump = std::env::var("WINCLI_DUMP_ON_ERROR")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let mut last_steps = 0u64;
         loop {
-            match self.emu.step()? {
+            let rip = self.emu.rip;
+            let step_res = match self.emu.step() {
+                Err(e) => {
+                    let mut msg =
+                        format!("{e} (rip=0x{rip:016x} {})", self.emu.regs_summary());
+                    if dump {
+                        msg.push_str(&self.post_mortem());
+                    }
+                    return Err(msg);
+                }
+                Ok(r) => r,
+            };
+            match step_res {
                 StepResult::Continue => {}
                 StepResult::Halted(code) => {
+                    if trace {
+                        eprintln!("[trace] halt exit={code} steps={}", self.emu.step_count());
+                    }
                     let fs = std::mem::replace(&mut self.fs, WinFs::new());
                     return Ok((code, fs, std::mem::take(&mut self.emu.stdout)));
                 }
                 StepResult::CalledStub { index } => {
+                    if trace {
+                        let imp = &self.emu.imports[index];
+                        eprintln!(
+                            "[trace] +{} call {}!{}",
+                            self.emu.step_count() - last_steps,
+                            imp.dll,
+                            imp.func
+                        );
+                        last_steps = self.emu.step_count();
+                    }
                     if self.do_shim(index)? {
-                        // do_shim returns true when it already halted (ExitProcess)
+                        if trace {
+                            eprintln!("[trace] halt exit={} steps={}", self.exit_code.unwrap(), self.emu.step_count());
+                        }
                         let code = self.exit_code.unwrap();
                         let fs = std::mem::replace(&mut self.fs, WinFs::new());
                         return Ok((code, fs, std::mem::take(&mut self.emu.stdout)));
@@ -139,6 +218,14 @@ impl Runner {
             ($code:expr) => {{
                 self.exit_code = Some($code);
                 return Ok(true);
+            }};
+        }
+        // Fail-stub: loadable but unimplemented. Sets LastError and returns
+        // the failure value — explicit at the call site, never silent success.
+        macro_rules! stub {
+            ($v:expr) => {{
+                self.last_error = 120; // ERROR_CALL_NOT_IMPLEMENTED
+                ret_bool!($v);
             }};
         }
 
@@ -439,6 +526,552 @@ impl Runner {
                 }
                 ret_bool!(1);
             }
+            "GetLastError" => {
+                ret_bool!(self.last_error as u64);
+            }
+            "SetLastError" => {
+                self.last_error = (rcx & 0xFFFF_FFFF) as u32;
+                ret_bool!(0);
+            }
+            "GetProcessHeap" => {
+                ret_bool!(0x400);
+            }
+            "HeapAlloc" => {
+                let n = (r8 & 0xFFFF_FFFF) as usize;
+                if n > 256 * 1024 * 1024 {
+                    self.last_error = 8; // ERROR_NOT_ENOUGH_MEMORY
+                    ret_bool!(0);
+                }
+                let p = self.emu.heap_alloc(n);
+                if p == 0 {
+                    self.last_error = 8;
+                }
+                ret_bool!(p);
+            }
+            "HeapFree" => {
+                // No-op by design (bump allocator, no reuse). NULL fails.
+                ret_bool!(u64::from(r8 != 0));
+            }
+            "HeapReAlloc" => {
+                let old = r8;
+                let n = (r9 & 0xFFFF_FFFF) as usize;
+                if old == 0 {
+                    let p = self.emu.heap_alloc(n);
+                    if p == 0 {
+                        self.last_error = 8;
+                    }
+                    ret_bool!(p);
+                }
+                let have = self.emu.heap_size_of(old) as usize;
+                let p = self.emu.heap_alloc(n);
+                if p == 0 {
+                    self.last_error = 8;
+                    ret_bool!(0);
+                }
+                let k = have.min(n);
+                if k > 0 {
+                    let data = self.emu.read_bytes(old, k)?;
+                    self.emu.write_bytes(p, &data)?;
+                }
+                ret_bool!(p);
+            }
+            "HeapSize" => {
+                ret_bool!(self.emu.heap_size_of(r8));
+            }
+            "VirtualAlloc" => {
+                // Only anywhere-mapping (addr NULL); protection ignored;
+                // backed by the same 16-aligned bump region (rounded to pages).
+                if rcx != 0 {
+                    self.last_error = 487; // ERROR_INVALID_ADDRESS
+                    ret_bool!(0);
+                }
+                let n = ((rdx + 0xFFF) & !0xFFF) as usize;
+                if n == 0 || n > 256 * 1024 * 1024 {
+                    self.last_error = 8;
+                    ret_bool!(0);
+                }
+                // page-align the bump cursor, then allocate
+                let p = self.emu.heap_alloc_aligned(n, 0x1000);
+                if p == 0 {
+                    self.last_error = 8;
+                }
+                ret_bool!(p);
+            }
+            "VirtualFree" => {
+                // No-op by design (no reuse). MEM_RELEASE needs size 0.
+                let ftype = (r8 & 0xFFFF_FFFF) as u32;
+                if ftype == 0x8000 && rdx != 0 {
+                    self.last_error = 87; // ERROR_INVALID_PARAMETER
+                    ret_bool!(0);
+                }
+                ret_bool!(1);
+            }
+            "VirtualProtect" => {
+                if r9 != 0 {
+                    self.emu.write_u32(r9, 0x04)?; // PAGE_READWRITE
+                }
+                ret_bool!(1);
+            }
+            "GetEnvironmentStringsW" => {
+                if self.env_block == 0 {
+                    // Host environment passed through as UTF-16 K=V blocks.
+                    let mut units: Vec<u16> = Vec::new();
+                    let mut vars: Vec<(String, String)> = std::env::vars_os()
+                        .filter_map(|(k, v)| {
+                            Some((k.to_str()?.to_string(), v.to_str()?.to_string()))
+                        })
+                        .collect();
+                    vars.sort();
+                    for (k, v) in &vars {
+                        for c in format!("{k}={v}").encode_utf16() {
+                            units.push(c);
+                        }
+                        units.push(0);
+                    }
+                    units.push(0);
+                    let bytes = units.len() * 2;
+                    let va = self.emu.heap_alloc(bytes);
+                    if va == 0 {
+                        self.last_error = 8;
+                        ret_bool!(0);
+                    }
+                    for (i, u) in units.iter().enumerate() {
+                        self.emu.write_u16(va + i as u64 * 2, *u)?;
+                    }
+                    self.env_block = va;
+                }
+                ret_bool!(self.env_block);
+            }
+            "FreeEnvironmentStringsW" => {
+                ret_bool!(1);
+            }
+            "GetEnvironmentVariableW" => {
+                let name = self.emu.read_utf16(rcx)?;
+                let buf = rdx;
+                let n = (r8 & 0xFFFF_FFFF) as usize;
+                let val = match self.env_overlay.get(&name) {
+                    Some(Some(v)) => Some(v.clone()),
+                    Some(None) => None,
+                    None => std::env::var(&name).ok(),
+                };
+                let val = match val {
+                    Some(v) => v,
+                    None => {
+                        self.last_error = 203; // ENVIRONMENT_VARIABLE_NOT_FOUND
+                        ret_bool!(0);
+                    }
+                };
+                let units: Vec<u16> =
+                    val.encode_utf16().chain(std::iter::once(0)).collect();
+                if n == 0 {
+                    ret_bool!(units.len() as u64);
+                }
+                if n < units.len() {
+                    ret_bool!(units.len() as u64);
+                }
+                for (i, u) in units.iter().enumerate() {
+                    self.emu.write_u16(buf + i as u64 * 2, *u)?;
+                }
+                ret_bool!((units.len() - 1) as u64);
+            }
+            "SetEnvironmentVariableW" => {
+                let name = self.emu.read_utf16(rcx)?;
+                if rdx == 0 {
+                    self.env_overlay.insert(name, None);
+                } else {
+                    let val = self.emu.read_utf16(rdx)?;
+                    self.env_overlay.insert(name, Some(val));
+                }
+                ret_bool!(1);
+            }
+            "GetStartupInfoW" => {
+                // STARTUPINFOW (104 bytes): std handles + USESTDHANDLES.
+                let si = rcx;
+                self.emu.write_bytes(si, &[0u8; 104])?;
+                self.emu.write_u32(si, 104)?; // cb
+                self.emu.write_u32(si + 60, 0x100)?; // STARTF_USESTDHANDLES
+                self.emu.write_u64(si + 80, 0)?; // hStdInput
+                self.emu.write_u64(si + 88, 1)?; // hStdOutput
+                self.emu.write_u64(si + 96, 2)?; // hStdError
+                ret_bool!(0);
+            }
+            "GetModuleHandleW" => {
+                if rcx == 0 {
+                    ret_bool!(self.emu.base); // main image
+                }
+                self.last_error = 126; // MOD_NOT_FOUND
+                ret_bool!(0);
+            }
+            "GetModuleHandleA" => {
+                if rcx == 0 {
+                    ret_bool!(self.emu.base);
+                } else {
+                    // read C string for a better error only
+                    let _ = self.emu.read_bytes(rcx, 64);
+                    self.last_error = 126;
+                    ret_bool!(0);
+                }
+            }
+            "GetModuleHandleExW" => {
+                // (flags, name, &h): all three fit in registers.
+                if rcx == 0 && rdx == 0 {
+                    if r8 != 0 {
+                        self.emu.write_u64(r8, self.emu.base)?;
+                    }
+                    ret_bool!(1);
+                }
+                self.last_error = 126;
+                ret_bool!(0);
+            }
+            "GetModuleFileNameW" => {
+                // Approximation: argv0 as typed (host path), truncated to n.
+                let buf = rdx;
+                let n = (r8 & 0xFFFF_FFFF) as usize;
+                if n == 0 {
+                    ret_bool!(0);
+                }
+                let units: Vec<u16> = self.prog.encode_utf16().collect();
+                let k = units.len().min(n);
+                for (i, u) in units.iter().take(k).enumerate() {
+                    self.emu.write_u16(buf + i as u64 * 2, *u)?;
+                }
+                ret_bool!(k as u64);
+            }
+            "GetSystemInfo" => {
+                // SYSTEM_INFO (36 bytes, x64 layout).
+                let si = rcx;
+                let ncpu = std::thread::available_parallelism()
+                    .map(|n| n.get() as u32)
+                    .unwrap_or(4);
+                self.emu.write_u16(si, 9)?; // AMD64
+                self.emu.write_u16(si + 2, 0)?;
+                self.emu.write_u32(si + 4, 0x1000)?; // page
+                self.emu.write_u64(si + 8, 0x10000)?; // min app
+                self.emu.write_u64(si + 16, 0x7FFE_FFFF)?; // max app
+                self.emu.write_u64(si + 24, 0xFF)?; // affinity mask
+                self.emu.write_u32(si + 32, ncpu)?;
+                ret_bool!(0);
+            }
+            "GetSystemTimeAsFileTime" => {
+                // 100ns ticks since 1601-01-01.
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                let ticks = now.as_secs() * 10_000_000
+                    + now.subsec_nanos() as u64 / 100
+                    + 11_644_473_600 * 10_000_000;
+                self.emu.write_u32(rcx, (ticks & 0xFFFF_FFFF) as u32)?;
+                self.emu.write_u32(rcx + 4, (ticks >> 32) as u32)?;
+                ret_bool!(0);
+            }
+            "QueryPerformanceFrequency" => {
+                if rcx != 0 {
+                    self.emu.write_u64(rcx, 10_000_000)?;
+                }
+                ret_bool!(1);
+            }
+            "QueryPerformanceCounter" => {
+                let ticks = self.start.elapsed().as_nanos() as u64 / 100;
+                if rcx != 0 {
+                    self.emu.write_u64(rcx, ticks)?;
+                }
+                ret_bool!(1);
+            }
+            "GetCurrentProcess" => {
+                ret_bool!(0xFFFF_FFFF_FFFF_FFFF);
+            }
+            "GetCurrentThread" => {
+                ret_bool!(0xFFFF_FFFF_FFFF_FFFE);
+            }
+            "GetCurrentProcessId" => {
+                ret_bool!(std::process::id() as u64);
+            }
+            "GetCurrentThreadId" => {
+                ret_bool!(1); // single-threaded guest model
+            }
+            "GetFileType" => {
+                if rcx <= 2 {
+                    ret_bool!(2); // FILE_TYPE_CHAR
+                } else if self.handles.contains_key(&rcx) {
+                    ret_bool!(1); // FILE_TYPE_DISK
+                } else {
+                    self.last_error = 6; // INVALID_HANDLE
+                    ret_bool!(0);
+                }
+            }
+            "GetCurrentDirectoryW" => {
+                let buf = rcx;
+                let n = (rdx & 0xFFFF_FFFF) as usize;
+                let units: Vec<u16> =
+                    self.fs.cwd().encode_utf16().chain(std::iter::once(0)).collect();
+                if n == 0 {
+                    ret_bool!(units.len() as u64);
+                }
+                if n < units.len() {
+                    ret_bool!(units.len() as u64);
+                }
+                for (i, u) in units.iter().enumerate() {
+                    self.emu.write_u16(buf + i as u64 * 2, *u)?;
+                }
+                ret_bool!((units.len() - 1) as u64);
+            }
+            "GetFullPathNameW" => {
+                // (path, n, buf, filepart): all in registers.
+                let raw = self.emu.read_utf16(rcx)?;
+                let n = (rdx & 0xFFFF_FFFF) as usize;
+                let buf = r8;
+                let p_filepart = r9;
+                let disp = self
+                    .fs
+                    .normalize(&raw)
+                    .map(|p| p.display())
+                    .unwrap_or(raw.clone());
+                let units: Vec<u16> = disp.encode_utf16().chain(std::iter::once(0)).collect();
+                if p_filepart != 0 {
+                    self.emu.write_u64(p_filepart, 0)?;
+                }
+                if n == 0 {
+                    ret_bool!(units.len() as u64);
+                }
+                if n < units.len() {
+                    ret_bool!(units.len() as u64);
+                }
+                for (i, u) in units.iter().enumerate() {
+                    self.emu.write_u16(buf + i as u64 * 2, *u)?;
+                }
+                ret_bool!((units.len() - 1) as u64);
+            }
+            "GetFileAttributesW" => {
+                let path = self.emu.read_utf16(rcx)?;
+                if self.fs.is_dir(&path) {
+                    ret_bool!(0x10);
+                } else if self.fs.is_file(&path) {
+                    ret_bool!(0x80);
+                } else {
+                    ret_bool!(0xFFFF_FFFF);
+                }
+            }
+            "MultiByteToWideChar" => {
+                // (codepage, flags, src, srclen, dst, dstlen).
+                // UTF-8 decode regardless of code page (documented UTF-8 world).
+                let src = r8;
+                let srclen = r9 as i32;
+                let dst = self.emu.stack_arg(4).unwrap_or(0);
+                let dstlen = self.emu.stack_arg(5).unwrap_or(0) as usize;
+                let bytes = if srclen < 0 {
+                    let mut v = Vec::new();
+                    for i in 0..1_048_576 {
+                        let b = self.emu.read_u8(src + i)?;
+                        if b == 0 {
+                            break;
+                        }
+                        v.push(b);
+                    }
+                    (v, true)
+                } else {
+                    (self.emu.read_bytes(src, srclen as usize)?, false)
+                };
+                let text = String::from_utf8_lossy(&bytes.0);
+                let mut units: Vec<u16> = text.encode_utf16().collect();
+                if bytes.1 {
+                    units.push(0);
+                }
+                if dst == 0 {
+                    ret_bool!(units.len() as u64);
+                }
+                if dstlen < units.len() {
+                    self.last_error = 122; // INSUFFICIENT_BUFFER
+                    ret_bool!(0);
+                }
+                for (i, u) in units.iter().enumerate() {
+                    self.emu.write_u16(dst + i as u64 * 2, *u)?;
+                }
+                ret_bool!(units.len() as u64);
+            }
+            "WideCharToMultiByte" => {
+                // (codepage, flags, wstr, wlen, out, outlen, def, useddef).
+                // Default-char args are accepted but unused (lossy '?' path
+                // is U+FFFD → UTF-8); documented simplification.
+                let wstr = r8;
+                let wlen = r9 as i32;
+                let out = self.emu.stack_arg(4).unwrap_or(0);
+                let outlen = self.emu.stack_arg(5).unwrap_or(0) as usize;
+                let mut units = Vec::new();
+                let nul_term: bool;
+                if wlen < 0 {
+                    nul_term = true;
+                    for i in 0..524_288 {
+                        let u = self.emu.read_u16(wstr + i as u64 * 2)?;
+                        if u == 0 {
+                            break;
+                        }
+                        units.push(u);
+                    }
+                } else {
+                    nul_term = false;
+                    for i in 0..wlen as usize {
+                        units.push(self.emu.read_u16(wstr + i as u64 * 2)?);
+                    }
+                }
+                let text = String::from_utf16_lossy(&units);
+                let mut bytes = text.into_bytes();
+                if nul_term {
+                    bytes.push(0);
+                }
+                if out == 0 {
+                    ret_bool!(bytes.len() as u64);
+                }
+                if outlen < bytes.len() {
+                    self.last_error = 122;
+                    ret_bool!(0);
+                }
+                self.emu.write_bytes(out, &bytes)?;
+                ret_bool!(bytes.len() as u64);
+            }
+            "GetACP" | "GetOEMCP" => {
+                ret_bool!(65001); // UTF-8 world, matches our transcodes
+            }
+            "IsValidCodePage" => {
+                ret_bool!(u64::from(rcx == 65001));
+            }
+            "IsDebuggerPresent" => {
+                ret_bool!(0);
+            }
+            "IsProcessorFeaturePresent" => {
+                ret_bool!(u64::from(rcx == 10)); // PF_XMMI64 (SSE2, always on x64)
+            }
+            "lstrlenW" => {
+                let mut len = 0u64;
+                while len < 1_048_576 {
+                    if self.emu.read_u16(rcx + len * 2)? == 0 {
+                        break;
+                    }
+                    len += 1;
+                }
+                ret_bool!(len);
+            }
+            "EncodePointer" => {
+                // Fixed-cookie XOR (documented simplification).
+                ret_bool!(rcx ^ 0x9E37_79B9_7F4A_7C15);
+            }
+            "ProcessPrng" => {
+                // Host /dev/urandom passthrough (documented): read exactly n.
+                let buf = rcx;
+                let n = (rdx & 0xFFFF_FFFF) as usize;
+                if n > 1 * 1024 * 1024 {
+                    ret_bool!(0);
+                }
+                let mut f = match std::fs::File::open("/dev/urandom") {
+                    Ok(f) => f,
+                    Err(_) => ret_bool!(0),
+                };
+                let mut tmp = vec![0u8; n];
+                use std::io::Read;
+                match f.read_exact(&mut tmp) {
+                    Ok(()) => {
+                        self.emu.write_bytes(buf, &tmp)?;
+                        ret_bool!(1);
+                    }
+                    Err(_) => ret_bool!(0),
+                }
+            }
+            "Sleep" => {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    (rcx & 0xFFFF_FFFF) as u64,
+                ));
+                ret_bool!(0);
+            }
+            "SleepEx" => {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    (rcx & 0xFFFF_FFFF) as u64,
+                ));
+                ret_bool!(0);
+            }
+            "SwitchToThread" => {
+                std::thread::yield_now();
+                ret_bool!(1);
+            }
+            "TerminateProcess" => {
+                if rcx == 0xFFFF_FFFF_FFFF_FFFF {
+                    ret_halt!((rdx & 0xFFFF_FFFF) as u32);
+                }
+                stub!(0);
+            }
+            "FlsAlloc" => {
+                if self.fls.len() >= 128 {
+                    self.last_error = 8;
+                    ret_bool!(0xFFFF_FFFF);
+                }
+                self.fls.push(None);
+                ret_bool!((self.fls.len() - 1) as u64);
+            }
+            "FlsFree" => {
+                let i = rcx as usize;
+                if i < self.fls.len() {
+                    self.fls[i] = None;
+                    ret_bool!(1);
+                } else {
+                    ret_bool!(0);
+                }
+            }
+            "FlsGetValue" => {
+                let i = rcx as usize;
+                ret_bool!(self.fls.get(i).and_then(|v| *v).unwrap_or(0));
+            }
+            "FlsSetValue" => {
+                let i = rcx as usize;
+                if i < self.fls.len() {
+                    self.fls[i] = Some(rdx);
+                    ret_bool!(1);
+                } else {
+                    ret_bool!(0);
+                }
+            }
+            "InitializeCriticalSectionEx" => {
+                // Single-threaded guest model: no contention is possible
+                // (CreateThread stays a fail-stub), so init zeroes the
+                // 40-byte RTL_CRITICAL_SECTION and all ops are no-ops.
+                let cs = rcx;
+                let spin = (rdx & 0xFFFF_FFFF) as u32;
+                self.emu.write_bytes(cs, &[0u8; 40])?;
+                self.emu.write_u32(cs, 0xFFFF_FFFF)?; // LockCount = -1
+                self.emu.write_u32(cs + 32, spin)?; // SpinCount
+                ret_bool!(1);
+            }
+            "EnterCriticalSection" | "LeaveCriticalSection" | "DeleteCriticalSection" => {
+                ret_bool!(0);
+            }
+            "InitializeSListHead" => {
+                self.emu.write_bytes(rcx, &[0u8; 16])?;
+                ret_bool!(0);
+            }
+            // ---- fail-stubs: loadable, fail clearly if called ----
+            "WaitOnAddress" | "WakeByAddressAll" | "WakeByAddressSingle"
+            | "NtCreateNamedPipeFile" | "NtOpenFile" | "NtReadFile" | "NtWriteFile"
+            | "RtlNtStatusToDosError" | "GetUserProfileDirectoryW"
+            | "AddVectoredExceptionHandler" | "CompareStringOrdinal" | "CompareStringW"
+            | "CreateFileMappingW"             | "CreateMutexA" | "CreateProcessW" | "CreateThread"
+            | "CreateWaitableTimerExW" | "DuplicateHandle"
+            | "FlushFileBuffers"
+            | "FormatMessageW" | "FreeLibrary" | "GetCPInfo" | "GetComputerNameExW"
+            | "GetConsoleScreenBufferInfo" | "GetExitCodeProcess"
+            | "GetFileInformationByHandle" | "GetFileInformationByHandleEx"
+            | "GetFinalPathNameByHandleW" | "GetProcAddress" | "GetStringTypeW"
+            | "GetSystemDirectoryW"             | "GetWindowsDirectoryW"
+            | "IsThreadAFiber"
+            | "LCMapStringW" | "LoadLibraryA"
+            | "LoadLibraryExW" | "MapViewOfFile" | "RaiseException" | "ReadFileEx"
+            | "ReleaseMutex" | "RtlCaptureContext" | "RtlLookupFunctionEntry"
+            | "RtlPcToFileHeader" | "RtlUnwindEx" | "RtlVirtualUnwind"
+            | "SetFileInformationByHandle" | "SetFilePointerEx" | "SetFileTime"
+            | "SetStdHandle" | "SetThreadStackGuarantee" | "SetUnhandledExceptionFilter"
+            | "SetWaitableTimer" | "UnhandledExceptionFilter" | "UnmapViewOfFile"
+            | "WaitForSingleObject" | "WaitForSingleObjectEx" | "WriteFileEx" => {
+                stub!(0);
+            }
+            "FindFirstFileExW" => {
+                stub!(INVALID_HANDLE);
+            }
             other => {
                 return Err(format!(
                     "unsupported import at runtime: {}!{other}",
@@ -466,11 +1099,45 @@ fn read_stdin_line() -> Option<String> {
     }
 }
 
+/// Map the image's TLS template (if any): allocate the per-thread block,
+/// point slot 0 of a fresh TLS array at it, publish the slot index, and
+/// install a minimal TEB (+PEB) as the GS base. Single-threaded model:
+/// slot 0 is always ours. Images *with* TLS callbacks are rejected at
+/// load time (see `pe`).
+fn setup_tls(emu: &mut Emu, img: &PeImage) -> Result<(), String> {
+    use crate::pe::emu::{PEB_IMAGEBASE_OFF, PEB_OFF, TEB_PEB_OFF, TEB_SELF_OFF, TEB_TLS_OFF};
+    let Some(tls) = &img.tls else {
+        return Ok(());
+    };
+    // TLS data block: template + zero fill.
+    let total = tls.raw_data.len() + tls.zero_fill as usize;
+    let data_va = emu.heap_alloc(total.max(8));
+    if data_va == 0 {
+        return Err("out of guest memory for TLS".to_string());
+    }
+    emu.write_bytes(data_va, &tls.raw_data)?;
+    // TLS slot array (64 entries), slot 0 -> data block.
+    let array_va = emu.heap_alloc(64 * 8);
+    if array_va == 0 {
+        return Err("out of guest memory for TLS".to_string());
+    }
+    emu.write_u64(array_va, data_va)?;
+    emu.write_u32(img.image_base + tls.index_rva as u64, 0)?;
+    // TEB + PEB.
+    let teb = emu.teb_va();
+    emu.write_u64(teb + TEB_SELF_OFF, teb)?;
+    emu.write_u64(teb + TEB_TLS_OFF, array_va)?;
+    let peb = teb + PEB_OFF;
+    emu.write_u64(teb + TEB_PEB_OFF, peb)?;
+    emu.write_u64(peb + PEB_IMAGEBASE_OFF, img.image_base)?;
+    emu.gs_base = teb;
+    Ok(())
+}
+
 /// Convenience: load bytes + run with a fresh or given FS.
 pub fn run_exe(data: &[u8], fs: WinFs) -> Result<(u32, WinFs, Vec<u8>), String> {
     run_exe_argv(data, fs, "<exe>", &[])
 }
-
 /// Load bytes + run with guest argv (`prog` is argv0 as typed).
 pub fn run_exe_argv(
     data: &[u8],

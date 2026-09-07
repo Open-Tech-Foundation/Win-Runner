@@ -16,15 +16,18 @@ pub struct InspectReport {
     pub entry_rva: u32,
     pub image_base: u64,
     pub supported: Vec<Import>,
+    /// Loadable fail-stubs: program starts, but dies clearly if it calls one.
+    pub stubbed: Vec<Import>,
     pub missing: Vec<Import>,
 }
 
 impl InspectReport {
+    /// Loadable (nothing fully unknown). Stubs may still fail at runtime.
     pub fn runnable(&self) -> bool {
         self.missing.is_empty()
     }
     pub fn total(&self) -> usize {
-        self.supported.len() + self.missing.len()
+        self.supported.len() + self.stubbed.len() + self.missing.len()
     }
 }
 
@@ -35,6 +38,7 @@ pub fn inspect_pe(data: &[u8]) -> Result<InspectReport, String> {
         entry_rva: img.entry_rva,
         image_base: img.image_base,
         supported: img.imports,
+        stubbed: img.stubs,
         missing: img.unsupported,
     })
 }
@@ -45,18 +49,27 @@ pub fn render(report: &InspectReport) -> String {
     s.push_str(&format!("Entry: 0x{:08x}\n", report.entry_rva));
     s.push_str(&format!("Imports: {}\n", report.total()));
     s.push_str(&format!("Supported imports: {}\n", report.supported.len()));
+    s.push_str(&format!(
+        "Stubbed imports (fail if called): {}\n",
+        report.stubbed.len()
+    ));
     s.push_str(&format!("Missing imports:   {}\n", report.missing.len()));
-    if !report.missing.is_empty() {
-        s.push_str("\nMissing:\n");
-        let mut missing = report.missing.clone();
-        missing.sort_by(|a, b| {
-            a.dll
-                .to_uppercase()
-                .cmp(&b.dll.to_uppercase())
-                .then(a.func.cmp(&b.func))
-        });
-        for imp in &missing {
-            s.push_str(&format!("  {}!{}\n", imp.dll, imp.func));
+    for (title, list) in [
+        ("Stubbed", &report.stubbed),
+        ("Missing", &report.missing),
+    ] {
+        if !list.is_empty() {
+            s.push_str(&format!("\n{title}:\n"));
+            let mut sorted = list.clone();
+            sorted.sort_by(|a, b| {
+                a.dll
+                    .to_uppercase()
+                    .cmp(&b.dll.to_uppercase())
+                    .then(a.func.cmp(&b.func))
+            });
+            for imp in &sorted {
+                s.push_str(&format!("  {}!{}\n", imp.dll, imp.func));
+            }
         }
     }
     s

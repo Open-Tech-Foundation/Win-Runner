@@ -21,11 +21,29 @@ pub struct PeImage {
     /// `image[rva] == byte at image_base + rva`.
     pub image: Vec<u8>,
     pub imports: Vec<Import>,
+    /// Loadable fail-stubs (`STUB_APIS`): resolved like imports, but calling
+    /// one fails clearly with LastError=120. Never silently succeeds.
+    pub stubs: Vec<Import>,
     /// Imports outside `SUPPORTED_APIS`. Always empty from `load` (strict);
     /// populated by `load_lenient` for `inspect`. Never executable.
     pub unsupported: Vec<Import>,
+    /// Thread-local storage template (TLS directory), if present.
+    pub tls: Option<TlsDir>,
     /// (iat_rva -> import index)
     pub iat_slots: Vec<u32>,
+}
+
+/// Thread-local storage directory (IMAGE_TLS_DIRECTORY64, RVAs).
+#[derive(Debug, Clone)]
+pub struct TlsDir {
+    /// Template bytes (raw data) to copy into each thread's TLS block.
+    pub raw_data: Vec<u8>,
+    /// Extra zero bytes after the template.
+    pub zero_fill: u32,
+    /// RVA of the slot-index DWORD (loader writes the assigned index).
+    pub index_rva: u32,
+    /// Callback RVAs (must be empty: callbacks are not supported).
+    pub callbacks: Vec<u32>,
 }
 
 /// APIs WinCLI implements. Anything else must fail clearly.
@@ -49,10 +67,138 @@ pub const SUPPORTED_APIS: &[(&str, &str)] = &[
     ("KERNEL32.DLL", "GetConsoleOutputCP"),
     ("KERNEL32.DLL", "SetConsoleTextAttribute"),
     ("KERNEL32.DLL", "ReadConsoleW"),
+    ("KERNEL32.DLL", "GetLastError"),
+    ("KERNEL32.DLL", "SetLastError"),
+    ("KERNEL32.DLL", "GetProcessHeap"),
+    ("KERNEL32.DLL", "HeapAlloc"),
+    ("KERNEL32.DLL", "HeapFree"),
+    ("KERNEL32.DLL", "HeapReAlloc"),
+    ("KERNEL32.DLL", "HeapSize"),
+    ("KERNEL32.DLL", "VirtualAlloc"),
+    ("KERNEL32.DLL", "VirtualFree"),
+    ("KERNEL32.DLL", "VirtualProtect"),
+    ("KERNEL32.DLL", "GetEnvironmentStringsW"),
+    ("KERNEL32.DLL", "FreeEnvironmentStringsW"),
+    ("KERNEL32.DLL", "GetEnvironmentVariableW"),
+    ("KERNEL32.DLL", "SetEnvironmentVariableW"),
+    ("KERNEL32.DLL", "GetStartupInfoW"),
+    ("KERNEL32.DLL", "GetModuleHandleW"),
+    ("KERNEL32.DLL", "GetModuleHandleA"),
+    ("KERNEL32.DLL", "GetModuleHandleExW"),
+    ("KERNEL32.DLL", "GetModuleFileNameW"),
+    ("KERNEL32.DLL", "GetSystemInfo"),
+    ("KERNEL32.DLL", "GetSystemTimeAsFileTime"),
+    ("KERNEL32.DLL", "QueryPerformanceCounter"),
+    ("KERNEL32.DLL", "QueryPerformanceFrequency"),
+    ("KERNEL32.DLL", "GetCurrentProcess"),
+    ("KERNEL32.DLL", "GetCurrentThread"),
+    ("KERNEL32.DLL", "GetCurrentProcessId"),
+    ("KERNEL32.DLL", "GetCurrentThreadId"),
+    ("KERNEL32.DLL", "GetFileType"),
+    ("KERNEL32.DLL", "GetCurrentDirectoryW"),
+    ("KERNEL32.DLL", "GetFullPathNameW"),
+    ("KERNEL32.DLL", "GetFileAttributesW"),
+    ("KERNEL32.DLL", "MultiByteToWideChar"),
+    ("KERNEL32.DLL", "WideCharToMultiByte"),
+    ("KERNEL32.DLL", "GetACP"),
+    ("KERNEL32.DLL", "GetOEMCP"),
+    ("KERNEL32.DLL", "IsValidCodePage"),
+    ("KERNEL32.DLL", "IsDebuggerPresent"),
+    ("KERNEL32.DLL", "IsProcessorFeaturePresent"),
+    ("KERNEL32.DLL", "lstrlenW"),
+    ("KERNEL32.DLL", "EncodePointer"),
+    ("KERNEL32.DLL", "Sleep"),
+    ("KERNEL32.DLL", "SleepEx"),
+    ("KERNEL32.DLL", "SwitchToThread"),
+    ("KERNEL32.DLL", "TerminateProcess"),
+    ("KERNEL32.DLL", "FlsAlloc"),
+    ("KERNEL32.DLL", "FlsFree"),
+    ("KERNEL32.DLL", "FlsGetValue"),
+    ("KERNEL32.DLL", "FlsSetValue"),
+    ("KERNEL32.DLL", "InitializeCriticalSectionEx"),
+    ("KERNEL32.DLL", "EnterCriticalSection"),
+    ("KERNEL32.DLL", "LeaveCriticalSection"),
+    ("KERNEL32.DLL", "DeleteCriticalSection"),
+    ("KERNEL32.DLL", "InitializeSListHead"),
+    ("BCRYPTPRIMITIVES.DLL", "ProcessPrng"),
+];
+
+/// Loadable-but-unimplemented APIs: the loader resolves them so real
+/// binaries start, but calling one fails clearly with
+/// `LastError=ERROR_CALL_NOT_IMPLEMENTED (120)`. Never silent success.
+/// Converted to real implementations on demand (execution traces decide).
+pub const STUB_APIS: &[(&str, &str)] = &[
+    ("API-MS-WIN-CORE-SYNCH-L1-2-0.DLL", "WaitOnAddress"),
+    ("API-MS-WIN-CORE-SYNCH-L1-2-0.DLL", "WakeByAddressAll"),
+    ("API-MS-WIN-CORE-SYNCH-L1-2-0.DLL", "WakeByAddressSingle"),
+    ("NTDLL.DLL", "NtCreateNamedPipeFile"),
+    ("NTDLL.DLL", "NtOpenFile"),
+    ("NTDLL.DLL", "NtReadFile"),
+    ("NTDLL.DLL", "NtWriteFile"),
+    ("NTDLL.DLL", "RtlNtStatusToDosError"),
+    ("USERENV.DLL", "GetUserProfileDirectoryW"),
+    ("KERNEL32.DLL", "AddVectoredExceptionHandler"),
+    ("KERNEL32.DLL", "CompareStringOrdinal"),
+    ("KERNEL32.DLL", "CompareStringW"),
+    ("KERNEL32.DLL", "CreateFileMappingW"),
+    ("KERNEL32.DLL", "CreateMutexA"),
+    ("KERNEL32.DLL", "CreateProcessW"),
+    ("KERNEL32.DLL", "CreateThread"),
+    ("KERNEL32.DLL", "CreateWaitableTimerExW"),
+    ("KERNEL32.DLL", "DuplicateHandle"),
+    ("KERNEL32.DLL", "FindClose"),
+    ("KERNEL32.DLL", "FindFirstFileExW"),
+    ("KERNEL32.DLL", "FindNextFileW"),
+    ("KERNEL32.DLL", "FlushFileBuffers"),
+    ("KERNEL32.DLL", "FormatMessageW"),
+    ("KERNEL32.DLL", "FreeLibrary"),
+    ("KERNEL32.DLL", "GetCPInfo"),
+    ("KERNEL32.DLL", "GetComputerNameExW"),
+    ("KERNEL32.DLL", "GetConsoleScreenBufferInfo"),
+    ("KERNEL32.DLL", "GetExitCodeProcess"),
+    ("KERNEL32.DLL", "GetFileInformationByHandle"),
+    ("KERNEL32.DLL", "GetFileInformationByHandleEx"),
+    ("KERNEL32.DLL", "GetFinalPathNameByHandleW"),
+    ("KERNEL32.DLL", "GetProcAddress"),
+    ("KERNEL32.DLL", "GetStringTypeW"),
+    ("KERNEL32.DLL", "GetSystemDirectoryW"),
+    ("KERNEL32.DLL", "GetWindowsDirectoryW"),
+    ("KERNEL32.DLL", "IsThreadAFiber"),
+    ("KERNEL32.DLL", "LCMapStringW"),
+    ("KERNEL32.DLL", "LoadLibraryA"),
+    ("KERNEL32.DLL", "LoadLibraryExW"),
+    ("KERNEL32.DLL", "MapViewOfFile"),
+    ("KERNEL32.DLL", "RaiseException"),
+    ("KERNEL32.DLL", "ReadFileEx"),
+    ("KERNEL32.DLL", "ReleaseMutex"),
+    ("KERNEL32.DLL", "RtlCaptureContext"),
+    ("KERNEL32.DLL", "RtlLookupFunctionEntry"),
+    ("KERNEL32.DLL", "RtlPcToFileHeader"),
+    ("KERNEL32.DLL", "RtlUnwindEx"),
+    ("KERNEL32.DLL", "RtlVirtualUnwind"),
+    ("KERNEL32.DLL", "SetFileInformationByHandle"),
+    ("KERNEL32.DLL", "SetFilePointerEx"),
+    ("KERNEL32.DLL", "SetFileTime"),
+    ("KERNEL32.DLL", "SetStdHandle"),
+    ("KERNEL32.DLL", "SetThreadStackGuarantee"),
+    ("KERNEL32.DLL", "SetUnhandledExceptionFilter"),
+    ("KERNEL32.DLL", "SetWaitableTimer"),
+    ("KERNEL32.DLL", "UnhandledExceptionFilter"),
+    ("KERNEL32.DLL", "UnmapViewOfFile"),
+    ("KERNEL32.DLL", "WaitForSingleObject"),
+    ("KERNEL32.DLL", "WaitForSingleObjectEx"),
+    ("KERNEL32.DLL", "WriteFileEx"),
 ];
 
 pub fn is_supported(dll: &str, func: &str) -> bool {
     SUPPORTED_APIS
+        .iter()
+        .any(|(d, f)| d.eq_ignore_ascii_case(dll) && *f == func)
+}
+
+/// True for loadable fail-stubs (see `STUB_APIS`).
+pub fn is_stub(dll: &str, func: &str) -> bool {
+    STUB_APIS
         .iter()
         .any(|(d, f)| d.eq_ignore_ascii_case(dll) && *f == func)
 }
@@ -154,6 +300,15 @@ fn load_inner(data: &[u8], strict: bool) -> Result<PeImage, String> {
     }
     let import_rva = u32le(data, opt + 112 + 8)?;
     let import_size = u32le(data, opt + 112 + 12)?;
+    // TLS directory is index 9 (optional).
+    let (tls_rva, tls_size) = if num_rva_sizes > 9 {
+        (
+            u32le(data, opt + 112 + 9 * 8)?,
+            u32le(data, opt + 112 + 9 * 8 + 4)?,
+        )
+    } else {
+        (0, 0)
+    };
     let _ = (section_align, file_align, size_of_headers);
 
     if size_of_image == 0 || size_of_image > 64 * 1024 * 1024 {
@@ -213,6 +368,7 @@ fn load_inner(data: &[u8], strict: bool) -> Result<PeImage, String> {
 
     // Parse imports (from file offsets via RVA->file mapping)
     let mut imports: Vec<Import> = Vec::new();
+    let mut stubs: Vec<Import> = Vec::new();
     let mut unsupported: Vec<Import> = Vec::new();
     if import_rva != 0 {
         if import_size == 0 {
@@ -266,13 +422,16 @@ fn load_inner(data: &[u8], strict: bool) -> Result<PeImage, String> {
                     func,
                 };
                 if !is_supported(&imp.dll, &imp.func) {
-                    if strict {
+                    if is_stub(&imp.dll, &imp.func) {
+                        stubs.push(imp);
+                    } else if strict {
                         return Err(format!(
                             "unsupported import: {}!{}",
                             imp.dll, imp.func
                         ));
+                    } else {
+                        unsupported.push(imp);
                     }
-                    unsupported.push(imp);
                 } else {
                     imports.push(imp);
                 }
@@ -289,13 +448,76 @@ fn load_inner(data: &[u8], strict: bool) -> Result<PeImage, String> {
     }
 
     let iat_slots = imports.iter().map(|i| i.iat_rva).collect();
+
+    // TLS directory (optional): RVAs into the loaded image.
+    let tls = if tls_rva != 0 {
+        if tls_size < 40 {
+            return Err("invalid TLS directory".to_string());
+        }
+        let t = tls_rva as usize;
+        if t + 40 > image.len() {
+            return Err("TLS directory out of bounds".to_string());
+        }
+        let va = |o: usize| u64::from_le_bytes(image[t + o..t + o + 8].try_into().unwrap());
+        let to_rva = |a: u64| -> Result<u32, String> {
+            a.checked_sub(image_base)
+                .and_then(|r| u32::try_from(r).ok())
+                .ok_or_else(|| "TLS address out of image".to_string())
+        };
+        let start = to_rva(va(0))? as usize;
+        let end = to_rva(va(8))? as usize;
+        if end < start || end - start > 1024 * 1024 {
+            return Err("invalid TLS data range".to_string());
+        }
+        if end > image.len() {
+            return Err("TLS data out of bounds".to_string());
+        }
+        let index_rva = to_rva(va(16))?;
+        let cb_va = va(24);
+        let zero_fill = u32::from_le_bytes(image[t + 32..t + 36].try_into().unwrap());
+        if zero_fill > 1024 * 1024 {
+            return Err("invalid TLS zero fill".to_string());
+        }
+        let mut callbacks = Vec::new();
+        if cb_va != 0 {
+            let cb_rva = to_rva(cb_va)? as usize;
+            for i in 0..64 {
+                let o = cb_rva + i * 8;
+                if o + 8 > image.len() {
+                    return Err("TLS callbacks out of bounds".to_string());
+                }
+                let f = u64::from_le_bytes(image[o..o + 8].try_into().unwrap());
+                if f == 0 {
+                    break;
+                }
+                callbacks.push(to_rva(f)?);
+            }
+        }
+        if !callbacks.is_empty() {
+            return Err(format!(
+                "TLS callbacks not supported ({} found)",
+                callbacks.len()
+            ));
+        }
+        Some(TlsDir {
+            raw_data: image[start..end].to_vec(),
+            zero_fill,
+            index_rva,
+            callbacks,
+        })
+    } else {
+        None
+    };
+
     Ok(PeImage {
         image_base,
         entry_rva,
         size_of_image,
         image,
         imports,
+        stubs,
         unsupported,
+        tls,
         iat_slots,
     })
 }

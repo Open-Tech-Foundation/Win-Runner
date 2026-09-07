@@ -70,3 +70,10 @@ All notable changes to this project will be documented in this file.
   `CMOVcc`, multi-byte `NOP`, segment-override-tolerant prefixes with a
   clear FS/GS (TLS) error. Guest rule documented: no unproven bounds
   checks (`panic_bounds_check` is undefined under `/NODEFAULTLIB`).
+- `guests/lang.rs` (`rust_lang.exe`): 16 self-verifying phases covering
+  conditionals, loops, match, calls/recursion, refs, structs/enums, casts,
+  bitwise ops, slices, u128, signed division, fn pointers, bit intrinsics.
+- Scalar-double FP: `MOVSD`/`ADDSD`/`SUBSD`/`MULSD`/`DIVSD`/`CMPLTSD`
+  (bit-identical via host f64 ops), `UCOMISD` with ZF/PF/CF (new `pf`
+  flag, `JP`/`JNP` now work), `ANDPD`/`ANDNPD`/`ORPD`, `MOVAPD`, plus a
+  `rust_fp.exe` guest proving `FP-OK` (guests define `_fltused` themselves).

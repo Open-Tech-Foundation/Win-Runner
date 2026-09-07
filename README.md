@@ -60,13 +60,16 @@ no mingw/xwin):
 ./guests/build.sh   # needs: rustup target add x86_64-pc-windows-msvc
 ```
 
-This compiles `guests/*.rs` (`hello.rs`, `fs_selftest.rs`), links with
-`guests/kernel32.def` (exactly the supported API set — keep in sync with
-`pe::SUPPORTED_APIS`), and copies the results to
+This compiles `guests/*.rs` (`hello.rs`, `fs_selftest.rs`, `argv_echo.rs`,
+`lang.rs`, `fp.rs`), links with `guests/kernel32.def` (exactly the supported
+API set — keep in sync with `pe::SUPPORTED_APIS`), and copies the results to
 `tests/artifacts/exe/rust_*.exe`. Guests are `no_std` self-tests: new rustc
 output not yet emulated fails with a clear `unsupported opcode` error, which
 drives emulator growth (so far: `xorps`/`movaps`/`movups`, `CMP r/m8,imm8`,
-`SETcc`, `TEST r/m8`).
+`SETcc`, `TEST r/m8`, 16-bit ops, `CMOVcc`, shifts/rotates, `XCHG`, `CPUID`,
+string ops, Grp3 mul/div, 8-bit ALU, scalar-double + `UCOMISD`).
+Guest rules: no CRT (`_fltused` defined by FP guests), no unproven bounds
+checks (`panic_bounds_check` is undefined under `/NODEFAULTLIB`).
 
 ## Tests
 
