@@ -623,19 +623,19 @@ fn test_install_unknown_package() {
 }
 
 #[test]
-fn test_install_no_source_configured() {
+fn test_install_missing_source_dir() {
     let cache = isolated_cache("nosrc");
     let cc = cache.to_string_lossy().to_string();
     let bin = env!("CARGO_BIN_EXE_wincli");
     let output = std::process::Command::new(bin)
         .args(["install", "demo"])
         .env("WINCLI_CACHE", &cc)
-        .env_remove("WINCLI_SOURCE")
+        .env("WINCLI_SOURCE", "/nonexistent-source-dir-xyz")
         .output()
         .expect("spawn wincli");
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    assert!(stderr.contains("no package source"), "stderr: {stderr}");
+    assert!(stderr.contains("package source dir not found"), "stderr: {stderr}");
     std::fs::remove_dir_all(&cache).ok();
 }
 
@@ -649,5 +649,62 @@ fn test_inspect_cache_miss_suggests_install() {
     );
     assert_eq!(code, 1);
     assert!(stderr.contains("wincli install ghost-pkg"), "stderr: {stderr}");
+    std::fs::remove_dir_all(&cache).ok();
+}
+
+#[test]
+fn test_install_deflated_fixture_offline() {
+    // demoz.zip is deflated (method 8) with a nested path: exercises the
+    // inflate path with zero network.
+    let cache = isolated_cache("demoz");
+    let src = artifact("packages").to_string_lossy().to_string();
+    let cc = cache.to_string_lossy().to_string();
+    let envs = [
+        ("WINCLI_CACHE", cc.as_ref()),
+        ("WINCLI_SOURCE", src.as_ref()),
+    ];
+    let (code, stdout, stderr) = run_wincli_env(&["install", "demoz"], &envs);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "Installed demoz 0.2.0 → C:\\bin\\demo.exe\n");
+    let exe = cache.join("pkgs").join("demoz.exe");
+    let (code, stdout, _) = run_wincli_env(&[exe.to_str().unwrap()], &envs);
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "demoz 0.1.0");
+    std::fs::remove_dir_all(&cache).ok();
+}
+
+/// Live acceptance: real WinGet install of ripgrep, then the harness loop.
+/// Needs network + GitHub API quota. Run explicitly:
+/// `cargo test -- --ignored live_install_ripgrep`.
+#[test]
+#[ignore]
+fn live_install_ripgrep() {
+    let cache = isolated_cache("rg");
+    let cc = cache.to_string_lossy().to_string();
+    let bin = env!("CARGO_BIN_EXE_wincli");
+    // remote default: no WINCLI_SOURCE
+    let out = std::process::Command::new(bin)
+        .args(["install", "rg"])
+        .env("WINCLI_CACHE", &cc)
+        .env_remove("WINCLI_SOURCE")
+        .output()
+        .expect("spawn wincli install");
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(stdout.starts_with("Installed rg "), "{stdout}");
+    assert!(stdout.contains("→ C:\\bin\\rg.exe"), "{stdout}");
+    assert!(cache.join("pkgs").join("rg.exe").is_file());
+
+    // the harness loop: real rg.exe is NOT yet runnable -> missing-API report
+    let out = std::process::Command::new(bin)
+        .args(["inspect", "rg"])
+        .env("WINCLI_CACHE", &cc)
+        .env_remove("WINCLI_SOURCE")
+        .output()
+        .expect("spawn wincli inspect");
+    assert_eq!(out.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(stdout.contains("Missing imports:"), "{stdout}");
+    assert!(stdout.contains("Missing:\n"), "{stdout}");
     std::fs::remove_dir_all(&cache).ok();
 }

@@ -73,8 +73,9 @@ cargo test   # unit tests + CLI end-to-end tests against tests/artifacts/
 ## Packages
 
 ```bash
-wincli install demo     # needs WINCLI_SOURCE (a package dir for now)
-wincli inspect demo     # inspect the cached package
+wincli install rg        # remote WinGet catalog (default source)
+wincli install demo      # WINCLI_SOURCE=tests/artifacts/packages (local dir)
+wincli inspect rg        # inspect the cached package
 ```
 
 `install` resolves `<source>/<name>.json` + `<name>.zip`, stores the blob
@@ -85,6 +86,12 @@ Remote WinGet-catalog sources, hash verification, and deflate land in P2;
 until then only local directories (`WINCLI_SOURCE=./dir`, stored zips).
 `tests/artifacts/packages/` holds offline fixtures built by
 `cargo run --example gen_artifacts`.
+
+Remote sources: short aliases (`rg`, `fd`, `jq`, `bat`, `fzf`) or full
+WinGet IDs (`BurntSushi.ripgrep.MSVC`). Manifests come from winget-pkgs
+(version discovery via GitHub API, YAML via raw); only portable/zip x64
+installers are accepted, downloads are SHA-256-verified against the
+manifest, and re-installs never re-download (content-addressed cache).
 
 ## Compatibility harness
 

@@ -1,18 +1,18 @@
-//! Package install + cache (P1: offline/local sources only).
+//! Package install + cache.
 //!
 //! Layout under `$WINCLI_CACHE` (default `$XDG_CACHE_HOME/wincli` or
 //! `~/.cache/wincli`):
 //!
 //! ```text
 //! index/<name>.json     resolved metadata (version, exe, archive sha256)
-//! archives/<sha256>.zip downloaded blobs, content-addressed (fetch once ever)
+//! archives/<sha256>.*   downloaded blobs, content-addressed (fetch once ever)
 //! pkgs/<name>.exe       extracted runnable EXEs
 //! ```
 //!
-//! A local source directory holds `<name>.json` + `<name>.zip` per package.
-//! Remote (WinGet catalog) sources land in P2; `install` requires
-//! `WINCLI_SOURCE` until then. Archives are plain stored (uncompressed) zips
-//! in P1; deflate lands with remote fetching in P2.
+//! Sources: a local directory (`$WINCLI_SOURCE` set to a path, holding
+//! `<name>.json` + `<name>.zip` per package) or, by default, the remote
+//! WinGet catalog (see `winget`). Archives may be stored or deflated zips,
+//! or (remote portable installers) the exe itself.
 
 use std::path::{Path, PathBuf};
 
@@ -36,16 +36,63 @@ pub fn cache_dir() -> PathBuf {
     std::env::temp_dir().join("wincli-cache")
 }
 
-/// Package source dir (`$WINCLI_SOURCE`). P1 supports local directories only.
-pub fn source_dir() -> Result<PathBuf, String> {
+/// Package source: a local directory, or the remote WinGet catalog.
+#[derive(Debug, Clone)]
+pub enum Source {
+    Local(PathBuf),
+    Winget,
+}
+
+/// Resolve the source: `$WINCLI_SOURCE` unset/`winget` → remote catalog,
+/// otherwise a local package directory (must exist).
+pub fn source_from_env() -> Result<Source, String> {
     match std::env::var("WINCLI_SOURCE") {
-        Ok(p) if !p.is_empty() => Ok(PathBuf::from(p)),
-        _ => Err(
-            "no package source: set WINCLI_SOURCE to a package directory \
-             (remote WinGet sources land in P2)"
-                .to_string(),
-        ),
+        Ok(p) if !p.is_empty() && p != "winget" => {
+            let dir = PathBuf::from(&p);
+            if !dir.is_dir() {
+                return Err(format!("package source dir not found: {p}"));
+            }
+            Ok(Source::Local(dir))
+        }
+        Ok(_) | Err(_) => Ok(Source::Winget),
     }
+}
+
+/// Kept for explicit local-dir use (tests, fixtures).
+pub fn source_dir() -> Result<PathBuf, String> {
+    match source_from_env()? {
+        Source::Local(p) => Ok(p),
+        Source::Winget => Err("no local package source: set WINCLI_SOURCE to a package directory".to_string()),
+    }
+}
+
+/// Download bytes over HTTPS via `curl`. Clear error when curl is missing.
+pub fn fetch_url(url: &str, max_time_secs: u64) -> Result<Vec<u8>, String> {
+    let out = std::process::Command::new("curl")
+        .args([
+            "-sSL",
+            "--fail",
+            "--max-time",
+            &max_time_secs.to_string(),
+            "-A",
+            "wincli/0.1.0",
+            url,
+        ])
+        .output()
+        .map_err(|_| "cannot run curl: install it to use remote sources".to_string())?;
+    if !out.status.success() {
+        let tail = String::from_utf8_lossy(&out.stderr);
+        return Err(format!(
+            "download failed: {url} ({}){}",
+            out.status,
+            if tail.trim().is_empty() {
+                String::new()
+            } else {
+                format!(": {}", tail.trim())
+            }
+        ));
+    }
+    Ok(out.stdout)
 }
 
 #[derive(Debug, Clone)]
@@ -79,31 +126,102 @@ pub fn install(name: &str, source: &Path, cache: &Path) -> Result<Installed, Str
     }
     let blob = std::fs::read(source.join(&archive_name))
         .map_err(|_| format!("package {name}: missing archive {archive_name} in source"))?;
-    let sha = sha256_hex(&blob);
-
-    std::fs::create_dir_all(cache.join("archives"))
-        .map_err(|e| format!("cannot create cache: {e}"))?;
-    std::fs::create_dir_all(cache.join("pkgs"))
-        .map_err(|e| format!("cannot create cache: {e}"))?;
-    std::fs::create_dir_all(cache.join("index"))
-        .map_err(|e| format!("cannot create cache: {e}"))?;
-    std::fs::write(cache.join("archives").join(format!("{sha}.zip")), &blob)
-        .map_err(|e| format!("cannot write cache: {e}"))?;
-
     let exe_bytes =
-        extract_stored(&blob, &exe).map_err(|e| format!("package {name}: {e}"))?;
+        extract_entry(&blob, &exe).map_err(|e| format!("package {name}: {e}"))?;
     if exe_bytes.len() < 2 || &exe_bytes[0..2] != b"MZ" {
         return Err(format!("package {name}: archive entry {exe} is not a PE file"));
     }
+    finalize(name, &version, &exe, &blob, "zip", cache)
+}
+
+/// Install from the remote WinGet catalog: resolve → download (unless the
+/// content-addressed blob is already cached) → verify SHA-256 → extract →
+/// cache. Re-running never re-downloads.
+pub fn install_remote(name: &str, cache: &Path) -> Result<Installed, String> {
+    check_name(name)?;
+    let r = crate::winget::resolve(name)?;
+    let ext = match r.kind {
+        crate::winget::Kind::Exe => "exe",
+        crate::winget::Kind::Zip { .. } => "zip",
+    };
+    let blob_path = cache.join("archives").join(format!("{}.{ext}", r.sha256));
+    let blob = if blob_path.is_file() {
+        std::fs::read(&blob_path).map_err(|e| format!("cannot read cache: {e}"))?
+    } else {
+        let bytes = fetch_url(&r.url, 180)?;
+        let sha = sha256_hex(&bytes);
+        if sha != r.sha256 {
+            return Err(format!(
+                "SHA-256 mismatch for {} {} (manifest {}, got {})",
+                r.id, r.version, r.sha256, sha
+            ));
+        }
+        std::fs::create_dir_all(blob_path.parent().unwrap())
+            .map_err(|e| format!("cannot create cache: {e}"))?;
+        std::fs::write(&blob_path, &bytes).map_err(|e| format!("cannot write cache: {e}"))?;
+        bytes
+    };
+    // Re-verify even on cache hit (cheap, guards against tampering).
+    if sha256_hex(&blob) != r.sha256 {
+        return Err(format!("cached blob failed SHA-256 for {} {}", r.id, r.version));
+    }
+    let (exe_bytes, exe_rel) = match &r.kind {
+        crate::winget::Kind::Exe => (blob.clone(), r.exe_name.clone()),
+        crate::winget::Kind::Zip { nested } => (
+            extract_entry(&blob, nested)
+                .map_err(|e| format!("package {}: {e}", r.id))?,
+            nested.clone(),
+        ),
+    };
+    if exe_bytes.len() < 2 || &exe_bytes[0..2] != b"MZ" {
+        return Err(format!("package {}: payload is not a PE file", r.id));
+    }
+    finalize(name, &r.version, &exe_rel, &blob, ext, cache)
+}
+
+fn check_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err(format!("invalid package name: {name}"));
+    }
+    Ok(())
+}
+
+/// Shared cache-write tail for local + remote installs.
+fn finalize(
+    name: &str,
+    version: &str,
+    exe_rel: &str,
+    blob: &[u8],
+    blob_ext: &str,
+    cache: &Path,
+) -> Result<Installed, String> {
+    let sha = sha256_hex(blob);
+    for d in ["archives", "pkgs", "index"] {
+        std::fs::create_dir_all(cache.join(d)).map_err(|e| format!("cannot create cache: {e}"))?;
+    }
+    // Local path already wrote the blob; remote path too. Ensure present.
+    let blob_path = cache.join("archives").join(format!("{sha}.{blob_ext}"));
+    if !blob_path.is_file() {
+        std::fs::write(&blob_path, blob).map_err(|e| format!("cannot write cache: {e}"))?;
+    }
+    let exe_bytes = if blob_ext == "zip" {
+        extract_entry(blob, exe_rel).map_err(|e| format!("package {name}: {e}"))?
+    } else {
+        blob.to_vec()
+    };
     let host_path = cache.join("pkgs").join(format!("{name}.exe"));
     std::fs::write(&host_path, &exe_bytes).map_err(|e| format!("cannot write cache: {e}"))?;
 
-    let exe_base = exe.rsplit(['/', '\\']).next().unwrap_or(&exe).to_string();
+    let exe_base = exe_rel
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(exe_rel)
+        .to_string();
     let index = format!(
         "{{\"name\":\"{}\",\"version\":\"{}\",\"exe\":\"{}\",\"sha256\":\"{}\"}}\n",
         esc(name),
-        esc(&version),
-        esc(&exe),
+        esc(version),
+        esc(exe_rel),
         sha
     );
     std::fs::write(cache.join("index").join(format!("{name}.json")), index)
@@ -111,7 +229,7 @@ pub fn install(name: &str, source: &Path, cache: &Path) -> Result<Installed, Str
 
     Ok(Installed {
         name: name.to_string(),
-        version,
+        version: version.to_string(),
         exe_name: exe_base.clone(),
         guest_path: format!("C:\\bin\\{exe_base}"),
         host_path,
@@ -158,9 +276,9 @@ pub fn json_string(doc: &str, key: &str) -> Option<String> {
     }
 }
 
-/// Extract a stored (uncompressed) entry from a ZIP archive.
+/// Extract one entry from a ZIP archive (stored or deflated).
 /// Scans local headers; central directory not required.
-pub fn extract_stored(zip: &[u8], want: &str) -> Result<Vec<u8>, String> {
+pub fn extract_entry(zip: &[u8], want: &str) -> Result<Vec<u8>, String> {
     let mut off = 0usize;
     let mut names: Vec<String> = Vec::new();
     let u16le = |o: usize| u16::from_le_bytes([zip[o], zip[o + 1]]);
@@ -171,8 +289,10 @@ pub fn extract_stored(zip: &[u8], want: &str) -> Result<Vec<u8>, String> {
         if &zip[off..off + 4] != b"PK\x03\x04" {
             break;
         }
-        let flag = u16le(off + 8);
-        let method = u16le(off + 10);
+        // local header: sig(4) ver(2) flags(2) method(2) time(2) date(2)
+        // crc(4) csize(4) usize(4) nlen(2) elen(2)
+        let flag = u16le(off + 6);
+        let method = u16le(off + 8);
         let csize = u32le(off + 18) as usize;
         let nlen = u16le(off + 26) as usize;
         let elen = u16le(off + 28) as usize;
@@ -191,12 +311,15 @@ pub fn extract_stored(zip: &[u8], want: &str) -> Result<Vec<u8>, String> {
         }
         names.push(name.to_string());
         if name == want {
-            if method != 0 {
-                return Err(format!(
-                    "unsupported zip method {method} for entry '{name}' (only stored)"
-                ));
-            }
-            return Ok(zip[data_off..data_off + csize].to_vec());
+            let raw = &zip[data_off..data_off + csize];
+            return match method {
+                0 => Ok(raw.to_vec()),
+                8 => crate::deflate::inflate(raw)
+                    .map_err(|e| format!("deflate failed for entry '{name}': {e}")),
+                _ => Err(format!(
+                    "unsupported zip method {method} for entry '{name}' (only stored/deflated)"
+                )),
+            };
         }
         off = data_off + csize;
     }
@@ -388,19 +511,40 @@ mod tests {
     #[test]
     fn stored_zip_roundtrip() {
         let z = zip_stored(&[("a.exe", b"MZfake1"), ("sub/b.txt", b"hello")]);
-        assert_eq!(extract_stored(&z, "a.exe").unwrap(), b"MZfake1");
-        assert_eq!(extract_stored(&z, "sub/b.txt").unwrap(), b"hello");
-        let err = extract_stored(&z, "nope.exe").unwrap_err();
+        assert_eq!(extract_entry(&z, "a.exe").unwrap(), b"MZfake1");
+        assert_eq!(extract_entry(&z, "sub/b.txt").unwrap(), b"hello");
+        let err = extract_entry(&z, "nope.exe").unwrap_err();
         assert!(err.contains("a.exe") && err.contains("sub/b.txt"), "{err}");
     }
 
     #[test]
-    fn deflated_entry_fails_clearly() {
-        let mut z = zip_stored(&[("a.exe", b"MZfake1")]);
-        // flip method of first entry to 8 (deflate)
-        z[10] = 8;
-        let err = extract_stored(&z, "a.exe").unwrap_err();
-        assert!(err.contains("unsupported zip method 8"), "{err}");
+    fn deflated_entry_decodes() {
+        // entry bytes: raw deflate of b"deflated-ok" (method flipped to 8)
+        let mut z = zip_stored(&[("skip", b"")]);
+        let raw = [
+            0x4b, 0x49, 0x4d, 0xcb, 0x49, 0x2c, 0x49, 0x4d, 0xd1, 0xcd, 0xcf, 0x06, 0x00,
+        ];
+        // rebuild: header with method 8 + raw payload
+        let mut entry = Vec::new();
+        entry.extend_from_slice(b"PK\x03\x04");
+        entry.extend_from_slice(&20u16.to_le_bytes());
+        entry.extend_from_slice(&0u16.to_le_bytes());
+        entry.extend_from_slice(&8u16.to_le_bytes()); // deflate
+        entry.extend_from_slice(&0u16.to_le_bytes());
+        entry.extend_from_slice(&0u16.to_le_bytes());
+        entry.extend_from_slice(&0u32.to_le_bytes()); // crc (unchecked by reader)
+        entry.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+        entry.extend_from_slice(&11u32.to_le_bytes()); // usize
+        entry.extend_from_slice(&6u16.to_le_bytes()); // "a.defl"
+        entry.extend_from_slice(&0u16.to_le_bytes());
+        entry.extend_from_slice(b"a.defl");
+        entry.extend_from_slice(&raw);
+        z.splice(0..z.len(), entry);
+        assert_eq!(extract_entry(&z, "a.defl").unwrap(), b"deflated-ok");
+        // unknown methods still fail clearly (method field is at header+8)
+        z[8] = 99;
+        let err = extract_entry(&z, "a.defl").unwrap_err();
+        assert!(err.contains("unsupported zip method 99"), "{err}");
     }
 
     #[test]

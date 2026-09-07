@@ -133,18 +133,22 @@ fn read_inspect_target(target: &str) -> Result<Vec<u8>, String> {
     ))
 }
 
-/// `wincli install <pkg>`: resolve from `$WINCLI_SOURCE` into the cache.
+/// `wincli install <pkg>`: local `$WINCLI_SOURCE` dir, else remote catalog.
 /// Guest-logical address is `C:\bin\<exe>`; bytes live in the host cache.
 fn install_pkg(name: &str) {
     let cache = install::cache_dir();
-    let source = match install::source_dir() {
+    let source = match install::source_from_env() {
         Ok(s) => s,
         Err(e) => {
             eprintln!("wincli: {e}");
             std::process::exit(1);
         }
     };
-    match install::install(name, &source, &cache) {
+    let result = match source {
+        install::Source::Local(dir) => install::install(name, &dir, &cache),
+        install::Source::Winget => install::install_remote(name, &cache),
+    };
+    match result {
         Ok(inst) => {
             println!(
                 "Installed {} {} → {}",

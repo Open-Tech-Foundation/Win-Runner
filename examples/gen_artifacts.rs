@@ -38,6 +38,7 @@ fn main() {
             ),
         ),
         ("bad_import.exe", builder::unknown_import()),
+        ("demoz.exe", builder::hello("demoz 0.1.0")),
     ];
     for (name, bytes) in &artifacts {
         let path = dir.join(name);

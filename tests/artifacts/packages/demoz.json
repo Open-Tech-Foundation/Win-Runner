@@ -1,0 +1,6 @@
+{
+ "name": "demoz",
+ "version": "0.2.0",
+ "exe": "demoz/deep/demo.exe",
+ "archive": "demoz.zip"
+}

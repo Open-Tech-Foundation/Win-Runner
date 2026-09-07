@@ -48,6 +48,13 @@ All notable changes to this project will be documented in this file.
   address `C:\bin\<exe>`, and `inspect <cached-name>` lookup. Offline
   fixtures in `tests/artifacts/packages/`; remote WinGet sources + deflate
   are P2.
+- P2 remote packages: default install source is the WinGet catalog
+  (short aliases `rg`/`fd`/`jq`/`bat`/`fzf` or full IDs; version discovery
+  via GitHub API, manifests via raw, portable/zip-x64 only, SHA-256
+  verified, never re-downloads). Vendored raw-DEFLATE decoder with zip-bomb
+  guard; fixed a header-offset bug it exposed in the zip reader. Live
+  acceptance installs real ripgrep; `inspect rg` reports 5/127 supported as
+  the expansion backlog.
 - Documented console contract: transparent byte pipe to the host terminal,
   no console emulation; `WriteConsoleW`/`GetConsoleMode`/streaming/input
   planned with run-with-args.
