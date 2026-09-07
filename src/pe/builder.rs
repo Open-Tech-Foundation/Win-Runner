@@ -120,6 +120,69 @@ impl Asm {
     pub fn mov_rcx_rax(&mut self) {
         self.emit(&[0x48, 0x89, 0xC1]);
     }
+    pub fn mov_rdx_rax(&mut self) {
+        self.emit(&[0x48, 0x89, 0xC2]);
+    }
+    /// mov r32, imm32 (any of rax..r15)
+    pub fn mov_r32_imm(&mut self, reg: usize, v: u32) {
+        assert!(reg < 16);
+        let mut b = Vec::new();
+        if reg >= 8 {
+            b.push(0x41);
+        }
+        b.push(0xB8 + (reg as u8 & 7));
+        b.extend_from_slice(&v.to_le_bytes());
+        self.emit(&b);
+    }
+    /// mov reg64, [rsp+off8]
+    pub fn mov_reg_rspoff(&mut self, reg: usize, off: u8) {
+        assert!(reg < 16);
+        let rex = 0x48 | if reg >= 8 { 4 } else { 0 };
+        let modrm = 0x44 | ((reg as u8 & 7) << 3); // mod=01 rm=100 (SIB)
+        self.emit(&[rex, 0x8B, modrm, 0x24, off]);
+    }
+    /// mov dword [rsp+off8], imm32
+    pub fn mov_rspoff_imm32(&mut self, off: u8, v: u32) {
+        let mut b = vec![0xC7, 0x44, 0x24, off];
+        b.extend_from_slice(&v.to_le_bytes());
+        self.emit(&b);
+    }
+    /// mov eax, [rip+data_idx]
+    pub fn mov_eax_mem_rip(&mut self, data_idx: usize) {
+        let pos = self.code.len() + 2;
+        self.emit(&[0x8B, 0x05, 0, 0, 0, 0]);
+        self.fix_dat.push((pos, data_idx));
+    }
+    /// cmp eax, imm32
+    pub fn cmp_eax_imm(&mut self, v: u32) {
+        let mut b = vec![0x3D];
+        b.extend_from_slice(&v.to_le_bytes());
+        self.emit(&b);
+    }
+    /// movzx ecx, byte [rax] / movzx ebx, byte [rdx]
+    pub fn movzx_ecx_byte_rax(&mut self) {
+        self.emit(&[0x0F, 0xB6, 0x08]);
+    }
+    pub fn movzx_ebx_byte_rdx(&mut self) {
+        self.emit(&[0x0F, 0xB6, 0x1A]);
+    }
+    /// cmp ecx, ebx
+    pub fn cmp_ecx_ebx(&mut self) {
+        self.emit(&[0x39, 0xD9]);
+    }
+    pub fn inc_rax(&mut self) {
+        self.emit(&[0x48, 0xFF, 0xC0]);
+    }
+    pub fn inc_rdx(&mut self) {
+        self.emit(&[0x48, 0xFF, 0xC2]);
+    }
+    pub fn dec_r10d(&mut self) {
+        self.emit(&[0x41, 0xFF, 0xCA]);
+    }
+    /// test r10d, r10d
+    pub fn test_r10d(&mut self) {
+        self.emit(&[0x45, 0x85, 0xD2]);
+    }
     /// lea reg32/64, [rip+data_idx]
     pub fn lea_reg_rip(&mut self, reg: usize, data_idx: usize) {
         // REX.W=1 (+ REX.R if reg>=8). opcode 8D, modrm mod=00 reg=reg&7 rm=101
@@ -710,4 +773,328 @@ pub fn copy_file(src: &str, dst: &str) -> Vec<u8> {
     a.add_rsp(0x28);
     a.ret();
     build(a, &[("KERNEL32.dll", "CopyFileW"), ("KERNEL32.dll", "ExitProcess")])
+}
+
+// ---------- self-verifying guest programs (used as committed test artifacts) ----------
+// Each prints `PASS\n` + exit 0 on success, `FAIL\n` + exit 1 on any failure,
+// so `wincli the.exe` is fully observable black-box (fresh WinFS per process).
+
+const CF: usize = 0; // CreateFileW
+const WF: usize = 1; // WriteFile
+const CH: usize = 2; // CloseHandle
+
+/// Emit `handle = CreateFileW(path_data, access, creation)`.
+/// Frame: caller must have `sub rsp` with room; uses [rsp+0x20..0x38].
+/// On return, rax = handle or INVALID_HANDLE_VALUE.
+fn emit_create(a: &mut Asm, d_path: usize, access: u64, creation: u32, call_idx: usize) {
+    a.lea_reg_rip(1, d_path); // rcx = path
+    a.mov_rax_imm64(access);
+    a.mov_rdx_rax(); // rdx = access
+    a.mov_r8d_imm(0); // share
+    a.mov_r9d_imm(0); // security
+    a.xor_eax();
+    a.mov_rspoff_rax(0x20); // lpSecurity = NULL
+    a.mov_rspoff_imm32(0x28, creation);
+    a.mov_rspoff_imm32(0x30, 0x80); // flags
+    a.mov_rspoff_rax(0x38); // hTemplate = NULL
+    a.call_import(call_idx);
+}
+
+/// Emit `print(msg_data, len)`: GetStdHandle(-11) + WriteFile + CloseHandle-free.
+/// Uses call indices gh_idx (GetStdHandle) and wf_idx (WriteFile), plus d_written cell.
+fn emit_print(
+    a: &mut Asm,
+    d_msg: usize,
+    len: u32,
+    d_written: usize,
+    gh_idx: usize,
+    wf_idx: usize,
+) {
+    a.mov_ecx_imm(0xFFFF_FFF5);
+    a.call_import(gh_idx);
+    a.mov_rcx_rax();
+    a.lea_reg_rip(2, d_msg);
+    a.mov_r32_imm(8, len); // r8d = len
+    a.lea_reg_rip(9, d_written);
+    a.xor_eax();
+    a.mov_rspoff_rax(0x20); // overlapped = NULL
+    a.call_import(wf_idx);
+}
+
+/// Full file selftest: write -> read back -> byte-compare -> delete ->
+/// verify-open-fails. Prints PASS/FAIL.
+pub fn fs_selftest_file(path: &str, content: &[u8]) -> Vec<u8> {
+    assert!(!content.is_empty(), "selftest content must be non-empty");
+    // imports: CreateFileW WriteFile CloseHandle ReadFile GetStdHandle DeleteFileW ExitProcess
+    const RF: usize = 3;
+    const GH: usize = 4;
+    const DF: usize = 5;
+    const XP: usize = 6;
+    let mut a = Asm::new();
+    let d_path = a.add_utf16(path);
+    let d_data = a.add_data(content.to_vec());
+    let d_buf = a.add_zeroed(content.len() + 64);
+    let d_written = a.add_zeroed(8);
+    let d_nread = a.add_zeroed(8);
+    let d_pass = a.add_data(b"PASS\n".to_vec());
+    let d_fail = a.add_data(b"FAIL\n".to_vec());
+    let lbl_fail = a.next_label;
+    a.next_label += 1;
+    let lbl_loop = a.next_label;
+    a.next_label += 1;
+    let lbl_noloop = a.next_label;
+    a.next_label += 1;
+
+    a.sub_rsp(0x58);
+    // -- create + write --
+    emit_create(&mut a, d_path, 0x4000_0000, 2, CF);
+    a.cmp_rax_m1();
+    a.jz(lbl_fail);
+    a.mov_rspoff_rax(0x40); // save handle
+    a.mov_reg_rspoff(1, 0x40); // rcx = handle
+    a.lea_reg_rip(2, d_data);
+    a.mov_r32_imm(8, content.len() as u32);
+    a.lea_reg_rip(9, d_written);
+    a.xor_eax();
+    a.mov_rspoff_rax(0x20);
+    a.call_import(WF);
+    a.test_eax_eax();
+    a.jz(lbl_fail);
+    a.mov_reg_rspoff(1, 0x40);
+    a.call_import(CH);
+    // -- open + read --
+    emit_create(&mut a, d_path, 0x8000_0000, 3, CF);
+    a.cmp_rax_m1();
+    a.jz(lbl_fail);
+    a.mov_rspoff_rax(0x40);
+    a.mov_reg_rspoff(1, 0x40);
+    a.lea_reg_rip(2, d_buf);
+    a.mov_r32_imm(8, (content.len() + 64) as u32);
+    a.lea_reg_rip(9, d_nread);
+    a.xor_eax();
+    a.mov_rspoff_rax(0x20);
+    a.call_import(RF);
+    a.test_eax_eax();
+    a.jz(lbl_fail);
+    a.mov_reg_rspoff(1, 0x40);
+    a.call_import(CH);
+    // -- verify byte count --
+    a.mov_eax_mem_rip(d_nread);
+    a.cmp_eax_imm(content.len() as u32);
+    a.jnz(lbl_fail);
+    // -- byte-compare loop --
+    a.lea_reg_rip(0, d_buf); // rax = actual
+    a.lea_reg_rip(2, d_data); // rdx = expected
+    a.mov_r32_imm(10, content.len() as u32); // r10d = n
+    a.test_r10d();
+    a.jz(lbl_noloop);
+    a.mark(lbl_loop);
+    a.movzx_ecx_byte_rax();
+    a.movzx_ebx_byte_rdx();
+    a.cmp_ecx_ebx();
+    a.jnz(lbl_fail);
+    a.inc_rax();
+    a.inc_rdx();
+    a.dec_r10d();
+    a.jnz(lbl_loop);
+    a.mark(lbl_noloop);
+    // -- delete + verify gone --
+    a.lea_reg_rip(1, d_path);
+    a.call_import(DF);
+    a.test_eax_eax();
+    a.jz(lbl_fail);
+    emit_create(&mut a, d_path, 0x8000_0000, 3, CF);
+    a.cmp_rax_m1();
+    a.jnz(lbl_fail); // open must FAIL now
+    // -- PASS --
+    emit_print(&mut a, d_pass, 5, d_written, GH, WF);
+    a.mov_ecx_imm(0);
+    a.call_import(XP);
+    a.add_rsp(0x58);
+    a.ret();
+    // -- FAIL --
+    a.mark(lbl_fail);
+    emit_print(&mut a, d_fail, 5, d_written, GH, WF);
+    a.mov_ecx_imm(1);
+    a.call_import(XP);
+    a.add_rsp(0x58);
+    a.ret();
+
+    build(
+        a,
+        &[
+            ("KERNEL32.dll", "CreateFileW"),
+            ("KERNEL32.dll", "WriteFile"),
+            ("KERNEL32.dll", "CloseHandle"),
+            ("KERNEL32.dll", "ReadFile"),
+            ("KERNEL32.dll", "GetStdHandle"),
+            ("KERNEL32.dll", "DeleteFileW"),
+            ("KERNEL32.dll", "ExitProcess"),
+        ],
+    )
+}
+
+/// Directory selftest: mkdir -> duplicate must fail -> rmdir ->
+/// duplicate must fail. Prints PASS/FAIL.
+pub fn dir_selftest(path: &str) -> Vec<u8> {
+    // imports: GetStdHandle WriteFile CreateDirectoryW RemoveDirectoryW ExitProcess
+    const GH: usize = 0;
+    const WF: usize = 1;
+    const MK: usize = 2;
+    const RM: usize = 3;
+    const XP: usize = 4;
+    let mut a = Asm::new();
+    let d_path = a.add_utf16(path);
+    let d_written = a.add_zeroed(8);
+    let d_pass = a.add_data(b"PASS\n".to_vec());
+    let d_fail = a.add_data(b"FAIL\n".to_vec());
+    let lbl_fail = a.next_label;
+    a.next_label += 1;
+    a.sub_rsp(0x28);
+    a.lea_reg_rip(1, d_path);
+    a.call_import(MK);
+    a.test_eax_eax();
+    a.jz(lbl_fail);
+    a.lea_reg_rip(1, d_path);
+    a.call_import(MK);
+    a.test_eax_eax();
+    a.jnz(lbl_fail); // duplicate must fail
+    a.lea_reg_rip(1, d_path);
+    a.call_import(RM);
+    a.test_eax_eax();
+    a.jz(lbl_fail);
+    a.lea_reg_rip(1, d_path);
+    a.call_import(RM);
+    a.test_eax_eax();
+    a.jnz(lbl_fail); // duplicate must fail
+    emit_print(&mut a, d_pass, 5, d_written, GH, WF);
+    a.mov_ecx_imm(0);
+    a.call_import(XP);
+    a.add_rsp(0x28);
+    a.ret();
+    a.mark(lbl_fail);
+    emit_print(&mut a, d_fail, 5, d_written, GH, WF);
+    a.mov_ecx_imm(1);
+    a.call_import(XP);
+    a.add_rsp(0x28);
+    a.ret();
+    build(
+        a,
+        &[
+            ("KERNEL32.dll", "GetStdHandle"),
+            ("KERNEL32.dll", "WriteFile"),
+            ("KERNEL32.dll", "CreateDirectoryW"),
+            ("KERNEL32.dll", "RemoveDirectoryW"),
+            ("KERNEL32.dll", "ExitProcess"),
+        ],
+    )
+}
+
+/// Move/copy selftest: write a -> copy a to b -> move b to c ->
+/// read c to stdout -> delete a,c. Prints content then PASS/FAIL.
+pub fn move_copy_selftest(a_path: &str, b_path: &str, c_path: &str, content: &[u8]) -> Vec<u8> {
+    // imports: CreateFileW WriteFile CloseHandle ReadFile GetStdHandle
+    //          CopyFileW MoveFileW DeleteFileW ExitProcess
+    const RF: usize = 3;
+    const GH: usize = 4;
+    const CP: usize = 5;
+    const MV: usize = 6;
+    const DF: usize = 7;
+    const XP: usize = 8;
+    let mut a = Asm::new();
+    let d_a = a.add_utf16(a_path);
+    let d_b = a.add_utf16(b_path);
+    let d_c = a.add_utf16(c_path);
+    let d_data = a.add_data(content.to_vec());
+    let d_buf = a.add_zeroed(content.len() + 64);
+    let d_written = a.add_zeroed(8);
+    let d_nread = a.add_zeroed(8);
+    let d_pass = a.add_data(b"PASS\n".to_vec());
+    let d_fail = a.add_data(b"FAIL\n".to_vec());
+    let lbl_fail = a.next_label;
+    a.next_label += 1;
+    a.sub_rsp(0x58);
+    // write a
+    emit_create(&mut a, d_a, 0x4000_0000, 2, CF);
+    a.cmp_rax_m1();
+    a.jz(lbl_fail);
+    a.mov_rspoff_rax(0x40);
+    a.mov_reg_rspoff(1, 0x40);
+    a.lea_reg_rip(2, d_data);
+    a.mov_r32_imm(8, content.len() as u32);
+    a.lea_reg_rip(9, d_written);
+    a.xor_eax();
+    a.mov_rspoff_rax(0x20);
+    a.call_import(WF);
+    a.test_eax_eax();
+    a.jz(lbl_fail);
+    a.mov_reg_rspoff(1, 0x40);
+    a.call_import(CH);
+    // copy a -> b
+    a.lea_reg_rip(1, d_a);
+    a.lea_reg_rip(2, d_b);
+    a.mov_r32_imm(8, 0);
+    a.call_import(CP);
+    a.test_eax_eax();
+    a.jz(lbl_fail);
+    // move b -> c
+    a.lea_reg_rip(1, d_b);
+    a.lea_reg_rip(2, d_c);
+    a.call_import(MV);
+    a.test_eax_eax();
+    a.jz(lbl_fail);
+    // read c to stdout (observable content)
+    emit_create(&mut a, d_c, 0x8000_0000, 3, CF);
+    a.cmp_rax_m1();
+    a.jz(lbl_fail);
+    a.mov_rspoff_rax(0x40);
+    a.mov_reg_rspoff(1, 0x40);
+    a.lea_reg_rip(2, d_buf);
+    a.mov_r32_imm(8, (content.len() + 64) as u32);
+    a.lea_reg_rip(9, d_nread);
+    a.xor_eax();
+    a.mov_rspoff_rax(0x20);
+    a.call_import(RF);
+    a.test_eax_eax();
+    a.jz(lbl_fail);
+    a.mov_reg_rspoff(1, 0x40);
+    a.call_import(CH);
+    a.mov_eax_mem_rip(d_nread);
+    a.cmp_eax_imm(content.len() as u32);
+    a.jnz(lbl_fail);
+    emit_print(&mut a, d_buf, content.len() as u32, d_written, GH, WF);
+    // delete a + c
+    a.lea_reg_rip(1, d_a);
+    a.call_import(DF);
+    a.test_eax_eax();
+    a.jz(lbl_fail);
+    a.lea_reg_rip(1, d_c);
+    a.call_import(DF);
+    a.test_eax_eax();
+    a.jz(lbl_fail);
+    emit_print(&mut a, d_pass, 5, d_written, GH, WF);
+    a.mov_ecx_imm(0);
+    a.call_import(XP);
+    a.add_rsp(0x58);
+    a.ret();
+    a.mark(lbl_fail);
+    emit_print(&mut a, d_fail, 5, d_written, GH, WF);
+    a.mov_ecx_imm(1);
+    a.call_import(XP);
+    a.add_rsp(0x58);
+    a.ret();
+    build(
+        a,
+        &[
+            ("KERNEL32.dll", "CreateFileW"),
+            ("KERNEL32.dll", "WriteFile"),
+            ("KERNEL32.dll", "CloseHandle"),
+            ("KERNEL32.dll", "ReadFile"),
+            ("KERNEL32.dll", "GetStdHandle"),
+            ("KERNEL32.dll", "CopyFileW"),
+            ("KERNEL32.dll", "MoveFileW"),
+            ("KERNEL32.dll", "DeleteFileW"),
+            ("KERNEL32.dll", "ExitProcess"),
+        ],
+    )
 }

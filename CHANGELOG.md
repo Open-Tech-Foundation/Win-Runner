@@ -19,3 +19,8 @@ All notable changes to this project will be documented in this file.
   `Get-Content`, `Get-ChildItem`, `Remove-Item`, `Copy-Item`, `Move-Item`,
   `Test-Path`.
 - Unit tests (WinFS) and end-to-end tests (all nine required behaviors).
+- Committed test artifacts: `tests/artifacts/ps1/*.ps1` scripts covering
+  every cmdlet (plus case-insensitivity, `./..`, error path),
+  `tests/artifacts/exe/*.exe` self-verifying PE32+ guest programs, and the
+  `examples/gen_artifacts.rs` Rust generator that builds them. Black-box CLI
+  tests run `wincli` against every artifact.
