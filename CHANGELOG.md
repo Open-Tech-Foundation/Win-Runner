@@ -115,3 +115,9 @@ All notable changes to this project will be documented in this file.
   `ADDPD`/`MULPD`/`SUBPD`/`DIVPD` (`66 0F 58`/`59`/`5C`/`5E`, per-lane host
   `f64`, bit-identical) with unit tests for reg and mem forms plus NaN
   propagation.
+- Real `rg.exe --version` now prints and exits 0: `NtWriteFile` is a real
+  shim (Rust std writes console/file output through it, not `WriteFile`;
+  synchronous, console + WinFS file handles, `IoStatusBlock` status/count),
+  promoted from fail-stub to supported with a builder-probe test. Minimal
+  zeroed `PEB_LDR_DATA` so loader-bit checks see genuine values.
+  `CVTSI2SD` (`F2 0F 2A`) joined the scalar-double arm along the way.

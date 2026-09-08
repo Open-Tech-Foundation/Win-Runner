@@ -119,6 +119,9 @@ pub const TEB_PEB_OFF: u64 = 0x60;
 /// PEB sits 0x800 into the TEB page; ImageBaseAddress at +0x10.
 pub const PEB_OFF: u64 = 0x800;
 pub const PEB_IMAGEBASE_OFF: u64 = 0x10;
+/// PEB_LDR_DATA pointer at +0x20 (minimal zeroed block; real SsHandle is
+/// NULL for EXEs, so loader-bit checks see the genuine value).
+pub const PEB_LDR_OFF: u64 = 0x20;
 
 impl Emu {
     pub fn new(img: &PeImage) -> Result<Self, String> {
@@ -741,7 +744,7 @@ impl Emu {
                     "unsupported REP-prefixed opcode 0F {op2:02X} at 0x{ip:016x}"
                 ));
             }
-            if repne && !matches!(op2, 0x70 | 0x10 | 0x11 | 0x58 | 0x59 | 0x5C | 0x5E | 0xC2) {
+            if repne && !matches!(op2, 0x70 | 0x10 | 0x11 | 0x2A | 0x58 | 0x59 | 0x5C | 0x5E | 0xC2) {
                 return Err(format!(
                     "unsupported REPNE/F2-prefixed opcode 0F {op2:02X} at 0x{ip:016x}"
                 ));
@@ -813,7 +816,7 @@ impl Emu {
                 self.rip = ip + (off + 2 + ml) as u64;
                 return Ok(StepResult::Continue);
             }
-            if repne && matches!(op2, 0x10 | 0x11 | 0x58 | 0x59 | 0x5C | 0x5E | 0xC2) {
+            if repne && matches!(op2, 0x10 | 0x11 | 0x2A | 0x58 | 0x59 | 0x5C | 0x5E | 0xC2) {
                 // Scalar-double family (F2-mandatory): MOVSD/ADDSD/SUBSD/
                 // MULSD/DIVSD/CMPLTSD. Rust f64 ops lower to the same
                 // instructions, so results are bit-identical. Upper lanes:
@@ -852,6 +855,18 @@ impl Emu {
                             0x5C => a - b,
                             _ => a / b,
                         };
+                        self.xmm[reg] = (self.xmm[reg] & !0xFFFF_FFFF_FFFF_FFFF)
+                            | r.to_bits() as u128;
+                    }
+                    0x2A => {
+                        // CVTSI2SD xmm, r/m32/64 (int64 with REX.W).
+                        // Host `as` lowers to the same instruction.
+                        let v: i64 = if rex_w {
+                            self.read_rm(is_reg, rm, ea, 64)? as i64
+                        } else {
+                            self.read_rm(is_reg, rm, ea, 32)? as u32 as i32 as i64
+                        };
+                        let r = v as f64;
                         self.xmm[reg] = (self.xmm[reg] & !0xFFFF_FFFF_FFFF_FFFF)
                             | r.to_bits() as u128;
                     }
@@ -1216,6 +1231,29 @@ impl Emu {
                 o[4..8].copy_from_slice(&s[0..4]);
                 o[8..12].copy_from_slice(&d[8..12]);
                 o[12..16].copy_from_slice(&s[8..12]);
+                self.xmm[reg] = u128::from_le_bytes(o);
+                self.rip = next;
+                return Ok(StepResult::Continue);
+            }
+            if op2 == 0x15 {
+                // UNPCKHPD xmm, xmm/m128 (66-mandatory; plain is UNPCKHPS).
+                // Interleaves high qwords, bitwise.
+                if !opsz16 || rep || repne {
+                    return Err(format!("unsupported non-HPD 0F 15 at 0x{ip:016x}"));
+                }
+                let (reg, is_reg, rm, ea_raw, ml) =
+                    self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
+                let next = ip + (off + 2 + ml) as u64;
+                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let d = self.xmm[reg].to_le_bytes();
+                let s: [u8; 16] = if is_reg {
+                    self.xmm[rm].to_le_bytes()
+                } else {
+                    self.read_u128(ea)?.to_le_bytes()
+                };
+                let mut o = [0u8; 16];
+                o[0..8].copy_from_slice(&d[8..16]);
+                o[8..16].copy_from_slice(&s[8..16]);
                 self.xmm[reg] = u128::from_le_bytes(o);
                 self.rip = next;
                 return Ok(StepResult::Continue);
@@ -3771,6 +3809,50 @@ mod tests {
         e.xmm[0] = pack(1.5, 2.5);
         e.step().unwrap();
         assert_eq!(unpack(e.xmm[0]), (2.0, 2.75));
+    }
+
+    #[test]
+    fn cvtsi2sd_int64_and_int32() {
+        // cvtsi2sd xmm0,rax (F2 REX.W 0F 2A C0): low lane, upper kept.
+        let mut e = emu_with(&[0xF2, 0x48, 0x0F, 0x2A, 0xC0]);
+        e.xmm[0] = 0xFFFF_FFFF_FFFF_FFFF_0000_0000_0000_0000;
+        e.regs[0] = 42;
+        e.step().unwrap();
+        assert_eq!(e.xmm[0], 0xFFFF_FFFF_FFFF_FFFF_4045_0000_0000_0000);
+        // 64-bit negative and large values round like hardware.
+        let mut e = emu_with(&[0xF2, 0x48, 0x0F, 0x2A, 0xC0]);
+        e.regs[0] = (-7i64) as u64;
+        e.step().unwrap();
+        assert_eq!(e.xmm[0], (-7.0f64).to_bits() as u128);
+        // cvtsi2sd xmm0,eax (F2 0F 2A C0): 32-bit sign-extended.
+        let mut e = emu_with(&[0xF2, 0x0F, 0x2A, 0xC0]);
+        e.regs[0] = 0xFFFF_FFFF;
+        e.step().unwrap();
+        assert_eq!(e.xmm[0], (-1.0f64).to_bits() as u128);
+    }
+
+    #[test]
+    fn unpckhpd_reg() {
+        // unpckhpd xmm1,xmm0 (66 0F 15 C8): high qwords [d_hi, s_hi].
+        let mut e = emu_with(&[0x66, 0x0F, 0x15, 0xC8]);
+        e.xmm[1] = u128::from_le_bytes([
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+        ]);
+        e.xmm[0] = u128::from_le_bytes([
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+            0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
+        ]);
+        e.step().unwrap();
+        assert_eq!(
+            e.xmm[1].to_le_bytes(),
+            [
+                0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+                0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
+            ]
+        );
+        // Plain UNPCKHPS fails clearly.
+        assert!(emu_with(&[0x0F, 0x15, 0xC8]).step().is_err());
     }
 
     #[test]

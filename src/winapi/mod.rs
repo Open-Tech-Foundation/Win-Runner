@@ -133,6 +133,16 @@ impl Runner {
         }
     }
 
+    /// Complete an NT syscall: report status + bytes through IoStatusBlock
+    /// (Status u32 at +0, Information u64 at +8). Returns status for RAX.
+    fn nt_finish(&mut self, iosb: u64, status: u64, written: u64) -> Result<u64, String> {
+        if iosb != 0 {
+            self.emu.write_u32(iosb, status as u32)?;
+            self.emu.write_u64(iosb + 8, written)?;
+        }
+        Ok(status)
+    }
+
     fn alloc_handle(&mut self, path: String, offset: u64) -> u64 {
         let h = self.next_handle;
         self.next_handle += 1;
@@ -1045,9 +1055,69 @@ impl Runner {
                 self.emu.write_bytes(rcx, &[0u8; 16])?;
                 ret_bool!(0);
             }
+            "NtWriteFile" => {
+                // NTSTATUS NtWriteFile(handle, event, apc, ctx, iosb, buf,
+                // len, byte_offset, key). Rust std writes stdout/stderr
+                // through here, not WriteFile. Synchronous only.
+                const STATUS_SUCCESS: u64 = 0;
+                const STATUS_INVALID_HANDLE: u64 = 0xC000_0008;
+                const STATUS_NOT_IMPLEMENTED: u64 = 0xC000_0002;
+                let h = rcx;
+                let event = rdx;
+                let iosb = self.emu.stack_arg(4).unwrap_or(0);
+                let buf = self.emu.stack_arg(5).unwrap_or(0);
+                let n = (self.emu.stack_arg(6).unwrap_or(0) & 0xFFFF_FFFF) as usize;
+                let byte_off = self.emu.stack_arg(7).unwrap_or(0);
+                if event != 0 || n > 16 * 1024 * 1024 {
+                    let s = self.nt_finish(iosb, STATUS_NOT_IMPLEMENTED, 0)?;
+                    ret_bool!(s);
+                }
+                let data = self.emu.read_bytes(buf, n)?;
+                if h == 1 || h == 2 {
+                    self.console_out(&data);
+                    let s = self.nt_finish(iosb, STATUS_SUCCESS, n as u64)?;
+                    ret_bool!(s);
+                }
+                if h == 0 {
+                    let s = self.nt_finish(iosb, STATUS_INVALID_HANDLE, 0)?;
+                    ret_bool!(s);
+                }
+                if !self.handles.contains_key(&h) {
+                    let s = self.nt_finish(iosb, STATUS_INVALID_HANDLE, 0)?;
+                    ret_bool!(s);
+                }
+                let (path, off) = {
+                    let fh = self.handles.get_mut(&h).unwrap();
+                    let off = if byte_off != 0 {
+                        self.emu.read_u64(byte_off)? as usize
+                    } else {
+                        fh.offset as usize
+                    };
+                    (fh.path.clone(), off)
+                };
+                let mut content = self
+                    .fs
+                    .read_file(&path)
+                    .map_err(|e| format!("NtWriteFile: {e}"))?;
+                if off > content.len() {
+                    content.resize(off, 0);
+                }
+                if off + n > content.len() {
+                    content.resize(off + n, 0);
+                }
+                content[off..off + n].copy_from_slice(&data);
+                if byte_off == 0 {
+                    self.handles.get_mut(&h).unwrap().offset += n as u64;
+                }
+                self.fs
+                    .write_file(&path, content)
+                    .map_err(|e| format!("NtWriteFile: {e}"))?;
+                let s = self.nt_finish(iosb, STATUS_SUCCESS, n as u64)?;
+                ret_bool!(s);
+            }
             // ---- fail-stubs: loadable, fail clearly if called ----
             "WaitOnAddress" | "WakeByAddressAll" | "WakeByAddressSingle"
-            | "NtCreateNamedPipeFile" | "NtOpenFile" | "NtReadFile" | "NtWriteFile"
+            | "NtCreateNamedPipeFile" | "NtOpenFile" | "NtReadFile"
             | "RtlNtStatusToDosError" | "GetUserProfileDirectoryW"
             | "AddVectoredExceptionHandler" | "CompareStringOrdinal" | "CompareStringW"
             | "CreateFileMappingW"             | "CreateMutexA" | "CreateProcessW" | "CreateThread"
@@ -1105,7 +1175,7 @@ fn read_stdin_line() -> Option<String> {
 /// slot 0 is always ours. Images *with* TLS callbacks are rejected at
 /// load time (see `pe`).
 fn setup_tls(emu: &mut Emu, img: &PeImage) -> Result<(), String> {
-    use crate::pe::emu::{PEB_IMAGEBASE_OFF, PEB_OFF, TEB_PEB_OFF, TEB_SELF_OFF, TEB_TLS_OFF};
+    use crate::pe::emu::{PEB_IMAGEBASE_OFF, PEB_LDR_OFF, PEB_OFF, TEB_PEB_OFF, TEB_SELF_OFF, TEB_TLS_OFF};
     let Some(tls) = &img.tls else {
         return Ok(());
     };
@@ -1130,6 +1200,13 @@ fn setup_tls(emu: &mut Emu, img: &PeImage) -> Result<(), String> {
     let peb = teb + PEB_OFF;
     emu.write_u64(teb + TEB_PEB_OFF, peb)?;
     emu.write_u64(peb + PEB_IMAGEBASE_OFF, img.image_base)?;
+    // Minimal zeroed PEB_LDR_DATA (real startup reads Ldr->SsHandle).
+    let ldr = emu.heap_alloc(64);
+    if ldr == 0 {
+        return Err("out of guest memory for PEB_LDR".to_string());
+    }
+    emu.write_bytes(ldr, &[0u8; 64])?;
+    emu.write_u64(peb + PEB_LDR_OFF, ldr)?;
     emu.gs_base = teb;
     Ok(())
 }
@@ -1251,6 +1328,70 @@ mod tests {
         assert_eq!(code, 0);
         assert_eq!(&*seen.borrow(), b"stream-me");
         assert_eq!(out, b"stream-me");
+    }
+
+    /// Probe guest: NtWriteFile to stdout reports STATUS_SUCCESS with the
+    /// byte count in IoStatusBlock; a bogus handle reports
+    /// STATUS_INVALID_HANDLE. Exit 0 = all good, 1 = any step failed.
+    fn nt_write_probe() -> Vec<u8> {
+        // imports: NtWriteFile, ExitProcess
+        const NW: usize = 0;
+        const XP: usize = 1;
+        let mut a = Asm::new();
+        let d_msg = a.add_data(b"hello".to_vec());
+        let d_iosb = a.add_zeroed(16);
+        let lbl_fail = a.fresh_label();
+        a.sub_rsp(0x48);
+        // NtWriteFile(1, 0, 0, 0, iosb, msg, 5, NULL, 0)
+        a.mov_ecx_imm(1);
+        a.mov_edx_imm(0);
+        a.mov_r8d_imm(0);
+        a.mov_r9d_imm(0);
+        a.lea_reg_rip(0, d_iosb);
+        a.mov_rspoff_rax(0x20);
+        a.lea_reg_rip(0, d_msg);
+        a.mov_rspoff_rax(0x28);
+        a.mov_r32_imm(0, 5);
+        a.mov_rspoff_rax(0x30);
+        a.xor_eax();
+        a.mov_rspoff_rax(0x38);
+        a.mov_rspoff_rax(0x40);
+        a.call_import(NW);
+        // RAX == STATUS_SUCCESS (0)?
+        a.test_eax_eax();
+        a.jnz(lbl_fail);
+        // IoStatusBlock.Status == 0?
+        a.mov_eax_mem_rip(d_iosb);
+        a.test_eax_eax();
+        a.jnz(lbl_fail);
+        // bogus handle -> STATUS_INVALID_HANDLE
+        a.mov_ecx_imm(0x1234);
+        a.call_import(NW);
+        a.cmp_eax_imm(0xC000_0008);
+        a.jnz(lbl_fail);
+        a.mov_ecx_imm(0);
+        a.call_import(XP);
+        a.add_rsp(0x48);
+        a.ret();
+        a.mark(lbl_fail);
+        a.mov_ecx_imm(1);
+        a.call_import(XP);
+        a.add_rsp(0x48);
+        a.ret();
+        build(
+            a,
+            &[
+                ("NTDLL.DLL", "NtWriteFile"),
+                ("KERNEL32.DLL", "ExitProcess"),
+            ],
+        )
+    }
+
+    #[test]
+    fn nt_write_file_console_and_status() {
+        let (code, _, out) = run_exe(&nt_write_probe(), WinFs::new()).unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(out, b"hello");
     }
 
     #[test]

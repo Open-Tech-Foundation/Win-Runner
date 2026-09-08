@@ -121,6 +121,7 @@ pub const SUPPORTED_APIS: &[(&str, &str)] = &[
     ("KERNEL32.DLL", "DeleteCriticalSection"),
     ("KERNEL32.DLL", "InitializeSListHead"),
     ("BCRYPTPRIMITIVES.DLL", "ProcessPrng"),
+    ("NTDLL.DLL", "NtWriteFile"),
 ];
 
 /// Loadable-but-unimplemented APIs: the loader resolves them so real
@@ -134,7 +135,6 @@ pub const STUB_APIS: &[(&str, &str)] = &[
     ("NTDLL.DLL", "NtCreateNamedPipeFile"),
     ("NTDLL.DLL", "NtOpenFile"),
     ("NTDLL.DLL", "NtReadFile"),
-    ("NTDLL.DLL", "NtWriteFile"),
     ("NTDLL.DLL", "RtlNtStatusToDosError"),
     ("USERENV.DLL", "GetUserProfileDirectoryW"),
     ("KERNEL32.DLL", "AddVectoredExceptionHandler"),
