@@ -30,6 +30,18 @@ mkdir -p "$OUT"
     "/OUT:$OUT/kernel32.lib" \
     /MACHINE:x64
 
+# Sysroot rlibs for the guest target: lets no_std guests use `extern crate
+# alloc` and out-of-line core helpers (bounds-check panics, slice helpers)
+# without CRT. Guest-provided memcpy/memset satisfy compiler-builtins refs.
+RLIB="$SYSROOT/lib/rustlib/$TARGET/lib"
+# shellcheck disable=SC2206
+GUEST_RLIBS=(
+    $RLIB/liballoc-*.rlib
+    $RLIB/libcore-*.rlib
+    $RLIB/libcompiler_builtins-*.rlib
+    $RLIB/libpanic_abort-*.rlib
+)
+
 build_guest() {
     local src="$1" entry="$2" dest="$3"
     local obj="$OUT/$(basename "$src" .rs).o"
@@ -40,7 +52,7 @@ build_guest() {
         "/OUT:$obj.exe" \
         "/ENTRY:$entry" \
         /NODEFAULTLIB /SUBSYSTEM:CONSOLE /DYNAMICBASE:NO \
-        "$obj" "$OUT/kernel32.lib"
+        "$obj" "$OUT/kernel32.lib" "${GUEST_RLIBS[@]}"
     cp "$obj.exe" "$ART/$dest"
     echo "built $ART/$dest"
 }
@@ -50,3 +62,4 @@ build_guest fs_selftest.rs guest_entry rust_fs.exe
 build_guest argv_echo.rs guest_entry rust_argv.exe
 build_guest lang.rs guest_entry rust_lang.exe
 build_guest fp.rs guest_entry rust_fp.exe
+build_guest alloc.rs guest_entry rust_alloc.exe

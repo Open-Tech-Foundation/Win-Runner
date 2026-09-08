@@ -77,3 +77,9 @@ All notable changes to this project will be documented in this file.
   (bit-identical via host f64 ops), `UCOMISD` with ZF/PF/CF (new `pf`
   flag, `JP`/`JNP` now work), `ANDPD`/`ANDNPD`/`ORPD`, `MOVAPD`, plus a
   `rust_fp.exe` guest proving `FP-OK` (guests define `_fltused` themselves).
+- `guests/alloc.rs` (`rust_alloc.exe`): `extern crate alloc` on a
+  `HeapAlloc`-backed `#[global_allocator]` — `Vec`/`String`/`format!`,
+  closures, `Box`/`BTreeMap`/`sort` all pass. Link recipe: sysroot
+  `alloc`/`core` rlibs + guest-provided `memcpy`/`memset`/`strlen`/
+  `__chkstk`/`__CxxFrameHandler3` and the two toolchain-specific
+  `__rustc::` alloc gates (loud link failure documents the coupling).

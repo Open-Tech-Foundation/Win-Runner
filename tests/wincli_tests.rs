@@ -794,3 +794,22 @@ fn test_art_exe_rust_fp() {
     assert_eq!(code, 0, "stderr: {stderr}");
     assert_eq!(stdout, "FP-OK\n");
 }
+
+#[test]
+fn test_art_exe_rust_alloc() {
+    // Real rustc-built alloc guest (guests/alloc.rs): Vec/String/format!,
+    // closures, Box/BTreeMap/sort on a HeapAlloc heap.
+    let bytes = std::fs::read(artifact("exe/rust_alloc.exe")).unwrap();
+    let img = pe::load(&bytes).expect("rust guest must load");
+    for imp in img.imports.iter().chain(img.stubs.iter()) {
+        assert!(
+            pe::is_supported(&imp.dll, &imp.func),
+            "unsupported import in rust guest: {}!{}",
+            imp.dll,
+            imp.func
+        );
+    }
+    let (code, stdout, stderr) = run_cli(&artifact("exe/rust_alloc.exe"));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "A1\nA2\nA3\nA4\nA5\nPASS\n");
+}
