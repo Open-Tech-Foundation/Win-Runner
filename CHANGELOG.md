@@ -105,3 +105,6 @@ All notable changes to this project will be documented in this file.
 - Emulator, trace-driven by real `rg.exe --help`: `BT`/`BTS`/`BTR`/`BTC`
   `r/m,r` (`0F A3`/`AB`/`B3`/`BB`) with register masking and memory
   bit-string addressing (only `CF` changes), plus unit tests for each form.
+- Emulator, trace-driven by real `rg.exe --help`: `MOVQ xmm/m64,xmm`
+  (`66 0F D6`, low qword, zero-extending reg-reg form) with a unit test;
+  MMX and `MOVQ2DQ` spellings fail clearly.

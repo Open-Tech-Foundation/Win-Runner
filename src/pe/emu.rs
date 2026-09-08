@@ -736,7 +736,7 @@ impl Emu {
         // two-byte opcodes
         if op == 0x0F {
             let op2 = self.read_u8(ip + off as u64 + 1)?;
-            if rep && !matches!(op2, 0x10 | 0x11 | 0x28 | 0x29 | 0x6E | 0x6F | 0x70 | 0x7E | 0x7F | 0xBC | 0xBD) {
+            if rep && !matches!(op2, 0x10 | 0x11 | 0x28 | 0x29 | 0x6E | 0x6F | 0x70 | 0x7E | 0x7F | 0xBC | 0xBD | 0xD6) {
                 return Err(format!(
                     "unsupported REP-prefixed opcode 0F {op2:02X} at 0x{ip:016x}"
                 ));
@@ -962,7 +962,7 @@ impl Emu {
                 self.rip = next;
                 return Ok(StepResult::Continue);
             }
-            if matches!(op2, 0x10 | 0x11 | 0x28 | 0x29 | 0x57 | 0x6E | 0x6F | 0x7E | 0x7F | 0xDB | 0xDF | 0xEB | 0xEF) {
+            if matches!(op2, 0x10 | 0x11 | 0x28 | 0x29 | 0x57 | 0x6E | 0x6F | 0x7E | 0x7F | 0xD6 | 0xDB | 0xDF | 0xEB | 0xEF) {
                 // Packed moves / xors. Bitwise only: no flags, no FP, no
                 // MXCSR, no alignment faulting (guests are compiler-aligned).
                 // A 0x66 prefix selects the unaligned/double/integer spellings
@@ -1059,6 +1059,26 @@ impl Emu {
                             // movd r/m32, xmm (low dword)
                             let v = (self.xmm[reg] & 0xFFFF_FFFF) as u64;
                             self.write_rm(is_reg, rm, ea, 32, v)?;
+                        }
+                    }
+                    0xD6 => {
+                        // movq xmm/m64, xmm (low qword; 66-mandatory).
+                        // F3 form is MOVQ2DQ (different op): fail clearly.
+                        if rep {
+                            return Err(format!(
+                                "unsupported MOVQ2DQ (F3 0F D6) at 0x{ip:016x}"
+                            ));
+                        }
+                        if !opsz16 {
+                            return Err(format!(
+                                "unsupported MMX opcode 0F D6 at 0x{ip:016x}"
+                            ));
+                        }
+                        let v = (self.xmm[reg] & 0xFFFF_FFFF_FFFF_FFFF) as u64;
+                        if is_reg {
+                            self.xmm[rm] = v as u128;
+                        } else {
+                            self.write_u64(ea, v)?;
                         }
                     }
                     _ => unreachable!(),
@@ -3636,8 +3656,32 @@ mod tests {
     }
 
     #[test]
-    fn bts_mem_bitstring() {
-        // bts qword [rip+cell],rax: bit 9 sets byte1 bit1 (string form).
+    fn movq_xmm_mem_reg() {
+        // movq [rip+cell],xmm1 (66 0F D6 0D disp): stores low qword LE.
+        let cell = 48usize;
+        let mut code = vec![0x66, 0x0F, 0xD6, 0x0D];
+        code.extend_from_slice(&rel32(0, 8, cell));
+        let mut e = emu_with(&code);
+        let base = BASE + 0x1000;
+        e.xmm[1] = 0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF;
+        e.step().unwrap();
+        assert_eq!(
+            e.read_u64(base + cell as u64).unwrap(),
+            0x8899_AABB_CCDD_EEFF
+        );
+        // movq xmm2,xmm1 (66 0F D6 CA): low qword, upper zeroed.
+        let mut e = emu_with(&[0x66, 0x0F, 0xD6, 0xCA]);
+        e.xmm[1] = 0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF;
+        e.xmm[2] = 0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF;
+        e.step().unwrap();
+        assert_eq!(e.xmm[2], 0x8899_AABB_CCDD_EEFF);
+        // MMX (no prefix) and MOVQ2DQ (F3) forms fail clearly.
+        assert!(emu_with(&[0x0F, 0xD6, 0xCA]).step().is_err());
+        assert!(emu_with(&[0xF3, 0x0F, 0xD6, 0xCA]).step().is_err());
+    }
+
+    #[test]
+    fn bts_mem_bitstring() {        // bts qword [rip+cell],rax: bit 9 sets byte1 bit1 (string form).
         let cell = 32usize;
         let mut code = vec![0x48, 0x0F, 0xAB, 0x05];
         code.extend_from_slice(&rel32(0, 8, cell));
