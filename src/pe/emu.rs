@@ -1163,6 +1163,31 @@ impl Emu {
                 self.rip = next;
                 return Ok(StepResult::Continue);
             }
+            if op2 == 0x14 {
+                // UNPCKLPS xmm, xmm/m128 (prefix-less; 66 is UNPCKLPD).
+                // Interleaves low single-precision lanes, bitwise.
+                if opsz16 || rep || repne {
+                    return Err(format!("unsupported prefixed 0F 14 at 0x{ip:016x}"));
+                }
+                let (reg, is_reg, rm, ea_raw, ml) =
+                    self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
+                let next = ip + (off + 2 + ml) as u64;
+                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let d = self.xmm[reg].to_le_bytes();
+                let s: [u8; 16] = if is_reg {
+                    self.xmm[rm].to_le_bytes()
+                } else {
+                    self.read_u128(ea)?.to_le_bytes()
+                };
+                let mut o = [0u8; 16];
+                o[0..4].copy_from_slice(&d[0..4]);
+                o[4..8].copy_from_slice(&s[0..4]);
+                o[8..12].copy_from_slice(&d[8..12]);
+                o[12..16].copy_from_slice(&s[8..12]);
+                self.xmm[reg] = u128::from_le_bytes(o);
+                self.rip = next;
+                return Ok(StepResult::Continue);
+            }
                         if op2 == 0x70 {
                 // PSHUFD (66) / PSHUFLW (F2) / PSHUFHW (F3): shuffle
                 // 32-bit lanes / low words / high words by imm8.
@@ -3678,6 +3703,30 @@ mod tests {
         // MMX (no prefix) and MOVQ2DQ (F3) forms fail clearly.
         assert!(emu_with(&[0x0F, 0xD6, 0xCA]).step().is_err());
         assert!(emu_with(&[0xF3, 0x0F, 0xD6, 0xCA]).step().is_err());
+    }
+
+    #[test]
+    fn unpcklps_reg() {
+        // unpcklps xmm0,xmm6 (0F 14 C6): [d0,s0,d2,s2] lanes.
+        let mut e = emu_with(&[0x0F, 0x14, 0xC6]);
+        e.xmm[0] = u128::from_le_bytes([
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+        ]);
+        e.xmm[6] = u128::from_le_bytes([
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+            0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
+        ]);
+        e.step().unwrap();
+        assert_eq!(
+            e.xmm[0].to_le_bytes(),
+            [
+                0x00, 0x01, 0x02, 0x03, 0x10, 0x11, 0x12, 0x13,
+                0x08, 0x09, 0x0A, 0x0B, 0x18, 0x19, 0x1A, 0x1B,
+            ]
+        );
+        // Prefixed spellings (UNPCKLPD et al.) fail clearly.
+        assert!(emu_with(&[0x66, 0x0F, 0x14, 0xC6]).step().is_err());
     }
 
     #[test]

@@ -108,3 +108,6 @@ All notable changes to this project will be documented in this file.
 - Emulator, trace-driven by real `rg.exe --help`: `MOVQ xmm/m64,xmm`
   (`66 0F D6`, low qword, zero-extending reg-reg form) with a unit test;
   MMX and `MOVQ2DQ` spellings fail clearly.
+- Emulator, trace-driven by real `rg.exe --help`: `UNPCKLPS xmm,xmm/m128`
+  (`0F 14`, low-lane interleave) with a unit test; prefixed spellings fail
+  clearly.
