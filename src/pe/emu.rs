@@ -131,9 +131,11 @@ impl Emu {
         let base = img.image_base;
         let mut mem = vec![0u8; total];
         mem[..img.image.len()].copy_from_slice(&img.image);
-        let stack_top = base + total as u64 - 0x100;
-        let stack_top = stack_top & !0xF;
         let heap_base = base + img.size_of_image as u64 + CMDLINE_SIZE as u64 + STACK_SIZE as u64;
+        // Stack starts at the top of its dedicated region (below the heap),
+        // 16-aligned. Starting at top-of-memory instead lets deep stacks
+        // march down through the TEB page and heap tail (rg startup did).
+        let stack_top = heap_base & !0xF;
         let mut e = Self {
             base,
             mem,
@@ -1468,6 +1470,50 @@ impl Emu {
                         w - 1 - (v << (64 - w)).leading_zeros()
                     };
                     self.write_rm(true, reg, 0, w, idx as u64)?;
+                }
+                self.rip = next;
+                return Ok(StepResult::Continue);
+            }
+            if op2 == 0xA3 || op2 == 0xAB || op2 == 0xB3 || op2 == 0xBB {
+                // BT/BTS/BTR/BTC r/m, r (demanded by rg's byte-to-bitmap loop:
+                // bts rax,r9). CF = old bit; only CF changes. Register dest
+                // masks the index; memory dest is a bit string (signed byte
+                // offset from the base, bit = index mod 8).
+                let (reg, is_reg, rm, ea_raw, ml) =
+                    self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
+                let next = ip + (off + 2 + ml) as u64;
+                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let idx = self.regs[reg];
+                if is_reg {
+                    let mask: u64 = match w {
+                        64 => u64::MAX,
+                        32 => 0xFFFF_FFFF,
+                        _ => 0xFFFF,
+                    };
+                    let b = (idx & (w as u64 - 1)) as u32;
+                    let v = self.regs[rm] & mask;
+                    self.cf = ((v >> b) & 1) == 1;
+                    let res = match op2 {
+                        0xA3 => v,
+                        0xAB => v | (1 << b),
+                        0xB3 => v & !(1 << b),
+                        _ => v ^ (1 << b),
+                    };
+                    if op2 != 0xA3 {
+                        self.regs[rm] = res & mask;
+                    }
+                } else {
+                    let off = idx as i64;
+                    let addr = ea.wrapping_add(off.div_euclid(8) as u64);
+                    let b = off.rem_euclid(8) as u32;
+                    let v = self.read_u8(addr)? as u64;
+                    self.cf = ((v >> b) & 1) == 1;
+                    match op2 {
+                        0xA3 => {}
+                        0xAB => self.write_u8(addr, (v | (1 << b)) as u8)?,
+                        0xB3 => self.write_u8(addr, (v & !(1 << b)) as u8)?,
+                        _ => self.write_u8(addr, (v ^ (1 << b)) as u8)?,
+                    }
                 }
                 self.rip = next;
                 return Ok(StepResult::Continue);
@@ -3542,6 +3588,68 @@ mod tests {
         assert_eq!(e.regs[11], 0x11);
         assert_eq!(e.regs[9], 0x11);
         assert_eq!(e.regs[8], 0x11);
+    }
+
+    #[test]
+    fn initial_rsp_in_stack_region() {
+        // RSP must start at the top of the dedicated stack region (below
+        // the heap and TEB), or deep stacks march down through TEB/heap
+        // (real rg startup did exactly that). The sentinel push leaves the
+        // standard entry invariant RSP%16==8.
+        let e = emu_with(&[0x90]);
+        assert_eq!(e.regs[4] % 16, 8);
+        assert!(e.regs[4] < e.teb_va());
+    }
+
+    #[test]
+    fn bt_family_reg() {
+        // bts rax,r9 (4C 0F AB C8): CF = old bit, then set.
+        let mut e = emu_with(&[0x4C, 0x0F, 0xAB, 0xC8]);
+        e.regs[0] = 0;
+        e.regs[9] = 5;
+        e.zf = true; // BT leaves ZF alone
+        e.step().unwrap();
+        assert_eq!(e.regs[0], 0x20);
+        assert!(!e.cf);
+        assert!(e.zf);
+        // bt edx,eax (0F A3 C2): test only.
+        let mut e = emu_with(&[0x0F, 0xA3, 0xC2]);
+        e.regs[2] = 0b1010;
+        e.regs[0] = 1;
+        e.step().unwrap();
+        assert_eq!(e.regs[2], 0b1010);
+        assert!(e.cf);
+        // btr edx,eax (0F B3 C2): CF = old bit, then clear.
+        let mut e = emu_with(&[0x0F, 0xB3, 0xC2]);
+        e.regs[2] = 0b1010;
+        e.regs[0] = 3;
+        e.step().unwrap();
+        assert_eq!(e.regs[2], 0b0010);
+        assert!(e.cf);
+        // btc edx,eax (0F BB C2): CF = old bit, then flip.
+        let mut e = emu_with(&[0x0F, 0xBB, 0xC2]);
+        e.regs[2] = 0b1010;
+        e.regs[0] = 1;
+        e.step().unwrap();
+        assert_eq!(e.regs[2], 0b1000);
+        assert!(e.cf);
+    }
+
+    #[test]
+    fn bts_mem_bitstring() {
+        // bts qword [rip+cell],rax: bit 9 sets byte1 bit1 (string form).
+        let cell = 32usize;
+        let mut code = vec![0x48, 0x0F, 0xAB, 0x05];
+        code.extend_from_slice(&rel32(0, 8, cell));
+        let mut e = emu_with(&code);
+        let base = BASE + 0x1000;
+        e.write_u8(base + cell as u64, 0).unwrap();
+        e.write_u8(base + cell as u64 + 1, 0).unwrap();
+        e.regs[0] = 9;
+        e.step().unwrap();
+        assert_eq!(e.read_u8(base + cell as u64).unwrap(), 0);
+        assert_eq!(e.read_u8(base + cell as u64 + 1).unwrap(), 0x02);
+        assert!(!e.cf);
     }
 
 }

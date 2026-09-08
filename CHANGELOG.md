@@ -97,3 +97,11 @@ All notable changes to this project will be documented in this file.
 - `guests/hashmap.rs` (`rust_hashmap.exe`): hand-rolled open-addressing map
   (FNV-1a, linear probing, growth/rehash, removal) passing `H1`-`H5`/`PASS`,
   with a CLI end-to-end test.
+- Fixed a stack-layout bug the real `rg.exe` exposed: `RSP` started at
+  top-of-memory so deep CRT startup marched down through the TEB page and
+  heap tail (clobbering the TLS slot array and faulting on a `-1` slot).
+  `RSP` now starts at the top of the dedicated 2MB stack region, with a unit
+  test pinning the entry invariant.
+- Emulator, trace-driven by real `rg.exe --help`: `BT`/`BTS`/`BTR`/`BTC`
+  `r/m,r` (`0F A3`/`AB`/`B3`/`BB`) with register masking and memory
+  bit-string addressing (only `CF` changes), plus unit tests for each form.
