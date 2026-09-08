@@ -813,3 +813,22 @@ fn test_art_exe_rust_alloc() {
     assert_eq!(code, 0, "stderr: {stderr}");
     assert_eq!(stdout, "A1\nA2\nA3\nA4\nA5\nPASS\n");
 }
+
+#[test]
+fn test_art_exe_rust_alloc_fs() {
+    // Real rustc-built guest (guests/alloc_fs.rs): format! + WinFS file
+    // write/read roundtrip with exact verification, then cleanup.
+    let bytes = std::fs::read(artifact("exe/rust_alloc_fs.exe")).unwrap();
+    let img = pe::load(&bytes).expect("rust guest must load");
+    for imp in img.imports.iter().chain(img.stubs.iter()) {
+        assert!(
+            pe::is_supported(&imp.dll, &imp.func),
+            "unsupported import in rust guest: {}!{}",
+            imp.dll,
+            imp.func
+        );
+    }
+    let (code, stdout, stderr) = run_cli(&artifact("exe/rust_alloc_fs.exe"));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "F1\nF2\nF3\nF4\nPASS\n");
+}

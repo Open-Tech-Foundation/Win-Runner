@@ -61,9 +61,10 @@ no mingw/xwin):
 ```
 
 This compiles `guests/*.rs` (`hello.rs`, `fs_selftest.rs`, `argv_echo.rs`,
-`lang.rs`, `fp.rs`, `alloc.rs`), links with `guests/kernel32.def` (exactly
-the supported API set — keep in sync with `pe::SUPPORTED_APIS`) plus the
-sysroot `alloc`/`core` rlibs (so `extern crate alloc`, bounds-check panics,
+`lang.rs`, `fp.rs`, `alloc.rs`, `alloc_fs.rs`; shared scaffold in
+`guests/support.rs`), links with `guests/kernel32.def` (exactly the supported
+API set — keep in sync with `pe::SUPPORTED_APIS`) plus the sysroot
+`alloc`/`core` rlibs (so `extern crate alloc`, bounds-check panics,
 and slice helpers resolve without CRT), and copies the results to
 `tests/artifacts/exe/rust_*.exe`. Guests are `no_std` self-tests: new rustc
 output not yet emulated fails with a clear `unsupported opcode` error, which

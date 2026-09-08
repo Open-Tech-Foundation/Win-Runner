@@ -934,7 +934,7 @@ impl Emu {
                 self.rip = next;
                 return Ok(StepResult::Continue);
             }
-            if matches!(op2, 0x10 | 0x11 | 0x28 | 0x29 | 0x57 | 0x6E | 0x6F | 0x7E | 0x7F | 0xEF) {
+            if matches!(op2, 0x10 | 0x11 | 0x28 | 0x29 | 0x57 | 0x6E | 0x6F | 0x7E | 0x7F | 0xDB | 0xDF | 0xEB | 0xEF) {
                 // Packed moves / xors. Bitwise only: no flags, no FP, no
                 // MXCSR, no alignment faulting (guests are compiler-aligned).
                 // A 0x66 prefix selects the unaligned/double/integer spellings
@@ -989,6 +989,24 @@ impl Emu {
                             self.read_u128(ea)?
                         };
                         self.xmm[reg] ^= b;
+                    }
+                    0xDB | 0xDF | 0xEB => {
+                        // PAND/PANDN/POR (66-mandatory; plain is MMX).
+                        if !opsz16 {
+                            return Err(format!(
+                                "unsupported MMX opcode 0F {op2:02X} at 0x{ip:016x}"
+                            ));
+                        }
+                        let b = if is_reg {
+                            self.xmm[rm]
+                        } else {
+                            self.read_u128(ea)?
+                        };
+                        self.xmm[reg] = match op2 {
+                            0xDB => self.xmm[reg] & b,
+                            0xDF => !self.xmm[reg] & b,
+                            _ => self.xmm[reg] | b,
+                        };
                     }
                     0x6E => {
                         // movd xmm, r/m32 (movq with REX.W); zero-extends
@@ -1635,13 +1653,50 @@ impl Emu {
                 self.rip = ip + off as u64 + 1;
                 Ok(StepResult::Continue)
             }
+            0x69 | 0x6B => {
+                // IMUL r, r/m, imm (demanded by real codegen). Truncated to
+                // width; CF=OF iff the full product doesn't fit signed width.
+                let (reg, is_reg, rm, ea_raw, ml) =
+                    self.decode_modrm(ip, off + 1, rex_r, rex_x, rex_b, true)?;
+                let (imm, imm_len): (i64, usize) = if op == 0x6B {
+                    (self.read_u8(ip + (off + 1 + ml) as u64)? as i8 as i64, 1)
+                } else {
+                    (
+                        self.read_u32(ip + (off + 1 + ml) as u64)? as i32 as i64,
+                        4,
+                    )
+                };
+                let next = ip + (off + 1 + ml + imm_len) as u64;
+                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let a = self.read_rm(is_reg, rm, ea, w)?;
+                let (trunc, of) = match w {
+                    64 => {
+                        let r = (a as i64 as i128) * (imm as i128);
+                        ((r as u64), r < i64::MIN as i128 || r > i64::MAX as i128)
+                    }
+                    32 => {
+                        let r = (a as u32 as i32 as i64) * imm;
+                        ((r as u32) as u64, r < i32::MIN as i64 || r > i32::MAX as i64)
+                    }
+                    _ => {
+                        let r = (a as u16 as i16 as i32) * (imm as i32);
+                        ((r as u16) as u64, r < i16::MIN as i32 || r > i16::MAX as i32)
+                    }
+                };
+                self.cf = of;
+                self.of = of;
+                self.zf = false;
+                self.sf = false;
+                self.write_rm(true, reg, 0, w, trunc)?;
+                self.rip = next;
+                Ok(StepResult::Continue)
+            }
             0x68 => {
                 let imm = self.read_u32(ip + off as u64 + 1)? as i32 as i64 as u64;
                 self.push_u64(imm)?;
                 self.rip = ip + off as u64 + 5;
                 Ok(StepResult::Continue)
-            }
-            0x6A => {
+            }            0x6A => {
                 let imm = self.read_u8(ip + off as u64 + 1)? as i8 as i64 as u64;
                 self.push_u64(imm)?;
                 self.rip = ip + off as u64 + 2;
@@ -2169,12 +2224,11 @@ impl Emu {
                 self.rip = next;
                 Ok(StepResult::Continue)
             }
-            0xC0 | 0xC1 | 0xD1 | 0xD3 => {
-                // Grp2 shifts/rotates (demanded by real binaries; RCL/RCR
-                // fail clearly until needed). OF semantics below are the
-                // standard 1-bit rules; count==0 leaves flags alone; rotates
-                // never touch ZF/SF.
-                let width: u32 = if op == 0xC0 { 8 } else { w };
+            0xC0 | 0xC1 | 0xD0 | 0xD1 | 0xD2 | 0xD3 => {
+                // Grp2 shifts/rotates with full RCL/RCR carry chaining.
+                // OF semantics below are the standard 1-bit rules;
+                // count==0 leaves flags alone; rotates never touch ZF/SF.
+                let width: u32 = if op == 0xC0 || op == 0xD0 { 8 } else { w };
                 if width == 16 {
                     return Err(format!("unsupported 16-bit shift at 0x{ip:016x}"));
                 }
@@ -2182,8 +2236,8 @@ impl Emu {
                     self.decode_modrm(ip, off + 1, rex_r, rex_x, rex_b, true)?;
                 let (count, imm_len) = match op {
                     0xC0 | 0xC1 => (self.read_u8(ip + (off + 1 + ml) as u64)? as u64, 1),
-                    0xD1 => (1, 0),
-                    _ => (self.regs[1], 0), // 0xD3: count in CL
+                    0xD0 | 0xD1 => (1, 0),
+                    _ => (self.regs[1], 0), // 0xD2/0xD3: count in CL
                 };
                 let next = ip + (off + 1 + ml + imm_len) as u64;
                 let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
@@ -2194,6 +2248,37 @@ impl Emu {
                 };
                 let a = self.read_rm(is_reg, rm, ea, width)? & mask;
                 let count = (if width == 64 { count & 63 } else { count & 31 }) as u32;
+                if reg_field == 2 || reg_field == 3 {
+                    // RCL/RCR with full carry chaining. ZF/SF/AF untouched.
+                    let mut v = a;
+                    let mut cf = self.cf;
+                    for _ in 0..count {
+                        if reg_field == 2 {
+                            let new_cf = ((v >> top) & 1) == 1;
+                            v = ((v << 1) & mask) | u64::from(cf);
+                            cf = new_cf;
+                        } else {
+                            let new_cf = (v & 1) == 1;
+                            v = (v >> 1) | ((cf as u64) << top);
+                            cf = new_cf;
+                        }
+                    }
+                    let res = v & mask;
+                    self.cf = cf;
+                    self.of = if count == 1 {
+                        if reg_field == 2 {
+                            ((res >> top) & 1 == 1) != self.cf
+                        } else {
+                            // documented approximation: MSB(orig) ^ MSB-1(orig)
+                            ((a >> top) & 1 == 1) != ((a >> (top - 1)) & 1 == 1)
+                        }
+                    } else {
+                        false
+                    };
+                    self.write_rm(is_reg, rm, ea, width, res)?;
+                    self.rip = next;
+                    return Ok(StepResult::Continue);
+                }
                 let res = match reg_field {
                     0 => {
                         // ROL
@@ -3298,4 +3383,44 @@ mod tests {
         assert_eq!(e.xmm[0], 0xFFF0_FFF0_FFF0_FFF0);
     }
 
+    fn run2(code: &[u8], steps: usize) -> Emu {
+        let mut e = emu_with(code);
+        for _ in 0..steps {
+            e.step().unwrap();
+        }
+        e
+    }
+    #[test]
+    fn rcl_carries() {
+        // stc; mov eax,0x80000000; rcl eax,1 -> 1, CF=1
+        let e = run2(&[0xF9, 0xB8, 0x00, 0x00, 0x00, 0x80, 0xC1, 0xD0, 0x01], 3);
+        assert_eq!(e.regs[0] & 0xFFFF_FFFF, 1);
+        assert!(e.cf);
+    }
+    #[test]
+    fn imul_imm() {
+        // mov eax,7; imul eax,eax,6 -> 42
+        let e = run2(
+            &[0xB8, 0x07, 0x00, 0x00, 0x00, 0x69, 0xC0, 0x06, 0x00, 0x00, 0x00],
+            2,
+        );
+        assert_eq!(e.regs[0] & 0xFFFF_FFFF, 42);
+        assert!(!e.cf);
+    }
+    #[test]
+    fn pand_family() {
+        // movdqu pattern via immediates is long; use rax/rbx + movq
+        // mov rax,0xFF00FF00FF00FF00; movq xmm0,rax
+        // mov rbx,0x0FF00FF00FF00FF0; movq xmm1,rbx; pand xmm0,xmm1
+        let mut code = vec![];
+        code.extend_from_slice(&[0x48, 0xB8]);
+        code.extend_from_slice(&0xFF00FF00FF00FF00u64.to_le_bytes());
+        code.extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, 0xC0]); // modrm C0: rm=rax
+        code.extend_from_slice(&[0x48, 0xBB]);
+        code.extend_from_slice(&0x0FF00FF00FF00FF0u64.to_le_bytes());
+        code.extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, 0xCB]); // modrm CB: rm=rbx
+        code.extend_from_slice(&[0x66, 0x0F, 0xDB, 0xC1]);
+        let e = run(&code, 5);
+        assert_eq!(e.xmm[0], 0x0F000F000F000F00);
+    }
 }

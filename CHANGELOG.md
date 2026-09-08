@@ -83,3 +83,8 @@ All notable changes to this project will be documented in this file.
   `alloc`/`core` rlibs + guest-provided `memcpy`/`memset`/`strlen`/
   `__chkstk`/`__CxxFrameHandler3` and the two toolchain-specific
   `__rustc::` alloc gates (loud link failure documents the coupling).
+- `guests/alloc_fs.rs` (`rust_alloc_fs.exe`): `format!` (width/precision/
+  float) + WinFS file write/read exact roundtrip + cleanup. Shared guest
+  scaffold extracted to `guests/support.rs`. Emulator additions demanded
+  along the way: `RCL`/`RCR` carry chains, 8-bit Grp2, 3-operand `IMUL`,
+  `PAND`/`PANDN`/`POR`.
