@@ -832,3 +832,23 @@ fn test_art_exe_rust_alloc_fs() {
     assert_eq!(code, 0, "stderr: {stderr}");
     assert_eq!(stdout, "F1\nF2\nF3\nF4\nPASS\n");
 }
+
+#[test]
+fn test_art_exe_rust_hashmap() {
+    // Real rustc-built guest (guests/hashmap.rs): hand-rolled open-addressing
+    // map (FNV-1a, linear probing, growth/rehash, removal). Exercises 8-bit
+    // high-byte register reads (AH/CH/DH/BH) in the hash loop.
+    let bytes = std::fs::read(artifact("exe/rust_hashmap.exe")).unwrap();
+    let img = pe::load(&bytes).expect("rust guest must load");
+    for imp in img.imports.iter().chain(img.stubs.iter()) {
+        assert!(
+            pe::is_supported(&imp.dll, &imp.func),
+            "unsupported import in rust guest: {}!{}",
+            imp.dll,
+            imp.func
+        );
+    }
+    let (code, stdout, stderr) = run_cli(&artifact("exe/rust_hashmap.exe"));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "H1a\nH1\nH2\nH3\nH4\nH5\nPASS\n");
+}

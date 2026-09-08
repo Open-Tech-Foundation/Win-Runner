@@ -98,6 +98,10 @@ pub struct Emu {
     pub gs_base: u64,
     /// Set while decoding an instruction with a GS override prefix.
     seg_gs: bool,
+    /// Whether the instruction currently being stepped has a REX prefix.
+    /// Needed for the 8-bit high-byte rule: without REX, indices 4-7 mean
+    /// AH/CH/DH/BH; with REX they mean SPL/BPL/SIL/DIL (low bytes).
+    cur_rex: bool,
     steps: u64,
 }
 
@@ -152,6 +156,7 @@ impl Emu {
             heap_next: heap_base,
             gs_base: 0,
             seg_gs: false,
+            cur_rex: false,
             steps: 0,
         };
         // Reserve stub addresses and patch IAT slots (real imports first,
@@ -546,10 +551,31 @@ impl Emu {
         Ok((reg, false, rm, ea, len))
     }
 
+    /// 8-bit register read honoring the no-REX high-byte rule: without a
+    /// REX prefix, indices 4-7 address AH/CH/DH/BH (bits 8-15 of regs 0-3);
+    /// with REX they address the low bytes (SPL/BPL/SIL/DIL, R8B-R15B).
+    fn read_r8(&self, idx: usize) -> u64 {
+        if !self.cur_rex && idx >= 4 {
+            (self.regs[idx - 4] >> 8) & 0xFF
+        } else {
+            self.regs[idx] & 0xFF
+        }
+    }
+
+    /// 8-bit register write honoring the no-REX high-byte rule (see above).
+    fn write_r8(&mut self, idx: usize, val: u64) {
+        if !self.cur_rex && idx >= 4 {
+            let b = idx - 4;
+            self.regs[b] = (self.regs[b] & !0xFF00) | ((val & 0xFF) << 8);
+        } else {
+            self.regs[idx] = (self.regs[idx] & !0xFF) | (val & 0xFF);
+        }
+    }
+
     fn read_rm(&self, is_reg: bool, rm: usize, ea: u64, width: u32) -> Result<u64, String> {
         if is_reg {
             Ok(match width {
-                8 => self.regs[rm] & 0xFF,
+                8 => self.read_r8(rm),
                 16 => self.regs[rm] & 0xFFFF,
                 32 => self.regs[rm] & 0xFFFF_FFFF,
                 64 => self.regs[rm],
@@ -570,7 +596,7 @@ impl Emu {
         if is_reg {
             match width {
                 8 => {
-                    self.regs[rm] = (self.regs[rm] & !0xFF) | (val & 0xFF);
+                    self.write_r8(rm, val);
                 }
                 16 => {
                     // 16-bit writes preserve the upper bits (no zero-extension)
@@ -661,7 +687,7 @@ impl Emu {
                 break;
             }
         }
-        let _ = rex_present;
+        self.cur_rex = rex_present;
         let op = self.read_u8(ip + off as u64)?;
         // REP is only meaningful on string ops (below), PAUSE (F3 90),
         // and the SSE-move aliases (F3 0F 10/11/...).
@@ -749,7 +775,7 @@ impl Emu {
                 };
                 let v = if is_reg {
                     if srcw == 8 {
-                        self.regs[rm] & 0xFF
+                        self.read_r8(rm)
                     } else {
                         // 16-bit register read: low 16 of reg (ignore REX subtleties)
                         self.regs[rm] & 0xFFFF
@@ -1194,8 +1220,7 @@ impl Emu {
                 self.rip = next;
                 return Ok(StepResult::Continue);
             }
-            if op2 == 0xC6 {
-                // SHUFPS (no prefix, 32-bit lanes) vs SHUFPD (0x66, 64-bit
+            if op2 == 0xC6 {                // SHUFPS (no prefix, 32-bit lanes) vs SHUFPD (0x66, 64-bit
                 // lanes: dest[63:0] = imm0 ? src : dst, same for high half).
                 // Bitwise only, no FP.
                 let shufpd = opsz16;
@@ -1365,7 +1390,8 @@ impl Emu {
                 let src = match width {
                     64 => self.regs[reg],
                     32 => self.regs[reg] & 0xFFFF_FFFF,
-                    _ => self.regs[reg] & 0xFF,
+                    16 => self.regs[reg] & 0xFFFF,
+                    _ => self.read_r8(reg),
                 };
                 let res = dst.wrapping_add(src) & mask;
                 self.set_add_flags(dst, src, res, width);
@@ -1395,7 +1421,8 @@ impl Emu {
                 let src = match width {
                     64 => self.regs[reg],
                     32 => self.regs[reg] & 0xFFFF_FFFF,
-                    _ => self.regs[reg] & 0xFF,
+                    16 => self.regs[reg] & 0xFFFF,
+                    _ => self.read_r8(reg),
                 };
                 let res = dst.wrapping_sub(acc) & mask;
                 self.set_sub_flags(dst, acc, res, width);
@@ -1705,7 +1732,7 @@ impl Emu {
             0xB0..=0xB7 => {
                 let r = (((rex_b as u8) << 3) | (op & 7)) as usize;
                 let imm = self.read_u8(ip + off as u64 + 1)?;
-                self.regs[r] = (self.regs[r] & !0xFF) | imm as u64;
+                self.write_r8(r, imm as u64);
                 self.rip = ip + off as u64 + 2;
                 Ok(StepResult::Continue)
             }
@@ -1805,12 +1832,12 @@ impl Emu {
                 match op {
                     0x88 => {
                         // mov r/m8, r8
-                        let v = self.regs[reg] & 0xFF;
+                        let v = self.read_r8(reg);
                         self.write_rm(is_reg, rm, ea, 8, v)?;
                     }
                     0x8A => {
                         let v = self.read_rm(is_reg, rm, ea, 8)?;
-                        self.regs[reg] = (self.regs[reg] & !0xFF) | v;
+                        self.write_r8(reg, v);
                     }
                     0x89 => {
                         let v = match width {
@@ -1853,7 +1880,7 @@ impl Emu {
                             64 => self.regs[reg],
                             32 => self.regs[reg] & 0xFFFF_FFFF,
                             16 => self.regs[reg] & 0xFFFF,
-                            _ => self.regs[reg] & 0xFF,
+                            _ => self.read_r8(reg),
                         };
                         let b = self.read_rm(is_reg, rm, ea, width)?;
                         let mask = match width {
@@ -1877,7 +1904,11 @@ impl Emu {
                             16 => 0xFFFF,
                             _ => 0xFF,
                         };
-                        let rv = self.regs[reg] & omask;
+                        let rv = if width == 8 {
+                            self.read_r8(reg)
+                        } else {
+                            self.regs[reg] & omask
+                        };
                         let mv = self.read_rm(is_reg, rm, ea, width)? & omask;
                         // Canonical operand order: (dest, src).
                         let (dst, src) = if to_rm { (mv, rv) } else { (rv, mv) };
@@ -2656,7 +2687,7 @@ impl Emu {
                 let b = match width {
                     64 => self.regs[reg],
                     32 => self.regs[reg] & 0xFFFF_FFFF,
-                    _ => self.regs[reg] & 0xFF,
+                    _ => self.read_r8(reg),
                 };
                 self.write_rm(is_reg, rm, ea, width, b)?;
                 self.write_rm(true, reg, 0, width, a)?;
@@ -3423,4 +3454,94 @@ mod tests {
         let e = run(&code, 5);
         assert_eq!(e.xmm[0], 0x0F000F000F000F00);
     }
+
+    #[test]
+    fn div64_basic() {
+        // xor edx,edx is 32-bit; build 64-bit dividend manually:
+        // mov rax,42; mov rcx,5; xor edx,edx would zero rdx... use:
+        // mov rax,42 (48 B8); mov rcx,5 (48 B9); mov rdx,0 (48 BA 0); div rcx (48 F7 F1)
+        let mut e = emu_with(&[
+            0x48, 0xB8, 0x2A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x48, 0xB9, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x48, 0xBA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x48, 0xF7, 0xF1,
+        ]);
+        for _ in 0..4 {
+            e.step().unwrap();
+        }
+        assert_eq!(e.regs[0], 8);
+        assert_eq!(e.regs[2], 2);
+    }
+
+    #[test]
+    fn high_byte_reg_read_no_rex() {
+        // movzx edx,bh (0F B6 D7, no REX): rm=7 means BH, not DIL.
+        // RDI low byte is 1 to catch the old mis-decode (read DIL).
+        let mut e = emu_with(&[0x0F, 0xB6, 0xD7]);
+        e.regs[3] = 0x1234;
+        e.regs[7] = 0xFF01;
+        e.step().unwrap();
+        assert_eq!(e.regs[2], 0x12);
+    }
+
+    #[test]
+    fn high_byte_reg_write_no_rex() {
+        // mov ah,0x42 (B4 42, no REX): writes bits 8-15 of RAX.
+        let mut e = emu_with(&[0xB4, 0x42]);
+        e.regs[0] = 0x1234;
+        e.step().unwrap();
+        assert_eq!(e.regs[0], 0x4234);
+    }
+
+    #[test]
+    fn low_byte_reg_read_with_rex() {
+        // movzx eax,sil (40 0F B6 C6): REX present, rm=6 means SIL.
+        let mut e = emu_with(&[0x40, 0x0F, 0xB6, 0xC6]);
+        e.regs[6] = 0xAB00;
+        e.step().unwrap();
+        assert_eq!(e.regs[0], 0x00);
+        let mut e = emu_with(&[0x40, 0x0F, 0xB6, 0xC6]);
+        e.regs[6] = 0xCDAB;
+        e.step().unwrap();
+        assert_eq!(e.regs[0], 0xAB);
+    }
+
+    #[test]
+    fn fnv_iter_with_high_byte() {
+        // Exact guest step that exposed the high-byte bug:
+        // movzx edx,bh; xor rdx,rax; imul rdx,r10 (FNV-1a byte step).
+        let mut e = emu_with(&[0x0F, 0xB6, 0xD7, 0x48, 0x31, 0xC2, 0x49, 0x0F, 0xAF, 0xD2]);
+        e.regs[3] = 0; // RBX=0, so BH=0
+        e.regs[7] = 1; // DIL=1: old code hashed 1 instead of BH=0
+        e.regs[0] = 0xaf63bd4c8601b7df;
+        e.regs[10] = 0x100000001b3;
+        for _ in 0..3 {
+            e.step().unwrap();
+        }
+        assert_eq!(e.regs[2], 0x8328807b4eb6fed);
+    }
+
+    #[test]
+    fn high_regs() {
+        // mov r8,0x11; mov r9,0x22; mov rax,r8; add rax,r9 -> 0x33
+        // mov r10,[rsp-8]? use stack slot via rbp? simpler: push/pop r12-r15
+        let mut e = emu_with(&[
+            0x41, 0xB8, 0x11, 0x00, 0x00, 0x00, // mov r8d,0x11
+            0x41, 0xB9, 0x22, 0x00, 0x00, 0x00, // mov r9d,0x22
+            0x4C, 0x89, 0xC0, // mov rax,r8
+            0x4C, 0x01, 0xC8, // add rax,r9
+            0x41, 0x50, // push r8
+            0x41, 0x5B, // pop r11
+            0x4D, 0x89, 0xD9, // mov r9,r11
+            0x4D, 0x8B, 0xC3, // mov r8,rbx?? no: REX.WRB, 8B C3 = mov r8,rbx? modrm C3: reg 000 rm 011 +REX.B -> r11? rm=8+3=11=r11, reg=0+REX.R(1<<3)=8=r8: mov r8,r11
+        ]);
+        for _ in 0..7 {
+            e.step().unwrap();
+        }
+        assert_eq!(e.regs[0], 0x33);
+        assert_eq!(e.regs[11], 0x11);
+        assert_eq!(e.regs[9], 0x11);
+        assert_eq!(e.regs[8], 0x11);
+    }
+
 }

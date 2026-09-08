@@ -64,3 +64,4 @@ build_guest lang.rs guest_entry rust_lang.exe
 build_guest fp.rs guest_entry rust_fp.exe
 build_guest alloc.rs guest_entry rust_alloc.exe
 build_guest alloc_fs.rs guest_entry rust_alloc_fs.exe
+build_guest hashmap.rs guest_entry rust_hashmap.exe

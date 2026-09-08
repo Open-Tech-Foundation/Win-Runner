@@ -88,3 +88,12 @@ All notable changes to this project will be documented in this file.
   scaffold extracted to `guests/support.rs`. Emulator additions demanded
   along the way: `RCL`/`RCR` carry chains, 8-bit Grp2, 3-operand `IMUL`,
   `PAND`/`PANDN`/`POR`.
+- Emulator 8-bit high-byte registers: without a REX prefix, indices 4-7
+  address `AH`/`CH`/`DH`/`BH` (the hashmap guest's FNV loop reads `BH` via
+  `movzx edx,bh`; the old code read `DIL` instead, silently corrupting
+  hashes). Central `read_r8`/`write_r8` helpers cover `movzx`/`movsx`,
+  `mov r/m8,r8`, `SETcc`, `XADD`/`CMPXCHG`/`XCHG`, `TEST`, `mov r8,imm8`
+  and the generic ALU group, with unit tests for each direction.
+- `guests/hashmap.rs` (`rust_hashmap.exe`): hand-rolled open-addressing map
+  (FNV-1a, linear probing, growth/rehash, removal) passing `H1`-`H5`/`PASS`,
+  with a CLI end-to-end test.
