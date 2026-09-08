@@ -126,3 +126,8 @@ All notable changes to this project will be documented in this file.
   package run; guest output streams, errors print and continue, `exit`/`quit`
   (Ctrl-D) ends with the last code. Unit-tested dispatch plus a piped-stdin
   end-to-end test (offline install + run + shared files).
+- PS1 text pipelines and download-and-run: `a | b` feeds captured text to
+  the next command, `irm`/`Invoke-RestMethod` GETs a URL via host curl, and
+  `iex`/`Invoke-Expression` runs text as code in the same session (nesting
+  capped). Unit-tested offline; `irm <url> | iex` is the entry pattern real
+  installer scripts use.

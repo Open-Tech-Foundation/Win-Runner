@@ -2,26 +2,39 @@
 //!
 //! Implements only: New-Item, Set-Content, Add-Content, Get-Content,
 //! Get-ChildItem, Remove-Item, Copy-Item, Move-Item, Test-Path
-//! (+ Write-Host/Write-Output/echo as pass-through for scripts).
+//! (+ Write-Host/Write-Output/echo as pass-through for scripts),
+//! text pipelines (`a | b`, fed as text), Invoke-RestMethod (`irm`,
+//! HTTPS GET via host curl), and Invoke-Expression (`iex`, runs text
+//! as code in the same session).
 //! All operations go through the exact same [`WinFs`](crate::winfs::WinFs) API
 //! that the EXE shims use.
 
 use crate::winfs::WinFs;
 use std::collections::HashMap;
 
+/// Max nested Invoke-Expression depth (a script executing itself would
+/// otherwise recurse until the host stack overflows).
+const MAX_IEX_DEPTH: usize = 32;
+
 /// Run a `.ps1` script. Returns exit code (0 ok). Output is appended to `out`.
 pub fn run_ps1(fs: &mut WinFs, script: &str, out: &mut Vec<u8>) -> Result<i32, String> {
-    let interp = Interpreter { fs, out };
+    let interp = Interpreter { fs, out, depth: 0 };
     interp.run(script)
 }
 
 struct Interpreter<'a> {
     fs: &'a mut WinFs,
     out: &'a mut Vec<u8>,
+    depth: usize,
 }
 
 impl<'a> Interpreter<'a> {
     fn run(mut self, script: &str) -> Result<i32, String> {
+        self.run_code(script)?;
+        Ok(0)
+    }
+
+    fn run_code(&mut self, script: &str) -> Result<(), String> {
         // Split into statements on newlines and top-level ';'
         let mut code = String::new();
         for line in script.lines() {
@@ -34,9 +47,38 @@ impl<'a> Interpreter<'a> {
             if stmt.is_empty() {
                 continue;
             }
-            self.exec_statement(stmt)?;
+            self.run_pipeline(stmt)?;
         }
-        Ok(0)
+        Ok(())
+    }
+
+    /// Run `a | b | c`: each segment's captured output feeds the next as
+    /// text; only the last segment's output reaches the session. Only
+    /// Invoke-Expression consumes piped input for now; other commands run
+    /// normally and ignore it.
+    fn run_pipeline(&mut self, stmt: &str) -> Result<(), String> {
+        let segments = split_pipeline(stmt)?;
+        if segments.len() == 1 {
+            return self.exec_statement(stmt, None);
+        }
+        let mut input: Option<String> = None;
+        for (i, seg) in segments.iter().enumerate() {
+            let mut buf = Vec::new();
+            {
+                let mut sub = Interpreter {
+                    fs: &mut *self.fs,
+                    out: &mut buf,
+                    depth: self.depth,
+                };
+                sub.exec_statement(seg, input.as_deref())?;
+            }
+            if i + 1 == segments.len() {
+                self.out.extend_from_slice(&buf);
+            } else {
+                input = Some(String::from_utf8_lossy(&buf).into_owned());
+            }
+        }
+        Ok(())
     }
 
     fn emit(&mut self, s: &str) {
@@ -44,7 +86,7 @@ impl<'a> Interpreter<'a> {
         self.out.push(b'\n');
     }
 
-    fn exec_statement(&mut self, stmt: &str) -> Result<(), String> {
+    fn exec_statement(&mut self, stmt: &str, pipe_in: Option<&str>) -> Result<(), String> {
         let args = tokenize(stmt)?;
         if args.is_empty() {
             return Ok(());
@@ -66,8 +108,42 @@ impl<'a> Interpreter<'a> {
                 self.emit(&positional.join(" "));
                 Ok(())
             }
+            "irm" | "invoke-restmethod" => self.cmd_irm(rest),
+            "iex" | "invoke-expression" => self.cmd_iex(rest, pipe_in),
             _ => Err(format!("unknown command: {}", args[0])),
         }
+    }
+
+    /// Invoke-RestMethod: HTTPS GET via host curl, response text to output.
+    fn cmd_irm(&mut self, args: &[String]) -> Result<(), String> {
+        let (named, positional) = parse_params(args, &["uri"])?;
+        let url = named
+            .get("uri")
+            .cloned()
+            .or_else(|| positional.first().cloned())
+            .ok_or_else(|| "usage: irm <url>".to_string())?;
+        let text = crate::install::fetch_url(&url, 120)
+            .map_err(|e| format!("irm: {e}"))?;
+        self.out.extend_from_slice(&text);
+        Ok(())
+    }
+
+    /// Invoke-Expression: run text as code in this session (same filesystem).
+    /// Prefers an argument; otherwise consumes piped input.
+    fn cmd_iex(&mut self, args: &[String], pipe_in: Option<&str>) -> Result<(), String> {
+        let (_, positional) = parse_params(args, &[])?;
+        let code = positional
+            .first()
+            .cloned()
+            .or_else(|| pipe_in.map(str::to_string))
+            .ok_or_else(|| "usage: iex <script>".to_string())?;
+        if self.depth + 1 > MAX_IEX_DEPTH {
+            return Err("iex: max nesting depth exceeded".to_string());
+        }
+        self.depth += 1;
+        let r = self.run_code(&code);
+        self.depth -= 1;
+        r
     }
 
     fn cmd_new_item(&mut self, args: &[String]) -> Result<(), String> {
@@ -349,6 +425,39 @@ fn split_statements(code: &str) -> Vec<String> {
     stmts
 }
 
+/// Split one statement into top-level `|` pipeline segments (quote-aware).
+/// Errors on empty segments so `| foo` / `foo |` fail clearly.
+fn split_pipeline(stmt: &str) -> Result<Vec<String>, String> {
+    let mut segs = Vec::new();
+    let mut cur = String::new();
+    let mut sq = false;
+    let mut dq = false;
+    for c in stmt.chars() {
+        match c {
+            '\'' if !dq => {
+                sq = !sq;
+                cur.push(c);
+            }
+            '"' if !sq => {
+                dq = !dq;
+                cur.push(c);
+            }
+            '|' if !sq && !dq => {
+                if cur.trim().is_empty() {
+                    return Err("empty command in pipeline".to_string());
+                }
+                segs.push(std::mem::take(&mut cur));
+            }
+            _ => cur.push(c),
+        }
+    }
+    if cur.trim().is_empty() {
+        return Err("empty command in pipeline".to_string());
+    }
+    segs.push(cur);
+    Ok(segs)
+}
+
 /// Tokenize respecting single/double quotes (quotes removed).
 fn tokenize(s: &str) -> Result<Vec<String>, String> {
     let mut toks = Vec::new();
@@ -441,5 +550,83 @@ fn parent_of(path: &str) -> Option<String> {
             }
         }
         None => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::winfs::WinFs;
+
+    fn run(script: &str) -> (i32, Vec<u8>, Result<i32, String>) {
+        let mut fs = WinFs::new();
+        let mut out = Vec::new();
+        let r = run_ps1(&mut fs, script, &mut out);
+        let code = match &r {
+            Ok(c) => *c,
+            Err(_) => -1,
+        };
+        (code, out, r)
+    }
+
+    #[test]
+    fn pipe_into_iex_executes_text() {
+        let (_, out, r) = run("echo 'Write-Host piped-hi' | iex");
+        assert!(r.is_ok());
+        assert_eq!(out, b"piped-hi\n");
+    }
+
+    #[test]
+    fn iex_arg_executes() {
+        let (_, out, r) = run("iex 'echo from-arg'");
+        assert!(r.is_ok());
+        assert_eq!(out, b"from-arg\n");
+    }
+
+    #[test]
+    fn iex_needs_code() {
+        let (_, _, r) = run("iex");
+        assert!(r.unwrap_err().contains("usage"));
+    }
+
+    #[test]
+    fn empty_pipeline_segment_fails() {
+        assert!(run("| echo hi").2.is_err());
+        assert!(run("echo hi |").2.is_err());
+    }
+
+    #[test]
+    fn iex_nesting_ok_and_capped() {
+        // Two levels nest with alternating quotes.
+        let (_, out, r) = run("iex 'iex \"echo L2\"'");
+        assert!(r.is_ok());
+        assert_eq!(out, b"L2\n");
+        // The depth cap itself, driven directly (textual nesting past
+        // two levels needs escape syntax the tokenizer lacks).
+        fn try_at_depth(depth: usize) -> Result<(), String> {
+            let mut fs = WinFs::new();
+            let mut out = Vec::new();
+            let mut interp = Interpreter {
+                fs: &mut fs,
+                out: &mut out,
+                depth,
+            };
+            interp.cmd_iex(&["echo hi".to_string()], None).map(|_| ())
+        }
+        assert!(try_at_depth(31).is_ok());
+        assert!(try_at_depth(32).unwrap_err().contains("depth"));
+    }
+
+    #[test]
+    fn irm_needs_url() {
+        let (_, _, r) = run("irm");
+        assert!(r.unwrap_err().contains("usage"));
+    }
+
+    #[test]
+    fn irm_failed_fetch_is_an_error() {
+        // Discard port on loopback: refused fast, no DNS, no network.
+        let (_, _, r) = run("irm http://127.0.0.1:9/nope");
+        assert!(r.is_err());
     }
 }

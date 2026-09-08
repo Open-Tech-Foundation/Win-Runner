@@ -28,7 +28,7 @@ src/winapi/  Win32 shims: ExitProcess, GetStdHandle, WriteFile,
              ReadConsoleW
 src/ps1/     minimal interpreter: New-Item, Set-Content, Add-Content,
              Get-Content, Get-ChildItem, Remove-Item, Copy-Item,
-             Move-Item, Test-Path
+             Move-Item, Test-Path, text pipelines (|), irm, iex
 tests/artifacts/  committed test artifacts (see below)
 ```
 
