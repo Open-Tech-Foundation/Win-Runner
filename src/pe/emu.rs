@@ -899,6 +899,38 @@ impl Emu {
                 self.rip = next;
                 return Ok(StepResult::Continue);
             }
+            if opsz16 && matches!(op2, 0x58 | 0x59 | 0x5C | 0x5E) {
+                // Packed-double family (66-mandatory): ADDPD/MULPD/SUBPD/
+                // DIVPD. Per-lane host f64 ops, bit-identical under the
+                // default MXCSR (same rationale as the scalar-double arm).
+                // No flags. Plain (packed-single) and F3 (scalar-single)
+                // spellings keep failing clearly below/above.
+                let (reg, is_reg, rm, ea_raw, ml) =
+                    self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
+                let next = ip + (off + 2 + ml) as u64;
+                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let a = self.xmm[reg].to_le_bytes();
+                let b: [u8; 16] = if is_reg {
+                    self.xmm[rm].to_le_bytes()
+                } else {
+                    self.read_u128(ea)?.to_le_bytes()
+                };
+                let mut o = [0u8; 16];
+                for i in 0..2 {
+                    let x = f64::from_le_bytes(a[8 * i..8 * i + 8].try_into().unwrap());
+                    let y = f64::from_le_bytes(b[8 * i..8 * i + 8].try_into().unwrap());
+                    let r = match op2 {
+                        0x58 => x + y,
+                        0x59 => x * y,
+                        0x5C => x - y,
+                        _ => x / y,
+                    };
+                    o[8 * i..8 * i + 8].copy_from_slice(&r.to_le_bytes());
+                }
+                self.xmm[reg] = u128::from_le_bytes(o);
+                self.rip = next;
+                return Ok(StepResult::Continue);
+            }
             if op2 == 0x2E {
                 // UCOMISD xmm, xmm/m64 (66-mandatory; plain is single-prec).
                 if !opsz16 {
@@ -3706,8 +3738,43 @@ mod tests {
     }
 
     #[test]
+    fn subpd_addpd() {
+        // Packed-double lanes, bit-identical via host f64 ops.
+        let pack = |lo: f64, hi: f64| ((hi.to_bits() as u128) << 64) | lo.to_bits() as u128;
+        let unpack = |v: u128| {
+            (
+                f64::from_bits(v as u64),
+                f64::from_bits((v >> 64) as u64),
+            )
+        };
+        // subpd xmm0,xmm7 (66 0F 5C C7).
+        let mut e = emu_with(&[0x66, 0x0F, 0x5C, 0xC7]);
+        e.xmm[0] = pack(1.5, 2.5);
+        e.xmm[7] = pack(0.5, 0.25);
+        e.step().unwrap();
+        assert_eq!(unpack(e.xmm[0]), (1.0, 2.25));
+        // NaN propagates per IEEE (inf - inf).
+        let mut e = emu_with(&[0x66, 0x0F, 0x5C, 0xC7]);
+        e.xmm[0] = pack(f64::INFINITY, 1.0);
+        e.xmm[7] = pack(f64::INFINITY, 0.0);
+        e.step().unwrap();
+        let (lo, hi) = unpack(e.xmm[0]);
+        assert!(lo.is_nan());
+        assert_eq!(hi, 1.0);
+        // addpd xmm0,[rip+cell] (66 0F 58 05 disp): mem form.
+        let cell = 64usize;
+        let mut code = vec![0x66, 0x0F, 0x58, 0x05];
+        code.extend_from_slice(&rel32(0, 8, cell));
+        let mut e = emu_with(&code);
+        e.write_u128(BASE + 0x1000 + cell as u64, pack(0.5, 0.25))
+            .unwrap();
+        e.xmm[0] = pack(1.5, 2.5);
+        e.step().unwrap();
+        assert_eq!(unpack(e.xmm[0]), (2.0, 2.75));
+    }
+
+    #[test]
     fn unpcklps_reg() {
-        // unpcklps xmm0,xmm6 (0F 14 C6): [d0,s0,d2,s2] lanes.
         let mut e = emu_with(&[0x0F, 0x14, 0xC6]);
         e.xmm[0] = u128::from_le_bytes([
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,

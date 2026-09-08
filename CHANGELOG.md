@@ -111,3 +111,7 @@ All notable changes to this project will be documented in this file.
 - Emulator, trace-driven by real `rg.exe --help`: `UNPCKLPS xmm,xmm/m128`
   (`0F 14`, low-lane interleave) with a unit test; prefixed spellings fail
   clearly.
+- Emulator, trace-driven by real `rg.exe --help`: packed double
+  `ADDPD`/`MULPD`/`SUBPD`/`DIVPD` (`66 0F 58`/`59`/`5C`/`5E`, per-lane host
+  `f64`, bit-identical) with unit tests for reg and mem forms plus NaN
+  propagation.
