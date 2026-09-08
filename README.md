@@ -8,6 +8,7 @@ or host filesystem backing.
 wincli app.exe [args...]  # minimal x86_64 PE execution (PE32+, native console apps)
 wincli rg --version       # cached package by bare name (or C:\bin\rg.exe)
 wincli script.ps1         # minimal PowerShell-like script execution
+wincli shell              # interactive shell: one in-memory WinFS per session
 wincli inspect app.exe    # PE compatibility report: supported vs missing imports
 ```
 
@@ -81,6 +82,20 @@ if the toolchain changes.
 ```bash
 cargo test   # unit tests + CLI end-to-end tests against tests/artifacts/
 ```
+
+## Interactive shell
+
+```bash
+wincli shell
+```
+
+One in-memory WinFS for the whole session (files created by one command
+are visible to the next). Each line is a PS1 statement, `install`/`inspect`,
+a host `.exe`/`.ps1` file, or a cached package with args — so `install rg`
+followed by `rg --version` works in one session. Errors print as
+`wincli: ...` without ending the session; `exit`/`quit` (or Ctrl-D) ends it
+with the last guest exit code. The prompt goes to stderr, keeping stdout
+clean for pipes.
 
 ## Packages
 

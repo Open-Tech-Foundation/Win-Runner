@@ -852,3 +852,64 @@ fn test_art_exe_rust_hashmap() {
     assert_eq!(code, 0, "stderr: {stderr}");
     assert_eq!(stdout, "H1a\nH1\nH2\nH3\nH4\nH5\nPASS\n");
 }
+
+// ---------- interactive shell (piped stdin, no network) ----------
+
+fn run_shell_env(input: &str, envs: &[(&str, &str)]) -> (i32, String, String) {
+    use std::io::Write;
+    let bin = env!("CARGO_BIN_EXE_wincli");
+    let mut child = std::process::Command::new(bin)
+        .arg("shell")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .envs(envs.iter().copied())
+        .spawn()
+        .expect("spawn wincli shell");
+    child
+        .stdin
+        .take()
+        .expect("shell stdin")
+        .write_all(input.as_bytes())
+        .expect("write shell input");
+    let output = child.wait_with_output().expect("wait shell");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+#[test]
+fn test_shell_install_run_session_offline() {
+    let cache = isolated_cache("shell");
+    let src = artifact("packages").to_string_lossy().to_string();
+    let cc = cache.to_string_lossy().to_string();
+    let envs = [
+        ("WINCLI_CACHE", cc.as_ref()),
+        ("WINCLI_SOURCE", src.as_ref()),
+    ];
+    // One session: install, run the package, share PS1 files across lines.
+    let input = "install demo\ndemo\nNew-Item C:\\shell-t.txt -Value hi\nGet-Content C:\\shell-t.txt\nexit\n";
+    let (code, stdout, stderr) = run_shell_env(input, &envs);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("Installed demo 0.1.0 → C:\\bin\\demo.exe"), "stdout: {stdout}");
+    assert!(stdout.contains("demo 0.1.0"), "stdout: {stdout}");
+    assert!(stdout.ends_with("hi\n"), "stdout: {stdout}");
+    assert!(cache.join("pkgs").join("demo.exe").is_file());
+    std::fs::remove_dir_all(&cache).ok();
+}
+
+#[test]
+fn test_shell_unknown_and_bad_exit() {
+    let cache = isolated_cache("shell-err");
+    let cc = cache.to_string_lossy().to_string();
+    let (code, stdout, stderr) = run_shell_env("frobnicate\nexit abc\n", &[("WINCLI_CACHE", cc.as_ref())]);
+    // Errors print and the shell continues; a bad exit code is an error,
+    // EOF ends the session cleanly.
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.is_empty(), "stdout: {stdout}");
+    assert!(stderr.contains("install frobnicate"), "stderr: {stderr}");
+    assert!(stderr.contains("exit: bad code"), "stderr: {stderr}");
+    std::fs::remove_dir_all(&cache).ok();
+}

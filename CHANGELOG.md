@@ -121,3 +121,8 @@ All notable changes to this project will be documented in this file.
   promoted from fail-stub to supported with a builder-probe test. Minimal
   zeroed `PEB_LDR_DATA` so loader-bit checks see genuine values.
   `CVTSI2SD` (`F2 0F 2A`) joined the scalar-double arm along the way.
+- `wincli shell`: interactive session with one WinFS. Each line is a PS1
+  statement, `install`/`inspect`, a host `.exe`/`.ps1` file, or a cached
+  package run; guest output streams, errors print and continue, `exit`/`quit`
+  (Ctrl-D) ends with the last code. Unit-tested dispatch plus a piped-stdin
+  end-to-end test (offline install + run + shared files).
