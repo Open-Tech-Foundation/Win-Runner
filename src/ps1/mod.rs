@@ -22,7 +22,11 @@
 //! too). String methods cover case, trim, replace, split (arrays,
 //! indexable), and starts/ends/contains. Static .NET calls cover
 //! `[Environment]` get/set (session-local), `[Guid]::NewGuid` (v4),
-//! and `[regex]::Escape`.
+//! and `[regex]::Escape`. JSON parses to nested values (canonical
+//! round-trip); pipelines carry `ForEach-Object`/`%`, `Where-Object` /
+//! `where`/`?` (conditions), and `Select-Object -First` over text or
+//! JSON lines with `$_` binding; `-match` runs a documented regex
+//! subset; `(...)` groups evaluate capturing output.
 //! `try`/`catch`/`finally` run the first error handler with `finally`
 //! always executing (its own signal wins). Console/script output flushes
 //! before errors report.
@@ -62,12 +66,13 @@ enum Flow {
     Continue,
 }
 
-/// A variable value: plain string, string array, or string-keyed map.
-/// Maps and arrays render space-joined/empty in string context.
-#[derive(Clone)]
+/// A variable value: plain string, array (possibly nested, e.g. parsed
+/// JSON), or string-keyed map. Arrays render space-joined in string
+/// context (PowerShell `$OFS` default).
+#[derive(Clone, PartialEq, Debug)]
 pub enum Value {
     Str(String),
-    Arr(Vec<String>),
+    Arr(Vec<Value>),
     Map(HashMap<String, Value>),
 }
 
@@ -169,7 +174,7 @@ impl<'a> Interpreter<'a> {
                     AssignOp::Append => {
                         let elems = match lines_value(lines) {
                             Value::Str(s) if s.is_empty() => Vec::new(),
-                            Value::Str(s) => vec![s],
+                            Value::Str(s) => vec![Value::Str(s)],
                             Value::Arr(a) => a,
                             Value::Map(_) => {
                                 return Err("cannot append a hashtable".to_string());
@@ -417,6 +422,12 @@ impl<'a> Interpreter<'a> {
             if op == "-ne" {
                 return Ok(args[0].to_lowercase() != args[2].to_lowercase());
             }
+            if op == "-match" {
+                return regex_match(&args[2], &args[0]);
+            }
+            if op == "-notmatch" {
+                return Ok(!regex_match(&args[2], &args[0])?);
+            }
             return Err(format!("{} is not supported in conditions", args[1]));
         }
         Err(format!("cannot evaluate condition: {}", args.join(" ")))
@@ -467,7 +478,7 @@ impl<'a> Interpreter<'a> {
     /// scalar. (Callers route `@(...)` to eval_array first.)
     fn resolve_operand_values(&mut self, tok: &Token) -> Result<Vec<String>, String> {
         if let Some(Value::Arr(a)) = self.var_value(&tok.text()).cloned() {
-            return Ok(a);
+            return Ok(a.iter().map(value_string).collect());
         }
         Ok(vec![self.expand_token(tok)?])
     }
@@ -535,6 +546,15 @@ impl<'a> Interpreter<'a> {
             if kw == "function" {
                 return self.cmd_function_def(stmt);
             }
+            if kw == "foreach-object" || kw == "%" {
+                return self.cmd_foreach_object(stmt, pipe_in);
+            }
+            if kw == "where-object" || kw == "where" || kw == "?" {
+                return self.cmd_where_object(stmt, pipe_in);
+            }
+            if kw == "select-object" || kw == "select" {
+                return self.cmd_select_object(stmt, pipe_in);
+            }
         }
         // `[Type]::Method(...)` as a whole statement: evaluate, emit
         // non-void results.
@@ -545,6 +565,24 @@ impl<'a> Interpreter<'a> {
             if let Some(v) = self.eval_static(&typ, &method, &inner)? {
                 self.emit(&v);
             }
+            return Ok(Flow::Next);
+        }
+        // `(...)` grouping: evaluate capturing output here.
+        if stmt.trim_start().starts_with('(') {
+            let (inner, rest) = take_wrapped(stmt.trim_start(), '(', ')')?;
+            if !rest.trim().is_empty() {
+                return Err("unexpected text after (...)".to_string());
+            }
+            let mut buf = Vec::new();
+            let flow = {
+                let mut sub = self.sub(&mut buf);
+                sub.run_code(&inner)
+            };
+            match flow? {
+                Flow::Next => {}
+                f => return Ok(f),
+            }
+            self.out.extend_from_slice(&buf);
             return Ok(Flow::Next);
         }
         // `$x = switch ... {...}` assigns the switch output.
@@ -654,8 +692,158 @@ impl<'a> Interpreter<'a> {
             .ok_or_else(|| "usage: irm <url>".to_string())?;
         let text = crate::install::fetch_url(&url, 120)
             .map_err(|e| format!("irm: {e}"))?;
+        // Like the real cmdlet, JSON bodies arrive parsed: arrays flow
+        // one element per line (JSON Lines), anything else one line.
+        // Anything unparseable flows as raw text (scripts depend on it).
+        let body = String::from_utf8_lossy(&text);
+        let trimmed = body.trim_start();
+        if trimmed.starts_with('{') || trimmed.starts_with('[') {
+            if let Ok(v) = parse_json(trimmed) {
+                match v {
+                    Value::Arr(items) => {
+                        for item in &items {
+                            self.out.extend_from_slice(render_json(item).as_bytes());
+                            self.out.push(b'\n');
+                        }
+                        return Ok(());
+                    }
+                    other => {
+                        self.out.extend_from_slice(render_json(&other).as_bytes());
+                        self.out.push(b'\n');
+                        return Ok(());
+                    }
+                }
+            }
+        }
         self.out.extend_from_slice(&text);
         Ok(())
+    }
+
+    /// `ForEach-Object { body }` / `%`: run the body per input item with
+    /// `$_` bound (JSON arrays enumerate their elements), collecting
+    /// output. `$_` restores afterwards. Loop signals propagate.
+    fn cmd_foreach_object(&mut self, stmt: &str, pipe_in: Option<&str>) -> Result<Flow, String> {
+        let body = Self::scriptblock_arg(stmt, "foreach-object")?;
+        let Some(input) = pipe_in else {
+            return Ok(Flow::Next);
+        };
+        let saved = self.vars.get("_").cloned();
+        for (_, item) in pipe_items(input) {
+            self.vars.insert("_".to_string(), item);
+            match self.run_code(&body)? {
+                Flow::Next => {}
+                f => {
+                    Self::restore_under(&mut self.vars, saved.clone());
+                    return Ok(f);
+                }
+            }
+        }
+        Self::restore_under(&mut self.vars, saved);
+        Ok(Flow::Next)
+    }
+
+    /// `Where-Object { cond }` / `where`: pass items whose condition holds.
+    /// Conditions only (`-match` included); general bodies come later.
+    fn cmd_where_object(&mut self, stmt: &str, pipe_in: Option<&str>) -> Result<Flow, String> {
+        let body = Self::scriptblock_arg(stmt, "where-object")?;
+        let Some(input) = pipe_in else {
+            return Ok(Flow::Next);
+        };
+        let saved = self.vars.get("_").cloned();
+        for (display, item) in pipe_items(input) {
+            self.vars.insert("_".to_string(), item);
+            let keep = self.eval_cond(&body)?;
+            if keep {
+                self.emit(&display);
+            }
+        }
+        Self::restore_under(&mut self.vars, saved);
+        Ok(Flow::Next)
+    }
+
+    /// `Select-Object -First N` / `select`: pass the first N input lines.
+    /// Other selections fail clearly for now.
+    fn cmd_select_object(&mut self, stmt: &str, pipe_in: Option<&str>) -> Result<Flow, String> {
+        let tail = Self::select_tail(stmt)?;
+        let mut first: Option<usize> = None;
+        let mut it = tail.split_whitespace().peekable();
+        while let Some(tok) = it.next() {
+            if tok.eq_ignore_ascii_case("-first") {
+                let n = it
+                    .next()
+                    .ok_or_else(|| "Select-Object -First needs a number".to_string())?;
+                first = Some(
+                    n.parse::<usize>()
+                        .map_err(|_| "Select-Object -First needs a number".to_string())?,
+                );
+            } else {
+                return Err(format!("Select-Object {tok} is not supported (only -First)"));
+            }
+        }
+        let n = first.ok_or_else(|| "Select-Object needs -First N".to_string())?;
+        let Some(input) = pipe_in else {
+            return Ok(Flow::Next);
+        };
+        for (display, _) in pipe_items(input).into_iter().take(n) {
+            self.emit(&display);
+        }
+        Ok(Flow::Next)
+    }
+
+    /// Restore `$_` after a pipeline cmdlet (absent stays absent).
+    fn restore_under(vars: &mut HashMap<String, Value>, saved: Option<Value>) {
+        match saved {
+            Some(v) => {
+                vars.insert("_".to_string(), v);
+            }
+            None => {
+                vars.remove("_");
+            }
+        }
+    }
+
+    /// Extract the `{...}` scriptblock argument (bare or `-Process` /
+    /// `-FilterScript` named). Errors clearly otherwise.
+    fn scriptblock_arg(stmt: &str, _cmd: &str) -> Result<String, String> {
+        // Drop the command word: up to first whitespace (the word itself
+        // has no spaces).
+        let t = stmt.trim_start();
+        let end = t.find(char::is_whitespace).unwrap_or(t.len());
+        let mut rest = t[end..].trim_start();
+        // Optional `-Process` / `-FilterScript` name.
+        for name in ["-process", "-filterscript"] {
+            if rest.len() > name.len()
+                && rest[..name.len()].eq_ignore_ascii_case(name)
+                && rest[name.len()..].starts_with(char::is_whitespace)
+            {
+                rest = rest[name.len()..].trim_start();
+                break;
+            }
+        }
+        if !rest.starts_with('{') {
+            return Err("a scriptblock { ... } is required".to_string());
+        }
+        let (body, rest2) = take_wrapped(rest, '{', '}')?;
+        if !rest2.trim().is_empty() {
+            return Err("unexpected text after scriptblock".to_string());
+        }
+        Ok(body)
+    }
+
+    /// Tail text after the `select`/`select-object` command word.
+    fn select_tail(stmt: &str) -> Result<&str, String> {
+        let t = stmt.trim_start();
+        let lower = t.to_lowercase();
+        for kw in ["select-object", "select"] {
+            if lower.starts_with(kw) {
+                match t[kw.len()..].chars().next() {
+                    None => return Ok(""),
+                    Some(c) if c.is_whitespace() => return Ok(t[kw.len()..].trim_start()),
+                    _ => {}
+                }
+            }
+        }
+        Err("cannot parse Select-Object".to_string())
     }
 
     /// Invoke-Expression: run text as code in this session (same filesystem).
@@ -695,7 +883,7 @@ impl<'a> Interpreter<'a> {
             AssignOp::Append => {
                 let elems = match &v {
                     Value::Str(s) if s.is_empty() => Vec::new(),
-                    Value::Str(s) => vec![s.clone()],
+                    Value::Str(s) => vec![Value::Str(s.clone())],
                     Value::Arr(a) => a.clone(),
                     Value::Map(_) => {
                         return Err("cannot append a hashtable".to_string());
@@ -719,7 +907,7 @@ impl<'a> Interpreter<'a> {
             .join(" ");
         let t = joined.trim_start();
         if t.starts_with("@(") {
-            return Ok((Value::Arr(self.eval_array(&joined)?), Flow::Next));
+            return Ok((Value::Arr(self.eval_array(&joined)?.into_iter().map(Value::Str).collect()), Flow::Next));
         }
         let nospace: String = t.chars().filter(|c| !c.is_whitespace()).collect();
         if nospace == "@{}" {
@@ -771,6 +959,30 @@ impl<'a> Interpreter<'a> {
                 return Ok((lines_value(lines), Flow::Next));
             }
         }
+        // `(...)` value (single token or spanning tokens): evaluate
+        // capturing output into lines.
+        {
+            let t = joined.trim_start();
+            if t.starts_with('(') {
+                if let Ok((inner, rest)) = take_wrapped(t, '(', ')') {
+                    if rest.trim().is_empty() {
+                        let mut buf = Vec::new();
+                        let flow = {
+                            let mut sub = self.sub(&mut buf);
+                            sub.run_code(&inner)
+                        };
+                        match flow? {
+                            Flow::Next => {}
+                            f => return Ok((Value::Str(String::new()), f)),
+                        }
+                        let text = String::from_utf8_lossy(&buf);
+                        let lines: Vec<String> =
+                            text.lines().map(str::to_string).collect();
+                        return Ok((lines_value(lines), Flow::Next));
+                    }
+                }
+            }
+        }
         if vals.len() != 1 {
             return Err("unexpected tokens after assignment value".to_string());
         }
@@ -816,7 +1028,7 @@ impl<'a> Interpreter<'a> {
             AssignOp::Append => {
                 let elems = match &v {
                     Value::Str(s) if s.is_empty() => Vec::new(),
-                    Value::Str(s) => vec![s.clone()],
+                    Value::Str(s) => vec![Value::Str(s.clone())],
                     Value::Arr(a) => a.clone(),
                     Value::Map(_) => {
                         return Err("cannot append a hashtable".to_string());
@@ -907,7 +1119,10 @@ impl<'a> Interpreter<'a> {
                 self.vars.insert(key, lines_value(lines));
             }
             AssignOp::Append => {
-                let merged = append_values(self.vars.get(&key), lines);
+                let merged = append_values(
+                    self.vars.get(&key),
+                    lines.into_iter().map(Value::Str).collect(),
+                );
                 self.vars.insert(key, merged);
             }
         }
@@ -1264,10 +1479,16 @@ impl<'a> Interpreter<'a> {
         if let Some(dot) = name.find('.') {
             let (head, tail) = (&name[..dot], &name[dot + 1..]);
             // `$arr.Count` / `$arr.Length` (string vars keep the legacy
-            // head-plus-literal behavior; other members come later).
+            // head-plus-literal behavior; other members navigate below).
             if tail.eq_ignore_ascii_case("count") || tail.eq_ignore_ascii_case("length") {
                 if let Some(Value::Arr(a)) = self.vars.get(&head.to_lowercase()) {
                     return a.len().to_string();
+                }
+            }
+            // Nested member path (`$_.author.login`, `$m.a.b`): walk values.
+            if let Some(v) = self.lookup_value(head) {
+                if let Some(s) = Self::navigate_value(v, tail) {
+                    return s;
                 }
             }
             return self.lookup_scalar(head) + "." + tail;
@@ -1275,8 +1496,26 @@ impl<'a> Interpreter<'a> {
         self.lookup_scalar(name)
     }
 
+    /// A name's value for member navigation: plain vars, `$env:`, `$HOME`.
+    /// (`$null`/`$_`-unset yield empty; unknown drives stay literal upstream.)
+    fn lookup_value(&self, name: &str) -> Option<Value> {
+        if name.eq_ignore_ascii_case("null") {
+            return Some(Value::Str(String::new()));
+        }
+        if name.eq_ignore_ascii_case("home") {
+            return Some(Value::Str(std::env::var("HOME").unwrap_or_default()));
+        }
+        if name.len() > 4 && name[..4].eq_ignore_ascii_case("env:") {
+            return Some(Value::Str(std::env::var(&name[4..]).unwrap_or_default()));
+        }
+        if name.contains(':') {
+            return None;
+        }
+        self.vars.get(&name.to_lowercase()).cloned()
+    }
+
     fn lookup_scalar(&self, name: &str) -> String {
-        if name.eq_ignore_ascii_case("null") || name == "_" {
+        if name.eq_ignore_ascii_case("null") {
             return String::new();
         }
         if name.eq_ignore_ascii_case("home") {
@@ -1291,6 +1530,45 @@ impl<'a> Interpreter<'a> {
         match self.vars.get(&name.to_lowercase()) {
             Some(v) => value_string(v),
             None => String::new(),
+        }
+    }
+
+    /// Walk `a.b.c` from an owned value: maps by key (case-insensitive),
+    /// arrays by integer index or `.Count`/`.Length`. Returns `None` when
+    /// any step misses (caller keeps the legacy head-plus-literal form) —
+    /// strings never navigate.
+    fn navigate_value(mut cur: Value, path: &str) -> Option<String> {
+        let mut path = path;
+        loop {
+            let (seg, rest) = match path.find('.') {
+                Some(i) => (&path[..i], &path[i + 1..]),
+                None => (path, ""),
+            };
+            if seg.is_empty() {
+                return None;
+            }
+            cur = match cur {
+                Value::Map(m) => m
+                    .into_iter()
+                    .find(|(k, _)| k == &seg.to_lowercase())
+                    .map(|(_, v)| v)?,
+                Value::Arr(a) => {
+                    if rest.is_empty()
+                        && (seg.eq_ignore_ascii_case("count")
+                            || seg.eq_ignore_ascii_case("length"))
+                    {
+                        return Some(a.len().to_string());
+                    }
+                    let idx: i64 = seg.trim().parse().ok()?;
+                    let idx = if idx < 0 { a.len() as i64 + idx } else { idx };
+                    a.into_iter().nth(idx as usize)?
+                }
+                Value::Str(_) => return None,
+            };
+            if rest.is_empty() {
+                return Some(value_string(&cur));
+            }
+            path = rest;
         }
     }
 
@@ -1326,7 +1604,7 @@ impl<'a> Interpreter<'a> {
                     return Err("Contains takes one argument".to_string());
                 }
                 Ok(Value::Str(
-                    if items.iter().any(|v| v == &args[0]) {
+                    if items.iter().any(|v| value_string(v) == args[0]) {
                         "True".to_string()
                     } else {
                         "False".to_string()
@@ -1345,11 +1623,13 @@ impl<'a> Interpreter<'a> {
                     // Single char splits on that char (like the char
                     // overload); longer separators split on the substring.
                     // Empty entries are kept, like .NET defaults.
-                    let parts: Vec<String> = if sep.chars().count() == 1 {
+                    let parts: Vec<Value> = if sep.chars().count() == 1 {
                         let c = sep.chars().next().unwrap();
-                        s.split(c).map(str::to_string).collect()
+                        s.split(c).map(|p| Value::Str(p.to_string())).collect()
                     } else {
-                        s.split(sep.as_str()).map(str::to_string).collect()
+                        s.split(sep.as_str())
+                            .map(|p| Value::Str(p.to_string()))
+                            .collect()
                     };
                     return Ok(Value::Arr(parts));
                 }
@@ -1481,7 +1761,10 @@ impl<'a> Interpreter<'a> {
                 .get(&key.to_lowercase())
                 .map(value_string)
                 .unwrap_or_default()),
-            Some(Value::Arr(a)) => array_index(a, key),
+            Some(Value::Arr(a)) => {
+                let strs: Vec<String> = a.iter().map(value_string).collect();
+                array_index(&strs, key)
+            }
             Some(Value::Str(s)) => {
                 let chars: Vec<char> = s.chars().collect();
                 array_index(&chars, key)
@@ -1788,11 +2071,11 @@ fn split_chunks(code: &str) -> Vec<String> {
                 dq = !dq;
                 cur.push(c);
             }
-            '{' if !sq && !dq => {
+            '{' | '(' if !sq && !dq => {
                 depth += 1;
                 cur.push(c);
             }
-            '}' if !sq && !dq => {
+            '}' | ')' if !sq && !dq => {
                 depth = depth.saturating_sub(1);
                 cur.push(c);
             }
@@ -1941,11 +2224,11 @@ fn split_statements(code: &str) -> Vec<String> {
                 dq = !dq;
                 cur.push(c);
             }
-            '{' if !sq && !dq => {
+            '{' | '(' if !sq && !dq => {
                 depth += 1;
                 cur.push(c);
             }
-            '}' if !sq && !dq => {
+            '}' | ')' if !sq && !dq => {
                 depth = depth.saturating_sub(1);
                 cur.push(c);
             }
@@ -2022,7 +2305,7 @@ fn lines_value(lines: Vec<String>) -> Value {
     } else if lines.is_empty() {
         Value::Str(String::new())
     } else {
-        Value::Arr(lines)
+        Value::Arr(lines.into_iter().map(Value::Str).collect())
     }
 }
 
@@ -2033,6 +2316,734 @@ fn bool_string(b: bool) -> String {
     } else {
         "False".to_string()
     }
+}
+
+/// Regex subset for `-match` (case-insensitive, unanchored search like
+/// .NET): literals, `.` (not `\n`), `\d\D\w\W\s\S\b\B`, `\X` literal-X for
+/// punctuation, `[...]` classes (ranges, `[^...]`), `^`/`$`, `|` groups,
+/// `(...)`, greedy `*`/`+`/`?`. Anything else (`{m,n}`, `\p`, groups with
+/// flags except `(?i:...)`) fails loudly instead of mis-matching.
+/// No captures (`$Matches` comes later).
+fn regex_match(pattern: &str, text: &str) -> Result<bool, String> {
+    let p: Vec<char> = pattern.to_lowercase().chars().collect();
+    let t: Vec<char> = text.to_lowercase().chars().collect();
+    let mut rx = RxParser {
+        p,
+        pos: 0,
+        nodes: Vec::new(),
+    };
+    let root = rx.parse_alt()?;
+    if rx.pos != rx.p.len() {
+        return Err("trailing characters in pattern".to_string());
+    }
+    let mut m = RxMatcher {
+        nodes: rx.nodes,
+        t,
+        fuel: 1_000_000,
+    };
+    // `^`-led patterns anchor at 0; otherwise try every start.
+    let starts: Vec<usize> = if pattern.trim_start().starts_with('^') {
+        vec![0]
+    } else {
+        (0..=m.t.len()).collect()
+    };
+    for s in starts {
+        if m.seq_from(root, s)?.iter().any(|_| true) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// AST node for the `-match` subset (indices into [`RxParser::nodes`]).
+#[derive(Clone)]
+enum RxNode {
+    Lit(char),
+    Dot,
+    Class { neg: bool, singles: Vec<char>, ranges: Vec<(char, char)> },
+    AnchorStart,
+    AnchorEnd,
+    Boundary(bool),
+    Seq(Vec<usize>),
+    Alt(Vec<usize>),
+    Rep(usize, RxRep),
+}
+
+#[derive(Clone, Copy)]
+enum RxRep {
+    Star,
+    Plus,
+    Opt,
+}
+
+struct RxParser {
+    p: Vec<char>,
+    pos: usize,
+    nodes: Vec<RxNode>,
+}
+
+impl RxParser {
+    fn peek(&self) -> Option<char> {
+        self.p.get(self.pos).copied()
+    }
+
+    fn push(&mut self, n: RxNode) -> usize {
+        self.nodes.push(n);
+        self.nodes.len() - 1
+    }
+
+    /// alt := seq ('|' seq)*
+    fn parse_alt(&mut self) -> Result<usize, String> {
+        let mut branches = vec![self.parse_seq()?];
+        while self.peek() == Some('|') {
+            self.pos += 1;
+            branches.push(self.parse_seq()?);
+        }
+        if branches.len() == 1 {
+            Ok(branches[0])
+        } else {
+            Ok(self.push(RxNode::Alt(branches)))
+        }
+    }
+
+    /// seq := term* (stops at `|` or `)` or end)
+    fn parse_seq(&mut self) -> Result<usize, String> {
+        let mut items = Vec::new();
+        while let Some(c) = self.peek() {
+            if c == '|' || c == ')' {
+                break;
+            }
+            items.push(self.parse_term()?);
+        }
+        if items.len() == 1 {
+            Ok(items[0])
+        } else {
+            Ok(self.push(RxNode::Seq(items)))
+        }
+    }
+
+    /// term := atom (`*` | `+` | `?`)?
+    fn parse_term(&mut self) -> Result<usize, String> {
+        let atom = self.parse_atom()?;
+        match self.peek() {
+            Some('*') => {
+                self.pos += 1;
+                Ok(self.push(RxNode::Rep(atom, RxRep::Star)))
+            }
+            Some('+') => {
+                self.pos += 1;
+                Ok(self.push(RxNode::Rep(atom, RxRep::Plus)))
+            }
+            Some('?') => {
+                self.pos += 1;
+                Ok(self.push(RxNode::Rep(atom, RxRep::Opt)))
+            }
+            _ => Ok(atom),
+        }
+    }
+
+    fn parse_atom(&mut self) -> Result<usize, String> {
+        match self.peek() {
+            None => Err("unexpected end of pattern".to_string()),
+            Some('(') => {
+                self.pos += 1;
+                if self.peek() == Some('?') {
+                    // `(?i:...)` / `(?:...)` / `(?<name>...)`; anything
+                    // else (lookaround, options) fails loudly.
+                    self.pos += 1;
+                    match self.peek() {
+                        Some(':') => {
+                            self.pos += 1;
+                        }
+                        Some('i') => {
+                            // `(?i:` only; `(?-i)` can't be honored.
+                            self.pos += 1;
+                            if self.peek() == Some(':') {
+                                self.pos += 1;
+                            } else {
+                                return Err("unsupported group flag".to_string());
+                            }
+                        }
+                        Some('<') => {
+                            self.pos += 1;
+                            while let Some(c) = self.peek() {
+                                self.pos += 1;
+                                if c == '>' {
+                                    break;
+                                }
+                                if c == ')' || c == '(' {
+                                    return Err("bad group name".to_string());
+                                }
+                            }
+                        }
+                        _ => return Err("unsupported group flag".to_string()),
+                    }
+                }
+                let inner = self.parse_alt()?;
+                if self.peek() != Some(')') {
+                    return Err("unbalanced ( in pattern".to_string());
+                }
+                self.pos += 1;
+                Ok(inner)
+            }
+            Some('[') => self.parse_class(),
+            Some('.') => {
+                self.pos += 1;
+                Ok(self.push(RxNode::Dot))
+            }
+            Some('^') => {
+                self.pos += 1;
+                Ok(self.push(RxNode::AnchorStart))
+            }
+            Some('$') => {
+                self.pos += 1;
+                Ok(self.push(RxNode::AnchorEnd))
+            }
+            Some('\\') => {
+                self.pos += 1;
+                let e = self.peek().ok_or_else(|| "trailing backslash".to_string())?;
+                self.pos += 1;
+                match e {
+                    'd' => Ok(self.push(RxNode::Class {
+                        neg: false,
+                        singles: Vec::new(),
+                        ranges: vec![('0', '9')],
+                    })),
+                    'D' => Ok(self.push(RxNode::Class {
+                        neg: true,
+                        singles: Vec::new(),
+                        ranges: vec![('0', '9')],
+                    })),
+                    'w' => Ok(self.push(RxNode::Class {
+                        neg: false,
+                        singles: vec!['_'],
+                        ranges: vec![('a', 'z'), ('A', 'Z'), ('0', '9')],
+                    })),
+                    'W' => Ok(self.push(RxNode::Class {
+                        neg: true,
+                        singles: vec!['_'],
+                        ranges: vec![('a', 'z'), ('A', 'Z'), ('0', '9')],
+                    })),
+                    's' => Ok(self.push(RxNode::Class {
+                        neg: false,
+                        singles: vec![' ', '\t', '\n', '\r', '\u{000C}', '\u{000B}'],
+                        ranges: Vec::new(),
+                    })),
+                    'S' => Ok(self.push(RxNode::Class {
+                        neg: true,
+                        singles: vec![' ', '\t', '\n', '\r', '\u{000C}', '\u{000B}'],
+                        ranges: Vec::new(),
+                    })),
+                    'b' => Ok(self.push(RxNode::Boundary(false))),
+                    'B' => Ok(self.push(RxNode::Boundary(true))),
+                    c if c.is_ascii_alphanumeric() => {
+                        Err(format!("unsupported escape: \\{c}"))
+                    }
+                    c => Ok(self.push(RxNode::Lit(c))),
+                }
+            }
+            Some('{') => {
+                // `{m,n}` counted repetition is out of subset; a `{`
+                // followed by a digit/comma would silently mis-match.
+                let mut j = self.pos + 1;
+                let mut looks_counted = false;
+                while j < self.p.len() {
+                    let c = self.p[j];
+                    if c.is_ascii_digit() || c == ',' {
+                        looks_counted = true;
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if looks_counted {
+                    return Err("counted repetition is not supported".to_string());
+                }
+                self.pos += 1;
+                Ok(self.push(RxNode::Lit('{')))
+            }
+            Some('*') | Some('+') | Some('?') => Err("dangling quantifier".to_string()),
+            Some(')') => Err("unbalanced ) in pattern".to_string()),
+            Some(c) => {
+                self.pos += 1;
+                Ok(self.push(RxNode::Lit(c)))
+            }
+        }
+    }
+
+    /// `[...]` class: `]`-first is literal, `a-z` ranges, `[^...]` negated.
+    fn parse_class(&mut self) -> Result<usize, String> {
+        self.pos += 1; // [
+        let neg = if self.peek() == Some('^') {
+            self.pos += 1;
+            true
+        } else {
+            false
+        };
+        let mut singles = Vec::new();
+        let mut ranges = Vec::new();
+        // A `]` first is literal.
+        if self.peek() == Some(']') {
+            singles.push(']');
+            self.pos += 1;
+        }
+        loop {
+            match self.peek() {
+                None => return Err("unterminated character class".to_string()),
+                Some(']') => {
+                    self.pos += 1;
+                    break;
+                }
+                Some('\\') => {
+                    self.pos += 1;
+                    let e = self.peek().ok_or_else(|| "trailing backslash".to_string())?;
+                    self.pos += 1;
+                    // Inside classes only simple escaped literals fold in;
+                    // class shorthands stay loud errors (documented subset).
+                    if e.is_ascii_alphanumeric() && !"dDsSwW".contains(e) {
+                        return Err(format!("unsupported escape: \\{e}"));
+                    }
+                    match e {
+                        'd' => ranges.push(('0', '9')),
+                        'D' => return Err("negated class inside class".to_string()),
+                        'w' => {
+                            singles.push('_');
+                            ranges.push(('a', 'z'));
+                            ranges.push(('A', 'Z'));
+                            ranges.push(('0', '9'));
+                        }
+                        'W' | 's' | 'S' => {
+                            return Err("unsupported class inside class".to_string())
+                        }
+                        c => singles.push(c),
+                    }
+                }
+                Some(c) => {
+                    self.pos += 1;
+                    // Range `a-z` (dash not first/last).
+                    if self.peek() == Some('-') {
+                        // Look past the dash: another `-` or `]` means literal.
+                        let dash_pos = self.pos;
+                        self.pos += 1;
+                        match self.peek() {
+                            Some(']') | None => {
+                                singles.push(c);
+                                singles.push('-');
+                            }
+                            Some(e) => {
+                                self.pos += 1;
+                                if (e as u32) < (c as u32) {
+                                    return Err("bad character range".to_string());
+                                }
+                                ranges.push((c, e));
+                            }
+                        }
+                        let _ = dash_pos;
+                    } else {
+                        singles.push(c);
+                    }
+                }
+            }
+        }
+        if singles.is_empty() && ranges.is_empty() {
+            return Err("empty character class".to_string());
+        }
+        Ok(self.push(RxNode::Class { neg, singles, ranges }))
+    }
+}
+
+struct RxMatcher {
+    nodes: Vec<RxNode>,
+    t: Vec<char>,
+    fuel: u64,
+}
+
+impl RxMatcher {
+    fn burn(&mut self) -> Result<(), String> {
+        if self.fuel == 0 {
+            return Err("pattern too complex".to_string());
+        }
+        self.fuel -= 1;
+        Ok(())
+    }
+
+    /// End positions after matching node `n` starting at `ti`.
+    fn run(&mut self, n: usize, ti: usize) -> Result<Vec<usize>, String> {
+        self.burn()?;
+        let node = self.nodes.get(n).cloned().ok_or_else(|| "bad node".to_string())?;
+        match node {
+            RxNode::Lit(c) => {
+                if self.t.get(ti) == Some(&c) {
+                    Ok(vec![ti + 1])
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+            RxNode::Dot => match self.t.get(ti) {
+                Some(&'\n') | None => Ok(Vec::new()),
+                _ => Ok(vec![ti + 1]),
+            },
+            RxNode::Class { neg, singles, ranges } => match self.t.get(ti) {
+                None => Ok(Vec::new()),
+                Some(&c) => {
+                    let mut hit =
+                        singles.contains(&c) || ranges.iter().any(|(a, b)| *a <= c && c <= *b);
+                    if neg {
+                        hit = !hit;
+                    }
+                    Ok(if hit { vec![ti + 1] } else { Vec::new() })
+                }
+            },
+            RxNode::AnchorStart => Ok(if ti == 0 { vec![ti] } else { Vec::new() }),
+            RxNode::AnchorEnd => Ok(if ti == self.t.len() { vec![ti] } else { Vec::new() }),
+            RxNode::Boundary(neg) => {
+                let word = |i: usize| {
+                    self.t
+                        .get(i)
+                        .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_')
+                };
+                let before = ti > 0 && word(ti - 1);
+                let after = word(ti);
+                let hit = before != after;
+                Ok(if hit != neg { vec![ti] } else { Vec::new() })
+            }
+            RxNode::Seq(items) => {
+                let mut positions = vec![ti];
+                for item in items {
+                    let mut next = Vec::new();
+                    for p in positions {
+                        next.extend(self.run(item, p)?);
+                    }
+                    // Dedup keeps repetition closure polynomial.
+                    next.sort_unstable();
+                    next.dedup();
+                    positions = next;
+                    if positions.is_empty() {
+                        break;
+                    }
+                }
+                Ok(positions)
+            }
+            RxNode::Alt(items) => {
+                let mut out = Vec::new();
+                for item in items {
+                    out.extend(self.run(item, ti)?);
+                }
+                out.sort_unstable();
+                out.dedup();
+                Ok(out)
+            }
+            RxNode::Rep(inner, kind) => {
+                let mut ends = vec![ti];
+                let mut frontier = vec![ti];
+                // Distinct positions are bounded by len+1: iterate to closure.
+                while !frontier.is_empty() {
+                    let mut next_front = Vec::new();
+                    for p in frontier {
+                        for e in self.run(inner, p)? {
+                            if !ends.contains(&e) {
+                                ends.push(e);
+                                next_front.push(e);
+                            }
+                        }
+                    }
+                    frontier = next_front;
+                }
+                ends.sort_unstable();
+                Ok(match kind {
+                    RxRep::Star => ends,
+                    RxRep::Plus => ends.into_iter().filter(|&e| e != ti).collect(),
+                    RxRep::Opt => {
+                        let mut o = vec![ti];
+                        o.extend(ends.into_iter().filter(|&e| e != ti));
+                        o
+                    }
+                })
+            }
+        }
+    }
+
+    /// Suffix starting at pattern node with text offset (entry point).
+    fn seq_from(&mut self, root: usize, ti: usize) -> Result<Vec<usize>, String> {
+        self.run(root, ti)
+    }
+}
+
+/// Minimal JSON parser into [`Value`] (objects→Map with lowercased keys,
+/// arrays→Arr, strings→content, numbers→raw text, true/false→`True`/`False`,
+/// null→empty). Depth-capped; malformed input fails clearly.
+struct JsonParser {
+    chars: Vec<char>,
+    pos: usize,
+}
+
+fn parse_json(text: &str) -> Result<Value, String> {
+    let mut p = JsonParser {
+        chars: text.chars().collect(),
+        pos: 0,
+    };
+    let v = p.parse_value(0)?;
+    p.skip_ws();
+    if p.pos != p.chars.len() {
+        return Err("trailing characters after JSON value".to_string());
+    }
+    Ok(v)
+}
+
+impl JsonParser {
+    fn skip_ws(&mut self) {
+        while self.pos < self.chars.len() && self.chars[self.pos].is_whitespace() {
+            self.pos += 1;
+        }
+    }
+
+    fn peek(&self) -> Option<char> {
+        self.chars.get(self.pos).copied()
+    }
+
+    fn parse_value(&mut self, depth: usize) -> Result<Value, String> {
+        if depth > 64 {
+            return Err("JSON too deeply nested".to_string());
+        }
+        self.skip_ws();
+        match self.peek() {
+            Some('{') => self.parse_object(depth),
+            Some('[') => self.parse_array(depth),
+            Some('"') => Ok(Value::Str(self.parse_string()?)),
+            Some(c) if c == '-' || c.is_ascii_digit() => self.parse_number(),
+            Some('t') => self.parse_literal("true", Value::Str("True".to_string())),
+            Some('f') => self.parse_literal("false", Value::Str("False".to_string())),
+            Some('n') => self.parse_literal("null", Value::Str(String::new())),
+            Some(c) => Err(format!("unexpected character in JSON: {c}")),
+            None => Err("unexpected end of JSON".to_string()),
+        }
+    }
+
+    fn parse_literal(&mut self, word: &str, val: Value) -> Result<Value, String> {
+        for c in word.chars() {
+            if self.peek() != Some(c) {
+                return Err(format!("invalid JSON literal near '{word}'"));
+            }
+            self.pos += 1;
+        }
+        Ok(val)
+    }
+
+    fn parse_object(&mut self, depth: usize) -> Result<Value, String> {
+        self.pos += 1; // {
+        let mut map = HashMap::new();
+        self.skip_ws();
+        if self.peek() == Some('}') {
+            self.pos += 1;
+            return Ok(Value::Map(map));
+        }
+        loop {
+            self.skip_ws();
+            if self.peek() != Some('"') {
+                return Err("expected string key in JSON object".to_string());
+            }
+            let key = self.parse_string()?.to_lowercase();
+            self.skip_ws();
+            if self.peek() != Some(':') {
+                return Err("expected ':' in JSON object".to_string());
+            }
+            self.pos += 1;
+            let val = self.parse_value(depth + 1)?;
+            map.insert(key, val);
+            self.skip_ws();
+            match self.peek() {
+                Some(',') => {
+                    self.pos += 1;
+                }
+                Some('}') => {
+                    self.pos += 1;
+                    return Ok(Value::Map(map));
+                }
+                _ => return Err("expected ',' or '}' in JSON object".to_string()),
+            }
+        }
+    }
+
+    fn parse_array(&mut self, depth: usize) -> Result<Value, String> {
+        self.pos += 1; // [
+        let mut items = Vec::new();
+        self.skip_ws();
+        if self.peek() == Some(']') {
+            self.pos += 1;
+            return Ok(Value::Arr(items));
+        }
+        loop {
+            items.push(self.parse_value(depth + 1)?);
+            self.skip_ws();
+            match self.peek() {
+                Some(',') => {
+                    self.pos += 1;
+                }
+                Some(']') => {
+                    self.pos += 1;
+                    return Ok(Value::Arr(items));
+                }
+                _ => return Err("expected ',' or ']' in JSON array".to_string()),
+            }
+        }
+    }
+
+    fn parse_string(&mut self) -> Result<String, String> {
+        self.pos += 1; // opening "
+        let mut out = String::new();
+        loop {
+            let c = self.peek().ok_or_else(|| "unterminated JSON string".to_string())?;
+            self.pos += 1;
+            match c {
+                '"' => return Ok(out),
+                '\\' => {
+                    let e = self.peek().ok_or_else(|| "unterminated JSON escape".to_string())?;
+                    self.pos += 1;
+                    match e {
+                        '"' => out.push('"'),
+                        '\\' => out.push('\\'),
+                        '/' => out.push('/'),
+                        'b' => out.push('\u{0008}'),
+                        'f' => out.push('\u{000C}'),
+                        'n' => out.push('\n'),
+                        'r' => out.push('\r'),
+                        't' => out.push('\t'),
+                        'u' => out.push(self.parse_hex4()?),
+                        _ => return Err(format!("bad JSON escape: \\{e}")),
+                    }
+                }
+                c if (c as u32) < 0x20 => {
+                    return Err("unescaped control in JSON string".to_string())
+                }
+                _ => out.push(c),
+            }
+        }
+    }
+
+    /// `\uXXXX`, combining a lead+trail surrogate pair; lone surrogates
+    /// become U+FFFD rather than failing the whole document.
+    fn parse_hex4(&mut self) -> Result<char, String> {
+        let mut n: u32 = 0;
+        for _ in 0..4 {
+            let c = self.peek().ok_or_else(|| "truncated \\u escape".to_string())?;
+            let d = c.to_digit(16).ok_or_else(|| "bad \\u escape".to_string())?;
+            n = n * 16 + d;
+            self.pos += 1;
+        }
+        if (0xD800..0xDC00).contains(&n) {
+            // Lead surrogate: expect a trail pair, else replacement.
+            let save = self.pos;
+            if self.peek() == Some('\\') {
+                self.pos += 1;
+                if self.peek() == Some('u') {
+                    self.pos += 1;
+                    let mut m: u32 = 0;
+                    let mut ok = true;
+                    for _ in 0..4 {
+                        match self.peek().and_then(|c| c.to_digit(16)) {
+                            Some(d) => {
+                                m = m * 16 + d;
+                                self.pos += 1;
+                            }
+                            None => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if ok && (0xDC00..0xE000).contains(&m) {
+                        let full = 0x10000 + ((n - 0xD800) << 10) + (m - 0xDC00);
+                        if let Some(c) = char::from_u32(full) {
+                            return Ok(c);
+                        }
+                    }
+                    self.pos = save;
+                } else {
+                    self.pos = save;
+                }
+            }
+            return Ok('\u{FFFD}');
+        }
+        Ok(char::from_u32(n).unwrap_or('\u{FFFD}'))
+    }
+
+    fn parse_number(&mut self) -> Result<Value, String> {
+        let start = self.pos;
+        if self.peek() == Some('-') {
+            self.pos += 1;
+        }
+        let digits = |p: &mut Self| {
+            let mut n = 0;
+            while p.peek().is_some_and(|c| c.is_ascii_digit()) {
+                p.pos += 1;
+                n += 1;
+            }
+            n
+        };
+        match self.peek() {
+            Some('0') => {
+                self.pos += 1;
+            }
+            Some(c) if c.is_ascii_digit() => {
+                digits(self);
+            }
+            _ => return Err("bad JSON number".to_string()),
+        }
+        if self.peek() == Some('.') {
+            self.pos += 1;
+            if digits(self) == 0 {
+                return Err("bad JSON number".to_string());
+            }
+        }
+        if matches!(self.peek(), Some('e') | Some('E')) {
+            self.pos += 1;
+            if matches!(self.peek(), Some('+') | Some('-')) {
+                self.pos += 1;
+            }
+            if digits(self) == 0 {
+                return Err("bad JSON number".to_string());
+            }
+        }
+        Ok(Value::Str(self.chars[start..self.pos].iter().collect()))
+    }
+}
+
+/// Canonical JSON text for a value (sorted object keys): the line form
+/// pipelines carry structured values in.
+fn render_json(v: &Value) -> String {
+    match v {
+        Value::Str(s) => render_json_string(s),
+        Value::Arr(items) => {
+            let parts: Vec<String> = items.iter().map(render_json).collect();
+            format!("[{}]", parts.join(","))
+        }
+        Value::Map(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let parts: Vec<String> = keys
+                .iter()
+                .map(|k| format!("{}:{}", render_json_string(k), render_json(&map[*k])))
+                .collect();
+            format!("{{{}}}", parts.join(","))
+        }
+    }
+}
+
+fn render_json_string(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// `[Environment]::Get/SetEnvironmentVariable`. `User`/`Machine` targets
@@ -2170,12 +3181,16 @@ fn split_static_call(s: &str) -> Result<Option<(String, String, String, String)>
     Ok(Some((typ, method, inner, rest2)))
 }
 
-/// A value in string context: strings as-is, arrays space-joined, empty
-/// maps stringify empty (Out-String behavior for `@{}`).
+/// A value in string context: strings as-is, arrays space-joined
+/// (recursively), empty maps stringify empty.
 fn value_string(v: &Value) -> String {
     match v {
         Value::Str(s) => s.clone(),
-        Value::Arr(a) => a.join(" "),
+        Value::Arr(a) => a
+            .iter()
+            .map(value_string)
+            .collect::<Vec<_>>()
+            .join(" "),
         Value::Map(_) => String::new(),
     }
 }
@@ -2206,16 +3221,16 @@ where
 /// an array (`"a" + "b"` becomes `@("a", "b")`, like the real thing).
 /// An array base stays an array even when the result has one element
 /// (`@() + "x"` has `.Count` 1).
-fn append_values(existing: Option<&Value>, new: Vec<String>) -> Value {
+fn append_values(existing: Option<&Value>, new: Vec<Value>) -> Value {
     let was_array = matches!(existing, Some(Value::Arr(_)));
-    let mut base: Vec<String> = match existing {
+    let mut base: Vec<Value> = match existing {
         Some(Value::Arr(a)) => a.clone(),
-        Some(Value::Str(s)) if !s.is_empty() => vec![s.clone()],
+        Some(Value::Str(s)) if !s.is_empty() => vec![Value::Str(s.clone())],
         _ => Vec::new(),
     };
     base.extend(new);
     if base.len() == 1 && !was_array {
-        Value::Str(base.into_iter().next().unwrap())
+        base.into_iter().next().unwrap()
     } else {
         Value::Arr(base)
     }
@@ -2682,6 +3697,41 @@ fn tokenize(s: &str) -> Result<Vec<Token>, String> {
     Ok(toks)
 }
 
+/// Pipeline input as (display, value) items: JSON arrays enumerate
+/// their elements (like real enumeration); anything else is one item
+/// per line, JSON-looking lines parsed. Strings display raw; maps and
+/// nested arrays display canonical.
+fn pipe_items(input: &str) -> Vec<(String, Value)> {
+    let mut out = Vec::new();
+    for line in input.lines() {
+        match parse_json_line(line) {
+            Value::Arr(elements) => {
+                for el in elements {
+                    let display = match &el {
+                        Value::Str(s) => s.clone(),
+                        _ => render_json(&el),
+                    };
+                    out.push((display, el));
+                }
+            }
+            v => out.push((line.to_string(), v)),
+        }
+    }
+    out
+}
+
+/// One input line as a value: JSON-looking lines parse, anything else
+/// stays text.
+fn parse_json_line(line: &str) -> Value {
+    let t = line.trim_start();
+    if t.starts_with('{') || t.starts_with('[') {
+        if let Ok(v) = parse_json(t) {
+            return v;
+        }
+    }
+    Value::Str(line.to_string())
+}
+
 /// Parse `-Name value` / `-Flag` params. Returns (named lower->value, positional).
 fn parse_params(
     args: &[String],
@@ -2818,6 +3868,136 @@ mod tests {
         // Discard port on loopback: refused fast, no DNS, no network.
         let (_, _, r) = run("irm http://127.0.0.1:9/nope");
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn paren_grouping_runs_and_captures() {
+        // Statement form emits.
+        let (out, r) = run_session("(echo hi)");
+        assert!(r.is_ok());
+        assert_eq!(out, b"hi\n");
+        // Value form captures (single and multi-token).
+        let (out, r) = run_session("$t = (echo hi)\necho $t");
+        assert!(r.is_ok());
+        assert_eq!(out, b"hi\n");
+        let (out, r) = run_session("$t = (echo a; echo b)\necho $t");
+        assert!(r.is_ok());
+        assert_eq!(out, b"a b\n");
+        // Trailing junk and unbalanced groups fail clearly.
+        assert!(run_session("(echo hi) extra").1.unwrap_err().contains("unexpected text"));
+        assert!(run_session("(echo hi").1.is_err());
+    }
+
+    #[test]
+    fn pipeline_cmdlets_over_json() {
+        // The Get-LatestTag shape: extract, filter, first.
+        let script = "echo '[{\"tag_name\": \"esrun@0.24.0\"}, {\"tag_name\": \"other\"}]' | ForEach-Object { $_.tag_name } | Where-Object { $_ -match \"esrun\" } | Select-Object -First 1";
+        let (out, r) = run_session(script);
+        assert!(r.is_ok());
+        assert_eq!(out, b"esrun@0.24.0\n");
+    }
+
+    #[test]
+    fn foreach_object_text_and_scoping() {
+        // Plain lines bind as text; `$_` restores afterwards.
+        let (out, r) = run_session("echo hi | ForEach-Object { echo \"got-$_\" }\necho \"after-$_\"");
+        assert!(r.is_ok());
+        assert_eq!(out, b"got-hi\nafter-\n");
+        // Aliases `%` and named `-Process` work.
+        let (out, r) = run_session("echo a | % { echo $_ }");
+        assert!(r.is_ok());
+        assert_eq!(out, b"a\n");
+        let (out, r) = run_session("echo a | ForEach-Object -Process { echo $_ }");
+        assert!(r.is_ok());
+        assert_eq!(out, b"a\n");
+        // Missing scriptblock fails clearly.
+        assert!(run_session("echo a | ForEach-Object").1.unwrap_err().contains("scriptblock"));
+    }
+
+    #[test]
+    fn where_object_filters() {
+        let (out, r) = run_session("echo '[\"a1\", \"b2\"]' | ForEach-Object { $_ } | Where-Object { $_ -match '2' }");
+        assert!(r.is_ok());
+        assert_eq!(out, b"b2\n");
+        // Directly over array lines too.
+        let (out, r) = run_session("echo '[\"a1\", \"b2\"]' | Where-Object { $_ -match '1' }");
+        assert!(r.is_ok());
+        assert_eq!(out, b"a1\n");
+    }
+
+    #[test]
+    fn select_object_first() {
+        let (out, r) = run_session("echo '[\"a\", \"b\", \"c\"]' | ForEach-Object { $_ } | Select-Object -First 2");
+        assert!(r.is_ok());
+        assert_eq!(out, b"a\nb\n");
+        assert!(run_session("echo hi | Select-Object").1.unwrap_err().contains("-First"));
+        assert!(run_session("echo hi | Select-Object -Last 1").1.unwrap_err().contains("only -First"));
+    }
+
+    #[test]
+    fn regex_subset_matches() {
+        // Shapes taken from the real installer script (host-checked).
+        let yes = [
+            ("^(esrun@|v[0-9])", "esrun@0.24.0"),
+            ("^(esrun@|v[0-9])", "v1.2.3"),
+            ("^esdev@", "esdev@0.1.0"),
+            ("  esrun\\-windows\\-x86\\-64\\.zip$", "  esrun-windows-x86-64.zip"),
+            ("@", "a@b"),
+            ("^v", "v1"),
+            ("a*b", "aaab"),
+            ("a*b", "b"),
+            ("colou?r", "colour"),
+            ("[0-9]+", "abc123"),
+            ("[^0-9]+", "abc"),
+            (".", "a"),
+            ("\\d+", "abc123"),
+            ("ESRUN@", "esrun@1"),
+        ];
+        for (pat, text) in yes {
+            assert!(regex_match(pat, text).unwrap(), "{pat} vs {text}");
+        }
+        let no = [
+            ("^(esrun@|v[0-9])", "esdev@0.1.0"),
+            ("^esdev@", "esrun@0.1.0"),
+            ("  esrun\\-windows\\-x86\\-64\\.zip$", "  esrun-linux-x86-64.zip"),
+            ("@", "ab"),
+            ("a+b", "b"),
+            (".", "\n"),
+            ("^v", "1v"),
+        ];
+        for (pat, text) in no {
+            assert!(!regex_match(pat, text).unwrap(), "{pat} vs {text}");
+        }
+    }
+
+    #[test]
+    fn regex_subset_loud_errors() {
+        for pat in ["a{2}", "\\p", "(?-i:)", "*", "(abc", "[z-a]", "[]"] {
+            assert!(regex_match(pat, "abc").is_err(), "{pat}");
+        }
+    }
+
+    #[test]
+    fn json_values_and_canonical_form() {
+        // Scalars canonicalize quoted (numbers/bools arrive as strings);
+        // the form round-trips structurally.
+        let v = parse_json("{\"tag_name\": \"esrun@0.24.0\", \"n\": 12, \"t\": true, \"z\": null}").unwrap();
+        assert_eq!(render_json(&v), "{\"n\":\"12\",\"t\":\"True\",\"tag_name\":\"esrun@0.24.0\",\"z\":\"\"}");
+        assert_eq!(parse_json(&render_json(&v)).unwrap(), v);
+        let v = parse_json("[{\"a\": 1}, {\"a\": 2}]").unwrap();
+        let Value::Arr(items) = v else {
+            panic!("expected array");
+        };
+        assert_eq!(items.len(), 2);
+        // Escapes incl. a surrogate pair (emoji), empty containers.
+        let v = parse_json("\"a\\\"b\\\\c\\n\\uD83D\\uDE00\"").unwrap();
+        assert_eq!(v, Value::Str("a\"b\\c\n😀".to_string()));
+        assert!(matches!(parse_json("{}"), Ok(Value::Map(_))));
+        assert!(matches!(parse_json("[]"), Ok(Value::Arr(_))));
+        // Malformed documents fail clearly.
+        for bad in ["{", "[1,]", "{\"a\": }", "nul", "--1", "01", "{\"a\" \"b\"}"] {
+            assert!(parse_json(bad).is_err(), "{bad}");
+        }
     }
 
     fn run_session(script: &str) -> (Vec<u8>, Result<i32, String>) {
@@ -2969,7 +4149,7 @@ mod tests {
 
     #[test]
     fn if_unsupported_conditions_fail_clearly() {
-        assert!(run_session("if ($x -match y) { echo bad }").1.unwrap_err().contains("-match"));
+        assert!(run_session("if ('abc' -match 'a{2}') { echo bad }").1.unwrap_err().contains("counted"));
         assert!(run_session("if ($x.Split('y') -eq 'a') { echo bad }").1.unwrap_err().contains("not supported"));
         assert!(run_session("if (($a -eq $b)) { echo bad }").1.is_err());
         assert!(run_session("if ($x) { echo bad } else ($y) { echo bad }").1.unwrap_err().contains("no condition"));
@@ -3346,9 +4526,10 @@ mod tests {
         let (out, r) = run_session("if (@('a') -contains 'a') { echo y }");
         assert!(r.is_ok());
         assert_eq!(out, b"y\n");
-        // Arrays as items and method calls fail clearly.
+        // Arrays as items and method calls fail clearly (`-match` itself
+        // works now; unsupported patterns do not).
         assert!(run_session("if (@('a') -in $Bins) { echo y }").1.unwrap_err().contains("items"));
-        assert!(run_session("if ($x -match y) { echo y }").1.unwrap_err().contains("-match"));
+        assert!(run_session("if ('abc' -match 'a{2}') { echo y }").1.unwrap_err().contains("counted"));
         assert!(run_session("if ($x.Split('@') -eq 'a') { echo y }").1.unwrap_err().contains("not supported"));
     }
 

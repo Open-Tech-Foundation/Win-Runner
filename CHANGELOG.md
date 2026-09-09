@@ -168,3 +168,9 @@ All notable changes to this project will be documented in this file.
   host process env; sets are session-local), `[Guid]::NewGuid` (v4 from
   host randomness), `[regex]::Escape`; plus `ToString` (`'N'` strips
   dashes). Unit-tested.
+- PS1 pipeline cmdlets over text/JSON: `ForEach-Object`/`%` (binds `$_`,
+  JSON arrays enumerate), `Where-Object`/`where`/`?` (conditions with
+  `-match`), `Select-Object`/`select -First N`; a regex subset (literals,
+  classes, anchors, alternation, groups, `*`/`+`/`?`, case-insensitive)
+  with loud errors outside it; JSON auto-parse in `irm` (arrays flow one
+  element per line); `(...)` grouping in statements and values. Unit-tested.
