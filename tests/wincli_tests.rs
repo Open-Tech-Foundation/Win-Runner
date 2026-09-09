@@ -890,7 +890,7 @@ fn test_shell_install_run_session_offline() {
         ("WINCLI_SOURCE", src.as_ref()),
     ];
     // One session: install, run the package, share PS1 files across lines.
-    let input = "install demo\ndemo\nNew-Item C:\\shell-t.txt -Value hi\nGet-Content C:\\shell-t.txt\n$v = 42\necho \"v=$v\"\nif ($v -eq 42) { echo if-ok }\n$langs = @('a', 'b')\nif ('a' -in $langs) { echo in-ok }\nswitch ('q') { 'q' { echo sw-ok } }\nfunction Hi($n) { echo \"hi-$n\" }\nforeach ($i in @('a', 'b')) { Hi $i }\n$ht = @{}\n$ht['k'] = 'v'\nif ($ht.ContainsKey('k')) { echo ht-ok }\ntry { echo try-ok } catch { echo bad }\nexit\n";
+    let input = "install demo\ndemo\nNew-Item C:\\shell-t.txt -Value hi\nGet-Content C:\\shell-t.txt\n$v = 42\necho \"v=$v\"\nif ($v -eq 42) { echo if-ok }\n$langs = @('a', 'b')\nif ('a' -in $langs) { echo in-ok }\nswitch ('q') { 'q' { echo sw-ok } }\nfunction Hi($n) { echo \"hi-$n\" }\nforeach ($i in @('a', 'b')) { Hi $i }\n$ht = @{}\n$ht['k'] = 'v'\nif ($ht.ContainsKey('k')) { echo ht-ok }\ntry { echo try-ok } catch { echo bad }\n$cap = Join-Path 'C:\\x' 'y'\necho $cap\necho $cap | Out-Null\necho done\nexit\n";
     let (code, stdout, stderr) = run_shell_env(input, &envs);
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(stdout.contains("Installed demo 0.1.0 → C:\\bin\\demo.exe"), "stdout: {stdout}");
@@ -902,7 +902,9 @@ fn test_shell_install_run_session_offline() {
     assert!(stdout.contains("sw-ok\n"), "stdout: {stdout}");
     assert!(stdout.contains("hi-b\n"), "stdout: {stdout}");
     assert!(stdout.contains("ht-ok\n"), "stdout: {stdout}");
-    assert!(stdout.ends_with("try-ok\n"), "stdout: {stdout}");
+    assert!(stdout.contains("try-ok\n"), "stdout: {stdout}");
+    assert!(stdout.contains("C:\\x\\y\n"), "stdout: {stdout}");
+    assert!(stdout.ends_with("done\n"), "stdout: {stdout}");
     assert!(cache.join("pkgs").join("demo.exe").is_file());
     std::fs::remove_dir_all(&cache).ok();
 }

@@ -158,3 +158,5 @@ All notable changes to this project will be documented in this file.
   `finally` always runs and overrides in-flight signals/breaks) and
   `Join-Path` (multi-child join, `-Resolve` checks existence).
   Error paths flush partial output first in both CLI and shell. Unit-tested.
+- PS1 builtin capture (`$x = Join-Path ...` runs any builtin capturing
+  output) and `Out-Null`. Unit-tested.

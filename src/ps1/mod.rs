@@ -573,7 +573,28 @@ impl<'a> Interpreter<'a> {
         {
             return self.call_function(&cmd, &params, &body, rest);
         }
-        match cmd.as_str() {
+        self.exec_builtin(&cmd, rest, pipe_in)
+    }
+
+    /// Plain builtins shared by statement position and value capture
+    /// (`$x = Join-Path ...`). `break`/`continue`/`iex` flow through.
+    /// `out-null` sinks its input (pipeline or argument position).
+    fn exec_builtin(
+        &mut self,
+        cmd: &str,
+        rest: &[String],
+        pipe_in: Option<&str>,
+    ) -> Result<Flow, String> {
+        if cmd == "break" {
+            return Ok(Flow::Break);
+        }
+        if cmd == "continue" {
+            return Ok(Flow::Continue);
+        }
+        if cmd == "iex" || cmd == "invoke-expression" {
+            return self.cmd_iex(rest, pipe_in);
+        }
+        match cmd {
             "new-item" => self.cmd_new_item(rest),
             "set-content" => self.cmd_set_content(rest),
             "add-content" => self.cmd_add_content(rest),
@@ -598,7 +619,8 @@ impl<'a> Interpreter<'a> {
                 Err(msg)
             }
             "irm" | "invoke-restmethod" => self.cmd_irm(rest),
-            _ => Err(format!("unknown command: {}", args[0])),
+            "out-null" => Ok(()),
+            _ => Err(format!("unknown command: {cmd}")),
         }?;
         Ok(Flow::Next)
     }
@@ -668,8 +690,8 @@ impl<'a> Interpreter<'a> {
     }
 
     /// Evaluate assignment value tokens: `@(...)` array, `@{}` empty map,
-    /// defined-function call capture, or scalar. Returns the value plus
-    /// any loop signal from a captured call (callers abandon on signal).
+    /// defined-function call capture, builtin capture, or scalar. Returns
+    /// the value plus any loop signal from a captured call (abandon on it).
     fn eval_value(&mut self, vals: &[Token]) -> Result<(Value, Flow), String> {
         let joined: String = vals
             .iter()
@@ -687,8 +709,8 @@ impl<'a> Interpreter<'a> {
         if nospace.starts_with("@{") {
             return Err("hashtable literals with entries are not supported".to_string());
         }
-        // `$t = GetIt [$args...]`: call a defined function, capture its
-        // output (0 lines → `""`, 1 → string, N → array).
+        // `$t = Command [$args...]`: defined function or builtin, run
+        // capturing output (0 lines → `""`, 1 → string, N → array).
         if !vals.is_empty() && !vals[0].verbatim() {
             let fname = vals[0].text().to_lowercase();
             if let Some((params, body)) =
@@ -702,6 +724,24 @@ impl<'a> Interpreter<'a> {
                 let flow = {
                     let mut sub = self.sub(&mut buf);
                     sub.call_function(&fname, &params, &body, &argvals)
+                };
+                match flow? {
+                    Flow::Next => {}
+                    f => return Ok((Value::Str(String::new()), f)),
+                }
+                let text = String::from_utf8_lossy(&buf);
+                let lines: Vec<String> = text.lines().map(str::to_string).collect();
+                return Ok((lines_value(lines), Flow::Next));
+            }
+            if is_builtin_command(&fname) {
+                let mut argvals = Vec::with_capacity(vals.len().saturating_sub(1));
+                for tok in vals.iter().skip(1) {
+                    argvals.push(self.expand_token(tok)?);
+                }
+                let mut buf = Vec::new();
+                let flow = {
+                    let mut sub = self.sub(&mut buf);
+                    sub.exec_builtin(&fname, &argvals, None)
                 };
                 match flow? {
                     Flow::Next => {}
@@ -2041,6 +2081,47 @@ fn split_clause_head(s: &str) -> Result<(String, String), String> {
     Err("expected {body} in switch clause".to_string())
 }
 
+/// Plain builtins runnable as statements and capturable in value
+/// position (`$x = Join-Path ...`). Keep in sync with `exec_builtin`.
+fn is_builtin_command(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "new-item"
+            | "set-content"
+            | "add-content"
+            | "get-content"
+            | "get-childitem"
+            | "dir"
+            | "ls"
+            | "gci"
+            | "remove-item"
+            | "rm"
+            | "del"
+            | "ri"
+            | "copy-item"
+            | "copy"
+            | "cp"
+            | "ci"
+            | "move-item"
+            | "move"
+            | "mv"
+            | "mi"
+            | "test-path"
+            | "join-path"
+            | "write-host"
+            | "write-output"
+            | "echo"
+            | "throw"
+            | "irm"
+            | "invoke-restmethod"
+            | "iex"
+            | "invoke-expression"
+            | "break"
+            | "continue"
+            | "out-null"
+    )
+}
+
 /// Split `$name = value` / `$name += value` (spaced or joined) off
 /// tokenized args. Ok(None) = not an assignment; Err = malformed.
 /// Value tokens are returned raw (array values legitimately span tokens).
@@ -2529,6 +2610,26 @@ mod tests {
             "boom-message"
         );
         assert!(run_session("throw").1.is_err());
+    }
+
+    #[test]
+    fn builtin_capture_in_assignment() {
+        // `$x = Join-Path ...` runs the builtin capturing its output.
+        let (out, r) = run_session("$d = Join-Path \"C:\\base\" sub\necho $d");
+        assert!(r.is_ok());
+        assert_eq!(out, b"C:\\base\\sub\n");
+        // Trailing/leading separators collapse; roots survive.
+        let (out, r) = run_session("$r = Join-Path 'C:\\' 'bin'\necho $r");
+        assert!(r.is_ok());
+        assert_eq!(out, b"C:\\bin\n");
+        // Any builtin captures, including echo itself.
+        let (out, r) = run_session("$t = echo captured\necho $t");
+        assert!(r.is_ok());
+        assert_eq!(out, b"captured\n");
+        // Out-Null sinks pipeline output.
+        let (out, r) = run_session("echo hi | Out-Null");
+        assert!(r.is_ok());
+        assert_eq!(out, b"");
     }
 
     #[test]
