@@ -142,3 +142,6 @@ All notable changes to this project will be documented in this file.
   truthiness, `-not`, and case-insensitive `-eq`/`-ne`; `throw` surfaces
   its message. Methods, properties, arrays, and other operators fail
   clearly. Unit-tested including chains, nesting, and shape errors.
+- PS1 arrays and membership: `@(...)` literals, `+=` appends, `.Count` /
+  `.Length`, and `-in` / `-notin` / `-contains` / `-notcontains`
+  (case-insensitive); `-match` and friends fail clearly. Unit-tested.

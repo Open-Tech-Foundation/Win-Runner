@@ -10,7 +10,9 @@
 //! Double-quoted strings interpolate (`$x`, `${x}`, `$(...)`);
 //! single-quoted strings stay verbatim. Multi-line `if`/`elseif`/`else`
 //! blocks work with truthiness, `-not`, and `-eq`/`-ne` conditions
-//! (`throw` surfaces a message); anything else fails clearly.
+//! (`throw` surfaces a message); anything else fails clearly. Variables
+//! hold strings or `@(...)` arrays (`+=` appends, `.Count`/`.Length`
+//! work, `-in`/`-notin`/`-contains`/`-notcontains` test membership).
 //! All operations go through the exact same [`WinFs`](crate::winfs::WinFs) API
 //! that the EXE shims use.
 
@@ -26,7 +28,15 @@ const MAX_IEX_DEPTH: usize = 32;
 /// `run_ps1` uses a throwaway session.
 #[derive(Default)]
 pub struct Session {
-    pub vars: HashMap<String, String>,
+    pub vars: HashMap<String, Value>,
+}
+
+/// A variable value: plain string or string array. Arrays render
+/// space-joined in string context (PowerShell `$OFS` default).
+#[derive(Clone)]
+pub enum Value {
+    Str(String),
+    Arr(Vec<String>),
 }
 
 /// Run a `.ps1` script. Returns exit code (0 ok). Output is appended to `out`.
@@ -54,7 +64,7 @@ struct Interpreter<'a> {
     fs: &'a mut WinFs,
     out: &'a mut Vec<u8>,
     depth: usize,
-    vars: &'a mut HashMap<String, String>,
+    vars: &'a mut HashMap<String, Value>,
 }
 
 impl<'a> Interpreter<'a> {
@@ -158,8 +168,10 @@ impl<'a> Interpreter<'a> {
         }
     }
 
-    /// Evaluate an if/elseif condition: truthy value, `-not`, `-eq`/`-ne`.
-    /// Method calls, properties, arrays, and other operators fail clearly.
+    /// Evaluate an if/elseif condition: truthy value, `-not`, `-eq`/`-ne`,
+    /// `-in`/`-notin`/`-contains`/`-notcontains` (arrays welcome on the
+    /// collection side). Method calls, other properties, and other
+    /// operators fail clearly.
     fn eval_cond(&mut self, cond: &str) -> Result<bool, String> {
         let toks = tokenize(cond)?;
         if toks.is_empty() {
@@ -174,11 +186,20 @@ impl<'a> Interpreter<'a> {
                 return Ok(false);
             }
         }
+        // Membership form first: `$x -in $coll` / `$coll -contains $x`
+        // (negated variants too). The collection side may be an array
+        // literal, which the shape guard below would otherwise reject.
+        if toks.len() >= 3 {
+            let op = toks[1].text().to_lowercase();
+            if ["-in", "-notin", "-contains", "-notcontains"].contains(&op.as_str()) {
+                return self.eval_membership(&toks, &op);
+            }
+        }
         // Code-shaped tokens need the object model (later); quoted
-        // literals pass through untouched.
+        // literals and `$arr.Count` probes pass through untouched.
         for tok in &toks {
             let t = tok.text();
-            if tok.verbatim() {
+            if tok.verbatim() || is_count_probe(&t) {
                 continue;
             }
             if t.contains(['.', '(', ')', '{', '}', '[', ']', '@']) {
@@ -209,6 +230,68 @@ impl<'a> Interpreter<'a> {
             return Err(format!("{} is not supported in conditions", args[1]));
         }
         Err(format!("cannot evaluate condition: {}", args.join(" ")))
+    }
+
+    /// Membership: `$item -in $coll` / `$coll -contains $item` (and
+    /// negations). The collection side is an array variable, an `@(...)`
+    /// literal, or a scalar (single-element); an array item is an error.
+    /// Case-insensitive, like the real operators.
+    fn eval_membership(&mut self, toks: &[Token], op: &str) -> Result<bool, String> {
+        let (item, coll): (&Token, &[Token]) = if op == "-in" || op == "-notin" {
+            if toks.len() < 3 {
+                return Err(format!("{op} needs a collection"));
+            }
+            (&toks[0], &toks[2..])
+        } else if toks.len() == 3 {
+            (&toks[2], &toks[..1])
+        } else {
+            return Err("cannot evaluate condition: trailing tokens".to_string());
+        };
+        if item.text().trim_start().starts_with("@(") {
+            return Err("arrays cannot be membership items".to_string());
+        }
+        if matches!(self.var_value(&item.text()), Some(Value::Arr(_))) {
+            return Err("arrays cannot be membership items".to_string());
+        }
+        let item_val = self.expand_token(item)?;
+        let coll_vals = if coll.len() == 1 && !coll[0].text().trim_start().starts_with("@(") {
+            self.resolve_operand_values(&coll[0])?
+        } else {
+            let joined: String = coll.iter().map(Token::text).collect::<Vec<_>>().join(" ");
+            if !joined.trim_start().starts_with("@(") {
+                return Err(format!("cannot evaluate condition: {op} needs a collection"));
+            }
+            self.eval_array(&joined)?
+        };
+        let hit = coll_vals
+            .iter()
+            .any(|v| v.eq_ignore_ascii_case(&item_val));
+        Ok(if op == "-in" || op == "-contains" {
+            hit
+        } else {
+            !hit
+        })
+    }
+
+    /// One operand's values: array variable elements, else the expanded
+    /// scalar. (Callers route `@(...)` to eval_array first.)
+    fn resolve_operand_values(&mut self, tok: &Token) -> Result<Vec<String>, String> {
+        if let Some(Value::Arr(a)) = self.var_value(&tok.text()).cloned() {
+            return Ok(a);
+        }
+        Ok(vec![self.expand_token(tok)?])
+    }
+
+    /// Variable value for plain `$name` text (dotted/coded shapes excluded).
+    fn var_value(&self, text: &str) -> Option<&Value> {
+        if !text.starts_with('$') {
+            return None;
+        }
+        let name = &text[1..];
+        if !is_var_name(name) {
+            return None;
+        }
+        self.vars.get(&name.to_lowercase())
     }
 
     /// Run `a | b | c`: each segment's captured output feeds the next as
@@ -248,7 +331,7 @@ impl<'a> Interpreter<'a> {
         }
         if !toks[0].verbatim() {
             if let Some(asg) = split_assignment(&toks)? {
-                return self.cmd_assign(asg.0, asg.1);
+                return self.cmd_assign(asg.0, asg.1, asg.2);
             }
         }
         // Expand variables per token; single-quoted spans stay verbatim.
@@ -319,9 +402,11 @@ impl<'a> Interpreter<'a> {
         r
     }
 
-    /// `$name = value` assignment. Only plain names are storable;
-    /// `$env:`/`$HOME`/`$null` targets fail clearly.
-    fn cmd_assign(&mut self, name: String, val: Token) -> Result<(), String> {
+    /// `$name = value` / `$name += value` assignment. `@(...)` values
+    /// become arrays; `+=` follows PowerShell add semantics (null+scalar
+    /// stays scalar, anything else grows an array). Only plain names are
+    /// storable; `$env:`/`$HOME`/`$null` targets fail clearly.
+    fn cmd_assign(&mut self, name: String, op: AssignOp, vals: Vec<Token>) -> Result<(), String> {
         let bare = &name[1..]; // split_assignment guarantees leading `$`
         if bare.eq_ignore_ascii_case("null") {
             return Err("cannot assign to $null".to_string());
@@ -335,9 +420,64 @@ impl<'a> Interpreter<'a> {
         if !is_var_name(bare) {
             return Err(format!("invalid variable name: {name}"));
         }
-        let v = self.expand_token(&val)?;
-        self.vars.insert(bare.to_lowercase(), v);
+        let key = bare.to_lowercase();
+        let joined: String = vals
+            .iter()
+            .map(Token::text)
+            .collect::<Vec<_>>()
+            .join(" ");
+        if joined.trim_start().starts_with("@(") {
+            let elements = self.eval_array(&joined)?;
+            match op {
+                AssignOp::Set => {
+                    self.vars.insert(key, Value::Arr(elements));
+                }
+                AssignOp::Append => {
+                    let merged = append_values(self.vars.get(&key), elements);
+                    self.vars.insert(key, merged);
+                }
+            }
+            return Ok(());
+        }
+        if vals.len() != 1 {
+            return Err("unexpected tokens after assignment value".to_string());
+        }
+        let v = self.expand_token(&vals[0])?;
+        match op {
+            AssignOp::Set => {
+                self.vars.insert(key, Value::Str(v));
+            }
+            AssignOp::Append => {
+                let merged = append_values(self.vars.get(&key), vec![v]);
+                self.vars.insert(key, merged);
+            }
+        }
         Ok(())
+    }
+
+    /// Evaluate `@(...)` text into element strings (each expanded).
+    fn eval_array(&mut self, text: &str) -> Result<Vec<String>, String> {
+        let t = text.trim_start();
+        let (inner, rest) = take_wrapped(&t[1..], '(', ')')?;
+        if !rest.trim().is_empty() {
+            return Err("unexpected text after array".to_string());
+        }
+        if inner.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for el in split_top_commas(&inner) {
+            let el = el.trim();
+            if el.is_empty() {
+                return Err("empty array element".to_string());
+            }
+            let toks = tokenize(el)?;
+            if toks.len() != 1 {
+                return Err("array elements must be single values".to_string());
+            }
+            out.push(self.expand_token(&toks[0])?);
+        }
+        Ok(out)
     }
 
     /// Expand one token: `$name` / `${name}` / `$(...)` in expandable spans,
@@ -375,7 +515,10 @@ impl<'a> Interpreter<'a> {
             }
             let mut j = i + 1;
             while j < cs.len()
-                && (cs[j].0.is_ascii_alphanumeric() || cs[j].0 == '_' || cs[j].0 == ':')
+                && (cs[j].0.is_ascii_alphanumeric()
+                    || cs[j].0 == '_'
+                    || cs[j].0 == ':'
+                    || cs[j].0 == '.')
             {
                 j += 1;
             }
@@ -383,6 +526,9 @@ impl<'a> Interpreter<'a> {
                 out.push('$');
                 i += 1;
             } else {
+                if j < cs.len() && cs[j].0 == '(' {
+                    return Err("method calls are not supported".to_string());
+                }
                 let name: String = cs[i + 1..j].iter().map(|(c, _)| *c).collect();
                 out.push_str(&self.lookup_var(&name));
                 i = j;
@@ -419,7 +565,22 @@ impl<'a> Interpreter<'a> {
     }
 
     fn lookup_var(&self, name: &str) -> String {
-        // `name` is ASCII-only ([A-Za-z0-9_:] run), so byte slicing is safe.
+        // `name` is ASCII-only ([A-Za-z0-9_.:] run), so byte slicing is safe.
+        if let Some(dot) = name.find('.') {
+            let (head, tail) = (&name[..dot], &name[dot + 1..]);
+            // `$arr.Count` / `$arr.Length` (string vars keep the legacy
+            // head-plus-literal behavior; other members come later).
+            if tail.eq_ignore_ascii_case("count") || tail.eq_ignore_ascii_case("length") {
+                if let Some(Value::Arr(a)) = self.vars.get(&head.to_lowercase()) {
+                    return a.len().to_string();
+                }
+            }
+            return self.lookup_scalar(head) + "." + tail;
+        }
+        self.lookup_scalar(name)
+    }
+
+    fn lookup_scalar(&self, name: &str) -> String {
         if name.eq_ignore_ascii_case("null") || name == "_" {
             return String::new();
         }
@@ -432,7 +593,11 @@ impl<'a> Interpreter<'a> {
         if name.contains(':') {
             return format!("${name}");
         }
-        self.vars.get(&name.to_lowercase()).cloned().unwrap_or_default()
+        match self.vars.get(&name.to_lowercase()) {
+            Some(Value::Str(s)) => s.clone(),
+            Some(Value::Arr(a)) => a.join(" "),
+            None => String::new(),
+        }
     }
 
     fn cmd_new_item(&mut self, args: &[String]) -> Result<(), String> {
@@ -879,44 +1044,108 @@ fn split_pipeline(stmt: &str) -> Result<Vec<String>, String> {
     Ok(segs)
 }
 
-/// Split `$name = value` (spaced or joined) off tokenized args.
-/// Ok(None) = not an assignment; Err = malformed assignment. Texts and
-/// value flags come from the tokens (quotes already stripped).
-fn split_assignment(args: &[Token]) -> Result<Option<(String, Token)>, String> {
+/// Assignment operator: `=` replaces, `+=` appends (PowerShell array-add
+/// semantics: null+scalar is scalar, anything else grows an array).
+#[derive(PartialEq, Eq)]
+enum AssignOp {
+    Set,
+    Append,
+}
+
+/// PowerShell `+=` merge: null+scalar stays scalar, anything else grows
+/// an array (`"a" + "b"` becomes `@("a", "b")`, like the real thing).
+/// An array base stays an array even when the result has one element
+/// (`@() + "x"` has `.Count` 1).
+fn append_values(existing: Option<&Value>, new: Vec<String>) -> Value {
+    let was_array = matches!(existing, Some(Value::Arr(_)));
+    let mut base: Vec<String> = match existing {
+        Some(Value::Arr(a)) => a.clone(),
+        Some(Value::Str(s)) if !s.is_empty() => vec![s.clone()],
+        _ => Vec::new(),
+    };
+    base.extend(new);
+    if base.len() == 1 && !was_array {
+        Value::Str(base.into_iter().next().unwrap())
+    } else {
+        Value::Arr(base)
+    }
+}
+
+/// Split on top-level commas (quote-aware, paren-depth-aware for `$(...)`).
+fn split_top_commas(s: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut cur = String::new();
+    let mut sq = false;
+    let mut dq = false;
+    let mut depth = 0usize;
+    for c in s.chars() {
+        match c {
+            '\'' if !dq => {
+                sq = !sq;
+                cur.push(c);
+            }
+            '"' if !sq => {
+                dq = !dq;
+                cur.push(c);
+            }
+            '(' if !sq && !dq => {
+                depth += 1;
+                cur.push(c);
+            }
+            ')' if !sq && !dq => {
+                depth = depth.saturating_sub(1);
+                cur.push(c);
+            }
+            ',' if !sq && !dq && depth == 0 => {
+                parts.push(std::mem::take(&mut cur));
+            }
+            _ => cur.push(c),
+        }
+    }
+    parts.push(cur);
+    parts
+}
+
+/// Split `$name = value` / `$name += value` (spaced or joined) off
+/// tokenized args. Ok(None) = not an assignment; Err = malformed.
+/// Value tokens are returned raw (array values legitimately span tokens).
+fn split_assignment(args: &[Token]) -> Result<Option<(String, AssignOp, Vec<Token>)>, String> {
     let first_text = args[0].text();
     if !first_text.starts_with('$') {
         return Ok(None);
     }
     if let Some(eq) = first_text.find('=') {
-        // Joined form: `$name=value` (also covers `$x= 1`, split by space).
+        // Joined form: `$name=value`, `$name+=value` (also `$x= 1`).
         // Text and flag indices line up (quotes stripped, never stored).
-        let name = first_text[..eq].to_string();
+        let mut name = first_text[..eq].to_string();
         let tail = &args[0].chars[eq + 1..];
         if tail.first().is_some_and(|(c, _)| *c == '=') {
             return Err("comparison operators are not supported".to_string());
         }
+        let op = if name.ends_with('+') {
+            name.pop();
+            AssignOp::Append
+        } else {
+            AssignOp::Set
+        };
         if name.len() < 2 {
             return Err("invalid variable name".to_string());
         }
-        if tail.is_empty() {
-            if args.len() == 2 {
-                return Ok(Some((name, args[1].clone())));
-            }
+        let mut vals = Vec::new();
+        if !tail.is_empty() {
+            vals.push(Token {
+                chars: tail.to_vec(),
+            });
+        }
+        vals.extend_from_slice(&args[1..]);
+        if vals.is_empty() {
             return Err("missing value in assignment".to_string());
         }
-        if args.len() > 1 {
-            return Err("unexpected tokens after assignment value".to_string());
-        }
-        return Ok(Some((
-            name,
-            Token {
-                chars: tail.to_vec(),
-            },
-        )));
+        return Ok(Some((name, op, vals)));
     }
-    // Spaced form: `$name = value`.
+    // Spaced form: `$name = value ...` / `$name += value ...`.
     let texts: Vec<String> = args.iter().map(Token::text).collect();
-    if texts.len() < 2 || texts[1] != "=" {
+    if texts.len() < 2 || (texts[1] != "=" && texts[1] != "+=") {
         if texts.len() > 1 && texts[1].starts_with('=') {
             return Err("comparison operators are not supported".to_string());
         }
@@ -925,13 +1154,15 @@ fn split_assignment(args: &[Token]) -> Result<Option<(String, Token)>, String> {
     if texts.len() < 3 {
         return Err("missing value in assignment".to_string());
     }
-    if texts.len() > 3 {
-        return Err("unexpected tokens after assignment value".to_string());
-    }
     if first_text.len() < 2 {
         return Err("invalid variable name".to_string());
     }
-    Ok(Some((first_text, args[2].clone())))
+    let op = if texts[1] == "+=" {
+        AssignOp::Append
+    } else {
+        AssignOp::Set
+    };
+    Ok(Some((first_text, op, args[2..].to_vec())))
 }
 
 /// Split `code...)` at the balancing `)` (quote-aware over the stripped
@@ -979,6 +1210,23 @@ fn is_var_name(s: &str) -> bool {
         _ => return false,
     }
     it.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// True for `$Name.Count` / `$Name.Length` probes (allowed in conditions;
+/// expansion resolves them against array variables).
+fn is_count_probe(text: &str) -> bool {
+    if !text.starts_with('$') {
+        return false;
+    }
+    match text[1..].find('.') {
+        Some(dot) => {
+            let (head, tail) = (&text[1..dot + 1], &text[dot + 2..]);
+            (tail.eq_ignore_ascii_case("count") || tail.eq_ignore_ascii_case("length"))
+                && is_var_name(head)
+                && !tail.contains('.')
+        }
+        None => false,
+    }
 }
 
 /// One whitespace-separated token: chars with a per-char expand flag
@@ -1325,7 +1573,7 @@ mod tests {
     #[test]
     fn if_unsupported_conditions_fail_clearly() {
         assert!(run_session("if ($x -match y) { echo bad }").1.unwrap_err().contains("-match"));
-        assert!(run_session("if ($x.Count -eq 1) { echo bad }").1.unwrap_err().contains("not supported"));
+        assert!(run_session("if ($x.Split('y') -eq 'a') { echo bad }").1.unwrap_err().contains("not supported"));
         assert!(run_session("if (($a -eq $b)) { echo bad }").1.is_err());
         assert!(run_session("if ($x) { echo bad } else ($y) { echo bad }").1.unwrap_err().contains("no condition"));
     }
@@ -1337,6 +1585,76 @@ mod tests {
             "boom-message"
         );
         assert!(run_session("throw").1.is_err());
+    }
+
+    #[test]
+    fn arrays_literal_count_and_join() {
+        let (out, r) = run_session("$Bins = @('esrun', 'esdev')\necho $Bins");
+        assert!(r.is_ok());
+        assert_eq!(out, b"esrun esdev\n");
+        let (out, r) = run_session("$Bins = @('esrun', 'esdev')\nif ($Bins.Count -eq 2) { echo c }");
+        assert!(r.is_ok());
+        assert_eq!(out, b"c\n");
+        let (out, r) = run_session("$Bins = @('esrun')\nif ($Bins.Length -eq 1) { echo len }");
+        assert!(r.is_ok());
+        assert_eq!(out, b"len\n");
+        let (out, r) = run_session("$e = @()\nif ($e.Count -eq 0) { echo empty }");
+        assert!(r.is_ok());
+        assert_eq!(out, b"empty\n");
+    }
+
+    #[test]
+    fn in_contains_family() {
+        let pre = "$Bins = @('esrun', 'esdev')\n";
+        for (cond, want) in [
+            ("if (esrun -in $Bins) { echo y }", "y\n"),
+            ("if (foo -in $Bins) { echo y } else { echo n }", "n\n"),
+            ("if (foo -notin $Bins) { echo y }", "y\n"),
+            ("if ($Bins -contains esdev) { echo y }", "y\n"),
+            ("if ($Bins -notcontains foo) { echo y }", "y\n"),
+            ("if (ESRUN -in $Bins) { echo y }", "y\n"),
+            ("if ('x' -in @('a', 'x')) { echo y }", "y\n"),
+            ("if ('x' -in 'x') { echo y }", "y\n"),
+        ] {
+            let (out, r) = run_session(&format!("{pre}{cond}"));
+            assert!(r.is_ok(), "{cond}");
+            assert_eq!(out, want.as_bytes(), "{cond}");
+        }
+    }
+
+    #[test]
+    fn append_grows_arrays() {
+        // null + scalar stays scalar.
+        let (out, r) = run_session("$u += \"b\"\necho $u");
+        assert!(r.is_ok());
+        assert_eq!(out, b"b\n");
+        // scalar + scalar becomes an array.
+        let (out, r) = run_session("$s = \"a\"\n$s += \"b\"\necho $s");
+        assert!(r.is_ok());
+        assert_eq!(out, b"a b\n");
+        // empty array stays an array (Count works).
+        let (out, r) = run_session("$e = @()\n$e += \"x\"\nif ($e.Count -eq 1) { echo y }");
+        assert!(r.is_ok());
+        assert_eq!(out, b"y\n");
+        // array extends.
+        let (out, r) = run_session("$a = @('x')\n$a += 'y'\necho $a");
+        assert!(r.is_ok());
+        assert_eq!(out, b"x y\n");
+    }
+
+    #[test]
+    fn array_and_membership_shape_errors() {
+        assert!(run_session("$a = @('x',,'y')").1.is_err());
+        assert!(run_session("$a = @('x'").1.is_err());
+        assert!(run_session("$a = @('x') extra").1.unwrap_err().contains("after array"));
+        // No-space `@(...)` on the collection side works.
+        let (out, r) = run_session("if (@('a') -contains 'a') { echo y }");
+        assert!(r.is_ok());
+        assert_eq!(out, b"y\n");
+        // Arrays as items and method calls fail clearly.
+        assert!(run_session("if (@('a') -in $Bins) { echo y }").1.unwrap_err().contains("items"));
+        assert!(run_session("if ($x -match y) { echo y }").1.unwrap_err().contains("-match"));
+        assert!(run_session("if ($x.Split('@') -eq 'a') { echo y }").1.unwrap_err().contains("not supported"));
     }
 
     #[test]
