@@ -19,9 +19,10 @@
 //! `function` defines named params with child-scope calls (output
 //! capturable by assignment). `@{}` maps string keys to values with
 //! `.ContainsKey()` and `[key]`/`[index]` reads (arrays/strings index
-//! too); other methods fail clearly. `try`/`catch`/`finally` run the
-//! first error handler with `finally` always executing (its own signal
-//! wins). Console/script output flushes before errors report.
+//! too). String methods cover case, trim, replace, split (arrays,
+//! indexable), and starts/ends/contains. `try`/`catch`/`finally` run
+//! the first error handler with `finally` always executing (its own
+//! signal wins). Console/script output flushes before errors report.
 //! All operations go through the exact same [`WinFs`](crate::winfs::WinFs) API
 //! that the EXE shims use.
 
@@ -365,6 +366,10 @@ impl<'a> Interpreter<'a> {
             }
             if t.eq_ignore_ascii_case("$false") {
                 return Ok(false);
+            }
+            // Parenthesized groups need the expression evaluator (later).
+            if t.trim_start().starts_with('(') {
+                return Err("parenthesized conditions are not supported".to_string());
             }
             // Single value: expand it (method calls like
             // `$m.ContainsKey($k)` evaluate here) and test truthiness.
@@ -1151,8 +1156,24 @@ impl<'a> Interpreter<'a> {
                             argvals.push(self.expand_token(&atoks[0])?);
                         }
                     }
-                    out.push_str(&self.eval_method(recv, method, &argvals)?);
-                    i = cs.len() - rest2.chars().count();
+                    let mv = self.eval_method(recv, method, &argvals)?;
+                    // Optional `[index]` chain on the method result.
+                    let mut k = cs.len() - rest2.chars().count();
+                    if k < cs.len() && cs[k].0 == '[' {
+                        let tail2: String =
+                            cs[k..].iter().map(|(c, _)| *c).collect();
+                        let (inner2, rest3) = take_wrapped(&tail2, '[', ']')?;
+                        let itoks = tokenize(inner2.trim())?;
+                        if itoks.len() != 1 {
+                            return Err("index must be a single value".to_string());
+                        }
+                        let key = self.expand_token(&itoks[0])?;
+                        out.push_str(&self.eval_index(Some(&mv), &key)?);
+                        k = cs.len() - rest3.chars().count();
+                    } else {
+                        out.push_str(&value_string(&mv));
+                    }
+                    i = k;
                     continue;
                 }
                 // Index `$v[...]` on plain variables (maps, arrays,
@@ -1245,23 +1266,120 @@ impl<'a> Interpreter<'a> {
         }
     }
 
-    /// `$recv.Method(args)`: only `ContainsKey` on maps for now (True/False,
-    /// PowerShell-capitalized). Anything else fails clearly.
-    fn eval_method(&self, recv: &str, method: &str, args: &[String]) -> Result<String, String> {
-        if !method.eq_ignore_ascii_case("containskey") {
-            return Err(format!("method {method} is not supported"));
-        }
-        let Some(Value::Map(m)) = self.vars.get(&recv.to_lowercase()) else {
-            return Err(format!("ContainsKey needs a hashtable"));
+    /// `$recv.Method(args)`: `ContainsKey` on maps; case/trim/replace/
+    /// split/starts/ends/contains on strings. Anything else fails clearly.
+    /// Booleans render PowerShell-capitalized (`True`/`False`).
+    fn eval_method(&self, recv: &str, method: &str, args: &[String]) -> Result<Value, String> {
+        let receiver = match self.vars.get(&recv.to_lowercase()) {
+            Some(v) => v.clone(),
+            None => return Err("cannot call method on null".to_string()),
         };
-        if args.len() != 1 {
-            return Err("ContainsKey takes one argument".to_string());
+        let m = method.to_lowercase();
+        match receiver {
+            Value::Map(map) => {
+                if m != "containskey" {
+                    return Err(format!("method {method} is not supported"));
+                }
+                if args.len() != 1 {
+                    return Err("ContainsKey takes one argument".to_string());
+                }
+                Ok(Value::Str(
+                    if map.contains_key(&args[0].to_lowercase()) {
+                        "True".to_string()
+                    } else {
+                        "False".to_string()
+                    },
+                ))
+            }
+            Value::Arr(items) => {
+                if m != "contains" {
+                    return Err(format!("method {method} is not supported on arrays"));
+                }
+                if args.len() != 1 {
+                    return Err("Contains takes one argument".to_string());
+                }
+                Ok(Value::Str(
+                    if items.iter().any(|v| v == &args[0]) {
+                        "True".to_string()
+                    } else {
+                        "False".to_string()
+                    },
+                ))
+            }
+            Value::Str(s) => {
+                if method.to_lowercase() == "split" {
+                    if args.len() != 1 {
+                        return Err("Split takes one argument".to_string());
+                    }
+                    let sep = &args[0];
+                    if sep.is_empty() {
+                        return Err("cannot split on an empty separator".to_string());
+                    }
+                    // Single char splits on that char (like the char
+                    // overload); longer separators split on the substring.
+                    // Empty entries are kept, like .NET defaults.
+                    let parts: Vec<String> = if sep.chars().count() == 1 {
+                        let c = sep.chars().next().unwrap();
+                        s.split(c).map(str::to_string).collect()
+                    } else {
+                        s.split(sep.as_str()).map(str::to_string).collect()
+                    };
+                    return Ok(Value::Arr(parts));
+                }
+                self.str_method(&s, method, args).map(Value::Str)
+            }
         }
-        Ok(if m.contains_key(&args[0].to_lowercase()) {
-            "True".to_string()
-        } else {
-            "False".to_string()
-        })
+    }
+
+    /// String methods: case/trim/replace/split/starts/ends/contains.
+    /// `Split` returns an array; predicates return `True`/`False`.
+    fn str_method(&self, s: &str, method: &str, args: &[String]) -> Result<String, String> {
+        let no_args = |what: &str| {
+            if args.is_empty() {
+                Ok(())
+            } else {
+                Err(format!("{what} takes no arguments"))
+            }
+        };
+        let one_arg = |what: &str| {
+            if args.len() == 1 {
+                Ok(args[0].clone())
+            } else {
+                Err(format!("{what} takes one argument"))
+            }
+        };
+        match method.to_lowercase().as_str() {
+            "toupper" => {
+                no_args("ToUpper")?;
+                Ok(s.to_uppercase())
+            }
+            "tolower" => {
+                no_args("ToLower")?;
+                Ok(s.to_lowercase())
+            }
+            "trim" => {
+                no_args("Trim")?;
+                Ok(s.trim().to_string())
+            }
+            "trimstart" => {
+                no_args("TrimStart")?;
+                Ok(s.trim_start().to_string())
+            }
+            "trimend" => {
+                no_args("TrimEnd")?;
+                Ok(s.trim_end().to_string())
+            }
+            "replace" => {
+                if args.len() != 2 {
+                    return Err("Replace takes two arguments".to_string());
+                }
+                Ok(s.replace(&args[0], &args[1]))
+            }
+            "startswith" => Ok(bool_string(s.starts_with(&one_arg("StartsWith")?))),
+            "endswith" => Ok(bool_string(s.ends_with(&one_arg("EndsWith")?))),
+            "contains" => Ok(bool_string(s.contains(&one_arg("Contains")?))),
+            _ => Err(format!("method {method} is not supported")),
+        }
     }
 
     /// `$v[key]`: map lookup (case-insensitive, missing → empty), array
@@ -1819,6 +1937,15 @@ fn lines_value(lines: Vec<String>) -> Value {
     }
 }
 
+/// PowerShell-capitalized boolean for method predicates.
+fn bool_string(b: bool) -> String {
+    if b {
+        "True".to_string()
+    } else {
+        "False".to_string()
+    }
+}
+
 /// A value in string context: strings as-is, arrays space-joined, empty
 /// maps stringify empty (Out-String behavior for `@{}`).
 fn value_string(v: &Value) -> String {
@@ -2266,7 +2393,9 @@ impl Token {
     }
 }
 
-/// Tokenize respecting single/double quotes (quotes removed).
+/// Tokenize respecting single/double quotes (quotes removed, except
+/// inside unquoted `(...)` where they are kept literally so subexpressions
+/// and method arguments re-parse faithfully).
 fn tokenize(s: &str) -> Result<Vec<Token>, String> {
     let mut toks = Vec::new();
     let mut cur: Vec<(char, bool)> = Vec::new();
@@ -2274,19 +2403,38 @@ fn tokenize(s: &str) -> Result<Vec<Token>, String> {
     let mut dq = false;
     let mut in_tok = false;
     let mut quoted = false;
+    let mut pdepth = 0usize;
     for c in s.chars() {
         match c {
             '\'' if !dq => {
                 sq = !sq;
                 in_tok = true;
                 quoted = true;
+                if pdepth > 0 {
+                    cur.push((c, false));
+                }
             }
             '"' if !sq => {
                 dq = !dq;
                 in_tok = true;
                 quoted = true;
+                if pdepth > 0 {
+                    cur.push((c, false));
+                }
             }
-            c if c.is_whitespace() && !sq && !dq => {
+            '(' if !sq && !dq => {
+                pdepth += 1;
+                cur.push((c, true));
+                in_tok = true;
+            }
+            ')' if !sq && !dq => {
+                if pdepth > 0 {
+                    pdepth -= 1;
+                }
+                cur.push((c, true));
+                in_tok = true;
+            }
+            c if c.is_whitespace() && !sq && !dq && pdepth == 0 => {
                 if in_tok {
                     toks.push(Token {
                         chars: std::mem::take(&mut cur),
@@ -2610,6 +2758,46 @@ mod tests {
             "boom-message"
         );
         assert!(run_session("throw").1.is_err());
+    }
+
+    #[test]
+    fn string_case_trim_replace() {
+        let (out, r) = run_session("$s = 'aBc'\necho $s.ToUpper()\necho $s.ToLower()");
+        assert!(r.is_ok());
+        assert_eq!(out, b"ABC\nabc\n");
+        let (out, r) = run_session("$s = '  x  '\necho $s.Trim()");
+        assert!(r.is_ok());
+        assert_eq!(out, b"x\n");
+        let (out, r) = run_session("$s = 'abc'\necho $s.Replace('b', 'B')");
+        assert!(r.is_ok());
+        assert_eq!(out, b"aBc\n");
+        assert!(run_session("$s = 'a'\necho $s.ToUpper('x')").1.unwrap_err().contains("no arguments"));
+        assert!(run_session("echo $s.Foo()").1.unwrap_err().contains("method"));
+    }
+
+    #[test]
+    fn string_split_and_index() {
+        // The exact Install-One shape: tag, split, second part.
+        let (out, r) = run_session("$t = 'esrun@0.24.0'\necho $t.Split('@')[1]");
+        assert!(r.is_ok());
+        assert_eq!(out, b"0.24.0\n");
+        let (out, r) = run_session("$t = 'esrun@0.24.0'\necho $t.Split('@')[0]");
+        assert!(r.is_ok());
+        assert_eq!(out, b"esrun\n");
+        // Multi-char separator splits on the substring.
+        let (out, r) = run_session("$s = 'a--b'\necho $s.Split('--')");
+        assert!(r.is_ok());
+        assert_eq!(out, b"a b\n");
+    }
+
+    #[test]
+    fn string_predicates_in_conditions() {
+        let (out, r) = run_session("$s = 'abc'\nif ($s.StartsWith('a')) { echo y }");
+        assert!(r.is_ok());
+        assert_eq!(out, b"y\n");
+        let (out, r) = run_session("$s = 'abc'\nif ($s.Contains('z')) { echo y } else { echo n }");
+        assert!(r.is_ok());
+        assert_eq!(out, b"n\n");
     }
 
     #[test]

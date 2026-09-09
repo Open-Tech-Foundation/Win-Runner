@@ -160,3 +160,7 @@ All notable changes to this project will be documented in this file.
   Error paths flush partial output first in both CLI and shell. Unit-tested.
 - PS1 builtin capture (`$x = Join-Path ...` runs any builtin capturing
   output) and `Out-Null`. Unit-tested.
+- PS1 string methods: `ToUpper`/`ToLower`, `Trim`/`TrimStart`/`TrimEnd`,
+  `Replace`, `Split` (arrays, chainable with `[n]`), `StartsWith` /
+  `EndsWith` / `Contains`; tokenizer keeps quotes inside `(...)` so quoted
+  literals re-parse. Unit-tested.
