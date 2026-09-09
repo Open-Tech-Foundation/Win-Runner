@@ -135,3 +135,6 @@ All notable changes to this project will be documented in this file.
   `run_ps1_session`; the shell shares one), `$env:`/`$HOME` reads from the
   host, `$null`/unknown names expand empty, comparison operators fail
   clearly. Unit-tested including shape errors.
+- PS1 string interpolation: double-quoted `$x`, `${x}`, and `$(...)`
+  subexpressions (captured, trimmed); single-quoted spans stay verbatim.
+  Unit-tested including unbalanced delimiters.

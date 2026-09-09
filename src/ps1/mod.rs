@@ -7,6 +7,8 @@
 //! HTTPS GET via host curl), Invoke-Expression (`iex`, runs text
 //! as code in the same session), and `$name = value` variables
 //! (`$env:`/`$HOME`/`$null` read from the host, session-persisted).
+//! Double-quoted strings interpolate (`$x`, `${x}`, `$(...)`);
+//! single-quoted strings stay verbatim.
 //! All operations go through the exact same [`WinFs`](crate::winfs::WinFs) API
 //! that the EXE shims use.
 
@@ -90,12 +92,7 @@ impl<'a> Interpreter<'a> {
         for (i, seg) in segments.iter().enumerate() {
             let mut buf = Vec::new();
             {
-                let mut sub = Interpreter {
-                    fs: &mut *self.fs,
-                    out: &mut buf,
-                    depth: self.depth,
-                    vars: &mut *self.vars,
-                };
+                let mut sub = self.sub(&mut buf);
                 sub.exec_statement(seg, input.as_deref())?;
             }
             if i + 1 == segments.len() {
@@ -113,17 +110,20 @@ impl<'a> Interpreter<'a> {
     }
 
     fn exec_statement(&mut self, stmt: &str, pipe_in: Option<&str>) -> Result<(), String> {
-        let args = tokenize(stmt)?;
-        if args.is_empty() {
+        let toks = tokenize(stmt)?;
+        if toks.is_empty() {
             return Ok(());
         }
-        if let Some(asg) = split_assignment(&args)? {
-            return self.cmd_assign(asg.0, asg.1);
+        if !toks[0].verbatim() {
+            if let Some(asg) = split_assignment(&toks)? {
+                return self.cmd_assign(asg.0, asg.1);
+            }
         }
-        // Expand variables in every token (single-quote fidelity arrives
-        // with string interpolation; quoted literals carrying `$` are rare
-        // enough that expanding them is the saner v1).
-        let args: Vec<String> = args.iter().map(|t| self.expand_vars(t)).collect();
+        // Expand variables per token; single-quoted spans stay verbatim.
+        let mut args = Vec::with_capacity(toks.len());
+        for tok in &toks {
+            args.push(self.expand_token(tok)?);
+        }
         let cmd = args[0].to_lowercase();
         let rest = &args[1..];
         match cmd.as_str() {
@@ -181,7 +181,7 @@ impl<'a> Interpreter<'a> {
 
     /// `$name = value` assignment. Only plain names are storable;
     /// `$env:`/`$HOME`/`$null` targets fail clearly.
-    fn cmd_assign(&mut self, name: String, raw: String) -> Result<(), String> {
+    fn cmd_assign(&mut self, name: String, val: Token) -> Result<(), String> {
         let bare = &name[1..]; // split_assignment guarantees leading `$`
         if bare.eq_ignore_ascii_case("null") {
             return Err("cannot assign to $null".to_string());
@@ -195,38 +195,87 @@ impl<'a> Interpreter<'a> {
         if !is_var_name(bare) {
             return Err(format!("invalid variable name: {name}"));
         }
-        let val = self.expand_vars(&raw);
-        self.vars.insert(bare.to_lowercase(), val);
+        let v = self.expand_token(&val)?;
+        self.vars.insert(bare.to_lowercase(), v);
         Ok(())
     }
 
-    /// Expand `$name` / `$env:NAME` / `$HOME` / `$null` inside one token.
-    /// Unknown plain names expand to empty; unknown `drive:` prefixes stay
-    /// literal. Member access (`$bin.exe`) expands the variable part only.
-    fn expand_vars(&self, token: &str) -> String {
+    /// Expand one token: `$name` / `${name}` / `$(...)` in expandable spans,
+    /// single-quoted spans verbatim. Member access (`$bin.exe`) expands the
+    /// variable part only.
+    fn expand_token(&mut self, tok: &Token) -> Result<String, String> {
+        let cs = &tok.chars;
         let mut out = String::new();
-        let mut it = token.chars().peekable();
-        while let Some(c) = it.next() {
-            if c != '$' {
+        let mut i = 0;
+        while i < cs.len() {
+            let (c, ex) = cs[i];
+            if c != '$' || !ex {
                 out.push(c);
+                i += 1;
                 continue;
             }
-            let mut name = String::new();
-            while let Some(&d) = it.peek() {
-                if d.is_ascii_alphanumeric() || d == '_' || d == ':' {
-                    name.push(d);
-                    it.next();
-                } else {
-                    break;
-                }
+            if i + 1 < cs.len() && cs[i + 1].0 == '(' {
+                let (code, used) = take_balanced(&cs[i + 2..])?;
+                out.push_str(&self.eval_sub(&code)?);
+                i += 2 + used;
+                continue;
             }
-            if name.is_empty() {
-                out.push('$');
-            } else {
+            if i + 1 < cs.len() && cs[i + 1].0 == '{' {
+                let mut j = i + 2;
+                while j < cs.len() && cs[j].0 != '}' {
+                    j += 1;
+                }
+                if j >= cs.len() {
+                    return Err("unbalanced ${}".to_string());
+                }
+                let name: String = cs[i + 2..j].iter().map(|(c, _)| *c).collect();
                 out.push_str(&self.lookup_var(&name));
+                i = j + 1;
+                continue;
+            }
+            let mut j = i + 1;
+            while j < cs.len()
+                && (cs[j].0.is_ascii_alphanumeric() || cs[j].0 == '_' || cs[j].0 == ':')
+            {
+                j += 1;
+            }
+            if j == i + 1 {
+                out.push('$');
+                i += 1;
+            } else {
+                let name: String = cs[i + 1..j].iter().map(|(c, _)| *c).collect();
+                out.push_str(&self.lookup_var(&name));
+                i = j;
             }
         }
-        out
+        Ok(out)
+    }
+
+    /// Run subexpression code, capturing output (trailing newlines trimmed).
+    fn eval_sub(&mut self, code: &str) -> Result<String, String> {
+        if self.depth + 1 > MAX_IEX_DEPTH {
+            return Err("iex: max nesting depth exceeded".to_string());
+        }
+        self.depth += 1;
+        let mut buf = Vec::new();
+        let r = {
+            let mut sub = self.sub(&mut buf);
+            sub.run_code(code)
+        };
+        self.depth -= 1;
+        r?;
+        let s = String::from_utf8_lossy(&buf);
+        Ok(s.trim_end_matches(['\n', '\r']).to_string())
+    }
+
+    /// Child interpreter sharing filesystem and variables, capturing output.
+    fn sub<'b>(&'b mut self, out: &'b mut Vec<u8>) -> Interpreter<'b> {
+        Interpreter {
+            fs: &mut *self.fs,
+            out,
+            depth: self.depth,
+            vars: &mut *self.vars,
+        }
     }
 
     fn lookup_var(&self, name: &str) -> String {
@@ -559,50 +608,95 @@ fn split_pipeline(stmt: &str) -> Result<Vec<String>, String> {
 }
 
 /// Split `$name = value` (spaced or joined) off tokenized args.
-/// Ok(None) = not an assignment; Err = malformed assignment.
-fn split_assignment(args: &[String]) -> Result<Option<(String, String)>, String> {
-    let first = &args[0];
-    if !first.starts_with('$') {
+/// Ok(None) = not an assignment; Err = malformed assignment. Texts and
+/// value flags come from the tokens (quotes already stripped).
+fn split_assignment(args: &[Token]) -> Result<Option<(String, Token)>, String> {
+    let first_text = args[0].text();
+    if !first_text.starts_with('$') {
         return Ok(None);
     }
-    if let Some(eq) = first.find('=') {
+    if let Some(eq) = first_text.find('=') {
         // Joined form: `$name=value` (also covers `$x= 1`, split by space).
-        let name = first[..eq].to_string();
-        let mut value = first[eq + 1..].to_string();
-        if value.starts_with('=') {
+        // Text and flag indices line up (quotes stripped, never stored).
+        let name = first_text[..eq].to_string();
+        let tail = &args[0].chars[eq + 1..];
+        if tail.first().is_some_and(|(c, _)| *c == '=') {
             return Err("comparison operators are not supported".to_string());
         }
         if name.len() < 2 {
             return Err("invalid variable name".to_string());
         }
-        if value.is_empty() {
+        if tail.is_empty() {
             if args.len() == 2 {
-                value = args[1].clone();
-            } else {
-                return Err("missing value in assignment".to_string());
+                return Ok(Some((name, args[1].clone())));
             }
-        } else if args.len() > 1 {
+            return Err("missing value in assignment".to_string());
+        }
+        if args.len() > 1 {
             return Err("unexpected tokens after assignment value".to_string());
         }
-        return Ok(Some((name, value)));
+        return Ok(Some((
+            name,
+            Token {
+                chars: tail.to_vec(),
+            },
+        )));
     }
     // Spaced form: `$name = value`.
-    if args.len() < 2 || args[1] != "=" {
-        if args.len() > 1 && args[1].starts_with('=') {
+    let texts: Vec<String> = args.iter().map(Token::text).collect();
+    if texts.len() < 2 || texts[1] != "=" {
+        if texts.len() > 1 && texts[1].starts_with('=') {
             return Err("comparison operators are not supported".to_string());
         }
         return Ok(None);
     }
-    if args.len() < 3 {
+    if texts.len() < 3 {
         return Err("missing value in assignment".to_string());
     }
-    if args.len() > 3 {
+    if texts.len() > 3 {
         return Err("unexpected tokens after assignment value".to_string());
     }
-    if first.len() < 2 {
+    if first_text.len() < 2 {
         return Err("invalid variable name".to_string());
     }
-    Ok(Some((first.clone(), args[2].clone())))
+    Ok(Some((first_text, args[2].clone())))
+}
+
+/// Split `code...)` at the balancing `)` (quote-aware over the stripped
+/// text). Returns (inner code, chars consumed including `)`).
+fn take_balanced(cs: &[(char, bool)]) -> Result<(String, usize), String> {
+    let mut depth = 1usize;
+    let mut sq = false;
+    let mut dq = false;
+    let mut inner = String::new();
+    let mut i = 0;
+    while i < cs.len() {
+        let (c, _) = cs[i];
+        match c {
+            '\'' if !dq => {
+                sq = !sq;
+                inner.push(c);
+            }
+            '"' if !sq => {
+                dq = !dq;
+                inner.push(c);
+            }
+            '(' if !sq && !dq => {
+                depth += 1;
+                inner.push(c);
+            }
+            ')' if !sq && !dq => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok((inner, i + 1));
+                }
+                inner.push(c);
+            }
+            _ => inner.push(c),
+        }
+        i += 1;
+    }
+    Err("unbalanced $(...)".to_string())
 }
 
 /// True for plain variable names (case-insensitive, ASCII).
@@ -615,10 +709,28 @@ fn is_var_name(s: &str) -> bool {
     it.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// One whitespace-separated token: chars with a per-char expand flag
+/// (false inside single quotes). `text()` drops the flags; indices of
+/// `text()` line up with `chars` (quotes are stripped, never stored).
+#[derive(Clone)]
+struct Token {
+    chars: Vec<(char, bool)>,
+}
+
+impl Token {
+    fn text(&self) -> String {
+        self.chars.iter().map(|(c, _)| *c).collect()
+    }
+    /// True when every char came from single quotes (verbatim literal).
+    fn verbatim(&self) -> bool {
+        !self.chars.is_empty() && self.chars.iter().all(|(_, ex)| !ex)
+    }
+}
+
 /// Tokenize respecting single/double quotes (quotes removed).
-fn tokenize(s: &str) -> Result<Vec<String>, String> {
+fn tokenize(s: &str) -> Result<Vec<Token>, String> {
     let mut toks = Vec::new();
-    let mut cur = String::new();
+    let mut cur: Vec<(char, bool)> = Vec::new();
     let mut sq = false;
     let mut dq = false;
     let mut in_tok = false;
@@ -634,12 +746,14 @@ fn tokenize(s: &str) -> Result<Vec<String>, String> {
             }
             c if c.is_whitespace() && !sq && !dq => {
                 if in_tok {
-                    toks.push(std::mem::take(&mut cur));
+                    toks.push(Token {
+                        chars: std::mem::take(&mut cur),
+                    });
                     in_tok = false;
                 }
             }
             _ => {
-                cur.push(c);
+                cur.push((c, !sq));
                 in_tok = true;
             }
         }
@@ -648,7 +762,7 @@ fn tokenize(s: &str) -> Result<Vec<String>, String> {
         return Err("unterminated quote".to_string());
     }
     if in_tok {
-        toks.push(cur);
+        toks.push(Token { chars: cur });
     }
     Ok(toks)
 }
@@ -841,5 +955,56 @@ mod tests {
         assert!(run_session("$env:A = b").1.unwrap_err().contains("$env:"));
         assert!(run_session("$HOME = b").1.unwrap_err().contains("$HOME"));
         assert!(run_session("$null = b").1.unwrap_err().contains("$null"));
+    }
+
+    #[test]
+    fn double_quoted_interpolation() {
+        let (out, r) = run_session("$name = World\necho \"Hello $name\"");
+        assert!(r.is_ok());
+        assert_eq!(out, b"Hello World\n");
+    }
+
+    #[test]
+    fn single_quoted_stays_verbatim() {
+        let (out, r) = run_session("$name = World\necho '$name'");
+        assert!(r.is_ok());
+        assert_eq!(out, b"$name\n");
+    }
+
+    #[test]
+    fn braced_and_adjacent_names() {
+        let (out, r) = run_session("$name = World\necho \"a${name}b\"");
+        assert!(r.is_ok());
+        assert_eq!(out, b"aWorldb\n");
+    }
+
+    #[test]
+    fn subexpression_runs_and_trims() {
+        let (out, r) = run_session("echo \"v$(echo 42)\"");
+        assert!(r.is_ok());
+        assert_eq!(out, b"v42\n");
+        // Empty subexpression.
+        let (out, r) = run_session("echo \"a$()b\"");
+        assert!(r.is_ok());
+        assert_eq!(out, b"ab\n");
+        // (Nested same-shape strings are unreliable without escapes;
+        // see the iex nesting test.)
+    }
+
+    #[test]
+    fn unbalanced_delimiters_fail() {
+        assert!(run_session("echo \"a$(echo b\"").1.is_err());
+        assert!(run_session("echo \"a${b\"").1.is_err());
+    }
+
+    #[test]
+    fn interpolated_assignment_value() {
+        let (out, r) = run_session("$name = World\n$t = \"$name!\"\necho $t");
+        assert!(r.is_ok());
+        assert_eq!(out, b"World!\n");
+        // Single-quoted values stay literal.
+        let (out, r) = run_session("$name = World\n$t = '$name'\necho $t");
+        assert!(r.is_ok());
+        assert_eq!(out, b"$name\n");
     }
 }
