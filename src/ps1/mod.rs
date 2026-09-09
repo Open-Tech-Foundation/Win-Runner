@@ -15,6 +15,9 @@
 //! work, `-in`/`-notin`/`-contains`/`-notcontains` test membership).
 //! `switch` matches literal patterns (plus `default`) as a statement or
 //! an assignment value; bare quoted/`$` strings output their value.
+//! `foreach` iterates arrays/literals/scalars with `break`/`continue`;
+//! `function` defines named params with child-scope calls (output
+//! capturable by assignment).
 //! All operations go through the exact same [`WinFs`](crate::winfs::WinFs) API
 //! that the EXE shims use.
 
@@ -31,6 +34,24 @@ const MAX_IEX_DEPTH: usize = 32;
 #[derive(Default)]
 pub struct Session {
     pub vars: HashMap<String, Value>,
+    pub funcs: HashMap<String, FuncDef>,
+}
+
+/// A defined function: parameter names (lowercased, no `$`) and body text.
+#[derive(Clone)]
+pub struct FuncDef {
+    pub params: Vec<String>,
+    pub body: String,
+}
+
+/// Statement flow: straight-line runs return `Next`; `break`/`continue`
+/// propagate dynamically to the innermost enclosing loop (`if`/`switch`
+/// bodies are transparent, except `switch` absorbs `break`). `$()`
+/// boundaries absorb both.
+enum Flow {
+    Next,
+    Break,
+    Continue,
 }
 
 /// A variable value: plain string or string array. Arrays render
@@ -58,6 +79,7 @@ pub fn run_ps1_session(
         out,
         depth: 0,
         vars: &mut sess.vars,
+        funcs: &mut sess.funcs,
     };
     interp.run(script)
 }
@@ -67,19 +89,29 @@ struct Interpreter<'a> {
     out: &'a mut Vec<u8>,
     depth: usize,
     vars: &'a mut HashMap<String, Value>,
+    funcs: &'a mut HashMap<String, FuncDef>,
 }
 
 impl<'a> Interpreter<'a> {
     fn run(mut self, script: &str) -> Result<i32, String> {
-        self.run_code(script)?;
-        Ok(0)
+        // Stray top-level break/continue is ignored, like the real shell.
+        match self.run_code(script)? {
+            Flow::Next | Flow::Break | Flow::Continue => Ok(0),
+        }
     }
 
-    fn run_code(&mut self, script: &str) -> Result<(), String> {
-        // Split into statements on newlines and top-level ';'
+    fn run_code(&mut self, script: &str) -> Result<Flow, String> {
+        // Split into statements on newlines and top-level ';'. A line
+        // ending in `=`, `|`, `,`, or backtick continues on the next line.
         let mut code = String::new();
         for line in script.lines() {
             let stripped = strip_comment(line);
+            let t = stripped.trim_end();
+            if t.ends_with('=') || t.ends_with('|') || t.ends_with(',') || t.ends_with('`') {
+                code.push_str(t);
+                code.push(' ');
+                continue;
+            }
             code.push_str(&stripped);
             code.push('\n');
         }
@@ -92,50 +124,78 @@ impl<'a> Interpreter<'a> {
                 continue;
             }
             if starts_kw(t, "if") {
-                i = self.run_if_chain(&chunks, i)?;
+                let (next, flow) = self.run_if_chain(&chunks, i)?;
+                i = next;
+                match flow {
+                    Flow::Next => {}
+                    Flow::Break | Flow::Continue => return Ok(flow),
+                }
+            } else if let Some((name, op, first)) = split_assign_if_head(&chunks[i]) {
+                // `$v = if ...` / `$v += if ...`: gather the chain,
+                // evaluate capturing output lines into the value.
+                let (text, next) = gather_if_tail(&chunks, i, first);
+                let key = check_assign_target(&name)?;
+                let mut buf = Vec::new();
+                let flow = {
+                    let mut sub = self.sub(&mut buf);
+                    sub.eval_if_chain(&text)
+                };
+                match flow? {
+                    Flow::Next => {}
+                    f => return Ok(f),
+                }
+                let text = String::from_utf8_lossy(&buf);
+                let lines: Vec<String> = text.lines().map(str::to_string).collect();
+                match op {
+                    AssignOp::Set => {
+                        self.vars.insert(key, lines_value(lines));
+                    }
+                    AssignOp::Append => {
+                        let elems = match lines_value(lines) {
+                            Value::Str(s) if s.is_empty() => Vec::new(),
+                            Value::Str(s) => vec![s],
+                            Value::Arr(a) => a,
+                        };
+                        let merged = append_values(self.vars.get(&key), elems);
+                        self.vars.insert(key, merged);
+                    }
+                }
+                i = next;
             } else {
                 for stmt in split_statements(&chunks[i]) {
                     let stmt = stmt.trim();
                     if stmt.is_empty() {
                         continue;
                     }
-                    self.run_pipeline(stmt)?;
+                    match self.run_pipeline(stmt)? {
+                        Flow::Next => {}
+                        f => return Ok(f),
+                    }
                 }
                 i += 1;
             }
         }
-        Ok(())
+        Ok(Flow::Next)
     }
 
     /// Run `if (c) {...} [elseif (c) {...}]* [else {...}]?` starting at
     /// chunk `i` (same-chunk `} else {` plus following elseif/else chunks).
-    /// Returns the next chunk index.
-    fn run_if_chain(&mut self, chunks: &[String], i: usize) -> Result<usize, String> {
-        let mut text = chunks[i].clone();
-        let mut j = i + 1;
-        loop {
-            let t = text.trim_end();
-            if !t.ends_with('}') || j >= chunks.len() {
-                break;
-            }
-            let nt = chunks[j].trim_start();
-            if starts_kw(nt, "elseif") || starts_kw(nt, "else") {
-                text.push('\n');
-                text.push_str(&chunks[j]);
-                j += 1;
-            } else {
-                break;
-            }
-        }
-        self.eval_if_chain(&text)?;
-        Ok(j)
+    /// Returns the next chunk index plus any loop signal from a body.
+    fn run_if_chain(&mut self, chunks: &[String], i: usize) -> Result<(usize, Flow), String> {
+        let (text, j) = gather_if_tail(chunks, i, chunks[i].clone());
+        let flow = self.eval_if_chain(&text)?;
+        Ok((j, flow))
     }
 
     /// Evaluate a complete if/elseif/else text: first true branch runs.
-    fn eval_if_chain(&mut self, text: &str) -> Result<(), String> {
+    /// A `break`/`continue` inside a body propagates to the caller's loop.
+    fn eval_if_chain(&mut self, text: &str) -> Result<Flow, String> {
         let (cond, body, mut rest) = parse_if_block(text, "if")?;
         if self.eval_cond(&cond)? {
-            self.run_code(&body)?;
+            let flow = self.run_code(&body)?;
+            if !matches!(flow, Flow::Next) {
+                return Ok(flow);
+            }
             return self.run_remainder(&skip_if_tail(&rest)?);
         }
         loop {
@@ -143,7 +203,10 @@ impl<'a> Interpreter<'a> {
             if starts_kw(&rest, "elseif") {
                 let (cond, body, rest2) = parse_if_block(&rest, "elseif")?;
                 if self.eval_cond(&cond)? {
-                    self.run_code(&body)?;
+                    let flow = self.run_code(&body)?;
+                    if !matches!(flow, Flow::Next) {
+                        return Ok(flow);
+                    }
                     return self.run_remainder(&skip_if_tail(&rest2)?);
                 }
                 rest = rest2;
@@ -153,7 +216,10 @@ impl<'a> Interpreter<'a> {
                     return Err("else takes no condition".to_string());
                 }
                 let (body, rest2) = take_wrapped(after, '{', '}')?;
-                self.run_code(&body)?;
+                let flow = self.run_code(&body)?;
+                if !matches!(flow, Flow::Next) {
+                    return Ok(flow);
+                }
                 return self.run_remainder(&rest2);
             } else {
                 return self.run_remainder(&rest);
@@ -162,9 +228,9 @@ impl<'a> Interpreter<'a> {
     }
 
     /// Run leftover text after an if-chain (same-line trailing statements).
-    fn run_remainder(&mut self, rest: &str) -> Result<(), String> {
+    fn run_remainder(&mut self, rest: &str) -> Result<Flow, String> {
         if rest.trim().is_empty() {
-            Ok(())
+            Ok(Flow::Next)
         } else {
             self.run_code(rest)
         }
@@ -299,8 +365,8 @@ impl<'a> Interpreter<'a> {
     /// Run `a | b | c`: each segment's captured output feeds the next as
     /// text; only the last segment's output reaches the session. Only
     /// Invoke-Expression consumes piped input for now; other commands run
-    /// normally and ignore it.
-    fn run_pipeline(&mut self, stmt: &str) -> Result<(), String> {
+    /// normally and ignore it. Loop signals propagate (abandoning the rest).
+    fn run_pipeline(&mut self, stmt: &str) -> Result<Flow, String> {
         let segments = split_pipeline(stmt)?;
         if segments.len() == 1 {
             return self.exec_statement(stmt, None);
@@ -308,9 +374,13 @@ impl<'a> Interpreter<'a> {
         let mut input: Option<String> = None;
         for (i, seg) in segments.iter().enumerate() {
             let mut buf = Vec::new();
-            {
+            let flow = {
                 let mut sub = self.sub(&mut buf);
-                sub.exec_statement(seg, input.as_deref())?;
+                sub.exec_statement(seg, input.as_deref())
+            };
+            match flow? {
+                Flow::Next => {}
+                f => return Ok(f),
             }
             if i + 1 == segments.len() {
                 self.out.extend_from_slice(&buf);
@@ -318,7 +388,7 @@ impl<'a> Interpreter<'a> {
                 input = Some(String::from_utf8_lossy(&buf).into_owned());
             }
         }
-        Ok(())
+        Ok(Flow::Next)
     }
 
     fn emit(&mut self, s: &str) {
@@ -326,14 +396,23 @@ impl<'a> Interpreter<'a> {
         self.out.push(b'\n');
     }
 
-    fn exec_statement(&mut self, stmt: &str, pipe_in: Option<&str>) -> Result<(), String> {
+    fn exec_statement(&mut self, stmt: &str, pipe_in: Option<&str>) -> Result<Flow, String> {
         let toks = tokenize(stmt)?;
         if toks.is_empty() {
-            return Ok(());
+            return Ok(Flow::Next);
         }
-        // `switch ... {...}` runs from raw text (braces don't tokenize).
-        if !toks[0].verbatim() && toks[0].text().eq_ignore_ascii_case("switch") {
-            return self.cmd_switch(stmt);
+        // Block constructs run from raw text (braces don't tokenize).
+        if !toks[0].verbatim() {
+            let kw = toks[0].text().to_lowercase();
+            if kw == "switch" {
+                return self.cmd_switch(stmt);
+            }
+            if kw == "foreach" {
+                return self.cmd_foreach(stmt);
+            }
+            if kw == "function" {
+                return self.cmd_function_def(stmt);
+            }
         }
         // `$x = switch ... {...}` assigns the switch output.
         if let Some(sw) = split_switch_assign(stmt)? {
@@ -349,7 +428,7 @@ impl<'a> Interpreter<'a> {
         if toks.len() == 1 && (toks[0].quoted || toks[0].text().len() > 1 && toks[0].text().starts_with('$')) {
             let v = self.expand_token(&toks[0])?;
             self.emit(&v);
-            return Ok(());
+            return Ok(Flow::Next);
         }
         // Expand variables per token; single-quoted spans stay verbatim.
         let mut args = Vec::with_capacity(toks.len());
@@ -358,6 +437,24 @@ impl<'a> Interpreter<'a> {
         }
         let cmd = args[0].to_lowercase();
         let rest = &args[1..];
+        // Loop signals and code execution (flow-aware) precede the
+        // plain builtins below.
+        if cmd == "break" {
+            return Ok(Flow::Break);
+        }
+        if cmd == "continue" {
+            return Ok(Flow::Continue);
+        }
+        if cmd == "iex" || cmd == "invoke-expression" {
+            return self.cmd_iex(rest, pipe_in);
+        }
+        if let Some((params, body)) = self
+            .funcs
+            .get(&cmd)
+            .map(|f| (f.params.clone(), f.body.clone()))
+        {
+            return self.call_function(&cmd, &params, &body, rest);
+        }
         match cmd.as_str() {
             "new-item" => self.cmd_new_item(rest),
             "set-content" => self.cmd_set_content(rest),
@@ -382,9 +479,9 @@ impl<'a> Interpreter<'a> {
                 Err(msg)
             }
             "irm" | "invoke-restmethod" => self.cmd_irm(rest),
-            "iex" | "invoke-expression" => self.cmd_iex(rest, pipe_in),
             _ => Err(format!("unknown command: {}", args[0])),
-        }
+        }?;
+        Ok(Flow::Next)
     }
 
     /// Invoke-RestMethod: HTTPS GET via host curl, response text to output.
@@ -402,8 +499,9 @@ impl<'a> Interpreter<'a> {
     }
 
     /// Invoke-Expression: run text as code in this session (same filesystem).
-    /// Prefers an argument; otherwise consumes piped input.
-    fn cmd_iex(&mut self, args: &[String], pipe_in: Option<&str>) -> Result<(), String> {
+    /// Prefers an argument; otherwise consumes piped input. Loop signals
+    /// propagate (dynamic scope).
+    fn cmd_iex(&mut self, args: &[String], pipe_in: Option<&str>) -> Result<Flow, String> {
         let (_, positional) = parse_params(args, &[])?;
         let code = positional
             .first()
@@ -423,21 +521,8 @@ impl<'a> Interpreter<'a> {
     /// become arrays; `+=` follows PowerShell add semantics (null+scalar
     /// stays scalar, anything else grows an array). Only plain names are
     /// storable; `$env:`/`$HOME`/`$null` targets fail clearly.
-    fn cmd_assign(&mut self, name: String, op: AssignOp, vals: Vec<Token>) -> Result<(), String> {
-        let bare = &name[1..]; // split_assignment guarantees leading `$`
-        if bare.eq_ignore_ascii_case("null") {
-            return Err("cannot assign to $null".to_string());
-        }
-        if bare.eq_ignore_ascii_case("home") {
-            return Err("assigning $HOME is not supported".to_string());
-        }
-        if bare.len() > 4 && bare[..4].eq_ignore_ascii_case("env:") {
-            return Err("assigning $env: is not supported".to_string());
-        }
-        if !is_var_name(bare) {
-            return Err(format!("invalid variable name: {name}"));
-        }
-        let key = bare.to_lowercase();
+    fn cmd_assign(&mut self, name: String, op: AssignOp, vals: Vec<Token>) -> Result<Flow, String> {
+        let key = check_assign_target(&name)?;
         let joined: String = vals
             .iter()
             .map(Token::text)
@@ -454,7 +539,41 @@ impl<'a> Interpreter<'a> {
                     self.vars.insert(key, merged);
                 }
             }
-            return Ok(());
+            return Ok(Flow::Next);
+        }
+        // `$t = GetIt [$args...]`: call a defined function, capture its
+        // output (0 lines → `""`, 1 → string, N → array).
+        if !vals.is_empty() && !vals[0].verbatim() {
+            let fname = vals[0].text().to_lowercase();
+            if let Some((params, body)) =
+                self.funcs.get(&fname).map(|f| (f.params.clone(), f.body.clone()))
+            {
+                let mut argvals = Vec::with_capacity(vals.len().saturating_sub(1));
+                for t in vals.iter().skip(1) {
+                    argvals.push(self.expand_token(t)?);
+                }
+                let mut buf = Vec::new();
+                let flow = {
+                    let mut sub = self.sub(&mut buf);
+                    sub.call_function(&fname, &params, &body, &argvals)
+                };
+                match flow? {
+                    Flow::Next => {}
+                    f => return Ok(f),
+                }
+                let text = String::from_utf8_lossy(&buf);
+                let lines: Vec<String> = text.lines().map(str::to_string).collect();
+                match op {
+                    AssignOp::Set => {
+                        self.vars.insert(key, lines_value(lines));
+                    }
+                    AssignOp::Append => {
+                        let merged = append_values(self.vars.get(&key), lines);
+                        self.vars.insert(key, merged);
+                    }
+                }
+                return Ok(Flow::Next);
+            }
         }
         if vals.len() != 1 {
             return Err("unexpected tokens after assignment value".to_string());
@@ -469,7 +588,7 @@ impl<'a> Interpreter<'a> {
                 self.vars.insert(key, merged);
             }
         }
-        Ok(())
+        Ok(Flow::Next)
     }
 
     /// Evaluate `@(...)` text into element strings (each expanded).
@@ -498,79 +617,69 @@ impl<'a> Interpreter<'a> {
     }
 
     /// `switch (value) { pattern { body } ... default { body } }` as a
-    /// statement: every matching branch runs (no `break` yet), `default`
-    /// runs iff nothing matched. Patterns are literal (case-insensitive);
-    /// `{...}` patterns and flags fail clearly.
-    fn cmd_switch(&mut self, stmt: &str) -> Result<(), String> {
+    /// statement: every matching branch runs, `default` runs iff nothing
+    /// matched. Patterns are literal (case-insensitive); `{...}` patterns
+    /// and flags fail clearly. A `break` inside a body exits the switch;
+    /// `continue` propagates to the enclosing loop.
+    fn cmd_switch(&mut self, stmt: &str) -> Result<Flow, String> {
         let (expr, clauses, rest) = parse_switch(stmt)?;
         if !rest.trim().is_empty() {
             return Err("unexpected text after switch".to_string());
         }
         let mut buf = Vec::new();
-        {
+        let flow = {
             let mut sub = self.sub(&mut buf);
-            sub.run_switch_bodies(&expr, &clauses)?;
-        }
+            sub.run_switch_bodies(&expr, &clauses)
+        };
         self.out.extend_from_slice(&buf);
-        Ok(())
+        match flow? {
+            Flow::Break => Ok(Flow::Next),
+            f => Ok(f),
+        }
     }
 
     /// `$name = switch ...` / `$name += switch ...`: the switch output
     /// lines become the value (0 lines → `""`, 1 → string, N → array).
+    /// A loop signal abandons the capture and propagates.
     fn cmd_assign_switch(
         &mut self,
         name: String,
         op: AssignOp,
         rhs: String,
-    ) -> Result<(), String> {
-        let bare = name
-            .strip_prefix('$')
-            .ok_or_else(|| "invalid variable name".to_string())?;
-        if bare.eq_ignore_ascii_case("null") {
-            return Err("cannot assign to $null".to_string());
-        }
-        if bare.eq_ignore_ascii_case("home") {
-            return Err("assigning $HOME is not supported".to_string());
-        }
-        if bare.len() > 4 && bare[..4].eq_ignore_ascii_case("env:") {
-            return Err("assigning $env: is not supported".to_string());
-        }
-        if !is_var_name(bare) {
-            return Err(format!("invalid variable name: {name}"));
-        }
-        let key = bare.to_lowercase();
+    ) -> Result<Flow, String> {
+        let key = check_assign_target(&name)?;
         let (expr, clauses, rest) = parse_switch(&rhs)?;
         if !rest.trim().is_empty() {
             return Err("unexpected text after switch".to_string());
         }
         let mut buf = Vec::new();
-        {
+        let flow = {
             let mut sub = self.sub(&mut buf);
-            sub.run_switch_bodies(&expr, &clauses)?;
+            sub.run_switch_bodies(&expr, &clauses)
+        };
+        // A loop signal abandons the capture and propagates.
+        match flow? {
+            Flow::Next => {}
+            f => return Ok(f),
         }
         let text = String::from_utf8_lossy(&buf);
         let lines: Vec<String> = text.lines().map(str::to_string).collect();
         match op {
             AssignOp::Set => {
-                let v = if lines.len() == 1 {
-                    Value::Str(lines.into_iter().next().unwrap())
-                } else if lines.is_empty() {
-                    Value::Str(String::new())
-                } else {
-                    Value::Arr(lines)
-                };
-                self.vars.insert(key, v);
+                self.vars.insert(key, lines_value(lines));
             }
             AssignOp::Append => {
                 let merged = append_values(self.vars.get(&key), lines);
                 self.vars.insert(key, merged);
             }
         }
-        Ok(())
+        Ok(Flow::Next)
     }
 
     /// Evaluate the switch expression, run matching clause bodies into `out`.
-    fn run_switch_bodies(&mut self, expr: &str, clauses: &str) -> Result<(), String> {
+    /// Loop signals from bodies propagate (the `switch` statement itself
+    /// absorbs `break`; see cmd_switch).
+    fn run_switch_bodies(&mut self, expr: &str, clauses: &str) -> Result<Flow, String> {
         let value = self.eval_switch_value(expr)?;
         let mut rest = clauses.trim_start().to_string();
         let mut matched = false;
@@ -594,16 +703,155 @@ impl<'a> Interpreter<'a> {
             let pat_val = self.expand_token(&ptoks[0])?;
             if pat_val.eq_ignore_ascii_case("default") {
                 if !matched {
-                    self.run_code(&body)?;
+                    match self.run_code(&body)? {
+                        Flow::Next => {}
+                        f => return Ok(f),
+                    }
                     matched = true;
                 }
             } else if pat_val.eq_ignore_ascii_case(&value) {
-                self.run_code(&body)?;
+                match self.run_code(&body)? {
+                    Flow::Next => {}
+                    f => return Ok(f),
+                }
                 matched = true;
             }
             rest = rest2.trim_start().to_string();
         }
-        Ok(())
+        Ok(Flow::Next)
+    }
+
+    /// `foreach ($v in EXPR) { body }`: array variable, `@(...)` literal,
+    /// or scalar (single iteration). `break` stops, `continue` skips.
+    fn cmd_foreach(&mut self, stmt: &str) -> Result<Flow, String> {
+        let rest = stmt.trim_start()["foreach".len()..].trim_start();
+        if !rest.starts_with('(') {
+            return Err("foreach needs ($var in ...)".to_string());
+        }
+        let (header, rest2) = take_wrapped(rest, '(', ')').map_err(|_| "foreach needs ($var in ...)".to_string())?;
+        let rest2 = rest2.trim_start();
+        if !rest2.starts_with('{') {
+            return Err("foreach needs {body}".to_string());
+        }
+        let (body, rest3) = take_wrapped(rest2, '{', '}')?;
+        if !rest3.trim().is_empty() {
+            return Err("unexpected text after foreach".to_string());
+        }
+        let htoks = tokenize(&header)?;
+        if htoks.len() < 3 || !htoks[1].text().eq_ignore_ascii_case("in") {
+            return Err("foreach needs ($var in ...)".to_string());
+        }
+        let var_name = htoks[0].text();
+        let var_name = var_name
+            .strip_prefix('$')
+            .ok_or_else(|| "invalid loop variable".to_string())?;
+        if !is_var_name(var_name) {
+            return Err("invalid loop variable".to_string());
+        }
+        let key = var_name.to_lowercase();
+        let items = self.eval_collection(&htoks[2..])?;
+        for item in items {
+            self.vars.insert(key.clone(), Value::Str(item));
+            match self.run_code(&body)? {
+                Flow::Next => {}
+                Flow::Break => break,
+                Flow::Continue => continue,
+            }
+        }
+        Ok(Flow::Next)
+    }
+
+    /// One collection's elements: array variable, `@(...)` literal, or a
+    /// single scalar (single iteration).
+    fn eval_collection(&mut self, toks: &[Token]) -> Result<Vec<String>, String> {
+        if toks.is_empty() {
+            return Err("foreach needs a collection".to_string());
+        }
+        if toks.len() == 1 && !toks[0].text().trim_start().starts_with("@(") {
+            return self.resolve_operand_values(&toks[0]);
+        }
+        let joined: String = toks.iter().map(Token::text).collect::<Vec<_>>().join(" ");
+        if !joined.trim_start().starts_with("@(") {
+            return Err("foreach needs a collection".to_string());
+        }
+        self.eval_array(&joined)
+    }
+
+    /// `function Name($a, $b) { body }` (params optional): stores the
+    /// definition; nothing runs. Redefinition overwrites.
+    fn cmd_function_def(&mut self, stmt: &str) -> Result<Flow, String> {
+        let rest = stmt.trim_start()["function".len()..].trim_start();
+        // Name runs to whitespace, `(`, or `{`.
+        let mut name_end = rest.len();
+        for (idx, c) in rest.char_indices() {
+            if c.is_whitespace() || c == '(' || c == '{' {
+                name_end = idx;
+                break;
+            }
+        }
+        let name = &rest[..name_end];
+        if name.is_empty()
+            || !name
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err("invalid function name".to_string());
+        }
+        let mut rest = rest[name_end..].trim_start().to_string();
+        let mut params = Vec::new();
+        if rest.starts_with('(') {
+            let (inner, rest2) = take_wrapped(&rest, '(', ')')?;
+            rest = rest2.trim_start().to_string();
+            for p in split_top_commas(&inner) {
+                let p = p.trim().strip_prefix('$').unwrap_or(p.trim());
+                if p.is_empty() || !is_var_name(p) {
+                    return Err(format!("invalid function parameter: {p}"));
+                }
+                params.push(p.to_lowercase());
+            }
+        }
+        if !rest.starts_with('{') {
+            return Err("function needs {body}".to_string());
+        }
+        let (body, rest2) = take_wrapped(&rest, '{', '}')?;
+        if !rest2.trim().is_empty() {
+            return Err("unexpected text after function".to_string());
+        }
+        self.funcs.insert(
+            name.to_lowercase(),
+            FuncDef {
+                params,
+                body,
+            },
+        );
+        Ok(Flow::Next)
+    }
+
+    /// Call a defined function: bind positionals (missing → `""`, extra is
+    /// an error), run the body in a child scope (writes are local).
+    fn call_function(
+        &mut self,
+        name: &str,
+        params: &[String],
+        body: &str,
+        args: &[String],
+    ) -> Result<Flow, String> {
+        if args.len() > params.len() {
+            return Err(format!("too many arguments to {name}"));
+        }
+        let saved = self.vars.clone();
+        for (i, p) in params.iter().enumerate() {
+            self.vars.insert(
+                p.clone(),
+                Value::Str(args.get(i).cloned().unwrap_or_default()),
+            );
+        }
+        let body = body.to_string();
+        let r = self.run_code(&body);
+        *self.vars = saved;
+        r
     }
 
     /// The switch value: single expanded token in `(...)` (parens required).
@@ -673,29 +921,33 @@ impl<'a> Interpreter<'a> {
     }
 
     /// Run subexpression code, capturing output (trailing newlines trimmed).
+    /// Loop signals are absorbed here (`$(...)` is a value boundary).
     fn eval_sub(&mut self, code: &str) -> Result<String, String> {
         if self.depth + 1 > MAX_IEX_DEPTH {
             return Err("iex: max nesting depth exceeded".to_string());
         }
         self.depth += 1;
         let mut buf = Vec::new();
-        let r = {
+        let flow = {
             let mut sub = self.sub(&mut buf);
             sub.run_code(code)
         };
         self.depth -= 1;
-        r?;
+        if let Err(e) = flow {
+            return Err(e);
+        }
         let s = String::from_utf8_lossy(&buf);
         Ok(s.trim_end_matches(['\n', '\r']).to_string())
     }
 
-    /// Child interpreter sharing filesystem and variables, capturing output.
+    /// Child interpreter sharing filesystem, variables, and functions.
     fn sub<'b>(&'b mut self, out: &'b mut Vec<u8>) -> Interpreter<'b> {
         Interpreter {
             fs: &mut *self.fs,
             out,
             depth: self.depth,
             vars: &mut *self.vars,
+            funcs: &mut *self.funcs,
         }
     }
 
@@ -1062,6 +1314,31 @@ fn skip_if_tail(rest: &str) -> Result<String, String> {
     }
 }
 
+/// Gather an if-chain's full text: first text plus following elseif/else
+/// chunks (and continuation chunks while the last block is unclosed, so
+/// newline-brace style works). Returns (text, next index).
+fn gather_if_tail(chunks: &[String], i: usize, first: String) -> (String, usize) {
+    let mut text = first;
+    let mut j = i + 1;
+    loop {
+        let t = text.trim_end();
+        let need_more = !t.ends_with('}');
+        let chain_next = t.ends_with('}')
+            && j < chunks.len()
+            && {
+                let nt = chunks[j].trim_start();
+                starts_kw(nt, "elseif") || starts_kw(nt, "else")
+            };
+        if (!need_more && !chain_next) || j >= chunks.len() {
+            break;
+        }
+        text.push('\n');
+        text.push_str(&chunks[j]);
+        j += 1;
+    }
+    (text, j)
+}
+
 /// Parse `KW (cond) { body }rest` (KW = if/elseif). Returns (cond, body, rest).
 fn parse_if_block(s: &str, kw: &str) -> Result<(String, String, String), String> {
     let after_kw = s.trim_start()[kw.len()..].trim_start();
@@ -1206,6 +1483,17 @@ enum AssignOp {
     Append,
 }
 
+/// Output lines to a value: 0 lines → `""`, 1 → string, N → array.
+fn lines_value(lines: Vec<String>) -> Value {
+    if lines.len() == 1 {
+        Value::Str(lines.into_iter().next().unwrap())
+    } else if lines.is_empty() {
+        Value::Str(String::new())
+    } else {
+        Value::Arr(lines)
+    }
+}
+
 /// PowerShell `+=` merge: null+scalar stays scalar, anything else grows
 /// an array (`"a" + "b"` becomes `@("a", "b")`, like the real thing).
 /// An array base stays an array even when the result has one element
@@ -1258,6 +1546,59 @@ fn split_top_commas(s: &str) -> Vec<String> {
     }
     parts.push(cur);
     parts
+}
+
+/// Detect `$name = if ...` / `$name += if ...` on raw chunk text.
+/// Returns (name, op, text starting at `if`).
+fn split_assign_if_head(chunk: &str) -> Option<(String, AssignOp, String)> {
+    let t = chunk.trim_start();
+    if !t.starts_with('$') {
+        return None;
+    }
+    let mut name_end = 1;
+    for c in t[1..].chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            name_end += c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if name_end < 2 {
+        return None;
+    }
+    let name = t[..name_end].to_string();
+    let rest = t[name_end..].trim_start();
+    let (op, after) = if rest.starts_with("+=") {
+        (AssignOp::Append, rest[2..].trim_start())
+    } else if rest.starts_with('=') && !rest[1..].starts_with('=') {
+        (AssignOp::Set, rest[1..].trim_start())
+    } else {
+        return None;
+    };
+    if !starts_kw(after, "if") {
+        return None;
+    }
+    Some((name, op, after.to_string()))
+}
+
+/// Validate an assignment target (`$name`), returning the key.
+fn check_assign_target(name: &str) -> Result<String, String> {
+    let bare = name
+        .strip_prefix('$')
+        .ok_or_else(|| "invalid variable name".to_string())?;
+    if bare.eq_ignore_ascii_case("null") {
+        return Err("cannot assign to $null".to_string());
+    }
+    if bare.eq_ignore_ascii_case("home") {
+        return Err("assigning $HOME is not supported".to_string());
+    }
+    if bare.len() > 4 && bare[..4].eq_ignore_ascii_case("env:") {
+        return Err("assigning $env: is not supported".to_string());
+    }
+    if !is_var_name(bare) {
+        return Err(format!("invalid variable name: {name}"));
+    }
+    Ok(bare.to_lowercase())
 }
 
 /// Detect `$name = switch ...` / `$name += switch ...` on raw statement
@@ -1623,11 +1964,13 @@ mod tests {
             let mut fs = WinFs::new();
             let mut out = Vec::new();
             let mut vars = HashMap::new();
+            let mut funcs = HashMap::new();
             let mut interp = Interpreter {
                 fs: &mut fs,
                 out: &mut out,
                 depth,
                 vars: &mut vars,
+                funcs: &mut funcs,
             };
             interp.cmd_iex(&["echo hi".to_string()], None).map(|_| ())
         }
@@ -1810,6 +2153,78 @@ mod tests {
             "boom-message"
         );
         assert!(run_session("throw").1.is_err());
+    }
+
+    #[test]
+    fn foreach_iterates_arrays_literals_scalars() {
+        let (out, r) = run_session("$c = @('a', 'b')\nforeach ($i in $c) { echo \"got-$i\" }");
+        assert!(r.is_ok());
+        assert_eq!(out, b"got-a\ngot-b\n");
+        let (out, r) = run_session("foreach ($i in @('x', 'y')) { echo $i }");
+        assert!(r.is_ok());
+        assert_eq!(out, b"x\ny\n");
+        let (out, r) = run_session("foreach ($i in solo) { echo $i }");
+        assert!(r.is_ok());
+        assert_eq!(out, b"solo\n");
+    }
+
+    #[test]
+    fn foreach_break_continue() {
+        let script = "foreach ($i in @('a', 'b', 'c', 'd')) { if ($i -eq 'b') { continue } if ($i -eq 'd') { break } echo \"kept-$i\" }";
+        let (out, r) = run_session(script);
+        assert!(r.is_ok());
+        assert_eq!(out, b"kept-a\nkept-c\n");
+        // Nested loops: inner break stays inner.
+        let script = "foreach ($o in @('1', '2')) { foreach ($i in @('a', 'b')) { if ($i -eq 'b') { break } echo \"$o$i\" } }";
+        let (out, r) = run_session(script);
+        assert!(r.is_ok());
+        assert_eq!(out, b"1a\n2a\n");
+        // Stray top-level break/continue are ignored.
+        assert!(run_session("break").1.is_ok());
+        assert!(run_session("continue").1.is_ok());
+    }
+
+    #[test]
+    fn foreach_shape_errors() {
+        assert!(run_session("foreach $x in $y { echo $x }").1.unwrap_err().contains("($var"));
+        assert!(run_session("foreach ($x in $y)").1.unwrap_err().contains("{body}"));
+        assert!(run_session("foreach ($1 in $y) { echo $1 }").1.unwrap_err().contains("loop variable"));
+        assert!(run_session("foreach ($x in $y) { echo $x } extra").1.unwrap_err().contains("unexpected text"));
+    }
+
+    #[test]
+    fn function_define_call_params() {
+        let (out, r) = run_session("function Hi($who) { echo \"hi-$who\" }\nHi world");
+        assert!(r.is_ok());
+        assert_eq!(out, b"hi-world\n");
+        // Missing args become "", extra args fail.
+        let (out, r) = run_session("function F($a, $b) { echo \"$a-$b\" }\nF only");
+        assert!(r.is_ok());
+        assert_eq!(out, b"only-\n");
+        assert!(run_session("function F($a) { echo $a }\nF 1 2").1.unwrap_err().contains("too many"));
+        // Unknown commands still fail.
+        assert!(run_session("NoSuchFn 1").1.unwrap_err().contains("unknown command"));
+        // Param-less form and redefinition.
+        let (out, r) = run_session("function P { echo one }\nP\nfunction P { echo two }\nP");
+        assert!(r.is_ok());
+        assert_eq!(out, b"one\ntwo\n");
+        // Names are case-insensitive, dashes allowed.
+        let (out, r) = run_session("function Install-One($b) { echo \"got-$b\" }\ninstall-one X");
+        assert!(r.is_ok());
+        assert_eq!(out, b"got-X\n");
+        assert!(run_session("function 1bad { echo x }").1.unwrap_err().contains("function name"));
+    }
+
+    #[test]
+    fn function_output_captures_and_scopes() {
+        // Call output captured by assignment (1 line → string).
+        let (out, r) = run_session("function GetIt($x) { echo \"got-$x\" }\n$t = GetIt world\necho $t");
+        assert!(r.is_ok());
+        assert_eq!(out, b"got-world\n");
+        // Writes are local to the call (child scope).
+        let (out, r) = run_session("$v = outer\nfunction Sc($v) { echo \"in-$v\" }\nSc inner\necho $v");
+        assert!(r.is_ok());
+        assert_eq!(out, b"in-inner\nouter\n");
     }
 
     #[test]

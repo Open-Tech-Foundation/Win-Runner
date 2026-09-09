@@ -148,3 +148,9 @@ All notable changes to this project will be documented in this file.
 - PS1 `switch` on literal patterns plus `default` (case-insensitive),
   as a statement or an assignment value; bare quoted/`$` strings output
   their value. Scriptblock patterns and flags fail clearly. Unit-tested.
+- PS1 `foreach` over arrays/literals/scalars with `break`/`continue`
+  (dynamic scope, nested-safe), and `function` definitions with positional
+  params, child-scope calls, and capturable output. Unit-tested.
+- PS1 `foreach` over arrays/literals/scalars with `break`/`continue`
+  (dynamic scope, nested-safe), and `function` definitions with positional
+  params, child-scope calls, and capturable output. Unit-tested.
