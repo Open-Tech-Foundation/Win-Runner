@@ -26,7 +26,9 @@
 //! round-trip); pipelines carry `ForEach-Object`/`%`, `Where-Object` /
 //! `where`/`?` (conditions), and `Select-Object -First` over text or
 //! JSON lines with `$_` binding; `-match` runs a documented regex
-//! subset; `(...)` groups evaluate capturing output.
+//! subset; `(...)` groups evaluate capturing output; bare collections
+//! enumerate. `-ErrorAction`/`-ErrorVariable` are universal no-ops
+//! (every error terminates).
 //! `try`/`catch`/`finally` run the first error handler with `finally`
 //! always executing (its own signal wins). Console/script output flushes
 //! before errors report.
@@ -394,10 +396,21 @@ impl<'a> Interpreter<'a> {
             }
         }
         // Code-shaped tokens need the object model (later); quoted
-        // literals and `$arr.Count` probes pass through untouched.
-        for tok in &toks {
+        // literals and `$arr.Count` probes pass through untouched. Both
+        // sides of `-match`/`-notmatch` are regex engine data, exempt too.
+        let match_operands = if toks.len() == 3 {
+            let op = toks[1].text().to_lowercase();
+            (op == "-match" || op == "-notmatch")
+                .then_some((0usize, 2usize))
+        } else {
+            None
+        };
+        for (idx, tok) in toks.iter().enumerate() {
             let t = tok.text();
             if tok.verbatim() || is_count_probe(&t) {
+                continue;
+            }
+            if match_operands.is_some_and(|(a, b)| idx == a || idx == b) {
                 continue;
             }
             if t.contains(['.', '(', ')', '{', '}', '[', ']', '@']) {
@@ -599,8 +612,31 @@ impl<'a> Interpreter<'a> {
             }
         }
         // Bare quoted strings and `$` expressions output their value
-        // (what switch bodies and subexpressions produce).
+        // (what switch bodies and subexpressions produce). Bare array/map
+        // variables enumerate (one element per line, like real output);
+        // strings display raw.
         if toks.len() == 1 && (toks[0].quoted || toks[0].text().len() > 1 && toks[0].text().starts_with('$')) {
+            let t = toks[0].text();
+            if !toks[0].quoted {
+                if let Some(v) = self.var_value(&t).cloned() {
+                    match v {
+                        Value::Arr(items) => {
+                            for item in &items {
+                                match item {
+                                    Value::Str(s) => self.emit(s),
+                                    _ => self.emit(&render_json(item)),
+                                }
+                            }
+                            return Ok(Flow::Next);
+                        }
+                        Value::Map(_) => {
+                            self.emit(&render_json(&v));
+                            return Ok(Flow::Next);
+                        }
+                        Value::Str(_) => {}
+                    }
+                }
+            }
             let v = self.expand_token(&toks[0])?;
             self.emit(&v);
             return Ok(Flow::Next);
@@ -702,8 +738,16 @@ impl<'a> Interpreter<'a> {
                 match v {
                     Value::Arr(items) => {
                         for item in &items {
-                            self.out.extend_from_slice(render_json(item).as_bytes());
-                            self.out.push(b'\n');
+                            match item {
+                                Value::Str(s) => {
+                                    self.out.extend_from_slice(s.as_bytes());
+                                    self.out.push(b'\n');
+                                }
+                                _ => {
+                                    self.out.extend_from_slice(render_json(item).as_bytes());
+                                    self.out.push(b'\n');
+                                }
+                            }
                         }
                         return Ok(());
                     }
@@ -3750,6 +3794,18 @@ fn parse_params(
                 "dest" => "destination".to_string(),
                 _ => key,
             };
+            // Universal no-ops: every error here terminates, so there is
+            // nothing for `-ErrorAction` to suppress and nowhere for
+            // `-ErrorVariable` to record. (`-WhatIf`/`-Confirm` would change
+            // semantics, so they stay loud errors below.)
+            if key == "erroraction" || key == "errorvariable" {
+                if i + 1 < args.len() {
+                    i += 2;
+                } else {
+                    return Err(format!("missing value for -{key}"));
+                }
+                continue;
+            }
             if known_set.contains(&key) || known.is_empty() {
                 // value-taking unless boolean flag (force/recurse)
                 if key == "force" || key == "recurse" {
@@ -3895,6 +3951,32 @@ mod tests {
         let (out, r) = run_session(script);
         assert!(r.is_ok());
         assert_eq!(out, b"esrun@0.24.0\n");
+    }
+
+    #[test]
+    fn erroraction_is_universal_noop() {
+        // Real scripts sprinkle -ErrorAction everywhere; with only
+        // terminating errors there is nothing to suppress.
+        let (out, r) = run_session("New-Item C:\\ea.txt -Value x -ErrorAction SilentlyContinue\nGet-Content C:\\ea.txt -ErrorAction Stop");
+        assert!(r.is_ok());
+        assert_eq!(out, b"x\n");
+        assert!(run_session("echo hi -ErrorAction").1.unwrap_err().contains("missing value"));
+    }
+
+    #[test]
+    fn bare_collections_enumerate() {
+        // Bare array variables enumerate one element per line (real
+        // output semantics), so `$arr | ...` flows elements downstream.
+        let (out, r) = run_session("$a = @('x', 'y')\n$a");
+        assert!(r.is_ok());
+        assert_eq!(out, b"x\ny\n");
+        let (out, r) = run_session("$a = @('x', 'y')\n$a | ForEach-Object { echo \"got-$_\" }");
+        assert!(r.is_ok());
+        assert_eq!(out, b"got-x\ngot-y\n");
+        // Bare maps emit canonical single lines.
+        let (out, r) = run_session("$h = @{}\n$h['k'] = 'v'\n$h");
+        assert!(r.is_ok());
+        assert_eq!(out, b"{\"k\":\"v\"}\n");
     }
 
     #[test]
