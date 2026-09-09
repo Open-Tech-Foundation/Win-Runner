@@ -4,8 +4,9 @@
 //! Get-ChildItem, Remove-Item, Copy-Item, Move-Item, Test-Path
 //! (+ Write-Host/Write-Output/echo as pass-through for scripts),
 //! text pipelines (`a | b`, fed as text), Invoke-RestMethod (`irm`,
-//! HTTPS GET via host curl), and Invoke-Expression (`iex`, runs text
-//! as code in the same session).
+//! HTTPS GET via host curl), Invoke-Expression (`iex`, runs text
+//! as code in the same session), and `$name = value` variables
+//! (`$env:`/`$HOME`/`$null` read from the host, session-persisted).
 //! All operations go through the exact same [`WinFs`](crate::winfs::WinFs) API
 //! that the EXE shims use.
 
@@ -16,9 +17,32 @@ use std::collections::HashMap;
 /// otherwise recurse until the host stack overflows).
 const MAX_IEX_DEPTH: usize = 32;
 
+/// Session variables (`$name = value`). Held by the caller (e.g. the
+/// interactive shell) so assignments persist across lines; one-shot
+/// `run_ps1` uses a throwaway session.
+#[derive(Default)]
+pub struct Session {
+    pub vars: HashMap<String, String>,
+}
+
 /// Run a `.ps1` script. Returns exit code (0 ok). Output is appended to `out`.
 pub fn run_ps1(fs: &mut WinFs, script: &str, out: &mut Vec<u8>) -> Result<i32, String> {
-    let interp = Interpreter { fs, out, depth: 0 };
+    run_ps1_session(&mut Session::default(), fs, script, out)
+}
+
+/// Run a script with a caller-held [`Session`] (variables persist).
+pub fn run_ps1_session(
+    sess: &mut Session,
+    fs: &mut WinFs,
+    script: &str,
+    out: &mut Vec<u8>,
+) -> Result<i32, String> {
+    let interp = Interpreter {
+        fs,
+        out,
+        depth: 0,
+        vars: &mut sess.vars,
+    };
     interp.run(script)
 }
 
@@ -26,6 +50,7 @@ struct Interpreter<'a> {
     fs: &'a mut WinFs,
     out: &'a mut Vec<u8>,
     depth: usize,
+    vars: &'a mut HashMap<String, String>,
 }
 
 impl<'a> Interpreter<'a> {
@@ -69,6 +94,7 @@ impl<'a> Interpreter<'a> {
                     fs: &mut *self.fs,
                     out: &mut buf,
                     depth: self.depth,
+                    vars: &mut *self.vars,
                 };
                 sub.exec_statement(seg, input.as_deref())?;
             }
@@ -91,6 +117,13 @@ impl<'a> Interpreter<'a> {
         if args.is_empty() {
             return Ok(());
         }
+        if let Some(asg) = split_assignment(&args)? {
+            return self.cmd_assign(asg.0, asg.1);
+        }
+        // Expand variables in every token (single-quote fidelity arrives
+        // with string interpolation; quoted literals carrying `$` are rare
+        // enough that expanding them is the saner v1).
+        let args: Vec<String> = args.iter().map(|t| self.expand_vars(t)).collect();
         let cmd = args[0].to_lowercase();
         let rest = &args[1..];
         match cmd.as_str() {
@@ -144,6 +177,73 @@ impl<'a> Interpreter<'a> {
         let r = self.run_code(&code);
         self.depth -= 1;
         r
+    }
+
+    /// `$name = value` assignment. Only plain names are storable;
+    /// `$env:`/`$HOME`/`$null` targets fail clearly.
+    fn cmd_assign(&mut self, name: String, raw: String) -> Result<(), String> {
+        let bare = &name[1..]; // split_assignment guarantees leading `$`
+        if bare.eq_ignore_ascii_case("null") {
+            return Err("cannot assign to $null".to_string());
+        }
+        if bare.eq_ignore_ascii_case("home") {
+            return Err("assigning $HOME is not supported".to_string());
+        }
+        if bare.len() > 4 && bare[..4].eq_ignore_ascii_case("env:") {
+            return Err("assigning $env: is not supported".to_string());
+        }
+        if !is_var_name(bare) {
+            return Err(format!("invalid variable name: {name}"));
+        }
+        let val = self.expand_vars(&raw);
+        self.vars.insert(bare.to_lowercase(), val);
+        Ok(())
+    }
+
+    /// Expand `$name` / `$env:NAME` / `$HOME` / `$null` inside one token.
+    /// Unknown plain names expand to empty; unknown `drive:` prefixes stay
+    /// literal. Member access (`$bin.exe`) expands the variable part only.
+    fn expand_vars(&self, token: &str) -> String {
+        let mut out = String::new();
+        let mut it = token.chars().peekable();
+        while let Some(c) = it.next() {
+            if c != '$' {
+                out.push(c);
+                continue;
+            }
+            let mut name = String::new();
+            while let Some(&d) = it.peek() {
+                if d.is_ascii_alphanumeric() || d == '_' || d == ':' {
+                    name.push(d);
+                    it.next();
+                } else {
+                    break;
+                }
+            }
+            if name.is_empty() {
+                out.push('$');
+            } else {
+                out.push_str(&self.lookup_var(&name));
+            }
+        }
+        out
+    }
+
+    fn lookup_var(&self, name: &str) -> String {
+        // `name` is ASCII-only ([A-Za-z0-9_:] run), so byte slicing is safe.
+        if name.eq_ignore_ascii_case("null") || name == "_" {
+            return String::new();
+        }
+        if name.eq_ignore_ascii_case("home") {
+            return std::env::var("HOME").unwrap_or_default();
+        }
+        if name.len() > 4 && name[..4].eq_ignore_ascii_case("env:") {
+            return std::env::var(&name[4..]).unwrap_or_default();
+        }
+        if name.contains(':') {
+            return format!("${name}");
+        }
+        self.vars.get(&name.to_lowercase()).cloned().unwrap_or_default()
     }
 
     fn cmd_new_item(&mut self, args: &[String]) -> Result<(), String> {
@@ -458,6 +558,63 @@ fn split_pipeline(stmt: &str) -> Result<Vec<String>, String> {
     Ok(segs)
 }
 
+/// Split `$name = value` (spaced or joined) off tokenized args.
+/// Ok(None) = not an assignment; Err = malformed assignment.
+fn split_assignment(args: &[String]) -> Result<Option<(String, String)>, String> {
+    let first = &args[0];
+    if !first.starts_with('$') {
+        return Ok(None);
+    }
+    if let Some(eq) = first.find('=') {
+        // Joined form: `$name=value` (also covers `$x= 1`, split by space).
+        let name = first[..eq].to_string();
+        let mut value = first[eq + 1..].to_string();
+        if value.starts_with('=') {
+            return Err("comparison operators are not supported".to_string());
+        }
+        if name.len() < 2 {
+            return Err("invalid variable name".to_string());
+        }
+        if value.is_empty() {
+            if args.len() == 2 {
+                value = args[1].clone();
+            } else {
+                return Err("missing value in assignment".to_string());
+            }
+        } else if args.len() > 1 {
+            return Err("unexpected tokens after assignment value".to_string());
+        }
+        return Ok(Some((name, value)));
+    }
+    // Spaced form: `$name = value`.
+    if args.len() < 2 || args[1] != "=" {
+        if args.len() > 1 && args[1].starts_with('=') {
+            return Err("comparison operators are not supported".to_string());
+        }
+        return Ok(None);
+    }
+    if args.len() < 3 {
+        return Err("missing value in assignment".to_string());
+    }
+    if args.len() > 3 {
+        return Err("unexpected tokens after assignment value".to_string());
+    }
+    if first.len() < 2 {
+        return Err("invalid variable name".to_string());
+    }
+    Ok(Some((first.clone(), args[2].clone())))
+}
+
+/// True for plain variable names (case-insensitive, ASCII).
+fn is_var_name(s: &str) -> bool {
+    let mut it = s.chars();
+    match it.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    it.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// Tokenize respecting single/double quotes (quotes removed).
 fn tokenize(s: &str) -> Result<Vec<String>, String> {
     let mut toks = Vec::new();
@@ -606,10 +763,12 @@ mod tests {
         fn try_at_depth(depth: usize) -> Result<(), String> {
             let mut fs = WinFs::new();
             let mut out = Vec::new();
+            let mut vars = HashMap::new();
             let mut interp = Interpreter {
                 fs: &mut fs,
                 out: &mut out,
                 depth,
+                vars: &mut vars,
             };
             interp.cmd_iex(&["echo hi".to_string()], None).map(|_| ())
         }
@@ -628,5 +787,59 @@ mod tests {
         // Discard port on loopback: refused fast, no DNS, no network.
         let (_, _, r) = run("irm http://127.0.0.1:9/nope");
         assert!(r.is_err());
+    }
+
+    fn run_session(script: &str) -> (Vec<u8>, Result<i32, String>) {
+        let mut sess = Session::default();
+        let mut fs = WinFs::new();
+        let mut out = Vec::new();
+        let r = run_ps1_session(&mut sess, &mut fs, script, &mut out);
+        (out, r)
+    }
+
+    #[test]
+    fn variables_assign_read_case_insensitive() {
+        let (out, r) = run_session("$Repo = Open-Tech-Foundation/ES-Runtime\necho $Repo\necho $repo");
+        assert!(r.is_ok());
+        assert_eq!(out, b"Open-Tech-Foundation/ES-Runtime\nOpen-Tech-Foundation/ES-Runtime\n");
+    }
+
+    #[test]
+    fn undefined_var_expands_empty() {
+        let (out, r) = run_session("echo a$Nope_XYZ_123 b");
+        assert!(r.is_ok());
+        assert_eq!(out, b"a b\n");
+    }
+
+    #[test]
+    fn null_and_home() {
+        let (out, r) = run_session("echo x$null y");
+        assert!(r.is_ok());
+        assert_eq!(out, b"x y\n");
+        let home = std::env::var("HOME").unwrap_or_default();
+        let (out, r) = run_session("echo $HOME");
+        assert!(r.is_ok());
+        assert_eq!(out, format!("{home}\n").as_bytes());
+    }
+
+    #[test]
+    fn env_var_reads_host() {
+        std::env::set_var("WINCLI_TEST_VAR_XYZ", "env-ok");
+        let (out, r) = run_session("echo $env:WINCLI_TEST_VAR_XYZ");
+        std::env::remove_var("WINCLI_TEST_VAR_XYZ");
+        assert!(r.is_ok());
+        assert_eq!(out, b"env-ok\n");
+        let (_, r) = run_session("echo $env:WINCLI_DEFINITELY_NOT_SET_XYZ");
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn assignment_shape_errors() {
+        assert!(run_session("$x =").1.is_err());
+        assert!(run_session("$x = a b").1.is_err());
+        assert!(run_session("$x == 1").1.unwrap_err().contains("comparison"));
+        assert!(run_session("$env:A = b").1.unwrap_err().contains("$env:"));
+        assert!(run_session("$HOME = b").1.unwrap_err().contains("$HOME"));
+        assert!(run_session("$null = b").1.unwrap_err().contains("$null"));
     }
 }

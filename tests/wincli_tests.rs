@@ -890,12 +890,13 @@ fn test_shell_install_run_session_offline() {
         ("WINCLI_SOURCE", src.as_ref()),
     ];
     // One session: install, run the package, share PS1 files across lines.
-    let input = "install demo\ndemo\nNew-Item C:\\shell-t.txt -Value hi\nGet-Content C:\\shell-t.txt\nexit\n";
+    let input = "install demo\ndemo\nNew-Item C:\\shell-t.txt -Value hi\nGet-Content C:\\shell-t.txt\n$v = 42\necho $v\nexit\n";
     let (code, stdout, stderr) = run_shell_env(input, &envs);
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(stdout.contains("Installed demo 0.1.0 → C:\\bin\\demo.exe"), "stdout: {stdout}");
     assert!(stdout.contains("demo 0.1.0"), "stdout: {stdout}");
-    assert!(stdout.ends_with("hi\n"), "stdout: {stdout}");
+    assert!(stdout.contains("hi\n"), "stdout: {stdout}");
+    assert!(stdout.ends_with("42\n"), "stdout: {stdout}");
     assert!(cache.join("pkgs").join("demo.exe").is_file());
     std::fs::remove_dir_all(&cache).ok();
 }

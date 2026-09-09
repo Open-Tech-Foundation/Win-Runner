@@ -131,3 +131,7 @@ All notable changes to this project will be documented in this file.
   `iex`/`Invoke-Expression` runs text as code in the same session (nesting
   capped). Unit-tested offline; `irm <url> | iex` is the entry pattern real
   installer scripts use.
+- PS1 variables: `$name = value` with session persistence (`Session` +
+  `run_ps1_session`; the shell shares one), `$env:`/`$HOME` reads from the
+  host, `$null`/unknown names expand empty, comparison operators fail
+  clearly. Unit-tested including shape errors.

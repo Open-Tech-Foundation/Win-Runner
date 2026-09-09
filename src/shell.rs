@@ -18,9 +18,10 @@ pub enum ShellFlow {
     Exit(i32),
 }
 
-/// One shell session: the filesystem every line shares.
+/// One shell session: the filesystem and variables every line shares.
 pub struct Shell {
     fs: WinFs,
+    sess: ps1::Session,
     last_code: i32,
 }
 
@@ -34,6 +35,7 @@ impl Shell {
     pub fn new() -> Self {
         Shell {
             fs: WinFs::new(),
+            sess: ps1::Session::default(),
             last_code: 0,
         }
     }
@@ -99,7 +101,7 @@ impl Shell {
                 "ps1" => {
                     let script = std::fs::read_to_string(target)
                         .map_err(|e| format!("cannot read {target}: {e}"))?;
-                    let code = ps1::run_ps1(&mut self.fs, &script, out)
+                    let code = ps1::run_ps1_session(&mut self.sess, &mut self.fs, &script, out)
                         .map_err(|e| format!("script error: {e}"))?;
                     self.last_code = code;
                     return Ok(ShellFlow::Continue);
@@ -122,7 +124,7 @@ impl Shell {
         }
         // Otherwise a PS1 statement; an unknown first word that is not
         // installed reads as the familiar install hint.
-        match ps1::run_ps1(&mut self.fs, line, out) {
+        match ps1::run_ps1_session(&mut self.sess, &mut self.fs, line, out) {
             Ok(code) => {
                 self.last_code = code;
                 Ok(ShellFlow::Continue)
@@ -304,6 +306,13 @@ mod tests {
             &mut shell,
             &["New-Item C:\\t.txt -Value hi", "Get-Content C:\\t.txt"],
         );
+        assert_eq!(out, b"hi\n");
+    }
+
+    #[test]
+    fn variables_persist_across_lines() {
+        let mut shell = Shell::new();
+        let (out, _) = run_lines(&mut shell, &["$greet = hi", "echo $greet"]);
         assert_eq!(out, b"hi\n");
     }
 
