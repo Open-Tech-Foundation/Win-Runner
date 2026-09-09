@@ -145,3 +145,6 @@ All notable changes to this project will be documented in this file.
 - PS1 arrays and membership: `@(...)` literals, `+=` appends, `.Count` /
   `.Length`, and `-in` / `-notin` / `-contains` / `-notcontains`
   (case-insensitive); `-match` and friends fail clearly. Unit-tested.
+- PS1 `switch` on literal patterns plus `default` (case-insensitive),
+  as a statement or an assignment value; bare quoted/`$` strings output
+  their value. Scriptblock patterns and flags fail clearly. Unit-tested.

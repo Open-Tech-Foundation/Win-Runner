@@ -13,6 +13,8 @@
 //! (`throw` surfaces a message); anything else fails clearly. Variables
 //! hold strings or `@(...)` arrays (`+=` appends, `.Count`/`.Length`
 //! work, `-in`/`-notin`/`-contains`/`-notcontains` test membership).
+//! `switch` matches literal patterns (plus `default`) as a statement or
+//! an assignment value; bare quoted/`$` strings output their value.
 //! All operations go through the exact same [`WinFs`](crate::winfs::WinFs) API
 //! that the EXE shims use.
 
@@ -329,10 +331,25 @@ impl<'a> Interpreter<'a> {
         if toks.is_empty() {
             return Ok(());
         }
+        // `switch ... {...}` runs from raw text (braces don't tokenize).
+        if !toks[0].verbatim() && toks[0].text().eq_ignore_ascii_case("switch") {
+            return self.cmd_switch(stmt);
+        }
+        // `$x = switch ... {...}` assigns the switch output.
+        if let Some(sw) = split_switch_assign(stmt)? {
+            return self.cmd_assign_switch(sw.0, sw.1, sw.2);
+        }
         if !toks[0].verbatim() {
             if let Some(asg) = split_assignment(&toks)? {
                 return self.cmd_assign(asg.0, asg.1, asg.2);
             }
+        }
+        // Bare quoted strings and `$` expressions output their value
+        // (what switch bodies and subexpressions produce).
+        if toks.len() == 1 && (toks[0].quoted || toks[0].text().len() > 1 && toks[0].text().starts_with('$')) {
+            let v = self.expand_token(&toks[0])?;
+            self.emit(&v);
+            return Ok(());
         }
         // Expand variables per token; single-quoted spans stay verbatim.
         let mut args = Vec::with_capacity(toks.len());
@@ -478,6 +495,124 @@ impl<'a> Interpreter<'a> {
             out.push(self.expand_token(&toks[0])?);
         }
         Ok(out)
+    }
+
+    /// `switch (value) { pattern { body } ... default { body } }` as a
+    /// statement: every matching branch runs (no `break` yet), `default`
+    /// runs iff nothing matched. Patterns are literal (case-insensitive);
+    /// `{...}` patterns and flags fail clearly.
+    fn cmd_switch(&mut self, stmt: &str) -> Result<(), String> {
+        let (expr, clauses, rest) = parse_switch(stmt)?;
+        if !rest.trim().is_empty() {
+            return Err("unexpected text after switch".to_string());
+        }
+        let mut buf = Vec::new();
+        {
+            let mut sub = self.sub(&mut buf);
+            sub.run_switch_bodies(&expr, &clauses)?;
+        }
+        self.out.extend_from_slice(&buf);
+        Ok(())
+    }
+
+    /// `$name = switch ...` / `$name += switch ...`: the switch output
+    /// lines become the value (0 lines → `""`, 1 → string, N → array).
+    fn cmd_assign_switch(
+        &mut self,
+        name: String,
+        op: AssignOp,
+        rhs: String,
+    ) -> Result<(), String> {
+        let bare = name
+            .strip_prefix('$')
+            .ok_or_else(|| "invalid variable name".to_string())?;
+        if bare.eq_ignore_ascii_case("null") {
+            return Err("cannot assign to $null".to_string());
+        }
+        if bare.eq_ignore_ascii_case("home") {
+            return Err("assigning $HOME is not supported".to_string());
+        }
+        if bare.len() > 4 && bare[..4].eq_ignore_ascii_case("env:") {
+            return Err("assigning $env: is not supported".to_string());
+        }
+        if !is_var_name(bare) {
+            return Err(format!("invalid variable name: {name}"));
+        }
+        let key = bare.to_lowercase();
+        let (expr, clauses, rest) = parse_switch(&rhs)?;
+        if !rest.trim().is_empty() {
+            return Err("unexpected text after switch".to_string());
+        }
+        let mut buf = Vec::new();
+        {
+            let mut sub = self.sub(&mut buf);
+            sub.run_switch_bodies(&expr, &clauses)?;
+        }
+        let text = String::from_utf8_lossy(&buf);
+        let lines: Vec<String> = text.lines().map(str::to_string).collect();
+        match op {
+            AssignOp::Set => {
+                let v = if lines.len() == 1 {
+                    Value::Str(lines.into_iter().next().unwrap())
+                } else if lines.is_empty() {
+                    Value::Str(String::new())
+                } else {
+                    Value::Arr(lines)
+                };
+                self.vars.insert(key, v);
+            }
+            AssignOp::Append => {
+                let merged = append_values(self.vars.get(&key), lines);
+                self.vars.insert(key, merged);
+            }
+        }
+        Ok(())
+    }
+
+    /// Evaluate the switch expression, run matching clause bodies into `out`.
+    fn run_switch_bodies(&mut self, expr: &str, clauses: &str) -> Result<(), String> {
+        let value = self.eval_switch_value(expr)?;
+        let mut rest = clauses.trim_start().to_string();
+        let mut matched = false;
+        while !rest.trim().is_empty() {
+            // Clause pattern: text to the first top-level `{`.
+            let (pat, after) = split_clause_head(&rest)?;
+            let after = after.trim_start();
+            if !after.starts_with('{') {
+                return Err("expected {body} in switch clause".to_string());
+            }
+            let (body, rest2) = take_wrapped(after, '{', '}')?;
+            let pat = pat.trim();
+            if pat.is_empty() {
+                // `{ cond } { body }` scriptblock form.
+                return Err("scriptblock switch patterns are not supported".to_string());
+            }
+            let ptoks = tokenize(pat)?;
+            if ptoks.len() != 1 {
+                return Err("switch patterns must be single values".to_string());
+            }
+            let pat_val = self.expand_token(&ptoks[0])?;
+            if pat_val.eq_ignore_ascii_case("default") {
+                if !matched {
+                    self.run_code(&body)?;
+                    matched = true;
+                }
+            } else if pat_val.eq_ignore_ascii_case(&value) {
+                self.run_code(&body)?;
+                matched = true;
+            }
+            rest = rest2.trim_start().to_string();
+        }
+        Ok(())
+    }
+
+    /// The switch value: single expanded token in `(...)` (parens required).
+    fn eval_switch_value(&mut self, expr: &str) -> Result<String, String> {
+        let toks = tokenize(expr)?;
+        if toks.len() != 1 {
+            return Err("switch value must be a single value".to_string());
+        }
+        self.expand_token(&toks[0])
     }
 
     /// Expand one token: `$name` / `${name}` / `$(...)` in expandable spans,
@@ -986,6 +1121,7 @@ fn split_statements(code: &str) -> Vec<String> {
     let mut cur = String::new();
     let mut sq = false;
     let mut dq = false;
+    let mut depth = 0usize;
     for c in code.chars() {
         match c {
             '\'' if !dq => {
@@ -996,10 +1132,18 @@ fn split_statements(code: &str) -> Vec<String> {
                 dq = !dq;
                 cur.push(c);
             }
-            ';' if !sq && !dq => {
+            '{' if !sq && !dq => {
+                depth += 1;
+                cur.push(c);
+            }
+            '}' if !sq && !dq => {
+                depth = depth.saturating_sub(1);
+                cur.push(c);
+            }
+            ';' if !sq && !dq && depth == 0 => {
                 stmts.push(std::mem::take(&mut cur));
             }
-            '\n' if !sq && !dq => {
+            '\n' if !sq && !dq && depth == 0 => {
                 stmts.push(std::mem::take(&mut cur));
             }
             _ => cur.push(c),
@@ -1011,13 +1155,15 @@ fn split_statements(code: &str) -> Vec<String> {
     stmts
 }
 
-/// Split one statement into top-level `|` pipeline segments (quote-aware).
+/// Split one statement into top-level `|` pipeline segments (quote-aware,
+/// brace/paren-depth-aware so pipes inside `{...}` / `$(...)` stay whole).
 /// Errors on empty segments so `| foo` / `foo |` fail clearly.
 fn split_pipeline(stmt: &str) -> Result<Vec<String>, String> {
     let mut segs = Vec::new();
     let mut cur = String::new();
     let mut sq = false;
     let mut dq = false;
+    let mut depth = 0usize;
     for c in stmt.chars() {
         match c {
             '\'' if !dq => {
@@ -1028,7 +1174,15 @@ fn split_pipeline(stmt: &str) -> Result<Vec<String>, String> {
                 dq = !dq;
                 cur.push(c);
             }
-            '|' if !sq && !dq => {
+            '{' | '(' if !sq && !dq => {
+                depth += 1;
+                cur.push(c);
+            }
+            '}' | ')' if !sq && !dq => {
+                depth = depth.saturating_sub(1);
+                cur.push(c);
+            }
+            '|' if !sq && !dq && depth == 0 => {
                 if cur.trim().is_empty() {
                     return Err("empty command in pipeline".to_string());
                 }
@@ -1106,6 +1260,70 @@ fn split_top_commas(s: &str) -> Vec<String> {
     parts
 }
 
+/// Detect `$name = switch ...` / `$name += switch ...` on raw statement
+/// text (tokenizing would shred the braces). Returns (name, op, rhs text).
+fn split_switch_assign(stmt: &str) -> Result<Option<(String, AssignOp, String)>, String> {
+    let t = stmt.trim_start();
+    if !t.starts_with('$') {
+        return Ok(None);
+    }
+    let eq = match t.find('=') {
+        Some(i) => i,
+        None => return Ok(None),
+    };
+    if t[eq + 1..].starts_with('=') {
+        return Ok(None); // `==` etc: normal path errors clearly
+    }
+    let mut name = t[..eq].trim_end().to_string();
+    let op = if name.ends_with('+') {
+        name.pop();
+        AssignOp::Append
+    } else {
+        AssignOp::Set
+    };
+    let rhs = t[eq + 1..].trim_start();
+    if !starts_kw(rhs, "switch") {
+        return Ok(None);
+    }
+    Ok(Some((name, op, rhs.to_string())))
+}
+
+/// Parse `switch [-flag] (value) { clauses }rest`. Flags fail clearly;
+/// the value parens are required. Returns (value, clauses, rest).
+fn parse_switch(s: &str) -> Result<(String, String, String), String> {
+    let mut rest = s.trim_start()["switch".len()..].trim_start();
+    if rest.starts_with('-') {
+        return Err("switch flags are not supported".to_string());
+    }
+    if !rest.starts_with('(') {
+        return Err("switch needs (value)".to_string());
+    }
+    let (expr, rest2) = take_wrapped(rest, '(', ')')?;
+    rest = rest2.trim_start();
+    if !rest.starts_with('{') {
+        return Err("switch needs {clauses}".to_string());
+    }
+    let (clauses, rest3) = take_wrapped(rest, '{', '}')?;
+    Ok((expr, clauses, rest3))
+}
+
+/// Split `pattern { ... }rest` at the first top-level `{`.
+/// Returns (pattern text, text from `{`).
+fn split_clause_head(s: &str) -> Result<(String, String), String> {
+    let mut sq = false;
+    let mut dq = false;
+    for (idx, c) in s.char_indices() {
+        if c == '\'' && !dq {
+            sq = !sq;
+        } else if c == '"' && !sq {
+            dq = !dq;
+        } else if c == '{' && !sq && !dq {
+            return Ok((s[..idx].to_string(), s[idx..].to_string()));
+        }
+    }
+    Err("expected {body} in switch clause".to_string())
+}
+
 /// Split `$name = value` / `$name += value` (spaced or joined) off
 /// tokenized args. Ok(None) = not an assignment; Err = malformed.
 /// Value tokens are returned raw (array values legitimately span tokens).
@@ -1135,6 +1353,7 @@ fn split_assignment(args: &[Token]) -> Result<Option<(String, AssignOp, Vec<Toke
         if !tail.is_empty() {
             vals.push(Token {
                 chars: tail.to_vec(),
+                quoted: false,
             });
         }
         vals.extend_from_slice(&args[1..]);
@@ -1231,10 +1450,12 @@ fn is_count_probe(text: &str) -> bool {
 
 /// One whitespace-separated token: chars with a per-char expand flag
 /// (false inside single quotes). `text()` drops the flags; indices of
-/// `text()` line up with `chars` (quotes are stripped, never stored).
+/// `text()` line up with `chars` (quotes stripped, never stored).
+/// `quoted` records whether any quotes surrounded part of it.
 #[derive(Clone)]
 struct Token {
     chars: Vec<(char, bool)>,
+    quoted: bool,
 }
 
 impl Token {
@@ -1254,20 +1475,24 @@ fn tokenize(s: &str) -> Result<Vec<Token>, String> {
     let mut sq = false;
     let mut dq = false;
     let mut in_tok = false;
+    let mut quoted = false;
     for c in s.chars() {
         match c {
             '\'' if !dq => {
                 sq = !sq;
                 in_tok = true;
+                quoted = true;
             }
             '"' if !sq => {
                 dq = !dq;
                 in_tok = true;
+                quoted = true;
             }
             c if c.is_whitespace() && !sq && !dq => {
                 if in_tok {
                     toks.push(Token {
                         chars: std::mem::take(&mut cur),
+                        quoted: std::mem::replace(&mut quoted, false),
                     });
                     in_tok = false;
                 }
@@ -1282,7 +1507,7 @@ fn tokenize(s: &str) -> Result<Vec<Token>, String> {
         return Err("unterminated quote".to_string());
     }
     if in_tok {
-        toks.push(Token { chars: cur });
+        toks.push(Token { chars: cur, quoted });
     }
     Ok(toks)
 }
@@ -1585,6 +1810,63 @@ mod tests {
             "boom-message"
         );
         assert!(run_session("throw").1.is_err());
+    }
+
+    #[test]
+    fn switch_assigns_matched_value() {
+        let script = "$arch = switch (\"AMD64\") { \"AMD64\" { \"x86-64\" } \"ARM64\" { \"arm64\" } default { throw \"unsupported\" } }\necho $arch";
+        let (out, r) = run_session(script);
+        assert!(r.is_ok());
+        assert_eq!(out, b"x86-64\n");
+    }
+
+    #[test]
+    fn switch_statement_default_and_case() {
+        let (out, r) = run_session("switch (\"b\") { \"a\" { echo A } \"b\" { echo B } }");
+        assert!(r.is_ok());
+        assert_eq!(out, b"B\n");
+        let (out, r) = run_session("switch (\"z\") { \"a\" { echo A } default { echo D } }");
+        assert!(r.is_ok());
+        assert_eq!(out, b"D\n");
+        // Case-insensitive, no match no default is silent.
+        let (out, r) = run_session("switch (\"amd64\") { \"AMD64\" { echo y } }");
+        assert!(r.is_ok());
+        assert_eq!(out, b"y\n");
+        let (out, r) = run_session("switch (\"z\") { \"a\" { echo A } }");
+        assert!(r.is_ok());
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn switch_multi_output_is_array() {
+        let (out, r) = run_session("$v = switch ('x') { 'x' { echo a; echo b } }\necho $v");
+        assert!(r.is_ok());
+        assert_eq!(out, b"a b\n");
+    }
+
+    #[test]
+    fn switch_nested_pipe_in_branch() {
+        let (out, r) = run_session("switch ('x') { 'x' { echo 'echo deep' | iex } }");
+        assert!(r.is_ok());
+        assert_eq!(out, b"deep\n");
+    }
+
+    #[test]
+    fn switch_shape_errors() {
+        assert!(run_session("switch -regex ('a') { 'a' { echo y } }").1.unwrap_err().contains("flags"));
+        assert!(run_session("switch $x { 'a' { echo y } }").1.unwrap_err().contains("needs (value)"));
+        assert!(run_session("switch ('a') { { $_ } { echo y } }").1.unwrap_err().contains("scriptblock"));
+        assert!(run_session("switch ('a') { 'a' 'b' }").1.is_err());
+    }
+
+    #[test]
+    fn bare_quoted_and_dollar_emit() {
+        let (out, r) = run_session("\"hi\"");
+        assert!(r.is_ok());
+        assert_eq!(out, b"hi\n");
+        let (out, r) = run_session("$v = 7\necho \"$v\"");
+        assert!(r.is_ok());
+        assert_eq!(out, b"7\n");
     }
 
     #[test]
