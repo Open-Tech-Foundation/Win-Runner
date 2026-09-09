@@ -17,7 +17,9 @@
 //! an assignment value; bare quoted/`$` strings output their value.
 //! `foreach` iterates arrays/literals/scalars with `break`/`continue`;
 //! `function` defines named params with child-scope calls (output
-//! capturable by assignment).
+//! capturable by assignment). `@{}` maps string keys to values with
+//! `.ContainsKey()` and `[key]`/`[index]` reads (arrays/strings index
+//! too); other methods fail clearly.
 //! All operations go through the exact same [`WinFs`](crate::winfs::WinFs) API
 //! that the EXE shims use.
 
@@ -54,12 +56,13 @@ enum Flow {
     Continue,
 }
 
-/// A variable value: plain string or string array. Arrays render
-/// space-joined in string context (PowerShell `$OFS` default).
+/// A variable value: plain string, string array, or string-keyed map.
+/// Maps and arrays render space-joined/empty in string context.
 #[derive(Clone)]
 pub enum Value {
     Str(String),
     Arr(Vec<String>),
+    Map(HashMap<String, Value>),
 }
 
 /// Run a `.ps1` script. Returns exit code (0 ok). Output is appended to `out`.
@@ -155,6 +158,9 @@ impl<'a> Interpreter<'a> {
                             Value::Str(s) if s.is_empty() => Vec::new(),
                             Value::Str(s) => vec![s],
                             Value::Arr(a) => a,
+                            Value::Map(_) => {
+                                return Err("cannot append a hashtable".to_string());
+                            }
                         };
                         let merged = append_values(self.vars.get(&key), elems);
                         self.vars.insert(key, merged);
@@ -253,6 +259,10 @@ impl<'a> Interpreter<'a> {
             if t.eq_ignore_ascii_case("$false") {
                 return Ok(false);
             }
+            // Single value: expand it (method calls like
+            // `$m.ContainsKey($k)` evaluate here) and test truthiness.
+            let v = self.expand_token(&toks[0])?;
+            return Ok(is_truthy(&v));
         }
         // Membership form first: `$x -in $coll` / `$coll -contains $x`
         // (negated variants too). The collection side may be an array
@@ -277,9 +287,6 @@ impl<'a> Interpreter<'a> {
         let mut args = Vec::with_capacity(toks.len());
         for tok in &toks {
             args.push(self.expand_token(tok)?);
-        }
-        if args.len() == 1 {
-            return Ok(is_truthy(&args[0]));
         }
         if args[0].eq_ignore_ascii_case("-not") {
             if args.len() == 2 {
@@ -418,6 +425,10 @@ impl<'a> Interpreter<'a> {
         if let Some(sw) = split_switch_assign(stmt)? {
             return self.cmd_assign_switch(sw.0, sw.1, sw.2);
         }
+        // `$m[$k] = v` assigns into a map.
+        if let Some(ix) = split_index_assign(stmt) {
+            return self.cmd_assign_index(ix.0, ix.1, ix.2, ix.3);
+        }
         if !toks[0].verbatim() {
             if let Some(asg) = split_assignment(&toks)? {
                 return self.cmd_assign(asg.0, asg.1, asg.2);
@@ -517,29 +528,56 @@ impl<'a> Interpreter<'a> {
         r
     }
 
-    /// `$name = value` / `$name += value` assignment. `@(...)` values
-    /// become arrays; `+=` follows PowerShell add semantics (null+scalar
-    /// stays scalar, anything else grows an array). Only plain names are
-    /// storable; `$env:`/`$HOME`/`$null` targets fail clearly.
+    /// `$name = value` / `$name += value` assignment. Values are
+    /// `@(...)` arrays, `@{}` (empty map), defined-function calls, or
+    /// scalars; `+=` follows PowerShell add semantics. Only plain names
+    /// are storable; `$env:`/`$HOME`/`$null` targets fail clearly.
     fn cmd_assign(&mut self, name: String, op: AssignOp, vals: Vec<Token>) -> Result<Flow, String> {
         let key = check_assign_target(&name)?;
+        let (v, flow) = self.eval_value(&vals)?;
+        match flow {
+            Flow::Next => {}
+            f => return Ok(f),
+        }
+        match op {
+            AssignOp::Set => {
+                self.vars.insert(key, v);
+            }
+            AssignOp::Append => {
+                let elems = match &v {
+                    Value::Str(s) if s.is_empty() => Vec::new(),
+                    Value::Str(s) => vec![s.clone()],
+                    Value::Arr(a) => a.clone(),
+                    Value::Map(_) => {
+                        return Err("cannot append a hashtable".to_string());
+                    }
+                };
+                let merged = append_values(self.vars.get(&key), elems);
+                self.vars.insert(key, merged);
+            }
+        }
+        Ok(Flow::Next)
+    }
+
+    /// Evaluate assignment value tokens: `@(...)` array, `@{}` empty map,
+    /// defined-function call capture, or scalar. Returns the value plus
+    /// any loop signal from a captured call (callers abandon on signal).
+    fn eval_value(&mut self, vals: &[Token]) -> Result<(Value, Flow), String> {
         let joined: String = vals
             .iter()
             .map(Token::text)
             .collect::<Vec<_>>()
             .join(" ");
-        if joined.trim_start().starts_with("@(") {
-            let elements = self.eval_array(&joined)?;
-            match op {
-                AssignOp::Set => {
-                    self.vars.insert(key, Value::Arr(elements));
-                }
-                AssignOp::Append => {
-                    let merged = append_values(self.vars.get(&key), elements);
-                    self.vars.insert(key, merged);
-                }
-            }
-            return Ok(Flow::Next);
+        let t = joined.trim_start();
+        if t.starts_with("@(") {
+            return Ok((Value::Arr(self.eval_array(&joined)?), Flow::Next));
+        }
+        let nospace: String = t.chars().filter(|c| !c.is_whitespace()).collect();
+        if nospace == "@{}" {
+            return Ok((Value::Map(HashMap::new()), Flow::Next));
+        }
+        if nospace.starts_with("@{") {
+            return Err("hashtable literals with entries are not supported".to_string());
         }
         // `$t = GetIt [$args...]`: call a defined function, capture its
         // output (0 lines → `""`, 1 → string, N → array).
@@ -549,8 +587,8 @@ impl<'a> Interpreter<'a> {
                 self.funcs.get(&fname).map(|f| (f.params.clone(), f.body.clone()))
             {
                 let mut argvals = Vec::with_capacity(vals.len().saturating_sub(1));
-                for t in vals.iter().skip(1) {
-                    argvals.push(self.expand_token(t)?);
+                for tok in vals.iter().skip(1) {
+                    argvals.push(self.expand_token(tok)?);
                 }
                 let mut buf = Vec::new();
                 let flow = {
@@ -559,33 +597,66 @@ impl<'a> Interpreter<'a> {
                 };
                 match flow? {
                     Flow::Next => {}
-                    f => return Ok(f),
+                    f => return Ok((Value::Str(String::new()), f)),
                 }
                 let text = String::from_utf8_lossy(&buf);
                 let lines: Vec<String> = text.lines().map(str::to_string).collect();
-                match op {
-                    AssignOp::Set => {
-                        self.vars.insert(key, lines_value(lines));
-                    }
-                    AssignOp::Append => {
-                        let merged = append_values(self.vars.get(&key), lines);
-                        self.vars.insert(key, merged);
-                    }
-                }
-                return Ok(Flow::Next);
+                return Ok((lines_value(lines), Flow::Next));
             }
         }
         if vals.len() != 1 {
             return Err("unexpected tokens after assignment value".to_string());
         }
-        let v = self.expand_token(&vals[0])?;
+        Ok((Value::Str(self.expand_token(&vals[0])?), Flow::Next))
+    }
+
+    /// `$map[$key] = value` / `$map[$key] += value`: index assignment
+    /// into an existing map (plain `$name` only). Keys and values expand;
+    /// `+=` merges with the same rules as variable append.
+    fn cmd_assign_index(
+        &mut self,
+        map: String,
+        keytext: String,
+        op: AssignOp,
+        valtext: String,
+    ) -> Result<Flow, String> {
+        let key = check_assign_target(&map)?;
+        if !matches!(self.vars.get(&key), Some(Value::Map(_))) {
+            return Err(format!("{map} is not a hashtable"));
+        }
+        let ktoks = tokenize(&keytext)?;
+        if ktoks.len() != 1 {
+            return Err("index must be a single value".to_string());
+        }
+        let k = self.expand_token(&ktoks[0])?.to_lowercase();
+        let vtoks = tokenize(&valtext)?;
+        if vtoks.is_empty() {
+            return Err("missing value in assignment".to_string());
+        }
+        let (v, flow) = self.eval_value(&vtoks)?;
+        match flow {
+            Flow::Next => {}
+            f => return Ok(f),
+        }
+        let entry = match self.vars.get_mut(&key) {
+            Some(Value::Map(m)) => m,
+            _ => return Err(format!("{map} is not a hashtable")),
+        };
         match op {
             AssignOp::Set => {
-                self.vars.insert(key, Value::Str(v));
+                entry.insert(k, v);
             }
             AssignOp::Append => {
-                let merged = append_values(self.vars.get(&key), vec![v]);
-                self.vars.insert(key, merged);
+                let elems = match &v {
+                    Value::Str(s) if s.is_empty() => Vec::new(),
+                    Value::Str(s) => vec![s.clone()],
+                    Value::Arr(a) => a.clone(),
+                    Value::Map(_) => {
+                        return Err("cannot append a hashtable".to_string());
+                    }
+                };
+                let merged = append_values(entry.get(&k), elems);
+                entry.insert(k, merged);
             }
         }
         Ok(Flow::Next)
@@ -909,10 +980,50 @@ impl<'a> Interpreter<'a> {
                 out.push('$');
                 i += 1;
             } else {
-                if j < cs.len() && cs[j].0 == '(' {
-                    return Err("method calls are not supported".to_string());
-                }
                 let name: String = cs[i + 1..j].iter().map(|(c, _)| *c).collect();
+                // Method call `$recv.Method(args)` / bare `(` after `$name`.
+                if j < cs.len() && cs[j].0 == '(' {
+                    if !name.contains('.') {
+                        return Err(format!("unexpected ( after ${name}"));
+                    }
+                    let dot = name.rfind('.').unwrap();
+                    let (recv, method) = (&name[..dot], &name[dot + 1..]);
+                    if !is_var_name(recv) {
+                        return Err("nested method receivers are not supported".to_string());
+                    }
+                    let tail: String = cs[j..].iter().map(|(c, _)| *c).collect();
+                    let (inner, rest2) = take_wrapped(&tail, '(', ')')?;
+                    let mut argvals = Vec::new();
+                    if !inner.trim().is_empty() {
+                        for a in split_top_commas(&inner) {
+                            let atoks = tokenize(a.trim())?;
+                            if atoks.len() != 1 {
+                                return Err("method arguments must be single values".to_string());
+                            }
+                            argvals.push(self.expand_token(&atoks[0])?);
+                        }
+                    }
+                    out.push_str(&self.eval_method(recv, method, &argvals)?);
+                    i = cs.len() - rest2.chars().count();
+                    continue;
+                }
+                // Index `$v[...]` on plain variables (maps, arrays,
+                // strings, or unset/null). Other bases keep the legacy
+                // value-plus-literal behavior.
+                if j < cs.len() && cs[j].0 == '[' && is_var_name(&name) {
+                    let tail: String =
+                        cs[j..].iter().map(|(c, _)| *c).collect();
+                    let (inner, rest2) = take_wrapped(&tail, '[', ']')?;
+                    let itoks = tokenize(inner.trim())?;
+                    if itoks.len() != 1 {
+                        return Err("index must be a single value".to_string());
+                    }
+                    let key = self.expand_token(&itoks[0])?;
+                    let base = self.vars.get(&name.to_lowercase());
+                    out.push_str(&self.eval_index(base, &key)?);
+                    i = cs.len() - rest2.chars().count();
+                    continue;
+                }
                 out.push_str(&self.lookup_var(&name));
                 i = j;
             }
@@ -981,9 +1092,45 @@ impl<'a> Interpreter<'a> {
             return format!("${name}");
         }
         match self.vars.get(&name.to_lowercase()) {
-            Some(Value::Str(s)) => s.clone(),
-            Some(Value::Arr(a)) => a.join(" "),
+            Some(v) => value_string(v),
             None => String::new(),
+        }
+    }
+
+    /// `$recv.Method(args)`: only `ContainsKey` on maps for now (True/False,
+    /// PowerShell-capitalized). Anything else fails clearly.
+    fn eval_method(&self, recv: &str, method: &str, args: &[String]) -> Result<String, String> {
+        if !method.eq_ignore_ascii_case("containskey") {
+            return Err(format!("method {method} is not supported"));
+        }
+        let Some(Value::Map(m)) = self.vars.get(&recv.to_lowercase()) else {
+            return Err(format!("ContainsKey needs a hashtable"));
+        };
+        if args.len() != 1 {
+            return Err("ContainsKey takes one argument".to_string());
+        }
+        Ok(if m.contains_key(&args[0].to_lowercase()) {
+            "True".to_string()
+        } else {
+            "False".to_string()
+        })
+    }
+
+    /// `$v[key]`: map lookup (case-insensitive, missing → empty), array
+    /// or string index (negative counts from the end, out-of-range →
+    /// empty), unset (`$null`) → empty.
+    fn eval_index(&self, base: Option<&Value>, key: &str) -> Result<String, String> {
+        match base {
+            None => Ok(String::new()),
+            Some(Value::Map(m)) => Ok(m
+                .get(&key.to_lowercase())
+                .map(value_string)
+                .unwrap_or_default()),
+            Some(Value::Arr(a)) => array_index(a, key),
+            Some(Value::Str(s)) => {
+                let chars: Vec<char> = s.chars().collect();
+                array_index(&chars, key)
+            }
         }
     }
 
@@ -1494,6 +1641,38 @@ fn lines_value(lines: Vec<String>) -> Value {
     }
 }
 
+/// A value in string context: strings as-is, arrays space-joined, empty
+/// maps stringify empty (Out-String behavior for `@{}`).
+fn value_string(v: &Value) -> String {
+    match v {
+        Value::Str(s) => s.clone(),
+        Value::Arr(a) => a.join(" "),
+        Value::Map(_) => String::new(),
+    }
+}
+
+/// Index into a slice by integer text (negative counts from the end,
+/// out-of-range → empty). Used for arrays and string characters.
+fn array_index<T>(items: &[T], key: &str) -> Result<String, String>
+where
+    T: Clone + Into<String>,
+{
+    let idx: i64 = key
+        .trim()
+        .parse()
+        .map_err(|_| "index must be an integer".to_string())?;
+    let idx = if idx < 0 {
+        items.len() as i64 + idx
+    } else {
+        idx
+    };
+    Ok(items
+        .get(idx as usize)
+        .cloned()
+        .map(Into::into)
+        .unwrap_or_default())
+}
+
 /// PowerShell `+=` merge: null+scalar stays scalar, anything else grows
 /// an array (`"a" + "b"` becomes `@("a", "b")`, like the real thing).
 /// An array base stays an array even when the result has one element
@@ -1599,6 +1778,65 @@ fn check_assign_target(name: &str) -> Result<String, String> {
         return Err(format!("invalid variable name: {name}"));
     }
     Ok(bare.to_lowercase())
+}
+
+/// Detect `$map[$key] = value` / `$map[$key] += value` on raw statement
+/// text (tokenizing would shred the brackets). Returns (map, key, op, value).
+fn split_index_assign(stmt: &str) -> Option<(String, String, AssignOp, String)> {
+    let t = stmt.trim_start();
+    if !t.starts_with('$') {
+        return None;
+    }
+    let mut ni = 1;
+    for c in t[1..].chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            ni += c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if ni < 2 {
+        return None;
+    }
+    let name = t[..ni].to_string();
+    let rest = t[ni..].trim_start();
+    if !rest.starts_with('[') {
+        return None;
+    }
+    // Balanced `[...]` over the raw text (quotes intact here).
+    let mut sq = false;
+    let mut dq = false;
+    let mut depth = 0usize;
+    let mut end = None;
+    for (idx, c) in rest.char_indices() {
+        if c == '\'' && !dq {
+            sq = !sq;
+        } else if c == '"' && !sq {
+            dq = !dq;
+        } else if c == '[' && !sq && !dq {
+            depth += 1;
+        } else if c == ']' && !sq && !dq {
+            depth -= 1;
+            if depth == 0 {
+                end = Some(idx);
+                break;
+            }
+        }
+    }
+    let end = end?;
+    let keytext = rest[1..end].to_string();
+    let after = rest[end + 1..].trim_start();
+    let (op, valtext) = if after.starts_with("+=") {
+        (AssignOp::Append, after[2..].trim_start().to_string())
+    } else if after.starts_with('=') && !after[1..].starts_with('=') {
+        (AssignOp::Set, after[1..].trim_start().to_string())
+    } else {
+        return None;
+    };
+    if valtext.is_empty() {
+        return None;
+    }
+    Some((name, keytext, op, valtext))
 }
 
 /// Detect `$name = switch ...` / `$name += switch ...` on raw statement
@@ -2153,6 +2391,36 @@ mod tests {
             "boom-message"
         );
         assert!(run_session("throw").1.is_err());
+    }
+
+    #[test]
+    fn hashtable_containskey_and_index() {
+        let script = "$u = @{}\nif ($u.ContainsKey('esrun')) { echo bad } else { echo miss }\n$u['esrun'] = 'no asset'\nif ($u.ContainsKey('esrun')) { echo hit }\necho $u['esrun']";
+        let (out, r) = run_session(script);
+        assert!(r.is_ok());
+        assert_eq!(out, b"miss\nhit\nno asset\n");
+        // Missing keys read empty; other-method and entry literals fail.
+        let (out, r) = run_session("$u = @{}\necho \"x$u['nope']y\"");
+        assert!(r.is_ok());
+        assert_eq!(out, b"xy\n");
+        assert!(run_session("$u = @{a=1}").1.unwrap_err().contains("entries"));
+        assert!(run_session("echo $u.Length('x')").1.unwrap_err().contains("method"));
+        assert!(run_session("$s = 'ab'\necho $s.Foo()").1.unwrap_err().contains("method"));
+    }
+
+    #[test]
+    fn array_index_reads() {
+        let (out, r) = run_session("$a = @('x', 'y')\necho $a[1]");
+        assert!(r.is_ok());
+        assert_eq!(out, b"y\n");
+        let (out, r) = run_session("$a = @('x', 'y')\necho $a[-1]");
+        assert!(r.is_ok());
+        assert_eq!(out, b"y\n");
+        let (out, r) = run_session("$a = @('x')\necho \"a$b[5]c\"");
+        assert!(r.is_ok());
+        assert_eq!(out, b"ac\n");
+        assert!(run_session("$a = @('x')\necho $a[nope]").1.unwrap_err().contains("integer"));
+        assert!(run_session("$nosuch[0] = 1").1.unwrap_err().contains("hashtable"));
     }
 
     #[test]

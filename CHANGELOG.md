@@ -151,6 +151,6 @@ All notable changes to this project will be documented in this file.
 - PS1 `foreach` over arrays/literals/scalars with `break`/`continue`
   (dynamic scope, nested-safe), and `function` definitions with positional
   params, child-scope calls, and capturable output. Unit-tested.
-- PS1 `foreach` over arrays/literals/scalars with `break`/`continue`
-  (dynamic scope, nested-safe), and `function` definitions with positional
-  params, child-scope calls, and capturable output. Unit-tested.
+- PS1 hashtables: `@{}` literals, `.ContainsKey()`, `[key]` reads/writes
+  (arrays/strings index too, negatives count back). Other methods and
+  entry-ful literals fail clearly. Unit-tested.
