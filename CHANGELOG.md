@@ -138,3 +138,7 @@ All notable changes to this project will be documented in this file.
 - PS1 string interpolation: double-quoted `$x`, `${x}`, and `$(...)`
   subexpressions (captured, trimmed); single-quoted spans stay verbatim.
   Unit-tested including unbalanced delimiters.
+- PS1 `if`/`elseif`/`else` blocks (same-line or next-line tails) with
+  truthiness, `-not`, and case-insensitive `-eq`/`-ne`; `throw` surfaces
+  its message. Methods, properties, arrays, and other operators fail
+  clearly. Unit-tested including chains, nesting, and shape errors.

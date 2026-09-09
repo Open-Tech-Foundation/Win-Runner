@@ -8,7 +8,9 @@
 //! as code in the same session), and `$name = value` variables
 //! (`$env:`/`$HOME`/`$null` read from the host, session-persisted).
 //! Double-quoted strings interpolate (`$x`, `${x}`, `$(...)`);
-//! single-quoted strings stay verbatim.
+//! single-quoted strings stay verbatim. Multi-line `if`/`elseif`/`else`
+//! blocks work with truthiness, `-not`, and `-eq`/`-ne` conditions
+//! (`throw` surfaces a message); anything else fails clearly.
 //! All operations go through the exact same [`WinFs`](crate::winfs::WinFs) API
 //! that the EXE shims use.
 
@@ -69,14 +71,144 @@ impl<'a> Interpreter<'a> {
             code.push_str(&stripped);
             code.push('\n');
         }
-        for stmt in split_statements(&code) {
-            let stmt = stmt.trim();
-            if stmt.is_empty() {
+        let chunks = split_chunks(&code);
+        let mut i = 0;
+        while i < chunks.len() {
+            let t = chunks[i].trim();
+            if t.is_empty() {
+                i += 1;
                 continue;
             }
-            self.run_pipeline(stmt)?;
+            if starts_kw(t, "if") {
+                i = self.run_if_chain(&chunks, i)?;
+            } else {
+                for stmt in split_statements(&chunks[i]) {
+                    let stmt = stmt.trim();
+                    if stmt.is_empty() {
+                        continue;
+                    }
+                    self.run_pipeline(stmt)?;
+                }
+                i += 1;
+            }
         }
         Ok(())
+    }
+
+    /// Run `if (c) {...} [elseif (c) {...}]* [else {...}]?` starting at
+    /// chunk `i` (same-chunk `} else {` plus following elseif/else chunks).
+    /// Returns the next chunk index.
+    fn run_if_chain(&mut self, chunks: &[String], i: usize) -> Result<usize, String> {
+        let mut text = chunks[i].clone();
+        let mut j = i + 1;
+        loop {
+            let t = text.trim_end();
+            if !t.ends_with('}') || j >= chunks.len() {
+                break;
+            }
+            let nt = chunks[j].trim_start();
+            if starts_kw(nt, "elseif") || starts_kw(nt, "else") {
+                text.push('\n');
+                text.push_str(&chunks[j]);
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        self.eval_if_chain(&text)?;
+        Ok(j)
+    }
+
+    /// Evaluate a complete if/elseif/else text: first true branch runs.
+    fn eval_if_chain(&mut self, text: &str) -> Result<(), String> {
+        let (cond, body, mut rest) = parse_if_block(text, "if")?;
+        if self.eval_cond(&cond)? {
+            self.run_code(&body)?;
+            return self.run_remainder(&skip_if_tail(&rest)?);
+        }
+        loop {
+            rest = rest.trim_start().to_string();
+            if starts_kw(&rest, "elseif") {
+                let (cond, body, rest2) = parse_if_block(&rest, "elseif")?;
+                if self.eval_cond(&cond)? {
+                    self.run_code(&body)?;
+                    return self.run_remainder(&skip_if_tail(&rest2)?);
+                }
+                rest = rest2;
+            } else if starts_kw(&rest, "else") {
+                let after = rest["else".len()..].trim_start();
+                if after.starts_with('(') {
+                    return Err("else takes no condition".to_string());
+                }
+                let (body, rest2) = take_wrapped(after, '{', '}')?;
+                self.run_code(&body)?;
+                return self.run_remainder(&rest2);
+            } else {
+                return self.run_remainder(&rest);
+            }
+        }
+    }
+
+    /// Run leftover text after an if-chain (same-line trailing statements).
+    fn run_remainder(&mut self, rest: &str) -> Result<(), String> {
+        if rest.trim().is_empty() {
+            Ok(())
+        } else {
+            self.run_code(rest)
+        }
+    }
+
+    /// Evaluate an if/elseif condition: truthy value, `-not`, `-eq`/`-ne`.
+    /// Method calls, properties, arrays, and other operators fail clearly.
+    fn eval_cond(&mut self, cond: &str) -> Result<bool, String> {
+        let toks = tokenize(cond)?;
+        if toks.is_empty() {
+            return Err("empty condition".to_string());
+        }
+        if toks.len() == 1 {
+            let t = toks[0].text();
+            if t.eq_ignore_ascii_case("$true") {
+                return Ok(true);
+            }
+            if t.eq_ignore_ascii_case("$false") {
+                return Ok(false);
+            }
+        }
+        // Code-shaped tokens need the object model (later); quoted
+        // literals pass through untouched.
+        for tok in &toks {
+            let t = tok.text();
+            if tok.verbatim() {
+                continue;
+            }
+            if t.contains(['.', '(', ')', '{', '}', '[', ']', '@']) {
+                return Err(format!("not supported in conditions: {t}"));
+            }
+        }
+        let mut args = Vec::with_capacity(toks.len());
+        for tok in &toks {
+            args.push(self.expand_token(tok)?);
+        }
+        if args.len() == 1 {
+            return Ok(is_truthy(&args[0]));
+        }
+        if args[0].eq_ignore_ascii_case("-not") {
+            if args.len() == 2 {
+                return Ok(!is_truthy(&args[1]));
+            }
+            return Err("only `-not <value>` is supported".to_string());
+        }
+        if args.len() == 3 {
+            let op = args[1].to_lowercase();
+            if op == "-eq" {
+                return Ok(args[0].to_lowercase() == args[2].to_lowercase());
+            }
+            if op == "-ne" {
+                return Ok(args[0].to_lowercase() != args[2].to_lowercase());
+            }
+            return Err(format!("{} is not supported in conditions", args[1]));
+        }
+        Err(format!("cannot evaluate condition: {}", args.join(" ")))
     }
 
     /// Run `a | b | c`: each segment's captured output feeds the next as
@@ -140,6 +272,14 @@ impl<'a> Interpreter<'a> {
                 let (_, positional) = parse_params(rest, &[])?;
                 self.emit(&positional.join(" "));
                 Ok(())
+            }
+            "throw" => {
+                let (_, positional) = parse_params(rest, &[])?;
+                let msg = positional.join(" ");
+                if msg.is_empty() {
+                    return Err("usage: throw <message>".to_string());
+                }
+                Err(msg)
             }
             "irm" | "invoke-restmethod" => self.cmd_irm(rest),
             "iex" | "invoke-expression" => self.cmd_iex(rest, pipe_in),
@@ -541,6 +681,138 @@ fn strip_comment(line: &str) -> String {
         }
     }
     out
+}
+
+/// Split code into chunks: newlines/semicolons at brace depth 0 end a
+/// chunk (quote-aware); `{...}` groups stay whole, including same-line
+/// `} else {` tails.
+fn split_chunks(code: &str) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut cur = String::new();
+    let mut sq = false;
+    let mut dq = false;
+    let mut depth = 0usize;
+    for c in code.chars() {
+        match c {
+            '\'' if !dq => {
+                sq = !sq;
+                cur.push(c);
+            }
+            '"' if !sq => {
+                dq = !dq;
+                cur.push(c);
+            }
+            '{' if !sq && !dq => {
+                depth += 1;
+                cur.push(c);
+            }
+            '}' if !sq && !dq => {
+                depth = depth.saturating_sub(1);
+                cur.push(c);
+            }
+            ';' | '\n' if !sq && !dq && depth == 0 => {
+                if !cur.trim().is_empty() {
+                    chunks.push(std::mem::take(&mut cur));
+                } else {
+                    cur.clear();
+                }
+            }
+            _ => cur.push(c),
+        }
+    }
+    if !cur.trim().is_empty() {
+        chunks.push(cur);
+    }
+    chunks
+}
+
+/// True when `s` starts with keyword `kw` on a word boundary
+/// (case-insensitive; `elsewhere` is not `else`).
+fn starts_kw(s: &str, kw: &str) -> bool {
+    let t = s.trim_start();
+    match t.get(..kw.len()) {
+        Some(head) if head.eq_ignore_ascii_case(kw) => {}
+        _ => return false,
+    }
+    match t[kw.len()..].chars().next() {
+        None => true,
+        Some(c) => c.is_whitespace() || c == '(' || c == '{',
+    }
+}
+
+/// Skip unexecuted trailing elseif/else blocks after a taken branch.
+/// A trailing elseif past `else` is invalid and stays for the caller to
+/// reject (it surfaces as an unknown command, clearly).
+fn skip_if_tail(rest: &str) -> Result<String, String> {
+    let mut rest = rest.trim_start().to_string();
+    loop {
+        if starts_kw(&rest, "elseif") {
+            let (_, _, rest2) = parse_if_block(&rest, "elseif")?;
+            rest = rest2.trim_start().to_string();
+        } else if starts_kw(&rest, "else") {
+            let after = rest["else".len()..].trim_start();
+            if after.starts_with('(') {
+                return Err("else takes no condition".to_string());
+            }
+            let (_, rest2) = take_wrapped(after, '{', '}')?;
+            rest = rest2;
+        } else {
+            return Ok(rest);
+        }
+    }
+}
+
+/// Parse `KW (cond) { body }rest` (KW = if/elseif). Returns (cond, body, rest).
+fn parse_if_block(s: &str, kw: &str) -> Result<(String, String, String), String> {
+    let after_kw = s.trim_start()[kw.len()..].trim_start();
+    if !after_kw.starts_with('(') {
+        return Err(format!("expected (condition) after {kw}"));
+    }
+    let (cond, rest) = take_wrapped(after_kw, '(', ')')?;
+    let rest = rest.trim_start();
+    if !rest.starts_with('{') {
+        return Err(format!("expected {{body}} after {kw} (...)"));
+    }
+    let (body, rest2) = take_wrapped(rest, '{', '}')?;
+    Ok((cond, body, rest2))
+}
+
+/// Split a leading `(...)`/`{...}` (quote-aware): returns (inner, rest).
+fn take_wrapped(s: &str, open: char, close: char) -> Result<(String, String), String> {
+    let mut depth = 0usize;
+    let mut sq = false;
+    let mut dq = false;
+    for (idx, c) in s.char_indices() {
+        if c == '\'' && !dq {
+            sq = !sq;
+            continue;
+        }
+        if c == '"' && !sq {
+            dq = !dq;
+            continue;
+        }
+        if sq || dq {
+            continue;
+        }
+        if c == open {
+            depth += 1;
+        }
+        if c == close {
+            depth -= 1;
+            if depth == 0 {
+                let inner = s[open.len_utf8()..idx].to_string();
+                let rest = s[idx + close.len_utf8()..].to_string();
+                return Ok((inner, rest));
+            }
+        }
+    }
+    Err(format!("unbalanced {open}"))
+}
+
+/// PowerShell truthiness lite: empty, `$false`/`false`, and numeric zero
+/// are false (arrays and other types don't exist here yet).
+fn is_truthy(s: &str) -> bool {
+    !(s.is_empty() || s.eq_ignore_ascii_case("false") || s == "0")
 }
 
 /// Split statements on newlines and top-level `;` (outside quotes).
@@ -995,6 +1267,76 @@ mod tests {
     fn unbalanced_delimiters_fail() {
         assert!(run_session("echo \"a$(echo b\"").1.is_err());
         assert!(run_session("echo \"a${b\"").1.is_err());
+    }
+
+    #[test]
+    fn if_branches_on_truthiness() {
+        let (out, r) = run_session("$x = 1\nif ($x) { echo yes }");
+        assert!(r.is_ok());
+        assert_eq!(out, b"yes\n");
+        let (out, r) = run_session("if ($Nope_X) { echo bad } else { echo fallback }");
+        assert!(r.is_ok());
+        assert_eq!(out, b"fallback\n");
+    }
+
+    #[test]
+    fn if_eq_ne_case_insensitive() {
+        let (out, r) = run_session("if (A -eq a) { echo ci }");
+        assert!(r.is_ok());
+        assert_eq!(out, b"ci\n");
+        let (out, r) = run_session("if (A -ne b) { echo ne }");
+        assert!(r.is_ok());
+        assert_eq!(out, b"ne\n");
+        let (out, r) = run_session("if ($Nope_X -eq 1) { echo bad } else { echo els }");
+        assert!(r.is_ok());
+        assert_eq!(out, b"els\n");
+    }
+
+    #[test]
+    fn if_not_and_literals() {
+        let (out, r) = run_session("if (-not $Nope_X) { echo not-ok }");
+        assert!(r.is_ok());
+        assert_eq!(out, b"not-ok\n");
+        let (out, r) = run_session("if ($true) { echo t }");
+        assert!(r.is_ok());
+        assert_eq!(out, b"t\n");
+        let (out, r) = run_session("if ($false) { echo bad } else { echo f }");
+        assert!(r.is_ok());
+        assert_eq!(out, b"f\n");
+    }
+
+    #[test]
+    fn if_elseif_else_chain_and_nesting() {
+        let script = "$x = 2\nif ($x -eq 1) { echo one } elseif ($x -eq 2) { echo two } else { echo other }";
+        let (out, r) = run_session(script);
+        assert!(r.is_ok());
+        assert_eq!(out, b"two\n");
+        // Multi-line shape with next-line elseif.
+        let script = "if ($Nope_X) {\n echo bad\n}\nelseif ($Nope_Y) {\n echo bad2\n}\nelse {\n echo els\n}";
+        let (out, r) = run_session(script);
+        assert!(r.is_ok());
+        assert_eq!(out, b"els\n");
+        // Taken branch skips the rest; nesting works.
+        let (out, r) = run_session("if (1 -eq 1) { if (2 -eq 2) { echo nest } } else { echo bad }");
+        assert!(r.is_ok());
+        assert_eq!(out, b"nest\n");
+    }
+
+    #[test]
+    fn if_unsupported_conditions_fail_clearly() {
+        assert!(run_session("if ($x -match y) { echo bad }").1.unwrap_err().contains("-match"));
+        assert!(run_session("if ($x.Count -eq 1) { echo bad }").1.unwrap_err().contains("not supported"));
+        assert!(run_session("if (($a -eq $b)) { echo bad }").1.is_err());
+        assert!(run_session("if ($x) { echo bad } else ($y) { echo bad }").1.unwrap_err().contains("no condition"));
+    }
+
+    #[test]
+    fn throw_surfaces_message() {
+        assert_eq!(
+            run_session("throw boom-message").1.unwrap_err(),
+            "boom-message"
+        );
+        assert!(run_session("throw").1.is_err());
     }
 
     #[test]
