@@ -20,9 +20,12 @@
 //! capturable by assignment). `@{}` maps string keys to values with
 //! `.ContainsKey()` and `[key]`/`[index]` reads (arrays/strings index
 //! too). String methods cover case, trim, replace, split (arrays,
-//! indexable), and starts/ends/contains. `try`/`catch`/`finally` run
-//! the first error handler with `finally` always executing (its own
-//! signal wins). Console/script output flushes before errors report.
+//! indexable), and starts/ends/contains. Static .NET calls cover
+//! `[Environment]` get/set (session-local), `[Guid]::NewGuid` (v4),
+//! and `[regex]::Escape`.
+//! `try`/`catch`/`finally` run the first error handler with `finally`
+//! always executing (its own signal wins). Console/script output flushes
+//! before errors report.
 //! All operations go through the exact same [`WinFs`](crate::winfs::WinFs) API
 //! that the EXE shims use.
 
@@ -532,6 +535,17 @@ impl<'a> Interpreter<'a> {
             if kw == "function" {
                 return self.cmd_function_def(stmt);
             }
+        }
+        // `[Type]::Method(...)` as a whole statement: evaluate, emit
+        // non-void results.
+        if let Some((typ, method, inner, rest)) = split_static_call(stmt.trim_start())? {
+            if !rest.trim().is_empty() {
+                return Err("unexpected text after static call".to_string());
+            }
+            if let Some(v) = self.eval_static(&typ, &method, &inner)? {
+                self.emit(&v);
+            }
+            return Ok(Flow::Next);
         }
         // `$x = switch ... {...}` assigns the switch output.
         if let Some(sw) = split_switch_assign(stmt)? {
@@ -1096,6 +1110,20 @@ impl<'a> Interpreter<'a> {
         let mut i = 0;
         while i < cs.len() {
             let (c, ex) = cs[i];
+            // Static call `[Type]::Method(args)` (void results vanish).
+            if c == '[' && ex {
+                let tail: String = cs[i..].iter().map(|(c, _)| *c).collect();
+                match split_static_call(&tail)? {
+                    Some((typ, method, inner, rest2)) => {
+                        if let Some(v) = self.eval_static(&typ, &method, &inner)? {
+                            out.push_str(&v);
+                        }
+                        i += tail.chars().count() - rest2.chars().count();
+                        continue;
+                    }
+                    None => {}
+                }
+            }
             if c != '$' || !ex {
                 out.push(c);
                 i += 1;
@@ -1269,8 +1297,7 @@ impl<'a> Interpreter<'a> {
     /// `$recv.Method(args)`: `ContainsKey` on maps; case/trim/replace/
     /// split/starts/ends/contains on strings. Anything else fails clearly.
     /// Booleans render PowerShell-capitalized (`True`/`False`).
-    fn eval_method(&self, recv: &str, method: &str, args: &[String]) -> Result<Value, String> {
-        let receiver = match self.vars.get(&recv.to_lowercase()) {
+    fn eval_method(&self, recv: &str, method: &str, args: &[String]) -> Result<Value, String> {        let receiver = match self.vars.get(&recv.to_lowercase()) {
             Some(v) => v.clone(),
             None => return Err("cannot call method on null".to_string()),
         };
@@ -1378,8 +1405,70 @@ impl<'a> Interpreter<'a> {
             "startswith" => Ok(bool_string(s.starts_with(&one_arg("StartsWith")?))),
             "endswith" => Ok(bool_string(s.ends_with(&one_arg("EndsWith")?))),
             "contains" => Ok(bool_string(s.contains(&one_arg("Contains")?))),
+            "tostring" => {
+                if args.is_empty() {
+                    Ok(s.to_string())
+                } else if args.len() == 1 && args[0].eq_ignore_ascii_case("n") {
+                    // Guid-style `N` format (no dashes); the emulation
+                    // stores guids dashed, so this strips them.
+                    Ok(s.replace('-', ""))
+                } else {
+                    Err("ToString takes no arguments (or 'N')".to_string())
+                }
+            }
             _ => Err(format!("method {method} is not supported")),
         }
+    }
+
+    /// `[Type]::Method(args)` static calls: `[Environment]` get/set (User
+    /// and Machine targets read the host process env; sets are
+    /// session-local, never persisted), `[Guid]::NewGuid` (v4, dashed),
+    /// `[regex]::Escape`. Anything else fails clearly. `None` = void
+    /// (no output, like `SetEnvironmentVariable`).
+    fn eval_static(
+        &mut self,
+        typ: &str,
+        method: &str,
+        inner: &str,
+    ) -> Result<Option<String>, String> {
+        let mut argvals = Vec::new();
+        if !inner.trim().is_empty() {
+            for a in split_top_commas(inner) {
+                let atoks = tokenize(a.trim())?;
+                if atoks.len() != 1 {
+                    return Err("static arguments must be single values".to_string());
+                }
+                argvals.push(self.expand_token(&atoks[0])?);
+            }
+        }
+        let t = typ.to_lowercase();
+        let m = method.to_lowercase();
+        if t == "environment" || t == "system.environment" {
+            if m == "setenvironmentvariable" {
+                eval_environment(&m, &argvals)?;
+                return Ok(None);
+            }
+            return eval_environment(&m, &argvals).map(Some);
+        }
+        if t == "guid" || t == "system.guid" {
+            if m != "newguid" {
+                return Err(format!("method {method} is not supported on Guid"));
+            }
+            if !argvals.is_empty() {
+                return Err("NewGuid takes no arguments".to_string());
+            }
+            return Ok(Some(new_guid()?));
+        }
+        if t == "regex" || t == "system.text.regularexpressions.regex" {
+            if m != "escape" {
+                return Err(format!("method {method} is not supported on Regex"));
+            }
+            if argvals.len() != 1 {
+                return Err("Escape takes one argument".to_string());
+            }
+            return Ok(Some(regex_escape(&argvals[0])));
+        }
+        Err(format!("type [{typ}] is not supported"))
     }
 
     /// `$v[key]`: map lookup (case-insensitive, missing → empty), array
@@ -1944,6 +2033,141 @@ fn bool_string(b: bool) -> String {
     } else {
         "False".to_string()
     }
+}
+
+/// `[Environment]::Get/SetEnvironmentVariable`. `User`/`Machine` targets
+/// read the host process env; sets land in the host process env too
+/// (visible for the rest of the session, never persisted anywhere).
+fn eval_environment(method: &str, args: &[String]) -> Result<String, String> {
+    match method {
+        "getenvironmentvariable" => {
+            if args.len() != 1 && args.len() != 2 {
+                return Err("GetEnvironmentVariable takes one or two arguments".to_string());
+            }
+            if args.len() == 2
+                && !args[1].eq_ignore_ascii_case("user")
+                && !args[1].eq_ignore_ascii_case("machine")
+                && !args[1].eq_ignore_ascii_case("process")
+            {
+                return Err(format!("unknown environment target: {}", args[1]));
+            }
+            Ok(std::env::var(&args[0]).unwrap_or_default())
+        }
+        "setenvironmentvariable" => {
+            if args.len() != 2 && args.len() != 3 {
+                return Err("SetEnvironmentVariable takes two or three arguments".to_string());
+            }
+            if args.len() == 3
+                && !args[2].eq_ignore_ascii_case("user")
+                && !args[2].eq_ignore_ascii_case("machine")
+                && !args[2].eq_ignore_ascii_case("process")
+            {
+                return Err(format!("unknown environment target: {}", args[2]));
+            }
+            // Session-local: visible to later reads, gone with the process.
+            std::env::set_var(&args[0], &args[1]);
+            Ok(String::new())
+        }
+        _ => Err(format!("method {method} is not supported on Environment")),
+    }
+}
+
+/// v4 GUID from host `/dev/urandom` (same source as the ProcessPrng shim),
+/// dashed lowercase form.
+fn new_guid() -> Result<String, String> {
+    use std::io::Read;
+    let mut b = [0u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut b))
+        .map_err(|_| "no system randomness for NewGuid".to_string())?;
+    b[6] = (b[6] & 0x0F) | 0x40;
+    b[8] = (b[8] & 0x3F) | 0x80;
+    Ok(format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11],
+        b[12], b[13], b[14], b[15]
+    ))
+}
+
+/// `.NET Regex.Escape`: alphanumerics and `_` verbatim, controls as
+/// letter escapes, everything else backslash-escaped.
+fn regex_escape(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        if c.is_alphanumeric() || c == '_' {
+            out.push(c);
+        } else {
+            match c {
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                '\u{000C}' => out.push_str("\\f"),
+                _ => {
+                    out.push('\\');
+                    out.push(c);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Parse `[Type]::Method(args)rest`: returns (type, method, args-inner,
+/// rest-after-`)`). Ok(None) when the text is not a static call shape.
+fn split_static_call(s: &str) -> Result<Option<(String, String, String, String)>, String> {
+    let t = s.trim_start();
+    if !t.starts_with('[') {
+        return Ok(None);
+    }
+    // Balanced `[...]` (quote-aware; quotes intact in raw text).
+    let mut sq = false;
+    let mut dq = false;
+    let mut depth = 0usize;
+    let mut end = None;
+    for (idx, c) in t.char_indices() {
+        if c == '\'' && !dq {
+            sq = !sq;
+        } else if c == '"' && !sq {
+            dq = !dq;
+        } else if c == '[' && !sq && !dq {
+            depth += 1;
+        } else if c == ']' && !sq && !dq {
+            depth -= 1;
+            if depth == 0 {
+                end = Some(idx);
+                break;
+            }
+        }
+    }
+    let end = match end {
+        Some(i) => i,
+        None => return Ok(None),
+    };
+    let typ = t[1..end].to_string();
+    let rest = t[end + 1..].trim_start();
+    if !rest.starts_with("::") {
+        return Ok(None);
+    }
+    let rest = rest[2..].trim_start();
+    // Method name runs to `(`.
+    let mut mend = rest.len();
+    for (idx, c) in rest.char_indices() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            continue;
+        }
+        mend = idx;
+        break;
+    }
+    if mend == 0 {
+        return Ok(None);
+    }
+    let method = rest[..mend].to_string();
+    let rest = rest[mend..].trim_start();
+    if !rest.starts_with('(') {
+        return Ok(None);
+    }
+    let (inner, rest2) = take_wrapped(rest, '(', ')')?;
+    Ok(Some((typ, method, inner, rest2)))
 }
 
 /// A value in string context: strings as-is, arrays space-joined, empty
@@ -2758,6 +2982,45 @@ mod tests {
             "boom-message"
         );
         assert!(run_session("throw").1.is_err());
+    }
+
+    #[test]
+    fn static_environment_roundtrip() {
+        let (out, r) = run_session("[Environment]::SetEnvironmentVariable('WINCLI_DOTNET_XYZ', 'dotnet-ok', 'User')");
+        assert!(r.is_ok());
+        assert!(out.is_empty());
+        let (out, r) = run_session("[Environment]::SetEnvironmentVariable('WINCLI_DOTNET_XYZ', 'dotnet-ok', 'User')\n[Environment]::GetEnvironmentVariable('WINCLI_DOTNET_XYZ')");
+        assert!(r.is_ok());
+        assert_eq!(out, b"dotnet-ok\n");
+        // Process target and missing names behave the same way.
+        let (out, r) = run_session("[Environment]::GetEnvironmentVariable('WINCLI_DEFINITELY_NOT_SET_XYZ')");
+        assert!(r.is_ok());
+        assert_eq!(out, b"\n");
+        assert!(run_session("[Environment]::Nope('x')").1.unwrap_err().contains("not supported"));
+        assert!(run_session("[Nope]::Nope('x')").1.unwrap_err().contains("not supported"));
+    }
+
+    #[test]
+    fn static_guid_shape() {
+        let (out, r) = run_session("$g = [Guid]::NewGuid()\necho $g");
+        assert!(r.is_ok());
+        let s = String::from_utf8_lossy(&out);
+        let s = s.trim();
+        assert_eq!(s.len(), 36);
+        assert_eq!(&s[8..9], "-");
+        assert_eq!(&s[14..15], "4");
+        assert!(matches!(&s[19..20], "8" | "9" | "a" | "b" | "A" | "B"));
+        // Uniqueness within a session (probabilistic, lossless on failure).
+        let (out2, r) = run_session("$g = [Guid]::NewGuid()\necho $g");
+        assert!(r.is_ok());
+        assert_ne!(out, out2);
+    }
+
+    #[test]
+    fn static_regex_escape() {
+        let (out, r) = run_session("echo $([regex]::Escape('esrun-windows-x86-64.zip'))");
+        assert!(r.is_ok());
+        assert_eq!(out, b"esrun\\-windows\\-x86\\-64\\.zip\n");
     }
 
     #[test]

@@ -164,3 +164,7 @@ All notable changes to this project will be documented in this file.
   `Replace`, `Split` (arrays, chainable with `[n]`), `StartsWith` /
   `EndsWith` / `Contains`; tokenizer keeps quotes inside `(...)` so quoted
   literals re-parse. Unit-tested.
+- PS1 static .NET calls: `[Environment]` get/set (User/Machine read the
+  host process env; sets are session-local), `[Guid]::NewGuid` (v4 from
+  host randomness), `[regex]::Escape`; plus `ToString` (`'N'` strips
+  dashes). Unit-tested.
