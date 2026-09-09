@@ -19,7 +19,9 @@
 //! `function` defines named params with child-scope calls (output
 //! capturable by assignment). `@{}` maps string keys to values with
 //! `.ContainsKey()` and `[key]`/`[index]` reads (arrays/strings index
-//! too); other methods fail clearly.
+//! too); other methods fail clearly. `try`/`catch`/`finally` run the
+//! first error handler with `finally` always executing (its own signal
+//! wins). Console/script output flushes before errors report.
 //! All operations go through the exact same [`WinFs`](crate::winfs::WinFs) API
 //! that the EXE shims use.
 
@@ -133,10 +135,17 @@ impl<'a> Interpreter<'a> {
                     Flow::Next => {}
                     Flow::Break | Flow::Continue => return Ok(flow),
                 }
+            } else if starts_kw(t, "try") {
+                let (next, flow) = self.run_try_chain(&chunks, i)?;
+                i = next;
+                match flow {
+                    Flow::Next => {}
+                    Flow::Break | Flow::Continue => return Ok(flow),
+                }
             } else if let Some((name, op, first)) = split_assign_if_head(&chunks[i]) {
                 // `$v = if ...` / `$v += if ...`: gather the chain,
                 // evaluate capturing output lines into the value.
-                let (text, next) = gather_if_tail(&chunks, i, first);
+                let (text, next) = gather_blocks(&chunks, i, first, &["elseif", "else"]);
                 let key = check_assign_target(&name)?;
                 let mut buf = Vec::new();
                 let flow = {
@@ -188,9 +197,107 @@ impl<'a> Interpreter<'a> {
     /// chunk `i` (same-chunk `} else {` plus following elseif/else chunks).
     /// Returns the next chunk index plus any loop signal from a body.
     fn run_if_chain(&mut self, chunks: &[String], i: usize) -> Result<(usize, Flow), String> {
-        let (text, j) = gather_if_tail(chunks, i, chunks[i].clone());
+        let (text, j) = gather_blocks(&chunks, i, chunks[i].clone(), &["elseif", "else"]);
         let flow = self.eval_if_chain(&text)?;
         Ok((j, flow))
+    }
+
+    /// Run `try {...} [catch {...}]* [finally {...}]?` starting at chunk
+    /// `i`. Returns the next chunk index plus any loop signal.
+    fn run_try_chain(&mut self, chunks: &[String], i: usize) -> Result<(usize, Flow), String> {
+        let (text, j) = gather_blocks(&chunks, i, chunks[i].clone(), &["catch", "finally"]);
+        let flow = self.eval_try(&text)?;
+        Ok((j, flow))
+    }
+
+    /// Evaluate a complete try text: try body, first catch on error (typed
+    /// catches are accepted but not distinguished), optional finally which
+    /// always runs. A finally of its own overrides any in-flight signal.
+    fn eval_try(&mut self, text: &str) -> Result<Flow, String> {
+        let rest = text.trim_start()["try".len()..].trim_start();
+        if !rest.starts_with('{') {
+            return Err("try needs {body}".to_string());
+        }
+        let (trybody, mut rest) = take_wrapped(rest, '{', '}')?;
+        // Collect catches then at most one finally, in order.
+        let mut catches = Vec::new();
+        let mut finally: Option<String> = None;
+        loop {
+            rest = rest.trim_start().to_string();
+            if starts_kw(&rest, "catch") {
+                let after_raw = rest["catch".len()..].trim_start();
+                // Optional `[Type]` (accepted, not distinguished).
+                let after = if after_raw.starts_with('[') {
+                    let (_, rest2) = take_wrapped(after_raw, '[', ']')?;
+                    rest2.trim_start().to_string()
+                } else {
+                    after_raw.to_string()
+                };
+                if !after.starts_with('{') {
+                    return Err("catch needs {body}".to_string());
+                }
+                let (body, rest2) = take_wrapped(&after, '{', '}')?;
+                catches.push(body);
+                rest = rest2;
+            } else if starts_kw(&rest, "finally") {
+                if finally.is_some() {
+                    return Err("duplicate finally".to_string());
+                }
+                let after = rest["finally".len()..].trim_start();
+                if !after.starts_with('{') {
+                    return Err("finally needs {body}".to_string());
+                }
+                let (body, rest2) = take_wrapped(after, '{', '}')?;
+                finally = Some(body);
+                rest = rest2;
+            } else {
+                break;
+            }
+        }
+        if catches.len() > 1 {
+            // Without typed matching every catch would fire in turn;
+            // running just the first keeps it predictable.
+        }
+        let run_finally = |me: &mut Self| -> Result<Flow, String> {
+            match &finally {
+                Some(b) => {
+                    let b = b.clone();
+                    me.run_code(&b)
+                }
+                None => Ok(Flow::Next),
+            }
+        };
+        match self.run_code(&trybody) {
+            Err(e) => {
+                let cf = if let Some(cb) = catches.first() {
+                    let cb = cb.clone();
+                    match self.run_code(&cb) {
+                        Err(e2) => {
+                            run_finally(self)?;
+                            return Err(e2);
+                        }
+                        Ok(f) => f,
+                    }
+                } else {
+                    if let Some(b) = finally.clone() {
+                        self.run_code(&b)?;
+                    }
+                    return Err(e);
+                };
+                let ff = run_finally(self)?;
+                Ok(match ff {
+                    Flow::Next => cf,
+                    _ => ff,
+                })
+            }
+            Ok(f) => {
+                let ff = run_finally(self)?;
+                Ok(match ff {
+                    Flow::Next => f,
+                    _ => ff,
+                })
+            }
+        }
     }
 
     /// Evaluate a complete if/elseif/else text: first true branch runs.
@@ -476,6 +583,7 @@ impl<'a> Interpreter<'a> {
             "copy-item" | "copy" | "cp" | "ci" => self.cmd_copy_item(rest),
             "move-item" | "move" | "mv" | "mi" => self.cmd_move_item(rest),
             "test-path" => self.cmd_test_path(rest),
+            "join-path" => self.cmd_join_path(rest),
             "write-host" | "write-output" | "echo" => {
                 let (_, positional) = parse_params(rest, &[])?;
                 self.emit(&positional.join(" "));
@@ -1358,6 +1466,38 @@ impl<'a> Interpreter<'a> {
         self.emit(if self.fs.test_path(&path) { "True" } else { "False" });
         Ok(())
     }
+
+    fn cmd_join_path(&mut self, args: &[String]) -> Result<(), String> {
+        let (named, pos) = parse_params(args, &["path", "childpath", "resolve"])?;
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(p) = named.get("path") {
+            parts.push(p.clone());
+        }
+        if let Some(c) = named.get("childpath") {
+            parts.push(c.clone());
+        }
+        parts.extend(pos.iter().cloned());
+        if parts.len() < 2 {
+            return Err("usage: Join-Path <path> <child> [...]".to_string());
+        }
+        let mut out = parts[0].replace('/', "\\");
+        for part in &parts[1..] {
+            let child = part.replace('/', "\\");
+            let child = child.trim_start_matches('\\');
+            let base = out.trim_end_matches('\\');
+            // `C:\` trims to `C:`; re-adding the separator restores it.
+            out = if base.is_empty() {
+                format!("\\{child}")
+            } else {
+                format!("{base}\\{child}")
+            };
+        }
+        if named.contains_key("resolve") && !self.fs.test_path(&out) {
+            return Err(format!("Join-Path: path not found: {out}"));
+        }
+        self.emit(&out);
+        Ok(())
+    }
 }
 
 /// Strip `#` comments (outside quotes).
@@ -1461,10 +1601,11 @@ fn skip_if_tail(rest: &str) -> Result<String, String> {
     }
 }
 
-/// Gather an if-chain's full text: first text plus following elseif/else
-/// chunks (and continuation chunks while the last block is unclosed, so
-/// newline-brace style works). Returns (text, next index).
-fn gather_if_tail(chunks: &[String], i: usize, first: String) -> (String, usize) {
+/// Gather a block chain's full text: first text plus following chunks
+/// starting with any of `kws` (e.g. elseif/else, catch/finally), plus
+/// continuation chunks while the last block is unclosed (so newline-brace
+/// style works). Returns (text, next index).
+fn gather_blocks(chunks: &[String], i: usize, first: String, kws: &[&str]) -> (String, usize) {
     let mut text = first;
     let mut j = i + 1;
     loop {
@@ -1472,10 +1613,7 @@ fn gather_if_tail(chunks: &[String], i: usize, first: String) -> (String, usize)
         let need_more = !t.ends_with('}');
         let chain_next = t.ends_with('}')
             && j < chunks.len()
-            && {
-                let nt = chunks[j].trim_start();
-                starts_kw(nt, "elseif") || starts_kw(nt, "else")
-            };
+            && kws.iter().any(|k| starts_kw(chunks[j].trim_start(), k));
         if (!need_more && !chain_next) || j >= chunks.len() {
             break;
         }
@@ -2391,6 +2529,46 @@ mod tests {
             "boom-message"
         );
         assert!(run_session("throw").1.is_err());
+    }
+
+    #[test]
+    fn try_catch_finally_paths() {
+        // Clean run: try + finally.
+        let (out, r) = run_session("try { echo t } catch { echo c } finally { echo f }");
+        assert!(r.is_ok());
+        assert_eq!(out, b"t\nf\n");
+        // Error: catch runs, error swallowed, finally runs.
+        let (out, r) = run_session("try { throw boom } catch { echo caught } finally { echo fin }");
+        assert!(r.is_ok());
+        assert_eq!(out, b"caught\nfin\n");
+        // No catch: finally runs, error propagates (with partial output).
+        let (out, r) = run_session("try { echo t } catch { echo c } finally { echo f2 }");
+        assert!(r.is_ok());
+        assert_eq!(out, b"t\nf2\n");
+        let (out, r) = run_session("try { throw x } finally { echo f2 }");
+        assert_eq!(r.unwrap_err(), "x");
+        assert_eq!(out, b"f2\n");
+        // Catch error replaces; no try output survives it silently.
+        let (out, r) = run_session("try { throw a } catch { throw b } finally { echo f }");
+        assert_eq!(r.unwrap_err(), "b");
+        assert_eq!(out, b"f\n");
+    }
+
+    #[test]
+    fn try_finally_break_propagates() {
+        // Break in try runs finally, then leaves the loop.
+        let script = "foreach ($i in @('a', 'b', 'c')) { try { if ($i -eq 'b') { break } echo \"kept-$i\" } finally { echo fin } }";
+        let (out, r) = run_session(script);
+        assert!(r.is_ok());
+        assert_eq!(out, b"kept-a\nfin\nfin\n");
+    }
+
+    #[test]
+    fn try_shape_errors() {
+        assert!(run_session("try echo hi").1.unwrap_err().contains("needs {body}"));
+        assert!(run_session("try { echo hi } catch echo").1.unwrap_err().contains("needs {body}"));
+        assert!(run_session("try { echo hi } finally").1.unwrap_err().contains("needs {body}"));
+        assert!(run_session("try { echo hi } finally { echo f } finally { echo g }").1.unwrap_err().contains("duplicate"));
     }
 
     #[test]

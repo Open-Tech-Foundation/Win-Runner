@@ -154,3 +154,7 @@ All notable changes to this project will be documented in this file.
 - PS1 hashtables: `@{}` literals, `.ContainsKey()`, `[key]` reads/writes
   (arrays/strings index too, negatives count back). Other methods and
   entry-ful literals fail clearly. Unit-tested.
+- PS1 `try`/`catch`/`finally` (typed catches accepted, first wins;
+  `finally` always runs and overrides in-flight signals/breaks) and
+  `Join-Path` (multi-child join, `-Resolve` checks existence).
+  Error paths flush partial output first in both CLI and shell. Unit-tested.

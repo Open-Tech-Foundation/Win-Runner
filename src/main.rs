@@ -156,6 +156,8 @@ fn run_ps1_file(path: &str) {
             let _ = std::io::stdout().write_all(&out);
         }
         Err(e) => {
+            // Flush partial output first (a real shell streams).
+            let _ = std::io::stdout().write_all(&out);
             eprintln!("wincli: script error: {e}");
             std::process::exit(1);
         }

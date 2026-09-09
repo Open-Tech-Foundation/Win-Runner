@@ -263,6 +263,8 @@ pub fn run_shell() -> i32 {
                 return code;
             }
             Err(e) => {
+                // Flush partial output first (a real shell streams).
+                let _ = std::io::stdout().write_all(&out);
                 eprintln!("wincli: {e}");
             }
         }
