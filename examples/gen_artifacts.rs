@@ -47,6 +47,14 @@ fn main() {
     }
 
     // Offline install fixture: package `demo` 0.1.0.
+    //
+    // NOTE: tests/artifacts/packages/demoz.zip is NOT generated here: it
+    // must stay deflated (method 8) to exercise the inflate path, and this
+    // repo has no deflate encoder. Rebuild it by hand when builder output
+    // changes, e.g.:
+    //   python3 -c "import zipfile; \
+    //     z = zipfile.ZipFile('tests/artifacts/packages/demoz.zip', 'w', zipfile.ZIP_DEFLATED); \
+    //     z.writestr('demoz/deep/demo.exe', open('tests/artifacts/exe/demoz.exe','rb').read())"
     let pkgs = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/artifacts/packages");
     std::fs::create_dir_all(&pkgs).unwrap();
     let demo_exe = builder::hello("demo 0.1.0");

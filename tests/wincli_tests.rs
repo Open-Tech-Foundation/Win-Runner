@@ -695,17 +695,23 @@ fn live_install_ripgrep() {
     assert!(stdout.contains("→ C:\\bin\\rg.exe"), "{stdout}");
     assert!(cache.join("pkgs").join("rg.exe").is_file());
 
-    // the harness loop: real rg.exe is NOT yet runnable -> missing-API report
+    // the harness loop: real rg.exe loads with no missing imports...
     let out = std::process::Command::new(bin)
         .args(["inspect", "rg"])
         .env("WINCLI_CACHE", &cc)
         .env_remove("WINCLI_SOURCE")
         .output()
         .expect("spawn wincli inspect");
-    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    assert!(stdout.contains("Missing imports:"), "{stdout}");
-    assert!(stdout.contains("Missing:\n"), "{stdout}");
+    assert!(stdout.contains("Missing imports:   0"), "{stdout}");
+    // ...and searches end to end in a shell session.
+    let (code, stdout, _) = run_shell_env(
+        "Set-Content C:\\log.txt 'error: disk full'\nAdd-Content C:\\log.txt 'info: all good'\nrg error C:\\log.txt\nexit\n",
+        &[("WINCLI_CACHE", cc.as_ref())],
+    );
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "error: disk full\n");
     std::fs::remove_dir_all(&cache).ok();
 }
 
@@ -750,7 +756,7 @@ fn test_bare_name_and_guest_path_resolution() {
     assert_eq!(code, 0, "stderr: {stderr}");
     assert_eq!(stdout, "demoz 0.1.0");
     // argv0 reflects what was typed
-    let (code, stdout, _) = run_wincli_env(&["install", "demo"], &envs);
+    let (code, _, _) = run_wincli_env(&["install", "demo"], &envs);
     assert_eq!(code, 0);
     std::fs::remove_dir_all(&cache).ok();
 }
@@ -851,6 +857,27 @@ fn test_art_exe_rust_hashmap() {
     let (code, stdout, stderr) = run_cli(&artifact("exe/rust_hashmap.exe"));
     assert_eq!(code, 0, "stderr: {stderr}");
     assert_eq!(stdout, "H1a\nH1\nH2\nH3\nH4\nH5\nPASS\n");
+}
+
+#[test]
+fn test_art_exe_rust_memcpy() {
+    // Real rustc-built guest (guests/memcpy.rs): copy torture that pins
+    // the F3 0F 7E movq-load direction fix — exact sizes incl. 212/213,
+    // misaligned and overlapping copies, explicit movdqu loops, ~100KB
+    // format!/push_str growth with verification.
+    let bytes = std::fs::read(artifact("exe/rust_memcpy.exe")).unwrap();
+    let img = pe::load(&bytes).expect("rust guest must load");
+    for imp in img.imports.iter().chain(img.stubs.iter()) {
+        assert!(
+            pe::is_supported(&imp.dll, &imp.func),
+            "unsupported import in rust guest: {}!{}",
+            imp.dll,
+            imp.func
+        );
+    }
+    let (code, stdout, stderr) = run_cli(&artifact("exe/rust_memcpy.exe"));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "M1\nM2\nM3\nM4\nM5\nM6\nPASS\n");
 }
 
 // ---------- interactive shell (piped stdin, no network) ----------

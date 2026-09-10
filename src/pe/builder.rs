@@ -463,7 +463,9 @@ pub fn build(mut asm: Asm, imports: &[(&str, &str)]) -> Vec<u8> {
     f.extend_from_slice(&0u32.to_le_bytes());
     f.extend_from_slice(&0u16.to_le_bytes());
     f.extend_from_slice(&0u16.to_le_bytes());
-    f.extend_from_slice(&0x6000_0020u32.to_le_bytes());
+    // CODE|EXECUTE|READ|WRITE: test probes keep data and the IAT in the
+    // single code section, and the emulator enforces W^X.
+    f.extend_from_slice(&0xE000_0020u32.to_le_bytes());
     while f.len() < size_of_headers as usize {
         f.push(0);
     }

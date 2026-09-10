@@ -150,6 +150,31 @@ impl Runner {
         h
     }
 
+    /// (attrs, byte length) for an open handle's path (dirs: 0x10, len 0).
+    /// Std handles (0/1/2) report as character devices with no size.
+    fn file_attrs_len_by_handle(&self, h: u64) -> Result<(u32, u64), String> {
+        if h <= 2 {
+            return Ok((0x40, 0));
+        }
+        let fh = self
+            .handles
+            .get(&h)
+            .ok_or_else(|| format!("bad file handle 0x{h:016x}"))?;
+        if self.fs.is_dir(&fh.path) {
+            return Ok((0x10, 0));
+        }
+        let data = self
+            .fs
+            .read_file(&fh.path)
+            .map_err(|e| format!("stat: {e}"))?;
+        Ok((0x80, data.len() as u64))
+    }
+
+    /// Byte length for an open handle's path.
+    fn file_len_by_handle(&self, h: u64) -> Result<u64, String> {
+        self.file_attrs_len_by_handle(h).map(|(_, len)| len)
+    }
+
     pub fn run(mut self) -> Result<(u32, WinFs, Vec<u8>), String> {
         let trace = std::env::var("WINCLI_TRACE").map(|v| v == "1").unwrap_or(false);
         let dump = std::env::var("WINCLI_DUMP_ON_ERROR")
@@ -748,7 +773,7 @@ impl Runner {
                 ret_bool!(k as u64);
             }
             "GetSystemInfo" => {
-                // SYSTEM_INFO (36 bytes, x64 layout).
+                // SYSTEM_INFO (48 bytes, x64 layout).
                 let si = rcx;
                 let ncpu = std::thread::available_parallelism()
                     .map(|n| n.get() as u32)
@@ -760,6 +785,10 @@ impl Runner {
                 self.emu.write_u64(si + 16, 0x7FFE_FFFF)?; // max app
                 self.emu.write_u64(si + 24, 0xFF)?; // affinity mask
                 self.emu.write_u32(si + 32, ncpu)?;
+                self.emu.write_u32(si + 36, 8664)?; // PROCESSOR_AMD_X8664
+                self.emu.write_u32(si + 40, 65536)?; // allocation granularity
+                self.emu.write_u16(si + 44, 6)?; // level
+                self.emu.write_u16(si + 46, 0)?; // revision
                 ret_bool!(0);
             }
             "GetSystemTimeAsFileTime" => {
@@ -810,8 +839,9 @@ impl Runner {
                 }
             }
             "GetCurrentDirectoryW" => {
-                let buf = rcx;
-                let n = (rdx & 0xFFFF_FFFF) as usize;
+                // (nBufferLength, lpBuffer): length first.
+                let n = (rcx & 0xFFFF_FFFF) as usize;
+                let buf = rdx;
                 let units: Vec<u16> =
                     self.fs.cwd().encode_utf16().chain(std::iter::once(0)).collect();
                 if n == 0 {
@@ -860,6 +890,62 @@ impl Runner {
                 } else {
                     ret_bool!(0xFFFF_FFFF);
                 }
+            }
+            "GetFileSizeEx" => {
+                // (hFile, lpFileSize): u64 length at lpFileSize, nonzero on ok.
+                let h = rcx;
+                let p_size = rdx;
+                let len = self.file_len_by_handle(h)?;
+                self.emu.write_u64(p_size, len)?;
+                ret_bool!(1);
+            }
+            "GetFileInformationByHandle" => {
+                // BY_HANDLE_FILE_INFORMATION (52 bytes): attrs, 3×FILETIME,
+                // volume serial, size high/low, links, index high/low.
+                // Times are zero (documented simplification).
+                let h = rcx;
+                let info = rdx;
+                let (attrs, len) = self.file_attrs_len_by_handle(h)?;
+                let mut b = [0u8; 52];
+                b[0..4].copy_from_slice(&attrs.to_le_bytes());
+                b[32..36].copy_from_slice(&((len >> 32) as u32).to_le_bytes());
+                b[36..40].copy_from_slice(&(len as u32).to_le_bytes());
+                b[40..44].copy_from_slice(&1u32.to_le_bytes());
+                self.emu.write_bytes(info, &b)?;
+                ret_bool!(1);
+            }
+            "GetFileInformationByHandleEx" => {
+                // (hFile, class, lpInfo, size): FileBasicInfo=0 (40 bytes),
+                // FileStandardInfo=1 (24 bytes). Times zero (simplification).
+                let h = rcx;
+                let class = (rdx & 0xFFFF_FFFF) as u32;
+                let info = r8;
+                let n = (r9 & 0xFFFF_FFFF) as usize;
+                let (attrs, len) = self.file_attrs_len_by_handle(h)?;
+                let mut b = vec![0u8; if class == 0 { 40 } else { 24 }];
+                if class == 0 {
+                    if n < 40 {
+                        self.last_error = 122; // INSUFFICIENT_BUFFER
+                        ret_bool!(0);
+                    }
+                    b[32..36].copy_from_slice(&attrs.to_le_bytes());
+                } else if class == 1 {
+                    if n < 24 {
+                        self.last_error = 122;
+                        ret_bool!(0);
+                    }
+                    b[0..8].copy_from_slice(&len.to_le_bytes());
+                    b[8..16].copy_from_slice(&len.to_le_bytes());
+                    b[16..20].copy_from_slice(&1u32.to_le_bytes());
+                    b[20] = 0;
+                    b[21] = u8::from(attrs & 0x10 != 0);
+                } else {
+                    return Err(format!(
+                        "GetFileInformationByHandleEx: info class {class} is not supported"
+                    ));
+                }
+                self.emu.write_bytes(info, &b)?;
+                ret_bool!(1);
             }
             "MultiByteToWideChar" => {
                 // (codepage, flags, src, srclen, dst, dstlen).
@@ -1115,9 +1201,58 @@ impl Runner {
                 let s = self.nt_finish(iosb, STATUS_SUCCESS, n as u64)?;
                 ret_bool!(s);
             }
+            "NtReadFile" => {
+                // NTSTATUS NtReadFile(handle, event, apc, ctx, iosb, buf,
+                // len, byte_offset, key). UCRT read() comes through here,
+                // not ReadFile. Synchronous only; EOF reads 0 bytes ok.
+                const STATUS_SUCCESS: u64 = 0;
+                const STATUS_INVALID_HANDLE: u64 = 0xC000_0008;
+                const STATUS_NOT_IMPLEMENTED: u64 = 0xC000_0002;
+                const STATUS_END_OF_FILE: u64 = 0xC000_0011;
+                let h = rcx;
+                let event = rdx;
+                let iosb = self.emu.stack_arg(4).unwrap_or(0);
+                let buf = self.emu.stack_arg(5).unwrap_or(0);
+                let n = (self.emu.stack_arg(6).unwrap_or(0) & 0xFFFF_FFFF) as usize;
+                let byte_off = self.emu.stack_arg(7).unwrap_or(0);
+                if event != 0 || n > 16 * 1024 * 1024 {
+                    let s = self.nt_finish(iosb, STATUS_NOT_IMPLEMENTED, 0)?;
+                    ret_bool!(s);
+                }
+                if h == 0 || !self.handles.contains_key(&h) {
+                    let s = self.nt_finish(iosb, STATUS_INVALID_HANDLE, 0)?;
+                    ret_bool!(s);
+                }
+                let (path, off) = {
+                    let fh = self.handles.get_mut(&h).unwrap();
+                    let off = if byte_off != 0 {
+                        self.emu.read_u64(byte_off)? as usize
+                    } else {
+                        fh.offset as usize
+                    };
+                    (fh.path.clone(), off)
+                };
+                let content = self
+                    .fs
+                    .read_file(&path)
+                    .map_err(|e| format!("NtReadFile: {e}"))?;
+                let avail = content.len().saturating_sub(off.min(content.len()));
+                let k = avail.min(n);
+                self.emu.write_bytes(buf, &content[off..off + k])?;
+                if byte_off == 0 {
+                    self.handles.get_mut(&h).unwrap().offset += k as u64;
+                }
+                // EOF (k == 0): STATUS_END_OF_FILE, like the real call.
+                let s = if k == 0 {
+                    self.nt_finish(iosb, STATUS_END_OF_FILE, 0)?
+                } else {
+                    self.nt_finish(iosb, STATUS_SUCCESS, k as u64)?
+                };
+                ret_bool!(s);
+            }
             // ---- fail-stubs: loadable, fail clearly if called ----
             "WaitOnAddress" | "WakeByAddressAll" | "WakeByAddressSingle"
-            | "NtCreateNamedPipeFile" | "NtOpenFile" | "NtReadFile"
+            | "NtCreateNamedPipeFile" | "NtOpenFile"
             | "RtlNtStatusToDosError" | "GetUserProfileDirectoryW"
             | "AddVectoredExceptionHandler" | "CompareStringOrdinal" | "CompareStringW"
             | "CreateFileMappingW"             | "CreateMutexA" | "CreateProcessW" | "CreateThread"
@@ -1125,7 +1260,6 @@ impl Runner {
             | "FlushFileBuffers"
             | "FormatMessageW" | "FreeLibrary" | "GetCPInfo" | "GetComputerNameExW"
             | "GetConsoleScreenBufferInfo" | "GetExitCodeProcess"
-            | "GetFileInformationByHandle" | "GetFileInformationByHandleEx"
             | "GetFinalPathNameByHandleW" | "GetProcAddress" | "GetStringTypeW"
             | "GetSystemDirectoryW"             | "GetWindowsDirectoryW"
             | "IsThreadAFiber"
@@ -1392,6 +1526,244 @@ mod tests {
         let (code, _, out) = run_exe(&nt_write_probe(), WinFs::new()).unwrap();
         assert_eq!(code, 0);
         assert_eq!(out, b"hello");
+    }
+
+    fn stat_probe() -> Vec<u8> {
+        // imports: CreateFileW, GetFileSizeEx, GetFileInformationByHandleEx,
+        // CloseHandle, ExitProcess. Opens C:\stat.txt (pre-seeded, 5 bytes),
+        // checks size and FileStandardInfo fields, exits 0/1.
+        use crate::pe::builder::{build, Asm};
+        const CF: usize = 0;
+        const SZ: usize = 1;
+        const GI: usize = 2;
+        const CH: usize = 3;
+        const XP: usize = 4;
+        const GIC: usize = 5;
+        let mut a = Asm::new();
+        let d_path = a.add_utf16("C:\\stat.txt");
+        let d_sz = a.add_zeroed(8);
+        let d_info = a.add_zeroed(52);
+        let lbl_fail = a.fresh_label();
+        a.sub_rsp(0x48);
+        // handle = CreateFileW(path, GENERIC_READ, 0,0, OPEN_EXISTING=3, 0,0)
+        a.lea_reg_rip(1, d_path);
+        a.emit(&[0x48, 0xB8]);
+        a.emit(&0x8000_0000u64.to_le_bytes());
+        a.emit(&[0x48, 0x89, 0xC2]); // mov rdx,rax
+        a.mov_r8d_imm(0);
+        a.mov_r9d_imm(0);
+        a.xor_eax();
+        a.emit(&[0xC7, 0x44, 0x24, 0x20]);
+        a.emit(&3u32.to_le_bytes());
+        a.emit(&[0xC7, 0x44, 0x24, 0x28]);
+        a.emit(&0u32.to_le_bytes());
+        a.mov_rspoff_rax(0x30);
+        a.call_import(CF);
+        a.cmp_rax_m1();
+        a.jz(lbl_fail);
+        a.emit(&[0x48, 0x89, 0x44, 0x24, 0x40]); // mov [rsp+0x40],rax
+        // GetFileSizeEx(handle, &sz): nonzero + low dword == 5
+        a.emit(&[0x48, 0x8B, 0x4C, 0x24, 0x40]); // mov rcx,[rsp+0x40]
+        a.lea_reg_rip(2, d_sz);
+        a.call_import(SZ);
+        a.test_eax_eax();
+        a.jz(lbl_fail);
+        a.mov_eax_mem_rip(d_sz);
+        a.cmp_eax_imm(5);
+        a.jnz(lbl_fail);
+        // GetFileInformationByHandleEx(handle, 1, &info, 24): nonzero,
+        // AllocationLength low == 5, EndOfFile low == 5, IsDirectory == 0
+        a.emit(&[0x48, 0x8B, 0x4C, 0x24, 0x40]); // mov rcx,[rsp+0x40]
+        a.mov_edx_imm(1);
+        a.lea_reg_rip(8, d_info);
+        a.mov_r9d_imm(24);
+        a.call_import(GI);
+        a.test_eax_eax();
+        a.jz(lbl_fail);
+        a.mov_eax_mem_rip(d_info);
+        a.cmp_eax_imm(5);
+        a.jnz(lbl_fail);
+        a.lea_reg_rip(0, d_info);
+        a.emit(&[0x48, 0x83, 0xC0, 0x08]); // add rax,8
+        a.emit(&[0x8B, 0x00]); // mov eax,[rax]
+        a.cmp_eax_imm(5);
+        a.jnz(lbl_fail);
+        a.lea_reg_rip(0, d_info);
+        a.emit(&[0x48, 0x83, 0xC0, 0x15]); // add rax,21
+        a.movzx_ecx_byte_rax(); // movzx ecx,byte [rax] (zero-extends)
+        a.emit(&[0x83, 0xF9, 0x00]); // cmp ecx,0
+        a.jnz(lbl_fail);
+        // GetFileInformationByHandle(handle, &classic52): nonzero,
+        // attrs dword == 0x80, size low (at +36) == 5
+        a.emit(&[0x48, 0x8B, 0x4C, 0x24, 0x40]); // mov rcx,[rsp+0x40]
+        a.lea_reg_rip(2, d_info);
+        a.call_import(GIC);
+        a.test_eax_eax();
+        a.jz(lbl_fail);
+        a.mov_eax_mem_rip(d_info);
+        a.cmp_eax_imm(0x80);
+        a.jnz(lbl_fail);
+        a.lea_reg_rip(0, d_info);
+        a.emit(&[0x48, 0x83, 0xC0, 0x24]); // add rax,36
+        a.emit(&[0x8B, 0x00]); // mov eax,[rax]
+        a.cmp_eax_imm(5);
+        a.jnz(lbl_fail);
+        // CloseHandle(handle); exit 0
+        a.emit(&[0x48, 0x8B, 0x4C, 0x24, 0x40]); // mov rcx,[rsp+0x40]
+        a.call_import(CH);
+        a.mov_ecx_imm(0);
+        a.call_import(XP);
+        a.add_rsp(0x48);
+        a.ret();
+        a.mark(lbl_fail);
+        a.mov_ecx_imm(1);
+        a.call_import(XP);
+        a.add_rsp(0x48);
+        a.ret();
+        build(
+            a,
+            &[
+                ("KERNEL32.dll", "CreateFileW"),
+                ("KERNEL32.dll", "GetFileSizeEx"),
+                ("KERNEL32.dll", "GetFileInformationByHandleEx"),
+                ("KERNEL32.dll", "CloseHandle"),
+                ("KERNEL32.dll", "ExitProcess"),
+                ("KERNEL32.dll", "GetFileInformationByHandle"),
+            ],
+        )
+    }
+
+    #[test]
+    fn file_metadata_by_handle() {
+        let mut fs = WinFs::new();
+        fs.write_file("C:\\stat.txt", b"hello".to_vec()).unwrap();
+        let (code, _, _) = run_exe(&stat_probe(), fs).unwrap();
+        assert_eq!(code, 0);
+    }
+
+    fn read_probe() -> Vec<u8> {
+        // imports: CreateFileW, NtReadFile, CloseHandle, ExitProcess.
+        // Reads C:\stat.txt (pre-seeded "hello") via NtReadFile, checks
+        // status, byte count, and first dword, exits 0/1.
+        use crate::pe::builder::{build, Asm};
+        const CF: usize = 0;
+        const RF: usize = 1;
+        const CH: usize = 2;
+        const XP: usize = 3;
+        let mut a = Asm::new();
+        let d_path = a.add_utf16("C:\\stat.txt");
+        let d_iosb = a.add_zeroed(16);
+        let d_buf = a.add_zeroed(8);
+        let lbl_fail = a.fresh_label();
+        a.sub_rsp(0x48);
+        // handle = CreateFileW(path, GENERIC_READ, 0,0, OPEN_EXISTING=3, 0,0)
+        a.lea_reg_rip(1, d_path);
+        a.emit(&[0x48, 0xB8]);
+        a.emit(&0x8000_0000u64.to_le_bytes());
+        a.emit(&[0x48, 0x89, 0xC2]); // mov rdx,rax
+        a.mov_r8d_imm(0);
+        a.mov_r9d_imm(0);
+        a.xor_eax();
+        a.emit(&[0xC7, 0x44, 0x24, 0x20]);
+        a.emit(&3u32.to_le_bytes());
+        a.emit(&[0xC7, 0x44, 0x24, 0x28]);
+        a.emit(&0u32.to_le_bytes());
+        a.mov_rspoff_rax(0x30);
+        a.call_import(CF);
+        a.cmp_rax_m1();
+        a.jz(lbl_fail);
+        a.emit(&[0x48, 0x89, 0x44, 0x24, 0x40]); // mov [rsp+0x40],rax
+        // NtReadFile(handle, 0,0,0, iosb, buf, 5, NULL, 0)
+        a.emit(&[0x48, 0x8B, 0x4C, 0x24, 0x40]); // mov rcx,[rsp+0x40]
+        a.mov_edx_imm(0);
+        a.mov_r8d_imm(0);
+        a.mov_r9d_imm(0);
+        a.lea_reg_rip(0, d_iosb);
+        a.mov_rspoff_rax(0x20);
+        a.lea_reg_rip(0, d_buf);
+        a.mov_rspoff_rax(0x28);
+        a.mov_r32_imm(0, 5);
+        a.mov_rspoff_rax(0x30);
+        a.xor_eax();
+        a.mov_rspoff_rax(0x38);
+        a.mov_rspoff_rax(0x40);
+        a.call_import(RF);
+        // status == 0?
+        a.test_eax_eax();
+        a.jnz(lbl_fail);
+        // iosb.Information (at +8) == 5?
+        a.lea_reg_rip(0, d_iosb);
+        a.emit(&[0x48, 0x83, 0xC0, 0x08]); // add rax,8
+        a.emit(&[0x8B, 0x00]); // mov eax,[rax]
+        a.cmp_eax_imm(5);
+        a.jnz(lbl_fail);
+        // buf first dword == "hell"?
+        a.mov_eax_mem_rip(d_buf);
+        a.cmp_eax_imm(0x6C6C6568);
+        a.jnz(lbl_fail);
+        // CloseHandle(handle); exit 0
+        a.emit(&[0x48, 0x8B, 0x4C, 0x24, 0x40]); // mov rcx,[rsp+0x40]
+        a.call_import(CH);
+        a.mov_ecx_imm(0);
+        a.call_import(XP);
+        a.add_rsp(0x48);
+        a.ret();
+        a.mark(lbl_fail);
+        a.mov_ecx_imm(1);
+        a.call_import(XP);
+        a.add_rsp(0x48);
+        a.ret();
+        build(
+            a,
+            &[
+                ("KERNEL32.dll", "CreateFileW"),
+                ("NTDLL.dll", "NtReadFile"),
+                ("KERNEL32.dll", "CloseHandle"),
+                ("KERNEL32.dll", "ExitProcess"),
+            ],
+        )
+    }
+
+    #[test]
+    fn nt_read_file_roundtrip() {
+        let mut fs = WinFs::new();
+        fs.write_file("C:\\stat.txt", b"hello".to_vec()).unwrap();
+        let (code, _, _) = run_exe(&read_probe(), fs).unwrap();
+        assert_eq!(code, 0);
+    }
+
+    fn sysinfo_probe() -> Vec<u8> {
+        // imports: GetSystemInfo, ExitProcess. Exits with
+        // dwAllocationGranularity (must be nonzero, real value 65536).
+        use crate::pe::builder::{build, Asm};
+        const SI: usize = 0;
+        const XP: usize = 1;
+        let mut a = Asm::new();
+        let d_si = a.add_zeroed(48);
+        a.sub_rsp(0x28);
+        a.lea_reg_rip(1, d_si);
+        a.call_import(SI);
+        a.lea_reg_rip(0, d_si);
+        a.emit(&[0x48, 0x83, 0xC0, 0x28]); // add rax,40
+        a.emit(&[0x8B, 0x08]); // mov ecx,[rax]
+        a.call_import(XP);
+        a.add_rsp(0x28);
+        a.ret();
+        build(
+            a,
+            &[
+                ("KERNEL32.dll", "GetSystemInfo"),
+                ("KERNEL32.dll", "ExitProcess"),
+            ],
+        )
+    }
+
+    #[test]
+    fn system_info_granularity_nonzero() {
+        // memmap2 divides file offsets by dwAllocationGranularity; zero
+        // panics the guest (divide by zero). Regression test.
+        let (code, _, _) = run_exe(&sysinfo_probe(), WinFs::new()).unwrap();
+        assert_eq!(code, 65536);
     }
 
     #[test]

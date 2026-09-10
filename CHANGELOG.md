@@ -201,3 +201,28 @@ All notable changes to this project will be documented in this file.
 - Milestone (live-network validation, not in the suite): the real ES-Runtime
   `install.ps1` via `irm ... | iex` runs end to end, installing and
   checksum-verifying both the `esrun` and `esdev` releases.
+- Emulator, trace-driven by real `rg.exe --help` output corruption (8-byte
+  forward smears with content from ~15 bytes earlier): `F3 0F 7E` without
+  REX.W is MOVQ (8-byte load), not MOVD — it executed as a store, never
+  loading. Fixed with unit tests; `--help` output is now word-identical to
+  upstream. Caught via guest watchpoints, disassembly, and a reference
+  Linux binary (kept out of tree).
+- Emulator, trace-driven by real `rg.exe` search: `PINSRW`, `PUNPCKHBW`,
+  `PUNPCKLWD`/`HWD`, `PACKUSWB`, scalar `MOVSS` load/store, `ADC`/`SBB`
+  `AL,imm8` plus Grp4 `INC`/`DEC r/m8` — each with unit tests.
+- `winapi` for real search: fixed `GetCurrentDirectoryW` arg order
+  (`nBufferLength` first); new `GetFileSizeEx`,
+  `GetFileInformationByHandle`/`Ex` (correct struct layouts), `NtReadFile`
+  (UCRT read path, EOF semantics); completed `GetSystemInfo` to 48 bytes
+  (missing allocation granularity divided-by-zeroed `memmap2`).
+  Unit-tested via builder probes (size, info structs, read round-trip).
+- W^X enforcement: guest writes to executable-but-not-writable sections
+  fail loudly (loader IAT patching exempt, like the real loader); test
+  builder emits RWX sections and fixtures were regenerated
+  (`gen_artifacts`, plus manual `demoz.zip` — see its note).
+- `guests/memcpy.rs` (`rust_memcpy.exe`): copy torture (sizes incl.
+  212/213, misaligned, overlapping, explicit `movdqu` loops, ~100KB
+  `format!` growth) with e2e test.
+- Milestone (live-network validation): real `rg.exe` searches WinFS files
+  end to end (`rg error C:\log.txt` prints matches); the live acceptance
+  test now covers install → inspect (0 missing) → search.

@@ -31,6 +31,10 @@ pub struct PeImage {
     pub tls: Option<TlsDir>,
     /// (iat_rva -> import index)
     pub iat_slots: Vec<u32>,
+    /// Executable-but-not-writable section ranges as absolute VAs (for W^X
+    /// enforcement: guest writes there fail loudly instead of corrupting
+    /// code; RWX sections stay writable).
+    pub code_ranges: Vec<(u64, u64)>,
 }
 
 /// Thread-local storage directory (IMAGE_TLS_DIRECTORY64, RVAs).
@@ -98,6 +102,9 @@ pub const SUPPORTED_APIS: &[(&str, &str)] = &[
     ("KERNEL32.DLL", "GetCurrentDirectoryW"),
     ("KERNEL32.DLL", "GetFullPathNameW"),
     ("KERNEL32.DLL", "GetFileAttributesW"),
+    ("KERNEL32.DLL", "GetFileSizeEx"),
+    ("KERNEL32.DLL", "GetFileInformationByHandle"),
+    ("KERNEL32.DLL", "GetFileInformationByHandleEx"),
     ("KERNEL32.DLL", "MultiByteToWideChar"),
     ("KERNEL32.DLL", "WideCharToMultiByte"),
     ("KERNEL32.DLL", "GetACP"),
@@ -122,6 +129,7 @@ pub const SUPPORTED_APIS: &[(&str, &str)] = &[
     ("KERNEL32.DLL", "InitializeSListHead"),
     ("BCRYPTPRIMITIVES.DLL", "ProcessPrng"),
     ("NTDLL.DLL", "NtWriteFile"),
+    ("NTDLL.DLL", "NtReadFile"),
 ];
 
 /// Loadable-but-unimplemented APIs: the loader resolves them so real
@@ -134,7 +142,6 @@ pub const STUB_APIS: &[(&str, &str)] = &[
     ("API-MS-WIN-CORE-SYNCH-L1-2-0.DLL", "WakeByAddressSingle"),
     ("NTDLL.DLL", "NtCreateNamedPipeFile"),
     ("NTDLL.DLL", "NtOpenFile"),
-    ("NTDLL.DLL", "NtReadFile"),
     ("NTDLL.DLL", "RtlNtStatusToDosError"),
     ("USERENV.DLL", "GetUserProfileDirectoryW"),
     ("KERNEL32.DLL", "AddVectoredExceptionHandler"),
@@ -324,6 +331,7 @@ fn load_inner(data: &[u8], strict: bool) -> Result<PeImage, String> {
         vsize: u32,
         foff: u32,
         fsize: u32,
+        chars: u32,
     }
     let mut secs: Vec<Sec> = Vec::new();
     for i in 0..num_sections {
@@ -335,11 +343,13 @@ fn load_inner(data: &[u8], strict: bool) -> Result<PeImage, String> {
         let vaddr = u32le(data, o + 12)?;
         let fsize = u32le(data, o + 16)?;
         let foff = u32le(data, o + 20)?;
+        let chars = u32le(data, o + 36)?;
         secs.push(Sec {
             vaddr,
             vsize,
             foff,
             fsize,
+            chars,
         });
         sections.push((vaddr, vsize.max(fsize), foff, fsize, 0));
     }
@@ -449,6 +459,17 @@ fn load_inner(data: &[u8], strict: bool) -> Result<PeImage, String> {
 
     let iat_slots = imports.iter().map(|i| i.iat_rva).collect();
 
+    // Executable-but-not-writable section ranges (absolute VAs) for W^X
+    // enforcement (RWX sections stay writable, like real Windows).
+    let code_ranges: Vec<(u64, u64)> = secs
+        .iter()
+        .filter(|s| s.chars & 0x20000000 != 0 && s.chars & 0x80000000 == 0)
+        .map(|s| {
+            let start = image_base + s.vaddr as u64;
+            (start, start + s.vsize.max(s.fsize) as u64)
+        })
+        .collect();
+
     // TLS directory (optional): RVAs into the loaded image.
     let tls = if tls_rva != 0 {
         if tls_size < 40 {
@@ -519,5 +540,6 @@ fn load_inner(data: &[u8], strict: bool) -> Result<PeImage, String> {
         unsupported,
         tls,
         iat_slots,
+        code_ranges,
     })
 }
