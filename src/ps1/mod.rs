@@ -366,8 +366,29 @@ impl<'a> Interpreter<'a> {
     /// operators fail clearly.
     fn eval_cond(&mut self, cond: &str) -> Result<bool, String> {
         let toks = tokenize(cond)?;
+        self.eval_cond_tokens(&toks)
+    }
+
+    /// Condition over tokens: `-or` splits first (lowest precedence),
+    /// then `-and` (short-circuiting, like PowerShell); the remainder is
+    /// a membership test, a 3-token comparison, `-not`, or a single
+    /// value — with whole `(...)` groups evaluated as conditions when
+    /// comparison-shaped, as code otherwise.
+    fn eval_cond_tokens(&mut self, toks: &[Token]) -> Result<bool, String> {
         if toks.is_empty() {
             return Err("empty condition".to_string());
+        }
+        if let Some(i) = find_logic_op(toks, "-or") {
+            if self.eval_cond_tokens(&toks[..i])? {
+                return Ok(true);
+            }
+            return self.eval_cond_tokens(&toks[i + 1..]);
+        }
+        if let Some(i) = find_logic_op(toks, "-and") {
+            if !self.eval_cond_tokens(&toks[..i])? {
+                return Ok(false);
+            }
+            return self.eval_cond_tokens(&toks[i + 1..]);
         }
         if toks.len() == 1 {
             let t = toks[0].text();
@@ -377,8 +398,19 @@ impl<'a> Interpreter<'a> {
             if t.eq_ignore_ascii_case("$false") {
                 return Ok(false);
             }
-            // Parenthesized groups need the expression evaluator (later).
+            // Whole `(...)` group: comparison-shaped inners evaluate as
+            // conditions (`($a -ne $b)`), anything else runs as code with
+            // output tested for truthiness (`(Test-Path $p)`).
             if t.trim_start().starts_with('(') {
+                if let Ok((inner, rest)) = take_wrapped(t.trim_start(), '(', ')') {
+                    if rest.trim().is_empty() {
+                        if is_condition_shape(&inner)? {
+                            return self.eval_cond(&inner);
+                        }
+                        let v = self.expand_token(&toks[0])?;
+                        return Ok(is_truthy(&v));
+                    }
+                }
                 return Err("parenthesized conditions are not supported".to_string());
             }
             // Single value: expand it (method calls like
@@ -413,12 +445,19 @@ impl<'a> Interpreter<'a> {
             if match_operands.is_some_and(|(a, b)| idx == a || idx == b) {
                 continue;
             }
+            // Whole `(...)` groups (with any `.Member`/`[i]` tail) expand
+            // through the subexpression evaluator below.
+            if t.trim_start().starts_with('(')
+                && take_wrapped(t.trim_start(), '(', ')').is_ok()
+            {
+                continue;
+            }
             if t.contains(['.', '(', ')', '{', '}', '[', ']', '@']) {
                 return Err(format!("not supported in conditions: {t}"));
             }
         }
         let mut args = Vec::with_capacity(toks.len());
-        for tok in &toks {
+        for tok in toks {
             args.push(self.expand_token(tok)?);
         }
         if args[0].eq_ignore_ascii_case("-not") {
@@ -516,6 +555,27 @@ impl<'a> Interpreter<'a> {
         let segments = split_pipeline(stmt)?;
         if segments.len() == 1 {
             return self.exec_statement(stmt, None);
+        }
+        // `$v = A | B | ...`: the assignment captures the whole
+        // pipeline's result (not just `A`'s output).
+        if let Some((name, op, rhs)) = split_assign_rhs(&segments[0]) {
+            if rhs.is_empty() {
+                return Err("missing value in assignment".to_string());
+            }
+            let pipeline = format!("{rhs} | {}", segments[1..].join(" | "));
+            let mut buf = Vec::new();
+            let flow = {
+                let mut sub = self.sub(&mut buf);
+                sub.run_pipeline(&pipeline)
+            };
+            match flow? {
+                Flow::Next => {}
+                f => return Ok(f),
+            }
+            let text = String::from_utf8_lossy(&buf);
+            let lines: Vec<String> = text.lines().map(str::to_string).collect();
+            self.store_assign(&name, op, lines_value(lines))?;
+            return Ok(Flow::Next);
         }
         let mut input: Option<String> = None;
         for (i, seg) in segments.iter().enumerate() {
@@ -641,6 +701,23 @@ impl<'a> Interpreter<'a> {
             self.emit(&v);
             return Ok(Flow::Next);
         }
+        // `X -join S` expression statement (`$installed -join ', '`,
+        // what `$()` captures): join and emit. Only for value-shaped
+        // heads so builtin calls keep their argument handling.
+        if toks.len() == 3
+            && !toks[0].verbatim()
+            && !toks[1].verbatim()
+            && toks[1].text().eq_ignore_ascii_case("-join")
+            && toks[0].text().starts_with(['$', '(', '@'])
+        {
+            let head = toks[0].text().to_lowercase();
+            let is_callable = is_builtin_command(&head) || self.funcs.contains_key(&head);
+            if !is_callable {
+                let joined = self.eval_join(&toks)?;
+                self.emit(&joined);
+                return Ok(Flow::Next);
+            }
+        }
         // Expand variables per token; single-quoted spans stay verbatim.
         let mut args = Vec::with_capacity(toks.len());
         for tok in &toks {
@@ -697,7 +774,9 @@ impl<'a> Interpreter<'a> {
             "copy-item" | "copy" | "cp" | "ci" => self.cmd_copy_item(rest),
             "move-item" | "move" | "mv" | "mi" => self.cmd_move_item(rest),
             "test-path" => self.cmd_test_path(rest),
-            "join-path" => self.cmd_join_path(rest),
+            "join-path" => self.cmd_join_path(rest),            "invoke-webrequest" | "iwr" | "wget" => self.cmd_invoke_webrequest(rest),
+            "expand-archive" => self.cmd_expand_archive(rest),
+            "get-filehash" => self.cmd_get_filehash(rest),
             "write-host" | "write-output" | "echo" => {
                 let (_, positional) = parse_params(rest, &[])?;
                 self.emit(&positional.join(" "));
@@ -914,12 +993,19 @@ impl<'a> Interpreter<'a> {
     /// scalars; `+=` follows PowerShell add semantics. Only plain names
     /// are storable; `$env:`/`$HOME`/`$null` targets fail clearly.
     fn cmd_assign(&mut self, name: String, op: AssignOp, vals: Vec<Token>) -> Result<Flow, String> {
-        let key = check_assign_target(&name)?;
         let (v, flow) = self.eval_value(&vals)?;
         match flow {
             Flow::Next => {}
             f => return Ok(f),
         }
+        self.store_assign(&name, op, v)?;
+        Ok(Flow::Next)
+    }
+
+    /// Store an assignment value (`$name` target; `+=` appends with the
+    /// same merge rules as variable append).
+    fn store_assign(&mut self, name: &str, op: AssignOp, v: Value) -> Result<(), String> {
+        let key = check_assign_target(name)?;
         match op {
             AssignOp::Set => {
                 self.vars.insert(key, v);
@@ -937,7 +1023,7 @@ impl<'a> Interpreter<'a> {
                 self.vars.insert(key, merged);
             }
         }
-        Ok(Flow::Next)
+        Ok(())
     }
 
     /// Evaluate assignment value tokens: `@(...)` array, `@{}` empty map,
@@ -959,6 +1045,23 @@ impl<'a> Interpreter<'a> {
         }
         if nospace.starts_with("@{") {
             return Err("hashtable literals with entries are not supported".to_string());
+        }
+        // `a | b` in value position (`$line = Get-Content $f | Where ...
+        // | Select -First 1`): run the whole pipeline as a statement,
+        // capturing the last stage's output lines.
+        if split_pipeline(&joined)?.len() > 1 {
+            let mut buf = Vec::new();
+            let flow = {
+                let mut sub = self.sub(&mut buf);
+                sub.run_pipeline(&joined)
+            };
+            match flow? {
+                Flow::Next => {}
+                f => return Ok((Value::Str(String::new()), f)),
+            }
+            let text = String::from_utf8_lossy(&buf);
+            let lines: Vec<String> = text.lines().map(str::to_string).collect();
+            return Ok((lines_value(lines), Flow::Next));
         }
         // `$t = Command [$args...]`: defined function or builtin, run
         // capturing output (0 lines → `""`, 1 → string, N → array).
@@ -985,6 +1088,16 @@ impl<'a> Interpreter<'a> {
                 return Ok((lines_value(lines), Flow::Next));
             }
             if is_builtin_command(&fname) {
+                // Get-FileHash in value position yields its object form
+                // (`@{Algorithm, Hash, Path}`) so `.Hash` member access works.
+                if fname == "get-filehash" {
+                    let mut argvals = Vec::with_capacity(vals.len().saturating_sub(1));
+                    for tok in vals.iter().skip(1) {
+                        argvals.push(self.expand_token(tok)?);
+                    }
+                    let v = self.get_filehash_value(&argvals)?;
+                    return Ok((v, Flow::Next));
+                }
                 let mut argvals = Vec::with_capacity(vals.len().saturating_sub(1));
                 for tok in vals.iter().skip(1) {
                     argvals.push(self.expand_token(tok)?);
@@ -1003,27 +1116,38 @@ impl<'a> Interpreter<'a> {
                 return Ok((lines_value(lines), Flow::Next));
             }
         }
-        // `(...)` value (single token or spanning tokens): evaluate
-        // capturing output into lines.
+        // `A + B` string concatenation (after callable heads so e.g.
+        // `Join-Path a + b` keeps builtin argument handling).
+        if vals.len() == 3 && !vals[1].verbatim() && vals[1].text() == "+" {
+            let v = self.eval_plus(vals)?;
+            return Ok((v, Flow::Next));
+        }
+        // `(...)` value (single token or spanning tokens): bare parens
+        // evaluate capturing output into lines; a `.Member` / `.Method()`
+        // / `[index]` tail resolves against the inner value instead
+        // (`(Get-FileHash $f).Hash`, `(($l -split '\s+')[0]).ToLower()`).
         {
             let t = joined.trim_start();
             if t.starts_with('(') {
                 if let Ok((inner, rest)) = take_wrapped(t, '(', ')') {
                     if rest.trim().is_empty() {
-                        let mut buf = Vec::new();
-                        let flow = {
-                            let mut sub = self.sub(&mut buf);
-                            sub.run_code(&inner)
-                        };
-                        match flow? {
+                        // Value-shaped inners (`-split`, bare
+                        // `Get-FileHash`, nested parens) evaluate directly;
+                        // anything else runs as code with output captured.
+                        let (v, flow) = self.eval_paren_inner(&inner)?;
+                        match flow {
                             Flow::Next => {}
                             f => return Ok((Value::Str(String::new()), f)),
                         }
-                        let text = String::from_utf8_lossy(&buf);
-                        let lines: Vec<String> =
-                            text.lines().map(str::to_string).collect();
-                        return Ok((lines_value(lines), Flow::Next));
+                        return Ok((v, Flow::Next));
                     }
+                    let (v, flow) = self.eval_paren_inner(&inner)?;
+                    match flow {
+                        Flow::Next => {}
+                        f => return Ok((Value::Str(String::new()), f)),
+                    }
+                    let v = self.apply_member_rest(v, rest.trim())?;
+                    return Ok((v, Flow::Next));
                 }
             }
         }
@@ -1362,8 +1486,29 @@ impl<'a> Interpreter<'a> {
 
     /// Expand one token: `$name` / `${name}` / `$(...)` in expandable spans,
     /// single-quoted spans verbatim. Member access (`$bin.exe`) expands the
-    /// variable part only.
+    /// variable part only. A whole-token `(...)` group evaluates as a
+    /// subexpression (`Copy-Item (Join-Path $a $b) ...`); partial or
+    /// mid-token parens stay literal.
     fn expand_token(&mut self, tok: &Token) -> Result<String, String> {
+        {
+            let text = tok.text();
+            let t = text.trim();
+            if t.starts_with('(') {
+                if let Ok((inner, rest)) = take_wrapped(t, '(', ')') {
+                    if !inner.trim().is_empty() {
+                        let (mut v, flow) = self.eval_paren_inner(&inner)?;
+                        match flow {
+                            Flow::Next => {}
+                            _ => return Err("loop control cannot appear here".to_string()),
+                        }
+                        if !rest.trim().is_empty() {
+                            v = self.apply_member_rest(v, rest.trim())?;
+                        }
+                        return Ok(value_string(&v));
+                    }
+                }
+            }
+        }
         let cs = &tok.chars;
         let mut out = String::new();
         let mut i = 0;
@@ -1433,16 +1578,7 @@ impl<'a> Interpreter<'a> {
                     }
                     let tail: String = cs[j..].iter().map(|(c, _)| *c).collect();
                     let (inner, rest2) = take_wrapped(&tail, '(', ')')?;
-                    let mut argvals = Vec::new();
-                    if !inner.trim().is_empty() {
-                        for a in split_top_commas(&inner) {
-                            let atoks = tokenize(a.trim())?;
-                            if atoks.len() != 1 {
-                                return Err("method arguments must be single values".to_string());
-                            }
-                            argvals.push(self.expand_token(&atoks[0])?);
-                        }
-                    }
+                    let argvals = self.expand_arg_list(&inner)?;
                     let mv = self.eval_method(recv, method, &argvals)?;
                     // Optional `[index]` chain on the method result.
                     let mut k = cs.len() - rest2.chars().count();
@@ -1616,13 +1752,39 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// Comma-separated single-value method arguments, expanded.
+    fn expand_arg_list(&mut self, inner: &str) -> Result<Vec<String>, String> {
+        let mut argvals = Vec::new();
+        if !inner.trim().is_empty() {
+            for a in split_top_commas(inner) {
+                let atoks = tokenize(a.trim())?;
+                if atoks.len() != 1 {
+                    return Err("method arguments must be single values".to_string());
+                }
+                argvals.push(self.expand_token(&atoks[0])?);
+            }
+        }
+        Ok(argvals)
+    }
+
     /// `$recv.Method(args)`: `ContainsKey` on maps; case/trim/replace/
     /// split/starts/ends/contains on strings. Anything else fails clearly.
     /// Booleans render PowerShell-capitalized (`True`/`False`).
-    fn eval_method(&self, recv: &str, method: &str, args: &[String]) -> Result<Value, String> {        let receiver = match self.vars.get(&recv.to_lowercase()) {
+    fn eval_method(&self, recv: &str, method: &str, args: &[String]) -> Result<Value, String> {
+        let receiver = match self.vars.get(&recv.to_lowercase()) {
             Some(v) => v.clone(),
             None => return Err("cannot call method on null".to_string()),
         };
+        self.eval_method_value(receiver, method, args)
+    }
+
+    /// Method call on an already-resolved value (member chains on
+    /// parenthesized expressions share this with `$var.Method()`).
+    fn eval_method_value(        &self,
+        receiver: Value,
+        method: &str,
+        args: &[String],
+    ) -> Result<Value, String> {
         let m = method.to_lowercase();
         match receiver {
             Value::Map(map) => {
@@ -2072,6 +2234,293 @@ impl<'a> Interpreter<'a> {
         self.emit(&out);
         Ok(())
     }
+
+    /// Ensure a directory chain exists (mkdir -p equivalent).
+    fn ensure_dir(&mut self, path: &str) -> Result<(), String> {
+        let mut chain = Vec::new();
+        let mut p = path.to_string();
+        loop {
+            if p.is_empty() || self.fs.exists(&p) {
+                break;
+            }
+            chain.push(p.clone());
+            match parent_of(&p) {
+                Some(par) if par != p => p = par,
+                _ => break,
+            }
+        }
+        for dir in chain.iter().rev() {
+            self.fs.mkdir(dir).map_err(|e| format!("mkdir {dir}: {e}"))?;
+        }
+        Ok(())
+    }
+
+    fn cmd_invoke_webrequest(&mut self, args: &[String]) -> Result<(), String> {
+        let (named, pos) = parse_params(args, &["uri", "outfile"])?;
+        let url = named
+            .get("uri")
+            .cloned()
+            .or_else(|| pos.first().cloned())
+            .ok_or_else(|| "usage: Invoke-WebRequest -Uri <url> -OutFile <path>".to_string())?;
+        let dest = named
+            .get("outfile")
+            .cloned()
+            .or_else(|| pos.get(1).cloned())
+            .ok_or_else(|| "usage: Invoke-WebRequest -Uri <url> -OutFile <path>".to_string())?;
+        let bytes = crate::install::fetch_url(&url, 300)
+            .map_err(|e| format!("Invoke-WebRequest: {e}"))?;
+        if let Some(parent) = parent_of(&dest) {
+            if !parent.is_empty() && !self.fs.exists(&parent) {
+                self.ensure_dir(&parent)?;
+            }
+        }
+        self.fs
+            .write_file(&dest, bytes)
+            .map_err(|e| format!("Invoke-WebRequest: {e}"))?;
+        Ok(())
+    }
+
+    fn cmd_expand_archive(&mut self, args: &[String]) -> Result<(), String> {
+        let (named, pos) = parse_params(args, &["path", "destinationpath", "force"])?;
+        let zip_path = named
+            .get("path")
+            .cloned()
+            .or_else(|| pos.first().cloned())
+            .ok_or_else(|| "usage: Expand-Archive -Path <zip> -DestinationPath <dir>".to_string())?;
+        let dest = named
+            .get("destinationpath")
+            .cloned()
+            .or_else(|| pos.get(1).cloned())
+            .ok_or_else(|| "usage: Expand-Archive -Path <zip> -DestinationPath <dir>".to_string())?;
+        let blob = self
+            .fs
+            .read_file(&zip_path)
+            .map_err(|e| format!("Expand-Archive: {e}"))?;
+        let entries = crate::install::zip_entries(&blob)
+            .map_err(|e| format!("Expand-Archive: {e}"))?;
+        self.ensure_dir(&dest)?;
+        for entry in entries {
+            let target = format!("{}\\{}", dest.trim_end_matches('\\'), entry.name.replace('/', "\\"));
+            if entry.is_dir {
+                self.ensure_dir(&target)?;
+                continue;
+            }
+            if let Some(parent) = parent_of(&target) {
+                if !parent.is_empty() && !self.fs.exists(&parent) {
+                    self.ensure_dir(&parent)?;
+                }
+            }
+            let data = crate::install::extract_bytes(&blob, &entry)
+                .map_err(|e| format!("Expand-Archive: {e}"))?;
+            self.fs
+                .write_file(&target, data)
+                .map_err(|e| format!("Expand-Archive: {e}"))?;
+        }
+        Ok(())
+    }
+
+    fn cmd_get_filehash(&mut self, args: &[String]) -> Result<(), String> {
+        let (named, pos) = parse_params(args, &["path", "algorithm"])?;
+        let path = named
+            .get("path")
+            .cloned()
+            .or_else(|| pos.first().cloned())
+            .ok_or_else(|| "usage: Get-FileHash <path> [-Algorithm SHA256]".to_string())?;
+        let algo = named
+            .get("algorithm")
+            .cloned()
+            .or_else(|| pos.get(1).cloned())
+            .unwrap_or_else(|| "SHA256".to_string());
+        if !algo.eq_ignore_ascii_case("sha256") {
+            return Err("only SHA256 is supported".to_string());
+        }
+        let bytes = self
+            .fs
+            .read_file(&path)
+            .map_err(|e| format!("Get-FileHash: {e}"))?;
+        let hex = crate::install::sha256_hex(&bytes).to_uppercase();
+        self.emit(&hex);
+        Ok(())
+    }
+
+    /// Value form of Get-FileHash for member chains:
+    /// `{Algorithm, Hash, Path}` (hash uppercase, like .NET).
+    fn filehash_value(&self, path: &str) -> Result<Value, String> {        let bytes = self
+            .fs
+            .read_file(path)
+            .map_err(|e| format!("Get-FileHash: {e}"))?;
+        let mut map = HashMap::new();
+        map.insert(
+            "algorithm".to_string(),
+            Value::Str("SHA256".to_string()),
+        );
+        map.insert(
+            "hash".to_string(),
+            Value::Str(crate::install::sha256_hex(&bytes).to_uppercase()),
+        );
+        map.insert("path".to_string(), Value::Str(path.to_string()));
+        Ok(Value::Map(map))
+    }
+
+    /// `Get-FileHash` from already-expanded argument values (shared by
+    /// value position and parenthesized member chains).
+    fn get_filehash_value(&self, argvals: &[String]) -> Result<Value, String> {
+        let (named, pos) = parse_params(argvals, &["path", "algorithm"])?;
+        let path = named
+            .get("path")
+            .cloned()
+            .or_else(|| pos.first().cloned())
+            .ok_or_else(|| "usage: Get-FileHash <path> [-Algorithm SHA256]".to_string())?;
+        let algo = named
+            .get("algorithm")
+            .cloned()
+            .or_else(|| pos.get(1).cloned())
+            .unwrap_or_else(|| "SHA256".to_string());
+        if !algo.eq_ignore_ascii_case("sha256") {
+            return Err("only SHA256 is supported".to_string());
+        }
+        self.filehash_value(&path)
+    }
+
+    /// `A + B` string concatenation (the only `+` value form for now;
+    /// PowerShell adds numbers but this interpreter has no arithmetic yet).
+    fn eval_plus(&mut self, toks: &[Token]) -> Result<Value, String> {
+        let lhs = self.expand_token(&toks[0])?;
+        let rhs = self.expand_token(&toks[2])?;
+        Ok(Value::Str(format!("{lhs}{rhs}")))
+    }
+
+    /// `A -join S`: array variable elements (or the expanded scalar)
+    /// joined with the separator.
+    fn eval_join(&mut self, toks: &[Token]) -> Result<String, String> {
+        let sep = self.expand_token(&toks[2])?;
+        let head = toks[0].text();
+        let elems: Vec<String> = if !toks[0].verbatim() {
+            if let Some(v) = self.var_value(&head).cloned() {
+                match v {
+                    Value::Arr(a) => a.iter().map(value_string).collect(),
+                    other => vec![value_string(&other)],
+                }
+            } else {
+                vec![self.expand_token(&toks[0])?]
+            }
+        } else {
+            vec![self.expand_token(&toks[0])?]
+        };
+        Ok(elems.join(&sep))
+    }
+
+    /// `(...)` inner to a value: nested parens recurse, `X -split Y`
+    /// splits to an array, bare `Get-FileHash` yields its object form,
+    /// anything else runs as code with output captured to lines.
+    fn eval_paren_inner(&mut self, inner: &str) -> Result<(Value, Flow), String> {
+        let t = inner.trim();
+        if t.starts_with('(') {
+            if let Ok((inner2, rest2)) = take_wrapped(t, '(', ')') {
+                let (v, flow) = self.eval_paren_inner(&inner2)?;
+                match flow {
+                    Flow::Next => {}
+                    f => return Ok((Value::Str(String::new()), f)),
+                }
+                if rest2.trim().is_empty() {
+                    return Ok((v, Flow::Next));
+                }
+                let v = self.apply_member_rest(v, rest2.trim())?;
+                return Ok((v, Flow::Next));
+            }
+        }
+        let toks = tokenize(t)?;
+        if toks.len() == 3
+            && !toks[1].verbatim()
+            && toks[1].text() == "+"
+        {
+            let v = self.eval_plus(&toks)?;
+            return Ok((v, Flow::Next));
+        }
+        if toks.len() == 3
+            && !toks[1].verbatim()
+            && toks[1].text().eq_ignore_ascii_case("-split")
+        {
+            let lhs = self.expand_token(&toks[0])?;
+            let pat = self.expand_token(&toks[2])?;
+            let parts = regex_split(&pat, &lhs)?;
+            return Ok((
+                Value::Arr(parts.into_iter().map(Value::Str).collect()),
+                Flow::Next,
+            ));
+        }
+        if !toks.is_empty()
+            && !toks[0].verbatim()
+            && toks[0].text().eq_ignore_ascii_case("get-filehash")
+        {
+            let mut argvals = Vec::with_capacity(toks.len().saturating_sub(1));
+            for tok in toks.iter().skip(1) {
+                argvals.push(self.expand_token(tok)?);
+            }
+            let v = self.get_filehash_value(&argvals)?;
+            return Ok((v, Flow::Next));
+        }
+        let mut buf = Vec::new();
+        let flow = {
+            let mut sub = self.sub(&mut buf);
+            sub.run_code(inner)
+        };
+        match flow? {
+            Flow::Next => {}
+            f => return Ok((Value::Str(String::new()), f)),
+        }
+        let text = String::from_utf8_lossy(&buf);
+        let lines: Vec<String> = text.lines().map(str::to_string).collect();
+        Ok((lines_value(lines), Flow::Next))
+    }
+
+    /// Apply a `.Member` / `.Method(args)` / `[index]` chain to a value
+    /// (parenthesized-expression tails). Each step resolves against the
+    /// current value; misses fail loudly.
+    fn apply_member_rest(&mut self, mut cur: Value, rest: &str) -> Result<Value, String> {
+        let mut r = rest.trim().to_string();
+        while !r.is_empty() {
+            if let Some(after) = r.strip_prefix('.') {
+                let mut len = 0usize;
+                for c in after.chars() {
+                    if c == '.' || c == '(' || c == '[' {
+                        break;
+                    }
+                    len += c.len_utf8();
+                }
+                let name = &after[..len];
+                if name.is_empty() {
+                    return Err(format!("bad member access: {rest}"));
+                }
+                let tail = &after[len..];
+                if let Some(args_src) = tail.strip_prefix('(') {
+                    let src = format!("({args_src}");
+                    let (inner, rest2) = take_wrapped(&src, '(', ')')?;
+                    let argvals = self.expand_arg_list(&inner)?;
+                    cur = self.eval_method_value(cur, name, &argvals)?;
+                    r = rest2.trim().to_string();
+                } else {
+                    let s = Self::navigate_value(cur, name)
+                        .ok_or_else(|| format!("member {name} not found"))?;
+                    cur = Value::Str(s);
+                    r = tail.trim().to_string();
+                }
+            } else if r.starts_with('[') {
+                let (inner, rest2) = take_wrapped(r.as_str(), '[', ']')?;
+                let itoks = tokenize(inner.trim())?;
+                if itoks.len() != 1 {
+                    return Err("index must be a single value".to_string());
+                }
+                let key = self.expand_token(&itoks[0])?;
+                let s = self.eval_index(Some(&cur), &key)?;
+                cur = Value::Str(s);
+                r = rest2.trim().to_string();
+            } else {
+                return Err(format!("cannot evaluate expression tail: {rest}"));
+            }
+        }
+        Ok(cur)
+    }
 }
 
 /// Strip `#` comments (outside quotes).
@@ -2369,19 +2818,10 @@ fn bool_string(b: bool) -> String {
 /// flags except `(?i:...)`) fails loudly instead of mis-matching.
 /// No captures (`$Matches` comes later).
 fn regex_match(pattern: &str, text: &str) -> Result<bool, String> {
-    let p: Vec<char> = pattern.to_lowercase().chars().collect();
+    let (nodes, root) = parse_regex(pattern)?;
     let t: Vec<char> = text.to_lowercase().chars().collect();
-    let mut rx = RxParser {
-        p,
-        pos: 0,
-        nodes: Vec::new(),
-    };
-    let root = rx.parse_alt()?;
-    if rx.pos != rx.p.len() {
-        return Err("trailing characters in pattern".to_string());
-    }
     let mut m = RxMatcher {
-        nodes: rx.nodes,
+        nodes,
         t,
         fuel: 1_000_000,
     };
@@ -2397,6 +2837,55 @@ fn regex_match(pattern: &str, text: &str) -> Result<bool, String> {
         }
     }
     Ok(false)
+}
+
+/// Parse a pattern once (shared by match and split). Matching is
+/// case-insensitive (pattern lowercased here; callers lowercase text).
+fn parse_regex(pattern: &str) -> Result<(Vec<RxNode>, usize), String> {
+    let p: Vec<char> = pattern.to_lowercase().chars().collect();
+    let mut rx = RxParser {
+        p,
+        pos: 0,
+        nodes: Vec::new(),
+    };
+    let root = rx.parse_alt()?;
+    if rx.pos != rx.p.len() {
+        return Err("trailing characters in pattern".to_string());
+    }
+    Ok((rx.nodes, root))
+}
+
+/// Split text on a regex separator (`-split` operator). Leftmost match
+/// wins, greedy (longest) end; zero-width matches never delimit (the
+/// scan advances past them). Spans are found case-insensitively but
+/// sliced from the original text, preserving case.
+fn regex_split(pattern: &str, text: &str) -> Result<Vec<String>, String> {
+    let (nodes, root) = parse_regex(pattern)?;
+    let lower: Vec<char> = text.to_lowercase().chars().collect();
+    let orig: Vec<char> = text.chars().collect();
+    let mut m = RxMatcher {
+        nodes,
+        t: lower,
+        fuel: 1_000_000,
+    };
+    let mut pieces = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i <= orig.len() {
+        let best = m.seq_from(root, i)?.into_iter().filter(|&e| e > i).max();
+        match best {
+            Some(end) => {
+                pieces.push(orig[start..i].iter().collect());
+                start = end;
+                i = end;
+            }
+            None => {
+                i += 1;
+            }
+        }
+    }
+    pieces.push(orig[start..].iter().collect());
+    Ok(pieces)
 }
 
 /// AST node for the `-match` subset (indices into [`RxParser::nodes`]).
@@ -3317,8 +3806,53 @@ fn split_top_commas(s: &str) -> Vec<String> {
 
 /// Detect `$name = if ...` / `$name += if ...` on raw chunk text.
 /// Returns (name, op, text starting at `if`).
-fn split_assign_if_head(chunk: &str) -> Option<(String, AssignOp, String)> {
-    let t = chunk.trim_start();
+/// First unquoted `op` token (`-and` / `-or`); whole `(...)` groups
+/// are single tokens so anything inside them never matches.
+fn find_logic_op(toks: &[Token], op: &str) -> Option<usize> {
+    toks.iter().position(|t| !t.verbatim() && t.text().eq_ignore_ascii_case(op))
+}
+
+/// Does a parenthesized inner read as a condition (comparison / logic /
+/// `-not` / single value) rather than a command to run?
+fn is_condition_shape(inner: &str) -> Result<bool, String> {
+    let toks = tokenize(inner)?;
+    if toks.len() == 1 {
+        return Ok(true);
+    }
+    if toks.len() == 2
+        && !toks[0].verbatim()
+        && toks[0].text().eq_ignore_ascii_case("-not")
+    {
+        return Ok(true);
+    }
+    if toks.len() == 3
+        && !toks[1].verbatim()
+        && [
+            "-eq",
+            "-ne",
+            "-match",
+            "-notmatch",
+            "-in",
+            "-notin",
+            "-contains",
+            "-notcontains",
+        ]
+        .contains(&toks[1].text().to_lowercase().as_str())
+    {
+        return Ok(true);
+    }
+    if toks
+        .iter()
+        .any(|t| !t.verbatim() && (t.text().eq_ignore_ascii_case("-and") || t.text().eq_ignore_ascii_case("-or")))
+    {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// `$name = rhs` / `$name += rhs` head split (any rhs; `==` excluded).
+fn split_assign_rhs(text: &str) -> Option<(String, AssignOp, String)> {
+    let t = text.trim_start();
     if !t.starts_with('$') {
         return None;
     }
@@ -3335,17 +3869,21 @@ fn split_assign_if_head(chunk: &str) -> Option<(String, AssignOp, String)> {
     }
     let name = t[..name_end].to_string();
     let rest = t[name_end..].trim_start();
-    let (op, after) = if rest.starts_with("+=") {
-        (AssignOp::Append, rest[2..].trim_start())
+    if let Some(after) = rest.strip_prefix("+=") {
+        Some((name, AssignOp::Append, after.trim_start().to_string()))
     } else if rest.starts_with('=') && !rest[1..].starts_with('=') {
-        (AssignOp::Set, rest[1..].trim_start())
+        Some((name, AssignOp::Set, rest[1..].trim_start().to_string()))
     } else {
-        return None;
-    };
-    if !starts_kw(after, "if") {
+        None
+    }
+}
+
+fn split_assign_if_head(chunk: &str) -> Option<(String, AssignOp, String)> {
+    let (name, op, after) = split_assign_rhs(chunk)?;
+    if !starts_kw(&after, "if") {
         return None;
     }
-    Some((name, op, after.to_string()))
+    Some((name, op, after))
 }
 
 /// Validate an assignment target (`$name`), returning the key.
@@ -3524,6 +4062,11 @@ fn is_builtin_command(cmd: &str) -> bool {
             | "throw"
             | "irm"
             | "invoke-restmethod"
+            | "invoke-webrequest"
+            | "iwr"
+            | "wget"
+            | "expand-archive"
+            | "get-filehash"
             | "iex"
             | "invoke-expression"
             | "break"
@@ -3807,8 +4350,8 @@ fn parse_params(
                 continue;
             }
             if known_set.contains(&key) || known.is_empty() {
-                // value-taking unless boolean flag (force/recurse)
-                if key == "force" || key == "recurse" {
+                // value-taking unless boolean flag (force/recurse/usebasicparsing)
+                if key == "force" || key == "recurse" || key == "usebasicparsing" {
                     named.insert(key, "true".to_string());
                     i += 1;
                 } else if i + 1 < args.len() {
@@ -3924,6 +4467,168 @@ mod tests {
         // Discard port on loopback: refused fast, no DNS, no network.
         let (_, _, r) = run("irm http://127.0.0.1:9/nope");
         assert!(r.is_err());
+    }
+
+    /// Pre-seeded WinFS run (script's `C:\...` files must already exist).
+    fn run_seed(seed: &[(&str, &[u8])], script: &str) -> (i32, Vec<u8>, Result<i32, String>, WinFs) {
+        let mut fs = WinFs::new();
+        for (path, data) in seed {
+            fs.write_file(path, data.to_vec()).unwrap();
+        }
+        let mut out = Vec::new();
+        let r = run_ps1(&mut fs, script, &mut out);
+        let code = match &r {
+            Ok(c) => *c,
+            Err(_) => -1,
+        };
+        (code, out, r, fs)
+    }
+
+    /// Minimal stored-method zip (local headers only; no central dir).
+    fn zip_stored(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (name, data) in files {
+            out.extend_from_slice(b"PK\x03\x04");
+            out.extend_from_slice(&20u16.to_le_bytes()); // version
+            out.extend_from_slice(&0u16.to_le_bytes()); // flags
+            out.extend_from_slice(&0u16.to_le_bytes()); // method: stored
+            out.extend_from_slice(&0u16.to_le_bytes()); // time
+            out.extend_from_slice(&0u16.to_le_bytes()); // date
+            out.extend_from_slice(&0u32.to_le_bytes()); // crc (unchecked)
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes()); // extra len
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(data);
+        }
+        out
+    }
+
+    #[test]
+    fn get_filehash_emits_uppercase_sha256() {
+        // SHA-256("abc") — FIPS 180-4 test vector.
+        let (_, out, r, _) = run_seed(
+            &[("C:\\data.txt", b"abc")],
+            "Get-FileHash C:\\data.txt",
+        );
+        assert!(r.is_ok());
+        assert_eq!(
+            out,
+            b"BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD\n"
+        );
+    }
+
+    #[test]
+    fn get_filehash_value_form_has_members() {
+        let (_, out, r, _) = run_seed(
+            &[("C:\\data.txt", b"abc")],
+            "$h = Get-FileHash C:\\data.txt\nWrite-Host $h.Hash\nWrite-Host $h.Algorithm",
+        );
+        assert!(r.is_ok());
+        assert_eq!(
+            out,
+            b"BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD\nSHA256\n"
+        );
+    }
+
+    #[test]
+    fn expand_archive_extracts_tree() {
+        let zip = zip_stored(&[
+            ("pkg/", b""),
+            ("pkg/a.txt", b"alpha"),
+            ("pkg/sub/b.txt", b"beta"),
+        ]);
+        let (code, out, r, fs) = run_seed(
+            &[("C:\\pkg.zip", &zip)],
+            "Expand-Archive C:\\pkg.zip C:\\out\nGet-Content C:\\out\\pkg\\a.txt\nGet-Content C:\\out\\pkg\\sub\\b.txt",
+        );
+        assert!(r.is_ok(), "code={code} out={}", String::from_utf8_lossy(&out));
+        assert_eq!(out, b"alpha\nbeta\n");
+        assert!(fs.test_path("C:\\out\\pkg\\a.txt"));
+    }
+
+    #[test]
+    fn invoke_webrequest_needs_outfile() {
+        // Usage error surfaces before any network fetch.
+        let (_, _, r) = run("Invoke-WebRequest https://example.com/x.zip");
+        assert!(r.unwrap_err().contains("usage"));
+    }
+
+    #[test]
+    fn split_operator_splits_to_array() {
+        let (_, out, r) = run("$p = ('a  b' -split '\\s+')\nWrite-Host $p.Count\nWrite-Host $p[1]");
+        assert!(r.is_ok());
+        assert_eq!(out, b"2\nb\n");
+    }
+
+    #[test]
+    fn split_first_index_and_method_chain() {
+        // The checksums.txt prober shape: first field, lowered.
+        let (_, out, r) = run(
+            "$line = 'B043CD80  esrun-windows-x86-64.zip'\n$expected = (($line -split '\\s+')[0]).ToLower()\nWrite-Host $expected",
+        );
+        assert!(r.is_ok());
+        assert_eq!(out, b"b043cd80\n");
+    }
+
+    #[test]
+    fn paren_filehash_member_method_chain() {
+        let (_, out, r, _) = run_seed(
+            &[("C:\\data.txt", b"abc")],
+            "$actual = (Get-FileHash C:\\data.txt -Algorithm SHA256).Hash.ToLower()\nWrite-Host $actual",
+        );
+        assert!(r.is_ok());
+        assert_eq!(
+            out,
+            b"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\n"
+        );
+    }
+
+    #[test]
+    fn paren_capture_index() {
+        let (_, out, r, _) = run_seed(
+            &[("C:\\f.txt", b"one\ntwo\n")],
+            "$first = (Get-Content C:\\f.txt)[0]\nWrite-Host $first",
+        );
+        assert!(r.is_ok());
+        assert_eq!(out, b"one\n");
+    }
+
+    #[test]
+    fn assignment_runs_full_pipeline() {        // `$line = Get-Content ... | Where ... | Select -First 1`
+        // (installer checksum prober): stages past the first must run.
+        let (_, out, r, _) = run_seed(
+            &[("C:\\s.txt", b"nope\nwant-me\n")],
+            "$hit = Get-Content C:\\s.txt | Where-Object { $_ -match 'want' } | Select-Object -First 1\nWrite-Host [$hit]",
+        );
+        assert!(r.is_ok());
+        assert_eq!(out, b"[want-me]\n");
+    }
+
+    #[test]
+    fn argument_paren_group_evaluates() {
+        // `Copy-Item (Join-Path $a $b) ...` shape: whole-token parens
+        // in argument position evaluate as a subexpression.
+        let (_, out, r) = run("Write-Host (Join-Path 'C:\\a' 'b')");
+        assert!(r.is_ok());
+        assert_eq!(out, b"C:\\a\\b\n");
+    }
+
+    #[test]
+    fn plus_concatenates_in_paren_and_bare() {
+        // `$tmp = Join-Path ... ("es-runtime-" + guid)` shape.
+        let (_, out, r) = run("$g = 'AB12'\nWrite-Host ('es-runtime-' + $g)\nWrite-Host ('x' + 'y')");
+        assert!(r.is_ok());
+        assert_eq!(out, b"es-runtime-AB12\nxy\n");
+    }
+
+    #[test]
+    fn join_expression_statement_and_capture() {
+        // `"Installed $($installed -join ', ') ..."` shape.
+        let (_, out, r) = run("$a = @('esrun', 'esdev')\nWrite-Host ($a -join ', ')\nWrite-Host \"X$($a -join ', ')Y\"");
+        assert!(r.is_ok());
+        assert_eq!(out, b"esrun, esdev\nXesrun, esdevY\n");
     }
 
     #[test]
@@ -4233,8 +4938,31 @@ mod tests {
     fn if_unsupported_conditions_fail_clearly() {
         assert!(run_session("if ('abc' -match 'a{2}') { echo bad }").1.unwrap_err().contains("counted"));
         assert!(run_session("if ($x.Split('y') -eq 'a') { echo bad }").1.unwrap_err().contains("not supported"));
-        assert!(run_session("if (($a -eq $b)) { echo bad }").1.is_err());
         assert!(run_session("if ($x) { echo bad } else ($y) { echo bad }").1.unwrap_err().contains("no condition"));
+    }
+
+    #[test]
+    fn if_paren_and_logic_conditions() {
+        // Doubled parens, `-and`/`-or`, and command-shaped groups.
+        let (out, r) = run_session("if (($a -eq $b)) { echo dbl }");
+        assert!(r.is_ok());
+        assert_eq!(out, b"dbl\n");
+        let (out, r) = run_session("$a = 1\n$b = 2\nif (($a -eq 1) -and ($b -eq 2)) { echo yes }");
+        assert!(r.is_ok());
+        assert_eq!(out, b"yes\n");
+        let (out, r) = run_session("$a = 1\nif (($a -eq 9) -or ($a -eq 1)) { echo or }");
+        assert!(r.is_ok());
+        assert_eq!(out, b"or\n");
+        let (out, r) = run_session("$a = 1\nif (($a -eq 9) -and ($a -eq 1)) { echo bad } else { echo good }");
+        assert!(r.is_ok());
+        assert_eq!(out, b"good\n");
+        // Command-shaped group: `(Test-Path $p)` runs and tests truthy.
+        let (out, r) = run_session("New-Item -Path C:\\t.txt -ItemType File | Out-Null\nif ((Test-Path C:\\t.txt) -and (Test-Path C:\\missing)) { echo bad } else { echo good }");
+        assert!(r.is_ok());
+        assert_eq!(out, b"good\n");
+        let (out, r) = run_session("New-Item -Path C:\\t.txt -ItemType File | Out-Null\nif ((Test-Path C:\\t.txt)) { echo yes }");
+        assert!(r.is_ok());
+        assert_eq!(out, b"yes\n");
     }
 
     #[test]

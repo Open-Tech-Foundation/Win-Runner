@@ -276,11 +276,20 @@ pub fn json_string(doc: &str, key: &str) -> Option<String> {
     }
 }
 
-/// Extract one entry from a ZIP archive (stored or deflated).
+/// One ZIP local-header entry (directories end in `/`).
+pub struct ZipEntry {
+    pub name: String,
+    pub is_dir: bool,
+    method: u16,
+    data_off: usize,
+    csize: usize,
+}
+
+/// List a ZIP archive's entries (stored or deflated).
 /// Scans local headers; central directory not required.
-pub fn extract_entry(zip: &[u8], want: &str) -> Result<Vec<u8>, String> {
+pub fn zip_entries(zip: &[u8]) -> Result<Vec<ZipEntry>, String> {
+    let mut out = Vec::new();
     let mut off = 0usize;
-    let mut names: Vec<String> = Vec::new();
     let u16le = |o: usize| u16::from_le_bytes([zip[o], zip[o + 1]]);
     let u32le = |o: usize| {
         u32::from_le_bytes([zip[o], zip[o + 1], zip[o + 2], zip[o + 3]])
@@ -309,20 +318,42 @@ pub fn extract_entry(zip: &[u8], want: &str) -> Result<Vec<u8>, String> {
         if data_off.checked_add(csize).map(|e| e > zip.len()).unwrap_or(true) {
             return Err(format!("truncated zip data (entry '{name}')"));
         }
-        names.push(name.to_string());
-        if name == want {
-            let raw = &zip[data_off..data_off + csize];
-            return match method {
-                0 => Ok(raw.to_vec()),
-                8 => crate::deflate::inflate(raw)
-                    .map_err(|e| format!("deflate failed for entry '{name}': {e}")),
-                _ => Err(format!(
-                    "unsupported zip method {method} for entry '{name}' (only stored/deflated)"
-                )),
-            };
-        }
+        out.push(ZipEntry {
+            name: name.to_string(),
+            is_dir: name.ends_with('/'),
+            method,
+            data_off,
+            csize,
+        });
         off = data_off + csize;
     }
+    Ok(out)
+}
+
+/// Extract one listed entry's bytes (stored or deflated).
+pub fn extract_bytes(zip: &[u8], entry: &ZipEntry) -> Result<Vec<u8>, String> {
+    let raw = &zip[entry.data_off..entry.data_off + entry.csize];
+    match entry.method {
+        0 => Ok(raw.to_vec()),
+        8 => crate::deflate::inflate(raw)
+            .map_err(|e| format!("deflate failed for entry '{}': {e}", entry.name)),
+        _ => Err(format!(
+            "unsupported zip method {} for entry '{}' (only stored/deflated)",
+            entry.method, entry.name
+        )),
+    }
+}
+
+/// Extract one entry from a ZIP archive (stored or deflated).
+/// Scans local headers; central directory not required.
+pub fn extract_entry(zip: &[u8], want: &str) -> Result<Vec<u8>, String> {
+    let entries = zip_entries(zip)?;
+    for entry in &entries {
+        if entry.name == want {
+            return extract_bytes(zip, entry);
+        }
+    }
+    let names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
     Err(format!(
         "entry '{want}' not in archive (has: {})",
         if names.is_empty() {

@@ -182,3 +182,22 @@ All notable changes to this project will be documented in this file.
   classes, anchors, alternation, groups, `*`/`+`/`?`, case-insensitive)
   with loud errors outside it; JSON auto-parse in `irm` (arrays flow one
   element per line); `(...)` grouping in statements and values. Unit-tested.
+- PS1 download/verify/extract: `Invoke-WebRequest`/`iwr`/`wget` (`-Uri`,
+  `-OutFile`, `-UseBasicParsing` no-op), `Expand-Archive` (`-Path`,
+  `-DestinationPath`, `-Force`), `Get-FileHash` (SHA-256 only; object form
+  with `.Hash`/`.Algorithm`/`.Path` so `(Get-FileHash $f).Hash` works);
+  `install::zip_entries`/`extract_bytes` factored out of `extract_entry`.
+  Unit-tested offline (FIPS vector, stored-zip tree extraction).
+- PS1 expressions: whole-token `(...)` groups in arguments, member/method/
+  index tails on parenthesized values (`(Get-FileHash $f).Hash.ToLower()`,
+  `(($line -split '\s+')[0])`), the `-split` regex operator (leftmost,
+  greedy), `A + B` string concatenation, `X -join S` expression statements,
+  and full pipelines in assignments (`$line = Get-Content $f | Where ... |
+  Select -First 1` captures the last stage, not the first). Unit-tested.
+- PS1 conditions: `-and`/`-or` with short-circuiting, and whole-group
+  `(...)` conditions (comparison-shaped inners evaluate as conditions,
+  command-shaped ones run with output tested for truthiness, e.g.
+  `((Test-Path $p) -and ($a -ne $b))`). Unit-tested.
+- Milestone (live-network validation, not in the suite): the real ES-Runtime
+  `install.ps1` via `irm ... | iex` runs end to end, installing and
+  checksum-verifying both the `esrun` and `esdev` releases.
