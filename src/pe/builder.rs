@@ -25,6 +25,7 @@ pub struct Asm {
     fix_iat: Vec<(usize, usize)>,  // (disp_pos, import_idx)
     fix_dat: Vec<(usize, usize)>,  // (disp_pos, data_idx)
     fix_jcc: Vec<(usize, usize)>,  // (disp_pos, label_id)
+    fix_jmp: Vec<(usize, usize)>,  // (disp_pos, label_id)
     labels: HashMap<usize, usize>, // label_id -> code offset
     next_label: usize,
 }
@@ -37,6 +38,7 @@ impl Asm {
             fix_iat: Vec::new(),
             fix_dat: Vec::new(),
             fix_jcc: Vec::new(),
+            fix_jmp: Vec::new(),
             labels: HashMap::new(),
             next_label: 0,
         }
@@ -227,6 +229,13 @@ impl Asm {
     pub fn jnz(&mut self, label: usize) {
         self.jcc_rel32(5, label)
     }
+    /// jmp rel32 to label.
+    pub fn jmp(&mut self, label: usize) {
+        // E9 disp32
+        let pos = self.code.len() + 1;
+        self.emit(&[0xE9, 0, 0, 0, 0]);
+        self.fix_jmp.push((pos, label));
+    }
 }
 
 /// Assemble a full PE file from asm + import list.
@@ -327,6 +336,16 @@ pub fn build(mut asm: Asm, imports: &[(&str, &str)]) -> Vec<u8> {
         }
     }
     for (pos, lab) in asm.fix_jcc.clone() {
+        let target_off = *asm
+            .labels
+            .get(&lab)
+            .unwrap_or_else(|| panic!("undefined label {lab}"));
+        let target = code_rva + target_off as u64;
+        let next = code_rva + pos as u64 + 4;
+        let disp = target.wrapping_sub(next) as u32;
+        asm.code[pos..pos + 4].copy_from_slice(&disp.to_le_bytes());
+    }
+    for (pos, lab) in asm.fix_jmp.clone() {
         let target_off = *asm
             .labels
             .get(&lab)

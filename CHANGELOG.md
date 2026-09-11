@@ -226,3 +226,13 @@ All notable changes to this project will be documented in this file.
 - Milestone (live-network validation): real `rg.exe` searches WinFS files
   end to end (`rg error C:\log.txt` prints matches); the live acceptance
   test now covers install → inspect (0 missing) → search.
+- `winapi` for real directory walks: `FindFirstFileExW`/`FindNextFileW`/
+  `FindClose` over WinFS (`*`/`?` wildcards, case-insensitive, dirs-only op,
+  `WIN32_FIND_DATAW`, `NO_MORE_FILES` exhaustion), `GetFinalPathNameByHandleW`
+  (canonical path + NUL, size query), and `CreateFileW` directory handles only
+  with `FILE_FLAG_BACKUP_SEMANTICS`. Promoted from fail-stubs to supported.
+  Unit-tested via builder probes (wildcard matcher, enumerate/count/close).
+- Emulator, trace-driven by real `rg.exe` directory walking: `MOVLPS`/`MOVHPS`
+  loads merge one qword (other half preserved) and stores write memory
+  (reg-reg stores fail clearly), with a unit test; test builder gains a
+  `jmp rel32` label helper used by the enumeration probe.

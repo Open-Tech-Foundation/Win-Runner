@@ -1593,6 +1593,37 @@ impl Emu {
                 self.rip = next;
                 return Ok(StepResult::Continue);
             }
+            if op2 == 0x12 || op2 == 0x13 || op2 == 0x16 || op2 == 0x17 {
+                // MOVLPS/MOVHPS (low/high qword). Loads merge (other half
+                // preserved); stores write memory. 0x13/0x17 reg-reg is #UD.
+                let (reg, is_reg, rm, ea_raw, ml) =
+                    self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
+                let next = ip + (off + 2 + ml) as u64;
+                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                if op2 == 0x12 || op2 == 0x16 {
+                    let base = if op2 == 0x12 { 0 } else { 8 };
+                    let chunk: [u8; 8] = if is_reg {
+                        let s = self.xmm[rm].to_le_bytes();
+                        s[base..base + 8].try_into().unwrap()
+                    } else {
+                        self.read_bytes(ea, 8)?.as_slice().try_into().unwrap()
+                    };
+                    let mut o = self.xmm[reg].to_le_bytes();
+                    o[base..base + 8].copy_from_slice(&chunk);
+                    self.xmm[reg] = u128::from_le_bytes(o);
+                } else {
+                    if is_reg {
+                        return Err(format!(
+                            "invalid MOVLPS/MOVHPS reg-reg store 0F {op2:02X} at 0x{ip:016x}"
+                        ));
+                    }
+                    let base = if op2 == 0x13 { 0 } else { 8 };
+                    let cur = self.xmm[reg].to_le_bytes();
+                    self.write_bytes(ea, &cur[base..base + 8])?;
+                }
+                self.rip = next;
+                return Ok(StepResult::Continue);
+            }
                         if op2 == 0xC0 || op2 == 0xC1 {
                 // XADD r/m, r: temp=dest; dest=src+dest; src=temp. LOCK ignored.
                 let width: u32 = if op2 == 0xC0 { 8 } else { w };
@@ -4322,6 +4353,45 @@ mod tests {
                 0x00, 0xFF, 0xFF, 0xFF, 0x7F, 0x80, 0xFF, 0x00,
                 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
             ]
+        );
+    }
+
+    #[test]
+    fn movlps_movhps_merge_and_store() {
+        let mut e = emu_with(&[
+            0x0F, 0x12, 0x06, // movlps xmm0,[rsi]
+            0x0F, 0x17, 0x07, // movhps [rdi],xmm0
+        ]);
+        let base = 0x1400_0000_000u64 + 0xA000;
+        for (i, b) in b"ABCDEFGH".iter().enumerate() {
+            e.write_u8(base + i as u64, *b).unwrap();
+        }
+        e.xmm[0] = u128::from_le_bytes(*b"0123456789ABCDEF");
+        e.regs[6] = base; // rsi
+        e.regs[7] = base + 0x100; // rdi
+        e.step().unwrap();
+        assert_eq!(
+            e.xmm[0].to_le_bytes(),
+            *b"ABCDEFGH89ABCDEF",
+            "movlps replaces low qword, preserves high"
+        );
+        e.step().unwrap();
+        for (i, b) in b"89ABCDEF".iter().enumerate() {
+            assert_eq!(
+                e.read_u8(base + 0x100 + i as u64).unwrap(),
+                *b,
+                "movhps store byte {i}"
+            );
+        }
+        // MOVHPS reg-reg merges the high qword (low preserved).
+        let mut e = emu_with(&[0x0F, 0x16, 0xC1]); // movhps xmm0,xmm1
+        e.xmm[0] = u128::from_le_bytes(*b"0123456789ABCDEF");
+        e.xmm[1] = u128::from_le_bytes(*b"abcdefghijklmnop");
+        e.step().unwrap();
+        assert_eq!(
+            e.xmm[0].to_le_bytes(),
+            *b"01234567ijklmnop",
+            "movhps reg-reg merges high qword"
         );
     }
 

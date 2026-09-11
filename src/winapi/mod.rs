@@ -29,11 +29,27 @@ struct FileHandle {
     offset: u64,
 }
 
+/// One directory-enumeration result for FindFirst/NextFileW.
+struct FindEntry {
+    name: String, // file name only
+    attrs: u32,   // 0x10 dir, 0x80 file
+    len: u64,     // 0 for dirs
+}
+
+/// Live FindFirstFileExW enumeration (entries precomputed, index into them).
+struct FindSearch {
+    entries: Vec<FindEntry>,
+    index: usize,
+}
+
 pub struct Runner {
     pub emu: Emu,
     pub fs: WinFs,
     handles: HashMap<u64, FileHandle>,
     next_handle: u64,
+    /// Live directory enumerations (separate handle space from files).
+    finds: HashMap<u64, FindSearch>,
+    next_find: u64,
     pub exit_code: Option<u32>,
     /// Called with every console write as it happens (streaming). When unset
     /// (tests), output stays buffered in `emu.stdout` until `run` returns.
@@ -82,6 +98,8 @@ impl Runner {
             fs,
             handles: HashMap::new(),
             next_handle: 0x100,
+            finds: HashMap::new(),
+            next_find: 0x10000,
             exit_code: None,
             console_sink: None,
             console_is_tty: std::io::stdout().is_terminal(),
@@ -173,6 +191,84 @@ impl Runner {
     /// Byte length for an open handle's path.
     fn file_len_by_handle(&self, h: u64) -> Result<u64, String> {
         self.file_attrs_len_by_handle(h).map(|(_, len)| len)
+    }
+
+    /// Names matching a FindFirst pattern: the exact path itself (file or
+    /// dir) when the pattern has no wildcards, else the directory listing
+    /// filtered by `*`/`?` (case-insensitive). Sorted (list_dir order).
+    /// Missing paths yield no matches (caller reports FILE_NOT_FOUND).
+    fn find_matches(&self, raw: &str, dirs_only: bool) -> Result<Vec<FindEntry>, String> {
+        let cut = raw.rfind(['\\', '/']).map(|i| i + 1).unwrap_or(0);
+        let (dir, mut pat) = if cut == 0 {
+            (self.fs.cwd(), raw)
+        } else {
+            (raw[..cut - 1].to_string(), &raw[cut..])
+        };
+        if pat.is_empty() {
+            pat = "*";
+        }
+        if !pat.contains(['*', '?']) {
+            let full = if dir.is_empty() {
+                pat.to_string()
+            } else {
+                format!("{}\\{pat}", dir.trim_end_matches(['\\', '/']))
+            };
+            if dirs_only && self.fs.is_file(&full) {
+                return Ok(Vec::new());
+            }
+            if self.fs.is_dir(&full) {
+                return Ok(vec![FindEntry {
+                    name: pat.to_string(),
+                    attrs: 0x10,
+                    len: 0,
+                }]);
+            }
+            if self.fs.is_file(&full) {
+                let len = self.fs.read_file(&full).map(|v| v.len() as u64).unwrap_or(0);
+                return Ok(vec![FindEntry {
+                    name: pat.to_string(),
+                    attrs: 0x80,
+                    len,
+                }]);
+            }
+            return Ok(Vec::new());
+        }
+        let names = match self.fs.list_dir(&dir) {
+            Ok(n) => n,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let mut out = Vec::new();
+        for name in names {
+            if !wildcard_match(pat, &name) {
+                continue;
+            }
+            let full = format!("{}\\{name}", dir.trim_end_matches(['\\', '/']));
+            if self.fs.is_dir(&full) {
+                out.push(FindEntry { name, attrs: 0x10, len: 0 });
+            } else if self.fs.is_file(&full) {
+                if dirs_only {
+                    continue;
+                }
+                let len = self.fs.read_file(&full).map(|v| v.len() as u64).unwrap_or(0);
+                out.push(FindEntry { name, attrs: 0x80, len });
+            }
+        }
+        Ok(out)
+    }
+
+    /// WIN32_FIND_DATAW (592 bytes) at `va`: attrs, zero times, sizes,
+    /// UTF-16 name (truncated to 259 + NUL), empty alternate name.
+    fn fill_find_data(&mut self, va: u64, name: &str, attrs: u32, len: u64) -> Result<(), String> {
+        let mut b = vec![0u8; 592];
+        b[0..4].copy_from_slice(&attrs.to_le_bytes());
+        b[28..32].copy_from_slice(&((len >> 32) as u32).to_le_bytes());
+        b[32..36].copy_from_slice(&(len as u32).to_le_bytes());
+        let units: Vec<u16> = name.encode_utf16().take(259).collect();
+        for (i, u) in units.iter().enumerate() {
+            b[44 + i * 2..44 + i * 2 + 2].copy_from_slice(&u.to_le_bytes());
+        }
+        self.emu.write_bytes(va, &b)?;
+        Ok(())
     }
 
     pub fn run(mut self) -> Result<(u32, WinFs, Vec<u8>), String> {
@@ -332,9 +428,12 @@ impl Runner {
                 // i.e. the first stack slot (index 4).
                 let p_path = rcx;
                 let creation = self.emu.stack_arg(4).unwrap_or(OPEN_EXISTING as u64) as u32;
+                let flags = self.emu.stack_arg(5).unwrap_or(0) as u32;
                 let path = self.emu.read_utf16(p_path)?;
                 let exists = self.fs.exists(&path);
                 let is_dir = self.fs.is_dir(&path);
+                // Directories open only with FILE_FLAG_BACKUP_SEMANTICS.
+                let dir_handle_ok = is_dir && (flags & 0x02000000) != 0;
                 match creation {
                     CREATE_NEW => {
                         if exists {
@@ -360,14 +459,14 @@ impl Runner {
                         ret_bool!(h);
                     }
                     OPEN_EXISTING => {
-                        if !exists || is_dir {
+                        if !exists || (is_dir && !dir_handle_ok) {
                             ret_bool!(INVALID_HANDLE);
                         }
                         let h = self.alloc_handle(path, 0);
                         ret_bool!(h);
                     }
                     OPEN_ALWAYS => {
-                        if is_dir {
+                        if is_dir && !dir_handle_ok {
                             ret_bool!(INVALID_HANDLE);
                         }
                         if !exists {
@@ -881,6 +980,30 @@ impl Runner {
                 }
                 ret_bool!((units.len() - 1) as u64);
             }
+            "GetFinalPathNameByHandleW" => {
+                // (hFile, buf, n, flags): canonical path + NUL. Flags
+                // ignored (no volumes; always the DOS path).
+                let h = rcx;
+                let buf = rdx;
+                let n = (r8 & 0xFFFF_FFFF) as usize;
+                let path = self
+                    .handles
+                    .get(&h)
+                    .map(|fh| fh.path.clone())
+                    .ok_or_else(|| format!("bad file handle 0x{h:016x}"))?;
+                let units: Vec<u16> =
+                    path.encode_utf16().chain(std::iter::once(0)).collect();
+                if n == 0 {
+                    ret_bool!(units.len() as u64);
+                }
+                if n < units.len() {
+                    ret_bool!(units.len() as u64);
+                }
+                for (i, u) in units.iter().enumerate() {
+                    self.emu.write_u16(buf + i as u64 * 2, *u)?;
+                }
+                ret_bool!((units.len() - 1) as u64);
+            }
             "GetFileAttributesW" => {
                 let path = self.emu.read_utf16(rcx)?;
                 if self.fs.is_dir(&path) {
@@ -945,6 +1068,76 @@ impl Runner {
                     ));
                 }
                 self.emu.write_bytes(info, &b)?;
+                ret_bool!(1);
+            }
+            "FindFirstFileExW" => {
+                // (pattern, level, data, op, filter, flags): enumerate
+                // matches into a search handle; the first flows to data.
+                // Levels 0 (standard) and 1 (basic) both work (alternate
+                // name stays empty); op 0 matches names, 1 dirs only.
+                let raw = self.emu.read_utf16(rcx)?;
+                let level = (rdx & 0xFFFF_FFFF) as u32;
+                let data = r8;
+                let op = (r9 & 0xFFFF_FFFF) as u32;
+                let filter = self.emu.stack_arg(4).unwrap_or(0);
+                if level > 1 {
+                    return Err(format!(
+                        "FindFirstFileExW: info level {level} is not supported"
+                    ));
+                }
+                if op > 1 {
+                    return Err(format!(
+                        "FindFirstFileExW: search op {op} is not supported"
+                    ));
+                }
+                if filter != 0 {
+                    return Err(
+                        "FindFirstFileExW: search filter is not supported".to_string()
+                    );
+                }
+                let entries = self.find_matches(&raw, op == 1)?;
+                if entries.is_empty() {
+                    self.last_error = 2; // FILE_NOT_FOUND
+                    ret_bool!(INVALID_HANDLE);
+                }
+                let first = &entries[0];
+                let (name, attrs, len) = (first.name.clone(), first.attrs, first.len);
+                self.fill_find_data(data, &name, attrs, len)?;
+                let h = self.next_find;
+                self.next_find += 1;
+                self.finds.insert(h, FindSearch { entries, index: 1 });
+                ret_bool!(h);
+            }
+            "FindNextFileW" => {
+                // (hFind, data): next entry, or 0 + ERROR_NO_MORE_FILES.
+                let h = rcx;
+                let data = rdx;
+                if !self.finds.contains_key(&h) {
+                    self.last_error = 6; // INVALID_HANDLE
+                    ret_bool!(0);
+                }
+                let (name, attrs, len, done) = {
+                    let s = self.finds.get_mut(&h).unwrap();
+                    if s.index >= s.entries.len() {
+                        (String::new(), 0, 0, true)
+                    } else {
+                        let e = &s.entries[s.index];
+                        s.index += 1;
+                        (e.name.clone(), e.attrs, e.len, false)
+                    }
+                };
+                if done {
+                    self.last_error = 18; // NO_MORE_FILES
+                    ret_bool!(0);
+                }
+                self.fill_find_data(data, &name, attrs, len)?;
+                ret_bool!(1);
+            }
+            "FindClose" => {
+                if self.finds.remove(&rcx).is_none() {
+                    self.last_error = 6; // INVALID_HANDLE
+                    ret_bool!(0);
+                }
                 ret_bool!(1);
             }
             "MultiByteToWideChar" => {
@@ -1260,7 +1453,7 @@ impl Runner {
             | "FlushFileBuffers"
             | "FormatMessageW" | "FreeLibrary" | "GetCPInfo" | "GetComputerNameExW"
             | "GetConsoleScreenBufferInfo" | "GetExitCodeProcess"
-            | "GetFinalPathNameByHandleW" | "GetProcAddress" | "GetStringTypeW"
+            | "GetProcAddress" | "GetStringTypeW"
             | "GetSystemDirectoryW"             | "GetWindowsDirectoryW"
             | "IsThreadAFiber"
             | "LCMapStringW" | "LoadLibraryA"
@@ -1273,9 +1466,6 @@ impl Runner {
             | "WaitForSingleObject" | "WaitForSingleObjectEx" | "WriteFileEx" => {
                 stub!(0);
             }
-            "FindFirstFileExW" => {
-                stub!(INVALID_HANDLE);
-            }
             other => {
                 return Err(format!(
                     "unsupported import at runtime: {}!{other}",
@@ -1284,6 +1474,39 @@ impl Runner {
             }
         }
     }
+}
+
+/// Wildcard match for FindFirst patterns: `*` spans any run (including
+/// empty), `?` is exactly one char, ASCII case-insensitive (other chars
+/// compare exactly). No DOS_STAR/DOS_QM quirks.
+fn wildcard_match(pat: &str, name: &str) -> bool {
+    let p: Vec<char> = pat.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    let (mut pi, mut ni) = (0usize, 0usize);
+    let (mut star, mut mark) = (None, 0usize);
+    while ni < n.len() {
+        if pi < p.len()
+            && (p[pi] == '?'
+                || p[pi].to_ascii_lowercase() == n[ni].to_ascii_lowercase())
+        {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            pi += 1;
+            mark = ni;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            mark += 1;
+            ni = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 /// One line from host stdin (no trailing newline), lossy UTF-8.
@@ -1764,6 +1987,118 @@ mod tests {
         // panics the guest (divide by zero). Regression test.
         let (code, _, _) = run_exe(&sysinfo_probe(), WinFs::new()).unwrap();
         assert_eq!(code, 65536);
+    }
+
+    #[test]
+    fn wildcard_match_basics() {
+        use super::wildcard_match;
+        assert!(wildcard_match("*", "anything.txt"));
+        assert!(wildcard_match("*.txt", "a.txt"));
+        assert!(wildcard_match("*.txt", "A.TXT"));
+        assert!(!wildcard_match("*.txt", "a.log"));
+        assert!(wildcard_match("a?.txt", "a1.txt"));
+        assert!(!wildcard_match("a?.txt", "a12.txt"));
+        assert!(wildcard_match("a*", "abc"));
+        assert!(wildcard_match("*b*", "abc"));
+        assert!(!wildcard_match("a*c", "ab"));
+        assert!(wildcard_match("a*c", "ac"));
+        assert!(wildcard_match("a*c", "axyzc"));
+        assert!(wildcard_match("exact", "exact"));
+        assert!(wildcard_match("exact", "EXACT"));
+        assert!(!wildcard_match("exact", "exact!"));
+        assert!(wildcard_match("", ""));
+        assert!(!wildcard_match("", "x"));
+    }
+
+    fn find_probe() -> Vec<u8> {
+        // imports: FindFirstFileExW, FindNextFileW, FindClose,
+        // GetLastError, ExitProcess. Enumerates C:\d\* (pre-seeded with
+        // a.txt, b.log), checks the first name is a.txt, counts entries,
+        // checks GetLastError is NO_MORE_FILES (18), exits with the count.
+        use crate::pe::builder::{build, Asm};
+        const FF: usize = 0;
+        const FN: usize = 1;
+        const FC: usize = 2;
+        const GE: usize = 3;
+        const XP: usize = 4;
+        let mut a = Asm::new();
+        let d_pat = a.add_utf16("C:\\d\\*");
+        let d_buf = a.add_zeroed(592);
+        let lbl_fail = a.fresh_label();
+        let lbl_next = a.fresh_label();
+        let lbl_done = a.fresh_label();
+        a.sub_rsp(0x48);
+        // h = FindFirstFileExW(pat, 0, buf, 0, 0, 0); fail if -1
+        a.lea_reg_rip(1, d_pat);
+        a.mov_edx_imm(0);
+        a.lea_reg_rip(8, d_buf);
+        a.mov_r9d_imm(0);
+        a.xor_eax();
+        a.mov_rspoff_rax(0x20);
+        a.mov_rspoff_rax(0x28);
+        a.call_import(FF);
+        a.cmp_rax_m1();
+        a.jz(lbl_fail);
+        a.emit(&[0x48, 0x89, 0x44, 0x24, 0x40]); // mov [rsp+0x40],rax
+        // first name must be a.txt: check buf+44 UTF-16 'a' (0x61)
+        a.lea_reg_rip(0, d_buf);
+        a.emit(&[0x48, 0x83, 0xC0, 0x2C]); // add rax,44
+        a.emit(&[0x66, 0x8B, 0x00]); // mov ax,[rax]
+        a.emit(&[0x66, 0x83, 0xF8, 0x61]); // cmp ax,'a'
+        a.jnz(lbl_fail);
+        a.mov_eax_mem_rip(d_buf);
+        a.cmp_eax_imm(0x80);
+        a.jnz(lbl_fail);
+        a.emit(&[0x48, 0x31, 0xDB]); // xor rbx,rbx
+        a.emit(&[0x48, 0xFF, 0xC3]); // inc rbx (first entry)
+        a.mark(lbl_next);
+        // FindNextFileW(h, buf): 0 ends the loop
+        a.emit(&[0x48, 0x8B, 0x4C, 0x24, 0x40]); // mov rcx,[rsp+0x40]
+        a.lea_reg_rip(2, d_buf);
+        a.call_import(FN);
+        a.test_eax_eax();
+        a.jz(lbl_done);
+        a.emit(&[0x48, 0xFF, 0xC3]); // inc rbx
+        a.jmp(lbl_next);
+        a.mark(lbl_done);
+        // GetLastError() == 18 (NO_MORE_FILES)?
+        a.call_import(GE);
+        a.cmp_eax_imm(18);
+        a.jnz(lbl_fail);
+        // FindClose(h); exit(count)
+        a.emit(&[0x48, 0x8B, 0x4C, 0x24, 0x40]); // mov rcx,[rsp+0x40]
+        a.call_import(FC);
+        a.emit(&[0x48, 0x89, 0xD9]); // mov rcx,rbx
+        a.call_import(XP);
+        a.add_rsp(0x48);
+        a.ret();
+        a.mark(lbl_fail);
+        a.mov_ecx_imm(1);
+        a.call_import(XP);
+        a.add_rsp(0x48);
+        a.ret();
+        build(
+            a,
+            &[
+                ("KERNEL32.dll", "FindFirstFileExW"),
+                ("KERNEL32.dll", "FindNextFileW"),
+                ("KERNEL32.dll", "FindClose"),
+                ("KERNEL32.dll", "GetLastError"),
+                ("KERNEL32.dll", "ExitProcess"),
+            ],
+        )
+    }
+
+    #[test]
+    fn find_enumerates_names_counts_and_ends() {
+        // C:\d holds a.txt + b.log: enumeration yields both (sorted),
+        // exhaustion reports NO_MORE_FILES, close succeeds; exit == count.
+        let mut fs = WinFs::new();
+        fs.mkdir("C:\\d").unwrap();
+        fs.write_file("C:\\d\\b.log", b"2".to_vec()).unwrap();
+        fs.write_file("C:\\d\\a.txt", b"1".to_vec()).unwrap();
+        let (code, _, _) = run_exe(&find_probe(), fs).unwrap();
+        assert_eq!(code, 2);
     }
 
     #[test]
