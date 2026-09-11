@@ -164,8 +164,6 @@ pub const STUB_APIS: &[(&str, &str)] = &[
     ("KERNEL32.DLL", "GetComputerNameExW"),
     ("KERNEL32.DLL", "GetConsoleScreenBufferInfo"),
     ("KERNEL32.DLL", "GetExitCodeProcess"),
-    ("KERNEL32.DLL", "GetFileInformationByHandle"),
-    ("KERNEL32.DLL", "GetFileInformationByHandleEx"),
     ("KERNEL32.DLL", "GetProcAddress"),
     ("KERNEL32.DLL", "GetStringTypeW"),
     ("KERNEL32.DLL", "GetSystemDirectoryW"),

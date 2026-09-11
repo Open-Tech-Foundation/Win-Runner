@@ -1864,6 +1864,103 @@ mod tests {
         assert_eq!(code, 0);
     }
 
+    fn final_path_probe() -> Vec<u8> {
+        // imports: CreateFileW, GetFinalPathNameByHandleW, CloseHandle,
+        // ExitProcess. Opens C:\stat.txt (pre-seeded), checks the returned
+        // length is 11 (chars, no NUL), the first unit is 'C', the third is
+        // '\\', the unit at index 11 is NUL, and the n=0 size query returns
+        // 12 (units incl. NUL). Exits 0/1.
+        use crate::pe::builder::{build, Asm};
+        const CF: usize = 0;
+        const FP: usize = 1;
+        const CH: usize = 2;
+        const XP: usize = 3;
+        let mut a = Asm::new();
+        let d_path = a.add_utf16("C:\\stat.txt");
+        let d_buf = a.add_zeroed(128);
+        let lbl_fail = a.fresh_label();
+        a.sub_rsp(0x48);
+        // handle = CreateFileW(path, GENERIC_READ, 0,0, OPEN_EXISTING=3, 0,0)
+        a.lea_reg_rip(1, d_path);
+        a.emit(&[0x48, 0xB8]);
+        a.emit(&0x8000_0000u64.to_le_bytes());
+        a.emit(&[0x48, 0x89, 0xC2]); // mov rdx,rax
+        a.mov_r8d_imm(0);
+        a.mov_r9d_imm(0);
+        a.xor_eax();
+        a.emit(&[0xC7, 0x44, 0x24, 0x20]);
+        a.emit(&3u32.to_le_bytes());
+        a.emit(&[0xC7, 0x44, 0x24, 0x28]);
+        a.emit(&0u32.to_le_bytes());
+        a.mov_rspoff_rax(0x30);
+        a.call_import(CF);
+        a.cmp_rax_m1();
+        a.jz(lbl_fail);
+        a.emit(&[0x48, 0x89, 0x44, 0x24, 0x40]); // mov [rsp+0x40],rax
+        // len = GetFinalPathNameByHandleW(handle, buf, 64, 0): == 11
+        a.emit(&[0x48, 0x8B, 0x4C, 0x24, 0x40]); // mov rcx,[rsp+0x40]
+        a.lea_reg_rip(2, d_buf);
+        a.mov_r8d_imm(64);
+        a.mov_r9d_imm(0);
+        a.call_import(FP);
+        a.cmp_eax_imm(11);
+        a.jnz(lbl_fail);
+        // buf[0] == 'C'
+        a.lea_reg_rip(0, d_buf);
+        a.emit(&[0x66, 0x8B, 0x00]); // mov ax,[rax]
+        a.emit(&[0x66, 0x83, 0xF8, 0x43]); // cmp ax,'C'
+        a.jnz(lbl_fail);
+        // buf[2] == '\\'
+        a.lea_reg_rip(0, d_buf);
+        a.emit(&[0x48, 0x83, 0xC0, 0x04]); // add rax,4
+        a.emit(&[0x66, 0x8B, 0x00]); // mov ax,[rax]
+        a.emit(&[0x66, 0x83, 0xF8, 0x5C]); // cmp ax,'\\'
+        a.jnz(lbl_fail);
+        // buf[11] == NUL
+        a.lea_reg_rip(0, d_buf);
+        a.emit(&[0x48, 0x83, 0xC0, 0x16]); // add rax,22
+        a.emit(&[0x66, 0x8B, 0x00]); // mov ax,[rax]
+        a.emit(&[0x66, 0x83, 0xF8, 0x00]); // cmp ax,0
+        a.jnz(lbl_fail);
+        // size query: GetFinalPathNameByHandleW(handle, 0, 0, 0) == 12
+        a.emit(&[0x48, 0x8B, 0x4C, 0x24, 0x40]); // mov rcx,[rsp+0x40]
+        a.mov_edx_imm(0);
+        a.mov_r8d_imm(0);
+        a.mov_r9d_imm(0);
+        a.call_import(FP);
+        a.cmp_eax_imm(12);
+        a.jnz(lbl_fail);
+        // CloseHandle(handle); exit 0
+        a.emit(&[0x48, 0x8B, 0x4C, 0x24, 0x40]); // mov rcx,[rsp+0x40]
+        a.call_import(CH);
+        a.mov_ecx_imm(0);
+        a.call_import(XP);
+        a.add_rsp(0x48);
+        a.ret();
+        a.mark(lbl_fail);
+        a.mov_ecx_imm(1);
+        a.call_import(XP);
+        a.add_rsp(0x48);
+        a.ret();
+        build(
+            a,
+            &[
+                ("KERNEL32.dll", "CreateFileW"),
+                ("KERNEL32.dll", "GetFinalPathNameByHandleW"),
+                ("KERNEL32.dll", "CloseHandle"),
+                ("KERNEL32.dll", "ExitProcess"),
+            ],
+        )
+    }
+
+    #[test]
+    fn final_path_by_handle_roundtrip() {
+        let mut fs = WinFs::new();
+        fs.write_file("C:\\stat.txt", b"hello".to_vec()).unwrap();
+        let (code, _, _) = run_exe(&final_path_probe(), fs).unwrap();
+        assert_eq!(code, 0);
+    }
+
     fn read_probe() -> Vec<u8> {
         // imports: CreateFileW, NtReadFile, CloseHandle, ExitProcess.
         // Reads C:\stat.txt (pre-seeded "hello") via NtReadFile, checks

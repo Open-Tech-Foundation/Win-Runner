@@ -236,3 +236,7 @@ All notable changes to this project will be documented in this file.
   loads merge one qword (other half preserved) and stores write memory
   (reg-reg stores fail clearly), with a unit test; test builder gains a
   `jmp rel32` label helper used by the enumeration probe.
+- `GetFinalPathNameByHandleW` now covered by a builder probe (length, content
+  spot-checks, NUL terminator, `n=0` size query); removed stale
+  `GetFileInformationByHandle`/`Ex` duplicates from the fail-stub list (they
+  are supported shims).
