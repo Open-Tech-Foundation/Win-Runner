@@ -25,6 +25,10 @@ native heap stress test, and `rust_lang.exe` / `rust_fp.exe` cover broader
 control-flow and floating-point code. This is not yet a general-purpose native
 PE runner.
 
+The native loader also has experimental TLS/TEB/PEB initialization for
+real-program diagnostics. It is not sufficient for general Windows CRT
+startup or exception handling yet.
+
 Both share the exact same in-memory `WinFS`: case-insensitive lookup with
 original casing preserved, `C:\` + relative paths, `.`/`..` normalization.
 

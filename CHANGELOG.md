@@ -22,6 +22,9 @@ All notable changes to this project will be documented in this file.
   lookup, and removal.
   Native regression coverage now includes the 16-phase `rust_lang.exe` guest
   and `rust_fp.exe` floating-point workload.
+  Native PE bring-up now creates a child-local TEB/PEB/TLS block, initializes
+  the image TLS index, installs the guest `GS` base, and maps unresolved
+  imports to contained fail trampolines for real-program startup diagnostics.
   Imported programs outside that baseline remain on the interpreter.
 - Minimal `wincli` tool: `wincli app.exe` runs PE32+ x86_64 console apps,
   `wincli script.ps1` runs filesystem scripts, both on the same in-memory

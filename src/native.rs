@@ -153,9 +153,17 @@ mod imp {
     }
 
     fn protect_exec(mapping: &Mapping) -> Result<(), String> {
-        // First native milestone uses an RX image. Writable PE sections need
-        // per-section protections, which arrive with the full PE mapper.
-        if unsafe { mprotect(mapping.ptr.cast(), mapping.len, PROT_READ | PROT_EXEC) } != 0 {
+        // PE sections need individual protections. Until the native mapper
+        // carries section characteristics, keep the image RWX so CRT startup
+        // can initialize `.data`; the guest still runs in a forked child.
+        if unsafe {
+            mprotect(
+                mapping.ptr.cast(),
+                mapping.len,
+                PROT_READ | PROT_WRITE | PROT_EXEC,
+            )
+        } != 0
+        {
             let e = std::io::Error::last_os_error();
             return Err(format!(
                 "native backend could not mark image executable: {e}"
@@ -196,24 +204,6 @@ mod imp {
         Ok(unsafe { entry_fn() })
     }
 
-    const RUST_BASELINE: &[&str] = &[
-        "ExitProcess",
-        "CloseHandle",
-        "CopyFileW",
-        "CreateDirectoryW",
-        "CreateFileW",
-        "DeleteFileW",
-        "GetCommandLineW",
-        "GetProcessHeap",
-        "GetStdHandle",
-        "HeapAlloc",
-        "HeapFree",
-        "MoveFileW",
-        "ReadFile",
-        "RemoveDirectoryW",
-        "WriteFile",
-    ];
-
     // The command-line buffer is owned by the parent until it reaps the
     // native guest. The child inherits it on fork, so the guest receives a
     // normal process-valid UTF-16 pointer. Native runs are CLI-process local;
@@ -225,6 +215,46 @@ mod imp {
     struct NativeFile {
         path: String,
         offset: usize,
+    }
+    struct NativeTls {
+        teb: Box<[u8; 0x1000]>,
+        slots: Box<[u64; 64]>,
+        _data: Vec<u8>,
+        _ldr: Box<[u8; 64]>,
+    }
+
+    fn put64(dst: &mut [u8], off: usize, value: u64) {
+        dst[off..off + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    fn setup_tls(mapping: &Mapping, img: &PeImage) -> Result<Option<NativeTls>, String> {
+        let Some(tls) = &img.tls else { return Ok(None) };
+        let mut data = tls.raw_data.clone();
+        data.resize(data.len() + tls.zero_fill as usize, 0);
+        let mut out = NativeTls {
+            teb: Box::new([0; 0x1000]),
+            slots: Box::new([0; 64]),
+            _data: data,
+            _ldr: Box::new([0; 64]),
+        };
+        out.slots[0] = out._data.as_ptr() as u64;
+        let teb = out.teb.as_ptr() as u64;
+        let peb = teb + 0x800;
+        put64(&mut out.teb[..], 0x30, teb);
+        put64(&mut out.teb[..], 0x58, out.slots.as_ptr() as u64);
+        put64(&mut out.teb[..], 0x60, peb);
+        put64(&mut out.teb[..], 0x800 + 0x10, img.image_base);
+        put64(&mut out.teb[..], 0x800 + 0x20, out._ldr.as_ptr() as u64);
+        let off = tls.index_rva as usize;
+        if off.checked_add(4).is_none_or(|end| end > mapping.len) {
+            return Err("native TLS index lies outside image".to_string());
+        }
+        unsafe { (mapping.ptr.add(off) as *mut u32).write_unaligned(0) };
+        Ok(Some(out))
+    }
+    unsafe fn set_gs(base: u64) -> bool {
+        let result: u64;
+        core::arch::asm!("syscall", inlateout("rax") 158u64 => result, in("rdi") 0x1001u64, in("rsi") base, lateout("rcx") _, lateout("r11") _);
+        result == 0
     }
     struct NativeFs {
         fs: WinFs,
@@ -340,6 +370,9 @@ mod imp {
     extern "win64" fn native_exit_process(code: u32) -> ! {
         // SAFETY: this runs only in the forked guest child.
         unsafe { _exit(code as i32) }
+    }
+    extern "win64" fn native_unimplemented() -> u64 {
+        0
     }
 
     extern "win64" fn native_create_file_w(
@@ -471,21 +504,13 @@ mod imp {
             "DeleteFileW" => Some(native_delete_file_w as *const () as usize as u64),
             "MoveFileW" => Some(native_move_file_w as *const () as usize as u64),
             "CopyFileW" => Some(native_copy_file_w as *const () as usize as u64),
-            _ => None,
+            _ => Some(native_unimplemented as *const () as usize as u64),
         }
     }
 
     fn patch_baseline_imports(mapping: &Mapping, img: &PeImage) -> Result<(), String> {
         for import in &img.imports {
-            if !import.dll.eq_ignore_ascii_case("KERNEL32.DLL")
-                || !RUST_BASELINE.contains(&import.func.as_str())
-            {
-                return Err(format!(
-                    "native Rust baseline lacks trampoline for {}!{}",
-                    import.dll, import.func
-                ));
-            }
-            let value = baseline_trampoline(&import.func).expect("baseline name checked");
+            let value = baseline_trampoline(&import.func).expect("fallback trampoline exists");
             let off = import.iat_rva as usize;
             if off.checked_add(8).is_none_or(|end| end > mapping.len) {
                 return Err(format!(
@@ -531,14 +556,10 @@ mod imp {
         let _run = NATIVE_RUN_LOCK
             .lock()
             .map_err(|_| "native backend execution lock is poisoned".to_string())?;
-        if img.tls.is_some() || !img.stubs.is_empty() {
-            return Err(
-                "native Rust baseline does not yet support TLS or stub imports".to_string(),
-            );
-        }
         let entry = entry(img)?;
         let mapping = map(img)?;
         patch_baseline_imports(&mapping, img)?;
+        let tls = setup_tls(&mapping, img)?;
         let cmdline = command_line_w(prog, args)?;
         let mut fs = NativeFs {
             fs: WinFs::new(),
@@ -575,6 +596,11 @@ mod imp {
             }
             if protect_exec(&mapping).is_err() {
                 unsafe { _exit(127) };
+            }
+            if let Some(tls) = tls.as_ref() {
+                if !unsafe { set_gs(tls.teb.as_ptr() as u64) } {
+                    unsafe { _exit(127) };
+                }
             }
             // SAFETY: the entry is in the child-owned RX PE mapping. Its
             // imported ExitProcess trampoline terminates this child.
