@@ -11,8 +11,10 @@ All notable changes to this project will be documented in this file.
   Windows-x64 entry point directly on the host CPU. `WINCLI_BACKEND=native`
   additionally runs `rust_hello.exe`-class guests in a child process through
   IAT trampolines for `GetCommandLineW`, `GetStdHandle`, `WriteFile`, and
-  `ExitProcess`, including MSVC command-line quoting. Imported programs
-  outside that baseline remain on the interpreter.
+  `ExitProcess`, including MSVC command-line quoting. Native Rust guests now
+  also use a child-local in-memory WinFS through `CreateFileW`, `ReadFile`,
+  `CloseHandle`, directory creation/removal, delete, copy, and move shims.
+  Imported programs outside that baseline remain on the interpreter.
 - Minimal `wincli` tool: `wincli app.exe` runs PE32+ x86_64 console apps,
   `wincli script.ps1` runs filesystem scripts, both on the same in-memory
   `WinFS` (case-insensitive, `.`/`..` aware, no host filesystem access).

@@ -17,9 +17,9 @@ wincli inspect app.exe    # PE compatibility report: supported vs missing import
 On Linux/x86-64, `WINCLI_BACKEND=native wincli app.exe` selects the native
 execution bring-up path. It executes PE instructions directly in a forked
 child, but currently supports only the import set used by `rust_hello.exe`
-and `rust_argv.exe`: `GetCommandLineW`, `GetStdHandle`, `WriteFile`, and
-`ExitProcess`. All other programs should use the default interpreter backend;
-this is not yet a general-purpose native PE runner.
+`rust_argv.exe`, and `rust_fs.exe`: console, command-line, and basic WinFS
+file/directory operations. All other programs should use the default
+interpreter backend; this is not yet a general-purpose native PE runner.
 
 Both share the exact same in-memory `WinFS`: case-insensitive lookup with
 original casing preserved, `C:\` + relative paths, `.`/`..` normalization.

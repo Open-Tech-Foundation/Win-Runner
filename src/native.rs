@@ -49,6 +49,8 @@ pub fn run_rust_baseline_argv(
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod imp {
     use super::PeImage;
+    use crate::winfs::WinFs;
+    use std::collections::HashMap;
     use std::ffi::c_void;
     use std::ptr;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -194,8 +196,16 @@ mod imp {
 
     const RUST_BASELINE: &[&str] = &[
         "ExitProcess",
+        "CloseHandle",
+        "CopyFileW",
+        "CreateDirectoryW",
+        "CreateFileW",
+        "DeleteFileW",
         "GetCommandLineW",
         "GetStdHandle",
+        "MoveFileW",
+        "ReadFile",
+        "RemoveDirectoryW",
         "WriteFile",
     ];
 
@@ -205,6 +215,35 @@ mod imp {
     // broader concurrent execution will replace this bootstrap slot with a
     // per-process shim context.
     static COMMAND_LINE_W: AtomicU64 = AtomicU64::new(0);
+    static NATIVE_FS: AtomicU64 = AtomicU64::new(0);
+
+    struct NativeFile {
+        path: String,
+        offset: usize,
+    }
+    struct NativeFs {
+        fs: WinFs,
+        handles: HashMap<u64, NativeFile>,
+        next: u64,
+    }
+
+    fn wide(ptr: *const u16) -> Option<String> {
+        if ptr.is_null() {
+            return None;
+        }
+        let mut units = Vec::new();
+        for i in 0..32768 {
+            let u = unsafe { ptr.add(i).read() };
+            if u == 0 {
+                return String::from_utf16(&units).ok();
+            }
+            units.push(u);
+        }
+        None
+    }
+    unsafe fn fs_ctx() -> Option<&'static mut NativeFs> {
+        (NATIVE_FS.load(Ordering::Acquire) as *mut NativeFs).as_mut()
+    }
 
     extern "win64" fn native_get_command_line_w() -> u64 {
         COMMAND_LINE_W.load(Ordering::Acquire)
@@ -226,7 +265,41 @@ mod imp {
         written: *mut u32,
         _overlapped: u64,
     ) -> i32 {
-        if handle != 1 && handle != 2 || buf.is_null() {
+        if buf.is_null() || len > 16 * 1024 * 1024 {
+            return 0;
+        }
+        if handle != 1 && handle != 2 {
+            let ctx = match unsafe { fs_ctx() } {
+                Some(v) => v,
+                None => return 0,
+            };
+            let file = match ctx.handles.get_mut(&handle) {
+                Some(v) => v,
+                None => return 0,
+            };
+            let data = unsafe { std::slice::from_raw_parts(buf, len as usize) };
+            let mut content = match ctx.fs.read_file(&file.path) {
+                Ok(v) => v,
+                Err(_) => return 0,
+            };
+            let end = match file.offset.checked_add(data.len()) {
+                Some(v) => v,
+                None => return 0,
+            };
+            if content.len() < end {
+                content.resize(end, 0);
+            }
+            content[file.offset..end].copy_from_slice(data);
+            if ctx.fs.write_file(&file.path, content).is_err() {
+                return 0;
+            }
+            file.offset = end;
+            if !written.is_null() {
+                unsafe { written.write(len) };
+            }
+            return 1;
+        }
+        if buf.is_null() {
             return 0;
         }
         // SAFETY: the guest supplied `buf`/`len`; a bad pointer terminates
@@ -247,12 +320,132 @@ mod imp {
         unsafe { _exit(code as i32) }
     }
 
+    extern "win64" fn native_create_file_w(
+        path: *const u16,
+        access: u32,
+        _share: u32,
+        _sec: u64,
+        creation: u32,
+        _flags: u32,
+        _tmpl: u64,
+    ) -> u64 {
+        let path = match wide(path) {
+            Some(v) => v,
+            None => return u64::MAX,
+        };
+        let ctx = match unsafe { fs_ctx() } {
+            Some(v) => v,
+            None => return u64::MAX,
+        };
+        let exists = ctx.fs.exists(&path);
+        let ok = match creation {
+            2 => ctx.fs.write_file(&path, Vec::new()),
+            3 if exists && ctx.fs.is_file(&path) => Ok(()),
+            _ => Err("unsupported create".into()),
+        };
+        if ok.is_err() || (access & 0xC000_0000) == 0 {
+            return u64::MAX;
+        }
+        let h = ctx.next;
+        ctx.next += 1;
+        ctx.handles.insert(h, NativeFile { path, offset: 0 });
+        h
+    }
+    extern "win64" fn native_read_file(
+        h: u64,
+        buf: *mut u8,
+        n: u32,
+        read: *mut u32,
+        _ov: u64,
+    ) -> i32 {
+        if buf.is_null() {
+            return 0;
+        }
+        let ctx = match unsafe { fs_ctx() } {
+            Some(v) => v,
+            None => return 0,
+        };
+        let file = match ctx.handles.get_mut(&h) {
+            Some(v) => v,
+            None => return 0,
+        };
+        let data = match ctx.fs.read_file(&file.path) {
+            Ok(v) => v,
+            Err(_) => return 0,
+        };
+        let k = (data.len().saturating_sub(file.offset)).min(n as usize);
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr().add(file.offset), buf, k) };
+        file.offset += k;
+        if !read.is_null() {
+            unsafe { read.write(k as u32) };
+        }
+        1
+    }
+    extern "win64" fn native_close_handle(h: u64) -> i32 {
+        unsafe {
+            fs_ctx()
+                .map(|c| c.handles.remove(&h).is_some())
+                .unwrap_or(false) as i32
+        }
+    }
+    extern "win64" fn native_create_directory_w(p: *const u16, _s: u64) -> i32 {
+        unsafe {
+            fs_ctx()
+                .and_then(|c| wide(p).map(|p| c.fs.mkdir_one(&p).is_ok()))
+                .unwrap_or(false) as i32
+        }
+    }
+    extern "win64" fn native_remove_directory_w(p: *const u16) -> i32 {
+        unsafe {
+            fs_ctx()
+                .and_then(|c| wide(p).map(|p| c.fs.rmdir(&p).is_ok()))
+                .unwrap_or(false) as i32
+        }
+    }
+    extern "win64" fn native_delete_file_w(p: *const u16) -> i32 {
+        unsafe {
+            fs_ctx()
+                .and_then(|c| wide(p).map(|p| c.fs.delete_file(&p).is_ok()))
+                .unwrap_or(false) as i32
+        }
+    }
+    extern "win64" fn native_move_file_w(a: *const u16, b: *const u16) -> i32 {
+        let (a, b) = match (wide(a), wide(b)) {
+            (Some(a), Some(b)) => (a, b),
+            _ => return 0,
+        };
+        unsafe {
+            fs_ctx()
+                .map(|c| c.fs.move_path(&a, &b).is_ok())
+                .unwrap_or(false) as i32
+        }
+    }
+    extern "win64" fn native_copy_file_w(a: *const u16, b: *const u16, fail: i32) -> i32 {
+        let (a, b) = match (wide(a), wide(b)) {
+            (Some(a), Some(b)) => (a, b),
+            _ => return 0,
+        };
+        unsafe {
+            fs_ctx()
+                .map(|c| c.fs.copy_file(&a, &b, fail != 0).is_ok())
+                .unwrap_or(false) as i32
+        }
+    }
+
     fn baseline_trampoline(name: &str) -> Option<u64> {
         match name {
             "GetCommandLineW" => Some(native_get_command_line_w as *const () as usize as u64),
             "GetStdHandle" => Some(native_get_std_handle as *const () as usize as u64),
             "WriteFile" => Some(native_write_file as *const () as usize as u64),
             "ExitProcess" => Some(native_exit_process as *const () as usize as u64),
+            "CreateFileW" => Some(native_create_file_w as *const () as usize as u64),
+            "ReadFile" => Some(native_read_file as *const () as usize as u64),
+            "CloseHandle" => Some(native_close_handle as *const () as usize as u64),
+            "CreateDirectoryW" => Some(native_create_directory_w as *const () as usize as u64),
+            "RemoveDirectoryW" => Some(native_remove_directory_w as *const () as usize as u64),
+            "DeleteFileW" => Some(native_delete_file_w as *const () as usize as u64),
+            "MoveFileW" => Some(native_move_file_w as *const () as usize as u64),
+            "CopyFileW" => Some(native_copy_file_w as *const () as usize as u64),
             _ => None,
         }
     }
@@ -322,7 +515,13 @@ mod imp {
         let mapping = map(img)?;
         patch_baseline_imports(&mapping, img)?;
         let cmdline = command_line_w(prog, args)?;
+        let mut fs = NativeFs {
+            fs: WinFs::new(),
+            handles: HashMap::new(),
+            next: 0x100,
+        };
         COMMAND_LINE_W.store(cmdline.as_ptr() as u64, Ordering::Release);
+        NATIVE_FS.store((&mut fs as *mut NativeFs) as u64, Ordering::Release);
         let mut fds = [-1, -1];
         if unsafe { pipe(fds.as_mut_ptr()) } != 0 {
             return Err(format!(
@@ -390,6 +589,7 @@ mod imp {
             ));
         }
         COMMAND_LINE_W.store(0, Ordering::Release);
+        NATIVE_FS.store(0, Ordering::Release);
         if status & 0x7f != 0 {
             return Err(format!(
                 "native guest terminated by signal {}",
