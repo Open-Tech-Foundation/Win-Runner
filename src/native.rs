@@ -88,6 +88,8 @@ mod imp {
         fn write(fd: i32, buf: *const c_void, count: usize) -> isize;
         fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
         fn _exit(status: i32) -> !;
+        fn malloc(size: usize) -> *mut c_void;
+        fn free(ptr: *mut c_void);
     }
 
     struct Mapping {
@@ -202,7 +204,10 @@ mod imp {
         "CreateFileW",
         "DeleteFileW",
         "GetCommandLineW",
+        "GetProcessHeap",
         "GetStdHandle",
+        "HeapAlloc",
+        "HeapFree",
         "MoveFileW",
         "ReadFile",
         "RemoveDirectoryW",
@@ -256,6 +261,23 @@ mod imp {
             -12 => 2,
             _ => u64::MAX,
         }
+    }
+
+    extern "win64" fn native_get_process_heap() -> u64 {
+        0x400
+    }
+    extern "win64" fn native_heap_alloc(_heap: u64, _flags: u32, size: u32) -> u64 {
+        let size = (size as usize).max(1);
+        unsafe { malloc(size).cast::<u8>() as u64 }
+    }
+    extern "win64" fn native_heap_free(_heap: u64, _flags: u32, ptr: u64) -> i32 {
+        if ptr == 0 {
+            return 0;
+        }
+        unsafe {
+            free(ptr as *mut c_void);
+        }
+        1
     }
 
     extern "win64" fn native_write_file(
@@ -435,7 +457,10 @@ mod imp {
     fn baseline_trampoline(name: &str) -> Option<u64> {
         match name {
             "GetCommandLineW" => Some(native_get_command_line_w as *const () as usize as u64),
+            "GetProcessHeap" => Some(native_get_process_heap as *const () as usize as u64),
             "GetStdHandle" => Some(native_get_std_handle as *const () as usize as u64),
+            "HeapAlloc" => Some(native_heap_alloc as *const () as usize as u64),
+            "HeapFree" => Some(native_heap_free as *const () as usize as u64),
             "WriteFile" => Some(native_write_file as *const () as usize as u64),
             "ExitProcess" => Some(native_exit_process as *const () as usize as u64),
             "CreateFileW" => Some(native_create_file_w as *const () as usize as u64),
