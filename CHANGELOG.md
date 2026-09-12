@@ -18,6 +18,8 @@ All notable changes to this project will be documented in this file.
   Rust allocator guest (`Vec`, `String`, `Box`, and `BTreeMap`).
   `rust_alloc_fs.exe` confirms allocation-backed formatting and WinFS I/O work
   together on the native path.
+  `rust_hashmap.exe` additionally covers native allocation growth, rehashing,
+  lookup, and removal.
   Imported programs outside that baseline remain on the interpreter.
 - Minimal `wincli` tool: `wincli app.exe` runs PE32+ x86_64 console apps,
   `wincli script.ps1` runs filesystem scripts, both on the same in-memory

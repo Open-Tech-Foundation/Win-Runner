@@ -154,6 +154,20 @@ fn native_backend_runs_rust_alloc_fs_guest() {
     assert!(output.stderr.is_empty());
 }
 
+#[test]
+fn native_backend_runs_rust_hashmap_guest() {
+    let bin = env!("CARGO_BIN_EXE_wincli");
+    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/artifacts/exe/rust_hashmap.exe");
+    let output = Command::new(bin)
+        .arg(exe)
+        .env("WINCLI_BACKEND", "native")
+        .output()
+        .expect("spawn native backend");
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"H1a\nH1\nH2\nH3\nH4\nH5\nPASS\n");
+    assert!(output.stderr.is_empty());
+}
+
 // ---------- 2: exit codes ----------
 
 #[test]
