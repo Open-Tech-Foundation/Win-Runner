@@ -16,6 +16,8 @@ All notable changes to this project will be documented in this file.
   `CloseHandle`, directory creation/removal, delete, copy, and move shims.
   `GetProcessHeap`, `HeapAlloc`, and `HeapFree` let the native backend run the
   Rust allocator guest (`Vec`, `String`, `Box`, and `BTreeMap`).
+  `rust_alloc_fs.exe` confirms allocation-backed formatting and WinFS I/O work
+  together on the native path.
   Imported programs outside that baseline remain on the interpreter.
 - Minimal `wincli` tool: `wincli app.exe` runs PE32+ x86_64 console apps,
   `wincli script.ps1` runs filesystem scripts, both on the same in-memory
