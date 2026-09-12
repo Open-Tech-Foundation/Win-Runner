@@ -21,7 +21,9 @@ child, but currently supports only the import set used by `rust_hello.exe`
 file/directory operations, plus the process heap used by `rust_alloc.exe`.
 The combined `rust_alloc_fs.exe` guest also passes. All other programs should
 use the default interpreter backend; `rust_hashmap.exe` is covered as a
-native heap stress test. This is not yet a general-purpose native PE runner.
+native heap stress test, and `rust_lang.exe` / `rust_fp.exe` cover broader
+control-flow and floating-point code. This is not yet a general-purpose native
+PE runner.
 
 Both share the exact same in-memory `WinFS`: case-insensitive lookup with
 original casing preserved, `C:\` + relative paths, `.`/`..` normalization.

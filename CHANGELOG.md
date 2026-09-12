@@ -20,6 +20,8 @@ All notable changes to this project will be documented in this file.
   together on the native path.
   `rust_hashmap.exe` additionally covers native allocation growth, rehashing,
   lookup, and removal.
+  Native regression coverage now includes the 16-phase `rust_lang.exe` guest
+  and `rust_fp.exe` floating-point workload.
   Imported programs outside that baseline remain on the interpreter.
 - Minimal `wincli` tool: `wincli app.exe` runs PE32+ x86_64 console apps,
   `wincli script.ps1` runs filesystem scripts, both on the same in-memory

@@ -168,6 +168,34 @@ fn native_backend_runs_rust_hashmap_guest() {
     assert!(output.stderr.is_empty());
 }
 
+#[test]
+fn native_backend_runs_rust_lang_guest() {
+    let bin = env!("CARGO_BIN_EXE_wincli");
+    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/artifacts/exe/rust_lang.exe");
+    let output = Command::new(bin)
+        .arg(exe)
+        .env("WINCLI_BACKEND", "native")
+        .output()
+        .expect("spawn native backend");
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"P1\nP2\nP3\nP4\nP5\nP6\nP7\nP8\nP9\nP10\nP11\nP12\nP13\nP14\nP15\nP16\nPASS\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn native_backend_runs_rust_fp_guest() {
+    let bin = env!("CARGO_BIN_EXE_wincli");
+    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/artifacts/exe/rust_fp.exe");
+    let output = Command::new(bin)
+        .arg(exe)
+        .env("WINCLI_BACKEND", "native")
+        .output()
+        .expect("spawn native backend");
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"FP-OK\n");
+    assert!(output.stderr.is_empty());
+}
+
 // ---------- 2: exit codes ----------
 
 #[test]
