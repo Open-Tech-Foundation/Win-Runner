@@ -91,6 +91,24 @@ fn native_backend_runs_rust_hello_guest() {
     assert!(output.stderr.is_empty());
 }
 
+#[test]
+fn native_backend_runs_rust_argv_guest() {
+    let bin = env!("CARGO_BIN_EXE_wincli");
+    let exe = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/artifacts/exe/rust_argv.exe"
+    );
+    let output = Command::new(bin)
+        .args([exe, "hello", "a b", "--version"])
+        .env("WINCLI_BACKEND", "native")
+        .output()
+        .expect("spawn native backend");
+    assert_eq!(output.status.code(), Some(0));
+    let expected = format!("{exe} hello \"a b\" --version\n");
+    assert_eq!(output.stdout, expected.as_bytes());
+    assert!(output.stderr.is_empty());
+}
+
 // ---------- 2: exit codes ----------
 
 #[test]

@@ -117,7 +117,7 @@ fn run_exe_file(path: &str, prog: &str, guest_args: &[String]) {    // NOTE: thi
 /// stdout as it happens.
 fn run_with_runner(img: &pe::PeImage, path: &str, prog: &str, guest_args: &[String]) {
     if std::env::var("WINCLI_BACKEND").as_deref() == Ok("native") {
-        match wincli::native::run_rust_baseline(img) {
+        match wincli::native::run_rust_baseline_argv(img, prog, guest_args) {
             Ok((code, out)) => {
                 let _ = std::io::stdout().write_all(&out);
                 std::process::exit(code as i32);

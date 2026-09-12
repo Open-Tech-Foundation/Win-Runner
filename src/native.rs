@@ -33,7 +33,17 @@ pub fn run_import_free(img: &PeImage) -> Result<u32, String> {
 /// makes `ExitProcess` safe and is the beginning of the native backend's
 /// isolation model.
 pub fn run_rust_baseline(img: &PeImage) -> Result<(u32, Vec<u8>), String> {
-    imp::run_rust_baseline(img)
+    run_rust_baseline_argv(img, "<exe>", &[])
+}
+
+/// Same as [`run_rust_baseline`], with the Windows command line supplied to
+/// guests importing `GetCommandLineW`.
+pub fn run_rust_baseline_argv(
+    img: &PeImage,
+    prog: &str,
+    args: &[String],
+) -> Result<(u32, Vec<u8>), String> {
+    imp::run_rust_baseline_argv(img, prog, args)
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -41,6 +51,8 @@ mod imp {
     use super::PeImage;
     use std::ffi::c_void;
     use std::ptr;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
 
     const PROT_READ: i32 = 0x1;
     const PROT_WRITE: i32 = 0x2;
@@ -50,6 +62,10 @@ mod imp {
     // Linux-specific. Unlike MAP_FIXED, this never replaces an existing map.
     const MAP_FIXED_NOREPLACE: i32 = 0x100000;
     const MAP_FAILED: *mut c_void = usize::MAX as *mut c_void;
+
+    // Preferred-base PE mappings collide by design. Serialize native runs in
+    // this process until relocations allow separate address-space layouts.
+    static NATIVE_RUN_LOCK: Mutex<()> = Mutex::new(());
 
     unsafe extern "C" {
         fn mmap(
@@ -145,6 +161,9 @@ mod imp {
     }
 
     pub(super) fn run_import_free(img: &PeImage) -> Result<u32, String> {
+        let _run = NATIVE_RUN_LOCK
+            .lock()
+            .map_err(|_| "native backend execution lock is poisoned".to_string())?;
         if !img.imports.is_empty() || !img.stubs.is_empty() {
             return Err(
                 "native backend does not yet support PE imports; use the interpreter backend"
@@ -173,7 +192,23 @@ mod imp {
         Ok(unsafe { entry_fn() })
     }
 
-    const RUST_BASELINE: &[&str] = &["ExitProcess", "GetStdHandle", "WriteFile"];
+    const RUST_BASELINE: &[&str] = &[
+        "ExitProcess",
+        "GetCommandLineW",
+        "GetStdHandle",
+        "WriteFile",
+    ];
+
+    // The command-line buffer is owned by the parent until it reaps the
+    // native guest. The child inherits it on fork, so the guest receives a
+    // normal process-valid UTF-16 pointer. Native runs are CLI-process local;
+    // broader concurrent execution will replace this bootstrap slot with a
+    // per-process shim context.
+    static COMMAND_LINE_W: AtomicU64 = AtomicU64::new(0);
+
+    extern "win64" fn native_get_command_line_w() -> u64 {
+        COMMAND_LINE_W.load(Ordering::Acquire)
+    }
 
     extern "win64" fn native_get_std_handle(which: u32) -> u64 {
         match which as i32 {
@@ -214,6 +249,7 @@ mod imp {
 
     fn baseline_trampoline(name: &str) -> Option<u64> {
         match name {
+            "GetCommandLineW" => Some(native_get_command_line_w as *const () as usize as u64),
             "GetStdHandle" => Some(native_get_std_handle as *const () as usize as u64),
             "WriteFile" => Some(native_write_file as *const () as usize as u64),
             "ExitProcess" => Some(native_exit_process as *const () as usize as u64),
@@ -256,7 +292,27 @@ mod imp {
         Ok(entry)
     }
 
-    pub(super) fn run_rust_baseline(img: &PeImage) -> Result<(u32, Vec<u8>), String> {
+    fn command_line_w(prog: &str, args: &[String]) -> Result<Vec<u16>, String> {
+        let mut line = crate::pe::emu::quote_arg(prog);
+        for arg in args {
+            line.push(' ');
+            line.push_str(&crate::pe::emu::quote_arg(arg));
+        }
+        let wide: Vec<u16> = line.encode_utf16().chain(std::iter::once(0)).collect();
+        if wide.len() * 2 > crate::pe::emu::CMDLINE_SIZE {
+            return Err("command line too long (64K guest block)".to_string());
+        }
+        Ok(wide)
+    }
+
+    pub(super) fn run_rust_baseline_argv(
+        img: &PeImage,
+        prog: &str,
+        args: &[String],
+    ) -> Result<(u32, Vec<u8>), String> {
+        let _run = NATIVE_RUN_LOCK
+            .lock()
+            .map_err(|_| "native backend execution lock is poisoned".to_string())?;
         if img.tls.is_some() || !img.stubs.is_empty() {
             return Err(
                 "native Rust baseline does not yet support TLS or stub imports".to_string(),
@@ -265,6 +321,8 @@ mod imp {
         let entry = entry(img)?;
         let mapping = map(img)?;
         patch_baseline_imports(&mapping, img)?;
+        let cmdline = command_line_w(prog, args)?;
+        COMMAND_LINE_W.store(cmdline.as_ptr() as u64, Ordering::Release);
         let mut fds = [-1, -1];
         if unsafe { pipe(fds.as_mut_ptr()) } != 0 {
             return Err(format!(
@@ -331,6 +389,7 @@ mod imp {
                 std::io::Error::last_os_error()
             ));
         }
+        COMMAND_LINE_W.store(0, Ordering::Release);
         if status & 0x7f != 0 {
             return Err(format!(
                 "native guest terminated by signal {}",
@@ -349,7 +408,11 @@ mod imp {
         Err("native backend is available only on Linux x86_64".to_string())
     }
 
-    pub(super) fn run_rust_baseline(_: &PeImage) -> Result<(u32, Vec<u8>), String> {
+    pub(super) fn run_rust_baseline_argv(
+        _: &PeImage,
+        _: &str,
+        _: &[String],
+    ) -> Result<(u32, Vec<u8>), String> {
         Err("native backend is available only on Linux x86_64".to_string())
     }
 }
@@ -391,5 +454,24 @@ mod tests {
         let (code, out) = run_rust_baseline(&img).expect("native rust hello runs");
         assert_eq!(code, 0);
         assert_eq!(out, b"Hello from Rust");
+    }
+
+    #[test]
+    fn executes_the_checked_in_rust_argv_guest_with_native_trampolines() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/artifacts/exe/rust_argv.exe"
+        );
+        let bytes = std::fs::read(path).expect("checked-in guest exists");
+        let img = load(&bytes).expect("rust argv loads");
+        let args = [
+            "hello".to_string(),
+            "a b".to_string(),
+            "--version".to_string(),
+        ];
+        let (code, out) =
+            run_rust_baseline_argv(&img, "myprog.exe", &args).expect("native rust argv runs");
+        assert_eq!(code, 0);
+        assert_eq!(out, b"myprog.exe hello \"a b\" --version\n");
     }
 }
