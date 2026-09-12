@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Initial opt-in native Linux/x86-64 PE backend: maps an import-free,
+  TLS-free PE32+ fixture at its preferred image base and invokes a returning
+  Windows-x64 entry point directly on the host CPU. `WINCLI_BACKEND=native`
+  additionally runs `rust_hello.exe`-class guests in a child process through
+  IAT trampolines for `GetStdHandle`, `WriteFile`, and `ExitProcess`.
+  Imported programs outside that baseline remain on the interpreter.
 - Minimal `wincli` tool: `wincli app.exe` runs PE32+ x86_64 console apps,
   `wincli script.ps1` runs filesystem scripts, both on the same in-memory
   `WinFS` (case-insensitive, `.`/`..` aware, no host filesystem access).

@@ -116,6 +116,18 @@ fn run_exe_file(path: &str, prog: &str, guest_args: &[String]) {    // NOTE: thi
 /// Execute a loaded image with guest argv. Console output streams to host
 /// stdout as it happens.
 fn run_with_runner(img: &pe::PeImage, path: &str, prog: &str, guest_args: &[String]) {
+    if std::env::var("WINCLI_BACKEND").as_deref() == Ok("native") {
+        match wincli::native::run_rust_baseline(img) {
+            Ok((code, out)) => {
+                let _ = std::io::stdout().write_all(&out);
+                std::process::exit(code as i32);
+            }
+            Err(e) => {
+                eprintln!("wincli: native backend failed for {path}: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
     let fs = WinFs::new();
     let runner = match winapi::Runner::with_argv(img, fs, prog, guest_args) {
         Ok(r) => r,

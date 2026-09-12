@@ -1,6 +1,7 @@
 pub mod deflate;
 pub mod inspect;
 pub mod install;
+pub mod native;
 pub mod pe;
 pub mod ps1;
 pub mod shell;
