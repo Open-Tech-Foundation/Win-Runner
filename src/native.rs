@@ -132,11 +132,11 @@ mod imp {
     mod protection_tests {
         use super::{
             command_line_a, linux_protection, native_delete_critical_section,
-            native_enter_critical_section, native_get_file_type, native_get_last_error,
-            native_get_proc_address, native_get_startup_info_w,
-            native_initialize_critical_section_ex, native_leave_critical_section,
-            native_set_last_error, uppercase_ascii_utf16, API_SET_MODULE, PROT_EXEC, PROT_READ,
-            PROT_WRITE,
+            native_enter_critical_section, native_get_acp, native_get_file_type,
+            native_get_last_error, native_get_oem_cp, native_get_proc_address,
+            native_get_startup_info_w, native_initialize_critical_section_ex,
+            native_is_valid_code_page, native_leave_critical_section, native_set_last_error,
+            uppercase_ascii_utf16, API_SET_MODULE, PROT_EXEC, PROT_READ, PROT_WRITE,
         };
 
         #[test]
@@ -220,6 +220,19 @@ mod imp {
         fn converts_command_lines_to_a_null_terminated_ansi_view() {
             assert_eq!(command_line_a(&['r' as u16, 'g' as u16, 0]), b"rg\0");
             assert_eq!(command_line_a(&[0x00e9, 0]), b"?\0");
+        }
+
+        #[test]
+        fn reports_a_consistent_single_byte_windows_code_page() {
+            assert_eq!(native_get_acp(), 1252);
+            assert_eq!(native_get_oem_cp(), 1252);
+        }
+
+        #[test]
+        fn validates_only_implemented_code_pages() {
+            assert_eq!(native_is_valid_code_page(1252), 1);
+            assert_eq!(native_is_valid_code_page(65001), 1);
+            assert_eq!(native_is_valid_code_page(932), 0);
         }
     }
 
@@ -416,6 +429,18 @@ mod imp {
             0..=2 => 0x0002, // FILE_TYPE_CHAR
             _ => 0,
         }
+    }
+
+    extern "win64" fn native_get_acp() -> u32 {
+        1252
+    }
+
+    extern "win64" fn native_get_oem_cp() -> u32 {
+        1252
+    }
+
+    extern "win64" fn native_is_valid_code_page(code_page: u32) -> i32 {
+        matches!(code_page, 1252 | 65001) as i32
     }
 
     extern "win64" fn native_get_process_heap() -> u64 {
@@ -869,6 +894,9 @@ mod imp {
             }
             "GetStdHandle" => Some(native_get_std_handle as *const () as usize as u64),
             "GetFileType" => Some(native_get_file_type as *const () as usize as u64),
+            "GetACP" => Some(native_get_acp as *const () as usize as u64),
+            "GetOEMCP" => Some(native_get_oem_cp as *const () as usize as u64),
+            "IsValidCodePage" => Some(native_is_valid_code_page as *const () as usize as u64),
             "HeapAlloc" => Some(native_heap_alloc as *const () as usize as u64),
             "HeapFree" => Some(native_heap_free as *const () as usize as u64),
             "WriteFile" => Some(native_write_file as *const () as usize as u64),
