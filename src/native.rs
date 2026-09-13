@@ -103,6 +103,7 @@ mod imp {
     static NATIVE_THREADS: LazyLock<Mutex<HashMap<u64, std::thread::JoinHandle<u32>>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
     static NATIVE_THREAD_NEXT: AtomicU64 = AtomicU64::new(0x8000_0000);
+    static NATIVE_TIMER_NEXT: AtomicU64 = AtomicU64::new(0x7000_0000);
 
     unsafe extern "C" {
         fn mmap(
@@ -165,11 +166,12 @@ mod imp {
     mod protection_tests {
         use super::{
             command_line_a, linux_protection, native_add_vectored_exception_handler,
-            native_delete_critical_section, native_enter_critical_section, native_extended_path,
-            native_file_attributes, native_format_message_w, native_free_environment_strings_w,
-            native_get_acp, native_get_computer_name_ex_w, native_get_console_mode,
-            native_get_console_output_cp, native_get_console_screen_buffer_info,
-            native_get_cp_info, native_get_current_directory_w, native_get_current_thread,
+            native_create_waitable_timer_ex_w, native_delete_critical_section,
+            native_enter_critical_section, native_extended_path, native_file_attributes,
+            native_format_message_w, native_free_environment_strings_w, native_get_acp,
+            native_get_computer_name_ex_w, native_get_console_mode, native_get_console_output_cp,
+            native_get_console_screen_buffer_info, native_get_cp_info,
+            native_get_current_directory_w, native_get_current_thread,
             native_get_environment_strings_w, native_get_environment_variable_w,
             native_get_file_type, native_get_full_path_name_w, native_get_last_error,
             native_get_module_file_name_w, native_get_module_handle_a,
@@ -181,9 +183,10 @@ mod imp {
             native_leave_critical_section, native_multi_byte_to_wide_char, native_process_prng,
             native_query_performance_frequency, native_set_console_mode, native_set_file_time,
             native_set_last_error, native_set_thread_stack_guarantee,
-            native_set_unhandled_exception_filter, native_wait_on_address,
-            native_wide_char_to_multi_byte, native_write_console_w, uppercase_ascii_utf16,
-            API_SET_MODULE, NATIVE_IMAGE_BASE, PROT_EXEC, PROT_READ, PROT_WRITE,
+            native_set_unhandled_exception_filter, native_set_waitable_timer,
+            native_wait_on_address, native_wide_char_to_multi_byte, native_write_console_w,
+            uppercase_ascii_utf16, API_SET_MODULE, NATIVE_IMAGE_BASE, PROT_EXEC, PROT_READ,
+            PROT_WRITE,
         };
         use std::sync::atomic::Ordering;
 
@@ -348,6 +351,16 @@ mod imp {
             assert_eq!(
                 native_wait_on_address(std::ptr::null(), (&expected as *const u8).cast(), 1, 0),
                 0
+            );
+        }
+
+        #[test]
+        fn creates_an_immediately_signaled_waitable_timer() {
+            let timer = native_create_waitable_timer_ex_w(std::ptr::null(), std::ptr::null(), 0, 0);
+            assert_ne!(timer, 0);
+            assert_eq!(
+                native_set_waitable_timer(timer, std::ptr::null(), 0, 0, 0, 0),
+                1
             );
         }
 
@@ -905,6 +918,7 @@ mod imp {
                 let _ = join.join();
                 0
             }
+            None if (0x7000_0000..0x8000_0000).contains(&handle) => 0,
             None => 0xffff_ffff,
         }
     }
@@ -921,6 +935,24 @@ mod imp {
         1
     }
     extern "win64" fn native_wake_by_address(_address: *const u8) {}
+    extern "win64" fn native_create_waitable_timer_ex_w(
+        _attributes: *const u8,
+        _name: *const u16,
+        _flags: u32,
+        _access: u32,
+    ) -> u64 {
+        NATIVE_TIMER_NEXT.fetch_add(1, Ordering::AcqRel)
+    }
+    extern "win64" fn native_set_waitable_timer(
+        handle: u64,
+        _due_time: *const i64,
+        _period: i32,
+        _completion: u64,
+        _arg: u64,
+        _resume: i32,
+    ) -> i32 {
+        (0x7000_0000..0x8000_0000).contains(&handle) as i32
+    }
     struct NativeFs {
         fs: WinFs,
         handles: HashMap<u64, NativeFile>,
@@ -2228,6 +2260,10 @@ mod imp {
             "WakeByAddressAll" | "WakeByAddressSingle" => {
                 Some(native_wake_by_address as *const () as usize as u64)
             }
+            "CreateWaitableTimerExW" => {
+                Some(native_create_waitable_timer_ex_w as *const () as usize as u64)
+            }
+            "SetWaitableTimer" => Some(native_set_waitable_timer as *const () as usize as u64),
             "ReadFile" => Some(native_read_file as *const () as usize as u64),
             "CloseHandle" => Some(native_close_handle as *const () as usize as u64),
             "CreateDirectoryW" => Some(native_create_directory_w as *const () as usize as u64),
