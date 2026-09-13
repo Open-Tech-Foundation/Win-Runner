@@ -1,4 +1,5 @@
-//! `wincli shell`: interactive command shell with one WinFS per session.
+//! Interactive and host-controlled runner shells with one fresh WinFs image
+//! per session.
 //!
 //! Each input line is, in order: an `exit`/`quit`, an `install`/`inspect`
 //! command, a host `.exe`/`.ps1` file, a cached package
@@ -34,10 +35,15 @@ impl Default for Shell {
 impl Shell {
     pub fn new() -> Self {
         Shell {
-            fs: WinFs::new(),
+            fs: WinFs::ephemeral_runner(),
             sess: ps1::Session::default(),
             last_code: 0,
         }
+    }
+
+    /// Windows working directory visible to the shell prompt and tests.
+    pub fn cwd(&self) -> String {
+        self.fs.cwd()
     }
 
     /// Execute one input line; guest/PS1 output is appended to `out`.
@@ -136,8 +142,8 @@ impl Shell {
     }
 
     /// Run an EXE with the session filesystem; the FS comes back with the
-    /// exit code. A failed run resets the session FS (it is unrecoverable
-    /// from a consumed runner).
+    /// exit code. A failed run resets the session to a clean runner image
+    /// (the interpreter runner has consumed its filesystem state).
     fn run_exe_file(
         &mut self,
         path: &str,
@@ -148,7 +154,7 @@ impl Shell {
         let data =
             std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
         let img = pe::load(&data).map_err(|e| format!("failed to load {path}: {e}"))?;
-        let fs = std::mem::replace(&mut self.fs, WinFs::new());
+        let fs = std::mem::replace(&mut self.fs, WinFs::ephemeral_runner());
         let runner = winapi::Runner::with_argv(&img, fs, prog, guest_args)
             .map_err(|e| format!("failed to start {path}: {e}"))?;
         match runner.run() {
@@ -235,19 +241,17 @@ fn split_line(line: &str) -> Vec<String> {
     out
 }
 
-/// Interactive loop. Returns the process exit code. The prompt goes to
-/// stderr (stdout stays clean for pipes); EOF ends with the last code.
-pub fn run_shell() -> i32 {
+fn run_session(prompt_enabled: bool) -> i32 {
     let stdin = std::io::stdin();
-    let tty = std::io::IsTerminal::is_terminal(&stdin);
+    let tty = prompt_enabled && std::io::IsTerminal::is_terminal(&stdin);
     let mut shell = Shell::new();
-    let prompt = || {
+    let prompt = |shell: &Shell| {
         if tty {
-            eprint!("PS C:\\> ");
+            eprint!("PS {}> ", shell.cwd());
             let _ = std::io::stderr().flush();
         }
     };
-    prompt();
+    prompt(&shell);
     for line in stdin.lock().lines() {
         let line = match line {
             Ok(l) => l,
@@ -268,9 +272,23 @@ pub fn run_shell() -> i32 {
                 eprintln!("wincli: {e}");
             }
         }
-        prompt();
+        prompt(&shell);
     }
     shell.last_code
+}
+
+/// Interactive loop. Returns the process exit code. The prompt goes to
+/// stderr (stdout stays clean for pipes); EOF ends with the last code.
+pub fn run_shell() -> i32 {
+    run_session(true)
+}
+
+/// Host-controlled runner loop. It consumes job commands from standard input
+/// without a prompt, boots one fresh ephemeral WinFs image, and destroys that
+/// image when the input closes. This is the local control-plane seam for a
+/// future GitHub Actions protocol adapter.
+pub fn run_runner() -> i32 {
+    run_session(false)
 }
 
 #[cfg(test)]
@@ -298,6 +316,12 @@ mod tests {
             Ok(ShellFlow::Continue)
         ));
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn shell_boots_an_ephemeral_runner_image() {
+        let shell = Shell::new();
+        assert_eq!(shell.cwd(), r"C:\actions-runner\_work");
     }
 
     #[test]

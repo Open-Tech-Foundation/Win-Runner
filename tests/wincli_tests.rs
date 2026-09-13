@@ -1004,29 +1004,42 @@ fn test_art_exe_rust_memcpy() {
 
 // ---------- interactive shell (piped stdin, no network) ----------
 
-fn run_shell_env(input: &str, envs: &[(&str, &str)]) -> (i32, String, String) {
+fn run_session_env(mode: &str, input: &str, envs: &[(&str, &str)]) -> (i32, String, String) {
     use std::io::Write;
     let bin = env!("CARGO_BIN_EXE_wincli");
     let mut child = std::process::Command::new(bin)
-        .arg("shell")
+        .arg(mode)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .envs(envs.iter().copied())
         .spawn()
-        .expect("spawn wincli shell");
+        .expect("spawn wincli session");
     child
         .stdin
         .take()
-        .expect("shell stdin")
+        .expect("session stdin")
         .write_all(input.as_bytes())
-        .expect("write shell input");
-    let output = child.wait_with_output().expect("wait shell");
+        .expect("write session input");
+    let output = child.wait_with_output().expect("wait session");
     (
         output.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&output.stdout).to_string(),
         String::from_utf8_lossy(&output.stderr).to_string(),
     )
+}
+
+fn run_shell_env(input: &str, envs: &[(&str, &str)]) -> (i32, String, String) {
+    run_session_env("shell", input, envs)
+}
+
+#[test]
+fn test_runner_executes_host_controlled_ephemeral_job() {
+    let input = "New-Item C:\\actions-runner\\_work\\job.txt -Value ready\nGet-Content C:\\actions-runner\\_work\\job.txt\nexit\n";
+    let (code, stdout, stderr) = run_session_env("runner", input, &[]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "ready\n");
+    assert!(stderr.is_empty(), "stderr: {stderr}");
 }
 
 #[test]

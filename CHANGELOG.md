@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- `wincli shell` now boots the same ephemeral runner image as native
+  launches, starts in `C:\\actions-runner\\_work`, and discards it when the
+  session exits. `wincli runner` is its non-interactive, stdin-driven
+  host-control counterpart, providing the initial lifecycle seam for a
+  GitHub Actions protocol adapter.
 - Native launches now boot a fresh, child-local runner WinFs image rather
   than a bare filesystem root. The ephemeral image supplies Windows system,
   runner, work, diagnostics, user-profile, and temp directories and starts

@@ -7,7 +7,8 @@ fn usage() -> ! {
     eprintln!("  wincli <app.exe|pkg> [args...]  run a Windows program (host path,");
     eprintln!("                                  cached package, or C:\\bin\\<exe>)");
     eprintln!("  wincli <script.ps1>             run a script (no args yet)");
-    eprintln!("  wincli shell                    interactive shell (one WinFS per session)");
+    eprintln!("  wincli shell                    interactive ephemeral runner shell");
+    eprintln!("  wincli runner                   run host-controlled job commands from stdin");
     eprintln!("  wincli inspect <app.exe|pkg>  report PE imports vs supported APIs");
     eprintln!("  wincli install <pkg>          install a package into the cache");
     eprintln!("env: WINCLI_CACHE (default ~/.cache/wincli), WINCLI_SOURCE (package dir)");
@@ -25,6 +26,9 @@ fn main() {
     }
     if args.len() == 2 && args[1] == "shell" {
         std::process::exit(wincli::shell::run_shell());
+    }
+    if args.len() == 2 && args[1] == "runner" {
+        std::process::exit(wincli::shell::run_runner());
     }
     if args.len() < 2 {
         usage();
