@@ -6,6 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added a native distinct-address mapping primitive that reserves a kernel
+  selected range, rebases the child PE to that actual address, and copies the
+  relocated image for the upcoming child launcher.
 - Added checked PE rebasing: validated DIR64 relocation targets can now be
   adjusted for a distinct mapping base, with positive/negative delta and
   overflow coverage.

@@ -888,6 +888,75 @@ mod imp {
         })
     }
 
+    /// Reserve a non-conflicting host address and rebase a child image to the
+    /// address actually chosen by the kernel.
+    #[allow(dead_code)] // attached to CreateProcessW's child launcher next
+    fn map_relocated(img: &PeImage) -> Result<(Mapping, PeImage), String> {
+        let len = page_len(img.image.len())?;
+        let raw = unsafe {
+            mmap(
+                ptr::null_mut(),
+                len,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if raw == MAP_FAILED {
+            return Err(format!(
+                "native backend could not reserve relocated image: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let mapping = Mapping {
+            ptr: raw.cast(),
+            len,
+        };
+        let mut relocated = img.clone();
+        if let Err(error) = crate::pe::rebase(&mut relocated, raw as u64) {
+            return Err(format!("native backend could not rebase image: {error}"));
+        }
+        unsafe {
+            ptr::copy_nonoverlapping(relocated.image.as_ptr(), mapping.ptr, relocated.image.len())
+        };
+        Ok((mapping, relocated))
+    }
+
+    #[cfg(test)]
+    mod relocated_map_tests {
+        use super::{map_relocated, PeImage};
+
+        #[test]
+        fn maps_at_the_reserved_address_and_applies_dir64_delta() {
+            let mut bytes = vec![0; 16];
+            bytes[..8].copy_from_slice(&0x1400_0010_0u64.to_le_bytes());
+            let image = PeImage {
+                image_base: 0x1400_0000_0,
+                entry_rva: 0,
+                size_of_image: 16,
+                image: bytes,
+                imports: vec![],
+                stubs: vec![],
+                unsupported: vec![],
+                tls: None,
+                iat_slots: vec![],
+                code_ranges: vec![],
+                relocations: vec![0],
+            };
+            let (mapping, relocated) = map_relocated(&image).unwrap();
+            assert_eq!(relocated.image_base, mapping.ptr as u64);
+            let value = unsafe {
+                u64::from_le_bytes(
+                    std::slice::from_raw_parts(mapping.ptr, 8)
+                        .try_into()
+                        .unwrap(),
+                )
+            };
+            assert_eq!(value, mapping.ptr as u64 + 0x100);
+        }
+    }
+
     fn protect_exec(mapping: &Mapping) -> Result<(), String> {
         // PE sections need individual protections. Until the native mapper
         // carries section characteristics, keep the image RWX so CRT startup
