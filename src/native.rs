@@ -182,13 +182,14 @@ mod imp {
     #[cfg(test)]
     mod protection_tests {
         use super::{
-            command_line_a, linux_protection, native_add_vectored_exception_handler,
-            native_close_handle, native_create_process_w, native_create_waitable_timer_ex_w,
-            native_delete_critical_section, native_enter_critical_section, native_extended_path,
-            native_file_attributes, native_format_message_w, native_free_environment_strings_w,
-            native_get_acp, native_get_computer_name_ex_w, native_get_console_mode,
-            native_get_console_output_cp, native_get_console_screen_buffer_info,
-            native_get_cp_info, native_get_current_directory_w, native_get_current_process,
+            command_line_a, linux_protection, load_native_child_image,
+            native_add_vectored_exception_handler, native_close_handle, native_create_process_w,
+            native_create_waitable_timer_ex_w, native_delete_critical_section,
+            native_enter_critical_section, native_extended_path, native_file_attributes,
+            native_format_message_w, native_free_environment_strings_w, native_get_acp,
+            native_get_computer_name_ex_w, native_get_console_mode, native_get_console_output_cp,
+            native_get_console_screen_buffer_info, native_get_cp_info,
+            native_get_current_directory_w, native_get_current_process,
             native_get_current_process_id, native_get_current_thread,
             native_get_environment_strings_w, native_get_environment_variable_w,
             native_get_exit_code_process, native_get_file_type, native_get_full_path_name_w,
@@ -204,7 +205,8 @@ mod imp {
             native_set_unhandled_exception_filter, native_set_waitable_timer,
             native_terminate_process, native_wait_for_single_object, native_wait_on_address,
             native_wide_char_to_multi_byte, native_write_console_w, parse_windows_command_line,
-            process_ctx, uppercase_ascii_utf16, API_SET_MODULE, PROT_EXEC, PROT_READ, PROT_WRITE,
+            process_ctx, uppercase_ascii_utf16, NativeLaunchSpec, API_SET_MODULE, PROT_EXEC,
+            PROT_READ, PROT_WRITE,
         };
         use crate::winfs::WinFs;
 
@@ -315,6 +317,36 @@ mod imp {
                 ),
                 Err(267)
             );
+        }
+
+        #[test]
+        fn loads_child_pe_images_only_from_the_guest_filesystem() {
+            let mut fs = WinFs::new();
+            fs.write_file(r"C:\child.exe", crate::pe::builder::hello("child"))
+                .unwrap();
+            let launch =
+                native_launch_spec(Some(r"C:\child.exe".to_string()), None, None, &fs).unwrap();
+            assert!(!load_native_child_image(&fs, &launch)
+                .unwrap()
+                .image
+                .is_empty());
+            assert_eq!(
+                load_native_child_image(
+                    &fs,
+                    &NativeLaunchSpec {
+                        application: r"C:\missing.exe".to_string(),
+                        command_line: String::new(),
+                        arguments: vec![],
+                        current_directory: r"C:\".to_string(),
+                    },
+                )
+                .unwrap_err(),
+                2
+            );
+            fs.write_file(r"C:\bad.exe", b"not a PE".to_vec()).unwrap();
+            let invalid =
+                native_launch_spec(Some(r"C:\bad.exe".to_string()), None, None, &fs).unwrap();
+            assert_eq!(load_native_child_image(&fs, &invalid).unwrap_err(), 193);
         }
 
         #[test]
@@ -1346,6 +1378,11 @@ mod imp {
             current_directory,
         })
     }
+
+    fn load_native_child_image(fs: &WinFs, launch: &NativeLaunchSpec) -> Result<PeImage, u32> {
+        let bytes = fs.read_file(&launch.application).map_err(|_| 2u32)?; // ERROR_FILE_NOT_FOUND
+        crate::pe::load(&bytes).map_err(|_| 193u32) // ERROR_BAD_EXE_FORMAT
+    }
     fn fs_ctx() -> Option<Arc<Mutex<NativeFs>>> {
         process_ctx().map(|process| Arc::clone(&process.fs))
     }
@@ -2321,14 +2358,21 @@ mod imp {
             native_set_last_error(87);
             return 0;
         }
-        if let Err(error) = native_launch_spec(application, command_line, current_directory, &fs.fs)
+        let launch = match native_launch_spec(application, command_line, current_directory, &fs.fs)
         {
+            Ok(launch) => launch,
+            Err(error) => {
+                native_set_last_error(error);
+                return 0;
+            }
+        };
+        if let Err(error) = load_native_child_image(&fs.fs, &launch) {
             native_set_last_error(error);
             return 0;
         }
-        // Parsing and filesystem validation are now process-local. Starting
-        // the parsed PE still waits on the child registry and distinct mapped
-        // image/TLS context implemented in the next slice.
+        // Parsing, WinFs resolution, and PE validation are process-local.
+        // Starting the loaded image still waits on a separate mapped image,
+        // TLS/TEB/PEB context, and shared filesystem broker.
         native_set_last_error(120); // ERROR_CALL_NOT_IMPLEMENTED
         0
     }

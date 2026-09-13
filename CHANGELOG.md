@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- `CreateProcessW` now loads child executable bytes only from WinFs and
+  validates them as supported PE images. Missing guest files report
+  `ERROR_FILE_NOT_FOUND`; malformed or unsupported PE files report
+  `ERROR_BAD_EXE_FORMAT` before the separate-image launch boundary.
 - Native processes now own a child-process registry with unique process IDs
   and closable handles. `GetExitCodeProcess`, `TerminateProcess`, and
   `WaitForSingleObject` use those records, including active, timeout, exit,
