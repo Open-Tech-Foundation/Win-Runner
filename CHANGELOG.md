@@ -68,7 +68,9 @@ All notable changes to this project will be documented in this file.
   `GetModuleHandleW(NULL)` and `GetModuleHandleExW` return the mapped main
   module. `CreateFileW` accepts existing WinFs directories for enumeration,
   `GetFileInformationByHandle` reports directory-aware WinFs metadata, and
-  `GetFinalPathNameByHandleW` returns extended WinFs paths.
+  `GetFinalPathNameByHandleW` returns extended WinFs paths. WinFs directory
+  enumeration now supports `FindFirstFileExW`, `FindNextFileW`, and
+  `FindClose`.
   `VirtualProtect`
   translates the standard page-access modes to page-aligned Linux mappings.
   A narrow API-set pseudo-module resolves the CRT's dynamic `CompareStringEx`

@@ -755,6 +755,10 @@ mod imp {
         path: String,
         offset: usize,
     }
+    struct NativeFind {
+        names: Vec<String>,
+        index: usize,
+    }
     struct NativeTls {
         teb: Box<[u8; 0x1000]>,
         slots: Box<[u64; 64]>,
@@ -798,6 +802,7 @@ mod imp {
     struct NativeFs {
         fs: WinFs,
         handles: HashMap<u64, NativeFile>,
+        finds: HashMap<u64, NativeFind>,
         next: u64,
     }
 
@@ -1383,6 +1388,89 @@ mod imp {
         unsafe { output.copy_from_nonoverlapping(encoded.as_ptr(), encoded.len()) };
         (encoded.len() - 1) as u32
     }
+    fn native_find_directory(pattern: &str) -> String {
+        let path = pattern
+            .strip_prefix(r"\\?\")
+            .unwrap_or(pattern)
+            .replace('/', "\\");
+        path.strip_suffix("\\*")
+            .unwrap_or(&path)
+            .trim_end_matches('\\')
+            .to_string()
+    }
+    fn native_write_find_data(output: *mut u8, name: &str) -> bool {
+        let name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        if output.is_null() || name.len() > 260 {
+            return false;
+        }
+        unsafe {
+            std::ptr::write_bytes(output, 0, 592);
+            output
+                .add(44)
+                .cast::<u16>()
+                .copy_from_nonoverlapping(name.as_ptr(), name.len());
+        }
+        true
+    }
+    extern "win64" fn native_find_first_file_ex_w(
+        pattern: *const u16,
+        _info_level: u32,
+        output: *mut u8,
+        _search_op: u32,
+        _filter: u64,
+        _flags: u32,
+    ) -> u64 {
+        let pattern = match wide(pattern) {
+            Some(value) => value,
+            None => return u64::MAX,
+        };
+        let ctx = match unsafe { fs_ctx() } {
+            Some(value) => value,
+            None => return u64::MAX,
+        };
+        let names = match ctx.fs.list_dir(&native_find_directory(&pattern)) {
+            Ok(value) => value,
+            Err(_) => {
+                native_set_last_error(3);
+                return u64::MAX;
+            }
+        };
+        let Some(first) = names.first() else {
+            native_set_last_error(2);
+            return u64::MAX;
+        };
+        if !native_write_find_data(output, first) {
+            native_set_last_error(87);
+            return u64::MAX;
+        }
+        let handle = ctx.next;
+        ctx.next += 1;
+        ctx.finds.insert(handle, NativeFind { names, index: 0 });
+        handle
+    }
+    extern "win64" fn native_find_next_file_w(handle: u64, output: *mut u8) -> i32 {
+        let ctx = match unsafe { fs_ctx() } {
+            Some(value) => value,
+            None => return 0,
+        };
+        let find = match ctx.finds.get_mut(&handle) {
+            Some(value) => value,
+            None => return 0,
+        };
+        find.index += 1;
+        let Some(name) = find.names.get(find.index) else {
+            native_set_last_error(18);
+            return 0;
+        };
+        native_write_find_data(output, name) as i32
+    }
+    extern "win64" fn native_find_close(handle: u64) -> i32 {
+        unsafe {
+            fs_ctx()
+                .map(|ctx| ctx.finds.remove(&handle).is_some())
+                .unwrap_or(false) as i32
+        }
+    }
     extern "win64" fn native_get_user_profile_directory_w(
         _token: u64,
         output: *mut u16,
@@ -1833,7 +1921,7 @@ mod imp {
     extern "win64" fn native_close_handle(h: u64) -> i32 {
         unsafe {
             fs_ctx()
-                .map(|c| c.handles.remove(&h).is_some())
+                .map(|c| c.handles.remove(&h).is_some() || c.finds.remove(&h).is_some())
                 .unwrap_or(false) as i32
         }
     }
@@ -1997,6 +2085,9 @@ mod imp {
             "GetFinalPathNameByHandleW" => {
                 Some(native_get_final_path_name_by_handle_w as *const () as usize as u64)
             }
+            "FindFirstFileExW" => Some(native_find_first_file_ex_w as *const () as usize as u64),
+            "FindNextFileW" => Some(native_find_next_file_w as *const () as usize as u64),
+            "FindClose" => Some(native_find_close as *const () as usize as u64),
             "ReadFile" => Some(native_read_file as *const () as usize as u64),
             "CloseHandle" => Some(native_close_handle as *const () as usize as u64),
             "CreateDirectoryW" => Some(native_create_directory_w as *const () as usize as u64),
@@ -2083,6 +2174,7 @@ mod imp {
         let mut fs = NativeFs {
             fs: WinFs::new(),
             handles: HashMap::new(),
+            finds: HashMap::new(),
             next: 0x100,
         };
         COMMAND_LINE_W.store(cmdline.as_ptr() as u64, Ordering::Release);
