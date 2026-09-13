@@ -70,7 +70,9 @@ All notable changes to this project will be documented in this file.
   `GetFileInformationByHandle` reports directory-aware WinFs metadata, and
   `GetFinalPathNameByHandleW` returns extended WinFs paths. WinFs directory
   enumeration now supports `FindFirstFileExW`, `FindNextFileW`, and
-  `FindClose`.
+  `FindClose`. Native `CreateThread` now launches guest workers with cloned
+  TLS state, and `WaitForSingleObject` joins their Windows-style handles.
+  `QueryPerformanceFrequency` matches the native nanosecond counter.
   `VirtualProtect`
   translates the standard page-access modes to page-aligned Linux mappings.
   A narrow API-set pseudo-module resolves the CRT's dynamic `CompareStringEx`

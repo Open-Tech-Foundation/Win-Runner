@@ -54,7 +54,7 @@ mod imp {
     use std::ffi::c_void;
     use std::ptr;
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-    use std::sync::Mutex;
+    use std::sync::{LazyLock, Mutex};
 
     const PROT_READ: i32 = 0x1;
     const PROT_WRITE: i32 = 0x2;
@@ -98,6 +98,11 @@ mod imp {
     static NATIVE_RUN_LOCK: Mutex<()> = Mutex::new(());
     static NATIVE_LAST_ERROR: AtomicU32 = AtomicU32::new(0);
     static NATIVE_IMAGE_BASE: AtomicU64 = AtomicU64::new(0);
+    static NATIVE_GS_BASE: AtomicU64 = AtomicU64::new(0);
+    static NATIVE_TLS_TEMPLATE: Mutex<Option<NativeTls>> = Mutex::new(None);
+    static NATIVE_THREADS: LazyLock<Mutex<HashMap<u64, std::thread::JoinHandle<u32>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    static NATIVE_THREAD_NEXT: AtomicU64 = AtomicU64::new(0x8000_0000);
 
     unsafe extern "C" {
         fn mmap(
@@ -174,10 +179,11 @@ mod imp {
             native_heap_free, native_heap_realloc, native_initialize_critical_section_ex,
             native_initialize_slist_head, native_is_valid_code_page, native_lc_map_string_w,
             native_leave_critical_section, native_multi_byte_to_wide_char, native_process_prng,
-            native_set_console_mode, native_set_file_time, native_set_last_error,
-            native_set_thread_stack_guarantee, native_set_unhandled_exception_filter,
-            native_wide_char_to_multi_byte, native_write_console_w, uppercase_ascii_utf16,
-            API_SET_MODULE, NATIVE_IMAGE_BASE, PROT_EXEC, PROT_READ, PROT_WRITE,
+            native_query_performance_frequency, native_set_console_mode, native_set_file_time,
+            native_set_last_error, native_set_thread_stack_guarantee,
+            native_set_unhandled_exception_filter, native_wide_char_to_multi_byte,
+            native_write_console_w, uppercase_ascii_utf16, API_SET_MODULE, NATIVE_IMAGE_BASE,
+            PROT_EXEC, PROT_READ, PROT_WRITE,
         };
         use std::sync::atomic::Ordering;
 
@@ -318,6 +324,13 @@ mod imp {
                 u32::from_le_bytes(output[36..40].try_into().unwrap()),
                 65_536
             );
+        }
+
+        #[test]
+        fn supplies_a_nanosecond_performance_frequency() {
+            let mut frequency = 0;
+            assert_eq!(native_query_performance_frequency(&mut frequency), 1);
+            assert_eq!(frequency, 1_000_000_000);
         }
 
         #[test]
@@ -765,6 +778,23 @@ mod imp {
         _data: Vec<u8>,
         _ldr: Box<[u8; 64]>,
     }
+    impl NativeTls {
+        fn clone_for_thread(&self) -> Self {
+            let mut out = Self {
+                teb: self.teb.clone(),
+                slots: self.slots.clone(),
+                _data: self._data.clone(),
+                _ldr: self._ldr.clone(),
+            };
+            let teb = out.teb.as_ptr() as u64;
+            put64(&mut out.teb[..], 0x30, teb);
+            put64(&mut out.teb[..], 0x58, out.slots.as_ptr() as u64);
+            put64(&mut out.teb[..], 0x60, teb + 0x800);
+            out.slots[0] = out._data.as_ptr() as u64;
+            put64(&mut out.teb[..], 0x800 + 0x20, out._ldr.as_ptr() as u64);
+            out
+        }
+    }
 
     fn put64(dst: &mut [u8], off: usize, value: u64) {
         dst[off..off + 8].copy_from_slice(&value.to_le_bytes());
@@ -798,6 +828,67 @@ mod imp {
         let result: u64;
         core::arch::asm!("syscall", inlateout("rax") 158u64 => result, in("rdi") 0x1001u64, in("rsi") base, lateout("rcx") _, lateout("r11") _);
         result == 0
+    }
+    extern "win64" fn native_create_thread(
+        _security: u64,
+        stack_size: usize,
+        start: u64,
+        parameter: u64,
+        _flags: u32,
+        thread_id: *mut u32,
+    ) -> u64 {
+        if start == 0 {
+            native_set_last_error(87);
+            return 0;
+        }
+        let tls = NATIVE_TLS_TEMPLATE
+            .lock()
+            .ok()
+            .and_then(|value| value.as_ref().map(NativeTls::clone_for_thread));
+        let handle = NATIVE_THREAD_NEXT.fetch_add(1, Ordering::AcqRel);
+        let builder = std::thread::Builder::new().stack_size(stack_size.max(64 * 1024));
+        let spawned = builder.spawn(move || {
+            let _tls = tls;
+            if let Some(tls) = _tls.as_ref() {
+                if !unsafe { set_gs(tls.teb.as_ptr() as u64) } {
+                    return 1;
+                }
+            } else if NATIVE_GS_BASE.load(Ordering::Acquire) != 0 {
+                return 1;
+            }
+            let entry: unsafe extern "win64" fn(u64) -> u32 = unsafe { std::mem::transmute(start) };
+            unsafe { entry(parameter) }
+        });
+        let Ok(join) = spawned else {
+            native_set_last_error(8);
+            return 0;
+        };
+        if !thread_id.is_null() {
+            unsafe { thread_id.write(handle as u32) }
+        }
+        match NATIVE_THREADS.lock() {
+            Ok(mut threads) => {
+                threads.insert(handle, join);
+                handle
+            }
+            Err(_) => {
+                native_set_last_error(6);
+                0
+            }
+        }
+    }
+    extern "win64" fn native_wait_for_single_object(handle: u64, _milliseconds: u32) -> u32 {
+        let join = match NATIVE_THREADS.lock() {
+            Ok(mut threads) => threads.remove(&handle),
+            Err(_) => None,
+        };
+        match join {
+            Some(join) => {
+                let _ = join.join();
+                0
+            }
+            None => 0xffff_ffff,
+        }
     }
     struct NativeFs {
         fs: WinFs,
@@ -1168,6 +1259,13 @@ mod imp {
             .map(|d| d.as_nanos().min(i64::MAX as u128) as i64)
             .unwrap_or(0);
         unsafe { out.write_unaligned(ticks) };
+        1
+    }
+    extern "win64" fn native_query_performance_frequency(out: *mut i64) -> i32 {
+        if out.is_null() {
+            return 0;
+        }
+        unsafe { out.write_unaligned(1_000_000_000) };
         1
     }
     extern "win64" fn native_initialize_critical_section_ex(
@@ -1991,6 +2089,9 @@ mod imp {
             "QueryPerformanceCounter" => {
                 Some(native_query_performance_counter as *const () as usize as u64)
             }
+            "QueryPerformanceFrequency" => {
+                Some(native_query_performance_frequency as *const () as usize as u64)
+            }
             "InitializeCriticalSectionEx" => {
                 Some(native_initialize_critical_section_ex as *const () as usize as u64)
             }
@@ -2088,6 +2189,10 @@ mod imp {
             "FindFirstFileExW" => Some(native_find_first_file_ex_w as *const () as usize as u64),
             "FindNextFileW" => Some(native_find_next_file_w as *const () as usize as u64),
             "FindClose" => Some(native_find_close as *const () as usize as u64),
+            "CreateThread" => Some(native_create_thread as *const () as usize as u64),
+            "WaitForSingleObject" => {
+                Some(native_wait_for_single_object as *const () as usize as u64)
+            }
             "ReadFile" => Some(native_read_file as *const () as usize as u64),
             "CloseHandle" => Some(native_close_handle as *const () as usize as u64),
             "CreateDirectoryW" => Some(native_create_directory_w as *const () as usize as u64),
@@ -2169,6 +2274,9 @@ mod imp {
         patch_baseline_imports(&mapping, img)?;
         NATIVE_IMAGE_BASE.store(img.image_base, Ordering::Release);
         let tls = setup_tls(&mapping, img)?;
+        if let Ok(mut template) = NATIVE_TLS_TEMPLATE.lock() {
+            *template = tls.as_ref().map(NativeTls::clone_for_thread);
+        }
         let cmdline = command_line_w(prog, args)?;
         let cmdline_a = command_line_a(&cmdline);
         let mut fs = NativeFs {
@@ -2210,6 +2318,7 @@ mod imp {
                 unsafe { _exit(127) };
             }
             if let Some(tls) = tls.as_ref() {
+                NATIVE_GS_BASE.store(tls.teb.as_ptr() as u64, Ordering::Release);
                 if !unsafe { set_gs(tls.teb.as_ptr() as u64) } {
                     unsafe { _exit(127) };
                 }
@@ -2255,6 +2364,10 @@ mod imp {
         COMMAND_LINE_A.store(0, Ordering::Release);
         NATIVE_FS.store(0, Ordering::Release);
         NATIVE_IMAGE_BASE.store(0, Ordering::Release);
+        NATIVE_GS_BASE.store(0, Ordering::Release);
+        if let Ok(mut template) = NATIVE_TLS_TEMPLATE.lock() {
+            *template = None;
+        }
         if status & 0x7f != 0 {
             return Err(format!(
                 "native guest terminated by signal {}",
