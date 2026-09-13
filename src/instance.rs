@@ -144,7 +144,7 @@ fn framed_exec(name: &str, command: &str) -> Result<ExecResult, String> {
         }
         match frame.kind {
             Kind::Response => {}
-            Kind::Stdout => stdout.extend_from_slice(&frame.payload),
+            Kind::Stdout | Kind::Stderr => stdout.extend_from_slice(&frame.payload),
             Kind::Failure => return Err(String::from_utf8_lossy(&frame.payload).to_string()),
             Kind::Exit if frame.payload.len() == 4 => {
                 return Ok(ExecResult {
@@ -264,7 +264,29 @@ pub fn run_daemon(name: &str, dir: &str, snapshot_path: Option<&str>) -> Result<
                     }
                 };
                 let mut output = Vec::new();
-                let code = match shell.exec_line(command, &mut output) {
+                let output_stream = match stream.try_clone() {
+                    Ok(value) => std::sync::Arc::new(std::sync::Mutex::new(value)),
+                    Err(error) => {
+                        let _ = write_frame(
+                            &mut stream,
+                            &Frame { stream: 1, kind: Kind::Failure, flags: 1, payload: error.to_string().into_bytes() },
+                        );
+                        continue;
+                    }
+                };
+                let sink: crate::backend::OutputSink = std::sync::Arc::new(move |channel, chunk| {
+                    let kind = match channel {
+                        crate::backend::OutputChannel::Stdout => Kind::Stdout,
+                        crate::backend::OutputChannel::Stderr => Kind::Stderr,
+                    };
+                    if let Ok(mut writer) = output_stream.lock() {
+                        let _ = write_frame(
+                            &mut *writer,
+                            &Frame { stream: 1, kind, flags: 0, payload: chunk.to_vec() },
+                        );
+                    }
+                });
+                let code = match shell.exec_line_streaming(command, &mut output, sink) {
                     Ok(ShellFlow::Continue) => shell.last_code(),
                     Ok(ShellFlow::Exit(code)) => code,
                     Err(error) => {

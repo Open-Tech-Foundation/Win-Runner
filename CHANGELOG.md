@@ -11,6 +11,8 @@ All notable changes to this project will be documented in this file.
   completion, cancellation, and failure events. Unix sockets and future
   Windows named pipes will carry the same frames. `instance exec` now uses
   that frame stream and returns chunked stdout plus an explicit exit frame.
+  Interpreter console output is forwarded directly through stdout frames while
+  the command runs; buffered script output remains compatible.
 - `wincli instance boot <name>`, `status`, and `destroy` now provide the
   first persistent named-instance lifecycle on Unix hosts. A background daemon
   owns a snapshot-backed WinFs image and protects its private control socket

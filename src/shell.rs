@@ -61,6 +61,26 @@ impl Shell {
     /// Execute one input line; guest/PS1 output is appended to `out`.
     /// `Err` is a printable error: show it and continue the session.
     pub fn exec_line(&mut self, line: &str, out: &mut Vec<u8>) -> Result<ShellFlow, String> {
+        self.exec_line_with_sink(line, out, None)
+    }
+
+    /// Execute with immediate console forwarding when the selected backend
+    /// supports it. Buffered output is still used for PS1 statements.
+    pub fn exec_line_streaming(
+        &mut self,
+        line: &str,
+        out: &mut Vec<u8>,
+        sink: backend::OutputSink,
+    ) -> Result<ShellFlow, String> {
+        self.exec_line_with_sink(line, out, Some(sink))
+    }
+
+    fn exec_line_with_sink(
+        &mut self,
+        line: &str,
+        out: &mut Vec<u8>,
+        sink: Option<backend::OutputSink>,
+    ) -> Result<ShellFlow, String> {
         let argv = split_line(line);
         if argv.is_empty() {
             return Ok(ShellFlow::Continue);
@@ -109,7 +129,7 @@ impl Shell {
                 out.extend_from_slice(inspect::render(&report).as_bytes());
                 Ok(ShellFlow::Continue)
             }
-            _ => self.run_target_line(&argv, line, out),
+            _ => self.run_target_line(&argv, line, out, sink),
         }
     }
 
@@ -119,6 +139,7 @@ impl Shell {
         argv: &[String],
         line: &str,
         out: &mut Vec<u8>,
+        sink: Option<backend::OutputSink>,
     ) -> Result<ShellFlow, String> {
         let target = &argv[0];
         if std::path::Path::new(target).is_file() {
@@ -128,7 +149,7 @@ impl Shell {
                 .unwrap_or("")
                 .to_lowercase();
             match ext.as_str() {
-                "exe" => return self.run_exe_file(target, target, &argv[1..], out),
+                "exe" => return self.run_exe_file(target, target, &argv[1..], out, sink),
                 "ps1" => {
                     let script = std::fs::read_to_string(target)
                         .map_err(|e| format!("cannot read {target}: {e}"))?;
@@ -149,7 +170,7 @@ impl Shell {
                 .fs
                 .read_file(target)
                 .map_err(|e| format!("cannot read guest executable {target}: {e}"))?;
-            return self.run_exe_bytes(&data, target, &argv[1..], out);
+            return self.run_exe_bytes(&data, target, &argv[1..], out, sink);
         }
         let cache = install::cache_dir();
         if let Some(exe_path) = install::find_cached(&cache, &guest_bin_name(target)) {
@@ -158,6 +179,7 @@ impl Shell {
                 target,
                 &argv[1..],
                 out,
+                sink,
             );
         }
         // Otherwise a PS1 statement; an unknown first word that is not
@@ -182,10 +204,11 @@ impl Shell {
         prog: &str,
         guest_args: &[String],
         out: &mut Vec<u8>,
+        sink: Option<backend::OutputSink>,
     ) -> Result<ShellFlow, String> {
         let data =
             std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
-        self.run_exe_bytes(&data, prog, guest_args, out)
+        self.run_exe_bytes(&data, prog, guest_args, out, sink)
     }
 
     /// Execute a PE already present in the guest image. This is intentionally
@@ -197,16 +220,22 @@ impl Shell {
         prog: &str,
         guest_args: &[String],
         out: &mut Vec<u8>,
+        sink: Option<backend::OutputSink>,
     ) -> Result<ShellFlow, String> {
         let img = pe::load(data).map_err(|e| format!("failed to load {prog}: {e}"))?;
         let fs = std::mem::replace(&mut self.fs, WinFs::ephemeral_runner());
         let backend = backend::configured().map_err(|e| format!("failed to select backend: {e}"))?;
-        let result = backend
-            .execute(&img, fs, prog, guest_args)
+        let streaming = sink.is_some();
+        let result = match sink {
+            Some(sink) => backend.execute_streaming(&img, fs, prog, guest_args, sink),
+            None => backend.execute(&img, fs, prog, guest_args),
+        }
             .map_err(|e| format!("{} execution failed: {e}", backend.id()))?;
         self.fs = result.fs;
         self.last_code = result.code as i32;
-        out.extend_from_slice(&result.stdout);
+        if !streaming {
+            out.extend_from_slice(&result.stdout);
+        }
         Ok(ShellFlow::Continue)
     }
 
