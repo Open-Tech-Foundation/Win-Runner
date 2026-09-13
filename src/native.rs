@@ -205,8 +205,8 @@ mod imp {
             native_set_unhandled_exception_filter, native_set_waitable_timer,
             native_terminate_process, native_wait_for_single_object, native_wait_on_address,
             native_wide_char_to_multi_byte, native_write_console_w, parse_windows_command_line,
-            process_ctx, uppercase_ascii_utf16, NativeLaunchSpec, API_SET_MODULE, PROT_EXEC,
-            PROT_READ, PROT_WRITE,
+            process_ctx, uppercase_ascii_utf16, write_process_information, NativeLaunchSpec,
+            API_SET_MODULE, PROT_EXEC, PROT_READ, PROT_WRITE,
         };
         use crate::winfs::WinFs;
 
@@ -235,6 +235,22 @@ mod imp {
         }
 
         #[test]
+        fn writes_the_x64_process_information_layout() {
+            let mut info = [0u8; 24];
+            assert!(write_process_information(
+                info.as_mut_ptr() as u64,
+                0x6000,
+                0x6100,
+                42
+            ));
+            assert_eq!(u64::from_le_bytes(info[..8].try_into().unwrap()), 0x6000);
+            assert_eq!(u64::from_le_bytes(info[8..16].try_into().unwrap()), 0x6100);
+            assert_eq!(u32::from_le_bytes(info[16..20].try_into().unwrap()), 42);
+            assert_eq!(u32::from_le_bytes(info[20..24].try_into().unwrap()), 1);
+            assert!(!write_process_information(0, 0, 0, 0));
+        }
+
+        #[test]
         fn exposes_a_process_owned_id_and_active_exit_status() {
             let process = native_get_current_process();
             assert_eq!(process, u64::MAX);
@@ -257,12 +273,13 @@ mod imp {
         #[test]
         fn owns_child_process_handles_until_explicit_close() {
             let process = process_ctx().unwrap();
-            let (handle, child) = process
+            let (handle, thread_handle, child) = process
                 .children
                 .lock()
                 .unwrap()
                 .allocate(process.process_id);
             assert_eq!(child.parent_process_id, 1);
+            assert_ne!(handle, thread_handle);
             assert!(child.process_id >= 2);
             let mut exit_code = 0;
             assert_eq!(native_get_exit_code_process(handle, &mut exit_code), 1);
@@ -1236,6 +1253,7 @@ mod imp {
 
     struct NativeProcessTable {
         next_handle: u64,
+        next_thread_handle: u64,
         next_process_id: u32,
         children: HashMap<u64, Arc<NativeChildProcess>>,
     }
@@ -1245,14 +1263,17 @@ mod imp {
         fn new() -> Self {
             Self {
                 next_handle: 0x6000_0000,
+                next_thread_handle: 0x6100_0000,
                 next_process_id: 2,
                 children: HashMap::new(),
             }
         }
 
-        fn allocate(&mut self, parent_process_id: u32) -> (u64, Arc<NativeChildProcess>) {
+        fn allocate(&mut self, parent_process_id: u32) -> (u64, u64, Arc<NativeChildProcess>) {
             let handle = self.next_handle;
             self.next_handle += 1;
+            let thread_handle = self.next_thread_handle;
+            self.next_thread_handle += 1;
             let child = Arc::new(NativeChildProcess {
                 process_id: self.next_process_id,
                 parent_process_id,
@@ -1261,8 +1282,23 @@ mod imp {
             });
             self.next_process_id += 1;
             self.children.insert(handle, Arc::clone(&child));
-            (handle, child)
+            (handle, thread_handle, child)
         }
+    }
+
+    #[allow(dead_code)] // called when the child launcher returns success
+    fn write_process_information(output: u64, process: u64, thread: u64, process_id: u32) -> bool {
+        if output == 0 {
+            return false;
+        }
+        unsafe {
+            let output = output as *mut u8;
+            (output as *mut u64).write_unaligned(process);
+            (output.add(8) as *mut u64).write_unaligned(thread);
+            (output.add(16) as *mut u32).write_unaligned(process_id);
+            (output.add(20) as *mut u32).write_unaligned(1);
+        }
+        true
     }
 
     /// State that belongs to exactly one Windows guest process. The current

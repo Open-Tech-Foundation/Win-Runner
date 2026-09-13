@@ -6,6 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Native child registry allocation now reserves distinct process and primary
+  thread handles, with a 64-bit `PROCESS_INFORMATION` layout writer for the
+  forthcoming successful `CreateProcessW` launch path.
 - Added a native distinct-address mapping primitive that reserves a kernel
   selected range, rebases the child PE to that actual address, and copies the
   relocated image for the upcoming child launcher.
