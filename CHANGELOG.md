@@ -46,7 +46,8 @@ All notable changes to this project will be documented in this file.
   discovery. `InitializeSListHead` creates empty 64-bit CRT list headers.
   `GetEnvironmentStringsW` exposes an empty child-local environment block.
   `SetUnhandledExceptionFilter` retains the child-local handler pointer for
-  CRT setup. `VirtualProtect`
+  CRT setup. `AddVectoredExceptionHandler` records the native child callback
+  for startup compatibility. `VirtualProtect`
   translates the standard page-access modes to page-aligned Linux mappings.
   A narrow API-set pseudo-module resolves the CRT's dynamic `CompareStringEx`
   lookup without loading a host DLL.

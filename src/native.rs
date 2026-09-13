@@ -91,6 +91,7 @@ mod imp {
     ];
     static EMPTY_ENVIRONMENT_BLOCK: [u16; 2] = [0, 0];
     static UNHANDLED_EXCEPTION_FILTER: AtomicU64 = AtomicU64::new(0);
+    static VECTORED_EXCEPTION_HANDLER: AtomicU64 = AtomicU64::new(0);
 
     // Preferred-base PE mappings collide by design. Serialize native runs in
     // this process until relocations allow separate address-space layouts.
@@ -155,11 +156,12 @@ mod imp {
     #[cfg(test)]
     mod protection_tests {
         use super::{
-            command_line_a, linux_protection, native_delete_critical_section,
-            native_enter_critical_section, native_free_environment_strings_w, native_get_acp,
-            native_get_cp_info, native_get_environment_strings_w, native_get_file_type,
-            native_get_last_error, native_get_module_file_name_w, native_get_oem_cp,
-            native_get_proc_address, native_get_startup_info_w, native_get_string_type_w,
+            command_line_a, linux_protection, native_add_vectored_exception_handler,
+            native_delete_critical_section, native_enter_critical_section,
+            native_free_environment_strings_w, native_get_acp, native_get_cp_info,
+            native_get_environment_strings_w, native_get_file_type, native_get_last_error,
+            native_get_module_file_name_w, native_get_oem_cp, native_get_proc_address,
+            native_get_startup_info_w, native_get_string_type_w,
             native_initialize_critical_section_ex, native_initialize_slist_head,
             native_is_valid_code_page, native_lc_map_string_w, native_leave_critical_section,
             native_multi_byte_to_wide_char, native_set_last_error,
@@ -276,6 +278,12 @@ mod imp {
         fn stores_the_child_unhandled_exception_filter() {
             assert_eq!(native_set_unhandled_exception_filter(0x1234), 0);
             assert_eq!(native_set_unhandled_exception_filter(0), 0x1234);
+        }
+
+        #[test]
+        fn registers_a_non_null_vectored_exception_handler() {
+            assert_eq!(native_add_vectored_exception_handler(1, 0), 0);
+            assert_eq!(native_add_vectored_exception_handler(1, 0x1234), 0x1235);
         }
 
         #[test]
@@ -628,6 +636,14 @@ mod imp {
 
     extern "win64" fn native_set_unhandled_exception_filter(filter: u64) -> u64 {
         UNHANDLED_EXCEPTION_FILTER.swap(filter, Ordering::AcqRel)
+    }
+
+    extern "win64" fn native_add_vectored_exception_handler(_first: u32, handler: u64) -> u64 {
+        if handler == 0 {
+            return 0;
+        }
+        VECTORED_EXCEPTION_HANDLER.store(handler, Ordering::Release);
+        handler | 1
     }
 
     extern "win64" fn native_get_acp() -> u32 {
@@ -1336,6 +1352,9 @@ mod imp {
             }
             "SetUnhandledExceptionFilter" => {
                 Some(native_set_unhandled_exception_filter as *const () as usize as u64)
+            }
+            "AddVectoredExceptionHandler" => {
+                Some(native_add_vectored_exception_handler as *const () as usize as u64)
             }
             "GetACP" => Some(native_get_acp as *const () as usize as u64),
             "GetOEMCP" => Some(native_get_oem_cp as *const () as usize as u64),
