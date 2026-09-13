@@ -1,3 +1,4 @@
+pub mod backend;
 pub mod deflate;
 pub mod inspect;
 pub mod install;

@@ -1,6 +1,6 @@
 use std::io::Write;
 use std::path::Path;
-use wincli::{inspect, install, pe, snapshot, winapi, winfs::WinFs};
+use wincli::{backend, inspect, install, pe, snapshot, winfs::WinFs};
 
 fn usage() -> ! {
     eprintln!("usage:");
@@ -158,41 +158,22 @@ fn run_exe_file(path: &str, prog: &str, guest_args: &[String]) {    // NOTE: thi
     run_with_runner(&img, path, prog, guest_args);
 }
 
-/// Execute a loaded image with guest argv. Console output streams to host
-/// stdout as it happens.
+/// Execute a loaded image through the configured platform backend.
 fn run_with_runner(img: &pe::PeImage, path: &str, prog: &str, guest_args: &[String]) {
-    if std::env::var("WINCLI_BACKEND").as_deref() == Ok("native") {
-        match wincli::native::run_rust_baseline_argv(img, prog, guest_args) {
-            Ok((code, out)) => {
-                let _ = std::io::stdout().write_all(&out);
-                std::process::exit(code as i32);
-            }
-            Err(e) => {
-                eprintln!("wincli: native backend failed for {path}: {e}");
-                std::process::exit(1);
-            }
-        }
-    }
-    let fs = WinFs::new();
-    let runner = match winapi::Runner::with_argv(img, fs, prog, guest_args) {
-        Ok(r) => r,
+    let backend = match backend::configured() {
+        Ok(value) => value,
         Err(e) => {
-            eprintln!("wincli: failed to start {path}: {e}");
+            eprintln!("wincli: failed to select execution backend for {path}: {e}");
             std::process::exit(1);
         }
     };
-    let stdout = std::io::stdout();
-    let mut locked = stdout.lock();
-    let runner = runner.with_console_sink(Box::new(move |chunk: &[u8]| {
-        let _ = locked.write_all(chunk);
-        let _ = locked.flush();
-    }));
-    match runner.run() {
-        Ok((code, _fs, _out)) => {
-            std::process::exit(code as i32);
+    match backend.execute(img, WinFs::new(), prog, guest_args) {
+        Ok(result) => {
+            let _ = std::io::stdout().write_all(&result.stdout);
+            std::process::exit(result.code as i32);
         }
         Err(e) => {
-            eprintln!("wincli: execution failed: {e}");
+            eprintln!("wincli: {} execution failed for {path}: {e}", backend.id());
             std::process::exit(1);
         }
     }

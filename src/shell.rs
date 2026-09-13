@@ -10,7 +10,7 @@
 //! shell continues. `exit [n]`/`quit`, Ctrl-D (EOF), or a closed pipe ends
 //! the session (code = argument, else the last guest code).
 
-use crate::{inspect, install, native, pe, ps1, winapi, winfs::WinFs};
+use crate::{backend, inspect, install, pe, ps1, winfs::WinFs};
 use std::io::{BufRead, Write};
 
 /// What the REPL does after a line.
@@ -196,28 +196,14 @@ impl Shell {
     ) -> Result<ShellFlow, String> {
         let img = pe::load(data).map_err(|e| format!("failed to load {prog}: {e}"))?;
         let fs = std::mem::replace(&mut self.fs, WinFs::ephemeral_runner());
-        if std::env::var("WINCLI_BACKEND").as_deref() == Ok("native") {
-            match native::run_rust_baseline_argv_with_fs(&img, fs, prog, guest_args) {
-                Ok((code, gout, fs_back)) => {
-                    self.fs = fs_back;
-                    self.last_code = code as i32;
-                    out.extend_from_slice(&gout);
-                    return Ok(ShellFlow::Continue);
-                }
-                Err(e) => return Err(format!("native execution failed: {e}")),
-            }
-        }
-        let runner = winapi::Runner::with_argv(&img, fs, prog, guest_args)
-            .map_err(|e| format!("failed to start {prog}: {e}"))?;
-        match runner.run() {
-            Ok((code, fs_back, gout)) => {
-                self.fs = fs_back;
-                self.last_code = code as i32;
-                out.extend_from_slice(&gout);
-                Ok(ShellFlow::Continue)
-            }
-            Err(e) => Err(format!("execution failed: {e}")),
-        }
+        let backend = backend::configured().map_err(|e| format!("failed to select backend: {e}"))?;
+        let result = backend
+            .execute(&img, fs, prog, guest_args)
+            .map_err(|e| format!("{} execution failed: {e}", backend.id()))?;
+        self.fs = result.fs;
+        self.last_code = result.code as i32;
+        out.extend_from_slice(&result.stdout);
+        Ok(ShellFlow::Continue)
     }
 
     /// One-way host-to-guest copy used while booting a local runner image.
