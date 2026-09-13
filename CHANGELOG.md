@@ -41,6 +41,7 @@ All notable changes to this project will be documented in this file.
   metadata. `MultiByteToWideChar` converts those pages for CRT locale setup.
   `GetStringTypeW` provides ASCII `CT_CTYPE1` character classifications.
   `LCMapStringW` supports CRT string sizing, copying, and ASCII case mapping.
+  `WideCharToMultiByte` converts native CRT strings to Windows-1252 or UTF-8.
   `VirtualProtect`
   translates the standard page-access modes to page-aligned Linux mappings.
   A narrow API-set pseudo-module resolves the CRT's dynamic `CompareStringEx`

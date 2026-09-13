@@ -137,8 +137,8 @@ mod imp {
             native_get_proc_address, native_get_startup_info_w, native_get_string_type_w,
             native_initialize_critical_section_ex, native_is_valid_code_page,
             native_lc_map_string_w, native_leave_critical_section, native_multi_byte_to_wide_char,
-            native_set_last_error, uppercase_ascii_utf16, API_SET_MODULE, PROT_EXEC, PROT_READ,
-            PROT_WRITE,
+            native_set_last_error, native_wide_char_to_multi_byte, uppercase_ascii_utf16,
+            API_SET_MODULE, PROT_EXEC, PROT_READ, PROT_WRITE,
         };
 
         #[test]
@@ -309,6 +309,39 @@ mod imp {
                     0
                 ),
                 3
+            );
+        }
+
+        #[test]
+        fn converts_wide_input_to_supported_multibyte_pages() {
+            let input = ['r' as u16, 'g' as u16, 0];
+            let mut output = [0; 3];
+            assert_eq!(
+                native_wide_char_to_multi_byte(
+                    1252,
+                    0,
+                    input.as_ptr(),
+                    -1,
+                    output.as_mut_ptr(),
+                    3,
+                    std::ptr::null(),
+                    std::ptr::null_mut()
+                ),
+                3
+            );
+            assert_eq!(output, *b"rg\0");
+            assert_eq!(
+                native_wide_char_to_multi_byte(
+                    65001,
+                    0,
+                    ['é' as u16].as_ptr(),
+                    1,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null_mut()
+                ),
+                2
             );
         }
     }
@@ -679,6 +712,67 @@ mod imp {
             unsafe { output.add(index).write(unit) };
         }
         len.try_into().unwrap_or(0)
+    }
+
+    extern "win64" fn native_wide_char_to_multi_byte(
+        code_page: u32,
+        _flags: u32,
+        input: *const u16,
+        input_len: i32,
+        output: *mut u8,
+        output_len: i32,
+        _default_char: *const u8,
+        used_default_char: *mut i32,
+    ) -> i32 {
+        if input.is_null() || input_len < -1 || output_len < 0 {
+            return 0;
+        }
+        let (len, append_nul) = if input_len >= 0 {
+            (input_len as usize, false)
+        } else {
+            let mut len = 0;
+            while len < 64 * 1024 && unsafe { *input.add(len) } != 0 {
+                len += 1;
+            }
+            if len == 64 * 1024 {
+                return 0;
+            }
+            (len, true)
+        };
+        let units = unsafe { std::slice::from_raw_parts(input, len) };
+        let mut used_default = false;
+        let mut bytes = match code_page {
+            1252 => units
+                .iter()
+                .map(|unit| {
+                    if *unit <= 0xff {
+                        *unit as u8
+                    } else {
+                        used_default = true;
+                        b'?'
+                    }
+                })
+                .collect(),
+            65001 => match String::from_utf16(units) {
+                Ok(value) => value.into_bytes(),
+                Err(_) => return 0,
+            },
+            _ => return 0,
+        };
+        if append_nul {
+            bytes.push(0);
+        }
+        if !used_default_char.is_null() {
+            unsafe { used_default_char.write(used_default as i32) };
+        }
+        if output.is_null() {
+            return bytes.len().try_into().unwrap_or(0);
+        }
+        if bytes.len() > output_len as usize {
+            return 0;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), output, bytes.len()) };
+        bytes.len().try_into().unwrap_or(0)
     }
 
     extern "win64" fn native_get_process_heap() -> u64 {
@@ -1141,6 +1235,9 @@ mod imp {
             }
             "GetStringTypeW" => Some(native_get_string_type_w as *const () as usize as u64),
             "LCMapStringW" => Some(native_lc_map_string_w as *const () as usize as u64),
+            "WideCharToMultiByte" => {
+                Some(native_wide_char_to_multi_byte as *const () as usize as u64)
+            }
             "HeapAlloc" => Some(native_heap_alloc as *const () as usize as u64),
             "HeapFree" => Some(native_heap_free as *const () as usize as u64),
             "WriteFile" => Some(native_write_file as *const () as usize as u64),
