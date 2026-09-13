@@ -9,7 +9,8 @@ All notable changes to this project will be documented in this file.
 - Added the transport-neutral v1 instance frame contract: a versioned,
   bounded multiplexed envelope for request/response, stdin, stdout, stderr,
   completion, cancellation, and failure events. Unix sockets and future
-  Windows named pipes will carry the same frames.
+  Windows named pipes will carry the same frames. `instance exec` now uses
+  that frame stream and returns chunked stdout plus an explicit exit frame.
 - `wincli instance boot <name>`, `status`, and `destroy` now provide the
   first persistent named-instance lifecycle on Unix hosts. A background daemon
   owns a snapshot-backed WinFs image and protects its private control socket

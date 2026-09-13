@@ -6,6 +6,7 @@
 //! macOS. This module intentionally contains no GitHub-specific behavior.
 
 use crate::{
+    protocol::{read_frame, write_frame, Frame, Kind},
     shell::{Shell, ShellFlow},
     snapshot,
     winfs::WinFs,
@@ -119,24 +120,46 @@ pub fn exec(name: &str, command: &str) -> Result<ExecResult, String> {
     if command.is_empty() {
         return Err("instance command may not be empty".to_string());
     }
-    let mut message = b"EXEC ".to_vec();
-    message.extend_from_slice(command.as_bytes());
-    let response = request(name, &message)?;
-    let newline = response
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .ok_or_else(|| "invalid execution response".to_string())?;
-    let header = std::str::from_utf8(&response[..newline])
-        .map_err(|_| "invalid execution response header".to_string())?;
-    let code = header
-        .strip_prefix("OK ")
-        .ok_or_else(|| String::from_utf8_lossy(&response).to_string())?
-        .parse::<i32>()
-        .map_err(|_| "invalid execution exit code".to_string())?;
-    Ok(ExecResult {
-        code,
-        stdout: response[newline + 1..].to_vec(),
-    })
+    framed_exec(name, command)
+}
+
+#[cfg(unix)]
+fn framed_exec(name: &str, command: &str) -> Result<ExecResult, String> {
+    use std::net::Shutdown;
+    use std::os::unix::net::UnixStream;
+    validate_name(name)?;
+    let socket = socket_path(&state_dir(), name);
+    let mut stream = UnixStream::connect(&socket)
+        .map_err(|e| format!("instance is not running ({name}): {e}"))?;
+    write_frame(
+        &mut stream,
+        &Frame { stream: 1, kind: Kind::Request, flags: 1, payload: command.as_bytes().to_vec() },
+    )?;
+    stream.shutdown(Shutdown::Write).map_err(|e| format!("cannot finish execution request: {e}"))?;
+    let mut stdout = Vec::new();
+    loop {
+        let frame = read_frame(&mut stream)?;
+        if frame.stream != 1 {
+            return Err("unexpected execution stream".to_string());
+        }
+        match frame.kind {
+            Kind::Response => {}
+            Kind::Stdout => stdout.extend_from_slice(&frame.payload),
+            Kind::Failure => return Err(String::from_utf8_lossy(&frame.payload).to_string()),
+            Kind::Exit if frame.payload.len() == 4 => {
+                return Ok(ExecResult {
+                    code: i32::from_be_bytes(frame.payload.try_into().unwrap()),
+                    stdout,
+                });
+            }
+            _ => return Err("invalid execution frame".to_string()),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn framed_exec(_: &str, _: &str) -> Result<ExecResult, String> {
+    Err("named-pipe instance transport is not implemented on this host".to_string())
 }
 
 #[cfg(unix)]
@@ -210,6 +233,62 @@ pub fn run_daemon(name: &str, dir: &str, snapshot_path: Option<&str>) -> Result<
             };
             if count > 64 * 1024 {
                 let _ = stream.write_all(b"ERR request too large\n");
+                continue;
+            }
+            if request.starts_with(b"WCLI") {
+                let frame = match read_frame(request.as_slice()) {
+                    Ok(frame) if frame.stream == 1 && frame.kind == Kind::Request => frame,
+                    Ok(_) => {
+                        let _ = write_frame(
+                            &mut stream,
+                            &Frame { stream: 1, kind: Kind::Failure, flags: 1, payload: b"invalid execution request".to_vec() },
+                        );
+                        continue;
+                    }
+                    Err(error) => {
+                        let _ = write_frame(
+                            &mut stream,
+                            &Frame { stream: 1, kind: Kind::Failure, flags: 1, payload: error.into_bytes() },
+                        );
+                        continue;
+                    }
+                };
+                let command = match std::str::from_utf8(&frame.payload) {
+                    Ok(command) if !command.is_empty() => command,
+                    _ => {
+                        let _ = write_frame(
+                            &mut stream,
+                            &Frame { stream: 1, kind: Kind::Failure, flags: 1, payload: b"invalid command".to_vec() },
+                        );
+                        continue;
+                    }
+                };
+                let mut output = Vec::new();
+                let code = match shell.exec_line(command, &mut output) {
+                    Ok(ShellFlow::Continue) => shell.last_code(),
+                    Ok(ShellFlow::Exit(code)) => code,
+                    Err(error) => {
+                        let _ = write_frame(
+                            &mut stream,
+                            &Frame { stream: 1, kind: Kind::Failure, flags: 1, payload: error.into_bytes() },
+                        );
+                        continue;
+                    }
+                };
+                let _ = write_frame(
+                    &mut stream,
+                    &Frame { stream: 1, kind: Kind::Response, flags: 0, payload: Vec::new() },
+                );
+                for chunk in output.chunks(crate::protocol::MAX_PAYLOAD) {
+                    let _ = write_frame(
+                        &mut stream,
+                        &Frame { stream: 1, kind: Kind::Stdout, flags: 0, payload: chunk.to_vec() },
+                    );
+                }
+                let _ = write_frame(
+                    &mut stream,
+                    &Frame { stream: 1, kind: Kind::Exit, flags: 1, payload: code.to_be_bytes().to_vec() },
+                );
                 continue;
             }
             match request.as_slice() {
