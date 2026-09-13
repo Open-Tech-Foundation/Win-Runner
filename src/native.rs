@@ -78,8 +78,10 @@ mod imp {
     use std::collections::HashMap;
     use std::ffi::c_void;
     use std::ptr;
-    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-    use std::sync::{Arc, LazyLock, Mutex};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+    #[cfg(test)]
+    use std::sync::LazyLock;
+    use std::sync::{Arc, Mutex};
 
     const PROT_READ: i32 = 0x1;
     const PROT_WRITE: i32 = 0x2;
@@ -115,21 +117,10 @@ mod imp {
         b'e' as u16,
     ];
     static EMPTY_ENVIRONMENT_BLOCK: [u16; 2] = [0, 0];
-    static UNHANDLED_EXCEPTION_FILTER: AtomicU64 = AtomicU64::new(0);
-    static VECTORED_EXCEPTION_HANDLER: AtomicU64 = AtomicU64::new(0);
 
     // Preferred-base PE mappings collide by design. Serialize native runs in
     // this process until relocations allow separate address-space layouts.
     static NATIVE_RUN_LOCK: Mutex<()> = Mutex::new(());
-    static NATIVE_LAST_ERROR: AtomicU32 = AtomicU32::new(0);
-    static NATIVE_IMAGE_BASE: AtomicU64 = AtomicU64::new(0);
-    static NATIVE_GS_BASE: AtomicU64 = AtomicU64::new(0);
-    static NATIVE_TLS_TEMPLATE: Mutex<Option<NativeTls>> = Mutex::new(None);
-    static NATIVE_THREADS: LazyLock<Mutex<HashMap<u64, std::thread::JoinHandle<u32>>>> =
-        LazyLock::new(|| Mutex::new(HashMap::new()));
-    static NATIVE_THREAD_NEXT: AtomicU64 = AtomicU64::new(0x8000_0000);
-    static NATIVE_TIMER_NEXT: AtomicU64 = AtomicU64::new(0x7000_0000);
-    static NATIVE_STATE_FD: AtomicU32 = AtomicU32::new(u32::MAX);
 
     unsafe extern "C" {
         fn mmap(
@@ -192,15 +183,16 @@ mod imp {
     mod protection_tests {
         use super::{
             command_line_a, linux_protection, native_add_vectored_exception_handler,
-            native_create_waitable_timer_ex_w, native_delete_critical_section,
+            native_close_handle, native_create_waitable_timer_ex_w, native_delete_critical_section,
             native_enter_critical_section, native_extended_path, native_file_attributes,
             native_format_message_w, native_free_environment_strings_w, native_get_acp,
             native_get_computer_name_ex_w, native_get_console_mode, native_get_console_output_cp,
             native_get_console_screen_buffer_info, native_get_cp_info,
-            native_get_current_directory_w, native_get_current_thread,
+            native_get_current_directory_w, native_get_current_process,
+            native_get_current_process_id, native_get_current_thread,
             native_get_environment_strings_w, native_get_environment_variable_w,
-            native_get_file_type, native_get_full_path_name_w, native_get_last_error,
-            native_get_module_file_name_w, native_get_module_handle_a,
+            native_get_exit_code_process, native_get_file_type, native_get_full_path_name_w,
+            native_get_last_error, native_get_module_file_name_w, native_get_module_handle_a,
             native_get_module_handle_ex_w, native_get_module_handle_w, native_get_oem_cp,
             native_get_proc_address, native_get_startup_info_w, native_get_string_type_w,
             native_get_system_info, native_get_user_profile_directory_w, native_heap_alloc,
@@ -211,10 +203,8 @@ mod imp {
             native_set_last_error, native_set_thread_stack_guarantee,
             native_set_unhandled_exception_filter, native_set_waitable_timer,
             native_wait_on_address, native_wide_char_to_multi_byte, native_write_console_w,
-            uppercase_ascii_utf16, API_SET_MODULE, NATIVE_IMAGE_BASE, PROT_EXEC, PROT_READ,
-            PROT_WRITE,
+            uppercase_ascii_utf16, API_SET_MODULE, PROT_EXEC, PROT_READ, PROT_WRITE,
         };
-        use std::sync::atomic::Ordering;
 
         #[test]
         fn translates_standard_windows_page_protections() {
@@ -238,6 +228,26 @@ mod imp {
         #[test]
         fn exposes_the_windows_current_thread_pseudo_handle() {
             assert_eq!(native_get_current_thread(), u64::MAX - 1);
+        }
+
+        #[test]
+        fn exposes_a_process_owned_id_and_active_exit_status() {
+            let process = native_get_current_process();
+            assert_eq!(process, u64::MAX);
+            assert_eq!(native_get_current_process_id(), 1);
+            let mut exit_code = 0;
+            assert_eq!(native_get_exit_code_process(process, &mut exit_code), 1);
+            assert_eq!(exit_code, 259); // STILL_ACTIVE
+        }
+
+        #[test]
+        fn rejects_invalid_process_queries_and_pseudo_handle_closes() {
+            native_set_last_error(0);
+            let mut exit_code = 0;
+            assert_eq!(native_get_exit_code_process(0x1234, &mut exit_code), 0);
+            assert_eq!(native_get_last_error(), 6); // ERROR_INVALID_HANDLE
+            assert_eq!(native_close_handle(native_get_current_process()), 0);
+            assert_eq!(native_get_last_error(), 6);
         }
 
         #[test]
@@ -462,13 +472,11 @@ mod imp {
 
         #[test]
         fn exposes_the_main_module_handle() {
-            NATIVE_IMAGE_BASE.store(0x1400_0000_0, Ordering::Release);
             assert_eq!(native_get_module_handle_w(std::ptr::null()), 0x1400_0000_0);
         }
 
         #[test]
         fn exposes_the_main_module_through_module_handle_ex() {
-            NATIVE_IMAGE_BASE.store(0x1400_0000_0, Ordering::Release);
             let mut handle = 0;
             assert_eq!(
                 native_get_module_handle_ex_w(0, std::ptr::null(), &mut handle),
@@ -484,10 +492,7 @@ mod imp {
                 0
             );
             assert_eq!(
-                native_get_proc_address(
-                    API_SET_MODULE,
-                    c"GetEnvironmentVariableW".as_ptr().cast()
-                ),
+                native_get_proc_address(API_SET_MODULE, c"GetEnvironmentVariableW".as_ptr().cast()),
                 native_get_environment_variable_w as *const () as usize as u64
             );
             assert_eq!(
@@ -811,16 +816,6 @@ mod imp {
         Ok(unsafe { entry_fn() })
     }
 
-    // The command-line buffer is owned by the parent until it reaps the
-    // native guest. The child inherits it on fork, so the guest receives a
-    // normal process-valid UTF-16 pointer. Native runs are CLI-process local;
-    // broader concurrent execution will replace this bootstrap slot with a
-    // per-process shim context.
-    static COMMAND_LINE_W: AtomicU64 = AtomicU64::new(0);
-    static COMMAND_LINE_A: AtomicU64 = AtomicU64::new(0);
-    static NATIVE_FS: Mutex<Option<Arc<Mutex<NativeFs>>>> = Mutex::new(None);
-    static FLS_VALUE: AtomicU64 = AtomicU64::new(0);
-
     struct NativeFile {
         path: String,
         offset: usize,
@@ -898,19 +893,25 @@ mod imp {
             native_set_last_error(87);
             return 0;
         }
-        let tls = NATIVE_TLS_TEMPLATE
+        let Some(process) = process_ctx() else {
+            native_set_last_error(6);
+            return 0;
+        };
+        let tls = process
+            .tls_template
             .lock()
             .ok()
             .and_then(|value| value.as_ref().map(NativeTls::clone_for_thread));
-        let handle = NATIVE_THREAD_NEXT.fetch_add(1, Ordering::AcqRel);
+        let handle = process.thread_next.fetch_add(1, Ordering::AcqRel);
         let builder = std::thread::Builder::new().stack_size(stack_size.max(64 * 1024));
+        let thread_process = Arc::clone(&process);
         let spawned = builder.spawn(move || {
             let _tls = tls;
             if let Some(tls) = _tls.as_ref() {
                 if !unsafe { set_gs(tls.teb.as_ptr() as u64) } {
                     return 1;
                 }
-            } else if NATIVE_GS_BASE.load(Ordering::Acquire) != 0 {
+            } else if thread_process.gs_base.load(Ordering::Acquire) != 0 {
                 return 1;
             }
             let entry: unsafe extern "win64" fn(u64) -> u32 = unsafe { std::mem::transmute(start) };
@@ -923,7 +924,7 @@ mod imp {
         if !thread_id.is_null() {
             unsafe { thread_id.write(handle as u32) }
         }
-        match NATIVE_THREADS.lock() {
+        let result = match process.threads.lock() {
             Ok(mut threads) => {
                 threads.insert(handle, join);
                 handle
@@ -932,12 +933,19 @@ mod imp {
                 native_set_last_error(6);
                 0
             }
-        }
+        };
+        result
     }
     extern "win64" fn native_wait_for_single_object(handle: u64, _milliseconds: u32) -> u32 {
-        let join = match NATIVE_THREADS.lock() {
-            Ok(mut threads) => threads.remove(&handle),
-            Err(_) => None,
+        let join = match process_ctx().and_then(|process| {
+            process
+                .threads
+                .lock()
+                .ok()
+                .and_then(|mut threads| threads.remove(&handle))
+        }) {
+            Some(join) => Some(join),
+            None => None,
         };
         match join {
             Some(join) => {
@@ -967,7 +975,9 @@ mod imp {
         _flags: u32,
         _access: u32,
     ) -> u64 {
-        NATIVE_TIMER_NEXT.fetch_add(1, Ordering::AcqRel)
+        process_ctx()
+            .map(|process| process.timer_next.fetch_add(1, Ordering::AcqRel))
+            .unwrap_or(0)
     }
     extern "win64" fn native_set_waitable_timer(
         handle: u64,
@@ -991,9 +1001,76 @@ mod imp {
     /// the ownership explicit is the migration seam for native CreateProcessW.
     struct NativeProcessContext {
         image_base: u64,
+        process_id: u32,
+        process_handle: u64,
+        parent_process_id: u32,
         command_line_w: Vec<u16>,
         command_line_a: Vec<u8>,
         fs: Arc<Mutex<NativeFs>>,
+        last_error: AtomicU32,
+        gs_base: AtomicU64,
+        tls_template: Mutex<Option<NativeTls>>,
+        threads: Mutex<HashMap<u64, std::thread::JoinHandle<u32>>>,
+        thread_next: AtomicU64,
+        timer_next: AtomicU64,
+        state_fd: AtomicU32,
+        fls_value: AtomicU64,
+        unhandled_exception_filter: AtomicU64,
+        vectored_exception_handler: AtomicU64,
+        exit_status: AtomicU32,
+        exited: AtomicBool,
+    }
+
+    // Import trampolines have no guest-context argument. This is therefore a
+    // narrow dispatcher slot, while every mutable Windows-process datum lives
+    // in the context it points at. A future CreateProcessW child installs its
+    // own context in its guest host process.
+    static NATIVE_PROCESS: Mutex<Option<Arc<NativeProcessContext>>> = Mutex::new(None);
+    #[cfg(test)]
+    static NATIVE_GUEST_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+    #[cfg(test)]
+    static TEST_PROCESS: LazyLock<Arc<NativeProcessContext>> = LazyLock::new(|| {
+        Arc::new(NativeProcessContext {
+            image_base: 0x1400_0000_0,
+            process_id: 1,
+            process_handle: u64::MAX,
+            parent_process_id: 0,
+            command_line_w: vec![0],
+            command_line_a: vec![0],
+            fs: Arc::new(Mutex::new(NativeFs {
+                fs: WinFs::new(),
+                handles: HashMap::new(),
+                finds: HashMap::new(),
+                next: 0x100,
+            })),
+            last_error: AtomicU32::new(0),
+            gs_base: AtomicU64::new(0),
+            tls_template: Mutex::new(None),
+            threads: Mutex::new(HashMap::new()),
+            thread_next: AtomicU64::new(0x8000_0000),
+            timer_next: AtomicU64::new(0x7000_0000),
+            state_fd: AtomicU32::new(u32::MAX),
+            fls_value: AtomicU64::new(0),
+            unhandled_exception_filter: AtomicU64::new(0),
+            vectored_exception_handler: AtomicU64::new(0),
+            exit_status: AtomicU32::new(259),
+            exited: AtomicBool::new(false),
+        })
+    });
+
+    fn process_ctx() -> Option<Arc<NativeProcessContext>> {
+        #[cfg(test)]
+        if !NATIVE_GUEST_ACTIVE.load(Ordering::Acquire) {
+            return Some(Arc::clone(&TEST_PROCESS));
+        }
+        if let Some(process) = NATIVE_PROCESS.lock().ok()?.as_ref().cloned() {
+            return Some(process);
+        }
+        #[cfg(test)]
+        return None;
+        #[cfg(not(test))]
+        None
     }
 
     fn wide(ptr: *const u16) -> Option<String> {
@@ -1011,14 +1088,18 @@ mod imp {
         None
     }
     fn fs_ctx() -> Option<Arc<Mutex<NativeFs>>> {
-        NATIVE_FS.lock().ok()?.as_ref().cloned()
+        process_ctx().map(|process| Arc::clone(&process.fs))
     }
 
     extern "win64" fn native_get_command_line_w() -> u64 {
-        COMMAND_LINE_W.load(Ordering::Acquire)
+        process_ctx()
+            .map(|process| process.command_line_w.as_ptr() as u64)
+            .unwrap_or(0)
     }
     extern "win64" fn native_get_command_line_a() -> u64 {
-        COMMAND_LINE_A.load(Ordering::Acquire)
+        process_ctx()
+            .map(|process| process.command_line_a.as_ptr() as u64)
+            .unwrap_or(0)
     }
 
     extern "win64" fn native_get_std_handle(which: u32) -> u64 {
@@ -1055,7 +1136,7 @@ mod imp {
     }
     extern "win64" fn native_get_module_handle_w(name: *const u16) -> u64 {
         if name.is_null() {
-            NATIVE_IMAGE_BASE.load(Ordering::Acquire)
+            process_ctx().map(|process| process.image_base).unwrap_or(0)
         } else {
             0
         }
@@ -1068,7 +1149,7 @@ mod imp {
         if output.is_null() {
             return 0;
         }
-        let module = NATIVE_IMAGE_BASE.load(Ordering::Acquire);
+        let module = process_ctx().map(|process| process.image_base).unwrap_or(0);
         if module == 0 {
             return 0;
         }
@@ -1085,14 +1166,24 @@ mod imp {
     }
 
     extern "win64" fn native_set_unhandled_exception_filter(filter: u64) -> u64 {
-        UNHANDLED_EXCEPTION_FILTER.swap(filter, Ordering::AcqRel)
+        process_ctx()
+            .map(|process| {
+                process
+                    .unhandled_exception_filter
+                    .swap(filter, Ordering::AcqRel)
+            })
+            .unwrap_or(0)
     }
 
     extern "win64" fn native_add_vectored_exception_handler(_first: u32, handler: u64) -> u64 {
         if handler == 0 {
             return 0;
         }
-        VECTORED_EXCEPTION_HANDLER.store(handler, Ordering::Release);
+        if let Some(process) = process_ctx() {
+            process
+                .vectored_exception_handler
+                .store(handler, Ordering::Release);
+        }
         handler | 1
     }
 
@@ -1341,10 +1432,51 @@ mod imp {
         1
     }
     extern "win64" fn native_get_current_process_id() -> u32 {
-        1
+        process_ctx()
+            .map(|process| {
+                debug_assert!(process.parent_process_id <= process.process_id);
+                process.process_id
+            })
+            .unwrap_or(0)
     }
     extern "win64" fn native_get_current_process() -> u64 {
-        u64::MAX
+        process_ctx()
+            .map(|process| process.process_handle)
+            .unwrap_or(u64::MAX)
+    }
+    extern "win64" fn native_get_exit_code_process(handle: u64, code: *mut u32) -> i32 {
+        if code.is_null() {
+            native_set_last_error(87); // ERROR_INVALID_PARAMETER
+            return 0;
+        }
+        let Some(process) = process_ctx() else {
+            native_set_last_error(6); // ERROR_INVALID_HANDLE
+            return 0;
+        };
+        if handle != process.process_handle {
+            native_set_last_error(6); // ERROR_INVALID_HANDLE
+            return 0;
+        }
+        let exit_code = if process.exited.load(Ordering::Acquire) {
+            process.exit_status.load(Ordering::Acquire)
+        } else {
+            259 // STILL_ACTIVE
+        };
+        unsafe { code.write(exit_code) };
+        1
+    }
+    extern "win64" fn native_terminate_process(handle: u64, code: u32) -> i32 {
+        let Some(process) = process_ctx() else {
+            native_set_last_error(6); // ERROR_INVALID_HANDLE
+            return 0;
+        };
+        if handle != process.process_handle {
+            native_set_last_error(6); // ERROR_INVALID_HANDLE
+            return 0;
+        }
+        process.exit_status.store(code, Ordering::Release);
+        process.exited.store(true, Ordering::Release);
+        native_exit_process(code)
     }
     extern "win64" fn native_get_current_thread() -> u64 {
         u64::MAX - 1
@@ -1385,12 +1517,16 @@ mod imp {
         if index != 0 {
             return 0;
         }
-        FLS_VALUE.store(0, Ordering::Release);
+        if let Some(process) = process_ctx() {
+            process.fls_value.store(0, Ordering::Release);
+        }
         1
     }
     extern "win64" fn native_fls_get_value(index: u32) -> u64 {
         if index == 0 {
-            FLS_VALUE.load(Ordering::Acquire)
+            process_ctx()
+                .map(|process| process.fls_value.load(Ordering::Acquire))
+                .unwrap_or(0)
         } else {
             0
         }
@@ -1399,7 +1535,11 @@ mod imp {
         if index != 0 {
             return 0;
         }
-        FLS_VALUE.store(value, Ordering::Release);
+        if let Some(process) = process_ctx() {
+            process.fls_value.store(value, Ordering::Release);
+        } else {
+            return 0;
+        }
         1
     }
     extern "win64" fn native_get_system_time_as_file_time(out: *mut u64) {
@@ -1871,7 +2011,10 @@ mod imp {
     }
 
     fn native_flush_instance_state() {
-        let fd = NATIVE_STATE_FD.load(Ordering::Acquire);
+        let Some(process) = process_ctx() else {
+            return;
+        };
+        let fd = process.state_fd.load(Ordering::Acquire);
         if fd == u32::MAX {
             return;
         }
@@ -1897,18 +2040,22 @@ mod imp {
             written += n as usize;
         }
         unsafe { close(fd as i32) };
-        NATIVE_STATE_FD.store(u32::MAX, Ordering::Release);
+        process.state_fd.store(u32::MAX, Ordering::Release);
     }
     extern "win64" fn native_unimplemented() -> u64 {
         0
     }
 
     extern "win64" fn native_get_last_error() -> u32 {
-        NATIVE_LAST_ERROR.load(Ordering::Acquire)
+        process_ctx()
+            .map(|process| process.last_error.load(Ordering::Acquire))
+            .unwrap_or(6)
     }
 
     extern "win64" fn native_set_last_error(error: u32) {
-        NATIVE_LAST_ERROR.store(error, Ordering::Release);
+        if let Some(process) = process_ctx() {
+            process.last_error.store(error, Ordering::Release);
+        }
     }
 
     extern "win64" fn native_get_startup_info_w(startup_info: *mut u8) {
@@ -2214,14 +2361,22 @@ mod imp {
         1
     }
     extern "win64" fn native_close_handle(h: u64) -> i32 {
-        fs_ctx()
+        if process_ctx().is_some_and(|process| h == process.process_handle || h == u64::MAX - 1) {
+            native_set_last_error(6); // pseudo handles cannot be closed
+            return 0;
+        }
+        let closed = fs_ctx()
             .and_then(|context| {
                 context
                     .lock()
                     .ok()
                     .map(|mut c| c.handles.remove(&h).is_some() || c.finds.remove(&h).is_some())
             })
-            .unwrap_or(false) as i32
+            .unwrap_or(false);
+        if !closed {
+            native_set_last_error(6);
+        }
+        closed as i32
     }
     extern "win64" fn native_create_directory_w(p: *const u16, _s: u64) -> i32 {
         fs_ctx()
@@ -2295,6 +2450,8 @@ mod imp {
                 Some(native_get_current_process_id as *const () as usize as u64)
             }
             "GetCurrentProcess" => Some(native_get_current_process as *const () as usize as u64),
+            "GetExitCodeProcess" => Some(native_get_exit_code_process as *const () as usize as u64),
+            "TerminateProcess" => Some(native_terminate_process as *const () as usize as u64),
             "GetCurrentThread" => Some(native_get_current_thread as *const () as usize as u64),
             "GetModuleHandleA" => Some(native_get_module_handle_a as *const () as usize as u64),
             "VirtualProtect" => Some(native_virtual_protect as *const () as usize as u64),
@@ -2526,30 +2683,38 @@ mod imp {
         let entry = entry(img)?;
         let mapping = map(img)?;
         patch_baseline_imports(&mapping, img)?;
-        NATIVE_IMAGE_BASE.store(img.image_base, Ordering::Release);
         let tls = setup_tls(&mapping, img)?;
-        if let Ok(mut template) = NATIVE_TLS_TEMPLATE.lock() {
-            *template = tls.as_ref().map(NativeTls::clone_for_thread);
-        }
         let fs = Arc::new(Mutex::new(NativeFs {
             fs: instance_fs,
             handles: HashMap::new(),
             finds: HashMap::new(),
             next: 0x100,
         }));
-        let process = NativeProcessContext {
+        let command_line_w = command_line_w(prog, args)?;
+        let command_line_a = command_line_a(&command_line_w);
+        let process = Arc::new(NativeProcessContext {
             image_base: img.image_base,
-            command_line_w: command_line_w(prog, args)?,
-            command_line_a: Vec::new(),
+            process_id: 1,
+            process_handle: u64::MAX,
+            parent_process_id: 0,
+            command_line_w,
+            command_line_a,
             fs,
-        };
-        let mut process = process;
-        process.command_line_a = command_line_a(&process.command_line_w);
-        NATIVE_IMAGE_BASE.store(process.image_base, Ordering::Release);
-        COMMAND_LINE_W.store(process.command_line_w.as_ptr() as u64, Ordering::Release);
-        COMMAND_LINE_A.store(process.command_line_a.as_ptr() as u64, Ordering::Release);
-        if let Ok(mut context) = NATIVE_FS.lock() {
-            *context = Some(Arc::clone(&process.fs));
+            last_error: AtomicU32::new(0),
+            gs_base: AtomicU64::new(0),
+            tls_template: Mutex::new(tls.as_ref().map(NativeTls::clone_for_thread)),
+            threads: Mutex::new(HashMap::new()),
+            thread_next: AtomicU64::new(0x8000_0000),
+            timer_next: AtomicU64::new(0x7000_0000),
+            state_fd: AtomicU32::new(u32::MAX),
+            fls_value: AtomicU64::new(0),
+            unhandled_exception_filter: AtomicU64::new(0),
+            vectored_exception_handler: AtomicU64::new(0),
+            exit_status: AtomicU32::new(259), // STILL_ACTIVE
+            exited: AtomicBool::new(false),
+        });
+        if let Ok(mut context) = NATIVE_PROCESS.lock() {
+            *context = Some(Arc::clone(&process));
         }
         let mut fds = [-1, -1];
         if unsafe { pipe(fds.as_mut_ptr()) } != 0 {
@@ -2583,6 +2748,8 @@ mod imp {
             ));
         }
         if pid == 0 {
+            #[cfg(test)]
+            NATIVE_GUEST_ACTIVE.store(true, Ordering::Release);
             unsafe {
                 close(fds[0]);
                 close(state_fds[0]);
@@ -2591,12 +2758,16 @@ mod imp {
                 }
                 close(fds[1]);
             }
-            NATIVE_STATE_FD.store(state_fds[1] as u32, Ordering::Release);
+            process
+                .state_fd
+                .store(state_fds[1] as u32, Ordering::Release);
             if protect_exec(&mapping).is_err() {
                 unsafe { _exit(127) };
             }
             if let Some(tls) = tls.as_ref() {
-                NATIVE_GS_BASE.store(tls.teb.as_ptr() as u64, Ordering::Release);
+                process
+                    .gs_base
+                    .store(tls.teb.as_ptr() as u64, Ordering::Release);
                 if !unsafe { set_gs(tls.teb.as_ptr() as u64) } {
                     unsafe { _exit(127) };
                 }
@@ -2660,15 +2831,12 @@ mod imp {
                 std::io::Error::last_os_error()
             ));
         }
-        COMMAND_LINE_W.store(0, Ordering::Release);
-        COMMAND_LINE_A.store(0, Ordering::Release);
-        if let Ok(mut context) = NATIVE_FS.lock() {
+        process
+            .exit_status
+            .store((status >> 8) as u32, Ordering::Release);
+        process.exited.store(true, Ordering::Release);
+        if let Ok(mut context) = NATIVE_PROCESS.lock() {
             *context = None;
-        }
-        NATIVE_IMAGE_BASE.store(0, Ordering::Release);
-        NATIVE_GS_BASE.store(0, Ordering::Release);
-        if let Ok(mut template) = NATIVE_TLS_TEMPLATE.lock() {
-            *template = None;
         }
         let final_fs = if state.is_empty() {
             process
@@ -2769,7 +2937,10 @@ mod tests {
 
     #[test]
     fn forwards_native_child_stdout_chunks() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/artifacts/exe/rust_hello.exe");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/artifacts/exe/rust_hello.exe"
+        );
         let img = load(&std::fs::read(path).unwrap()).unwrap();
         let output = std::sync::Mutex::new(Vec::new());
         let (code, returned, _) = run_rust_baseline_argv_with_fs_streaming(
@@ -2806,8 +2977,11 @@ mod tests {
 
     #[test]
     fn native_guest_commits_filesystem_state_across_child_boundary() {
-        let writer = load(&crate::pe::builder::write_file(r"C:\work\state.txt", b"native"))
-            .expect("writer loads");
+        let writer = load(&crate::pe::builder::write_file(
+            r"C:\work\state.txt",
+            b"native",
+        ))
+        .expect("writer loads");
         let mut fs = WinFs::ephemeral_runner();
         fs.mkdir(r"C:\work").unwrap();
         let (code, _, fs) = run_rust_baseline_argv_with_fs(&writer, fs, "writer.exe", &[])
@@ -2815,8 +2989,10 @@ mod tests {
         assert_eq!(code, 0);
         assert_eq!(fs.read_file(r"C:\work\state.txt").unwrap(), b"native");
 
-        let reader = load(&crate::pe::builder::read_file_to_stdout(r"C:\work\state.txt"))
-            .expect("reader loads");
+        let reader = load(&crate::pe::builder::read_file_to_stdout(
+            r"C:\work\state.txt",
+        ))
+        .expect("reader loads");
         let (code, out, _) = run_rust_baseline_argv_with_fs(&reader, fs, "reader.exe", &[])
             .expect("native reader runs");
         assert_eq!(code, 0);

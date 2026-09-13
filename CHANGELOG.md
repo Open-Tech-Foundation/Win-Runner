@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Native guest process state is now owned by `NativeProcessContext` rather
+  than shared runtime globals: command lines, image/TLS state, filesystem
+  handles, thread/timer allocation, last-error/FLS/exception state, and
+  snapshot-pipe ownership are isolated behind the process dispatcher. The
+  native import bridge now implements current-process IDs and handles,
+  `GetExitCodeProcess`, `TerminateProcess`, and correct pseudo-handle
+  rejection in `CloseHandle`, establishing the process-core foundation for
+  `CreateProcessW` children.
 - Added the transport-neutral v1 instance frame contract: a versioned,
   bounded multiplexed envelope for request/response, stdin, stdout, stderr,
   completion, cancellation, and failure events. Unix sockets and future
