@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Native launches now boot a fresh, child-local runner WinFs image rather
+  than a bare filesystem root. The ephemeral image supplies Windows system,
+  runner, work, diagnostics, user-profile, and temp directories and starts
+  at `C:\\actions-runner\\_work`. Its state is never mounted from or written
+  back to Linux and is discarded after the guest exits. Native current- and
+  full-path queries now resolve through that instance filesystem.
 - Initial opt-in native Linux/x86-64 PE backend: maps an import-free,
   TLS-free PE32+ fixture at its preferred image base and invokes a returning
   Windows-x64 entry point directly on the host CPU. `WINCLI_BACKEND=native`

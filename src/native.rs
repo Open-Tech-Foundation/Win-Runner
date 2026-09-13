@@ -1481,12 +1481,15 @@ mod imp {
         0
     }
     extern "win64" fn native_get_current_directory_w(output_len: u32, output: *mut u16) -> u32 {
-        const ROOT: [u16; 4] = ['C' as u16, ':' as u16, '\\' as u16, 0];
-        if output.is_null() || output_len < ROOT.len() as u32 {
-            return ROOT.len() as u32;
+        let cwd = fs_ctx()
+            .and_then(|context| context.lock().ok().map(|ctx| ctx.fs.cwd()))
+            .unwrap_or_else(|| "C:\\".to_string());
+        let encoded: Vec<u16> = cwd.encode_utf16().chain(std::iter::once(0)).collect();
+        if output.is_null() || output_len < encoded.len() as u32 {
+            return encoded.len() as u32;
         }
-        unsafe { output.copy_from_nonoverlapping(ROOT.as_ptr(), ROOT.len()) };
-        (ROOT.len() - 1) as u32
+        unsafe { output.copy_from_nonoverlapping(encoded.as_ptr(), encoded.len()) };
+        (encoded.len() - 1) as u32
     }
     extern "win64" fn native_get_computer_name_ex_w(
         _name_type: u32,
@@ -1535,13 +1538,22 @@ mod imp {
         let Some(raw) = wide(input) else {
             return 0;
         };
-        let path = if raw == "." || raw.is_empty() {
-            "C:\\".to_string()
-        } else if raw.len() >= 2 && raw.as_bytes()[1] == b':' {
-            raw.replace('/', "\\")
-        } else {
-            format!("C:\\{}", raw.replace('/', "\\"))
-        };
+        let path = fs_ctx()
+            .and_then(|context| {
+                context
+                    .lock()
+                    .ok()
+                    .and_then(|ctx| ctx.fs.normalize(&raw).ok().map(|path| path.display()))
+            })
+            .unwrap_or_else(|| {
+                if raw == "." || raw.is_empty() {
+                    "C:\\".to_string()
+                } else if raw.len() >= 2 && raw.as_bytes()[1] == b':' {
+                    raw.replace('/', "\\")
+                } else {
+                    format!("C:\\{}", raw.replace('/', "\\"))
+                }
+            });
         let encoded: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
         if output.is_null() || output_len < encoded.len() as u32 {
             return encoded.len() as u32;
@@ -2404,7 +2416,7 @@ mod imp {
         let cmdline = command_line_w(prog, args)?;
         let cmdline_a = command_line_a(&cmdline);
         let fs = Arc::new(Mutex::new(NativeFs {
-            fs: WinFs::new(),
+            fs: WinFs::ephemeral_runner(),
             handles: HashMap::new(),
             finds: HashMap::new(),
             next: 0x100,

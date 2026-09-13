@@ -96,6 +96,34 @@ impl WinFs {
         }
     }
 
+    /// Build the empty disk for one ephemeral Windows runner instance.
+    ///
+    /// This deliberately creates no host mount and contains no persisted
+    /// state. Callers own the returned filesystem; dropping it destroys the
+    /// instance disk. The layout mirrors the writable locations a freshly
+    /// provisioned Windows Actions-style runner expects before it downloads
+    /// tools or checks out a repository.
+    pub fn ephemeral_runner() -> Self {
+        let mut fs = Self::new();
+        for path in [
+            r"C:\\Windows\\System32",
+            r"C:\\Windows\\Temp",
+            r"C:\\Program Files",
+            r"C:\\Users\\runner",
+            r"C:\\Users\\runner\\AppData\\Local\\Temp",
+            r"C:\\actions-runner\\_work",
+            r"C:\\actions-runner\\_diag",
+            r"C:\\actions-runner\\externals",
+        ] {
+            // The paths above have no conflicting files in a fresh WinFs.
+            fs.mkdir(path)
+                .expect("ephemeral runner layout must be internally valid");
+        }
+        fs.set_cwd(r"C:\\actions-runner\\_work")
+            .expect("ephemeral runner work directory must exist");
+        fs
+    }
+
     pub fn cwd(&self) -> String {
         WinPath {
             drive: self.cwd_drive,
@@ -620,5 +648,24 @@ mod tests {
         assert!(!std::path::Path::new("C:\\host_check_xyz.txt").exists());
         assert!(!std::path::Path::new("/tmp/host_check_xyz.txt").exists());
         assert!(!std::path::Path::new("host_check_xyz.txt").exists());
+    }
+
+    #[test]
+    fn ephemeral_runner_has_fresh_windows_runner_layout() {
+        let mut first = WinFs::ephemeral_runner();
+        assert_eq!(first.cwd(), r"C:\actions-runner\_work");
+        for path in [
+            r"C:\Windows\System32",
+            r"C:\Users\runner\AppData\Local\Temp",
+            r"C:\actions-runner\_diag",
+        ] {
+            assert!(first.is_dir(path), "missing {path}");
+        }
+        first.write_file(r"C:\actions-runner\_work\checkout.txt", b"one".to_vec())
+            .unwrap();
+
+        let second = WinFs::ephemeral_runner();
+        assert!(!second.exists(r"C:\actions-runner\_work\checkout.txt"));
+        assert_eq!(second.cwd(), r"C:\actions-runner\_work");
     }
 }
