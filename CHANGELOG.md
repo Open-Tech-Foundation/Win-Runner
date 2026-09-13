@@ -61,7 +61,9 @@ All notable changes to this project will be documented in this file.
   synthetic `C:\\` working directory. `GetComputerNameExW` exposes the
   synthetic `wincli` host name. `GetSystemInfo` exposes the x64 page and
   allocation layout. `GetFullPathNameW` expands relative paths in the native
-  `C:\\` WinFs namespace.
+  `C:\\` WinFs namespace. `GetUserProfileDirectoryW` provides the synthetic
+  `C:\\Users\\wincli` profile path. `GetConsoleScreenBufferInfo` exposes an
+  80×25 native console buffer.
   `VirtualProtect`
   translates the standard page-access modes to page-aligned Linux mappings.
   A narrow API-set pseudo-module resolves the CRT's dynamic `CompareStringEx`

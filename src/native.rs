@@ -161,17 +161,18 @@ mod imp {
             command_line_a, linux_protection, native_add_vectored_exception_handler,
             native_delete_critical_section, native_enter_critical_section,
             native_free_environment_strings_w, native_get_acp, native_get_computer_name_ex_w,
-            native_get_console_mode, native_get_console_output_cp, native_get_cp_info,
+            native_get_console_mode, native_get_console_output_cp,
+            native_get_console_screen_buffer_info, native_get_cp_info,
             native_get_current_directory_w, native_get_current_thread,
             native_get_environment_strings_w, native_get_environment_variable_w,
             native_get_file_type, native_get_full_path_name_w, native_get_last_error,
             native_get_module_file_name_w, native_get_module_handle_a, native_get_oem_cp,
             native_get_proc_address, native_get_startup_info_w, native_get_string_type_w,
-            native_get_system_info, native_heap_alloc, native_heap_free, native_heap_realloc,
-            native_initialize_critical_section_ex, native_initialize_slist_head,
-            native_is_valid_code_page, native_lc_map_string_w, native_leave_critical_section,
-            native_multi_byte_to_wide_char, native_process_prng, native_set_file_time,
-            native_set_last_error, native_set_thread_stack_guarantee,
+            native_get_system_info, native_get_user_profile_directory_w, native_heap_alloc,
+            native_heap_free, native_heap_realloc, native_initialize_critical_section_ex,
+            native_initialize_slist_head, native_is_valid_code_page, native_lc_map_string_w,
+            native_leave_critical_section, native_multi_byte_to_wide_char, native_process_prng,
+            native_set_file_time, native_set_last_error, native_set_thread_stack_guarantee,
             native_set_unhandled_exception_filter, native_wide_char_to_multi_byte,
             native_write_console_w, uppercase_ascii_utf16, API_SET_MODULE, PROT_EXEC, PROT_READ,
             PROT_WRITE,
@@ -330,6 +331,33 @@ mod imp {
                 3
             );
             assert_eq!(&output, &['C' as u16, ':' as u16, '\\' as u16, 0]);
+        }
+
+        #[test]
+        fn supplies_a_synthetic_user_profile_directory() {
+            let mut len = 0;
+            assert_eq!(
+                native_get_user_profile_directory_w(u64::MAX - 3, std::ptr::null_mut(), &mut len),
+                0
+            );
+            assert_eq!(len, 16);
+            let mut output = [0; 16];
+            assert_eq!(
+                native_get_user_profile_directory_w(u64::MAX - 3, output.as_mut_ptr(), &mut len),
+                1
+            );
+            assert_eq!(String::from_utf16_lossy(&output[..15]), "C:\\Users\\wincli");
+        }
+
+        #[test]
+        fn supplies_a_standard_console_screen_buffer() {
+            let mut output = [0; 22];
+            assert_eq!(
+                native_get_console_screen_buffer_info(1, output.as_mut_ptr()),
+                1
+            );
+            assert_eq!(i16::from_le_bytes(output[..2].try_into().unwrap()), 80);
+            assert_eq!(i16::from_le_bytes(output[2..4].try_into().unwrap()), 25);
         }
 
         #[test]
@@ -1142,6 +1170,22 @@ mod imp {
     extern "win64" fn native_get_console_output_cp() -> u32 {
         native_get_acp()
     }
+    extern "win64" fn native_get_console_screen_buffer_info(handle: u64, output: *mut u8) -> i32 {
+        if !matches!(handle, 0..=2) || output.is_null() {
+            return 0;
+        }
+        unsafe {
+            std::ptr::write_bytes(output, 0, 22);
+            (output as *mut i16).write_unaligned(80);
+            (output.add(2) as *mut i16).write_unaligned(25);
+            (output.add(8) as *mut u16).write_unaligned(7);
+            (output.add(14) as *mut i16).write_unaligned(79);
+            (output.add(16) as *mut i16).write_unaligned(24);
+            (output.add(18) as *mut i16).write_unaligned(80);
+            (output.add(20) as *mut i16).write_unaligned(25);
+        }
+        1
+    }
     extern "win64" fn native_get_environment_variable_w(
         name: *const u16,
         _output: *mut u16,
@@ -1224,6 +1268,43 @@ mod imp {
         }
         unsafe { output.copy_from_nonoverlapping(encoded.as_ptr(), encoded.len()) };
         (encoded.len() - 1) as u32
+    }
+    extern "win64" fn native_get_user_profile_directory_w(
+        _token: u64,
+        output: *mut u16,
+        len: *mut u32,
+    ) -> i32 {
+        const PROFILE: &[u16] = &[
+            b'C' as u16,
+            b':' as u16,
+            b'\\' as u16,
+            b'U' as u16,
+            b's' as u16,
+            b'e' as u16,
+            b'r' as u16,
+            b's' as u16,
+            b'\\' as u16,
+            b'w' as u16,
+            b'i' as u16,
+            b'n' as u16,
+            b'c' as u16,
+            b'l' as u16,
+            b'i' as u16,
+            0,
+        ];
+        if len.is_null() {
+            return 0;
+        }
+        if output.is_null() || unsafe { len.read() } < PROFILE.len() as u32 {
+            unsafe { len.write(PROFILE.len() as u32) };
+            native_set_last_error(122);
+            return 0;
+        }
+        unsafe {
+            output.copy_from_nonoverlapping(PROFILE.as_ptr(), PROFILE.len());
+            len.write((PROFILE.len() - 1) as u32)
+        };
+        1
     }
     extern "win64" fn native_set_file_time(
         handle: u64,
@@ -1661,6 +1742,9 @@ mod imp {
             }
             "GetSystemInfo" => Some(native_get_system_info as *const () as usize as u64),
             "GetFullPathNameW" => Some(native_get_full_path_name_w as *const () as usize as u64),
+            "GetUserProfileDirectoryW" => {
+                Some(native_get_user_profile_directory_w as *const () as usize as u64)
+            }
             "GetStdHandle" => Some(native_get_std_handle as *const () as usize as u64),
             "GetFileType" => Some(native_get_file_type as *const () as usize as u64),
             "GetModuleFileNameW" => {
@@ -1699,6 +1783,9 @@ mod imp {
             "ProcessPrng" => Some(native_process_prng as *const () as usize as u64),
             "GetConsoleMode" => Some(native_get_console_mode as *const () as usize as u64),
             "GetConsoleOutputCP" => Some(native_get_console_output_cp as *const () as usize as u64),
+            "GetConsoleScreenBufferInfo" => {
+                Some(native_get_console_screen_buffer_info as *const () as usize as u64)
+            }
             "GetEnvironmentVariableW" => {
                 Some(native_get_environment_variable_w as *const () as usize as u64)
             }
