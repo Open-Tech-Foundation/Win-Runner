@@ -171,7 +171,8 @@ mod imp {
             native_multi_byte_to_wide_char, native_process_prng, native_set_file_time,
             native_set_last_error, native_set_thread_stack_guarantee,
             native_set_unhandled_exception_filter, native_wide_char_to_multi_byte,
-            uppercase_ascii_utf16, API_SET_MODULE, PROT_EXEC, PROT_READ, PROT_WRITE,
+            native_write_console_w, uppercase_ascii_utf16, API_SET_MODULE, PROT_EXEC, PROT_READ,
+            PROT_WRITE,
         };
 
         #[test]
@@ -251,6 +252,14 @@ mod imp {
             );
             assert_eq!(
                 native_set_file_time(99, std::ptr::null(), std::ptr::null(), std::ptr::null()),
+                0
+            );
+        }
+
+        #[test]
+        fn rejects_console_writes_to_non_console_handles() {
+            assert_eq!(
+                native_write_console_w(99, std::ptr::null(), 0, std::ptr::null_mut(), 0),
                 0
             );
         }
@@ -1143,6 +1152,31 @@ mod imp {
         1
     }
 
+    extern "win64" fn native_write_console_w(
+        handle: u64,
+        text: *const u16,
+        len: u32,
+        written: *mut u32,
+        _reserved: u64,
+    ) -> i32 {
+        if !matches!(handle, 1 | 2) || (text.is_null() && len != 0) {
+            return 0;
+        }
+        let units = if len == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(text, len as usize) }
+        };
+        let encoded = String::from_utf16_lossy(units);
+        if unsafe { write(handle as i32, encoded.as_ptr().cast(), encoded.len()) } < 0 {
+            return 0;
+        }
+        if !written.is_null() {
+            unsafe { written.write(len) };
+        }
+        1
+    }
+
     extern "win64" fn native_exit_process(code: u32) -> ! {
         // SAFETY: this runs only in the forked guest child.
         unsafe { _exit(code as i32) }
@@ -1501,6 +1535,7 @@ mod imp {
             "GetConsoleOutputCP" => Some(native_get_console_output_cp as *const () as usize as u64),
             "SetFileTime" => Some(native_set_file_time as *const () as usize as u64),
             "WriteFile" => Some(native_write_file as *const () as usize as u64),
+            "WriteConsoleW" => Some(native_write_console_w as *const () as usize as u64),
             "ExitProcess" => Some(native_exit_process as *const () as usize as u64),
             "CreateFileW" => Some(native_create_file_w as *const () as usize as u64),
             "ReadFile" => Some(native_read_file as *const () as usize as u64),

@@ -54,7 +54,8 @@ All notable changes to this project will be documented in this file.
   entropy from Linux `getrandom`, and `GetConsoleMode` exposes a basic mode on
   the child standard descriptors. `GetConsoleOutputCP` returns the matching
   Windows-1252 console encoding. `SetFileTime` accepts metadata updates on
-  standard descriptors without persisting timestamps.
+  standard descriptors without persisting timestamps. `WriteConsoleW` writes
+  native UTF-16 console text as UTF-8.
   `VirtualProtect`
   translates the standard page-access modes to page-aligned Linux mappings.
   A narrow API-set pseudo-module resolves the CRT's dynamic `CompareStringEx`
