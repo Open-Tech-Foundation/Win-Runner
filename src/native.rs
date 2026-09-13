@@ -313,6 +313,17 @@ mod imp {
         unsafe { out.write_unaligned(ticks) };
         1
     }
+    extern "win64" fn native_initialize_critical_section_ex(
+        section: *mut u8,
+        _spin: u32,
+        _flags: u32,
+    ) -> i32 {
+        if section.is_null() {
+            return 0;
+        }
+        unsafe { std::ptr::write_bytes(section, 0, 40) };
+        1
+    }
     extern "win64" fn native_get_system_time_as_file_time(out: *mut u64) {
         if out.is_null() {
             return;
@@ -525,6 +536,9 @@ mod imp {
             }
             "QueryPerformanceCounter" => {
                 Some(native_query_performance_counter as *const () as usize as u64)
+            }
+            "InitializeCriticalSectionEx" => {
+                Some(native_initialize_critical_section_ex as *const () as usize as u64)
             }
             "GetSystemTimeAsFileTime" => {
                 Some(native_get_system_time_as_file_time as *const () as usize as u64)
