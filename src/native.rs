@@ -97,6 +97,7 @@ mod imp {
     // this process until relocations allow separate address-space layouts.
     static NATIVE_RUN_LOCK: Mutex<()> = Mutex::new(());
     static NATIVE_LAST_ERROR: AtomicU32 = AtomicU32::new(0);
+    static NATIVE_IMAGE_BASE: AtomicU64 = AtomicU64::new(0);
 
     unsafe extern "C" {
         fn mmap(
@@ -159,24 +160,26 @@ mod imp {
     mod protection_tests {
         use super::{
             command_line_a, linux_protection, native_add_vectored_exception_handler,
-            native_delete_critical_section, native_enter_critical_section,
+            native_delete_critical_section, native_enter_critical_section, native_format_message_w,
             native_free_environment_strings_w, native_get_acp, native_get_computer_name_ex_w,
             native_get_console_mode, native_get_console_output_cp,
             native_get_console_screen_buffer_info, native_get_cp_info,
             native_get_current_directory_w, native_get_current_thread,
             native_get_environment_strings_w, native_get_environment_variable_w,
             native_get_file_type, native_get_full_path_name_w, native_get_last_error,
-            native_get_module_file_name_w, native_get_module_handle_a, native_get_oem_cp,
+            native_get_module_file_name_w, native_get_module_handle_a,
+            native_get_module_handle_ex_w, native_get_module_handle_w, native_get_oem_cp,
             native_get_proc_address, native_get_startup_info_w, native_get_string_type_w,
             native_get_system_info, native_get_user_profile_directory_w, native_heap_alloc,
             native_heap_free, native_heap_realloc, native_initialize_critical_section_ex,
             native_initialize_slist_head, native_is_valid_code_page, native_lc_map_string_w,
             native_leave_critical_section, native_multi_byte_to_wide_char, native_process_prng,
-            native_set_file_time, native_set_last_error, native_set_thread_stack_guarantee,
-            native_set_unhandled_exception_filter, native_wide_char_to_multi_byte,
-            native_write_console_w, uppercase_ascii_utf16, API_SET_MODULE, PROT_EXEC, PROT_READ,
-            PROT_WRITE,
+            native_set_console_mode, native_set_file_time, native_set_last_error,
+            native_set_thread_stack_guarantee, native_set_unhandled_exception_filter,
+            native_wide_char_to_multi_byte, native_write_console_w, uppercase_ascii_utf16,
+            API_SET_MODULE, NATIVE_IMAGE_BASE, PROT_EXEC, PROT_READ, PROT_WRITE,
         };
+        use std::sync::atomic::Ordering;
 
         #[test]
         fn translates_standard_windows_page_protections() {
@@ -358,6 +361,39 @@ mod imp {
             );
             assert_eq!(i16::from_le_bytes(output[..2].try_into().unwrap()), 80);
             assert_eq!(i16::from_le_bytes(output[2..4].try_into().unwrap()), 25);
+        }
+
+        #[test]
+        fn accepts_console_mode_changes_for_standard_handles() {
+            assert_eq!(native_set_console_mode(1, 5), 1);
+            assert_eq!(native_set_console_mode(99, 5), 0);
+        }
+
+        #[test]
+        fn formats_a_native_system_error_message() {
+            let mut output = [0; 32];
+            let count = native_format_message_w(0, 0, 5, 0, output.as_mut_ptr(), 32, 0);
+            assert_eq!(
+                String::from_utf16_lossy(&output[..count as usize]),
+                "WinCLI native error.\r\n"
+            );
+        }
+
+        #[test]
+        fn exposes_the_main_module_handle() {
+            NATIVE_IMAGE_BASE.store(0x1400_0000_0, Ordering::Release);
+            assert_eq!(native_get_module_handle_w(std::ptr::null()), 0x1400_0000_0);
+        }
+
+        #[test]
+        fn exposes_the_main_module_through_module_handle_ex() {
+            NATIVE_IMAGE_BASE.store(0x1400_0000_0, Ordering::Release);
+            let mut handle = 0;
+            assert_eq!(
+                native_get_module_handle_ex_w(0, std::ptr::null(), &mut handle),
+                1
+            );
+            assert_eq!(handle, 0x1400_0000_0);
         }
 
         #[test]
@@ -811,6 +847,28 @@ mod imp {
         }
         copied as u32
     }
+    extern "win64" fn native_get_module_handle_w(name: *const u16) -> u64 {
+        if name.is_null() {
+            NATIVE_IMAGE_BASE.load(Ordering::Acquire)
+        } else {
+            0
+        }
+    }
+    extern "win64" fn native_get_module_handle_ex_w(
+        _flags: u32,
+        _name: *const u16,
+        output: *mut u64,
+    ) -> i32 {
+        if output.is_null() {
+            return 0;
+        }
+        let module = NATIVE_IMAGE_BASE.load(Ordering::Acquire);
+        if module == 0 {
+            return 0;
+        }
+        unsafe { output.write(module) };
+        1
+    }
 
     extern "win64" fn native_get_environment_strings_w() -> *const u16 {
         EMPTY_ENVIRONMENT_BLOCK.as_ptr()
@@ -1185,6 +1243,51 @@ mod imp {
             (output.add(20) as *mut i16).write_unaligned(25);
         }
         1
+    }
+    extern "win64" fn native_set_console_mode(handle: u64, _mode: u32) -> i32 {
+        matches!(handle, 0..=2) as i32
+    }
+    extern "win64" fn native_format_message_w(
+        _flags: u32,
+        _source: u64,
+        _message_id: u32,
+        _language: u32,
+        output: *mut u16,
+        output_len: u32,
+        _arguments: u64,
+    ) -> u32 {
+        const MESSAGE: &[u16] = &[
+            b'W' as u16,
+            b'i' as u16,
+            b'n' as u16,
+            b'C' as u16,
+            b'L' as u16,
+            b'I' as u16,
+            b' ' as u16,
+            b'n' as u16,
+            b'a' as u16,
+            b't' as u16,
+            b'i' as u16,
+            b'v' as u16,
+            b'e' as u16,
+            b' ' as u16,
+            b'e' as u16,
+            b'r' as u16,
+            b'r' as u16,
+            b'o' as u16,
+            b'r' as u16,
+            b'.' as u16,
+            b'\r' as u16,
+            b'\n' as u16,
+        ];
+        if output.is_null() || output_len <= MESSAGE.len() as u32 {
+            return 0;
+        }
+        unsafe {
+            output.copy_from_nonoverlapping(MESSAGE.as_ptr(), MESSAGE.len());
+            output.add(MESSAGE.len()).write(0)
+        };
+        MESSAGE.len() as u32
     }
     extern "win64" fn native_get_environment_variable_w(
         name: *const u16,
@@ -1742,6 +1845,7 @@ mod imp {
             }
             "GetSystemInfo" => Some(native_get_system_info as *const () as usize as u64),
             "GetFullPathNameW" => Some(native_get_full_path_name_w as *const () as usize as u64),
+            "FormatMessageW" => Some(native_format_message_w as *const () as usize as u64),
             "GetUserProfileDirectoryW" => {
                 Some(native_get_user_profile_directory_w as *const () as usize as u64)
             }
@@ -1749,6 +1853,10 @@ mod imp {
             "GetFileType" => Some(native_get_file_type as *const () as usize as u64),
             "GetModuleFileNameW" => {
                 Some(native_get_module_file_name_w as *const () as usize as u64)
+            }
+            "GetModuleHandleW" => Some(native_get_module_handle_w as *const () as usize as u64),
+            "GetModuleHandleExW" => {
+                Some(native_get_module_handle_ex_w as *const () as usize as u64)
             }
             "GetEnvironmentStringsW" => {
                 Some(native_get_environment_strings_w as *const () as usize as u64)
@@ -1786,6 +1894,7 @@ mod imp {
             "GetConsoleScreenBufferInfo" => {
                 Some(native_get_console_screen_buffer_info as *const () as usize as u64)
             }
+            "SetConsoleMode" => Some(native_set_console_mode as *const () as usize as u64),
             "GetEnvironmentVariableW" => {
                 Some(native_get_environment_variable_w as *const () as usize as u64)
             }
@@ -1879,6 +1988,7 @@ mod imp {
         let entry = entry(img)?;
         let mapping = map(img)?;
         patch_baseline_imports(&mapping, img)?;
+        NATIVE_IMAGE_BASE.store(img.image_base, Ordering::Release);
         let tls = setup_tls(&mapping, img)?;
         let cmdline = command_line_w(prog, args)?;
         let cmdline_a = command_line_a(&cmdline);
@@ -1964,6 +2074,7 @@ mod imp {
         COMMAND_LINE_W.store(0, Ordering::Release);
         COMMAND_LINE_A.store(0, Ordering::Release);
         NATIVE_FS.store(0, Ordering::Release);
+        NATIVE_IMAGE_BASE.store(0, Ordering::Release);
         if status & 0x7f != 0 {
             return Err(format!(
                 "native guest terminated by signal {}",

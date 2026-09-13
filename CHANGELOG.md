@@ -63,7 +63,10 @@ All notable changes to this project will be documented in this file.
   allocation layout. `GetFullPathNameW` expands relative paths in the native
   `C:\\` WinFs namespace. `GetUserProfileDirectoryW` provides the synthetic
   `C:\\Users\\wincli` profile path. `GetConsoleScreenBufferInfo` exposes an
-  80×25 native console buffer.
+  80×25 native console buffer, and `SetConsoleMode` accepts standard-handle
+  mode changes. `FormatMessageW` supplies bounded native error text, and
+  `GetModuleHandleW(NULL)` and `GetModuleHandleExW` return the mapped main
+  module.
   `VirtualProtect`
   translates the standard page-access modes to page-aligned Linux mappings.
   A narrow API-set pseudo-module resolves the CRT's dynamic `CompareStringEx`
