@@ -296,6 +296,20 @@ mod imp {
     extern "win64" fn native_get_process_heap() -> u64 {
         0x400
     }
+    extern "win64" fn native_get_current_thread_id() -> u32 {
+        1
+    }
+    extern "win64" fn native_get_system_time_as_file_time(out: *mut u64) {
+        if out.is_null() {
+            return;
+        }
+        let ticks = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs().saturating_mul(10_000_000) + (d.subsec_nanos() / 100) as u64)
+            .unwrap_or(0)
+            .saturating_add(116_444_736_000_000_000);
+        unsafe { out.write_unaligned(ticks) };
+    }
     extern "win64" fn native_heap_alloc(_heap: u64, _flags: u32, size: u32) -> u64 {
         let size = (size as usize).max(1);
         unsafe { malloc(size).cast::<u8>() as u64 }
@@ -491,6 +505,10 @@ mod imp {
         match name {
             "GetCommandLineW" => Some(native_get_command_line_w as *const () as usize as u64),
             "GetProcessHeap" => Some(native_get_process_heap as *const () as usize as u64),
+            "GetCurrentThreadId" => Some(native_get_current_thread_id as *const () as usize as u64),
+            "GetSystemTimeAsFileTime" => {
+                Some(native_get_system_time_as_file_time as *const () as usize as u64)
+            }
             "GetStdHandle" => Some(native_get_std_handle as *const () as usize as u64),
             "HeapAlloc" => Some(native_heap_alloc as *const () as usize as u64),
             "HeapFree" => Some(native_heap_free as *const () as usize as u64),
