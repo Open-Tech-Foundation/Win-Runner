@@ -6,6 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added checked PE rebasing: validated DIR64 relocation targets can now be
+  adjusted for a distinct mapping base, with positive/negative delta and
+  overflow coverage.
 - PE32+ loading now validates and retains `IMAGE_REL_BASED_DIR64` relocation
   entries, rejecting malformed relocation blocks and unsupported relocation
   types. This supplies the relocation data needed for distinct child-image

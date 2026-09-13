@@ -53,6 +53,55 @@ pub struct TlsDir {
     pub callbacks: Vec<u32>,
 }
 
+/// Rebase a loaded PE image before mapping it at `new_base`.
+pub fn rebase(image: &mut PeImage, new_base: u64) -> Result<(), String> {
+    if new_base == image.image_base {
+        return Ok(());
+    }
+    if image.relocations.is_empty() {
+        return Err("PE image has no base relocations".to_string());
+    }
+    apply_base_relocations(
+        &mut image.image,
+        &image.relocations,
+        image.image_base,
+        new_base,
+    )?;
+    let delta = new_base as i128 - image.image_base as i128;
+    for (start, end) in &mut image.code_ranges {
+        *start = (*start as i128 + delta)
+            .try_into()
+            .map_err(|_| "rebased code range overflows".to_string())?;
+        *end = (*end as i128 + delta)
+            .try_into()
+            .map_err(|_| "rebased code range overflows".to_string())?;
+    }
+    image.image_base = new_base;
+    Ok(())
+}
+
+fn apply_base_relocations(
+    image: &mut [u8],
+    relocations: &[u32],
+    old_base: u64,
+    new_base: u64,
+) -> Result<(), String> {
+    let delta = new_base as i128 - old_base as i128;
+    for rva in relocations {
+        let offset = *rva as usize;
+        let end = offset
+            .checked_add(8)
+            .filter(|end| *end <= image.len())
+            .ok_or_else(|| "base relocation target out of bounds".to_string())?;
+        let value = u64::from_le_bytes(image[offset..end].try_into().unwrap());
+        let rebased: u64 = (value as i128 + delta)
+            .try_into()
+            .map_err(|_| "rebased address overflows".to_string())?;
+        image[offset..end].copy_from_slice(&rebased.to_le_bytes());
+    }
+    Ok(())
+}
+
 /// APIs WinCLI implements. Anything else must fail clearly.
 pub const SUPPORTED_APIS: &[(&str, &str)] = &[
     ("KERNEL32.DLL", "ExitProcess"),
@@ -606,7 +655,7 @@ fn parse_base_relocations(image: &[u8], rva: u32, size: u32) -> Result<Vec<u32>,
 
 #[cfg(test)]
 mod relocation_tests {
-    use super::parse_base_relocations;
+    use super::{apply_base_relocations, parse_base_relocations};
 
     #[test]
     fn accepts_dir64_relocations_and_rejects_bad_blocks() {
@@ -622,5 +671,22 @@ mod relocation_tests {
         assert!(parse_base_relocations(&image, 0x1000, 10).is_err());
         image[0x1008..0x100a].copy_from_slice(&0x3008u16.to_le_bytes());
         assert!(parse_base_relocations(&image, 0x1000, 12).is_err());
+    }
+
+    #[test]
+    fn applies_positive_and_negative_relocation_deltas() {
+        let mut image = vec![0; 16];
+        image[..8].copy_from_slice(&0x1400_0010_0u64.to_le_bytes());
+        apply_base_relocations(&mut image, &[0], 0x1400_0000_0, 0x1500_0000_0).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(image[..8].try_into().unwrap()),
+            0x1500_0010_0
+        );
+        apply_base_relocations(&mut image, &[0], 0x1500_0000_0, 0x1400_0000_0).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(image[..8].try_into().unwrap()),
+            0x1400_0010_0
+        );
+        assert!(apply_base_relocations(&mut image, &[12], 1, 2).is_err());
     }
 }
