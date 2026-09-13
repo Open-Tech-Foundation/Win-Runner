@@ -299,6 +299,20 @@ mod imp {
     extern "win64" fn native_get_current_thread_id() -> u32 {
         1
     }
+    extern "win64" fn native_get_current_process_id() -> u32 {
+        1
+    }
+    extern "win64" fn native_query_performance_counter(out: *mut i64) -> i32 {
+        if out.is_null() {
+            return 0;
+        }
+        let ticks = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos().min(i64::MAX as u128) as i64)
+            .unwrap_or(0);
+        unsafe { out.write_unaligned(ticks) };
+        1
+    }
     extern "win64" fn native_get_system_time_as_file_time(out: *mut u64) {
         if out.is_null() {
             return;
@@ -506,6 +520,12 @@ mod imp {
             "GetCommandLineW" => Some(native_get_command_line_w as *const () as usize as u64),
             "GetProcessHeap" => Some(native_get_process_heap as *const () as usize as u64),
             "GetCurrentThreadId" => Some(native_get_current_thread_id as *const () as usize as u64),
+            "GetCurrentProcessId" => {
+                Some(native_get_current_process_id as *const () as usize as u64)
+            }
+            "QueryPerformanceCounter" => {
+                Some(native_query_performance_counter as *const () as usize as u64)
+            }
             "GetSystemTimeAsFileTime" => {
                 Some(native_get_system_time_as_file_time as *const () as usize as u64)
             }

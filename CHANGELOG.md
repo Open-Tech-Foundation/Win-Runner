@@ -26,7 +26,8 @@ All notable changes to this project will be documented in this file.
   the image TLS index, installs the guest `GS` base, and maps unresolved
   imports to contained fail trampolines for real-program startup diagnostics.
   Native ripgrep bring-up adds `GetSystemTimeAsFileTime` and
-  `GetCurrentThreadId` for CRT security-cookie initialization.
+  `GetCurrentThreadId` for CRT security-cookie initialization, plus
+  `GetCurrentProcessId` and `QueryPerformanceCounter`.
   Imported programs outside that baseline remain on the interpreter.
 - Minimal `wincli` tool: `wincli app.exe` runs PE32+ x86_64 console apps,
   `wincli script.ps1` runs filesystem scripts, both on the same in-memory
