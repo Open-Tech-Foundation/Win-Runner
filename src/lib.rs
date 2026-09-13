@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod deflate;
 pub mod inspect;
+pub mod instance;
 pub mod install;
 pub mod native;
 pub mod pe;

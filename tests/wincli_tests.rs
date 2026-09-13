@@ -1113,6 +1113,32 @@ fn test_runner_boots_snapshot_file() {
 }
 
 #[test]
+fn test_named_instance_boot_status_and_destroy() {
+    let state = tmp_path("instances");
+    let name = format!("test-{}", counter());
+    let bin = env!("CARGO_BIN_EXE_wincli");
+    let boot = Command::new(bin)
+        .args(["instance", "boot", &name])
+        .env("WINCLI_INSTANCE_DIR", &state)
+        .output()
+        .expect("boot instance");
+    assert_eq!(boot.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&boot.stderr));
+    let status = Command::new(bin)
+        .args(["instance", "status", &name])
+        .env("WINCLI_INSTANCE_DIR", &state)
+        .output()
+        .expect("query instance");
+    assert_eq!(status.status.code(), Some(0));
+    let destroy = Command::new(bin)
+        .args(["instance", "destroy", &name])
+        .env("WINCLI_INSTANCE_DIR", &state)
+        .output()
+        .expect("destroy instance");
+    assert_eq!(destroy.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&destroy.stderr));
+    std::fs::remove_dir_all(state).ok();
+}
+
+#[test]
 fn test_shell_install_run_session_offline() {
     let cache = isolated_cache("shell");
     let src = artifact("packages").to_string_lossy().to_string();

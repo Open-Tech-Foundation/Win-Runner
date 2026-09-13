@@ -1,6 +1,6 @@
 use std::io::Write;
 use std::path::Path;
-use wincli::{backend, inspect, install, pe, snapshot, winfs::WinFs};
+use wincli::{backend, inspect, instance, install, pe, snapshot, winfs::WinFs};
 
 fn usage() -> ! {
     eprintln!("usage:");
@@ -11,6 +11,8 @@ fn usage() -> ! {
     eprintln!("  wincli runner                   run host-controlled job commands from stdin");
     eprintln!("  wincli --snapshot=os.snap shell|runner  boot a snapshot image");
     eprintln!("  wincli snapshot build <dir> <os.snap>   build image from <dir>/C");
+    eprintln!("  wincli instance boot <name> [--snapshot=os.snap]");
+    eprintln!("  wincli instance status|destroy <name>");
     eprintln!("  wincli inspect <app.exe|pkg>  report PE imports vs supported APIs");
     eprintln!("  wincli install <pkg>          install a package into the cache");
     eprintln!("env: WINCLI_CACHE (default ~/.cache/wincli), WINCLI_SOURCE (package dir)");
@@ -19,6 +21,14 @@ fn usage() -> ! {
 
 fn main() {
     let mut args: Vec<String> = std::env::args().collect();
+    if (args.len() == 4 || args.len() == 5) && args[1] == "__instance-daemon" {
+        let snapshot = args.get(4).map(String::as_str);
+        if let Err(e) = instance::run_daemon(&args[2], &args[3], snapshot) {
+            eprintln!("wincli: instance daemon failed: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let snapshot_path = args
         .get(1)
         .and_then(|arg| arg.strip_prefix("--snapshot="))
@@ -40,6 +50,40 @@ fn main() {
                 eprintln!("wincli: cannot build snapshot: {e}");
                 std::process::exit(1);
             }
+        }
+        return;
+    }
+    if args.len() >= 4 && args[1] == "instance" {
+        match args[2].as_str() {
+            "boot" if args.len() == 4 || args.len() == 5 => {
+                let snapshot = args.get(4).and_then(|value| value.strip_prefix("--snapshot="));
+                if args.len() == 5 && snapshot.is_none() {
+                    usage();
+                }
+                match instance::boot(&args[3], snapshot) {
+                    Ok(()) => println!("Instance {} is running", args[3]),
+                    Err(e) => {
+                        eprintln!("wincli: cannot boot instance: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                return;
+            }
+            "status" if args.len() == 4 => match instance::status(&args[3]) {
+                Ok(()) => println!("Instance {} is running", args[3]),
+                Err(e) => {
+                    eprintln!("wincli: {e}");
+                    std::process::exit(1);
+                }
+            },
+            "destroy" if args.len() == 4 => match instance::destroy(&args[3]) {
+                Ok(()) => println!("Instance {} destroyed", args[3]),
+                Err(e) => {
+                    eprintln!("wincli: {e}");
+                    std::process::exit(1);
+                }
+            },
+            _ => usage(),
         }
         return;
     }

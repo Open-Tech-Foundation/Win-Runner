@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- `wincli instance boot <name>`, `status`, and `destroy` now provide the
+  first persistent named-instance lifecycle on Unix hosts. A background daemon
+  owns a snapshot-backed WinFs image and protects its private control socket
+  with mode `0600`; this generic transport is intentionally separate from
+  future Windows named-pipe support and from GitHub-specific adapters.
 - PE execution now goes through a platform-neutral `ExecutionBackend`
   interface. The portable interpreter and the Linux x86-64 direct-PE backend
   are registered implementations with stable identifiers and capabilities;
