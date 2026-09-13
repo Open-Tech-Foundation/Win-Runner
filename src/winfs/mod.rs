@@ -303,6 +303,30 @@ impl WinFs {
         }
     }
 
+    /// Return every regular file as an absolute Windows path and its bytes.
+    /// Snapshot code uses this to serialize an isolated instance without ever
+    /// consulting the Linux filesystem.
+    pub fn files(&self) -> Vec<(String, Vec<u8>)> {
+        fn visit(node: &Node, path: &str, out: &mut Vec<(String, Vec<u8>)>) {
+            match node {
+                Node::File { data, .. } => {
+                    out.push((path.to_string(), data.clone()));
+                }
+                Node::Dir { children, .. } => {
+                    for child in children.values() {
+                        visit(child, &format!("{path}\\{}", child.name()), out);
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for (drive, root) in &self.drives {
+            visit(root, &format!("{drive}:"), &mut out);
+        }
+        out.sort_by(|left, right| left.0.cmp(&right.0));
+        out
+    }
+
     // ---- mutations ----
 
     /// Create all missing directories along `path` (like mkdir -p).
@@ -667,5 +691,20 @@ mod tests {
         let second = WinFs::ephemeral_runner();
         assert!(!second.exists(r"C:\actions-runner\_work\checkout.txt"));
         assert_eq!(second.cwd(), r"C:\actions-runner\_work");
+    }
+
+    #[test]
+    fn files_lists_absolute_paths_in_deterministic_order() {
+        let mut fs = WinFs::new();
+        fs.write_file(r"C:\b.txt", b"b".to_vec()).unwrap();
+        fs.mkdir(r"C:\a").unwrap();
+        fs.write_file(r"C:\a\a.txt", b"a".to_vec()).unwrap();
+        assert_eq!(
+            fs.files(),
+            vec![
+                (r"C:\a\a.txt".to_string(), b"a".to_vec()),
+                (r"C:\b.txt".to_string(), b"b".to_vec()),
+            ]
+        );
     }
 }

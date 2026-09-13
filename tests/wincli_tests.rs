@@ -1056,6 +1056,25 @@ fn test_runner_seeds_and_executes_a_guest_pe() {
 }
 
 #[test]
+fn test_native_runner_commits_guest_files_to_the_session() {
+    let host_exe = tmp_path("native-writer.exe");
+    std::fs::write(
+        &host_exe,
+        pe::builder::write_file(r"C:\actions-runner\_work\native.txt", b"persisted"),
+    )
+    .unwrap();
+    let input = format!(
+        "@seed {} C:\\actions-runner\\_work\\writer.exe\nC:\\actions-runner\\_work\\writer.exe\nGet-Content C:\\actions-runner\\_work\\native.txt\nexit\n",
+        host_exe.display()
+    );
+    let (code, stdout, stderr) = run_session_env("runner", &input, &[("WINCLI_BACKEND", "native")]);
+    std::fs::remove_file(host_exe).ok();
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "persisted\n");
+    assert!(stderr.is_empty(), "stderr: {stderr}");
+}
+
+#[test]
 fn test_runner_boots_snapshot_file() {
     let input = tmp_path("snapshot-input");
     let path = tmp_path("runner.snap");

@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Native runner commands now retain their WinFs changes across the forked
+  direct-PE execution boundary. On guest exit, the child returns a validated
+  in-memory snapshot through a private pipe; the host restores it into the
+  same ephemeral session without exposing a Linux filesystem mount. This
+  enables a native guest to create files consumed by following runner steps.
 - `wincli --snapshot=os.snap shell` and `runner` now boot a compressed ZIP
   snapshot over the fresh instance image. The documented v1 archive layout
   maps `files/C/...` entries to WinFs paths and verifies a version marker;

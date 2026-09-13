@@ -46,6 +46,19 @@ pub fn run_rust_baseline_argv(
     imp::run_rust_baseline_argv(img, prog, args)
 }
 
+/// Run a native guest against an existing isolated instance filesystem and
+/// return the child-committed filesystem with its exit status and console
+/// output. The guest still executes in a forked child; state crosses that
+/// boundary as a validated in-memory snapshot, never through a host mount.
+pub fn run_rust_baseline_argv_with_fs(
+    img: &PeImage,
+    fs: crate::winfs::WinFs,
+    prog: &str,
+    args: &[String],
+) -> Result<(u32, Vec<u8>, crate::winfs::WinFs), String> {
+    imp::run_rust_baseline_argv_with_fs(img, fs, prog, args)
+}
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod imp {
     use super::PeImage;
@@ -104,6 +117,7 @@ mod imp {
         LazyLock::new(|| Mutex::new(HashMap::new()));
     static NATIVE_THREAD_NEXT: AtomicU64 = AtomicU64::new(0x8000_0000);
     static NATIVE_TIMER_NEXT: AtomicU64 = AtomicU64::new(0x7000_0000);
+    static NATIVE_STATE_FD: AtomicU32 = AtomicU32::new(u32::MAX);
 
     unsafe extern "C" {
         fn mmap(
@@ -1809,8 +1823,42 @@ mod imp {
     }
 
     extern "win64" fn native_exit_process(code: u32) -> ! {
+        // Closing stdout lets the parent drain console output before the
+        // snapshot pipe can block on a large guest disk image.
+        unsafe { close(1) };
+        native_flush_instance_state();
         // SAFETY: this runs only in the forked guest child.
         unsafe { _exit(code as i32) }
+    }
+
+    fn native_flush_instance_state() {
+        let fd = NATIVE_STATE_FD.load(Ordering::Acquire);
+        if fd == u32::MAX {
+            return;
+        }
+        let Some(context) = fs_ctx() else {
+            return;
+        };
+        let Ok(ctx) = context.lock() else {
+            return;
+        };
+        let encoded = crate::snapshot::encode(&ctx.fs);
+        let mut written = 0;
+        while written < encoded.len() {
+            let n = unsafe {
+                write(
+                    fd as i32,
+                    encoded[written..].as_ptr().cast(),
+                    encoded.len() - written,
+                )
+            };
+            if n <= 0 {
+                break;
+            }
+            written += n as usize;
+        }
+        unsafe { close(fd as i32) };
+        NATIVE_STATE_FD.store(u32::MAX, Ordering::Release);
     }
     extern "win64" fn native_unimplemented() -> u64 {
         0
@@ -2402,6 +2450,16 @@ mod imp {
         prog: &str,
         args: &[String],
     ) -> Result<(u32, Vec<u8>), String> {
+        run_rust_baseline_argv_with_fs(img, WinFs::ephemeral_runner(), prog, args)
+            .map(|(code, out, _)| (code, out))
+    }
+
+    pub(super) fn run_rust_baseline_argv_with_fs(
+        img: &PeImage,
+        instance_fs: WinFs,
+        prog: &str,
+        args: &[String],
+    ) -> Result<(u32, Vec<u8>, WinFs), String> {
         let _run = NATIVE_RUN_LOCK
             .lock()
             .map_err(|_| "native backend execution lock is poisoned".to_string())?;
@@ -2416,7 +2474,7 @@ mod imp {
         let cmdline = command_line_w(prog, args)?;
         let cmdline_a = command_line_a(&cmdline);
         let fs = Arc::new(Mutex::new(NativeFs {
-            fs: WinFs::ephemeral_runner(),
+            fs: instance_fs,
             handles: HashMap::new(),
             finds: HashMap::new(),
             next: 0x100,
@@ -2433,11 +2491,24 @@ mod imp {
                 std::io::Error::last_os_error()
             ));
         }
+        let mut state_fds = [-1, -1];
+        if unsafe { pipe(state_fds.as_mut_ptr()) } != 0 {
+            unsafe {
+                close(fds[0]);
+                close(fds[1]);
+            }
+            return Err(format!(
+                "native backend could not create state pipe: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
         let pid = unsafe { fork() };
         if pid < 0 {
             unsafe {
                 close(fds[0]);
                 close(fds[1]);
+                close(state_fds[0]);
+                close(state_fds[1]);
             }
             return Err(format!(
                 "native backend could not fork guest: {}",
@@ -2447,11 +2518,13 @@ mod imp {
         if pid == 0 {
             unsafe {
                 close(fds[0]);
+                close(state_fds[0]);
                 if dup2(fds[1], 1) < 0 {
                     _exit(127);
                 }
                 close(fds[1]);
             }
+            NATIVE_STATE_FD.store(state_fds[1] as u32, Ordering::Release);
             if protect_exec(&mapping).is_err() {
                 unsafe { _exit(127) };
             }
@@ -2465,10 +2538,13 @@ mod imp {
             // imported ExitProcess trampoline terminates this child.
             let guest: unsafe extern "win64" fn() -> u32 = unsafe { std::mem::transmute(entry) };
             let code = unsafe { guest() };
+            unsafe { close(1) };
+            native_flush_instance_state();
             unsafe { _exit(code as i32) };
         }
         unsafe {
             close(fds[1]);
+            close(state_fds[1]);
         }
         let mut out = Vec::new();
         let mut buf = [0u8; 4096];
@@ -2491,6 +2567,22 @@ mod imp {
         unsafe {
             close(fds[0]);
         }
+        let mut state = Vec::new();
+        loop {
+            let n = unsafe { read(state_fds[0], buf.as_mut_ptr().cast(), buf.len()) };
+            if n == 0 {
+                break;
+            }
+            if n < 0 {
+                unsafe { close(state_fds[0]) };
+                return Err(format!(
+                    "native backend could not read guest filesystem state: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            state.extend_from_slice(&buf[..n as usize]);
+        }
+        unsafe { close(state_fds[0]) };
         let mut status = 0;
         if unsafe { waitpid(pid, &mut status, 0) } != pid {
             return Err(format!(
@@ -2508,13 +2600,22 @@ mod imp {
         if let Ok(mut template) = NATIVE_TLS_TEMPLATE.lock() {
             *template = None;
         }
+        let final_fs = if state.is_empty() {
+            fs.lock()
+                .map_err(|_| "native backend filesystem lock is poisoned".to_string())?
+                .fs
+                .clone()
+        } else {
+            crate::snapshot::load(&state)
+                .map_err(|e| format!("native backend returned invalid filesystem state: {e}"))?
+        };
         if status & 0x7f != 0 {
             return Err(format!(
                 "native guest terminated by signal {}",
                 status & 0x7f
             ));
         }
-        Ok(((status >> 8) as u32, out))
+        Ok(((status >> 8) as u32, out, final_fs))
     }
 }
 
@@ -2533,6 +2634,15 @@ mod imp {
     ) -> Result<(u32, Vec<u8>), String> {
         Err("native backend is available only on Linux x86_64".to_string())
     }
+
+    pub(super) fn run_rust_baseline_argv_with_fs(
+        _: &PeImage,
+        _: crate::winfs::WinFs,
+        _: &str,
+        _: &[String],
+    ) -> Result<(u32, Vec<u8>, crate::winfs::WinFs), String> {
+        Err("native backend is available only on Linux x86_64".to_string())
+    }
 }
 
 #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
@@ -2542,6 +2652,7 @@ mod tests {
         builder::{build, Asm},
         load,
     };
+    use crate::winfs::WinFs;
 
     #[test]
     fn executes_an_import_free_pe_at_native_speed() {
@@ -2591,5 +2702,24 @@ mod tests {
             run_rust_baseline_argv(&img, "myprog.exe", &args).expect("native rust argv runs");
         assert_eq!(code, 0);
         assert_eq!(out, b"myprog.exe hello \"a b\" --version\n");
+    }
+
+    #[test]
+    fn native_guest_commits_filesystem_state_across_child_boundary() {
+        let writer = load(&crate::pe::builder::write_file(r"C:\work\state.txt", b"native"))
+            .expect("writer loads");
+        let mut fs = WinFs::ephemeral_runner();
+        fs.mkdir(r"C:\work").unwrap();
+        let (code, _, fs) = run_rust_baseline_argv_with_fs(&writer, fs, "writer.exe", &[])
+            .expect("native writer runs");
+        assert_eq!(code, 0);
+        assert_eq!(fs.read_file(r"C:\work\state.txt").unwrap(), b"native");
+
+        let reader = load(&crate::pe::builder::read_file_to_stdout(r"C:\work\state.txt"))
+            .expect("reader loads");
+        let (code, out, _) = run_rust_baseline_argv_with_fs(&reader, fs, "reader.exe", &[])
+            .expect("native reader runs");
+        assert_eq!(code, 0);
+        assert_eq!(out, b"native");
     }
 }

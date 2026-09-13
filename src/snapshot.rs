@@ -82,6 +82,18 @@ pub fn load(bytes: &[u8]) -> Result<WinFs, String> {
     Ok(fs)
 }
 
+/// Encode an in-memory instance as a bootable v1 archive. This is used by
+/// the native child boundary to return its guest-side filesystem changes to
+/// the host controller without mounting the host filesystem.
+pub fn encode(fs: &WinFs) -> Vec<u8> {
+    let mut entries = vec![(MARKER.to_string(), MARKER_CONTENTS.to_vec())];
+    for (path, data) in fs.files() {
+        let path = path.strip_prefix("C:\\").unwrap_or(&path).replace('\\', "/");
+        entries.push((format!("files/C/{path}"), data));
+    }
+    zip_stored(&entries)
+}
+
 fn guest_path(name: &str) -> Result<String, String> {
     validate_name(name)?;
     let tail = name
@@ -246,5 +258,18 @@ mod tests {
         let fs = load(&std::fs::read(&output).unwrap()).unwrap();
         assert_eq!(fs.read_file(r"C:\tools\tool.txt").unwrap(), b"tool");
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn encodes_a_live_instance() {
+        let mut fs = WinFs::ephemeral_runner();
+        fs.mkdir(r"C:\actions-runner\_work").unwrap();
+        fs.write_file(r"C:\actions-runner\_work\result.txt", b"done".to_vec())
+            .unwrap();
+        let restored = load(&encode(&fs)).unwrap();
+        assert_eq!(
+            restored.read_file(r"C:\actions-runner\_work\result.txt").unwrap(),
+            b"done"
+        );
     }
 }
