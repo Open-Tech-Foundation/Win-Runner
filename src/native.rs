@@ -110,6 +110,44 @@ mod imp {
             .ok_or_else(|| "native image size overflows page rounding".to_string())
     }
 
+    fn linux_protection(page_protection: u32) -> Option<i32> {
+        // The low byte specifies the page access mode. Guard/cache modifiers
+        // are intentionally not implemented by the native backend yet.
+        match page_protection & 0xff {
+            0x01 => Some(0),                                  // PAGE_NOACCESS
+            0x02 => Some(PROT_READ),                          // PAGE_READONLY
+            0x04 => Some(PROT_READ | PROT_WRITE),             // PAGE_READWRITE
+            0x10 => Some(PROT_EXEC),                          // PAGE_EXECUTE
+            0x20 => Some(PROT_READ | PROT_EXEC),              // PAGE_EXECUTE_READ
+            0x40 => Some(PROT_READ | PROT_WRITE | PROT_EXEC), // PAGE_EXECUTE_READWRITE
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    mod protection_tests {
+        use super::{linux_protection, PROT_EXEC, PROT_READ, PROT_WRITE};
+
+        #[test]
+        fn translates_standard_windows_page_protections() {
+            assert_eq!(linux_protection(0x01), Some(0));
+            assert_eq!(linux_protection(0x02), Some(PROT_READ));
+            assert_eq!(linux_protection(0x04), Some(PROT_READ | PROT_WRITE));
+            assert_eq!(linux_protection(0x10), Some(PROT_EXEC));
+            assert_eq!(linux_protection(0x20), Some(PROT_READ | PROT_EXEC));
+            assert_eq!(
+                linux_protection(0x40),
+                Some(PROT_READ | PROT_WRITE | PROT_EXEC)
+            );
+        }
+
+        #[test]
+        fn rejects_unsupported_windows_page_protections() {
+            assert_eq!(linux_protection(0x08), None);
+            assert_eq!(linux_protection(0x100), None);
+        }
+    }
+
     fn map(img: &PeImage) -> Result<Mapping, String> {
         if img.image_base & 4095 != 0 {
             return Err(format!(
@@ -442,6 +480,45 @@ mod imp {
         0
     }
 
+    extern "win64" fn native_virtual_protect(
+        address: *mut c_void,
+        size: usize,
+        page_protection: u32,
+        old_page_protection: *mut u32,
+    ) -> i32 {
+        if address.is_null() || size == 0 {
+            return 0;
+        }
+        let protection = match linux_protection(page_protection) {
+            Some(value) => value,
+            None => return 0,
+        };
+        let start = (address as usize) & !4095;
+        let end = match (address as usize)
+            .checked_add(size)
+            .and_then(|value| value.checked_add(4095))
+        {
+            Some(value) => value & !4095,
+            None => return 0,
+        };
+        if end <= start {
+            return 0;
+        }
+        // SAFETY: `mprotect` receives a page-aligned range derived from the
+        // guest's requested range. Invalid guest ranges fail without harming
+        // the parent because the PE runs in its forked child.
+        if unsafe { mprotect(start as *mut c_void, end - start, protection) } != 0 {
+            return 0;
+        }
+        if !old_page_protection.is_null() {
+            // The loader initially maps native PE images RWX. This is the
+            // accurate old protection until section-aware initial mapping is
+            // introduced.
+            unsafe { old_page_protection.write(0x40) };
+        }
+        1
+    }
+
     extern "win64" fn native_create_file_w(
         path: *const u16,
         access: u32,
@@ -563,6 +640,7 @@ mod imp {
                 Some(native_get_current_process_id as *const () as usize as u64)
             }
             "GetCurrentProcess" => Some(native_get_current_process as *const () as usize as u64),
+            "VirtualProtect" => Some(native_virtual_protect as *const () as usize as u64),
             "QueryPerformanceCounter" => {
                 Some(native_query_performance_counter as *const () as usize as u64)
             }
