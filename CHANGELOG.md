@@ -28,10 +28,14 @@ All notable changes to this project will be documented in this file.
   Native ripgrep bring-up adds `GetSystemTimeAsFileTime` and
   `GetCurrentThreadId` for CRT security-cookie initialization, plus
   `GetCurrentProcessId`, `QueryPerformanceCounter`, and a single-threaded
-  `InitializeCriticalSectionEx` shim. A single-threaded `FlsAlloc`/get/set/
-  free slot supports ripgrep CRT fiber-local initialization, and
-  `GetCurrentProcess` supplies the Windows pseudo-handle. `VirtualProtect`
+  critical-section shim (`InitializeCriticalSectionEx`, enter, leave, and
+  delete). A single-threaded `FlsAlloc`/get/set/free slot supports ripgrep CRT
+  fiber-local initialization, and
+  `GetCurrentProcess` supplies the Windows pseudo-handle. `GetLastError` and
+  `SetLastError` preserve child-local error values. `VirtualProtect`
   translates the standard page-access modes to page-aligned Linux mappings.
+  A narrow API-set pseudo-module resolves the CRT's dynamic `CompareStringEx`
+  lookup without loading a host DLL.
   Imported programs outside that baseline remain on the interpreter.
 - Minimal `wincli` tool: `wincli app.exe` runs PE32+ x86_64 console apps,
   `wincli script.ps1` runs filesystem scripts, both on the same in-memory

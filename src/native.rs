@@ -53,7 +53,7 @@ mod imp {
     use std::collections::HashMap;
     use std::ffi::c_void;
     use std::ptr;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     use std::sync::Mutex;
 
     const PROT_READ: i32 = 0x1;
@@ -64,10 +64,14 @@ mod imp {
     // Linux-specific. Unlike MAP_FIXED, this never replaces an existing map.
     const MAP_FIXED_NOREPLACE: i32 = 0x100000;
     const MAP_FAILED: *mut c_void = usize::MAX as *mut c_void;
+    // A child-local stand-in for the API-set modules dynamically requested by
+    // the Universal CRT. It is deliberately not a host `dlopen` handle.
+    const API_SET_MODULE: u64 = 0x5749_4e43_4c49_0001;
 
     // Preferred-base PE mappings collide by design. Serialize native runs in
     // this process until relocations allow separate address-space layouts.
     static NATIVE_RUN_LOCK: Mutex<()> = Mutex::new(());
+    static NATIVE_LAST_ERROR: AtomicU32 = AtomicU32::new(0);
 
     unsafe extern "C" {
         fn mmap(
@@ -126,7 +130,12 @@ mod imp {
 
     #[cfg(test)]
     mod protection_tests {
-        use super::{linux_protection, PROT_EXEC, PROT_READ, PROT_WRITE};
+        use super::{
+            linux_protection, native_delete_critical_section, native_enter_critical_section,
+            native_get_last_error, native_get_proc_address, native_initialize_critical_section_ex,
+            native_leave_critical_section, native_set_last_error, uppercase_ascii_utf16,
+            API_SET_MODULE, PROT_EXEC, PROT_READ, PROT_WRITE,
+        };
 
         #[test]
         fn translates_standard_windows_page_protections() {
@@ -145,6 +154,45 @@ mod imp {
         fn rejects_unsupported_windows_page_protections() {
             assert_eq!(linux_protection(0x08), None);
             assert_eq!(linux_protection(0x100), None);
+        }
+
+        #[test]
+        fn resolves_only_the_supported_dynamic_api_set_export() {
+            assert_ne!(
+                native_get_proc_address(API_SET_MODULE, c"CompareStringEx".as_ptr().cast()),
+                0
+            );
+            assert_eq!(
+                native_get_proc_address(API_SET_MODULE, c"UnknownExport".as_ptr().cast()),
+                0
+            );
+        }
+
+        #[test]
+        fn folds_ascii_case_without_changing_non_ascii_utf16() {
+            let mut value = ['a' as u16, 'Z' as u16, 0x00e9];
+            uppercase_ascii_utf16(&mut value);
+            assert_eq!(value, ['A' as u16, 'Z' as u16, 0x00e9]);
+        }
+
+        #[test]
+        fn single_threaded_critical_sections_initialize_and_are_callable() {
+            let mut section = [0xa5; 40];
+            assert_eq!(
+                native_initialize_critical_section_ex(section.as_mut_ptr(), 0, 0),
+                1
+            );
+            assert_eq!(section, [0; 40]);
+            native_enter_critical_section(section.as_mut_ptr());
+            native_leave_critical_section(section.as_mut_ptr());
+            native_delete_critical_section(section.as_mut_ptr());
+        }
+
+        #[test]
+        fn preserves_the_native_child_last_error() {
+            native_set_last_error(87);
+            assert_eq!(native_get_last_error(), 87);
+            native_set_last_error(0);
         }
     }
 
@@ -414,6 +462,9 @@ mod imp {
         }
         1
     }
+    extern "win64" fn native_enter_critical_section(_section: *mut u8) {}
+    extern "win64" fn native_leave_critical_section(_section: *mut u8) {}
+    extern "win64" fn native_delete_critical_section(_section: *mut u8) {}
 
     extern "win64" fn native_write_file(
         handle: u64,
@@ -478,6 +529,101 @@ mod imp {
     }
     extern "win64" fn native_unimplemented() -> u64 {
         0
+    }
+
+    extern "win64" fn native_get_last_error() -> u32 {
+        NATIVE_LAST_ERROR.load(Ordering::Acquire)
+    }
+
+    extern "win64" fn native_set_last_error(error: u32) {
+        NATIVE_LAST_ERROR.store(error, Ordering::Release);
+    }
+
+    unsafe fn ascii_z(ptr: *const u8) -> Option<&'static str> {
+        if ptr.is_null() {
+            return None;
+        }
+        let mut len = 0;
+        while len < 128 && unsafe { *ptr.add(len) } != 0 {
+            len += 1;
+        }
+        if len == 128 {
+            return None;
+        }
+        std::str::from_utf8(unsafe { std::slice::from_raw_parts(ptr, len) }).ok()
+    }
+
+    unsafe fn utf16_argument(ptr: *const u16, len: i32) -> Option<Vec<u16>> {
+        if ptr.is_null() || len < -1 {
+            return None;
+        }
+        if len >= 0 {
+            return Some(unsafe { std::slice::from_raw_parts(ptr, len as usize) }.to_vec());
+        }
+        let mut count = 0;
+        while count < 32 * 1024 && unsafe { *ptr.add(count) } != 0 {
+            count += 1;
+        }
+        (count < 32 * 1024).then(|| unsafe { std::slice::from_raw_parts(ptr, count) }.to_vec())
+    }
+
+    fn uppercase_ascii_utf16(value: &mut [u16]) {
+        for unit in value {
+            if (b'a' as u16..=b'z' as u16).contains(unit) {
+                *unit -= (b'a' - b'A') as u16;
+            }
+        }
+    }
+
+    extern "win64" fn native_compare_string_ex(
+        _locale: *const u16,
+        flags: u32,
+        left: *const u16,
+        left_len: i32,
+        right: *const u16,
+        right_len: i32,
+        _version: *const c_void,
+        _reserved: *const c_void,
+        _param: isize,
+    ) -> i32 {
+        let (mut left, mut right) = match unsafe {
+            (
+                utf16_argument(left, left_len),
+                utf16_argument(right, right_len),
+            )
+        } {
+            (Some(left), Some(right)) => (left, right),
+            _ => return 0,
+        };
+        // NORM_IGNORECASE is the only comparison flag needed by the CRT's
+        // API-set probing path. Full Windows locale collation is future work.
+        if flags & 0x1 != 0 {
+            uppercase_ascii_utf16(&mut left);
+            uppercase_ascii_utf16(&mut right);
+        }
+        match left.cmp(&right) {
+            std::cmp::Ordering::Less => 1,
+            std::cmp::Ordering::Equal => 2,
+            std::cmp::Ordering::Greater => 3,
+        }
+    }
+
+    extern "win64" fn native_load_library_ex_w(path: *const u16, _file: u64, _flags: u32) -> u64 {
+        (!path.is_null()).then_some(API_SET_MODULE).unwrap_or(0)
+    }
+
+    extern "win64" fn native_get_proc_address(module: u64, name: *const u8) -> u64 {
+        if module != API_SET_MODULE {
+            return 0;
+        }
+        match unsafe { ascii_z(name) } {
+            Some("CompareStringEx") => native_compare_string_ex as *const () as usize as u64,
+            _ => 0,
+        }
+    }
+
+    extern "win64" fn native_free_library(module: u64) -> i32 {
+        (module == API_SET_MODULE) as i32
     }
 
     extern "win64" fn native_virtual_protect(
@@ -634,6 +780,8 @@ mod imp {
     fn baseline_trampoline(name: &str) -> Option<u64> {
         match name {
             "GetCommandLineW" => Some(native_get_command_line_w as *const () as usize as u64),
+            "GetLastError" => Some(native_get_last_error as *const () as usize as u64),
+            "SetLastError" => Some(native_set_last_error as *const () as usize as u64),
             "GetProcessHeap" => Some(native_get_process_heap as *const () as usize as u64),
             "GetCurrentThreadId" => Some(native_get_current_thread_id as *const () as usize as u64),
             "GetCurrentProcessId" => {
@@ -641,11 +789,23 @@ mod imp {
             }
             "GetCurrentProcess" => Some(native_get_current_process as *const () as usize as u64),
             "VirtualProtect" => Some(native_virtual_protect as *const () as usize as u64),
+            "LoadLibraryExW" => Some(native_load_library_ex_w as *const () as usize as u64),
+            "GetProcAddress" => Some(native_get_proc_address as *const () as usize as u64),
+            "FreeLibrary" => Some(native_free_library as *const () as usize as u64),
             "QueryPerformanceCounter" => {
                 Some(native_query_performance_counter as *const () as usize as u64)
             }
             "InitializeCriticalSectionEx" => {
                 Some(native_initialize_critical_section_ex as *const () as usize as u64)
+            }
+            "EnterCriticalSection" => {
+                Some(native_enter_critical_section as *const () as usize as u64)
+            }
+            "LeaveCriticalSection" => {
+                Some(native_leave_critical_section as *const () as usize as u64)
+            }
+            "DeleteCriticalSection" => {
+                Some(native_delete_critical_section as *const () as usize as u64)
             }
             "FlsAlloc" => Some(native_fls_alloc as *const () as usize as u64),
             "FlsFree" => Some(native_fls_free as *const () as usize as u64),
@@ -672,7 +832,10 @@ mod imp {
     }
 
     fn patch_baseline_imports(mapping: &Mapping, img: &PeImage) -> Result<(), String> {
-        for import in &img.imports {
+        // `stubs` are loader-recognized APIs that normally route to an
+        // interpreter fail-stub. Native mode gives them a contained fallback
+        // (or a real native trampoline when one has been added) as well.
+        for import in img.imports.iter().chain(&img.stubs) {
             let value = baseline_trampoline(&import.func).expect("fallback trampoline exists");
             let off = import.iat_rva as usize;
             if off.checked_add(8).is_none_or(|end| end > mapping.len) {
