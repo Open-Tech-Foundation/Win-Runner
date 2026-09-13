@@ -24,6 +24,9 @@ All notable changes to this project will be documented in this file.
   are registered implementations with stable identifiers and capabilities;
   macOS translation, Windows-native, and VM worker backends can be added
   without changing runner, snapshot, or instance semantics.
+  Backends now also expose an output-sink execution hook; the interpreter
+  forwards console chunks as they occur, establishing the live-output bridge
+  used by future instance stream writers.
 - Native runner commands now retain their WinFs changes across the forked
   direct-PE execution boundary. On guest exit, the child returns a validated
   in-memory snapshot through a private pipe; the host restores it into the

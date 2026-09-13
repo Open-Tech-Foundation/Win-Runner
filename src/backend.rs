@@ -7,6 +7,7 @@
 //! alongside the built-ins here.
 
 use crate::{native, pe::PeImage, winapi, winfs::WinFs};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Capabilities {
@@ -19,6 +20,14 @@ pub struct Execution {
     pub stdout: Vec<u8>,
     pub fs: WinFs,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputChannel {
+    Stdout,
+    Stderr,
+}
+
+pub type OutputSink = Arc<dyn Fn(OutputChannel, &[u8]) + Send + Sync>;
 
 pub trait ExecutionBackend: Sync {
     /// Stable backend identifier used by configuration and future protocol
@@ -33,6 +42,25 @@ pub trait ExecutionBackend: Sync {
         prog: &str,
         args: &[String],
     ) -> Result<Execution, String>;
+
+    /// Execute while forwarding console output. Backends without a native
+    /// incremental console bridge retain the safe default and emit once on
+    /// completion; platform add-ons can override this without changing the
+    /// instance protocol.
+    fn execute_streaming(
+        &self,
+        image: &PeImage,
+        fs: WinFs,
+        prog: &str,
+        args: &[String],
+        sink: OutputSink,
+    ) -> Result<Execution, String> {
+        let result = self.execute(image, fs, prog, args)?;
+        if !result.stdout.is_empty() {
+            sink(OutputChannel::Stdout, &result.stdout);
+        }
+        Ok(result)
+    }
 }
 
 struct Interpreter;
@@ -61,6 +89,22 @@ impl ExecutionBackend for Interpreter {
         args: &[String],
     ) -> Result<Execution, String> {
         let (code, fs, stdout) = winapi::Runner::with_argv(image, fs, prog, args)?.run()?;
+        Ok(Execution { code, stdout, fs })
+    }
+
+    fn execute_streaming(
+        &self,
+        image: &PeImage,
+        fs: WinFs,
+        prog: &str,
+        args: &[String],
+        sink: OutputSink,
+    ) -> Result<Execution, String> {
+        let forward = Arc::clone(&sink);
+        let runner = winapi::Runner::with_argv(image, fs, prog, args)?.with_console_sink(Box::new(
+            move |chunk| forward(OutputChannel::Stdout, chunk),
+        ));
+        let (code, fs, stdout) = runner.run()?;
         Ok(Execution { code, stdout, fs })
     }
 }
@@ -126,6 +170,7 @@ pub fn configured() -> Result<&'static dyn ExecutionBackend, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     #[test]
     fn builtins_have_unique_stable_ids() {
@@ -133,5 +178,21 @@ mod tests {
         assert_ne!(backends[0].id(), backends[1].id());
         assert!(backends.iter().any(|backend| backend.id() == "interpreter"));
         assert!(backends.iter().any(|backend| backend.id() == "native-linux-x64"));
+    }
+
+    #[test]
+    fn interpreter_forwards_console_output_to_stream_sink() {
+        let image = crate::pe::load(&crate::pe::builder::hello("streamed")).unwrap();
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let sink_output = Arc::clone(&output);
+        let sink: OutputSink = Arc::new(move |channel, chunk| {
+            assert_eq!(channel, OutputChannel::Stdout);
+            sink_output.lock().unwrap().extend_from_slice(chunk);
+        });
+        let result = INTERPRETER
+            .execute_streaming(&image, WinFs::new(), "hello.exe", &[], sink)
+            .unwrap();
+        assert_eq!(result.code, 0);
+        assert_eq!(*output.lock().unwrap(), b"streamed");
     }
 }
