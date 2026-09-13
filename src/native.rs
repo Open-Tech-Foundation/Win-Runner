@@ -67,6 +67,28 @@ mod imp {
     // A child-local stand-in for the API-set modules dynamically requested by
     // the Universal CRT. It is deliberately not a host `dlopen` handle.
     const API_SET_MODULE: u64 = 0x5749_4e43_4c49_0001;
+    const MODULE_FILE_NAME: &[u16] = &[
+        b'C' as u16,
+        b':' as u16,
+        b'\\' as u16,
+        b'w' as u16,
+        b'i' as u16,
+        b'n' as u16,
+        b'c' as u16,
+        b'l' as u16,
+        b'i' as u16,
+        b'\\' as u16,
+        b'w' as u16,
+        b'i' as u16,
+        b'n' as u16,
+        b'c' as u16,
+        b'l' as u16,
+        b'i' as u16,
+        b'.' as u16,
+        b'e' as u16,
+        b'x' as u16,
+        b'e' as u16,
+    ];
 
     // Preferred-base PE mappings collide by design. Serialize native runs in
     // this process until relocations allow separate address-space layouts.
@@ -133,12 +155,12 @@ mod imp {
         use super::{
             command_line_a, linux_protection, native_delete_critical_section,
             native_enter_critical_section, native_get_acp, native_get_cp_info,
-            native_get_file_type, native_get_last_error, native_get_oem_cp,
-            native_get_proc_address, native_get_startup_info_w, native_get_string_type_w,
-            native_initialize_critical_section_ex, native_is_valid_code_page,
-            native_lc_map_string_w, native_leave_critical_section, native_multi_byte_to_wide_char,
-            native_set_last_error, native_wide_char_to_multi_byte, uppercase_ascii_utf16,
-            API_SET_MODULE, PROT_EXEC, PROT_READ, PROT_WRITE,
+            native_get_file_type, native_get_last_error, native_get_module_file_name_w,
+            native_get_oem_cp, native_get_proc_address, native_get_startup_info_w,
+            native_get_string_type_w, native_initialize_critical_section_ex,
+            native_is_valid_code_page, native_lc_map_string_w, native_leave_critical_section,
+            native_multi_byte_to_wide_char, native_set_last_error, native_wide_char_to_multi_byte,
+            uppercase_ascii_utf16, API_SET_MODULE, PROT_EXEC, PROT_READ, PROT_WRITE,
         };
 
         #[test]
@@ -216,6 +238,19 @@ mod imp {
             assert_eq!(native_get_file_type(1), 2);
             assert_eq!(native_get_file_type(2), 2);
             assert_eq!(native_get_file_type(0x100), 0);
+        }
+
+        #[test]
+        fn exposes_a_synthetic_windows_module_path() {
+            let mut path = [0; 32];
+            let len = native_get_module_file_name_w(0, path.as_mut_ptr(), path.len() as u32);
+            assert_eq!(
+                String::from_utf16(&path[..len as usize]).unwrap(),
+                "C:\\wincli\\wincli.exe"
+            );
+            let mut short = [0; 3];
+            assert_eq!(native_get_module_file_name_w(0, short.as_mut_ptr(), 3), 3);
+            assert_eq!(short, ['C' as u16, ':' as u16, '\\' as u16]);
         }
 
         #[test]
@@ -539,6 +574,23 @@ mod imp {
             0..=2 => 0x0002, // FILE_TYPE_CHAR
             _ => 0,
         }
+    }
+
+    extern "win64" fn native_get_module_file_name_w(
+        _module: u64,
+        output: *mut u16,
+        output_len: u32,
+    ) -> u32 {
+        if output.is_null() || output_len == 0 {
+            return 0;
+        }
+        let capacity = output_len as usize;
+        let copied = MODULE_FILE_NAME.len().min(capacity);
+        unsafe { std::ptr::copy_nonoverlapping(MODULE_FILE_NAME.as_ptr(), output, copied) };
+        if copied < capacity {
+            unsafe { output.add(copied).write(0) };
+        }
+        copied as u32
     }
 
     extern "win64" fn native_get_acp() -> u32 {
@@ -1226,6 +1278,9 @@ mod imp {
             }
             "GetStdHandle" => Some(native_get_std_handle as *const () as usize as u64),
             "GetFileType" => Some(native_get_file_type as *const () as usize as u64),
+            "GetModuleFileNameW" => {
+                Some(native_get_module_file_name_w as *const () as usize as u64)
+            }
             "GetACP" => Some(native_get_acp as *const () as usize as u64),
             "GetOEMCP" => Some(native_get_oem_cp as *const () as usize as u64),
             "IsValidCodePage" => Some(native_is_valid_code_page as *const () as usize as u64),
