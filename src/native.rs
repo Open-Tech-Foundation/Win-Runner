@@ -160,17 +160,17 @@ mod imp {
         use super::{
             command_line_a, linux_protection, native_add_vectored_exception_handler,
             native_delete_critical_section, native_enter_critical_section,
-            native_free_environment_strings_w, native_get_acp, native_get_console_mode,
-            native_get_console_output_cp, native_get_cp_info, native_get_current_directory_w,
-            native_get_current_thread, native_get_environment_strings_w,
-            native_get_environment_variable_w, native_get_file_type, native_get_last_error,
-            native_get_module_file_name_w, native_get_module_handle_a, native_get_oem_cp,
-            native_get_proc_address, native_get_startup_info_w, native_get_string_type_w,
-            native_heap_alloc, native_heap_free, native_heap_realloc,
-            native_initialize_critical_section_ex, native_initialize_slist_head,
-            native_is_valid_code_page, native_lc_map_string_w, native_leave_critical_section,
-            native_multi_byte_to_wide_char, native_process_prng, native_set_file_time,
-            native_set_last_error, native_set_thread_stack_guarantee,
+            native_free_environment_strings_w, native_get_acp, native_get_computer_name_ex_w,
+            native_get_console_mode, native_get_console_output_cp, native_get_cp_info,
+            native_get_current_directory_w, native_get_current_thread,
+            native_get_environment_strings_w, native_get_environment_variable_w,
+            native_get_file_type, native_get_last_error, native_get_module_file_name_w,
+            native_get_module_handle_a, native_get_oem_cp, native_get_proc_address,
+            native_get_startup_info_w, native_get_string_type_w, native_heap_alloc,
+            native_heap_free, native_heap_realloc, native_initialize_critical_section_ex,
+            native_initialize_slist_head, native_is_valid_code_page, native_lc_map_string_w,
+            native_leave_critical_section, native_multi_byte_to_wide_char, native_process_prng,
+            native_set_file_time, native_set_last_error, native_set_thread_stack_guarantee,
             native_set_unhandled_exception_filter, native_wide_char_to_multi_byte,
             native_write_console_w, uppercase_ascii_utf16, API_SET_MODULE, PROT_EXEC, PROT_READ,
             PROT_WRITE,
@@ -282,6 +282,25 @@ mod imp {
             assert_eq!(native_get_current_directory_w(4, output.as_mut_ptr()), 3);
             assert_eq!(&output, &['C' as u16, ':' as u16, '\\' as u16, 0]);
             assert_eq!(native_get_current_directory_w(3, output.as_mut_ptr()), 4);
+        }
+
+        #[test]
+        fn supplies_a_synthetic_computer_name() {
+            let mut len = 0;
+            assert_eq!(
+                native_get_computer_name_ex_w(5, std::ptr::null_mut(), &mut len),
+                0
+            );
+            assert_eq!(len, 7);
+            let mut output = [0; 7];
+            assert_eq!(
+                native_get_computer_name_ex_w(5, output.as_mut_ptr(), &mut len),
+                1
+            );
+            assert_eq!(
+                &output[..6],
+                &['w' as u16, 'i' as u16, 'n' as u16, 'c' as u16, 'l' as u16, 'i' as u16]
+            );
         }
 
         #[test]
@@ -1116,6 +1135,29 @@ mod imp {
         unsafe { output.copy_from_nonoverlapping(ROOT.as_ptr(), ROOT.len()) };
         (ROOT.len() - 1) as u32
     }
+    extern "win64" fn native_get_computer_name_ex_w(
+        _name_type: u32,
+        output: *mut u16,
+        len: *mut u32,
+    ) -> i32 {
+        const NAME: [u16; 7] = [
+            'w' as u16, 'i' as u16, 'n' as u16, 'c' as u16, 'l' as u16, 'i' as u16, 0,
+        ];
+        if len.is_null() {
+            return 0;
+        }
+        let capacity = unsafe { len.read() };
+        if output.is_null() || capacity < NAME.len() as u32 {
+            unsafe { len.write(NAME.len() as u32) };
+            native_set_last_error(234);
+            return 0;
+        }
+        unsafe {
+            output.copy_from_nonoverlapping(NAME.as_ptr(), NAME.len());
+            len.write((NAME.len() - 1) as u32)
+        };
+        1
+    }
     extern "win64" fn native_set_file_time(
         handle: u64,
         _creation: *const u64,
@@ -1590,6 +1632,12 @@ mod imp {
             "GetConsoleOutputCP" => Some(native_get_console_output_cp as *const () as usize as u64),
             "GetEnvironmentVariableW" => {
                 Some(native_get_environment_variable_w as *const () as usize as u64)
+            }
+            "GetCurrentDirectoryW" => {
+                Some(native_get_current_directory_w as *const () as usize as u64)
+            }
+            "GetComputerNameExW" => {
+                Some(native_get_computer_name_ex_w as *const () as usize as u64)
             }
             "SetFileTime" => Some(native_set_file_time as *const () as usize as u64),
             "WriteFile" => Some(native_write_file as *const () as usize as u64),

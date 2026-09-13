@@ -58,7 +58,8 @@ All notable changes to this project will be documented in this file.
   native UTF-16 console text as UTF-8. `GetEnvironmentVariableW` correctly
   reports missing values from the native child’s empty environment, including
   ripgrep's dynamic kernel32 lookup. `GetCurrentDirectoryW` supplies the
-  synthetic `C:\\` working directory.
+  synthetic `C:\\` working directory. `GetComputerNameExW` exposes the
+  synthetic `wincli` host name.
   `VirtualProtect`
   translates the standard page-access modes to page-aligned Linux mappings.
   A narrow API-set pseudo-module resolves the CRT's dynamic `CompareStringEx`
