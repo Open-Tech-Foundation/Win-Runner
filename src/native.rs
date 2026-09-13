@@ -118,7 +118,9 @@ mod imp {
         fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
         fn _exit(status: i32) -> !;
         fn malloc(size: usize) -> *mut c_void;
+        fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void;
         fn free(ptr: *mut c_void);
+        fn getrandom(buf: *mut c_void, buflen: usize, flags: u32) -> isize;
     }
 
     struct Mapping {
@@ -158,16 +160,18 @@ mod imp {
         use super::{
             command_line_a, linux_protection, native_add_vectored_exception_handler,
             native_delete_critical_section, native_enter_critical_section,
-            native_free_environment_strings_w, native_get_acp, native_get_cp_info,
+            native_free_environment_strings_w, native_get_acp, native_get_console_mode,
+            native_get_console_output_cp, native_get_cp_info, native_get_current_thread,
             native_get_environment_strings_w, native_get_file_type, native_get_last_error,
-            native_get_module_file_name_w, native_get_oem_cp, native_get_proc_address,
-            native_get_startup_info_w, native_get_string_type_w,
+            native_get_module_file_name_w, native_get_module_handle_a, native_get_oem_cp,
+            native_get_proc_address, native_get_startup_info_w, native_get_string_type_w,
+            native_heap_alloc, native_heap_free, native_heap_realloc,
             native_initialize_critical_section_ex, native_initialize_slist_head,
             native_is_valid_code_page, native_lc_map_string_w, native_leave_critical_section,
-            native_multi_byte_to_wide_char, native_set_last_error,
-            native_set_thread_stack_guarantee, native_set_unhandled_exception_filter,
-            native_wide_char_to_multi_byte, uppercase_ascii_utf16, API_SET_MODULE, PROT_EXEC,
-            PROT_READ, PROT_WRITE,
+            native_multi_byte_to_wide_char, native_process_prng, native_set_file_time,
+            native_set_last_error, native_set_thread_stack_guarantee,
+            native_set_unhandled_exception_filter, native_wide_char_to_multi_byte,
+            uppercase_ascii_utf16, API_SET_MODULE, PROT_EXEC, PROT_READ, PROT_WRITE,
         };
 
         #[test]
@@ -187,6 +191,68 @@ mod imp {
         fn rejects_unsupported_windows_page_protections() {
             assert_eq!(linux_protection(0x08), None);
             assert_eq!(linux_protection(0x100), None);
+        }
+
+        #[test]
+        fn exposes_the_windows_current_thread_pseudo_handle() {
+            assert_eq!(native_get_current_thread(), u64::MAX - 1);
+        }
+
+        #[test]
+        fn resolves_the_kernel32_ansi_module_handle() {
+            assert_eq!(
+                native_get_module_handle_a(b"kernel32\0".as_ptr()),
+                API_SET_MODULE
+            );
+            assert_eq!(native_get_module_handle_a(b"user32\0".as_ptr()), 0);
+        }
+
+        #[test]
+        fn reallocates_process_heap_memory_without_losing_contents() {
+            let allocation = native_heap_alloc(1, 0, 4);
+            assert_ne!(allocation, 0);
+            unsafe { std::ptr::copy_nonoverlapping(b"rg!\0".as_ptr(), allocation as *mut u8, 4) };
+            let grown = native_heap_realloc(1, 0, allocation, 8);
+            assert_ne!(grown, 0);
+            assert_eq!(
+                unsafe { std::slice::from_raw_parts(grown as *const u8, 4) },
+                b"rg!\0"
+            );
+            assert_eq!(native_heap_free(1, 0, grown), 1);
+        }
+
+        #[test]
+        fn fills_process_prng_output() {
+            let mut output = [0; 16];
+            assert_eq!(native_process_prng(output.as_mut_ptr(), output.len()), 1);
+            assert!(output.iter().any(|byte| *byte != 0));
+            assert_eq!(native_process_prng(std::ptr::null_mut(), 1), 0);
+        }
+
+        #[test]
+        fn reports_a_basic_console_mode_for_standard_output() {
+            let mut mode = 0;
+            assert_eq!(native_get_console_mode(1, &mut mode), 1);
+            assert_eq!(mode, 1);
+            assert_eq!(native_get_console_mode(99, &mut mode), 0);
+            assert_eq!(native_get_console_mode(1, std::ptr::null_mut()), 0);
+        }
+
+        #[test]
+        fn reports_the_native_console_output_code_page() {
+            assert_eq!(native_get_console_output_cp(), 1252);
+        }
+
+        #[test]
+        fn accepts_timestamp_updates_on_native_standard_handles() {
+            assert_eq!(
+                native_set_file_time(1, std::ptr::null(), std::ptr::null(), std::ptr::null()),
+                1
+            );
+            assert_eq!(
+                native_set_file_time(99, std::ptr::null(), std::ptr::null(), std::ptr::null()),
+                0
+            );
         }
 
         #[test]
@@ -904,6 +970,9 @@ mod imp {
     extern "win64" fn native_get_current_process() -> u64 {
         u64::MAX
     }
+    extern "win64" fn native_get_current_thread() -> u64 {
+        u64::MAX - 1
+    }
     extern "win64" fn native_query_performance_counter(out: *mut i64) -> i32 {
         if out.is_null() {
             return 0;
@@ -964,6 +1033,38 @@ mod imp {
     extern "win64" fn native_heap_alloc(_heap: u64, _flags: u32, size: u32) -> u64 {
         let size = (size as usize).max(1);
         unsafe { malloc(size).cast::<u8>() as u64 }
+    }
+    extern "win64" fn native_heap_realloc(_heap: u64, _flags: u32, ptr: u64, size: u32) -> u64 {
+        if ptr == 0 {
+            return 0;
+        }
+        unsafe { realloc(ptr as *mut c_void, (size as usize).max(1)) as u64 }
+    }
+    extern "win64" fn native_process_prng(out: *mut u8, len: usize) -> i32 {
+        if out.is_null() && len != 0 {
+            return 0;
+        }
+        (unsafe { getrandom(out.cast(), len, 0) } == len as isize) as i32
+    }
+    extern "win64" fn native_get_console_mode(handle: u64, mode: *mut u32) -> i32 {
+        if !matches!(handle, 0..=2) || mode.is_null() {
+            return 0;
+        }
+        // ENABLE_PROCESSED_OUTPUT. The native child exposes only its three
+        // standard descriptors as consoles.
+        unsafe { mode.write(1) };
+        1
+    }
+    extern "win64" fn native_get_console_output_cp() -> u32 {
+        native_get_acp()
+    }
+    extern "win64" fn native_set_file_time(
+        handle: u64,
+        _creation: *const u64,
+        _access: *const u64,
+        _write: *const u64,
+    ) -> i32 {
+        matches!(handle, 0..=2) as i32
     }
     extern "win64" fn native_heap_free(_heap: u64, _flags: u32, ptr: u64) -> i32 {
         if ptr == 0 {
@@ -1144,6 +1245,13 @@ mod imp {
         (!path.is_null()).then_some(API_SET_MODULE).unwrap_or(0)
     }
 
+    extern "win64" fn native_get_module_handle_a(name: *const u8) -> u64 {
+        match unsafe { ascii_z(name) } {
+            Some(value) if value.eq_ignore_ascii_case("kernel32") => API_SET_MODULE,
+            _ => 0,
+        }
+    }
+
     extern "win64" fn native_get_proc_address(module: u64, name: *const u8) -> u64 {
         if module != API_SET_MODULE {
             return 0;
@@ -1322,6 +1430,8 @@ mod imp {
                 Some(native_get_current_process_id as *const () as usize as u64)
             }
             "GetCurrentProcess" => Some(native_get_current_process as *const () as usize as u64),
+            "GetCurrentThread" => Some(native_get_current_thread as *const () as usize as u64),
+            "GetModuleHandleA" => Some(native_get_module_handle_a as *const () as usize as u64),
             "VirtualProtect" => Some(native_virtual_protect as *const () as usize as u64),
             "LoadLibraryExW" => Some(native_load_library_ex_w as *const () as usize as u64),
             "GetProcAddress" => Some(native_get_proc_address as *const () as usize as u64),
@@ -1384,7 +1494,12 @@ mod imp {
                 Some(native_wide_char_to_multi_byte as *const () as usize as u64)
             }
             "HeapAlloc" => Some(native_heap_alloc as *const () as usize as u64),
+            "HeapReAlloc" => Some(native_heap_realloc as *const () as usize as u64),
             "HeapFree" => Some(native_heap_free as *const () as usize as u64),
+            "ProcessPrng" => Some(native_process_prng as *const () as usize as u64),
+            "GetConsoleMode" => Some(native_get_console_mode as *const () as usize as u64),
+            "GetConsoleOutputCP" => Some(native_get_console_output_cp as *const () as usize as u64),
+            "SetFileTime" => Some(native_set_file_time as *const () as usize as u64),
             "WriteFile" => Some(native_write_file as *const () as usize as u64),
             "ExitProcess" => Some(native_exit_process as *const () as usize as u64),
             "CreateFileW" => Some(native_create_file_w as *const () as usize as u64),

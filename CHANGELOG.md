@@ -48,7 +48,14 @@ All notable changes to this project will be documented in this file.
   `SetUnhandledExceptionFilter` retains the child-local handler pointer for
   CRT setup. `AddVectoredExceptionHandler` records the native child callback
   for startup compatibility. `SetThreadStackGuarantee` accepts CRT guard-stack
-  requests. `VirtualProtect`
+  requests, `GetCurrentThread` supplies its pseudo-handle, and
+  `GetModuleHandleA` resolves the CRT's `kernel32` probe, and `HeapReAlloc`
+  grows CRT process-heap allocations. `ProcessPrng` draws native Rust runtime
+  entropy from Linux `getrandom`, and `GetConsoleMode` exposes a basic mode on
+  the child standard descriptors. `GetConsoleOutputCP` returns the matching
+  Windows-1252 console encoding. `SetFileTime` accepts metadata updates on
+  standard descriptors without persisting timestamps.
+  `VirtualProtect`
   translates the standard page-access modes to page-aligned Linux mappings.
   A narrow API-set pseudo-module resolves the CRT's dynamic `CompareStringEx`
   lookup without loading a host DLL.
