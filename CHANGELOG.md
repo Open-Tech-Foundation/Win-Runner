@@ -39,6 +39,7 @@ All notable changes to this project will be documented in this file.
   line. ANSI and OEM code-page queries report Windows-1252, while code-page
   validation supports Windows-1252 and UTF-8; `GetCPInfo` supplies their CRT
   metadata. `MultiByteToWideChar` converts those pages for CRT locale setup.
+  `GetStringTypeW` provides ASCII `CT_CTYPE1` character classifications.
   `VirtualProtect`
   translates the standard page-access modes to page-aligned Linux mappings.
   A narrow API-set pseudo-module resolves the CRT's dynamic `CompareStringEx`

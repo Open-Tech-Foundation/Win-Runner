@@ -134,7 +134,7 @@ mod imp {
             command_line_a, linux_protection, native_delete_critical_section,
             native_enter_critical_section, native_get_acp, native_get_cp_info,
             native_get_file_type, native_get_last_error, native_get_oem_cp,
-            native_get_proc_address, native_get_startup_info_w,
+            native_get_proc_address, native_get_startup_info_w, native_get_string_type_w,
             native_initialize_critical_section_ex, native_is_valid_code_page,
             native_leave_critical_section, native_multi_byte_to_wide_char, native_set_last_error,
             uppercase_ascii_utf16, API_SET_MODULE, PROT_EXEC, PROT_READ, PROT_WRITE,
@@ -263,6 +263,21 @@ mod imp {
             );
             assert_eq!(
                 native_multi_byte_to_wide_char(932, 0, input.as_ptr(), -1, output.as_mut_ptr(), 4),
+                0
+            );
+        }
+
+        #[test]
+        fn classifies_ascii_characters_for_the_crt() {
+            let input = ['A' as u16, '7' as u16, ' ' as u16, '!' as u16];
+            let mut output = [0; 4];
+            assert_eq!(
+                native_get_string_type_w(1, input.as_ptr(), 4, output.as_mut_ptr()),
+                1
+            );
+            assert_eq!(output, [0x0101, 0x0084, 0x0048, 0x0010]);
+            assert_eq!(
+                native_get_string_type_w(2, input.as_ptr(), 4, output.as_mut_ptr()),
                 0
             );
         }
@@ -550,6 +565,46 @@ mod imp {
         }
         unsafe { std::ptr::copy_nonoverlapping(wide.as_ptr(), output, wide.len()) };
         wide.len().try_into().unwrap_or(0)
+    }
+
+    fn ctype1(unit: u16) -> u16 {
+        match char::from_u32(unit as u32) {
+            Some(ch) if ch.is_ascii_uppercase() => 0x0001 | 0x0100,
+            Some(ch) if ch.is_ascii_lowercase() => 0x0002 | 0x0100,
+            Some(ch) if ch.is_ascii_digit() => 0x0004 | 0x0080,
+            Some(' ') => 0x0008 | 0x0040,
+            Some('\t') => 0x0008 | 0x0040,
+            Some(ch) if ch.is_ascii_control() => 0x0020,
+            Some(ch) if ch.is_ascii_punctuation() => 0x0010,
+            _ => 0,
+        }
+    }
+
+    extern "win64" fn native_get_string_type_w(
+        info_type: u32,
+        input: *const u16,
+        input_len: i32,
+        output: *mut u16,
+    ) -> i32 {
+        if info_type != 1 || input.is_null() || output.is_null() || input_len < -1 {
+            return 0;
+        }
+        let len = if input_len >= 0 {
+            input_len as usize
+        } else {
+            let mut len = 0;
+            while len < 64 * 1024 && unsafe { *input.add(len) } != 0 {
+                len += 1;
+            }
+            if len == 64 * 1024 {
+                return 0;
+            }
+            len + 1
+        };
+        for index in 0..len {
+            unsafe { output.add(index).write(ctype1(*input.add(index))) };
+        }
+        1
     }
 
     extern "win64" fn native_get_process_heap() -> u64 {
@@ -1010,6 +1065,7 @@ mod imp {
             "MultiByteToWideChar" => {
                 Some(native_multi_byte_to_wide_char as *const () as usize as u64)
             }
+            "GetStringTypeW" => Some(native_get_string_type_w as *const () as usize as u64),
             "HeapAlloc" => Some(native_heap_alloc as *const () as usize as u64),
             "HeapFree" => Some(native_heap_free as *const () as usize as u64),
             "WriteFile" => Some(native_write_file as *const () as usize as u64),
