@@ -32,7 +32,11 @@ All notable changes to this project will be documented in this file.
   delete). A single-threaded `FlsAlloc`/get/set/free slot supports ripgrep CRT
   fiber-local initialization, and
   `GetCurrentProcess` supplies the Windows pseudo-handle. `GetLastError` and
-  `SetLastError` preserve child-local error values. `VirtualProtect`
+  `SetLastError` preserve child-local error values. `GetStartupInfoW` exposes
+  a zeroed console-process startup record, and `GetFileType` identifies the
+  native child standard descriptors as console character handles.
+  Both `GetCommandLineW` and `GetCommandLineA` expose the native guest command
+  line. `VirtualProtect`
   translates the standard page-access modes to page-aligned Linux mappings.
   A narrow API-set pseudo-module resolves the CRT's dynamic `CompareStringEx`
   lookup without loading a host DLL.

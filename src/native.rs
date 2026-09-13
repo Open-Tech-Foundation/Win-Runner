@@ -131,10 +131,12 @@ mod imp {
     #[cfg(test)]
     mod protection_tests {
         use super::{
-            linux_protection, native_delete_critical_section, native_enter_critical_section,
-            native_get_last_error, native_get_proc_address, native_initialize_critical_section_ex,
-            native_leave_critical_section, native_set_last_error, uppercase_ascii_utf16,
-            API_SET_MODULE, PROT_EXEC, PROT_READ, PROT_WRITE,
+            command_line_a, linux_protection, native_delete_critical_section,
+            native_enter_critical_section, native_get_file_type, native_get_last_error,
+            native_get_proc_address, native_get_startup_info_w,
+            native_initialize_critical_section_ex, native_leave_critical_section,
+            native_set_last_error, uppercase_ascii_utf16, API_SET_MODULE, PROT_EXEC, PROT_READ,
+            PROT_WRITE,
         };
 
         #[test]
@@ -193,6 +195,31 @@ mod imp {
             native_set_last_error(87);
             assert_eq!(native_get_last_error(), 87);
             native_set_last_error(0);
+        }
+
+        #[test]
+        fn provides_a_zeroed_64_bit_startup_info_record() {
+            let mut startup_info = [0xa5; 104];
+            native_get_startup_info_w(startup_info.as_mut_ptr());
+            assert_eq!(
+                u32::from_le_bytes(startup_info[..4].try_into().unwrap()),
+                104
+            );
+            assert!(startup_info[4..].iter().all(|byte| *byte == 0));
+        }
+
+        #[test]
+        fn classifies_native_standard_descriptors_as_console_handles() {
+            assert_eq!(native_get_file_type(0), 2);
+            assert_eq!(native_get_file_type(1), 2);
+            assert_eq!(native_get_file_type(2), 2);
+            assert_eq!(native_get_file_type(0x100), 0);
+        }
+
+        #[test]
+        fn converts_command_lines_to_a_null_terminated_ansi_view() {
+            assert_eq!(command_line_a(&['r' as u16, 'g' as u16, 0]), b"rg\0");
+            assert_eq!(command_line_a(&[0x00e9, 0]), b"?\0");
         }
     }
 
@@ -296,6 +323,7 @@ mod imp {
     // broader concurrent execution will replace this bootstrap slot with a
     // per-process shim context.
     static COMMAND_LINE_W: AtomicU64 = AtomicU64::new(0);
+    static COMMAND_LINE_A: AtomicU64 = AtomicU64::new(0);
     static NATIVE_FS: AtomicU64 = AtomicU64::new(0);
     static FLS_VALUE: AtomicU64 = AtomicU64::new(0);
 
@@ -370,6 +398,9 @@ mod imp {
     extern "win64" fn native_get_command_line_w() -> u64 {
         COMMAND_LINE_W.load(Ordering::Acquire)
     }
+    extern "win64" fn native_get_command_line_a() -> u64 {
+        COMMAND_LINE_A.load(Ordering::Acquire)
+    }
 
     extern "win64" fn native_get_std_handle(which: u32) -> u64 {
         match which as i32 {
@@ -377,6 +408,13 @@ mod imp {
             -11 => 1,
             -12 => 2,
             _ => u64::MAX,
+        }
+    }
+
+    extern "win64" fn native_get_file_type(handle: u64) -> u32 {
+        match handle {
+            0..=2 => 0x0002, // FILE_TYPE_CHAR
+            _ => 0,
         }
     }
 
@@ -537,6 +575,19 @@ mod imp {
 
     extern "win64" fn native_set_last_error(error: u32) {
         NATIVE_LAST_ERROR.store(error, Ordering::Release);
+    }
+
+    extern "win64" fn native_get_startup_info_w(startup_info: *mut u8) {
+        if startup_info.is_null() {
+            return;
+        }
+        // STARTUPINFOW is 104 bytes on 64-bit Windows. The native runner has
+        // no inherited Windows handles, so a zeroed record is the appropriate
+        // console-process baseline.
+        unsafe {
+            std::ptr::write_bytes(startup_info, 0, 104);
+            (startup_info as *mut u32).write_unaligned(104);
+        }
     }
 
     unsafe fn ascii_z(ptr: *const u8) -> Option<&'static str> {
@@ -780,8 +831,10 @@ mod imp {
     fn baseline_trampoline(name: &str) -> Option<u64> {
         match name {
             "GetCommandLineW" => Some(native_get_command_line_w as *const () as usize as u64),
+            "GetCommandLineA" => Some(native_get_command_line_a as *const () as usize as u64),
             "GetLastError" => Some(native_get_last_error as *const () as usize as u64),
             "SetLastError" => Some(native_set_last_error as *const () as usize as u64),
+            "GetStartupInfoW" => Some(native_get_startup_info_w as *const () as usize as u64),
             "GetProcessHeap" => Some(native_get_process_heap as *const () as usize as u64),
             "GetCurrentThreadId" => Some(native_get_current_thread_id as *const () as usize as u64),
             "GetCurrentProcessId" => {
@@ -815,6 +868,7 @@ mod imp {
                 Some(native_get_system_time_as_file_time as *const () as usize as u64)
             }
             "GetStdHandle" => Some(native_get_std_handle as *const () as usize as u64),
+            "GetFileType" => Some(native_get_file_type as *const () as usize as u64),
             "HeapAlloc" => Some(native_heap_alloc as *const () as usize as u64),
             "HeapFree" => Some(native_heap_free as *const () as usize as u64),
             "WriteFile" => Some(native_write_file as *const () as usize as u64),
@@ -874,6 +928,20 @@ mod imp {
         Ok(wide)
     }
 
+    fn command_line_a(command_line: &[u16]) -> Vec<u8> {
+        let end = command_line
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(command_line.len());
+        let text = String::from_utf16_lossy(&command_line[..end]);
+        let mut bytes = text
+            .chars()
+            .map(|ch| if ch.is_ascii() { ch as u8 } else { b'?' })
+            .collect::<Vec<_>>();
+        bytes.push(0);
+        bytes
+    }
+
     pub(super) fn run_rust_baseline_argv(
         img: &PeImage,
         prog: &str,
@@ -887,12 +955,14 @@ mod imp {
         patch_baseline_imports(&mapping, img)?;
         let tls = setup_tls(&mapping, img)?;
         let cmdline = command_line_w(prog, args)?;
+        let cmdline_a = command_line_a(&cmdline);
         let mut fs = NativeFs {
             fs: WinFs::new(),
             handles: HashMap::new(),
             next: 0x100,
         };
         COMMAND_LINE_W.store(cmdline.as_ptr() as u64, Ordering::Release);
+        COMMAND_LINE_A.store(cmdline_a.as_ptr() as u64, Ordering::Release);
         NATIVE_FS.store((&mut fs as *mut NativeFs) as u64, Ordering::Release);
         let mut fds = [-1, -1];
         if unsafe { pipe(fds.as_mut_ptr()) } != 0 {
@@ -966,6 +1036,7 @@ mod imp {
             ));
         }
         COMMAND_LINE_W.store(0, Ordering::Release);
+        COMMAND_LINE_A.store(0, Ordering::Release);
         NATIVE_FS.store(0, Ordering::Release);
         if status & 0x7f != 0 {
             return Err(format!(
