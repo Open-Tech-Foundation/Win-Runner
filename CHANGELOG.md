@@ -36,6 +36,9 @@ All notable changes to this project will be documented in this file.
   in-memory snapshot through a private pipe; the host restores it into the
   same ephemeral session without exposing a Linux filesystem mount. This
   enables a native guest to create files consumed by following runner steps.
+  `CreateProcessW` is now an explicit native process-model boundary that
+  returns `ERROR_CALL_NOT_IMPLEMENTED` until per-process guest contexts and
+  inherited-handle semantics are available.
 - `wincli --snapshot=os.snap shell` and `runner` now boot a compressed ZIP
   snapshot over the fresh instance image. The documented v1 archive layout
   maps `files/C/...` entries to WinFs paths and verifies a version marker;

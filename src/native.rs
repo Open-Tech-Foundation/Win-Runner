@@ -1842,6 +1842,23 @@ mod imp {
         // SAFETY: this runs only in the forked guest child.
         unsafe { _exit(code as i32) }
     }
+    extern "win64" fn native_create_process_w(
+        _application: *const u16,
+        _command_line: *mut u16,
+        _process_attributes: u64,
+        _thread_attributes: u64,
+        _inherit_handles: i32,
+        _creation_flags: u32,
+        _environment: u64,
+        _current_directory: *const u16,
+        _startup_info: u64,
+        _process_information: u64,
+    ) -> i32 {
+        // This is intentionally explicit until native execution state is
+        // per-process rather than the current single mapped guest context.
+        native_set_last_error(120); // ERROR_CALL_NOT_IMPLEMENTED
+        0
+    }
 
     fn native_flush_instance_state() {
         let fd = NATIVE_STATE_FD.load(Ordering::Acquire);
@@ -2367,6 +2384,7 @@ mod imp {
             "WriteFile" => Some(native_write_file as *const () as usize as u64),
             "WriteConsoleW" => Some(native_write_console_w as *const () as usize as u64),
             "ExitProcess" => Some(native_exit_process as *const () as usize as u64),
+            "CreateProcessW" => Some(native_create_process_w as *const () as usize as u64),
             "CreateFileW" => Some(native_create_file_w as *const () as usize as u64),
             "GetFileInformationByHandle" => {
                 Some(native_get_file_information_by_handle as *const () as usize as u64)
