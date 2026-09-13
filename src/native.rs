@@ -183,12 +183,12 @@ mod imp {
     mod protection_tests {
         use super::{
             command_line_a, linux_protection, native_add_vectored_exception_handler,
-            native_close_handle, native_create_waitable_timer_ex_w, native_delete_critical_section,
-            native_enter_critical_section, native_extended_path, native_file_attributes,
-            native_format_message_w, native_free_environment_strings_w, native_get_acp,
-            native_get_computer_name_ex_w, native_get_console_mode, native_get_console_output_cp,
-            native_get_console_screen_buffer_info, native_get_cp_info,
-            native_get_current_directory_w, native_get_current_process,
+            native_close_handle, native_create_process_w, native_create_waitable_timer_ex_w,
+            native_delete_critical_section, native_enter_critical_section, native_extended_path,
+            native_file_attributes, native_format_message_w, native_free_environment_strings_w,
+            native_get_acp, native_get_computer_name_ex_w, native_get_console_mode,
+            native_get_console_output_cp, native_get_console_screen_buffer_info,
+            native_get_cp_info, native_get_current_directory_w, native_get_current_process,
             native_get_current_process_id, native_get_current_thread,
             native_get_environment_strings_w, native_get_environment_variable_w,
             native_get_exit_code_process, native_get_file_type, native_get_full_path_name_w,
@@ -197,14 +197,16 @@ mod imp {
             native_get_proc_address, native_get_startup_info_w, native_get_string_type_w,
             native_get_system_info, native_get_user_profile_directory_w, native_heap_alloc,
             native_heap_free, native_heap_realloc, native_initialize_critical_section_ex,
-            native_initialize_slist_head, native_is_valid_code_page, native_lc_map_string_w,
-            native_leave_critical_section, native_multi_byte_to_wide_char, native_process_prng,
-            native_query_performance_frequency, native_set_console_mode, native_set_file_time,
-            native_set_last_error, native_set_thread_stack_guarantee,
+            native_initialize_slist_head, native_is_valid_code_page, native_launch_spec,
+            native_lc_map_string_w, native_leave_critical_section, native_multi_byte_to_wide_char,
+            native_process_prng, native_query_performance_frequency, native_set_console_mode,
+            native_set_file_time, native_set_last_error, native_set_thread_stack_guarantee,
             native_set_unhandled_exception_filter, native_set_waitable_timer,
             native_wait_on_address, native_wide_char_to_multi_byte, native_write_console_w,
-            uppercase_ascii_utf16, API_SET_MODULE, PROT_EXEC, PROT_READ, PROT_WRITE,
+            parse_windows_command_line, uppercase_ascii_utf16, API_SET_MODULE, PROT_EXEC,
+            PROT_READ, PROT_WRITE,
         };
+        use crate::winfs::WinFs;
 
         #[test]
         fn translates_standard_windows_page_protections() {
@@ -248,6 +250,74 @@ mod imp {
             assert_eq!(native_get_last_error(), 6); // ERROR_INVALID_HANDLE
             assert_eq!(native_close_handle(native_get_current_process()), 0);
             assert_eq!(native_get_last_error(), 6);
+        }
+
+        #[test]
+        fn parses_quoted_create_process_command_lines() {
+            assert_eq!(
+                parse_windows_command_line(r#"  "C:\Program Files\tool.exe" --flag "two words""#)
+                    .unwrap(),
+                [r"C:\Program Files\tool.exe", "--flag", "two words"]
+            );
+            assert_eq!(
+                parse_windows_command_line(r#"tool.exe "a\"b""#).unwrap(),
+                ["tool.exe", "a\"b"]
+            );
+            assert!(parse_windows_command_line("\"unterminated").is_err());
+        }
+
+        #[test]
+        fn derives_create_process_target_and_validates_working_directory() {
+            let mut fs = WinFs::new();
+            fs.mkdir(r"C:\work").unwrap();
+            let launch = native_launch_spec(
+                None,
+                Some(r#""C:\tools\child.exe" --check"#.to_string()),
+                Some(r"C:\work".to_string()),
+                &fs,
+            )
+            .unwrap();
+            assert_eq!(launch.application, r"C:\tools\child.exe");
+            assert_eq!(launch.arguments, [r"C:\tools\child.exe", "--check"]);
+            assert_eq!(launch.current_directory, r"C:\work");
+            assert_eq!(
+                native_launch_spec(Some(String::new()), None, None, &fs),
+                Err(87)
+            );
+            assert_eq!(
+                native_launch_spec(
+                    Some(r"C:\child.exe".to_string()),
+                    None,
+                    Some(r"C:\missing".to_string()),
+                    &fs,
+                ),
+                Err(267)
+            );
+        }
+
+        #[test]
+        fn create_process_rejects_missing_output_record_before_launching() {
+            let mut application: Vec<u16> = r"C:\child.exe"
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            native_set_last_error(0);
+            assert_eq!(
+                native_create_process_w(
+                    application.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    0,
+                ),
+                0
+            );
+            assert_eq!(native_get_last_error(), 87); // ERROR_INVALID_PARAMETER
         }
 
         #[test]
@@ -1086,6 +1156,95 @@ mod imp {
             units.push(u);
         }
         None
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct NativeLaunchSpec {
+        application: String,
+        command_line: String,
+        arguments: Vec<String>,
+        current_directory: String,
+    }
+
+    /// Parse the subset of Windows command-line syntax needed to identify an
+    /// executable. Backslashes are literal except when immediately before a
+    /// quote, following the CommandLineToArgvW/MSVC escaping rules.
+    fn parse_windows_command_line(line: &str) -> Result<Vec<String>, String> {
+        let mut args = Vec::new();
+        let chars: Vec<char> = line.chars().collect();
+        let mut index = 0;
+        while index < chars.len() {
+            while index < chars.len() && chars[index].is_ascii_whitespace() {
+                index += 1;
+            }
+            if index == chars.len() {
+                break;
+            }
+            let mut arg = String::new();
+            let mut quoted = false;
+            while index < chars.len() {
+                let mut slashes = 0;
+                while index < chars.len() && chars[index] == '\\' {
+                    slashes += 1;
+                    index += 1;
+                }
+                if index < chars.len() && chars[index] == '"' {
+                    arg.extend(std::iter::repeat_n('\\', slashes / 2));
+                    if slashes % 2 == 1 {
+                        arg.push('"');
+                    } else if quoted && index + 1 < chars.len() && chars[index + 1] == '"' {
+                        arg.push('"');
+                        index += 1;
+                    } else {
+                        quoted = !quoted;
+                    }
+                    index += 1;
+                    continue;
+                }
+                arg.extend(std::iter::repeat_n('\\', slashes));
+                if index == chars.len() || (!quoted && chars[index].is_ascii_whitespace()) {
+                    break;
+                }
+                arg.push(chars[index]);
+                index += 1;
+            }
+            if quoted {
+                return Err("unterminated quote in command line".to_string());
+            }
+            args.push(arg);
+        }
+        Ok(args)
+    }
+
+    fn native_launch_spec(
+        application: Option<String>,
+        command_line: Option<String>,
+        current_directory: Option<String>,
+        fs: &WinFs,
+    ) -> Result<NativeLaunchSpec, u32> {
+        let command_line = command_line.unwrap_or_default();
+        let arguments = parse_windows_command_line(&command_line).map_err(|_| 87u32)?;
+        let application = application
+            .filter(|value| !value.is_empty())
+            .or_else(|| arguments.first().cloned())
+            .ok_or(87u32)?;
+        let application = fs.normalize(&application).map_err(|_| 3u32)?.display();
+        let current_directory = match current_directory.filter(|value| !value.is_empty()) {
+            Some(value) => {
+                let path = fs.normalize(&value).map_err(|_| 3u32)?.display();
+                if !fs.is_dir(&path) {
+                    return Err(267u32); // ERROR_DIRECTORY
+                }
+                path
+            }
+            None => fs.cwd(),
+        };
+        Ok(NativeLaunchSpec {
+            application,
+            command_line,
+            arguments,
+            current_directory,
+        })
     }
     fn fs_ctx() -> Option<Arc<Mutex<NativeFs>>> {
         process_ctx().map(|process| Arc::clone(&process.fs))
@@ -1993,19 +2152,54 @@ mod imp {
         unsafe { _exit(code as i32) }
     }
     extern "win64" fn native_create_process_w(
-        _application: *const u16,
-        _command_line: *mut u16,
+        application: *const u16,
+        command_line: *mut u16,
         _process_attributes: u64,
         _thread_attributes: u64,
         _inherit_handles: i32,
         _creation_flags: u32,
         _environment: u64,
-        _current_directory: *const u16,
+        current_directory: *const u16,
         _startup_info: u64,
-        _process_information: u64,
+        process_information: u64,
     ) -> i32 {
-        // This is intentionally explicit until native execution state is
-        // per-process rather than the current single mapped guest context.
+        if process_information == 0 {
+            native_set_last_error(87); // ERROR_INVALID_PARAMETER
+            return 0;
+        }
+        let Some(context) = fs_ctx() else {
+            native_set_last_error(6); // ERROR_INVALID_HANDLE
+            return 0;
+        };
+        let Ok(fs) = context.lock() else {
+            native_set_last_error(6);
+            return 0;
+        };
+        let has_application = !application.is_null();
+        let has_command_line = !command_line.is_null();
+        let has_current_directory = !current_directory.is_null();
+        let application = has_application.then(|| wide(application)).flatten();
+        let command_line = has_command_line
+            .then(|| wide(command_line.cast_const()))
+            .flatten();
+        let current_directory = has_current_directory
+            .then(|| wide(current_directory))
+            .flatten();
+        if (has_application && application.is_none())
+            || (has_command_line && command_line.is_none())
+            || (has_current_directory && current_directory.is_none())
+        {
+            native_set_last_error(87);
+            return 0;
+        }
+        if let Err(error) = native_launch_spec(application, command_line, current_directory, &fs.fs)
+        {
+            native_set_last_error(error);
+            return 0;
+        }
+        // Parsing and filesystem validation are now process-local. Starting
+        // the parsed PE still waits on the child registry and distinct mapped
+        // image/TLS context implemented in the next slice.
         native_set_last_error(120); // ERROR_CALL_NOT_IMPLEMENTED
         0
     }

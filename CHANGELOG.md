@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- `CreateProcessW` now parses Windows-quoted command lines and validates its
+  application target and guest working directory before launch. Invalid
+  process-information records, malformed command lines, and invalid working
+  directories return their corresponding Windows errors; actual child PE
+  execution remains the next process-registry step.
 - Added repository contribution instructions covering commit conventions,
   changelog updates, test expectations, and AI-attribution restrictions.
 - Native guest process state is now owned by `NativeProcessContext` rather
