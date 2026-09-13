@@ -43,7 +43,8 @@ All notable changes to this project will be documented in this file.
   `LCMapStringW` supports CRT string sizing, copying, and ASCII case mapping.
   `WideCharToMultiByte` converts native CRT strings to Windows-1252 or UTF-8.
   `GetModuleFileNameW` supplies a synthetic Windows module path for CRT path
-  discovery. `VirtualProtect`
+  discovery. `InitializeSListHead` creates empty 64-bit CRT list headers.
+  `VirtualProtect`
   translates the standard page-access modes to page-aligned Linux mappings.
   A narrow API-set pseudo-module resolves the CRT's dynamic `CompareStringEx`
   lookup without loading a host DLL.

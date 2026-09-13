@@ -158,9 +158,10 @@ mod imp {
             native_get_file_type, native_get_last_error, native_get_module_file_name_w,
             native_get_oem_cp, native_get_proc_address, native_get_startup_info_w,
             native_get_string_type_w, native_initialize_critical_section_ex,
-            native_is_valid_code_page, native_lc_map_string_w, native_leave_critical_section,
-            native_multi_byte_to_wide_char, native_set_last_error, native_wide_char_to_multi_byte,
-            uppercase_ascii_utf16, API_SET_MODULE, PROT_EXEC, PROT_READ, PROT_WRITE,
+            native_initialize_slist_head, native_is_valid_code_page, native_lc_map_string_w,
+            native_leave_critical_section, native_multi_byte_to_wide_char, native_set_last_error,
+            native_wide_char_to_multi_byte, uppercase_ascii_utf16, API_SET_MODULE, PROT_EXEC,
+            PROT_READ, PROT_WRITE,
         };
 
         #[test]
@@ -212,6 +213,13 @@ mod imp {
             native_enter_critical_section(section.as_mut_ptr());
             native_leave_critical_section(section.as_mut_ptr());
             native_delete_critical_section(section.as_mut_ptr());
+        }
+
+        #[test]
+        fn initializes_an_empty_64_bit_slist_header() {
+            let mut header = [0xa5; 16];
+            native_initialize_slist_head(header.as_mut_ptr());
+            assert_eq!(header, [0; 16]);
         }
 
         #[test]
@@ -913,6 +921,13 @@ mod imp {
     extern "win64" fn native_leave_critical_section(_section: *mut u8) {}
     extern "win64" fn native_delete_critical_section(_section: *mut u8) {}
 
+    extern "win64" fn native_initialize_slist_head(head: *mut u8) {
+        if !head.is_null() {
+            // SLIST_HEADER occupies 16 bytes on 64-bit Windows.
+            unsafe { std::ptr::write_bytes(head, 0, 16) };
+        }
+    }
+
     extern "win64" fn native_write_file(
         handle: u64,
         buf: *const u8,
@@ -1268,6 +1283,9 @@ mod imp {
             }
             "DeleteCriticalSection" => {
                 Some(native_delete_critical_section as *const () as usize as u64)
+            }
+            "InitializeSListHead" => {
+                Some(native_initialize_slist_head as *const () as usize as u64)
             }
             "FlsAlloc" => Some(native_fls_alloc as *const () as usize as u64),
             "FlsFree" => Some(native_fls_free as *const () as usize as u64),
