@@ -75,6 +75,8 @@ All notable changes to this project will be documented in this file.
   `QueryPerformanceFrequency` matches the native nanosecond counter.
   `WaitOnAddress` and wake calls provide cooperative worker parking. Native
   waitable timers are immediately signaled for worker scheduling.
+  Native WinFs and its file/enumeration handle tables are now synchronized for
+  concurrent guest-worker access.
   `VirtualProtect`
   translates the standard page-access modes to page-aligned Linux mappings.
   A narrow API-set pseudo-module resolves the CRT's dynamic `CompareStringEx`
