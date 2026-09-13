@@ -136,8 +136,9 @@ mod imp {
             native_get_file_type, native_get_last_error, native_get_oem_cp,
             native_get_proc_address, native_get_startup_info_w, native_get_string_type_w,
             native_initialize_critical_section_ex, native_is_valid_code_page,
-            native_leave_critical_section, native_multi_byte_to_wide_char, native_set_last_error,
-            uppercase_ascii_utf16, API_SET_MODULE, PROT_EXEC, PROT_READ, PROT_WRITE,
+            native_lc_map_string_w, native_leave_critical_section, native_multi_byte_to_wide_char,
+            native_set_last_error, uppercase_ascii_utf16, API_SET_MODULE, PROT_EXEC, PROT_READ,
+            PROT_WRITE,
         };
 
         #[test]
@@ -279,6 +280,35 @@ mod imp {
             assert_eq!(
                 native_get_string_type_w(2, input.as_ptr(), 4, output.as_mut_ptr()),
                 0
+            );
+        }
+
+        #[test]
+        fn maps_ascii_case_and_reports_wide_output_size() {
+            let input = ['R' as u16, 'g' as u16, 0];
+            let mut output = [0; 3];
+            assert_eq!(
+                native_lc_map_string_w(
+                    std::ptr::null(),
+                    0x100,
+                    input.as_ptr(),
+                    -1,
+                    output.as_mut_ptr(),
+                    3
+                ),
+                3
+            );
+            assert_eq!(output, ['r' as u16, 'g' as u16, 0]);
+            assert_eq!(
+                native_lc_map_string_w(
+                    std::ptr::null(),
+                    0,
+                    input.as_ptr(),
+                    -1,
+                    std::ptr::null_mut(),
+                    0
+                ),
+                3
             );
         }
     }
@@ -605,6 +635,50 @@ mod imp {
             unsafe { output.add(index).write(ctype1(*input.add(index))) };
         }
         1
+    }
+
+    extern "win64" fn native_lc_map_string_w(
+        _locale: *const u16,
+        flags: u32,
+        input: *const u16,
+        input_len: i32,
+        output: *mut u16,
+        output_len: i32,
+    ) -> i32 {
+        if input.is_null() || input_len < -1 || output_len < 0 || flags & !0x300 != 0 {
+            return 0;
+        }
+        if flags & 0x300 == 0x300 {
+            return 0;
+        }
+        let len = if input_len >= 0 {
+            input_len as usize
+        } else {
+            let mut len = 0;
+            while len < 64 * 1024 && unsafe { *input.add(len) } != 0 {
+                len += 1;
+            }
+            if len == 64 * 1024 {
+                return 0;
+            }
+            len + 1
+        };
+        if output.is_null() {
+            return len.try_into().unwrap_or(0);
+        }
+        if len > output_len as usize {
+            return 0;
+        }
+        for index in 0..len {
+            let mut unit = unsafe { *input.add(index) };
+            if flags & 0x100 != 0 && (b'A' as u16..=b'Z' as u16).contains(&unit) {
+                unit += (b'a' - b'A') as u16;
+            } else if flags & 0x200 != 0 && (b'a' as u16..=b'z' as u16).contains(&unit) {
+                unit -= (b'a' - b'A') as u16;
+            }
+            unsafe { output.add(index).write(unit) };
+        }
+        len.try_into().unwrap_or(0)
     }
 
     extern "win64" fn native_get_process_heap() -> u64 {
@@ -1066,6 +1140,7 @@ mod imp {
                 Some(native_multi_byte_to_wide_char as *const () as usize as u64)
             }
             "GetStringTypeW" => Some(native_get_string_type_w as *const () as usize as u64),
+            "LCMapStringW" => Some(native_lc_map_string_w as *const () as usize as u64),
             "HeapAlloc" => Some(native_heap_alloc as *const () as usize as u64),
             "HeapFree" => Some(native_heap_free as *const () as usize as u64),
             "WriteFile" => Some(native_write_file as *const () as usize as u64),
