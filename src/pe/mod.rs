@@ -35,6 +35,9 @@ pub struct PeImage {
     /// enforcement: guest writes there fail loudly instead of corrupting
     /// code; RWX sections stay writable).
     pub code_ranges: Vec<(u64, u64)>,
+    /// RVAs of 64-bit words requiring IMAGE_REL_BASED_DIR64 adjustment when
+    /// the image cannot be mapped at `image_base`.
+    pub relocations: Vec<u32>,
 }
 
 /// Thread-local storage directory (IMAGE_TLS_DIRECTORY64, RVAs).
@@ -278,7 +281,9 @@ fn load_inner(data: &[u8], strict: bool) -> Result<PeImage, String> {
     let coff = e_lfanew + 4;
     let machine = u16le(data, coff)?;
     if machine != 0x8664 {
-        return Err(format!("unsupported machine 0x{machine:04x}: only x86_64 (0x8664) supported"));
+        return Err(format!(
+            "unsupported machine 0x{machine:04x}: only x86_64 (0x8664) supported"
+        ));
     }
     let num_sections = u16le(data, coff + 2)? as usize;
     let opt_size = u16le(data, coff + 16)? as usize;
@@ -305,6 +310,14 @@ fn load_inner(data: &[u8], strict: bool) -> Result<PeImage, String> {
     }
     let import_rva = u32le(data, opt + 112 + 8)?;
     let import_size = u32le(data, opt + 112 + 12)?;
+    let (reloc_rva, reloc_size) = if num_rva_sizes > 5 {
+        (
+            u32le(data, opt + 112 + 5 * 8)?,
+            u32le(data, opt + 112 + 5 * 8 + 4)?,
+        )
+    } else {
+        (0, 0)
+    };
     // TLS directory is index 9 (optional).
     let (tls_rva, tls_size) = if num_rva_sizes > 9 {
         (
@@ -323,7 +336,7 @@ fn load_inner(data: &[u8], strict: bool) -> Result<PeImage, String> {
     // Section headers
     let sec_off = opt + opt_size;
     let mut sections: Vec<(u32, u32, u32, u32, u32)> = Vec::new(); // vaddr, vsize, raw_ptr, raw_size
-    // (vaddr, vsize, foff, fsize, characteristics)
+                                                                   // (vaddr, vsize, foff, fsize, characteristics)
     struct Sec {
         vaddr: u32,
         vsize: u32,
@@ -374,6 +387,8 @@ fn load_inner(data: &[u8], strict: bool) -> Result<PeImage, String> {
         image[dst_off..dst_end].copy_from_slice(&data[src_off..src_end]);
     }
 
+    let relocations = parse_base_relocations(&image, reloc_rva, reloc_size)?;
+
     // Parse imports (from file offsets via RVA->file mapping)
     let mut imports: Vec<Import> = Vec::new();
     let mut stubs: Vec<Import> = Vec::new();
@@ -417,7 +432,10 @@ fn load_inner(data: &[u8], strict: bool) -> Result<PeImage, String> {
                     break;
                 }
                 if ent & 0x8000_0000_0000_0000 != 0 {
-                    return Err(format!("ordinal imports not supported: {dll} ordinal {}", ent & 0xffff));
+                    return Err(format!(
+                        "ordinal imports not supported: {dll} ordinal {}",
+                        ent & 0xffff
+                    ));
                 }
                 let hn_off = to_off(ent as u32)?;
                 if hn_off + 2 > data.len() {
@@ -433,10 +451,7 @@ fn load_inner(data: &[u8], strict: bool) -> Result<PeImage, String> {
                     if is_stub(&imp.dll, &imp.func) {
                         stubs.push(imp);
                     } else if strict {
-                        return Err(format!(
-                            "unsupported import: {}!{}",
-                            imp.dll, imp.func
-                        ));
+                        return Err(format!("unsupported import: {}!{}", imp.dll, imp.func));
                     } else {
                         unsupported.push(imp);
                     }
@@ -539,5 +554,73 @@ fn load_inner(data: &[u8], strict: bool) -> Result<PeImage, String> {
         tls,
         iat_slots,
         code_ranges,
+        relocations,
     })
+}
+
+fn parse_base_relocations(image: &[u8], rva: u32, size: u32) -> Result<Vec<u32>, String> {
+    if rva == 0 && size == 0 {
+        return Ok(Vec::new());
+    }
+    if rva == 0 || size < 8 {
+        return Err("invalid base relocation directory".to_string());
+    }
+    let end = (rva as usize)
+        .checked_add(size as usize)
+        .filter(|end| *end <= image.len())
+        .ok_or_else(|| "base relocation directory out of bounds".to_string())?;
+    let mut at = rva as usize;
+    let mut out = Vec::new();
+    while at < end {
+        if end - at < 8 {
+            return Err("truncated base relocation block".to_string());
+        }
+        let page = u32::from_le_bytes(image[at..at + 4].try_into().unwrap());
+        let block = u32::from_le_bytes(image[at + 4..at + 8].try_into().unwrap()) as usize;
+        if block < 8 || block % 2 != 0 || block > end - at {
+            return Err("invalid base relocation block".to_string());
+        }
+        for entry in image[at + 8..at + block].chunks_exact(2) {
+            let entry = u16::from_le_bytes(entry.try_into().unwrap());
+            match entry >> 12 {
+                0 => {}
+                10 => {
+                    let target = page
+                        .checked_add((entry & 0x0fff) as u32)
+                        .ok_or_else(|| "base relocation RVA overflows".to_string())?;
+                    if (target as usize)
+                        .checked_add(8)
+                        .is_none_or(|end| end > image.len())
+                    {
+                        return Err("base relocation target out of bounds".to_string());
+                    }
+                    out.push(target);
+                }
+                ty => return Err(format!("unsupported base relocation type {ty}")),
+            }
+        }
+        at += block;
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod relocation_tests {
+    use super::parse_base_relocations;
+
+    #[test]
+    fn accepts_dir64_relocations_and_rejects_bad_blocks() {
+        let mut image = vec![0; 0x2000];
+        image[0x1000..0x1004].copy_from_slice(&0x0000_1000u32.to_le_bytes());
+        image[0x1004..0x1008].copy_from_slice(&12u32.to_le_bytes());
+        image[0x1008..0x100a].copy_from_slice(&0xa008u16.to_le_bytes());
+        image[0x100a..0x100c].copy_from_slice(&0u16.to_le_bytes());
+        assert_eq!(
+            parse_base_relocations(&image, 0x1000, 12).unwrap(),
+            vec![0x1008]
+        );
+        assert!(parse_base_relocations(&image, 0x1000, 10).is_err());
+        image[0x1008..0x100a].copy_from_slice(&0x3008u16.to_le_bytes());
+        assert!(parse_base_relocations(&image, 0x1000, 12).is_err());
+    }
 }

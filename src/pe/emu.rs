@@ -3240,6 +3240,7 @@ mod tests {
             tls: None,
             iat_slots: vec![],
             code_ranges: vec![],
+            relocations: vec![],
         };
         Emu::new(&img).unwrap()
     }

@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- PE32+ loading now validates and retains `IMAGE_REL_BASED_DIR64` relocation
+  entries, rejecting malformed relocation blocks and unsupported relocation
+  types. This supplies the relocation data needed for distinct child-image
+  mappings.
 - `CreateProcessW` now loads child executable bytes only from WinFs and
   validates them as supported PE images. Missing guest files report
   `ERROR_FILE_NOT_FOUND`; malformed or unsupported PE files report
