@@ -29,7 +29,8 @@ All notable changes to this project will be documented in this file.
   `GetCurrentThreadId` for CRT security-cookie initialization, plus
   `GetCurrentProcessId`, `QueryPerformanceCounter`, and a single-threaded
   `InitializeCriticalSectionEx` shim. A single-threaded `FlsAlloc`/get/set/
-  free slot supports ripgrep CRT fiber-local initialization.
+  free slot supports ripgrep CRT fiber-local initialization, and
+  `GetCurrentProcess` supplies the Windows pseudo-handle.
   Imported programs outside that baseline remain on the interpreter.
 - Minimal `wincli` tool: `wincli app.exe` runs PE32+ x86_64 console apps,
   `wincli script.ps1` runs filesystem scripts, both on the same in-memory

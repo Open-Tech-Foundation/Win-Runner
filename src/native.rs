@@ -303,6 +303,9 @@ mod imp {
     extern "win64" fn native_get_current_process_id() -> u32 {
         1
     }
+    extern "win64" fn native_get_current_process() -> u64 {
+        u64::MAX
+    }
     extern "win64" fn native_query_performance_counter(out: *mut i64) -> i32 {
         if out.is_null() {
             return 0;
@@ -559,6 +562,7 @@ mod imp {
             "GetCurrentProcessId" => {
                 Some(native_get_current_process_id as *const () as usize as u64)
             }
+            "GetCurrentProcess" => Some(native_get_current_process as *const () as usize as u64),
             "QueryPerformanceCounter" => {
                 Some(native_query_performance_counter as *const () as usize as u64)
             }
