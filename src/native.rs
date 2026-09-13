@@ -986,6 +986,16 @@ mod imp {
         next: u64,
     }
 
+    /// State that belongs to exactly one Windows guest process. The current
+    /// launcher still initializes legacy accessors from this bundle; keeping
+    /// the ownership explicit is the migration seam for native CreateProcessW.
+    struct NativeProcessContext {
+        image_base: u64,
+        command_line_w: Vec<u16>,
+        command_line_a: Vec<u8>,
+        fs: Arc<Mutex<NativeFs>>,
+    }
+
     fn wide(ptr: *const u16) -> Option<String> {
         if ptr.is_null() {
             return None;
@@ -2521,18 +2531,25 @@ mod imp {
         if let Ok(mut template) = NATIVE_TLS_TEMPLATE.lock() {
             *template = tls.as_ref().map(NativeTls::clone_for_thread);
         }
-        let cmdline = command_line_w(prog, args)?;
-        let cmdline_a = command_line_a(&cmdline);
         let fs = Arc::new(Mutex::new(NativeFs {
             fs: instance_fs,
             handles: HashMap::new(),
             finds: HashMap::new(),
             next: 0x100,
         }));
-        COMMAND_LINE_W.store(cmdline.as_ptr() as u64, Ordering::Release);
-        COMMAND_LINE_A.store(cmdline_a.as_ptr() as u64, Ordering::Release);
+        let process = NativeProcessContext {
+            image_base: img.image_base,
+            command_line_w: command_line_w(prog, args)?,
+            command_line_a: Vec::new(),
+            fs,
+        };
+        let mut process = process;
+        process.command_line_a = command_line_a(&process.command_line_w);
+        NATIVE_IMAGE_BASE.store(process.image_base, Ordering::Release);
+        COMMAND_LINE_W.store(process.command_line_w.as_ptr() as u64, Ordering::Release);
+        COMMAND_LINE_A.store(process.command_line_a.as_ptr() as u64, Ordering::Release);
         if let Ok(mut context) = NATIVE_FS.lock() {
-            *context = Some(Arc::clone(&fs));
+            *context = Some(Arc::clone(&process.fs));
         }
         let mut fds = [-1, -1];
         if unsafe { pipe(fds.as_mut_ptr()) } != 0 {
@@ -2654,7 +2671,9 @@ mod imp {
             *template = None;
         }
         let final_fs = if state.is_empty() {
-            fs.lock()
+            process
+                .fs
+                .lock()
                 .map_err(|_| "native backend filesystem lock is poisoned".to_string())?
                 .fs
                 .clone()

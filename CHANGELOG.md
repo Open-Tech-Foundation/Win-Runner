@@ -39,6 +39,9 @@ All notable changes to this project will be documented in this file.
   `CreateProcessW` is now an explicit native process-model boundary that
   returns `ERROR_CALL_NOT_IMPLEMENTED` until per-process guest contexts and
   inherited-handle semantics are available.
+  Native launch state now begins in an explicit `NativeProcessContext`,
+  consolidating process-owned command-line, image, and WinFs ownership for
+  the ongoing multi-process refactor.
 - `wincli --snapshot=os.snap shell` and `runner` now boot a compressed ZIP
   snapshot over the fresh instance image. The documented v1 archive layout
   maps `files/C/...` entries to WinFs paths and verifies a version marker;
