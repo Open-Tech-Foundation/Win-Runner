@@ -60,7 +60,8 @@ All notable changes to this project will be documented in this file.
   ripgrep's dynamic kernel32 lookup. `GetCurrentDirectoryW` supplies the
   synthetic `C:\\` working directory. `GetComputerNameExW` exposes the
   synthetic `wincli` host name. `GetSystemInfo` exposes the x64 page and
-  allocation layout.
+  allocation layout. `GetFullPathNameW` expands relative paths in the native
+  `C:\\` WinFs namespace.
   `VirtualProtect`
   translates the standard page-access modes to page-aligned Linux mappings.
   A narrow API-set pseudo-module resolves the CRT's dynamic `CompareStringEx`

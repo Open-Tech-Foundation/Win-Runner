@@ -164,10 +164,10 @@ mod imp {
             native_get_console_mode, native_get_console_output_cp, native_get_cp_info,
             native_get_current_directory_w, native_get_current_thread,
             native_get_environment_strings_w, native_get_environment_variable_w,
-            native_get_file_type, native_get_last_error, native_get_module_file_name_w,
-            native_get_module_handle_a, native_get_oem_cp, native_get_proc_address,
-            native_get_startup_info_w, native_get_string_type_w, native_get_system_info,
-            native_heap_alloc, native_heap_free, native_heap_realloc,
+            native_get_file_type, native_get_full_path_name_w, native_get_last_error,
+            native_get_module_file_name_w, native_get_module_handle_a, native_get_oem_cp,
+            native_get_proc_address, native_get_startup_info_w, native_get_string_type_w,
+            native_get_system_info, native_heap_alloc, native_heap_free, native_heap_realloc,
             native_initialize_critical_section_ex, native_initialize_slist_head,
             native_is_valid_code_page, native_lc_map_string_w, native_leave_critical_section,
             native_multi_byte_to_wide_char, native_process_prng, native_set_file_time,
@@ -314,6 +314,22 @@ mod imp {
                 u32::from_le_bytes(output[36..40].try_into().unwrap()),
                 65_536
             );
+        }
+
+        #[test]
+        fn expands_relative_paths_from_the_native_root() {
+            let input = ['.' as u16, 0];
+            let mut output = [0; 4];
+            assert_eq!(
+                native_get_full_path_name_w(
+                    input.as_ptr(),
+                    4,
+                    output.as_mut_ptr(),
+                    std::ptr::null_mut()
+                ),
+                3
+            );
+            assert_eq!(&output, &['C' as u16, ':' as u16, '\\' as u16, 0]);
         }
 
         #[test]
@@ -1186,6 +1202,29 @@ mod imp {
             (output.add(36) as *mut u32).write_unaligned(65_536);
         }
     }
+    extern "win64" fn native_get_full_path_name_w(
+        input: *const u16,
+        output_len: u32,
+        output: *mut u16,
+        _part: *mut *mut u16,
+    ) -> u32 {
+        let Some(raw) = wide(input) else {
+            return 0;
+        };
+        let path = if raw == "." || raw.is_empty() {
+            "C:\\".to_string()
+        } else if raw.len() >= 2 && raw.as_bytes()[1] == b':' {
+            raw.replace('/', "\\")
+        } else {
+            format!("C:\\{}", raw.replace('/', "\\"))
+        };
+        let encoded: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+        if output.is_null() || output_len < encoded.len() as u32 {
+            return encoded.len() as u32;
+        }
+        unsafe { output.copy_from_nonoverlapping(encoded.as_ptr(), encoded.len()) };
+        (encoded.len() - 1) as u32
+    }
     extern "win64" fn native_set_file_time(
         handle: u64,
         _creation: *const u64,
@@ -1621,6 +1660,7 @@ mod imp {
                 Some(native_get_system_time_as_file_time as *const () as usize as u64)
             }
             "GetSystemInfo" => Some(native_get_system_info as *const () as usize as u64),
+            "GetFullPathNameW" => Some(native_get_full_path_name_w as *const () as usize as u64),
             "GetStdHandle" => Some(native_get_std_handle as *const () as usize as u64),
             "GetFileType" => Some(native_get_file_type as *const () as usize as u64),
             "GetModuleFileNameW" => {
