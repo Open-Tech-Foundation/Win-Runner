@@ -165,8 +165,9 @@ mod imp {
             native_initialize_critical_section_ex, native_initialize_slist_head,
             native_is_valid_code_page, native_lc_map_string_w, native_leave_critical_section,
             native_multi_byte_to_wide_char, native_set_last_error,
-            native_set_unhandled_exception_filter, native_wide_char_to_multi_byte,
-            uppercase_ascii_utf16, API_SET_MODULE, PROT_EXEC, PROT_READ, PROT_WRITE,
+            native_set_thread_stack_guarantee, native_set_unhandled_exception_filter,
+            native_wide_char_to_multi_byte, uppercase_ascii_utf16, API_SET_MODULE, PROT_EXEC,
+            PROT_READ, PROT_WRITE,
         };
 
         #[test]
@@ -284,6 +285,13 @@ mod imp {
         fn registers_a_non_null_vectored_exception_handler() {
             assert_eq!(native_add_vectored_exception_handler(1, 0), 0);
             assert_eq!(native_add_vectored_exception_handler(1, 0x1234), 0x1235);
+        }
+
+        #[test]
+        fn accepts_a_thread_stack_guarantee_request() {
+            let mut size = 0x5000;
+            assert_eq!(native_set_thread_stack_guarantee(&mut size), 1);
+            assert_eq!(native_set_thread_stack_guarantee(std::ptr::null_mut()), 0);
         }
 
         #[test]
@@ -644,6 +652,10 @@ mod imp {
         }
         VECTORED_EXCEPTION_HANDLER.store(handler, Ordering::Release);
         handler | 1
+    }
+
+    extern "win64" fn native_set_thread_stack_guarantee(size: *mut u32) -> i32 {
+        (!size.is_null()) as i32
     }
 
     extern "win64" fn native_get_acp() -> u32 {
@@ -1355,6 +1367,9 @@ mod imp {
             }
             "AddVectoredExceptionHandler" => {
                 Some(native_add_vectored_exception_handler as *const () as usize as u64)
+            }
+            "SetThreadStackGuarantee" => {
+                Some(native_set_thread_stack_guarantee as *const () as usize as u64)
             }
             "GetACP" => Some(native_get_acp as *const () as usize as u64),
             "GetOEMCP" => Some(native_get_oem_cp as *const () as usize as u64),

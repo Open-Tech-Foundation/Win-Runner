@@ -47,7 +47,8 @@ All notable changes to this project will be documented in this file.
   `GetEnvironmentStringsW` exposes an empty child-local environment block.
   `SetUnhandledExceptionFilter` retains the child-local handler pointer for
   CRT setup. `AddVectoredExceptionHandler` records the native child callback
-  for startup compatibility. `VirtualProtect`
+  for startup compatibility. `SetThreadStackGuarantee` accepts CRT guard-stack
+  requests. `VirtualProtect`
   translates the standard page-access modes to page-aligned Linux mappings.
   A narrow API-set pseudo-module resolves the CRT's dynamic `CompareStringEx`
   lookup without loading a host DLL.
