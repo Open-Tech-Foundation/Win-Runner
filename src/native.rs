@@ -166,11 +166,12 @@ mod imp {
             native_get_environment_strings_w, native_get_environment_variable_w,
             native_get_file_type, native_get_last_error, native_get_module_file_name_w,
             native_get_module_handle_a, native_get_oem_cp, native_get_proc_address,
-            native_get_startup_info_w, native_get_string_type_w, native_heap_alloc,
-            native_heap_free, native_heap_realloc, native_initialize_critical_section_ex,
-            native_initialize_slist_head, native_is_valid_code_page, native_lc_map_string_w,
-            native_leave_critical_section, native_multi_byte_to_wide_char, native_process_prng,
-            native_set_file_time, native_set_last_error, native_set_thread_stack_guarantee,
+            native_get_startup_info_w, native_get_string_type_w, native_get_system_info,
+            native_heap_alloc, native_heap_free, native_heap_realloc,
+            native_initialize_critical_section_ex, native_initialize_slist_head,
+            native_is_valid_code_page, native_lc_map_string_w, native_leave_critical_section,
+            native_multi_byte_to_wide_char, native_process_prng, native_set_file_time,
+            native_set_last_error, native_set_thread_stack_guarantee,
             native_set_unhandled_exception_filter, native_wide_char_to_multi_byte,
             native_write_console_w, uppercase_ascii_utf16, API_SET_MODULE, PROT_EXEC, PROT_READ,
             PROT_WRITE,
@@ -300,6 +301,18 @@ mod imp {
             assert_eq!(
                 &output[..6],
                 &['w' as u16, 'i' as u16, 'n' as u16, 'c' as u16, 'l' as u16, 'i' as u16]
+            );
+        }
+
+        #[test]
+        fn supplies_x64_system_information() {
+            let mut output = [0; 48];
+            native_get_system_info(output.as_mut_ptr());
+            assert_eq!(u16::from_le_bytes(output[..2].try_into().unwrap()), 9);
+            assert_eq!(u32::from_le_bytes(output[4..8].try_into().unwrap()), 4096);
+            assert_eq!(
+                u32::from_le_bytes(output[36..40].try_into().unwrap()),
+                65_536
             );
         }
 
@@ -1158,6 +1171,21 @@ mod imp {
         };
         1
     }
+    extern "win64" fn native_get_system_info(output: *mut u8) {
+        if output.is_null() {
+            return;
+        }
+        unsafe {
+            std::ptr::write_bytes(output, 0, 48);
+            (output as *mut u16).write_unaligned(9);
+            (output.add(4) as *mut u32).write_unaligned(4096);
+            (output.add(8) as *mut u64).write_unaligned(0x1_0000);
+            (output.add(16) as *mut u64).write_unaligned(0x7fff_ffff_ffff);
+            (output.add(24) as *mut u64).write_unaligned(1);
+            (output.add(32) as *mut u32).write_unaligned(8664);
+            (output.add(36) as *mut u32).write_unaligned(65_536);
+        }
+    }
     extern "win64" fn native_set_file_time(
         handle: u64,
         _creation: *const u64,
@@ -1592,6 +1620,7 @@ mod imp {
             "GetSystemTimeAsFileTime" => {
                 Some(native_get_system_time_as_file_time as *const () as usize as u64)
             }
+            "GetSystemInfo" => Some(native_get_system_info as *const () as usize as u64),
             "GetStdHandle" => Some(native_get_std_handle as *const () as usize as u64),
             "GetFileType" => Some(native_get_file_type as *const () as usize as u64),
             "GetModuleFileNameW" => {
