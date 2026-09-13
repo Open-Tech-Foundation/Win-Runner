@@ -73,6 +73,7 @@ All notable changes to this project will be documented in this file.
   `FindClose`. Native `CreateThread` now launches guest workers with cloned
   TLS state, and `WaitForSingleObject` joins their Windows-style handles.
   `QueryPerformanceFrequency` matches the native nanosecond counter.
+  `WaitOnAddress` and wake calls provide cooperative worker parking.
   `VirtualProtect`
   translates the standard page-access modes to page-aligned Linux mappings.
   A narrow API-set pseudo-module resolves the CRT's dynamic `CompareStringEx`

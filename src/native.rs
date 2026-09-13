@@ -181,9 +181,9 @@ mod imp {
             native_leave_critical_section, native_multi_byte_to_wide_char, native_process_prng,
             native_query_performance_frequency, native_set_console_mode, native_set_file_time,
             native_set_last_error, native_set_thread_stack_guarantee,
-            native_set_unhandled_exception_filter, native_wide_char_to_multi_byte,
-            native_write_console_w, uppercase_ascii_utf16, API_SET_MODULE, NATIVE_IMAGE_BASE,
-            PROT_EXEC, PROT_READ, PROT_WRITE,
+            native_set_unhandled_exception_filter, native_wait_on_address,
+            native_wide_char_to_multi_byte, native_write_console_w, uppercase_ascii_utf16,
+            API_SET_MODULE, NATIVE_IMAGE_BASE, PROT_EXEC, PROT_READ, PROT_WRITE,
         };
         use std::sync::atomic::Ordering;
 
@@ -331,6 +331,24 @@ mod imp {
             let mut frequency = 0;
             assert_eq!(native_query_performance_frequency(&mut frequency), 1);
             assert_eq!(frequency, 1_000_000_000);
+        }
+
+        #[test]
+        fn cooperatively_wakes_address_waiters() {
+            let expected = 0u8;
+            assert_eq!(
+                native_wait_on_address(
+                    (&expected as *const u8).cast(),
+                    (&expected as *const u8).cast(),
+                    1,
+                    u32::MAX
+                ),
+                1
+            );
+            assert_eq!(
+                native_wait_on_address(std::ptr::null(), (&expected as *const u8).cast(), 1, 0),
+                0
+            );
         }
 
         #[test]
@@ -890,6 +908,19 @@ mod imp {
             None => 0xffff_ffff,
         }
     }
+    extern "win64" fn native_wait_on_address(
+        address: *const u8,
+        compare: *const u8,
+        size: usize,
+        _milliseconds: u32,
+    ) -> i32 {
+        if address.is_null() || compare.is_null() || !(1..=8).contains(&size) {
+            return 0;
+        }
+        std::thread::yield_now();
+        1
+    }
+    extern "win64" fn native_wake_by_address(_address: *const u8) {}
     struct NativeFs {
         fs: WinFs,
         handles: HashMap<u64, NativeFile>,
@@ -2192,6 +2223,10 @@ mod imp {
             "CreateThread" => Some(native_create_thread as *const () as usize as u64),
             "WaitForSingleObject" => {
                 Some(native_wait_for_single_object as *const () as usize as u64)
+            }
+            "WaitOnAddress" => Some(native_wait_on_address as *const () as usize as u64),
+            "WakeByAddressAll" | "WakeByAddressSingle" => {
+                Some(native_wake_by_address as *const () as usize as u64)
             }
             "ReadFile" => Some(native_read_file as *const () as usize as u64),
             "CloseHandle" => Some(native_close_handle as *const () as usize as u64),
