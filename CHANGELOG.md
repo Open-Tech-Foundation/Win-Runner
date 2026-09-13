@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Native processes now own a child-process registry with unique process IDs
+  and closable handles. `GetExitCodeProcess`, `TerminateProcess`, and
+  `WaitForSingleObject` use those records, including active, timeout, exit,
+  and invalid-handle behavior; child PE launch will attach to this registry.
 - `CreateProcessW` now parses Windows-quoted command lines and validates its
   application target and guest working directory before launch. Invalid
   process-information records, malformed command lines, and invalid working

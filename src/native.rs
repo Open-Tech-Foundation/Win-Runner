@@ -81,7 +81,7 @@ mod imp {
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     #[cfg(test)]
     use std::sync::LazyLock;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Condvar, Mutex};
 
     const PROT_READ: i32 = 0x1;
     const PROT_WRITE: i32 = 0x2;
@@ -202,9 +202,9 @@ mod imp {
             native_process_prng, native_query_performance_frequency, native_set_console_mode,
             native_set_file_time, native_set_last_error, native_set_thread_stack_guarantee,
             native_set_unhandled_exception_filter, native_set_waitable_timer,
-            native_wait_on_address, native_wide_char_to_multi_byte, native_write_console_w,
-            parse_windows_command_line, uppercase_ascii_utf16, API_SET_MODULE, PROT_EXEC,
-            PROT_READ, PROT_WRITE,
+            native_terminate_process, native_wait_for_single_object, native_wait_on_address,
+            native_wide_char_to_multi_byte, native_write_console_w, parse_windows_command_line,
+            process_ctx, uppercase_ascii_utf16, API_SET_MODULE, PROT_EXEC, PROT_READ, PROT_WRITE,
         };
         use crate::winfs::WinFs;
 
@@ -250,6 +250,28 @@ mod imp {
             assert_eq!(native_get_last_error(), 6); // ERROR_INVALID_HANDLE
             assert_eq!(native_close_handle(native_get_current_process()), 0);
             assert_eq!(native_get_last_error(), 6);
+        }
+
+        #[test]
+        fn owns_child_process_handles_until_explicit_close() {
+            let process = process_ctx().unwrap();
+            let (handle, child) = process
+                .children
+                .lock()
+                .unwrap()
+                .allocate(process.process_id);
+            assert_eq!(child.parent_process_id, 1);
+            assert!(child.process_id >= 2);
+            let mut exit_code = 0;
+            assert_eq!(native_get_exit_code_process(handle, &mut exit_code), 1);
+            assert_eq!(exit_code, 259); // STILL_ACTIVE
+            assert_eq!(native_wait_for_single_object(handle, 0), 258); // WAIT_TIMEOUT
+            assert_eq!(native_terminate_process(handle, 23), 1);
+            assert_eq!(native_wait_for_single_object(handle, 0), 0);
+            assert_eq!(native_get_exit_code_process(handle, &mut exit_code), 1);
+            assert_eq!(exit_code, 23);
+            assert_eq!(native_close_handle(handle), 1);
+            assert_eq!(native_get_exit_code_process(handle, &mut exit_code), 0);
         }
 
         #[test]
@@ -1006,7 +1028,7 @@ mod imp {
         };
         result
     }
-    extern "win64" fn native_wait_for_single_object(handle: u64, _milliseconds: u32) -> u32 {
+    extern "win64" fn native_wait_for_single_object(handle: u64, milliseconds: u32) -> u32 {
         let join = match process_ctx().and_then(|process| {
             process
                 .threads
@@ -1023,7 +1045,42 @@ mod imp {
                 0
             }
             None if (0x7000_0000..0x8000_0000).contains(&handle) => 0,
-            None => 0xffff_ffff,
+            None => {
+                let Some(process) = process_ctx() else {
+                    return 0xffff_ffff; // WAIT_FAILED
+                };
+                let Some(child) = child_process(&process, handle) else {
+                    return 0xffff_ffff;
+                };
+                let Ok(mut state) = child.state.lock() else {
+                    return 0xffff_ffff;
+                };
+                if state.is_some() {
+                    return 0; // WAIT_OBJECT_0
+                }
+                if milliseconds == 0 {
+                    return 258; // WAIT_TIMEOUT
+                }
+                if milliseconds == u32::MAX {
+                    while state.is_none() {
+                        state = match child.exited.wait(state) {
+                            Ok(state) => state,
+                            Err(_) => return 0xffff_ffff,
+                        };
+                    }
+                    return 0;
+                }
+                let result = match child.exited.wait_timeout_while(
+                    state,
+                    std::time::Duration::from_millis(milliseconds as u64),
+                    |state| state.is_none(),
+                ) {
+                    Ok((state, _)) if state.is_some() => 0,
+                    Ok(_) => 258,
+                    Err(_) => 0xffff_ffff,
+                };
+                result
+            }
         }
     }
     extern "win64" fn native_wait_on_address(
@@ -1066,6 +1123,47 @@ mod imp {
         next: u64,
     }
 
+    // CreateProcessW will allocate these once PE mapping is attached to the
+    // registry; they are already consumed by the process-handle APIs.
+    #[allow(dead_code)]
+    struct NativeChildProcess {
+        process_id: u32,
+        parent_process_id: u32,
+        state: Mutex<Option<u32>>,
+        exited: Condvar,
+    }
+
+    struct NativeProcessTable {
+        next_handle: u64,
+        next_process_id: u32,
+        children: HashMap<u64, Arc<NativeChildProcess>>,
+    }
+
+    #[allow(dead_code)]
+    impl NativeProcessTable {
+        fn new() -> Self {
+            Self {
+                next_handle: 0x6000_0000,
+                next_process_id: 2,
+                children: HashMap::new(),
+            }
+        }
+
+        fn allocate(&mut self, parent_process_id: u32) -> (u64, Arc<NativeChildProcess>) {
+            let handle = self.next_handle;
+            self.next_handle += 1;
+            let child = Arc::new(NativeChildProcess {
+                process_id: self.next_process_id,
+                parent_process_id,
+                state: Mutex::new(None),
+                exited: Condvar::new(),
+            });
+            self.next_process_id += 1;
+            self.children.insert(handle, Arc::clone(&child));
+            (handle, child)
+        }
+    }
+
     /// State that belongs to exactly one Windows guest process. The current
     /// launcher still initializes legacy accessors from this bundle; keeping
     /// the ownership explicit is the migration seam for native CreateProcessW.
@@ -1089,6 +1187,7 @@ mod imp {
         vectored_exception_handler: AtomicU64,
         exit_status: AtomicU32,
         exited: AtomicBool,
+        children: Mutex<NativeProcessTable>,
     }
 
     // Import trampolines have no guest-context argument. This is therefore a
@@ -1126,6 +1225,7 @@ mod imp {
             vectored_exception_handler: AtomicU64::new(0),
             exit_status: AtomicU32::new(259),
             exited: AtomicBool::new(false),
+            children: Mutex::new(NativeProcessTable::new()),
         })
     });
 
@@ -1603,6 +1703,14 @@ mod imp {
             .map(|process| process.process_handle)
             .unwrap_or(u64::MAX)
     }
+
+    fn child_process(
+        process: &NativeProcessContext,
+        handle: u64,
+    ) -> Option<Arc<NativeChildProcess>> {
+        process.children.lock().ok()?.children.get(&handle).cloned()
+    }
+
     extern "win64" fn native_get_exit_code_process(handle: u64, code: *mut u32) -> i32 {
         if code.is_null() {
             native_set_last_error(87); // ERROR_INVALID_PARAMETER
@@ -1612,15 +1720,25 @@ mod imp {
             native_set_last_error(6); // ERROR_INVALID_HANDLE
             return 0;
         };
-        if handle != process.process_handle {
+        if handle == process.process_handle {
+            let exit_code = if process.exited.load(Ordering::Acquire) {
+                process.exit_status.load(Ordering::Acquire)
+            } else {
+                259 // STILL_ACTIVE
+            };
+            unsafe { code.write(exit_code) };
+            return 1;
+        }
+        let Some(child) = child_process(&process, handle) else {
             native_set_last_error(6); // ERROR_INVALID_HANDLE
             return 0;
-        }
-        let exit_code = if process.exited.load(Ordering::Acquire) {
-            process.exit_status.load(Ordering::Acquire)
-        } else {
-            259 // STILL_ACTIVE
         };
+        let exit_code = child
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| *state)
+            .unwrap_or(259);
         unsafe { code.write(exit_code) };
         1
     }
@@ -1629,13 +1747,24 @@ mod imp {
             native_set_last_error(6); // ERROR_INVALID_HANDLE
             return 0;
         };
-        if handle != process.process_handle {
+        if handle == process.process_handle {
+            process.exit_status.store(code, Ordering::Release);
+            process.exited.store(true, Ordering::Release);
+            native_exit_process(code)
+        }
+        let Some(child) = child_process(&process, handle) else {
             native_set_last_error(6); // ERROR_INVALID_HANDLE
             return 0;
+        };
+        let Ok(mut state) = child.state.lock() else {
+            native_set_last_error(6);
+            return 0;
+        };
+        if state.is_none() {
+            *state = Some(code);
+            child.exited.notify_all();
         }
-        process.exit_status.store(code, Ordering::Release);
-        process.exited.store(true, Ordering::Release);
-        native_exit_process(code)
+        1
     }
     extern "win64" fn native_get_current_thread() -> u64 {
         u64::MAX - 1
@@ -2555,9 +2684,26 @@ mod imp {
         1
     }
     extern "win64" fn native_close_handle(h: u64) -> i32 {
-        if process_ctx().is_some_and(|process| h == process.process_handle || h == u64::MAX - 1) {
+        let process = process_ctx();
+        if process
+            .as_ref()
+            .is_some_and(|process| h == process.process_handle || h == u64::MAX - 1)
+        {
             native_set_last_error(6); // pseudo handles cannot be closed
             return 0;
+        }
+        if process
+            .as_ref()
+            .and_then(|process| {
+                process
+                    .children
+                    .lock()
+                    .ok()
+                    .map(|mut children| children.children.remove(&h).is_some())
+            })
+            .unwrap_or(false)
+        {
+            return 1;
         }
         let closed = fs_ctx()
             .and_then(|context| {
@@ -2906,6 +3052,7 @@ mod imp {
             vectored_exception_handler: AtomicU64::new(0),
             exit_status: AtomicU32::new(259), // STILL_ACTIVE
             exited: AtomicBool::new(false),
+            children: Mutex::new(NativeProcessTable::new()),
         });
         if let Ok(mut context) = NATIVE_PROCESS.lock() {
             *context = Some(Arc::clone(&process));
