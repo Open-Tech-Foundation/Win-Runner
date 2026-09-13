@@ -55,7 +55,10 @@ All notable changes to this project will be documented in this file.
   the child standard descriptors. `GetConsoleOutputCP` returns the matching
   Windows-1252 console encoding. `SetFileTime` accepts metadata updates on
   standard descriptors without persisting timestamps. `WriteConsoleW` writes
-  native UTF-16 console text as UTF-8.
+  native UTF-16 console text as UTF-8. `GetEnvironmentVariableW` correctly
+  reports missing values from the native child’s empty environment, including
+  ripgrep's dynamic kernel32 lookup. `GetCurrentDirectoryW` supplies the
+  synthetic `C:\\` working directory.
   `VirtualProtect`
   translates the standard page-access modes to page-aligned Linux mappings.
   A narrow API-set pseudo-module resolves the CRT's dynamic `CompareStringEx`

@@ -161,8 +161,9 @@ mod imp {
             command_line_a, linux_protection, native_add_vectored_exception_handler,
             native_delete_critical_section, native_enter_critical_section,
             native_free_environment_strings_w, native_get_acp, native_get_console_mode,
-            native_get_console_output_cp, native_get_cp_info, native_get_current_thread,
-            native_get_environment_strings_w, native_get_file_type, native_get_last_error,
+            native_get_console_output_cp, native_get_cp_info, native_get_current_directory_w,
+            native_get_current_thread, native_get_environment_strings_w,
+            native_get_environment_variable_w, native_get_file_type, native_get_last_error,
             native_get_module_file_name_w, native_get_module_handle_a, native_get_oem_cp,
             native_get_proc_address, native_get_startup_info_w, native_get_string_type_w,
             native_heap_alloc, native_heap_free, native_heap_realloc,
@@ -265,10 +266,36 @@ mod imp {
         }
 
         #[test]
+        fn reports_missing_variables_from_the_empty_native_environment() {
+            native_set_last_error(0);
+            let name = ['R' as u16, 0];
+            assert_eq!(
+                native_get_environment_variable_w(name.as_ptr(), std::ptr::null_mut(), 0),
+                0
+            );
+            assert_eq!(native_get_last_error(), 203);
+        }
+
+        #[test]
+        fn supplies_a_root_current_directory() {
+            let mut output = [0; 4];
+            assert_eq!(native_get_current_directory_w(4, output.as_mut_ptr()), 3);
+            assert_eq!(&output, &['C' as u16, ':' as u16, '\\' as u16, 0]);
+            assert_eq!(native_get_current_directory_w(3, output.as_mut_ptr()), 4);
+        }
+
+        #[test]
         fn resolves_only_the_supported_dynamic_api_set_export() {
             assert_ne!(
                 native_get_proc_address(API_SET_MODULE, c"CompareStringEx".as_ptr().cast()),
                 0
+            );
+            assert_eq!(
+                native_get_proc_address(
+                    API_SET_MODULE,
+                    c"GetEnvironmentVariableW".as_ptr().cast()
+                ),
+                native_get_environment_variable_w as *const () as usize as u64
             );
             assert_eq!(
                 native_get_proc_address(API_SET_MODULE, c"UnknownExport".as_ptr().cast()),
@@ -1067,6 +1094,28 @@ mod imp {
     extern "win64" fn native_get_console_output_cp() -> u32 {
         native_get_acp()
     }
+    extern "win64" fn native_get_environment_variable_w(
+        name: *const u16,
+        _output: *mut u16,
+        _output_len: u32,
+    ) -> u32 {
+        if name.is_null() {
+            native_set_last_error(87); // ERROR_INVALID_PARAMETER
+            return 0;
+        }
+        // Native children presently expose the same deliberately empty
+        // environment returned by GetEnvironmentStringsW.
+        native_set_last_error(203); // ERROR_ENVVAR_NOT_FOUND
+        0
+    }
+    extern "win64" fn native_get_current_directory_w(output_len: u32, output: *mut u16) -> u32 {
+        const ROOT: [u16; 4] = ['C' as u16, ':' as u16, '\\' as u16, 0];
+        if output.is_null() || output_len < ROOT.len() as u32 {
+            return ROOT.len() as u32;
+        }
+        unsafe { output.copy_from_nonoverlapping(ROOT.as_ptr(), ROOT.len()) };
+        (ROOT.len() - 1) as u32
+    }
     extern "win64" fn native_set_file_time(
         handle: u64,
         _creation: *const u64,
@@ -1292,6 +1341,12 @@ mod imp {
         }
         match unsafe { ascii_z(name) } {
             Some("CompareStringEx") => native_compare_string_ex as *const () as usize as u64,
+            Some("GetEnvironmentVariableW") => {
+                native_get_environment_variable_w as *const () as usize as u64
+            }
+            Some("GetCurrentDirectoryW") => {
+                native_get_current_directory_w as *const () as usize as u64
+            }
             _ => 0,
         }
     }
@@ -1533,6 +1588,9 @@ mod imp {
             "ProcessPrng" => Some(native_process_prng as *const () as usize as u64),
             "GetConsoleMode" => Some(native_get_console_mode as *const () as usize as u64),
             "GetConsoleOutputCP" => Some(native_get_console_output_cp as *const () as usize as u64),
+            "GetEnvironmentVariableW" => {
+                Some(native_get_environment_variable_w as *const () as usize as u64)
+            }
             "SetFileTime" => Some(native_set_file_time as *const () as usize as u64),
             "WriteFile" => Some(native_write_file as *const () as usize as u64),
             "WriteConsoleW" => Some(native_write_console_w as *const () as usize as u64),
