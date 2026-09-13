@@ -59,6 +59,18 @@ pub fn run_rust_baseline_argv_with_fs(
     imp::run_rust_baseline_argv_with_fs(img, fs, prog, args)
 }
 
+/// As [`run_rust_baseline_argv_with_fs`], forwarding stdout chunks while the
+/// isolated native child is still running.
+pub fn run_rust_baseline_argv_with_fs_streaming(
+    img: &PeImage,
+    fs: crate::winfs::WinFs,
+    prog: &str,
+    args: &[String],
+    output: &dyn Fn(&[u8]),
+) -> Result<(u32, Vec<u8>, crate::winfs::WinFs), String> {
+    imp::run_rust_baseline_argv_with_fs_streaming(img, fs, prog, args, output)
+}
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod imp {
     use super::PeImage;
@@ -2460,6 +2472,26 @@ mod imp {
         prog: &str,
         args: &[String],
     ) -> Result<(u32, Vec<u8>, WinFs), String> {
+        run_rust_baseline_argv_with_fs_impl(img, instance_fs, prog, args, None)
+    }
+
+    pub(super) fn run_rust_baseline_argv_with_fs_streaming(
+        img: &PeImage,
+        instance_fs: WinFs,
+        prog: &str,
+        args: &[String],
+        output: &dyn Fn(&[u8]),
+    ) -> Result<(u32, Vec<u8>, WinFs), String> {
+        run_rust_baseline_argv_with_fs_impl(img, instance_fs, prog, args, Some(output))
+    }
+
+    fn run_rust_baseline_argv_with_fs_impl(
+        img: &PeImage,
+        instance_fs: WinFs,
+        prog: &str,
+        args: &[String],
+        output: Option<&dyn Fn(&[u8])>,
+    ) -> Result<(u32, Vec<u8>, WinFs), String> {
         let _run = NATIVE_RUN_LOCK
             .lock()
             .map_err(|_| "native backend execution lock is poisoned".to_string())?;
@@ -2563,6 +2595,9 @@ mod imp {
                 ));
             }
             out.extend_from_slice(&buf[..n as usize]);
+            if let Some(output) = output {
+                output(&buf[..n as usize]);
+            }
         }
         unsafe {
             close(fds[0]);
@@ -2643,6 +2678,16 @@ mod imp {
     ) -> Result<(u32, Vec<u8>, crate::winfs::WinFs), String> {
         Err("native backend is available only on Linux x86_64".to_string())
     }
+
+    pub(super) fn run_rust_baseline_argv_with_fs_streaming(
+        _: &PeImage,
+        _: crate::winfs::WinFs,
+        _: &str,
+        _: &[String],
+        _: &dyn Fn(&[u8]),
+    ) -> Result<(u32, Vec<u8>, crate::winfs::WinFs), String> {
+        Err("native backend is available only on Linux x86_64".to_string())
+    }
 }
 
 #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
@@ -2683,6 +2728,24 @@ mod tests {
         let (code, out) = run_rust_baseline(&img).expect("native rust hello runs");
         assert_eq!(code, 0);
         assert_eq!(out, b"Hello from Rust");
+    }
+
+    #[test]
+    fn forwards_native_child_stdout_chunks() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/artifacts/exe/rust_hello.exe");
+        let img = load(&std::fs::read(path).unwrap()).unwrap();
+        let output = std::sync::Mutex::new(Vec::new());
+        let (code, returned, _) = run_rust_baseline_argv_with_fs_streaming(
+            &img,
+            WinFs::ephemeral_runner(),
+            "hello.exe",
+            &[],
+            &|chunk| output.lock().unwrap().extend_from_slice(chunk),
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(returned, b"Hello from Rust");
+        assert_eq!(*output.lock().unwrap(), b"Hello from Rust");
     }
 
     #[test]

@@ -137,6 +137,25 @@ impl ExecutionBackend for NativeLinuxX64 {
         let (code, stdout, fs) = native::run_rust_baseline_argv_with_fs(image, fs, prog, args)?;
         Ok(Execution { code, stdout, fs })
     }
+
+    fn execute_streaming(
+        &self,
+        image: &PeImage,
+        fs: WinFs,
+        prog: &str,
+        args: &[String],
+        sink: OutputSink,
+    ) -> Result<Execution, String> {
+        let forward = Arc::clone(&sink);
+        let (code, stdout, fs) = native::run_rust_baseline_argv_with_fs_streaming(
+            image,
+            fs,
+            prog,
+            args,
+            &move |chunk| forward(OutputChannel::Stdout, chunk),
+        )?;
+        Ok(Execution { code, stdout, fs })
+    }
 }
 
 static INTERPRETER: Interpreter = Interpreter;
