@@ -136,8 +136,8 @@ mod imp {
             native_get_file_type, native_get_last_error, native_get_oem_cp,
             native_get_proc_address, native_get_startup_info_w,
             native_initialize_critical_section_ex, native_is_valid_code_page,
-            native_leave_critical_section, native_set_last_error, uppercase_ascii_utf16,
-            API_SET_MODULE, PROT_EXEC, PROT_READ, PROT_WRITE,
+            native_leave_critical_section, native_multi_byte_to_wide_char, native_set_last_error,
+            uppercase_ascii_utf16, API_SET_MODULE, PROT_EXEC, PROT_READ, PROT_WRITE,
         };
 
         #[test]
@@ -246,6 +246,25 @@ mod imp {
             assert_eq!(native_get_cp_info(65001, cp_info.as_mut_ptr()), 1);
             assert_eq!(u32::from_le_bytes(cp_info[..4].try_into().unwrap()), 4);
             assert_eq!(native_get_cp_info(932, cp_info.as_mut_ptr()), 0);
+        }
+
+        #[test]
+        fn converts_supported_multibyte_inputs_to_utf16() {
+            let input = b"rg\0";
+            let mut output = [0; 4];
+            assert_eq!(
+                native_multi_byte_to_wide_char(1252, 0, input.as_ptr(), -1, output.as_mut_ptr(), 4),
+                3
+            );
+            assert_eq!(&output[..3], &['r' as u16, 'g' as u16, 0]);
+            assert_eq!(
+                native_multi_byte_to_wide_char(65001, 0, "é".as_ptr(), 2, std::ptr::null_mut(), 0),
+                1
+            );
+            assert_eq!(
+                native_multi_byte_to_wide_char(932, 0, input.as_ptr(), -1, output.as_mut_ptr(), 4),
+                0
+            );
         }
     }
 
@@ -473,6 +492,64 @@ mod imp {
             info.add(4).write(b'?');
         }
         1
+    }
+
+    unsafe fn multibyte_input(input: *const u8, len: i32) -> Option<(Vec<u8>, bool)> {
+        if input.is_null() || len < -1 {
+            return None;
+        }
+        if len >= 0 {
+            return Some((
+                unsafe { std::slice::from_raw_parts(input, len as usize) }.to_vec(),
+                false,
+            ));
+        }
+        let mut size = 0;
+        while size < 64 * 1024 && unsafe { *input.add(size) } != 0 {
+            size += 1;
+        }
+        (size < 64 * 1024).then(|| {
+            (
+                unsafe { std::slice::from_raw_parts(input, size) }.to_vec(),
+                true,
+            )
+        })
+    }
+
+    extern "win64" fn native_multi_byte_to_wide_char(
+        code_page: u32,
+        _flags: u32,
+        input: *const u8,
+        input_len: i32,
+        output: *mut u16,
+        output_len: i32,
+    ) -> i32 {
+        if output_len < 0 {
+            return 0;
+        }
+        let (input, append_nul) = match unsafe { multibyte_input(input, input_len) } {
+            Some(value) => value,
+            None => return 0,
+        };
+        let mut wide: Vec<u16> = match code_page {
+            1252 => input.into_iter().map(u16::from).collect(),
+            65001 => match std::str::from_utf8(&input) {
+                Ok(value) => value.encode_utf16().collect(),
+                Err(_) => return 0,
+            },
+            _ => return 0,
+        };
+        if append_nul {
+            wide.push(0);
+        }
+        if output.is_null() {
+            return wide.len().try_into().unwrap_or(0);
+        }
+        if wide.len() > output_len as usize {
+            return 0;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(wide.as_ptr(), output, wide.len()) };
+        wide.len().try_into().unwrap_or(0)
     }
 
     extern "win64" fn native_get_process_heap() -> u64 {
@@ -930,6 +1007,9 @@ mod imp {
             "GetOEMCP" => Some(native_get_oem_cp as *const () as usize as u64),
             "IsValidCodePage" => Some(native_is_valid_code_page as *const () as usize as u64),
             "GetCPInfo" => Some(native_get_cp_info as *const () as usize as u64),
+            "MultiByteToWideChar" => {
+                Some(native_multi_byte_to_wide_char as *const () as usize as u64)
+            }
             "HeapAlloc" => Some(native_heap_alloc as *const () as usize as u64),
             "HeapFree" => Some(native_heap_free as *const () as usize as u64),
             "WriteFile" => Some(native_write_file as *const () as usize as u64),
