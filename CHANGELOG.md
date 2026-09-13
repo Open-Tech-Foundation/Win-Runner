@@ -10,7 +10,9 @@ All notable changes to this project will be documented in this file.
   launches, starts in `C:\\actions-runner\\_work`, and discards it when the
   session exits. `wincli runner` is its non-interactive, stdin-driven
   host-control counterpart, providing the initial lifecycle seam for a
-  GitHub Actions protocol adapter.
+  GitHub Actions protocol adapter. Both accept an explicit `@seed <host-file>
+  <guest-path>` directive, which copies one host file into the instance and
+  permits execution from that guest path without creating a filesystem mount.
 - Native launches now boot a fresh, child-local runner WinFs image rather
   than a bare filesystem root. The ephemeral image supplies Windows system,
   runner, work, diagnostics, user-profile, and temp directories and starts

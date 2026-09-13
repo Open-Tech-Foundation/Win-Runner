@@ -1,8 +1,9 @@
 //! Interactive and host-controlled runner shells with one fresh WinFs image
 //! per session.
 //!
-//! Each input line is, in order: an `exit`/`quit`, an `install`/`inspect`
-//! command, a host `.exe`/`.ps1` file, a cached package
+//! Each input line is, in order: an `exit`/`quit`, a host-only `@seed`
+//! injection directive, an `install`/`inspect` command, a host or guest
+//! `.exe`/`.ps1` file, a cached package
 //! (`name`, `name.exe`, `C:\bin\name.exe` + args), or a PS1 statement run
 //! against the session filesystem. Guest console output streams exactly
 //! like the one-shot CLI paths; errors print as `wincli: ...` and the
@@ -63,6 +64,19 @@ impl Shell {
                 };
                 Ok(ShellFlow::Exit(code))
             }
+            "@seed" => {
+                let host = argv
+                    .get(1)
+                    .ok_or_else(|| "usage: @seed <host-file> <guest-path>".to_string())?;
+                let guest = argv
+                    .get(2)
+                    .ok_or_else(|| "usage: @seed <host-file> <guest-path>".to_string())?;
+                if argv.len() != 3 {
+                    return Err("usage: @seed <host-file> <guest-path>".to_string());
+                }
+                self.seed_host_file(host, guest)?;
+                Ok(ShellFlow::Continue)
+            }
             "install" => {
                 let name = argv
                     .get(1)
@@ -119,6 +133,13 @@ impl Shell {
                 }
             }
         }
+        if self.fs.is_file(target) {
+            let data = self
+                .fs
+                .read_file(target)
+                .map_err(|e| format!("cannot read guest executable {target}: {e}"))?;
+            return self.run_exe_bytes(&data, target, &argv[1..], out);
+        }
         let cache = install::cache_dir();
         if let Some(exe_path) = install::find_cached(&cache, &guest_bin_name(target)) {
             return self.run_exe_file(
@@ -153,10 +174,23 @@ impl Shell {
     ) -> Result<ShellFlow, String> {
         let data =
             std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
-        let img = pe::load(&data).map_err(|e| format!("failed to load {path}: {e}"))?;
+        self.run_exe_bytes(&data, prog, guest_args, out)
+    }
+
+    /// Execute a PE already present in the guest image. This is intentionally
+    /// separate from host-file loading so a seeded runner can execute tools
+    /// without a host filesystem mount.
+    fn run_exe_bytes(
+        &mut self,
+        data: &[u8],
+        prog: &str,
+        guest_args: &[String],
+        out: &mut Vec<u8>,
+    ) -> Result<ShellFlow, String> {
+        let img = pe::load(data).map_err(|e| format!("failed to load {prog}: {e}"))?;
         let fs = std::mem::replace(&mut self.fs, WinFs::ephemeral_runner());
         let runner = winapi::Runner::with_argv(&img, fs, prog, guest_args)
-            .map_err(|e| format!("failed to start {path}: {e}"))?;
+            .map_err(|e| format!("failed to start {prog}: {e}"))?;
         match runner.run() {
             Ok((code, fs_back, gout)) => {
                 self.fs = fs_back;
@@ -166,6 +200,32 @@ impl Shell {
             }
             Err(e) => Err(format!("execution failed: {e}")),
         }
+    }
+
+    /// One-way host-to-guest copy used while booting a local runner image.
+    /// The guest path is validated and written through WinFs; no guest call
+    /// can recover the corresponding host path.
+    fn seed_host_file(&mut self, host: &str, guest: &str) -> Result<(), String> {
+        let bytes = std::fs::read(host).map_err(|e| format!("cannot seed {host}: {e}"))?;
+        let normalized = self
+            .fs
+            .normalize(guest)
+            .map_err(|e| format!("invalid guest seed path {guest}: {e}"))?;
+        if normalized.parts.is_empty() {
+            return Err("cannot seed the guest filesystem root".to_string());
+        }
+        let parent = normalized.parts[..normalized.parts.len() - 1].join("\\");
+        let parent = if parent.is_empty() {
+            format!("{}:\\", normalized.drive)
+        } else {
+            format!("{}:\\{parent}", normalized.drive)
+        };
+        self.fs
+            .mkdir(&parent)
+            .map_err(|e| format!("cannot create guest seed directory: {e}"))?;
+        self.fs
+            .write_file(&normalized.display(), bytes)
+            .map_err(|e| format!("cannot seed {guest}: {e}"))
     }
 }
 
@@ -322,6 +382,21 @@ mod tests {
     fn shell_boots_an_ephemeral_runner_image() {
         let shell = Shell::new();
         assert_eq!(shell.cwd(), r"C:\actions-runner\_work");
+    }
+
+    #[test]
+    fn seed_copies_a_host_file_only_into_the_session_image() {
+        let host = std::env::temp_dir().join(format!("wincli-seed-{}.txt", std::process::id()));
+        std::fs::write(&host, b"seeded").unwrap();
+        let mut shell = Shell::new();
+        shell
+            .seed_host_file(host.to_str().unwrap(), r"C:\actions-runner\_work\in.txt")
+            .unwrap();
+        assert_eq!(
+            shell.fs.read_file(r"C:\actions-runner\_work\in.txt").unwrap(),
+            b"seeded"
+        );
+        std::fs::remove_file(host).ok();
     }
 
     #[test]

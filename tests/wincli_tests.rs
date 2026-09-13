@@ -1043,6 +1043,19 @@ fn test_runner_executes_host_controlled_ephemeral_job() {
 }
 
 #[test]
+fn test_runner_seeds_and_executes_a_guest_pe() {
+    let host_exe = artifact("exe/rust_hello.exe");
+    let input = format!(
+        "@seed {} C:\\actions-runner\\_work\\hello.exe\nC:\\actions-runner\\_work\\hello.exe\nexit\n",
+        host_exe.display()
+    );
+    let (code, stdout, stderr) = run_session_env("runner", &input, &[]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "Hello from Rust");
+    assert!(stderr.is_empty(), "stderr: {stderr}");
+}
+
+#[test]
 fn test_shell_install_run_session_offline() {
     let cache = isolated_cache("shell");
     let src = artifact("packages").to_string_lossy().to_string();
