@@ -10,7 +10,7 @@
 //! 8. Unknown PE imports fail clearly.
 //! 9. EXE and PS1 execution use the exact same WinFS API.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use wincli::pe;
 use wincli::winapi;
@@ -1033,6 +1033,26 @@ fn run_shell_env(input: &str, envs: &[(&str, &str)]) -> (i32, String, String) {
     run_session_env("shell", input, envs)
 }
 
+fn stored_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (name, data) in files {
+        out.extend_from_slice(b"PK\x03\x04");
+        out.extend_from_slice(&20u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(data);
+    }
+    out
+}
+
 #[test]
 fn test_runner_executes_host_controlled_ephemeral_job() {
     let input = "New-Item C:\\actions-runner\\_work\\job.txt -Value ready\nGet-Content C:\\actions-runner\\_work\\job.txt\nexit\n";
@@ -1053,6 +1073,40 @@ fn test_runner_seeds_and_executes_a_guest_pe() {
     assert_eq!(code, 0, "stderr: {stderr}");
     assert_eq!(stdout, "Hello from Rust");
     assert!(stderr.is_empty(), "stderr: {stderr}");
+}
+
+#[test]
+fn test_runner_boots_snapshot_file() {
+    let path = tmp_path("runner.snap");
+    std::fs::write(
+        &path,
+        stored_zip(&[
+            ("wincli-snapshot/v1", b"wincli snapshot v1\n"),
+            ("files/C/actions-runner/_work/from-snapshot.txt", b"booted"),
+        ]),
+    )
+    .unwrap();
+    let bin = env!("CARGO_BIN_EXE_wincli");
+    let output = Command::new(bin)
+        .arg(format!("--snapshot={}", path.display()))
+        .arg("runner")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn snapshot runner");
+    let mut child = output;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"Get-Content C:\\actions-runner\\_work\\from-snapshot.txt\nexit\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    std::fs::remove_file(path).ok();
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"booted\n");
+    assert!(output.stderr.is_empty());
 }
 
 #[test]

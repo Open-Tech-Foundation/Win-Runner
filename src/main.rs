@@ -1,6 +1,6 @@
 use std::io::Write;
 use std::path::Path;
-use wincli::{inspect, install, pe, winapi, winfs::WinFs};
+use wincli::{inspect, install, pe, snapshot, winapi, winfs::WinFs};
 
 fn usage() -> ! {
     eprintln!("usage:");
@@ -9,6 +9,7 @@ fn usage() -> ! {
     eprintln!("  wincli <script.ps1>             run a script (no args yet)");
     eprintln!("  wincli shell                    interactive ephemeral runner shell");
     eprintln!("  wincli runner                   run host-controlled job commands from stdin");
+    eprintln!("  wincli --snapshot=os.snap shell|runner  boot a snapshot image");
     eprintln!("  wincli inspect <app.exe|pkg>  report PE imports vs supported APIs");
     eprintln!("  wincli install <pkg>          install a package into the cache");
     eprintln!("env: WINCLI_CACHE (default ~/.cache/wincli), WINCLI_SOURCE (package dir)");
@@ -16,7 +17,14 @@ fn usage() -> ! {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let mut args: Vec<String> = std::env::args().collect();
+    let snapshot_path = args
+        .get(1)
+        .and_then(|arg| arg.strip_prefix("--snapshot="))
+        .map(str::to_string);
+    if snapshot_path.is_some() {
+        args.remove(1);
+    }
     if args.len() == 3 && args[1] == "inspect" {
         inspect_target(&args[2]);
     }
@@ -25,15 +33,37 @@ fn main() {
         return;
     }
     if args.len() == 2 && args[1] == "shell" {
+        if let Some(path) = snapshot_path.as_deref() {
+            let fs = load_snapshot(path);
+            std::process::exit(wincli::shell::run_shell_with_fs(fs));
+        }
         std::process::exit(wincli::shell::run_shell());
     }
     if args.len() == 2 && args[1] == "runner" {
+        if let Some(path) = snapshot_path.as_deref() {
+            let fs = load_snapshot(path);
+            std::process::exit(wincli::shell::run_runner_with_fs(fs));
+        }
         std::process::exit(wincli::shell::run_runner());
+    }
+    if snapshot_path.is_some() {
+        eprintln!("wincli: --snapshot is currently supported with shell or runner");
+        std::process::exit(2);
     }
     if args.len() < 2 {
         usage();
     }
     run_target(&args[1], &args[2..]);
+}
+
+fn load_snapshot(path: &str) -> WinFs {
+    match snapshot::load_file(path) {
+        Ok(fs) => fs,
+        Err(e) => {
+            eprintln!("wincli: cannot boot snapshot {path}: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Run target: host `.exe`/`.ps1` path, cached package name, or guest

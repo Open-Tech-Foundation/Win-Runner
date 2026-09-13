@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- `wincli --snapshot=os.snap shell` and `runner` now boot a compressed ZIP
+  snapshot over the fresh instance image. The documented v1 archive layout
+  maps `files/C/...` entries to WinFs paths and verifies a version marker;
+  directories are implicit and archive paths cannot escape the guest disk.
 - `wincli shell` now boots the same ephemeral runner image as native
   launches, starts in `C:\\actions-runner\\_work`, and discards it when the
   session exits. `wincli runner` is its non-interactive, stdin-driven

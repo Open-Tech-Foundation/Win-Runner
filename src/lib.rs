@@ -5,6 +5,7 @@ pub mod native;
 pub mod pe;
 pub mod ps1;
 pub mod shell;
+pub mod snapshot;
 pub mod winapi;
 pub mod winfs;
 pub mod winget;

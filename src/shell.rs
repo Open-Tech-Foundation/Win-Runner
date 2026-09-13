@@ -35,8 +35,15 @@ impl Default for Shell {
 
 impl Shell {
     pub fn new() -> Self {
+        Self::with_fs(WinFs::ephemeral_runner())
+    }
+
+    /// Start a session from a prebuilt ephemeral image, such as a decoded
+    /// immutable snapshot. The image is owned by this session and discarded
+    /// once it exits.
+    pub fn with_fs(fs: WinFs) -> Self {
         Shell {
-            fs: WinFs::ephemeral_runner(),
+            fs,
             sess: ps1::Session::default(),
             last_code: 0,
         }
@@ -301,10 +308,10 @@ fn split_line(line: &str) -> Vec<String> {
     out
 }
 
-fn run_session(prompt_enabled: bool) -> i32 {
+fn run_session(fs: WinFs, prompt_enabled: bool) -> i32 {
     let stdin = std::io::stdin();
     let tty = prompt_enabled && std::io::IsTerminal::is_terminal(&stdin);
-    let mut shell = Shell::new();
+    let mut shell = Shell::with_fs(fs);
     let prompt = |shell: &Shell| {
         if tty {
             eprint!("PS {}> ", shell.cwd());
@@ -340,7 +347,12 @@ fn run_session(prompt_enabled: bool) -> i32 {
 /// Interactive loop. Returns the process exit code. The prompt goes to
 /// stderr (stdout stays clean for pipes); EOF ends with the last code.
 pub fn run_shell() -> i32 {
-    run_session(true)
+    run_session(WinFs::ephemeral_runner(), true)
+}
+
+/// Run an interactive shell from a decoded snapshot image.
+pub fn run_shell_with_fs(fs: WinFs) -> i32 {
+    run_session(fs, true)
 }
 
 /// Host-controlled runner loop. It consumes job commands from standard input
@@ -348,7 +360,12 @@ pub fn run_shell() -> i32 {
 /// image when the input closes. This is the local control-plane seam for a
 /// future GitHub Actions protocol adapter.
 pub fn run_runner() -> i32 {
-    run_session(false)
+    run_session(WinFs::ephemeral_runner(), false)
+}
+
+/// Run a host-controlled session from a decoded snapshot image.
+pub fn run_runner_with_fs(fs: WinFs) -> i32 {
+    run_session(fs, false)
 }
 
 #[cfg(test)]
