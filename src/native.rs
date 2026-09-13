@@ -160,11 +160,11 @@ mod imp {
     mod protection_tests {
         use super::{
             command_line_a, linux_protection, native_add_vectored_exception_handler,
-            native_delete_critical_section, native_enter_critical_section, native_format_message_w,
-            native_free_environment_strings_w, native_get_acp, native_get_computer_name_ex_w,
-            native_get_console_mode, native_get_console_output_cp,
-            native_get_console_screen_buffer_info, native_get_cp_info,
-            native_get_current_directory_w, native_get_current_thread,
+            native_delete_critical_section, native_enter_critical_section, native_extended_path,
+            native_file_attributes, native_format_message_w, native_free_environment_strings_w,
+            native_get_acp, native_get_computer_name_ex_w, native_get_console_mode,
+            native_get_console_output_cp, native_get_console_screen_buffer_info,
+            native_get_cp_info, native_get_current_directory_w, native_get_current_thread,
             native_get_environment_strings_w, native_get_environment_variable_w,
             native_get_file_type, native_get_full_path_name_w, native_get_last_error,
             native_get_module_file_name_w, native_get_module_handle_a,
@@ -334,6 +334,17 @@ mod imp {
                 3
             );
             assert_eq!(&output, &['C' as u16, ':' as u16, '\\' as u16, 0]);
+        }
+
+        #[test]
+        fn classifies_native_file_metadata_attributes() {
+            assert_eq!(native_file_attributes(true), 0x10);
+            assert_eq!(native_file_attributes(false), 0x80);
+        }
+
+        #[test]
+        fn encodes_extended_final_paths() {
+            assert_eq!(native_extended_path("C:\\"), "\\\\?\\C:\\");
         }
 
         #[test]
@@ -1689,7 +1700,7 @@ mod imp {
 
     extern "win64" fn native_create_file_w(
         path: *const u16,
-        access: u32,
+        _access: u32,
         _share: u32,
         _sec: u64,
         creation: u32,
@@ -1697,7 +1708,7 @@ mod imp {
         _tmpl: u64,
     ) -> u64 {
         let path = match wide(path) {
-            Some(v) => v,
+            Some(v) => v.strip_prefix(r"\\?\").unwrap_or(&v).to_string(),
             None => return u64::MAX,
         };
         let ctx = match unsafe { fs_ctx() } {
@@ -1707,16 +1718,87 @@ mod imp {
         let exists = ctx.fs.exists(&path);
         let ok = match creation {
             2 => ctx.fs.write_file(&path, Vec::new()),
-            3 if exists && ctx.fs.is_file(&path) => Ok(()),
+            // OPEN_EXISTING can target either a file or a directory. The
+            // caller supplies FILE_FLAG_BACKUP_SEMANTICS for directories;
+            // enumeration support consumes the resulting handle next.
+            3 if exists && (ctx.fs.is_file(&path) || ctx.fs.is_dir(&path)) => Ok(()),
             _ => Err("unsupported create".into()),
         };
-        if ok.is_err() || (access & 0xC000_0000) == 0 {
+        if ok.is_err() {
             return u64::MAX;
         }
         let h = ctx.next;
         ctx.next += 1;
         ctx.handles.insert(h, NativeFile { path, offset: 0 });
         h
+    }
+    fn native_file_attributes(is_directory: bool) -> u32 {
+        if is_directory {
+            0x10
+        } else {
+            0x80
+        }
+    }
+    fn native_extended_path(path: &str) -> String {
+        let path = path.trim_end_matches('.').trim_end_matches('\\');
+        if path.eq_ignore_ascii_case("C:") || path.is_empty() {
+            "\\\\?\\C:\\".to_string()
+        } else {
+            format!("\\\\?\\{}", path)
+        }
+    }
+    extern "win64" fn native_get_final_path_name_by_handle_w(
+        handle: u64,
+        output: *mut u16,
+        output_len: u32,
+        _flags: u32,
+    ) -> u32 {
+        let ctx = match unsafe { fs_ctx() } {
+            Some(value) => value,
+            None => return 0,
+        };
+        let path = match ctx.handles.get(&handle) {
+            Some(value) => native_extended_path(&value.path),
+            None => return 0,
+        };
+        let encoded: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+        if output.is_null() || output_len < encoded.len() as u32 {
+            return encoded.len() as u32;
+        }
+        unsafe { output.copy_from_nonoverlapping(encoded.as_ptr(), encoded.len()) };
+        (encoded.len() - 1) as u32
+    }
+    extern "win64" fn native_get_file_information_by_handle(handle: u64, output: *mut u8) -> i32 {
+        if output.is_null() {
+            return 0;
+        }
+        let ctx = match unsafe { fs_ctx() } {
+            Some(value) => value,
+            None => return 0,
+        };
+        let path = match ctx.handles.get(&handle) {
+            Some(value) => &value.path,
+            None => return 0,
+        };
+        let is_directory = ctx.fs.is_dir(path);
+        let size = if is_directory {
+            0
+        } else {
+            ctx.fs
+                .read_file(path)
+                .map(|data| data.len() as u64)
+                .unwrap_or(0)
+        };
+        unsafe {
+            std::ptr::write_bytes(output, 0, 52);
+            (output as *mut u32).write_unaligned(native_file_attributes(is_directory));
+            (output.add(28) as *mut u32).write_unaligned(1);
+            (output.add(32) as *mut u32).write_unaligned((size >> 32) as u32);
+            (output.add(36) as *mut u32).write_unaligned(size as u32);
+            (output.add(40) as *mut u32).write_unaligned(1);
+            (output.add(44) as *mut u32).write_unaligned(handle as u32);
+        }
+        1
     }
     extern "win64" fn native_read_file(
         h: u64,
@@ -1909,6 +1991,12 @@ mod imp {
             "WriteConsoleW" => Some(native_write_console_w as *const () as usize as u64),
             "ExitProcess" => Some(native_exit_process as *const () as usize as u64),
             "CreateFileW" => Some(native_create_file_w as *const () as usize as u64),
+            "GetFileInformationByHandle" => {
+                Some(native_get_file_information_by_handle as *const () as usize as u64)
+            }
+            "GetFinalPathNameByHandleW" => {
+                Some(native_get_final_path_name_by_handle_w as *const () as usize as u64)
+            }
             "ReadFile" => Some(native_read_file as *const () as usize as u64),
             "CloseHandle" => Some(native_close_handle as *const () as usize as u64),
             "CreateDirectoryW" => Some(native_create_directory_w as *const () as usize as u64),
