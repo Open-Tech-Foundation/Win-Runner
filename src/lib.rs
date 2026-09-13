@@ -6,6 +6,7 @@ pub mod install;
 pub mod native;
 pub mod pe;
 pub mod ps1;
+pub mod protocol;
 pub mod shell;
 pub mod snapshot;
 pub mod winapi;
