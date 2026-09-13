@@ -37,7 +37,8 @@ All notable changes to this project will be documented in this file.
   native child standard descriptors as console character handles.
   Both `GetCommandLineW` and `GetCommandLineA` expose the native guest command
   line. ANSI and OEM code-page queries report Windows-1252, while code-page
-  validation supports Windows-1252 and UTF-8. `VirtualProtect`
+  validation supports Windows-1252 and UTF-8; `GetCPInfo` supplies their CRT
+  metadata. `VirtualProtect`
   translates the standard page-access modes to page-aligned Linux mappings.
   A narrow API-set pseudo-module resolves the CRT's dynamic `CompareStringEx`
   lookup without loading a host DLL.

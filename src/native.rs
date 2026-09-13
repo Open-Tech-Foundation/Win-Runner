@@ -132,11 +132,12 @@ mod imp {
     mod protection_tests {
         use super::{
             command_line_a, linux_protection, native_delete_critical_section,
-            native_enter_critical_section, native_get_acp, native_get_file_type,
-            native_get_last_error, native_get_oem_cp, native_get_proc_address,
-            native_get_startup_info_w, native_initialize_critical_section_ex,
-            native_is_valid_code_page, native_leave_critical_section, native_set_last_error,
-            uppercase_ascii_utf16, API_SET_MODULE, PROT_EXEC, PROT_READ, PROT_WRITE,
+            native_enter_critical_section, native_get_acp, native_get_cp_info,
+            native_get_file_type, native_get_last_error, native_get_oem_cp,
+            native_get_proc_address, native_get_startup_info_w,
+            native_initialize_critical_section_ex, native_is_valid_code_page,
+            native_leave_critical_section, native_set_last_error, uppercase_ascii_utf16,
+            API_SET_MODULE, PROT_EXEC, PROT_READ, PROT_WRITE,
         };
 
         #[test]
@@ -233,6 +234,18 @@ mod imp {
             assert_eq!(native_is_valid_code_page(1252), 1);
             assert_eq!(native_is_valid_code_page(65001), 1);
             assert_eq!(native_is_valid_code_page(932), 0);
+        }
+
+        #[test]
+        fn fills_code_page_info_for_supported_pages() {
+            let mut cp_info = [0xa5; 16];
+            assert_eq!(native_get_cp_info(1252, cp_info.as_mut_ptr()), 1);
+            assert_eq!(u32::from_le_bytes(cp_info[..4].try_into().unwrap()), 1);
+            assert_eq!(cp_info[4], b'?');
+            assert!(cp_info[5..].iter().all(|byte| *byte == 0));
+            assert_eq!(native_get_cp_info(65001, cp_info.as_mut_ptr()), 1);
+            assert_eq!(u32::from_le_bytes(cp_info[..4].try_into().unwrap()), 4);
+            assert_eq!(native_get_cp_info(932, cp_info.as_mut_ptr()), 0);
         }
     }
 
@@ -441,6 +454,25 @@ mod imp {
 
     extern "win64" fn native_is_valid_code_page(code_page: u32) -> i32 {
         matches!(code_page, 1252 | 65001) as i32
+    }
+
+    extern "win64" fn native_get_cp_info(code_page: u32, info: *mut u8) -> i32 {
+        if info.is_null() {
+            return 0;
+        }
+        let max_char_size = match code_page {
+            1252 => 1,
+            65001 => 4,
+            _ => return 0,
+        };
+        // CPINFO is 16 bytes: DWORD MaxCharSize, 2-byte DefaultChar, and a
+        // 12-byte lead-byte range table.
+        unsafe {
+            std::ptr::write_bytes(info, 0, 16);
+            (info as *mut u32).write_unaligned(max_char_size);
+            info.add(4).write(b'?');
+        }
+        1
     }
 
     extern "win64" fn native_get_process_heap() -> u64 {
@@ -897,6 +929,7 @@ mod imp {
             "GetACP" => Some(native_get_acp as *const () as usize as u64),
             "GetOEMCP" => Some(native_get_oem_cp as *const () as usize as u64),
             "IsValidCodePage" => Some(native_is_valid_code_page as *const () as usize as u64),
+            "GetCPInfo" => Some(native_get_cp_info as *const () as usize as u64),
             "HeapAlloc" => Some(native_heap_alloc as *const () as usize as u64),
             "HeapFree" => Some(native_heap_free as *const () as usize as u64),
             "WriteFile" => Some(native_write_file as *const () as usize as u64),
