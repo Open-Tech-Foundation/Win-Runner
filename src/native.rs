@@ -89,6 +89,7 @@ mod imp {
         b'x' as u16,
         b'e' as u16,
     ];
+    static EMPTY_ENVIRONMENT_BLOCK: [u16; 2] = [0, 0];
 
     // Preferred-base PE mappings collide by design. Serialize native runs in
     // this process until relocations allow separate address-space layouts.
@@ -154,14 +155,14 @@ mod imp {
     mod protection_tests {
         use super::{
             command_line_a, linux_protection, native_delete_critical_section,
-            native_enter_critical_section, native_get_acp, native_get_cp_info,
-            native_get_file_type, native_get_last_error, native_get_module_file_name_w,
-            native_get_oem_cp, native_get_proc_address, native_get_startup_info_w,
-            native_get_string_type_w, native_initialize_critical_section_ex,
-            native_initialize_slist_head, native_is_valid_code_page, native_lc_map_string_w,
-            native_leave_critical_section, native_multi_byte_to_wide_char, native_set_last_error,
-            native_wide_char_to_multi_byte, uppercase_ascii_utf16, API_SET_MODULE, PROT_EXEC,
-            PROT_READ, PROT_WRITE,
+            native_enter_critical_section, native_free_environment_strings_w, native_get_acp,
+            native_get_cp_info, native_get_environment_strings_w, native_get_file_type,
+            native_get_last_error, native_get_module_file_name_w, native_get_oem_cp,
+            native_get_proc_address, native_get_startup_info_w, native_get_string_type_w,
+            native_initialize_critical_section_ex, native_initialize_slist_head,
+            native_is_valid_code_page, native_lc_map_string_w, native_leave_critical_section,
+            native_multi_byte_to_wide_char, native_set_last_error, native_wide_char_to_multi_byte,
+            uppercase_ascii_utf16, API_SET_MODULE, PROT_EXEC, PROT_READ, PROT_WRITE,
         };
 
         #[test]
@@ -259,6 +260,14 @@ mod imp {
             let mut short = [0; 3];
             assert_eq!(native_get_module_file_name_w(0, short.as_mut_ptr(), 3), 3);
             assert_eq!(short, ['C' as u16, ':' as u16, '\\' as u16]);
+        }
+
+        #[test]
+        fn exposes_and_frees_a_child_local_empty_environment_block() {
+            let block = native_get_environment_strings_w();
+            assert_eq!(unsafe { std::slice::from_raw_parts(block, 2) }, &[0, 0]);
+            assert_eq!(native_free_environment_strings_w(block), 1);
+            assert_eq!(native_free_environment_strings_w(std::ptr::null()), 0);
         }
 
         #[test]
@@ -599,6 +608,14 @@ mod imp {
             unsafe { output.add(copied).write(0) };
         }
         copied as u32
+    }
+
+    extern "win64" fn native_get_environment_strings_w() -> *const u16 {
+        EMPTY_ENVIRONMENT_BLOCK.as_ptr()
+    }
+
+    extern "win64" fn native_free_environment_strings_w(block: *const u16) -> i32 {
+        (block == EMPTY_ENVIRONMENT_BLOCK.as_ptr()) as i32
     }
 
     extern "win64" fn native_get_acp() -> u32 {
@@ -1298,6 +1315,12 @@ mod imp {
             "GetFileType" => Some(native_get_file_type as *const () as usize as u64),
             "GetModuleFileNameW" => {
                 Some(native_get_module_file_name_w as *const () as usize as u64)
+            }
+            "GetEnvironmentStringsW" => {
+                Some(native_get_environment_strings_w as *const () as usize as u64)
+            }
+            "FreeEnvironmentStringsW" => {
+                Some(native_free_environment_strings_w as *const () as usize as u64)
             }
             "GetACP" => Some(native_get_acp as *const () as usize as u64),
             "GetOEMCP" => Some(native_get_oem_cp as *const () as usize as u64),

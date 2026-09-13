@@ -44,6 +44,7 @@ All notable changes to this project will be documented in this file.
   `WideCharToMultiByte` converts native CRT strings to Windows-1252 or UTF-8.
   `GetModuleFileNameW` supplies a synthetic Windows module path for CRT path
   discovery. `InitializeSListHead` creates empty 64-bit CRT list headers.
+  `GetEnvironmentStringsW` exposes an empty child-local environment block.
   `VirtualProtect`
   translates the standard page-access modes to page-aligned Linux mappings.
   A narrow API-set pseudo-module resolves the CRT's dynamic `CompareStringEx`
