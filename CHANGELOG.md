@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added repository contribution instructions covering commit conventions,
+  changelog updates, test expectations, and AI-attribution restrictions.
 - Native guest process state is now owned by `NativeProcessContext` rather
   than shared runtime globals: command lines, image/TLS state, filesystem
   handles, thread/timer allocation, last-error/FLS/exception state, and
