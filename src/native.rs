@@ -211,6 +211,7 @@ mod imp {
     // per-process shim context.
     static COMMAND_LINE_W: AtomicU64 = AtomicU64::new(0);
     static NATIVE_FS: AtomicU64 = AtomicU64::new(0);
+    static FLS_VALUE: AtomicU64 = AtomicU64::new(0);
 
     struct NativeFile {
         path: String,
@@ -322,6 +323,30 @@ mod imp {
             return 0;
         }
         unsafe { std::ptr::write_bytes(section, 0, 40) };
+        1
+    }
+    extern "win64" fn native_fls_alloc(_callback: u64) -> u32 {
+        0
+    }
+    extern "win64" fn native_fls_free(index: u32) -> i32 {
+        if index != 0 {
+            return 0;
+        }
+        FLS_VALUE.store(0, Ordering::Release);
+        1
+    }
+    extern "win64" fn native_fls_get_value(index: u32) -> u64 {
+        if index == 0 {
+            FLS_VALUE.load(Ordering::Acquire)
+        } else {
+            0
+        }
+    }
+    extern "win64" fn native_fls_set_value(index: u32, value: u64) -> i32 {
+        if index != 0 {
+            return 0;
+        }
+        FLS_VALUE.store(value, Ordering::Release);
         1
     }
     extern "win64" fn native_get_system_time_as_file_time(out: *mut u64) {
@@ -540,6 +565,10 @@ mod imp {
             "InitializeCriticalSectionEx" => {
                 Some(native_initialize_critical_section_ex as *const () as usize as u64)
             }
+            "FlsAlloc" => Some(native_fls_alloc as *const () as usize as u64),
+            "FlsFree" => Some(native_fls_free as *const () as usize as u64),
+            "FlsGetValue" => Some(native_fls_get_value as *const () as usize as u64),
+            "FlsSetValue" => Some(native_fls_set_value as *const () as usize as u64),
             "GetSystemTimeAsFileTime" => {
                 Some(native_get_system_time_as_file_time as *const () as usize as u64)
             }
