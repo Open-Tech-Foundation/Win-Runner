@@ -1129,6 +1129,35 @@ fn test_named_instance_boot_status_and_destroy() {
         .output()
         .expect("query instance");
     assert_eq!(status.status.code(), Some(0));
+    let write = Command::new(bin)
+        .args([
+            "instance",
+            "exec",
+            &name,
+            "--",
+            "New-Item",
+            "C:\\actions-runner\\_work\\live.txt",
+            "-Value",
+            "live",
+        ])
+        .env("WINCLI_INSTANCE_DIR", &state)
+        .output()
+        .expect("write in instance");
+    assert_eq!(write.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&write.stderr));
+    let read = Command::new(bin)
+        .args([
+            "instance",
+            "exec",
+            &name,
+            "--",
+            "Get-Content",
+            "C:\\actions-runner\\_work\\live.txt",
+        ])
+        .env("WINCLI_INSTANCE_DIR", &state)
+        .output()
+        .expect("read in instance");
+    assert_eq!(read.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&read.stderr));
+    assert_eq!(read.stdout, b"live\n");
     let destroy = Command::new(bin)
         .args(["instance", "destroy", &name])
         .env("WINCLI_INSTANCE_DIR", &state)

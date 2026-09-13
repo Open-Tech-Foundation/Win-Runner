@@ -54,6 +54,10 @@ impl Shell {
         self.fs.cwd()
     }
 
+    pub fn last_code(&self) -> i32 {
+        self.last_code
+    }
+
     /// Execute one input line; guest/PS1 output is appended to `out`.
     /// `Err` is a printable error: show it and continue the session.
     pub fn exec_line(&mut self, line: &str, out: &mut Vec<u8>) -> Result<ShellFlow, String> {

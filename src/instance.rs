@@ -5,7 +5,11 @@
 //! use the same commands over named pipes on Windows or Unix sockets on
 //! macOS. This module intentionally contains no GitHub-specific behavior.
 
-use crate::{snapshot, winfs::WinFs};
+use crate::{
+    shell::{Shell, ShellFlow},
+    snapshot,
+    winfs::WinFs,
+};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -71,7 +75,8 @@ pub fn boot(name: &str, snapshot_path: Option<&str>) -> Result<(), String> {
 }
 
 pub fn status(name: &str) -> Result<(), String> {
-    let response = request(name, b"PING\n")?;
+    let response = String::from_utf8(request(name, b"PING\n")?)
+        .map_err(|_| "invalid status response".to_string())?;
     if response.starts_with("OK ") {
         Ok(())
     } else {
@@ -80,7 +85,8 @@ pub fn status(name: &str) -> Result<(), String> {
 }
 
 pub fn destroy(name: &str) -> Result<(), String> {
-    let response = request(name, b"DESTROY\n")?;
+    let response = String::from_utf8(request(name, b"DESTROY\n")?)
+        .map_err(|_| "invalid destroy response".to_string())?;
     if response != "OK\n" {
         return Err(format!("invalid destroy response for {name}"));
     }
@@ -95,15 +101,47 @@ pub fn destroy(name: &str) -> Result<(), String> {
 }
 
 fn ping(name: &str) -> Result<(), String> {
-    let response = request(name, b"PING\n")?;
+    let response = String::from_utf8(request(name, b"PING\n")?)
+        .map_err(|_| "invalid instance response".to_string())?;
     response
         .starts_with("OK ")
         .then_some(())
         .ok_or_else(|| "unexpected instance response".to_string())
 }
 
+pub struct ExecResult {
+    pub code: i32,
+    pub stdout: Vec<u8>,
+}
+
+/// Execute one command in the daemon's retained guest session.
+pub fn exec(name: &str, command: &str) -> Result<ExecResult, String> {
+    if command.is_empty() {
+        return Err("instance command may not be empty".to_string());
+    }
+    let mut message = b"EXEC ".to_vec();
+    message.extend_from_slice(command.as_bytes());
+    let response = request(name, &message)?;
+    let newline = response
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .ok_or_else(|| "invalid execution response".to_string())?;
+    let header = std::str::from_utf8(&response[..newline])
+        .map_err(|_| "invalid execution response header".to_string())?;
+    let code = header
+        .strip_prefix("OK ")
+        .ok_or_else(|| String::from_utf8_lossy(&response).to_string())?
+        .parse::<i32>()
+        .map_err(|_| "invalid execution exit code".to_string())?;
+    Ok(ExecResult {
+        code,
+        stdout: response[newline + 1..].to_vec(),
+    })
+}
+
 #[cfg(unix)]
-fn request(name: &str, message: &[u8]) -> Result<String, String> {
+fn request(name: &str, message: &[u8]) -> Result<Vec<u8>, String> {
+    use std::net::Shutdown;
     use std::os::unix::net::UnixStream;
     validate_name(name)?;
     let socket = socket_path(&state_dir(), name);
@@ -115,15 +153,18 @@ fn request(name: &str, message: &[u8]) -> Result<String, String> {
     stream
         .write_all(message)
         .map_err(|e| format!("cannot send instance request: {e}"))?;
-    let mut response = String::new();
     stream
-        .read_to_string(&mut response)
+        .shutdown(Shutdown::Write)
+        .map_err(|e| format!("cannot finish instance request: {e}"))?;
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
         .map_err(|e| format!("cannot read instance response: {e}"))?;
     Ok(response)
 }
 
 #[cfg(not(unix))]
-fn request(_: &str, _: &[u8]) -> Result<String, String> {
+fn request(_: &str, _: &[u8]) -> Result<Vec<u8>, String> {
     Err("named-pipe instance transport is not implemented on this host".to_string())
 }
 
@@ -148,10 +189,11 @@ pub fn run_daemon(name: &str, dir: &str, snapshot_path: Option<&str>) -> Result<
             std::fs::remove_file(&socket)
                 .map_err(|e| format!("cannot clear daemon socket {}: {e}", socket.display()))?;
         }
-        let _instance_fs: WinFs = match snapshot_path {
+        let instance_fs: WinFs = match snapshot_path {
             Some(path) => snapshot::load_file(path)?,
             None => WinFs::ephemeral_runner(),
         };
+        let mut shell = Shell::with_fs(instance_fs);
         let listener = UnixListener::bind(&socket)
             .map_err(|e| format!("cannot bind instance socket {}: {e}", socket.display()))?;
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
@@ -161,12 +203,16 @@ pub fn run_daemon(name: &str, dir: &str, snapshot_path: Option<&str>) -> Result<
                 Ok(stream) => stream,
                 Err(_) => continue,
             };
-            let mut request = [0; 32];
-            let count = match stream.read(&mut request) {
+            let mut request = Vec::new();
+            let count = match stream.read_to_end(&mut request) {
                 Ok(count) => count,
                 Err(_) => continue,
             };
-            match &request[..count] {
+            if count > 64 * 1024 {
+                let _ = stream.write_all(b"ERR request too large\n");
+                continue;
+            }
+            match request.as_slice() {
                 b"PING\n" => {
                     let _ = stream.write_all(format!("OK {name}\n").as_bytes());
                 }
@@ -174,6 +220,26 @@ pub fn run_daemon(name: &str, dir: &str, snapshot_path: Option<&str>) -> Result<
                     let _ = stream.write_all(b"OK\n");
                     let _ = std::fs::remove_file(&socket);
                     return Ok(());
+                }
+                request if request.starts_with(b"EXEC ") => {
+                    let command = match std::str::from_utf8(&request[5..]) {
+                        Ok(command) if !command.is_empty() => command,
+                        _ => {
+                            let _ = stream.write_all(b"ERR invalid command\n");
+                            continue;
+                        }
+                    };
+                    let mut output = Vec::new();
+                    let code = match shell.exec_line(command, &mut output) {
+                        Ok(ShellFlow::Continue) => shell.last_code(),
+                        Ok(ShellFlow::Exit(code)) => code,
+                        Err(error) => {
+                            let _ = stream.write_all(format!("ERR {error}\n").as_bytes());
+                            continue;
+                        }
+                    };
+                    let _ = stream.write_all(format!("OK {code}\n").as_bytes());
+                    let _ = stream.write_all(&output);
                 }
                 _ => {
                     let _ = stream.write_all(b"ERR unsupported request\n");

@@ -13,6 +13,7 @@ fn usage() -> ! {
     eprintln!("  wincli snapshot build <dir> <os.snap>   build image from <dir>/C");
     eprintln!("  wincli instance boot <name> [--snapshot=os.snap]");
     eprintln!("  wincli instance status|destroy <name>");
+    eprintln!("  wincli instance exec <name> -- <command> [args...]");
     eprintln!("  wincli inspect <app.exe|pkg>  report PE imports vs supported APIs");
     eprintln!("  wincli install <pkg>          install a package into the cache");
     eprintln!("env: WINCLI_CACHE (default ~/.cache/wincli), WINCLI_SOURCE (package dir)");
@@ -83,6 +84,25 @@ fn main() {
                     std::process::exit(1);
                 }
             },
+            "exec" if args.len() >= 6 && args[4] == "--" => {
+                let command = match shell_command(&args[5..]) {
+                    Ok(value) => value,
+                    Err(e) => {
+                        eprintln!("wincli: {e}");
+                        std::process::exit(2);
+                    }
+                };
+                match instance::exec(&args[3], &command) {
+                    Ok(result) => {
+                        let _ = std::io::stdout().write_all(&result.stdout);
+                        std::process::exit(result.code);
+                    }
+                    Err(e) => {
+                        eprintln!("wincli: instance execution failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
             _ => usage(),
         }
         return;
@@ -109,6 +129,22 @@ fn main() {
         usage();
     }
     run_target(&args[1], &args[2..]);
+}
+
+fn shell_command(args: &[String]) -> Result<String, String> {
+    args.iter()
+        .map(|arg| {
+            if arg.contains('"') {
+                return Err("instance exec arguments may not contain double quotes yet".to_string());
+            }
+            if arg.is_empty() || arg.chars().any(char::is_whitespace) {
+                Ok(format!("\"{arg}\""))
+            } else {
+                Ok(arg.clone())
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|parts| parts.join(" "))
 }
 
 fn load_snapshot(path: &str) -> WinFs {
