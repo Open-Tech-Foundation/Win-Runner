@@ -10,6 +10,7 @@ fn usage() -> ! {
     eprintln!("  wincli shell                    interactive ephemeral runner shell");
     eprintln!("  wincli runner                   run host-controlled job commands from stdin");
     eprintln!("  wincli --snapshot=os.snap shell|runner  boot a snapshot image");
+    eprintln!("  wincli snapshot build <dir> <os.snap>   build image from <dir>/C");
     eprintln!("  wincli inspect <app.exe|pkg>  report PE imports vs supported APIs");
     eprintln!("  wincli install <pkg>          install a package into the cache");
     eprintln!("env: WINCLI_CACHE (default ~/.cache/wincli), WINCLI_SOURCE (package dir)");
@@ -30,6 +31,16 @@ fn main() {
     }
     if args.len() == 3 && args[1] == "install" {
         install_pkg(&args[2]);
+        return;
+    }
+    if args.len() == 5 && args[1] == "snapshot" && args[2] == "build" {
+        match snapshot::build_file(&args[3], &args[4]) {
+            Ok(count) => println!("Built snapshot {} ({} files)", args[4], count),
+            Err(e) => {
+                eprintln!("wincli: cannot build snapshot: {e}");
+                std::process::exit(1);
+            }
+        }
         return;
     }
     if args.len() == 2 && args[1] == "shell" {

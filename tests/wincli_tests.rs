@@ -1033,26 +1033,6 @@ fn run_shell_env(input: &str, envs: &[(&str, &str)]) -> (i32, String, String) {
     run_session_env("shell", input, envs)
 }
 
-fn stored_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for (name, data) in files {
-        out.extend_from_slice(b"PK\x03\x04");
-        out.extend_from_slice(&20u16.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
-        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(name.as_bytes());
-        out.extend_from_slice(data);
-    }
-    out
-}
-
 #[test]
 fn test_runner_executes_host_controlled_ephemeral_job() {
     let input = "New-Item C:\\actions-runner\\_work\\job.txt -Value ready\nGet-Content C:\\actions-runner\\_work\\job.txt\nexit\n";
@@ -1077,16 +1057,19 @@ fn test_runner_seeds_and_executes_a_guest_pe() {
 
 #[test]
 fn test_runner_boots_snapshot_file() {
+    let input = tmp_path("snapshot-input");
     let path = tmp_path("runner.snap");
-    std::fs::write(
-        &path,
-        stored_zip(&[
-            ("wincli-snapshot/v1", b"wincli snapshot v1\n"),
-            ("files/C/actions-runner/_work/from-snapshot.txt", b"booted"),
-        ]),
-    )
-    .unwrap();
+    std::fs::create_dir_all(input.join("C/actions-runner/_work")).unwrap();
+    std::fs::write(input.join("C/actions-runner/_work/from-snapshot.txt"), b"booted").unwrap();
     let bin = env!("CARGO_BIN_EXE_wincli");
+    let built = Command::new(bin)
+        .args(["snapshot", "build"])
+        .arg(&input)
+        .arg(&path)
+        .output()
+        .expect("build snapshot");
+    assert_eq!(built.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&built.stdout).contains("Built snapshot"));
     let output = Command::new(bin)
         .arg(format!("--snapshot={}", path.display()))
         .arg("runner")
@@ -1104,6 +1087,7 @@ fn test_runner_boots_snapshot_file() {
         .unwrap();
     let output = child.wait_with_output().unwrap();
     std::fs::remove_file(path).ok();
+    std::fs::remove_dir_all(input).ok();
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(output.stdout, b"booted\n");
     assert!(output.stderr.is_empty());
