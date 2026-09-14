@@ -135,6 +135,7 @@ mod imp {
         fn munmap(addr: *mut c_void, len: usize) -> i32;
         fn pipe(fds: *mut i32) -> i32;
         fn fork() -> i32;
+        #[cfg(test)]
         fn pause() -> i32;
         fn dup2(oldfd: i32, newfd: i32) -> i32;
         fn close(fd: i32) -> i32;
@@ -184,7 +185,7 @@ mod imp {
     #[cfg(test)]
     mod protection_tests {
         use super::{
-            _exit, command_line_a, linux_protection, load_native_child_image,
+            _exit, command_line_a, environment_block, linux_protection, load_native_child_image,
             native_add_vectored_exception_handler, native_close_handle, native_create_process_w,
             native_create_waitable_timer_ex_w, native_delete_critical_section,
             native_enter_critical_section, native_extended_path, native_file_attributes,
@@ -342,6 +343,20 @@ mod imp {
                 ["tool.exe", "a\"b"]
             );
             assert!(parse_windows_command_line("\"unterminated").is_err());
+        }
+
+        #[test]
+        fn parses_a_unicode_child_environment_block() {
+            let block: Vec<u16> = "Path=one\0NAME=value\0\0".encode_utf16().collect();
+            assert_eq!(
+                environment_block(block.as_ptr() as u64).unwrap(),
+                [
+                    ("Path".to_string(), "one".to_string()),
+                    ("NAME".to_string(), "value".to_string())
+                ]
+            );
+            let invalid: Vec<u16> = "missing-equals\0\0".encode_utf16().collect();
+            assert_eq!(environment_block(invalid.as_ptr() as u64), Err(87));
         }
 
         #[test]
@@ -1402,6 +1417,7 @@ mod imp {
         parent_process_id: u32,
         command_line_w: Vec<u16>,
         command_line_a: Vec<u8>,
+        environment: Vec<(String, String)>,
         fs: Arc<Mutex<NativeFs>>,
         last_error: AtomicU32,
         gs_base: AtomicU64,
@@ -1435,6 +1451,7 @@ mod imp {
             parent_process_id: 0,
             command_line_w: vec![0],
             command_line_a: vec![0],
+            environment: Vec::new(),
             fs: Arc::new(Mutex::new(NativeFs {
                 fs: WinFs::new(),
                 handles: HashMap::new(),
@@ -1484,6 +1501,38 @@ mod imp {
             units.push(u);
         }
         None
+    }
+
+    fn environment_block(ptr: u64) -> Result<Vec<(String, String)>, u32> {
+        if ptr == 0 {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let mut units = Vec::new();
+            while offset < 32 * 1024 {
+                let unit = unsafe { (ptr as *const u16).add(offset).read() };
+                offset += 1;
+                if unit == 0 {
+                    break;
+                }
+                units.push(unit);
+            }
+            if offset == 32 * 1024 && !units.is_empty() {
+                return Err(87);
+            }
+            if units.is_empty() {
+                return Ok(out);
+            }
+            let entry = String::from_utf16(&units).map_err(|_| 87u32)?;
+            let (name, value) = entry
+                .split_once('=')
+                .filter(|(name, _)| !name.is_empty())
+                .ok_or(87u32)?;
+            out.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+            out.push((name.to_string(), value.to_string()));
+        }
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -2187,17 +2236,39 @@ mod imp {
     }
     extern "win64" fn native_get_environment_variable_w(
         name: *const u16,
-        _output: *mut u16,
-        _output_len: u32,
+        output: *mut u16,
+        output_len: u32,
     ) -> u32 {
         if name.is_null() {
             native_set_last_error(87); // ERROR_INVALID_PARAMETER
             return 0;
         }
-        // Native children presently expose the same deliberately empty
-        // environment returned by GetEnvironmentStringsW.
-        native_set_last_error(203); // ERROR_ENVVAR_NOT_FOUND
-        0
+        let Some(name) = wide(name) else {
+            native_set_last_error(87);
+            return 0;
+        };
+        let Some(value) = process_ctx().and_then(|process| {
+            process
+                .environment
+                .iter()
+                .find_map(|(key, value)| key.eq_ignore_ascii_case(&name).then(|| value.clone()))
+        }) else {
+            native_set_last_error(203); // ERROR_ENVVAR_NOT_FOUND
+            return 0;
+        };
+        let value: Vec<u16> = value.encode_utf16().collect();
+        let required = value.len() + 1;
+        if output.is_null() || output_len == 0 {
+            return required as u32;
+        }
+        if (output_len as usize) < required {
+            return required as u32;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(value.as_ptr(), output, value.len());
+            output.add(value.len()).write(0);
+        }
+        value.len() as u32
     }
     extern "win64" fn native_get_current_directory_w(output_len: u32, output: *mut u16) -> u32 {
         let cwd = fs_ctx()
@@ -2542,7 +2613,7 @@ mod imp {
         _thread_attributes: u64,
         _inherit_handles: i32,
         _creation_flags: u32,
-        _environment: u64,
+        environment: u64,
         current_directory: *const u16,
         _startup_info: u64,
         process_information: u64,
@@ -2579,6 +2650,13 @@ mod imp {
         let launch = match native_launch_spec(application, command_line, current_directory, &fs.fs)
         {
             Ok(launch) => launch,
+            Err(error) => {
+                native_set_last_error(error);
+                return 0;
+            }
+        };
+        let environment = match environment_block(environment) {
+            Ok(environment) => environment,
             Err(error) => {
                 native_set_last_error(error);
                 return 0;
@@ -2661,6 +2739,7 @@ mod imp {
                 parent_process_id: parent.process_id,
                 command_line_a: command_line_a(&command_line_w),
                 command_line_w,
+                environment,
                 fs: Arc::clone(&context),
                 last_error: AtomicU32::new(0),
                 gs_base: AtomicU64::new(0),
@@ -3423,6 +3502,7 @@ mod imp {
             parent_process_id: 0,
             command_line_w,
             command_line_a,
+            environment: Vec::new(),
             fs,
             last_error: AtomicU32::new(0),
             gs_base: AtomicU64::new(0),
