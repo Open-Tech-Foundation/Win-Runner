@@ -3576,6 +3576,10 @@ mod tests {
         );
         let bytes = std::fs::read(path).expect("checked-in guest exists");
         let img = load(&bytes).expect("rust hello loads");
+        assert!(
+            !img.relocations.is_empty(),
+            "native child images are relocatable"
+        );
         let (code, out) = run_rust_baseline(&img).expect("native rust hello runs");
         assert_eq!(code, 0);
         assert_eq!(out, b"Hello from Rust");
@@ -3643,5 +3647,18 @@ mod tests {
             .expect("native reader runs");
         assert_eq!(code, 0);
         assert_eq!(out, b"native");
+    }
+
+    #[test]
+    fn native_guest_can_create_wait_for_and_reap_a_relocated_child() {
+        let child = crate::pe::builder::hello("child\n");
+        let parent =
+            load(&crate::pe::builder::create_process_wait(r"C:\child.exe")).expect("parent loads");
+        let mut fs = WinFs::ephemeral_runner();
+        fs.write_file(r"C:\child.exe", child).unwrap();
+        let (code, output, _) = run_rust_baseline_argv_with_fs(&parent, fs, "parent.exe", &[])
+            .expect("native parent runs");
+        assert_eq!(code, 0);
+        assert_eq!(output, b"child\n");
     }
 }

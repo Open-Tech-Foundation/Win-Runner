@@ -573,6 +573,51 @@ pub fn exit_code(code: u32) -> Vec<u8> {
     build(a, &[("KERNEL32.dll", "ExitProcess")])
 }
 
+/// Create a child process, wait for it, then exit successfully. Used to test
+/// the native process boundary without requiring an external toolchain.
+pub fn create_process_wait(application: &str) -> Vec<u8> {
+    // imports: 0 CreateProcessW, 1 WaitForSingleObject, 2 ExitProcess
+    let mut a = Asm::new();
+    let d_application = a.add_utf16(application);
+    let d_process_information = a.add_zeroed(24);
+    let fail = a.fresh_label();
+    a.sub_rsp(0x58);
+    a.lea_reg_rip(1, d_application);
+    a.xor_eax();
+    a.mov_rdx_rax();
+    a.mov_r8d_imm(0);
+    a.mov_r9d_imm(0);
+    for offset in [0x20, 0x28, 0x30, 0x38, 0x40] {
+        a.mov_rspoff_rax(offset);
+    }
+    a.lea_reg_rip(0, d_process_information);
+    a.mov_rspoff_rax(0x48);
+    a.call_import(0);
+    a.test_eax_eax();
+    a.jz(fail);
+    a.mov_eax_mem_rip(d_process_information);
+    a.mov_rcx_rax();
+    a.mov_edx_imm(u32::MAX);
+    a.call_import(1);
+    a.cmp_eax_imm(0);
+    a.jnz(fail);
+    a.mov_ecx_imm(0);
+    a.call_import(2);
+    a.ret();
+    a.mark(fail);
+    a.mov_ecx_imm(1);
+    a.call_import(2);
+    a.ret();
+    build(
+        a,
+        &[
+            ("KERNEL32.dll", "CreateProcessW"),
+            ("KERNEL32.dll", "WaitForSingleObject"),
+            ("KERNEL32.dll", "ExitProcess"),
+        ],
+    )
+}
+
 /// write file via CreateFileW + WriteFile + CloseHandle, exit 0/1.
 pub fn write_file(path: &str, content: &[u8]) -> Vec<u8> {
     // imports: 0 CreateFileW, 1 WriteFile, 2 CloseHandle, 3 ExitProcess

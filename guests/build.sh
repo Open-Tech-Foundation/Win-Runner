@@ -42,6 +42,14 @@ GUEST_RLIBS=(
     $RLIB/libpanic_abort-*.rlib
 )
 
+# Force a retained absolute image reference into each otherwise
+# position-independent guest, so PE base relocations are available to native
+# CreateProcessW child mapping.
+RELOCATION_OBJ="$OUT/relocation.o"
+rustc --target "$TARGET" --crate-type lib --emit obj \
+    -C panic=abort -C opt-level=2 --edition 2021 \
+    "$ROOT/guests/relocation.rs" -o "$RELOCATION_OBJ"
+
 build_guest() {
     local src="$1" entry="$2" dest="$3"
     local obj="$OUT/$(basename "$src" .rs).o"
@@ -51,8 +59,8 @@ build_guest() {
     "$LLD" -flavor link \
         "/OUT:$obj.exe" \
         "/ENTRY:$entry" \
-        /NODEFAULTLIB /SUBSYSTEM:CONSOLE /DYNAMICBASE:NO \
-        "$obj" "$OUT/kernel32.lib" "${GUEST_RLIBS[@]}"
+        /NODEFAULTLIB /SUBSYSTEM:CONSOLE /DYNAMICBASE \
+        "$obj" "$RELOCATION_OBJ" "$OUT/kernel32.lib" "${GUEST_RLIBS[@]}"
     cp "$obj.exe" "$ART/$dest"
     echo "built $ART/$dest"
 }
