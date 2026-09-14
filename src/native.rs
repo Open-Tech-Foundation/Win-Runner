@@ -78,7 +78,7 @@ mod imp {
     use std::collections::HashMap;
     use std::ffi::c_void;
     use std::ptr;
-    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
     #[cfg(test)]
     use std::sync::LazyLock;
     use std::sync::{Arc, Condvar, Mutex};
@@ -135,11 +135,13 @@ mod imp {
         fn munmap(addr: *mut c_void, len: usize) -> i32;
         fn pipe(fds: *mut i32) -> i32;
         fn fork() -> i32;
+        fn pause() -> i32;
         fn dup2(oldfd: i32, newfd: i32) -> i32;
         fn close(fd: i32) -> i32;
         fn read(fd: i32, buf: *mut c_void, count: usize) -> isize;
         fn write(fd: i32, buf: *const c_void, count: usize) -> isize;
         fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+        fn kill(pid: i32, signal: i32) -> i32;
         fn _exit(status: i32) -> !;
         fn malloc(size: usize) -> *mut c_void;
         fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void;
@@ -182,7 +184,7 @@ mod imp {
     #[cfg(test)]
     mod protection_tests {
         use super::{
-            command_line_a, linux_protection, load_native_child_image,
+            _exit, command_line_a, linux_protection, load_native_child_image,
             native_add_vectored_exception_handler, native_close_handle, native_create_process_w,
             native_create_waitable_timer_ex_w, native_delete_critical_section,
             native_enter_critical_section, native_extended_path, native_file_attributes,
@@ -205,8 +207,8 @@ mod imp {
             native_set_unhandled_exception_filter, native_set_waitable_timer,
             native_terminate_process, native_wait_for_single_object, native_wait_on_address,
             native_wide_char_to_multi_byte, native_write_console_w, parse_windows_command_line,
-            process_ctx, uppercase_ascii_utf16, write_process_information, NativeLaunchSpec,
-            API_SET_MODULE, PROT_EXEC, PROT_READ, PROT_WRITE,
+            process_ctx, uppercase_ascii_utf16, waitpid, write_process_information,
+            NativeLaunchSpec, API_SET_MODULE, PROT_EXEC, PROT_READ, PROT_WRITE,
         };
         use crate::winfs::WinFs;
 
@@ -291,6 +293,33 @@ mod imp {
             assert_eq!(exit_code, 23);
             assert_eq!(native_close_handle(handle), 1);
             assert_eq!(native_get_exit_code_process(handle, &mut exit_code), 0);
+        }
+
+        #[test]
+        fn terminate_process_signals_a_launched_host_child() {
+            let process = process_ctx().unwrap();
+            let (handle, _, child) = process
+                .children
+                .lock()
+                .unwrap()
+                .allocate(process.process_id);
+            let pid = unsafe { super::fork() };
+            assert!(pid >= 0);
+            if pid == 0 {
+                unsafe {
+                    super::pause();
+                    _exit(0);
+                }
+            }
+            child
+                .host_pid
+                .store(pid, std::sync::atomic::Ordering::Release);
+            assert_eq!(native_terminate_process(handle, 23), 1);
+            assert_eq!(*child.termination_code.lock().unwrap(), Some(23));
+            let mut status = 0;
+            assert_eq!(unsafe { waitpid(pid, &mut status, 0) }, pid);
+            assert_eq!(status & 0x7f, 15);
+            assert_eq!(native_close_handle(handle), 1);
         }
 
         #[test]
@@ -1247,6 +1276,8 @@ mod imp {
     struct NativeChildProcess {
         process_id: u32,
         parent_process_id: u32,
+        host_pid: AtomicI32,
+        termination_code: Mutex<Option<u32>>,
         state: Mutex<Option<u32>>,
         exited: Condvar,
     }
@@ -1277,6 +1308,8 @@ mod imp {
             let child = Arc::new(NativeChildProcess {
                 process_id: self.next_process_id,
                 parent_process_id,
+                host_pid: AtomicI32::new(0),
+                termination_code: Mutex::new(None),
                 state: Mutex::new(None),
                 exited: Condvar::new(),
             });
@@ -1328,11 +1361,14 @@ mod imp {
         }
         if let Ok(mut state) = child.state.lock() {
             if state.is_none() {
-                *state = Some(if reaped && status & 0x7f == 0 {
-                    (status >> 8) as u32
-                } else {
-                    1
-                });
+                let terminated = child.termination_code.lock().ok().and_then(|code| *code);
+                *state = Some(terminated.unwrap_or_else(|| {
+                    if reaped && status & 0x7f == 0 {
+                        (status >> 8) as u32
+                    } else {
+                        1
+                    }
+                }));
             }
             child.exited.notify_all();
         }
@@ -1935,6 +1971,23 @@ mod imp {
             native_set_last_error(6); // ERROR_INVALID_HANDLE
             return 0;
         };
+        let host_pid = child.host_pid.load(Ordering::Acquire);
+        if host_pid > 0 {
+            // SIGTERM is the contained host-side equivalent of terminating a
+            // guest child. The monitor remains responsible for reaping it and
+            // publishing completion to WaitForSingleObject/GetExitCodeProcess.
+            if let Ok(mut termination_code) = child.termination_code.lock() {
+                *termination_code = Some(code);
+            } else {
+                native_set_last_error(6);
+                return 0;
+            }
+            if unsafe { kill(host_pid, 15) } == 0 {
+                return 1;
+            }
+            native_set_last_error(6);
+            return 0;
+        }
         let Ok(mut state) = child.state.lock() else {
             native_set_last_error(6);
             return 0;
@@ -2613,6 +2666,7 @@ mod imp {
             native_flush_instance_state();
             unsafe { _exit(code as i32) };
         }
+        child.host_pid.store(pid, Ordering::Release);
         unsafe { close(state_fds[1]) };
         let monitor_child = Arc::clone(&child);
         let monitor_fs = Arc::clone(&context);

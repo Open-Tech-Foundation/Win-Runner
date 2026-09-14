@@ -6,6 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- `TerminateProcess` now sends a contained host termination signal to launched
+  native children; the child monitor subsequently reaps it and publishes the
+  resulting completion state to process waits and exit-code queries.
 - Native `CreateProcessW` now has the isolated child-launch path: it maps a
   relocatable PE at a distinct address, patches native imports, creates an
   independent process context, and returns process/thread handles while a
