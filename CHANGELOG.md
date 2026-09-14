@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Native `CreateProcessW` now has the isolated child-launch path: it maps a
+  relocatable PE at a distinct address, patches native imports, creates an
+  independent process context, and returns process/thread handles while a
+  monitor publishes child completion and its snapshot-backed WinFs changes.
+  Non-relocatable child images continue to fail with `ERROR_BAD_EXE_FORMAT`.
 - Native child registry allocation now reserves distinct process and primary
   thread handles, with a 64-bit `PROCESS_INFORMATION` layout writer for the
   forthcoming successful `CreateProcessW` launch path.

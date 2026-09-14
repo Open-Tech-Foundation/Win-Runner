@@ -1301,6 +1301,43 @@ mod imp {
         true
     }
 
+    fn finish_native_child(
+        child: Arc<NativeChildProcess>,
+        fs: Arc<Mutex<NativeFs>>,
+        state_fd: i32,
+        pid: i32,
+    ) {
+        let mut encoded = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            let read_count = unsafe { read(state_fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+            if read_count <= 0 {
+                break;
+            }
+            encoded.extend_from_slice(&buffer[..read_count as usize]);
+        }
+        unsafe { close(state_fd) };
+        let mut status = 0;
+        let reaped = unsafe { waitpid(pid, &mut status, 0) } == pid;
+        if reaped && !encoded.is_empty() {
+            if let Ok(snapshot) = crate::snapshot::load(&encoded) {
+                if let Ok(mut native_fs) = fs.lock() {
+                    native_fs.fs = snapshot;
+                }
+            }
+        }
+        if let Ok(mut state) = child.state.lock() {
+            if state.is_none() {
+                *state = Some(if reaped && status & 0x7f == 0 {
+                    (status >> 8) as u32
+                } else {
+                    1
+                });
+            }
+            child.exited.notify_all();
+        }
+    }
+
     /// State that belongs to exactly one Windows guest process. The current
     /// launcher still initializes legacy accessors from this bundle; keeping
     /// the ownership explicit is the migration seam for native CreateProcessW.
@@ -2471,15 +2508,134 @@ mod imp {
                 return 0;
             }
         };
-        if let Err(error) = load_native_child_image(&fs.fs, &launch) {
-            native_set_last_error(error);
+        let image = match load_native_child_image(&fs.fs, &launch) {
+            Ok(image) => image,
+            Err(error) => {
+                native_set_last_error(error);
+                return 0;
+            }
+        };
+        drop(fs);
+        let (mapping, image) = match map_relocated(&image) {
+            Ok(value) => value,
+            Err(_) => {
+                native_set_last_error(193); // ERROR_BAD_EXE_FORMAT
+                return 0;
+            }
+        };
+        if patch_baseline_imports(&mapping, &image).is_err() {
+            native_set_last_error(193);
             return 0;
         }
-        // Parsing, WinFs resolution, and PE validation are process-local.
-        // Starting the loaded image still waits on a separate mapped image,
-        // TLS/TEB/PEB context, and shared filesystem broker.
-        native_set_last_error(120); // ERROR_CALL_NOT_IMPLEMENTED
-        0
+        let tls = match setup_tls(&mapping, &image) {
+            Ok(value) => value,
+            Err(_) => {
+                native_set_last_error(193);
+                return 0;
+            }
+        };
+        let entry = match entry(&image) {
+            Ok(value) => value,
+            Err(_) => {
+                native_set_last_error(193);
+                return 0;
+            }
+        };
+        let Some(parent) = process_ctx() else {
+            native_set_last_error(6);
+            return 0;
+        };
+        let (process_handle, thread_handle, child) = match parent.children.lock() {
+            Ok(mut children) => children.allocate(parent.process_id),
+            Err(_) => {
+                native_set_last_error(6);
+                return 0;
+            }
+        };
+        let mut state_fds = [-1, -1];
+        if unsafe { pipe(state_fds.as_mut_ptr()) } != 0 {
+            native_set_last_error(8); // ERROR_NOT_ENOUGH_MEMORY
+            return 0;
+        }
+        let pid = unsafe { fork() };
+        if pid < 0 {
+            unsafe {
+                close(state_fds[0]);
+                close(state_fds[1]);
+            }
+            native_set_last_error(8);
+            return 0;
+        }
+        if pid == 0 {
+            #[cfg(test)]
+            NATIVE_GUEST_ACTIVE.store(true, Ordering::Release);
+            unsafe { close(state_fds[0]) };
+            let command_line_w = command_line_w(
+                &launch.application,
+                launch.arguments.get(1..).unwrap_or(&[]),
+            )
+            .unwrap_or_else(|_| vec![0]);
+            let child_context = Arc::new(NativeProcessContext {
+                image_base: image.image_base,
+                process_id: child.process_id,
+                process_handle,
+                parent_process_id: parent.process_id,
+                command_line_a: command_line_a(&command_line_w),
+                command_line_w,
+                fs: Arc::clone(&context),
+                last_error: AtomicU32::new(0),
+                gs_base: AtomicU64::new(0),
+                tls_template: Mutex::new(tls.as_ref().map(NativeTls::clone_for_thread)),
+                threads: Mutex::new(HashMap::new()),
+                thread_next: AtomicU64::new(0x8000_0000),
+                timer_next: AtomicU64::new(0x7000_0000),
+                state_fd: AtomicU32::new(state_fds[1] as u32),
+                fls_value: AtomicU64::new(0),
+                unhandled_exception_filter: AtomicU64::new(0),
+                vectored_exception_handler: AtomicU64::new(0),
+                exit_status: AtomicU32::new(259),
+                exited: AtomicBool::new(false),
+                children: Mutex::new(NativeProcessTable::new()),
+            });
+            if let Ok(mut active) = NATIVE_PROCESS.lock() {
+                *active = Some(child_context);
+            }
+            if protect_exec(&mapping).is_err() {
+                unsafe { _exit(127) };
+            }
+            if let Some(tls) = tls.as_ref() {
+                if !unsafe { set_gs(tls.teb.as_ptr() as u64) } {
+                    unsafe { _exit(127) };
+                }
+            }
+            let guest: unsafe extern "win64" fn() -> u32 = unsafe { std::mem::transmute(entry) };
+            let code = unsafe { guest() };
+            native_flush_instance_state();
+            unsafe { _exit(code as i32) };
+        }
+        unsafe { close(state_fds[1]) };
+        let monitor_child = Arc::clone(&child);
+        let monitor_fs = Arc::clone(&context);
+        if std::thread::Builder::new()
+            .name("wincli-native-child".to_string())
+            .spawn(move || finish_native_child(monitor_child, monitor_fs, state_fds[0], pid))
+            .is_err()
+        {
+            unsafe { close(state_fds[0]) };
+            native_set_last_error(8);
+            return 0;
+        }
+        if !write_process_information(
+            process_information,
+            process_handle,
+            thread_handle,
+            child.process_id,
+        ) {
+            native_set_last_error(87);
+            return 0;
+        }
+        native_set_last_error(0);
+        1
     }
 
     fn native_flush_instance_state() {

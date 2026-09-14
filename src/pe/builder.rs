@@ -301,8 +301,19 @@ pub fn build(mut asm: Asm, imports: &[(&str, &str)]) -> Vec<u8> {
         dllname_rvas.push(p as u32);
         p += dlls[di].len() + 1;
     }
-    let import_end = p as u32;
-    let section_len = (import_end - SECTION_RVA as u32) as usize;
+    // A loader-written IAT slot is an ideal harmless relocation target: the
+    // native loader replaces it with a trampoline before execution.  Keeping
+    // this tiny relocation block in generated fixtures lets CreateProcessW
+    // exercise its distinct-address child mapping.
+    let reloc_target = iat_rvas.first().copied();
+    let reloc_rva = reloc_target.map(|target| {
+        p = (p + 3) & !3;
+        let rva = p as u32;
+        let _ = target;
+        p += 12; // IMAGE_BASE_RELOCATION header + DIR64 entry + ABSOLUTE pad
+        rva
+    });
+    let section_len = p - SECTION_RVA as usize;
 
     // Global IAT rva per import index
     let mut iat_of_import: Vec<u32> = Vec::new();
@@ -407,6 +418,15 @@ pub fn build(mut asm: Asm, imports: &[(&str, &str)]) -> Vec<u8> {
         sec.push(0);
         let _ = di;
     }
+    if let (Some(reloc_rva), Some(reloc_target)) = (reloc_rva, reloc_target) {
+        while SECTION_RVA as usize + sec.len() < reloc_rva as usize {
+            sec.push(0);
+        }
+        sec.extend_from_slice(&(reloc_target & !0xfff).to_le_bytes());
+        sec.extend_from_slice(&12u32.to_le_bytes());
+        sec.extend_from_slice(&(0xA000u16 | (reloc_target as u16 & 0x0fff)).to_le_bytes());
+        sec.extend_from_slice(&0u16.to_le_bytes());
+    }
     assert_eq!(sec.len(), section_len);
 
     // Headers
@@ -433,7 +453,7 @@ pub fn build(mut asm: Asm, imports: &[(&str, &str)]) -> Vec<u8> {
     f.extend_from_slice(&0u32.to_le_bytes()); // nsyms
     f.extend_from_slice(&0xF0u16.to_le_bytes()); // opt size (240)
     f.extend_from_slice(&0x0022u16.to_le_bytes()); // characteristics (exec)
-    // Optional header (240 bytes)
+                                                   // Optional header (240 bytes)
     let mut o = Vec::new();
     o.extend_from_slice(&0x20Bu16.to_le_bytes()); // magic PE32+
     o.push(0);
@@ -461,14 +481,19 @@ pub fn build(mut asm: Asm, imports: &[(&str, &str)]) -> Vec<u8> {
     o.extend_from_slice(&0x1000u64.to_le_bytes()); // heap commit
     o.extend_from_slice(&0u32.to_le_bytes()); // loader flags
     o.extend_from_slice(&16u32.to_le_bytes()); // rva count
-    // data dirs: export(0), import(1), rest 0
+                                               // data dirs: export(0), import(1), rest 0
     o.extend_from_slice(&0u32.to_le_bytes());
     o.extend_from_slice(&0u32.to_le_bytes());
     o.extend_from_slice(&import_base.to_le_bytes());
     o.extend_from_slice(&import_dir_size.to_le_bytes());
-    for _ in 2..16 {
-        o.extend_from_slice(&0u32.to_le_bytes());
-        o.extend_from_slice(&0u32.to_le_bytes());
+    for index in 2..16 {
+        if index == 5 {
+            o.extend_from_slice(&reloc_rva.unwrap_or(0).to_le_bytes());
+            o.extend_from_slice(&(if reloc_rva.is_some() { 12u32 } else { 0 }).to_le_bytes());
+        } else {
+            o.extend_from_slice(&0u32.to_le_bytes());
+            o.extend_from_slice(&0u32.to_le_bytes());
+        }
     }
     assert_eq!(o.len(), 0xF0);
     f.extend_from_slice(&o);
@@ -517,7 +542,25 @@ pub fn hello(msg: &str) -> Vec<u8> {
     a.mov_ecx_imm(0);
     a.call_import(2);
     a.ret();
-    build(a, &[("KERNEL32.dll", "GetStdHandle"), ("KERNEL32.dll", "WriteFile"), ("KERNEL32.dll", "ExitProcess")])
+    build(
+        a,
+        &[
+            ("KERNEL32.dll", "GetStdHandle"),
+            ("KERNEL32.dll", "WriteFile"),
+            ("KERNEL32.dll", "ExitProcess"),
+        ],
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hello;
+
+    #[test]
+    fn generated_images_are_relocatable_for_native_child_launches() {
+        let image = crate::pe::load(&hello("child\n")).unwrap();
+        assert!(!image.relocations.is_empty());
+    }
 }
 
 /// exit(code): ExitProcess(code)
@@ -626,7 +669,7 @@ pub fn read_file_to_stdout(path: &str) -> Vec<u8> {
     a.cmp_rax_m1();
     a.jz(lbl_fail);
     a.emit(&[0x48, 0x89, 0x44, 0x24, 0x40]); // save handle [rsp+0x40]
-    // ReadFile(handle, buf, 512, &read, NULL)
+                                             // ReadFile(handle, buf, 512, &read, NULL)
     a.emit(&[0x48, 0x8B, 0x4C, 0x24, 0x40]); // rcx = handle
     a.lea_reg_rip(2, d_buf);
     a.mov_r8d_imm(512);
@@ -650,7 +693,7 @@ pub fn read_file_to_stdout(path: &str) -> Vec<u8> {
     a.call_import(2);
     a.mov_rcx_rax(); // rcx = stdout
     a.emit(&[0x41, 0x58]); // pop r8
-    // rdx = buf
+                           // rdx = buf
     a.lea_reg_rip(2, d_buf);
     // r9 = &written
     a.lea_reg_rip(9, d_written);
@@ -703,7 +746,13 @@ pub fn delete_file(path: &str) -> Vec<u8> {
     a.call_import(1);
     a.add_rsp(0x28);
     a.ret();
-    build(a, &[("KERNEL32.dll", "DeleteFileW"), ("KERNEL32.dll", "ExitProcess")])
+    build(
+        a,
+        &[
+            ("KERNEL32.dll", "DeleteFileW"),
+            ("KERNEL32.dll", "ExitProcess"),
+        ],
+    )
 }
 
 /// exe with an unsupported import (loader must fail clearly).
@@ -771,7 +820,13 @@ pub fn move_file(src: &str, dst: &str) -> Vec<u8> {
     a.call_import(1);
     a.add_rsp(0x28);
     a.ret();
-    build(a, &[("KERNEL32.dll", "MoveFileW"), ("KERNEL32.dll", "ExitProcess")])
+    build(
+        a,
+        &[
+            ("KERNEL32.dll", "MoveFileW"),
+            ("KERNEL32.dll", "ExitProcess"),
+        ],
+    )
 }
 
 /// copy via CopyFileW(src, dst, FALSE) + exit by BOOL.
@@ -797,7 +852,13 @@ pub fn copy_file(src: &str, dst: &str) -> Vec<u8> {
     a.call_import(1);
     a.add_rsp(0x28);
     a.ret();
-    build(a, &[("KERNEL32.dll", "CopyFileW"), ("KERNEL32.dll", "ExitProcess")])
+    build(
+        a,
+        &[
+            ("KERNEL32.dll", "CopyFileW"),
+            ("KERNEL32.dll", "ExitProcess"),
+        ],
+    )
 }
 
 // ---------- self-verifying guest programs (used as committed test artifacts) ----------
@@ -828,14 +889,7 @@ fn emit_create(a: &mut Asm, d_path: usize, access: u64, creation: u32, call_idx:
 
 /// Emit `print(msg_data, len)`: GetStdHandle(-11) + WriteFile + CloseHandle-free.
 /// Uses call indices gh_idx (GetStdHandle) and wf_idx (WriteFile), plus d_written cell.
-fn emit_print(
-    a: &mut Asm,
-    d_msg: usize,
-    len: u32,
-    d_written: usize,
-    gh_idx: usize,
-    wf_idx: usize,
-) {
+fn emit_print(a: &mut Asm, d_msg: usize, len: u32, d_written: usize, gh_idx: usize, wf_idx: usize) {
     a.mov_ecx_imm(0xFFFF_FFF5);
     a.call_import(gh_idx);
     a.mov_rcx_rax();
@@ -932,7 +986,7 @@ pub fn fs_selftest_file(path: &str, content: &[u8]) -> Vec<u8> {
     emit_create(&mut a, d_path, 0x8000_0000, 3, CF);
     a.cmp_rax_m1();
     a.jnz(lbl_fail); // open must FAIL now
-    // -- PASS --
+                     // -- PASS --
     emit_print(&mut a, d_pass, 5, d_written, GH, WF);
     a.mov_ecx_imm(0);
     a.call_import(XP);
