@@ -575,10 +575,11 @@ pub fn exit_code(code: u32) -> Vec<u8> {
 
 /// Create a child process, wait for it, then exit successfully. Used to test
 /// the native process boundary without requiring an external toolchain.
-pub fn create_process_wait(application: &str) -> Vec<u8> {
+pub fn create_process_wait(application: &str, current_directory: Option<&str>) -> Vec<u8> {
     // imports: 0 CreateProcessW, 1 WaitForSingleObject, 2 ExitProcess
     let mut a = Asm::new();
     let d_application = a.add_utf16(application);
+    let d_current_directory = current_directory.map(|path| a.add_utf16(path));
     let d_process_information = a.add_zeroed(24);
     let fail = a.fresh_label();
     a.sub_rsp(0x58);
@@ -589,6 +590,10 @@ pub fn create_process_wait(application: &str) -> Vec<u8> {
     a.mov_r9d_imm(0);
     for offset in [0x20, 0x28, 0x30, 0x38, 0x40] {
         a.mov_rspoff_rax(offset);
+    }
+    if let Some(current_directory) = d_current_directory {
+        a.lea_reg_rip(0, current_directory);
+        a.mov_rspoff_rax(0x38);
     }
     a.lea_reg_rip(0, d_process_information);
     a.mov_rspoff_rax(0x48);

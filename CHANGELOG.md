@@ -6,6 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Native `CreateProcessW` now applies `lpCurrentDirectory` only to the child
+  WinFs view, while preserving the parent's directory when child changes are
+  merged. Its primary thread handle is independently waitable and closable.
 - `TerminateProcess` now sends a contained host termination signal to launched
   native children; the child monitor subsequently reaps it and publishes the
   resulting completion state to process waits and exit-code queries.

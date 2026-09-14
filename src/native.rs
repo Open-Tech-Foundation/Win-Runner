@@ -287,12 +287,20 @@ mod imp {
             assert_eq!(native_get_exit_code_process(handle, &mut exit_code), 1);
             assert_eq!(exit_code, 259); // STILL_ACTIVE
             assert_eq!(native_wait_for_single_object(handle, 0), 258); // WAIT_TIMEOUT
+            assert_eq!(native_wait_for_single_object(thread_handle, 0), 258); // WAIT_TIMEOUT
             assert_eq!(native_terminate_process(handle, 23), 1);
             assert_eq!(native_wait_for_single_object(handle, 0), 0);
+            assert_eq!(native_wait_for_single_object(thread_handle, 0), 0);
             assert_eq!(native_get_exit_code_process(handle, &mut exit_code), 1);
             assert_eq!(exit_code, 23);
             assert_eq!(native_close_handle(handle), 1);
             assert_eq!(native_get_exit_code_process(handle, &mut exit_code), 0);
+            assert_eq!(
+                native_get_exit_code_process(thread_handle, &mut exit_code),
+                1
+            );
+            assert_eq!(exit_code, 23);
+            assert_eq!(native_close_handle(thread_handle), 1);
         }
 
         #[test]
@@ -1287,6 +1295,7 @@ mod imp {
         next_thread_handle: u64,
         next_process_id: u32,
         children: HashMap<u64, Arc<NativeChildProcess>>,
+        primary_threads: HashMap<u64, Arc<NativeChildProcess>>,
     }
 
     #[allow(dead_code)]
@@ -1297,6 +1306,7 @@ mod imp {
                 next_thread_handle: 0x6100_0000,
                 next_process_id: 2,
                 children: HashMap::new(),
+                primary_threads: HashMap::new(),
             }
         }
 
@@ -1315,6 +1325,8 @@ mod imp {
             });
             self.next_process_id += 1;
             self.children.insert(handle, Arc::clone(&child));
+            self.primary_threads
+                .insert(thread_handle, Arc::clone(&child));
             (handle, thread_handle, child)
         }
     }
@@ -1355,6 +1367,12 @@ mod imp {
         if reaped && !encoded.is_empty() {
             if let Ok(snapshot) = crate::snapshot::load(&encoded) {
                 if let Ok(mut native_fs) = fs.lock() {
+                    // A child process owns its working directory. Preserve
+                    // the parent's directory while accepting its WinFs file
+                    // changes from the snapshot transport.
+                    let parent_cwd = native_fs.fs.cwd();
+                    let mut snapshot = snapshot;
+                    let _ = snapshot.set_cwd(&parent_cwd);
                     native_fs.fs = snapshot;
                 }
             }
@@ -1923,7 +1941,12 @@ mod imp {
         process: &NativeProcessContext,
         handle: u64,
     ) -> Option<Arc<NativeChildProcess>> {
-        process.children.lock().ok()?.children.get(&handle).cloned()
+        let table = process.children.lock().ok()?;
+        table
+            .children
+            .get(&handle)
+            .or_else(|| table.primary_threads.get(&handle))
+            .cloned()
     }
 
     extern "win64" fn native_get_exit_code_process(handle: u64, code: *mut u32) -> i32 {
@@ -2623,6 +2646,9 @@ mod imp {
             #[cfg(test)]
             NATIVE_GUEST_ACTIVE.store(true, Ordering::Release);
             unsafe { close(state_fds[0]) };
+            if let Ok(mut child_fs) = context.lock() {
+                let _ = child_fs.fs.set_cwd(&launch.current_directory);
+            }
             let command_line_w = command_line_w(
                 &launch.application,
                 launch.arguments.get(1..).unwrap_or(&[]),
@@ -3054,11 +3080,10 @@ mod imp {
         if process
             .as_ref()
             .and_then(|process| {
-                process
-                    .children
-                    .lock()
-                    .ok()
-                    .map(|mut children| children.children.remove(&h).is_some())
+                process.children.lock().ok().map(|mut children| {
+                    children.children.remove(&h).is_some()
+                        || children.primary_threads.remove(&h).is_some()
+                })
             })
             .unwrap_or(false)
         {
@@ -3706,13 +3731,35 @@ mod tests {
     #[test]
     fn native_guest_can_create_wait_for_and_reap_a_relocated_child() {
         let child = crate::pe::builder::hello("child\n");
-        let parent =
-            load(&crate::pe::builder::create_process_wait(r"C:\child.exe")).expect("parent loads");
+        let parent = load(&crate::pe::builder::create_process_wait(
+            r"C:\child.exe",
+            None,
+        ))
+        .expect("parent loads");
         let mut fs = WinFs::ephemeral_runner();
         fs.write_file(r"C:\child.exe", child).unwrap();
         let (code, output, _) = run_rust_baseline_argv_with_fs(&parent, fs, "parent.exe", &[])
             .expect("native parent runs");
         assert_eq!(code, 0);
         assert_eq!(output, b"child\n");
+    }
+
+    #[test]
+    fn native_child_uses_its_requested_working_directory() {
+        let child = crate::pe::builder::write_file("child.txt", b"cwd");
+        let parent = load(&crate::pe::builder::create_process_wait(
+            r"C:\child.exe",
+            Some(r"C:\work"),
+        ))
+        .expect("parent loads");
+        let mut fs = WinFs::ephemeral_runner();
+        fs.mkdir(r"C:\work").unwrap();
+        let parent_cwd = fs.cwd();
+        fs.write_file(r"C:\child.exe", child).unwrap();
+        let (code, _, fs) = run_rust_baseline_argv_with_fs(&parent, fs, "parent.exe", &[])
+            .expect("native parent runs");
+        assert_eq!(code, 0);
+        assert_eq!(fs.read_file(r"C:\work\child.txt").unwrap(), b"cwd");
+        assert_eq!(fs.cwd(), parent_cwd);
     }
 }
