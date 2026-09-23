@@ -64,6 +64,22 @@ pub enum StepResult {
     Halted(u32),
 }
 
+/// Per-thread processor state. Guest memory and import tables stay in `Emu`
+/// and are shared by every cooperatively scheduled guest thread.
+#[derive(Clone)]
+pub struct CpuState {
+    pub regs: [u64; 16],
+    pub xmm: [u128; 16],
+    pub rip: u64,
+    pub zf: bool,
+    pub sf: bool,
+    pub cf: bool,
+    pub of: bool,
+    pub pf: bool,
+    pub df: bool,
+    pub gs_base: u64,
+}
+
 pub struct Emu {
     pub base: u64,
     pub mem: Vec<u8>,
@@ -127,13 +143,75 @@ pub const PEB_IMAGEBASE_OFF: u64 = 0x10;
 pub const PEB_LDR_OFF: u64 = 0x20;
 
 impl Emu {
+    pub fn cpu_state(&self) -> CpuState {
+        CpuState {
+            regs: self.regs,
+            xmm: self.xmm,
+            rip: self.rip,
+            zf: self.zf,
+            sf: self.sf,
+            cf: self.cf,
+            of: self.of,
+            pf: self.pf,
+            df: self.df,
+            gs_base: self.gs_base,
+        }
+    }
+
+    pub fn restore_cpu(&mut self, state: &CpuState) {
+        self.regs = state.regs;
+        self.xmm = state.xmm;
+        self.rip = state.rip;
+        self.zf = state.zf;
+        self.sf = state.sf;
+        self.cf = state.cf;
+        self.of = state.of;
+        self.pf = state.pf;
+        self.df = state.df;
+        self.gs_base = state.gs_base;
+    }
+
+    pub fn thread_cpu(
+        &mut self,
+        start: u64,
+        parameter: u64,
+        stack_size: usize,
+        gs_base: u64,
+    ) -> Result<CpuState, String> {
+        self.read_u8(start)?;
+        let size = if stack_size == 0 {
+            STACK_SIZE
+        } else {
+            stack_size.max(64 * 1024)
+        };
+        if size > HEAP_SIZE / 2 {
+            return Err("guest thread stack is too large".to_string());
+        }
+        let stack = self.heap_alloc_aligned(size, 16);
+        if stack == 0 {
+            return Err("out of guest memory for thread stack".to_string());
+        }
+        let top = (stack + size as u64) & !0xf;
+        self.write_u64(top - 8, ENTRY_SENTINEL)?;
+        let mut cpu = self.cpu_state();
+        cpu.regs = [0; 16];
+        cpu.xmm = [0; 16];
+        cpu.regs[1] = parameter;
+        cpu.regs[4] = top - 8;
+        cpu.rip = start;
+        cpu.zf = false;
+        cpu.sf = false;
+        cpu.cf = false;
+        cpu.of = false;
+        cpu.pf = false;
+        cpu.df = false;
+        cpu.gs_base = gs_base;
+        Ok(cpu)
+    }
+
     pub fn new(img: &PeImage) -> Result<Self, String> {
-        let total = img.size_of_image as usize
-            + CMDLINE_SIZE
-            + STACK_SIZE
-            + HEAP_SIZE
-            + TEB_SIZE
-            + 0x1000;
+        let total =
+            img.size_of_image as usize + CMDLINE_SIZE + STACK_SIZE + HEAP_SIZE + TEB_SIZE + 0x1000;
         let base = img.image_base;
         let mut mem = vec![0u8; total];
         mem[..img.image.len()].copy_from_slice(&img.image);
@@ -205,7 +283,11 @@ impl Emu {
         if size > HEAP_SIZE || align == 0 || align & (align - 1) != 0 {
             return 0;
         }
-        let Some(payload) = self.heap_next.checked_add(8 + align - 1).map(|v| v & !(align - 1)) else {
+        let Some(payload) = self
+            .heap_next
+            .checked_add(8 + align - 1)
+            .map(|v| v & !(align - 1))
+        else {
             return 0;
         };
         let next = payload - 8;
@@ -266,7 +348,11 @@ impl Emu {
             return Err(format!("memory access below image base: 0x{va:016x}"));
         }
         let off = (va - self.base) as usize;
-        if off.checked_add(len).map(|e| e > self.mem.len()).unwrap_or(true) {
+        if off
+            .checked_add(len)
+            .map(|e| e > self.mem.len())
+            .unwrap_or(true)
+        {
             return Err(format!("memory access out of bounds: 0x{va:016x}+{len}"));
         }
         Ok(off)
@@ -422,7 +508,11 @@ impl Emu {
 
     // ---------- flags ----------
     fn set_logic_flags(&mut self, res: u64, width: u32) {
-        let mask = if width == 64 { u64::MAX } else { (1u64 << width) - 1 };
+        let mask = if width == 64 {
+            u64::MAX
+        } else {
+            (1u64 << width) - 1
+        };
         let r = res & mask;
         self.zf = r == 0;
         self.sf = if width == 64 {
@@ -434,7 +524,11 @@ impl Emu {
         self.of = false;
     }
     fn set_add_flags(&mut self, a: u64, b: u64, res: u64, width: u32) {
-        let mask = if width == 64 { u64::MAX } else { (1u64 << width) - 1 };
+        let mask = if width == 64 {
+            u64::MAX
+        } else {
+            (1u64 << width) - 1
+        };
         let r = res & mask;
         self.zf = r == 0;
         self.sf = ((r >> (width - 1)) & 1) == 1;
@@ -445,7 +539,11 @@ impl Emu {
         self.of = ((a ^ r) & (b ^ r) & sign) != 0;
     }
     fn set_sub_flags(&mut self, a: u64, b: u64, res: u64, width: u32) {
-        let mask = if width == 64 { u64::MAX } else { (1u64 << width) - 1 };
+        let mask = if width == 64 {
+            u64::MAX
+        } else {
+            (1u64 << width) - 1
+        };
         let r = res & mask;
         self.zf = r == 0;
         self.sf = ((r >> (width - 1)) & 1) == 1;
@@ -458,22 +556,22 @@ impl Emu {
 
     fn jcc_taken(&self, cond: u8) -> Result<bool, String> {
         Ok(match cond {
-            0 => self.of,                        // O
-            1 => !self.of,                       // NO
-            2 => self.cf,                        // B
-            3 => !self.cf,                       // NB
-            4 => self.zf,                        // Z
-            5 => !self.zf,                       // NZ
-            6 => self.cf || self.zf,             // BE
-            7 => !self.cf && !self.zf,           // NBE
-            8 => self.sf,                        // S
-            9 => !self.sf,                       // NS
-            10 => self.pf,                       // P (FP unordered only)
-            11 => !self.pf,                      // NP
-            12 => self.sf != self.of,            // L
-            13 => self.sf == self.of,            // NL
-            14 => self.zf || self.sf != self.of, // LE
-            15 => !self.zf && self.sf == self.of,// NLE
+            0 => self.of,                         // O
+            1 => !self.of,                        // NO
+            2 => self.cf,                         // B
+            3 => !self.cf,                        // NB
+            4 => self.zf,                         // Z
+            5 => !self.zf,                        // NZ
+            6 => self.cf || self.zf,              // BE
+            7 => !self.cf && !self.zf,            // NBE
+            8 => self.sf,                         // S
+            9 => !self.sf,                        // NS
+            10 => self.pf,                        // P (FP unordered only)
+            11 => !self.pf,                       // NP
+            12 => self.sf != self.of,             // L
+            13 => self.sf == self.of,             // NL
+            14 => self.zf || self.sf != self.of,  // LE
+            15 => !self.zf && self.sf == self.of, // NLE
             _ => unreachable!(),
         })
     }
@@ -514,7 +612,11 @@ impl Emu {
                 len += 4;
                 let mut addr = d;
                 if index != 4 {
-                    addr = addr.wrapping_add(self.regs[index].wrapping_shl(scale as u32 * 0).wrapping_mul(1 << scale));
+                    addr = addr.wrapping_add(
+                        self.regs[index]
+                            .wrapping_shl(scale as u32 * 0)
+                            .wrapping_mul(1 << scale),
+                    );
                 }
                 ea = addr;
             } else {
@@ -547,9 +649,9 @@ impl Emu {
             // To keep it simple, read next_rip via a second pass: caller must compute.
             // We return disp as signed; caller converts. Use u64 wrapping of disp.
             ea = d as u64; // marker
-            // flag via high bit impossible; caller knows this case by mod/rm.
-            // We'll handle RIP-relative in the caller by recomputing. For now return disp.
-            // To disambiguate, return ea = disp and len; caller checks (modrm&7)==5&&mod==0.
+                           // flag via high bit impossible; caller knows this case by mod/rm.
+                           // We'll handle RIP-relative in the caller by recomputing. For now return disp.
+                           // To disambiguate, return ea = disp and len; caller checks (modrm&7)==5&&mod==0.
             return Ok((reg, false, 0x100, ea, len)); // 0x100 = RIP-rel marker
         } else {
             let mut addr = self.regs[rm];
@@ -572,9 +674,7 @@ impl Emu {
         // GS override (TEB/TLS access): fold the segment base in.
         let ea = if self.seg_gs {
             if self.gs_base == 0 {
-                return Err(
-                    "gs: segment used but no TEB is mapped (image has no TLS?)".to_string(),
-                );
+                return Err("gs: segment used but no TEB is mapped (image has no TLS?)".to_string());
             }
             self.gs_base.wrapping_add(ea)
         } else {
@@ -624,7 +724,14 @@ impl Emu {
         }
     }
 
-    fn write_rm(&mut self, is_reg: bool, rm: usize, ea: u64, width: u32, val: u64) -> Result<(), String> {
+    fn write_rm(
+        &mut self,
+        is_reg: bool,
+        rm: usize,
+        ea: u64,
+        width: u32,
+        val: u64,
+    ) -> Result<(), String> {
         if is_reg {
             match width {
                 8 => {
@@ -724,7 +831,9 @@ impl Emu {
         // REP is only meaningful on string ops (below), PAUSE (F3 90),
         // and the SSE-move aliases (F3 0F 10/11/...).
         if rep && !matches!(op, 0x90 | 0x0F | 0xA4 | 0xA5 | 0xAA | 0xAB | 0xAC | 0xAD) {
-            return Err(format!("unsupported REP string op 0x{op:02X} at 0x{ip:016x}"));
+            return Err(format!(
+                "unsupported REP string op 0x{op:02X} at 0x{ip:016x}"
+            ));
         }
         if repne && op != 0x0F {
             return Err(format!("unsupported REPNE prefix at 0x{ip:016x}"));
@@ -759,19 +868,42 @@ impl Emu {
                     | 0x3D
                     | 0x0D
                     | 0x25
-            ) {
-            return Err(format!("unsupported 16-bit opcode 0x{op:02X} at 0x{ip:016x}"));
+            )
+        {
+            return Err(format!(
+                "unsupported 16-bit opcode 0x{op:02X} at 0x{ip:016x}"
+            ));
         }
 
         // two-byte opcodes
         if op == 0x0F {
             let op2 = self.read_u8(ip + off as u64 + 1)?;
-            if rep && !matches!(op2, 0x10 | 0x11 | 0x28 | 0x29 | 0x6E | 0x6F | 0x70 | 0x7E | 0x7F | 0xBC | 0xBD | 0xD6) {
+            if rep
+                && !matches!(
+                    op2,
+                    0x10 | 0x11
+                        | 0x28
+                        | 0x29
+                        | 0x6E
+                        | 0x6F
+                        | 0x70
+                        | 0x7E
+                        | 0x7F
+                        | 0xBC
+                        | 0xBD
+                        | 0xD6
+                )
+            {
                 return Err(format!(
                     "unsupported REP-prefixed opcode 0F {op2:02X} at 0x{ip:016x}"
                 ));
             }
-            if repne && !matches!(op2, 0x70 | 0x10 | 0x11 | 0x2A | 0x58 | 0x59 | 0x5C | 0x5E | 0xC2) {
+            if repne
+                && !matches!(
+                    op2,
+                    0x70 | 0x10 | 0x11 | 0x2A | 0x58 | 0x59 | 0x5C | 0x5E | 0xC2
+                )
+            {
                 return Err(format!(
                     "unsupported REPNE/F2-prefixed opcode 0F {op2:02X} at 0x{ip:016x}"
                 ));
@@ -812,9 +944,7 @@ impl Emu {
                 // movzx/movsx r, r/m8(16). A 0x66 prefix would narrow the
                 // destination to 16 bits; refuse rather than mis-emulate.
                 if opsz16 {
-                    return Err(format!(
-                        "unsupported 16-bit movzx at 0x{ip:016x}"
-                    ));
+                    return Err(format!("unsupported 16-bit movzx at 0x{ip:016x}"));
                 }
                 let signed = op2 == 0xBE || op2 == 0xBF;
                 let srcw = if op2 == 0xB6 || op2 == 0xBE { 8 } else { 16 };
@@ -872,14 +1002,18 @@ impl Emu {
                 let (reg, is_reg, rm, ea_raw, ml) =
                     self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
                 let next = ip + (off + 2 + ml) as u64;
-                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let ea = if rm == 0x100 {
+                    next.wrapping_add(ea_raw)
+                } else {
+                    ea_raw
+                };
                 let lane = |v: u128| f64::from_bits((v & 0xFFFF_FFFF_FFFF_FFFF) as u64);
                 match op2 {
                     0x10 => {
                         if is_reg {
                             let s = self.xmm[rm];
-                            self.xmm[reg] =
-                                (self.xmm[reg] & !0xFFFF_FFFF_FFFF_FFFF) | (s & 0xFFFF_FFFF_FFFF_FFFF);
+                            self.xmm[reg] = (self.xmm[reg] & !0xFFFF_FFFF_FFFF_FFFF)
+                                | (s & 0xFFFF_FFFF_FFFF_FFFF);
                         } else {
                             self.xmm[reg] = self.read_u64(ea)? as u128;
                         }
@@ -903,8 +1037,8 @@ impl Emu {
                             0x5C => a - b,
                             _ => a / b,
                         };
-                        self.xmm[reg] = (self.xmm[reg] & !0xFFFF_FFFF_FFFF_FFFF)
-                            | r.to_bits() as u128;
+                        self.xmm[reg] =
+                            (self.xmm[reg] & !0xFFFF_FFFF_FFFF_FFFF) | r.to_bits() as u128;
                     }
                     0x2A => {
                         // CVTSI2SD xmm, r/m32/64 (int64 with REX.W).
@@ -915,8 +1049,8 @@ impl Emu {
                             self.read_rm(is_reg, rm, ea, 32)? as u32 as i32 as i64
                         };
                         let r = v as f64;
-                        self.xmm[reg] = (self.xmm[reg] & !0xFFFF_FFFF_FFFF_FFFF)
-                            | r.to_bits() as u128;
+                        self.xmm[reg] =
+                            (self.xmm[reg] & !0xFFFF_FFFF_FFFF_FFFF) | r.to_bits() as u128;
                     }
                     _ => {
                         // CMPLTSD-style imm8 predicate -> low-qword mask,
@@ -971,7 +1105,11 @@ impl Emu {
                 let (reg, is_reg, rm, ea_raw, ml) =
                     self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
                 let next = ip + (off + 2 + ml) as u64;
-                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let ea = if rm == 0x100 {
+                    next.wrapping_add(ea_raw)
+                } else {
+                    ea_raw
+                };
                 let a = self.xmm[reg].to_le_bytes();
                 let b: [u8; 16] = if is_reg {
                     self.xmm[rm].to_le_bytes()
@@ -1002,7 +1140,11 @@ impl Emu {
                 let (reg, is_reg, rm, ea_raw, ml) =
                     self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
                 let next = ip + (off + 2 + ml) as u64;
-                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let ea = if rm == 0x100 {
+                    next.wrapping_add(ea_raw)
+                } else {
+                    ea_raw
+                };
                 let a = f64::from_bits((self.xmm[reg] & 0xFFFF_FFFF_FFFF_FFFF) as u64);
                 let b = if is_reg {
                     f64::from_bits((self.xmm[rm] & 0xFFFF_FFFF_FFFF_FFFF) as u64)
@@ -1038,12 +1180,18 @@ impl Emu {
             if op2 == 0x54 || op2 == 0x55 || op2 == 0x56 {
                 // ANDPD/ANDNPD/ORPD (66-mandatory). Bitwise, no flags.
                 if !opsz16 {
-                    return Err(format!("unsupported MMX opcode 0F {op2:02X} at 0x{ip:016x}"));
+                    return Err(format!(
+                        "unsupported MMX opcode 0F {op2:02X} at 0x{ip:016x}"
+                    ));
                 }
                 let (reg, is_reg, rm, ea_raw, ml) =
                     self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
                 let next = ip + (off + 2 + ml) as u64;
-                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let ea = if rm == 0x100 {
+                    next.wrapping_add(ea_raw)
+                } else {
+                    ea_raw
+                };
                 let b = if is_reg {
                     self.xmm[rm]
                 } else {
@@ -1057,7 +1205,22 @@ impl Emu {
                 self.rip = next;
                 return Ok(StepResult::Continue);
             }
-            if matches!(op2, 0x10 | 0x11 | 0x28 | 0x29 | 0x57 | 0x6E | 0x6F | 0x7E | 0x7F | 0xD6 | 0xDB | 0xDF | 0xEB | 0xEF) {
+            if matches!(
+                op2,
+                0x10 | 0x11
+                    | 0x28
+                    | 0x29
+                    | 0x57
+                    | 0x6E
+                    | 0x6F
+                    | 0x7E
+                    | 0x7F
+                    | 0xD6
+                    | 0xDB
+                    | 0xDF
+                    | 0xEB
+                    | 0xEF
+            ) {
                 // Packed moves / xors. Bitwise only: no flags, no FP, no
                 // MXCSR, no alignment faulting (guests are compiler-aligned).
                 // A 0x66 prefix selects the unaligned/double/integer spellings
@@ -1074,7 +1237,11 @@ impl Emu {
                 let (reg, is_reg, rm, ea_raw, ml) =
                     self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
                 let next = ip + (off + 2 + ml) as u64;
-                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let ea = if rm == 0x100 {
+                    next.wrapping_add(ea_raw)
+                } else {
+                    ea_raw
+                };
                 match op2 {
                     0x10 | 0x28 | 0x6F => {
                         // movups/movaps/movdqa xmm, xmm/m128. F3 selects
@@ -1099,9 +1266,7 @@ impl Emu {
                         // scalar MOVSS m32, xmm (reg-reg form is #UD).
                         if rep && op2 == 0x11 {
                             if is_reg {
-                                return Err(format!(
-                                    "invalid MOVSS reg-reg store at 0x{ip:016x}"
-                                ));
+                                return Err(format!("invalid MOVSS reg-reg store at 0x{ip:016x}"));
                             }
                             let v = (self.xmm[reg] & 0xFFFF_FFFF) as u32;
                             self.write_u32(ea, v)?;
@@ -1177,14 +1342,10 @@ impl Emu {
                         // movq xmm/m64, xmm (low qword; 66-mandatory).
                         // F3 form is MOVQ2DQ (different op): fail clearly.
                         if rep {
-                            return Err(format!(
-                                "unsupported MOVQ2DQ (F3 0F D6) at 0x{ip:016x}"
-                            ));
+                            return Err(format!("unsupported MOVQ2DQ (F3 0F D6) at 0x{ip:016x}"));
                         }
                         if !opsz16 {
-                            return Err(format!(
-                                "unsupported MMX opcode 0F D6 at 0x{ip:016x}"
-                            ));
+                            return Err(format!("unsupported MMX opcode 0F D6 at 0x{ip:016x}"));
                         }
                         let v = (self.xmm[reg] & 0xFFFF_FFFF_FFFF_FFFF) as u64;
                         if is_reg {
@@ -1204,7 +1365,11 @@ impl Emu {
                 let (_, is_reg, rm, ea_raw, ml) =
                     self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
                 let next = ip + (off + 2 + ml) as u64;
-                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let ea = if rm == 0x100 {
+                    next.wrapping_add(ea_raw)
+                } else {
+                    ea_raw
+                };
                 let v = if self.jcc_taken(op2 & 0xF)? { 1 } else { 0 };
                 self.write_rm(is_reg, rm, ea, 8, v)?;
                 self.rip = next;
@@ -1240,7 +1405,11 @@ impl Emu {
                 let (reg, is_reg, rm, ea_raw, ml) =
                     self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
                 let next = ip + (off + 2 + ml) as u64;
-                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let ea = if rm == 0x100 {
+                    next.wrapping_add(ea_raw)
+                } else {
+                    ea_raw
+                };
                 let a = self.read_rm(is_reg, rm, ea, w)?;
                 let b = match w {
                     64 => self.regs[reg],
@@ -1284,7 +1453,11 @@ impl Emu {
                 let (reg, is_reg, rm, ea_raw, ml) =
                     self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
                 let next = ip + (off + 2 + ml) as u64;
-                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let ea = if rm == 0x100 {
+                    next.wrapping_add(ea_raw)
+                } else {
+                    ea_raw
+                };
                 let d = self.xmm[reg].to_le_bytes();
                 let s: [u8; 16] = if is_reg {
                     self.xmm[rm].to_le_bytes()
@@ -1309,7 +1482,11 @@ impl Emu {
                 let (reg, is_reg, rm, ea_raw, ml) =
                     self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
                 let next = ip + (off + 2 + ml) as u64;
-                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let ea = if rm == 0x100 {
+                    next.wrapping_add(ea_raw)
+                } else {
+                    ea_raw
+                };
                 let d = self.xmm[reg].to_le_bytes();
                 let s: [u8; 16] = if is_reg {
                     self.xmm[rm].to_le_bytes()
@@ -1333,7 +1510,11 @@ impl Emu {
                     self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
                 let imm = self.read_u8(ip + (off + 2 + ml) as u64)?;
                 let next = ip + (off + 2 + ml + 1) as u64;
-                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let ea = if rm == 0x100 {
+                    next.wrapping_add(ea_raw)
+                } else {
+                    ea_raw
+                };
                 let s: [u8; 16] = if is_reg {
                     self.xmm[rm].to_le_bytes()
                 } else {
@@ -1380,7 +1561,9 @@ impl Emu {
                 let (group, is_reg, rm, _, ml) =
                     self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
                 if !is_reg || !matches!(group, 2 | 4 | 6) {
-                    return Err(format!("unsupported packed-word shift /{group} at 0x{ip:016x}"));
+                    return Err(format!(
+                        "unsupported packed-word shift /{group} at 0x{ip:016x}"
+                    ));
                 }
                 let count = self.read_u8(ip + (off + 2 + ml) as u64)? as u32;
                 let input = self.xmm[rm].to_le_bytes();
@@ -1389,13 +1572,31 @@ impl Emu {
                     let start = lane * 2;
                     let value = u16::from_le_bytes(input[start..start + 2].try_into().unwrap());
                     let shifted = match group {
-                        2 => if count >= 16 { 0 } else { value >> count },
-                        4 => if count >= 16 {
-                            if value & 0x8000 != 0 { u16::MAX } else { 0 }
-                        } else {
-                            ((value as i16) >> count) as u16
-                        },
-                        _ => if count >= 16 { 0 } else { value << count },
+                        2 => {
+                            if count >= 16 {
+                                0
+                            } else {
+                                value >> count
+                            }
+                        }
+                        4 => {
+                            if count >= 16 {
+                                if value & 0x8000 != 0 {
+                                    u16::MAX
+                                } else {
+                                    0
+                                }
+                            } else {
+                                ((value as i16) >> count) as u16
+                            }
+                        }
+                        _ => {
+                            if count >= 16 {
+                                0
+                            } else {
+                                value << count
+                            }
+                        }
                     };
                     out[start..start + 2].copy_from_slice(&shifted.to_le_bytes());
                 }
@@ -1406,12 +1607,18 @@ impl Emu {
             if op2 == 0x74 || op2 == 0x75 || op2 == 0x76 {
                 // PCMPEQB/W/D: per-lane equality masks (plain forms are MMX).
                 if !opsz16 {
-                    return Err(format!("unsupported MMX opcode 0F {op2:02X} at 0x{ip:016x}"));
+                    return Err(format!(
+                        "unsupported MMX opcode 0F {op2:02X} at 0x{ip:016x}"
+                    ));
                 }
                 let (reg, is_reg, rm, ea_raw, ml) =
                     self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
                 let next = ip + (off + 2 + ml) as u64;
-                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let ea = if rm == 0x100 {
+                    next.wrapping_add(ea_raw)
+                } else {
+                    ea_raw
+                };
                 let a = self.xmm[reg].to_le_bytes();
                 let b: [u8; 16] = if is_reg {
                     self.xmm[rm].to_le_bytes()
@@ -1436,7 +1643,8 @@ impl Emu {
                 self.rip = next;
                 return Ok(StepResult::Continue);
             }
-            if op2 == 0xC6 {                // SHUFPS (no prefix, 32-bit lanes) vs SHUFPD (0x66, 64-bit
+            if op2 == 0xC6 {
+                // SHUFPS (no prefix, 32-bit lanes) vs SHUFPD (0x66, 64-bit
                 // lanes: dest[63:0] = imm0 ? src : dst, same for high half).
                 // Bitwise only, no FP.
                 let shufpd = opsz16;
@@ -1444,7 +1652,11 @@ impl Emu {
                     self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
                 let imm = self.read_u8(ip + (off + 2 + ml) as u64)?;
                 let next = ip + (off + 2 + ml + 1) as u64;
-                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let ea = if rm == 0x100 {
+                    next.wrapping_add(ea_raw)
+                } else {
+                    ea_raw
+                };
                 let a = self.xmm[reg].to_le_bytes();
                 let b: [u8; 16] = if is_reg {
                     self.xmm[rm].to_le_bytes()
@@ -1493,7 +1705,11 @@ impl Emu {
                     self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
                 let imm = self.read_u8(ip + (off + 2 + ml) as u64)?;
                 let next = ip + (off + 2 + ml + 1) as u64;
-                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let ea = if rm == 0x100 {
+                    next.wrapping_add(ea_raw)
+                } else {
+                    ea_raw
+                };
                 let w: u16 = if is_reg {
                     (self.regs[rm] & 0xFFFF) as u16
                 } else {
@@ -1528,12 +1744,18 @@ impl Emu {
                 // PSUBB/W/D/Q xmm, xmm/m128: wrapping lane subtract.
                 // Plain forms need 66 in 64-bit mode (MMX otherwise).
                 if !opsz16 {
-                    return Err(format!("unsupported MMX opcode 0F {op2:02X} at 0x{ip:016x}"));
+                    return Err(format!(
+                        "unsupported MMX opcode 0F {op2:02X} at 0x{ip:016x}"
+                    ));
                 }
                 let (reg, is_reg, rm, ea_raw, ml) =
                     self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
                 let next = ip + (off + 2 + ml) as u64;
-                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let ea = if rm == 0x100 {
+                    next.wrapping_add(ea_raw)
+                } else {
+                    ea_raw
+                };
                 let a = self.xmm[reg].to_le_bytes();
                 let b: [u8; 16] = if is_reg {
                     self.xmm[rm].to_le_bytes()
@@ -1573,7 +1795,11 @@ impl Emu {
                 let (reg, is_reg, rm, ea_raw, ml) =
                     self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
                 let next = ip + (off + 2 + ml) as u64;
-                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let ea = if rm == 0x100 {
+                    next.wrapping_add(ea_raw)
+                } else {
+                    ea_raw
+                };
                 let a = self.xmm[reg].to_le_bytes();
                 let b: [u8; 16] = if is_reg {
                     self.xmm[rm].to_le_bytes()
@@ -1596,12 +1822,18 @@ impl Emu {
                 // or dword lanes. These are the companion operations to
                 // PADDQ in compiler-generated SIMD search code.
                 if !opsz16 || rep || repne {
-                    return Err(format!("unsupported MMX opcode 0F {op2:02X} at 0x{ip:016x}"));
+                    return Err(format!(
+                        "unsupported MMX opcode 0F {op2:02X} at 0x{ip:016x}"
+                    ));
                 }
                 let (reg, is_reg, rm, ea_raw, ml) =
                     self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
                 let next = ip + (off + 2 + ml) as u64;
-                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let ea = if rm == 0x100 {
+                    next.wrapping_add(ea_raw)
+                } else {
+                    ea_raw
+                };
                 let a = self.xmm[reg].to_le_bytes();
                 let b: [u8; 16] = if is_reg {
                     self.xmm[rm].to_le_bytes()
@@ -1641,7 +1873,11 @@ impl Emu {
                 let (reg, is_reg, rm, ea_raw, ml) =
                     self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
                 let next = ip + (off + 2 + ml) as u64;
-                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let ea = if rm == 0x100 {
+                    next.wrapping_add(ea_raw)
+                } else {
+                    ea_raw
+                };
                 let a = self.xmm[reg].to_le_bytes();
                 let b: [u8; 16] = if is_reg {
                     self.xmm[rm].to_le_bytes()
@@ -1667,14 +1903,19 @@ impl Emu {
                 self.rip = ip + off as u64 + 2;
                 return Ok(StepResult::Continue);
             }
-            if op2 == 0xD7 {                // PMOVMSKB r32, xmm/m128 (plain form is MMX).
+            if op2 == 0xD7 {
+                // PMOVMSKB r32, xmm/m128 (plain form is MMX).
                 if !opsz16 {
                     return Err(format!("unsupported MMX opcode 0F D7 at 0x{ip:016x}"));
                 }
                 let (reg, is_reg, rm, ea_raw, ml) =
                     self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
                 let next = ip + (off + 2 + ml) as u64;
-                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let ea = if rm == 0x100 {
+                    next.wrapping_add(ea_raw)
+                } else {
+                    ea_raw
+                };
                 let v: [u8; 16] = if is_reg {
                     self.xmm[rm].to_le_bytes()
                 } else {
@@ -1702,7 +1943,11 @@ impl Emu {
                 let (reg, is_reg, rm, ea_raw, ml) =
                     self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
                 let next = ip + (off + 2 + ml) as u64;
-                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let ea = if rm == 0x100 {
+                    next.wrapping_add(ea_raw)
+                } else {
+                    ea_raw
+                };
                 let a = self.xmm[reg].to_le_bytes();
                 let b: [u8; 16] = if is_reg {
                     self.xmm[rm].to_le_bytes()
@@ -1740,14 +1985,16 @@ impl Emu {
                 // PACKUSWB xmm, xmm/m128: signed words saturate to bytes
                 // (low 8 of each operand). Plain form is MMX.
                 if !opsz16 {
-                    return Err(format!(
-                        "unsupported MMX opcode 0F 67 at 0x{ip:016x}"
-                    ));
+                    return Err(format!("unsupported MMX opcode 0F 67 at 0x{ip:016x}"));
                 }
                 let (reg, is_reg, rm, ea_raw, ml) =
                     self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
                 let next = ip + (off + 2 + ml) as u64;
-                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let ea = if rm == 0x100 {
+                    next.wrapping_add(ea_raw)
+                } else {
+                    ea_raw
+                };
                 let a = self.xmm[reg].to_le_bytes();
                 let b: [u8; 16] = if is_reg {
                     self.xmm[rm].to_le_bytes()
@@ -1773,7 +2020,11 @@ impl Emu {
                 let (reg, is_reg, rm, ea_raw, ml) =
                     self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
                 let next = ip + (off + 2 + ml) as u64;
-                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let ea = if rm == 0x100 {
+                    next.wrapping_add(ea_raw)
+                } else {
+                    ea_raw
+                };
                 if op2 == 0x12 || op2 == 0x16 {
                     let dest_base = if op2 == 0x12 { 0 } else { 8 };
                     let chunk: [u8; 8] = if is_reg {
@@ -1799,7 +2050,7 @@ impl Emu {
                 self.rip = next;
                 return Ok(StepResult::Continue);
             }
-                        if op2 == 0xC0 || op2 == 0xC1 {
+            if op2 == 0xC0 || op2 == 0xC1 {
                 // XADD r/m, r: temp=dest; dest=src+dest; src=temp. LOCK ignored.
                 let width: u32 = if op2 == 0xC0 { 8 } else { w };
                 if width == 16 {
@@ -1808,7 +2059,11 @@ impl Emu {
                 let (reg, is_reg, rm, ea_raw, ml) =
                     self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
                 let next = ip + (off + 2 + ml) as u64;
-                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let ea = if rm == 0x100 {
+                    next.wrapping_add(ea_raw)
+                } else {
+                    ea_raw
+                };
                 let mask: u64 = match width {
                     64 => u64::MAX,
                     32 => 0xFFFF_FFFF,
@@ -1828,7 +2083,7 @@ impl Emu {
                 self.rip = next;
                 return Ok(StepResult::Continue);
             }
-                        if op2 == 0xB0 || op2 == 0xB1 {
+            if op2 == 0xB0 || op2 == 0xB1 {
                 // CMPXCHG r/m, r: temp=dest; ZF=(dest==rax); dest=ZF?src:dest;
                 // rax=temp. LOCK ignored (single thread).
                 let width: u32 = if op2 == 0xB0 { 8 } else { w };
@@ -1838,7 +2093,11 @@ impl Emu {
                 let (reg, is_reg, rm, ea_raw, ml) =
                     self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
                 let next = ip + (off + 2 + ml) as u64;
-                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let ea = if rm == 0x100 {
+                    next.wrapping_add(ea_raw)
+                } else {
+                    ea_raw
+                };
                 let mask: u64 = match width {
                     64 => u64::MAX,
                     32 => 0xFFFF_FFFF,
@@ -1862,14 +2121,18 @@ impl Emu {
                 self.rip = next;
                 return Ok(StepResult::Continue);
             }
-                        if op2 == 0xBC || op2 == 0xBD {
+            if op2 == 0xBC || op2 == 0xBD {
                 // BSF/BSR, or TZCNT/LZCNT with F3. TZCNT/LZCNT counts are
                 // well-defined for zero input (== width); plain BSF/BSR leave
                 // dest unchanged on zero input (matching common usage).
                 let (reg, is_reg, rm, ea_raw, ml) =
                     self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
                 let next = ip + (off + 2 + ml) as u64;
-                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let ea = if rm == 0x100 {
+                    next.wrapping_add(ea_raw)
+                } else {
+                    ea_raw
+                };
                 let mask: u64 = match w {
                     64 => u64::MAX,
                     32 => 0xFFFF_FFFF,
@@ -1908,7 +2171,11 @@ impl Emu {
                 let (reg, is_reg, rm, ea_raw, ml) =
                     self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
                 let next = ip + (off + 2 + ml) as u64;
-                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let ea = if rm == 0x100 {
+                    next.wrapping_add(ea_raw)
+                } else {
+                    ea_raw
+                };
                 let idx = self.regs[reg];
                 if is_reg {
                     let mask: u64 = match w {
@@ -1944,12 +2211,17 @@ impl Emu {
                 self.rip = next;
                 return Ok(StepResult::Continue);
             }
-            if op2 == 0xBA {                // Grp8 Ev,Ib: BT/BTS/BTR/BTC. Only CF is affected.
+            if op2 == 0xBA {
+                // Grp8 Ev,Ib: BT/BTS/BTR/BTC. Only CF is affected.
                 let (reg_field, is_reg, rm, ea_raw, ml) =
                     self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
                 let imm = self.read_u8(ip + (off + 2 + ml) as u64)? as u64;
                 let next = ip + (off + 2 + ml + 1) as u64;
-                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let ea = if rm == 0x100 {
+                    next.wrapping_add(ea_raw)
+                } else {
+                    ea_raw
+                };
                 let mask: u64 = match w {
                     64 => u64::MAX,
                     32 => 0xFFFF_FFFF,
@@ -1959,10 +2231,10 @@ impl Emu {
                 let v = self.read_rm(is_reg, rm, ea, w)? & mask;
                 self.cf = ((v >> idx) & 1) == 1;
                 let res = match reg_field {
-                    4 => v,              // BT: test only
-                    5 => v | (1 << idx), // BTS
+                    4 => v,               // BT: test only
+                    5 => v | (1 << idx),  // BTS
                     6 => v & !(1 << idx), // BTR
-                    7 => v ^ (1 << idx), // BTC
+                    7 => v ^ (1 << idx),  // BTC
                     _ => {
                         return Err(format!(
                             "unsupported Grp8 sub-op /{reg_field} at 0x{ip:016x}"
@@ -1981,7 +2253,11 @@ impl Emu {
                 let (reg, is_reg, rm, ea_raw, ml) =
                     self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
                 let next = ip + (off + 2 + ml) as u64;
-                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let ea = if rm == 0x100 {
+                    next.wrapping_add(ea_raw)
+                } else {
+                    ea_raw
+                };
                 if self.jcc_taken(op2 & 0xF)? {
                     let v = self.read_rm(is_reg, rm, ea, w)?;
                     self.write_rm(true, reg, 0, w, v)?;
@@ -1989,7 +2265,9 @@ impl Emu {
                 self.rip = next;
                 return Ok(StepResult::Continue);
             }
-            return Err(format!("unsupported 2-byte opcode 0F {op2:02X} at 0x{ip:016x}"));
+            return Err(format!(
+                "unsupported 2-byte opcode 0F {op2:02X} at 0x{ip:016x}"
+            ));
         }
 
         // jcc rel8
@@ -2160,13 +2438,14 @@ impl Emu {
                 let (imm, imm_len): (i64, usize) = if op == 0x6B {
                     (self.read_u8(ip + (off + 1 + ml) as u64)? as i8 as i64, 1)
                 } else {
-                    (
-                        self.read_u32(ip + (off + 1 + ml) as u64)? as i32 as i64,
-                        4,
-                    )
+                    (self.read_u32(ip + (off + 1 + ml) as u64)? as i32 as i64, 4)
                 };
                 let next = ip + (off + 1 + ml + imm_len) as u64;
-                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let ea = if rm == 0x100 {
+                    next.wrapping_add(ea_raw)
+                } else {
+                    ea_raw
+                };
                 let a = self.read_rm(is_reg, rm, ea, w)?;
                 let (trunc, of) = match w {
                     64 => {
@@ -2175,11 +2454,17 @@ impl Emu {
                     }
                     32 => {
                         let r = (a as u32 as i32 as i64) * imm;
-                        ((r as u32) as u64, r < i32::MIN as i64 || r > i32::MAX as i64)
+                        (
+                            (r as u32) as u64,
+                            r < i32::MIN as i64 || r > i32::MAX as i64,
+                        )
                     }
                     _ => {
                         let r = (a as u16 as i16 as i32) * (imm as i32);
-                        ((r as u16) as u64, r < i16::MIN as i32 || r > i16::MAX as i32)
+                        (
+                            (r as u16) as u64,
+                            r < i16::MIN as i32 || r > i16::MAX as i32,
+                        )
                     }
                 };
                 self.cf = of;
@@ -2195,7 +2480,8 @@ impl Emu {
                 self.push_u64(imm)?;
                 self.rip = ip + off as u64 + 5;
                 Ok(StepResult::Continue)
-            }            0x6A => {
+            }
+            0x6A => {
                 let imm = self.read_u8(ip + off as u64 + 1)? as i8 as i64 as u64;
                 self.push_u64(imm)?;
                 self.rip = ip + off as u64 + 2;
@@ -2283,23 +2569,39 @@ impl Emu {
                 self.rip = next.wrapping_add(disp as u64);
                 Ok(StepResult::Continue)
             }
-            0x88 | 0x89 | 0x8A | 0x8B | 0x8D | 0x01 | 0x03 | 0x29 | 0x2B | 0x31 | 0x33
-            | 0x39 | 0x3B | 0x09 | 0x0B | 0x21 | 0x23 | 0x84 | 0x85 | 0x63
-            | 0x00 | 0x02 | 0x08 | 0x0A | 0x20 | 0x22 | 0x28 | 0x2A | 0x30
-            | 0x32 | 0x38 | 0x3A | 0x10 | 0x12 | 0x18 | 0x1A | 0x11 | 0x13
-            | 0x19 | 0x1B => {
+            0x88 | 0x89 | 0x8A | 0x8B | 0x8D | 0x01 | 0x03 | 0x29 | 0x2B | 0x31 | 0x33 | 0x39
+            | 0x3B | 0x09 | 0x0B | 0x21 | 0x23 | 0x84 | 0x85 | 0x63 | 0x00 | 0x02 | 0x08 | 0x0A
+            | 0x20 | 0x22 | 0x28 | 0x2A | 0x30 | 0x32 | 0x38 | 0x3A | 0x10 | 0x12 | 0x18 | 0x1A
+            | 0x11 | 0x13 | 0x19 | 0x1B => {
                 let is_8 = op == 0x88
                     || op == 0x8A
                     || op == 0x84
                     || matches!(
                         op,
-                        0x00 | 0x02 | 0x08 | 0x0A | 0x20 | 0x22 | 0x28 | 0x2A | 0x30
-                            | 0x32 | 0x38 | 0x3A | 0x10 | 0x12 | 0x18 | 0x1A
+                        0x00 | 0x02
+                            | 0x08
+                            | 0x0A
+                            | 0x20
+                            | 0x22
+                            | 0x28
+                            | 0x2A
+                            | 0x30
+                            | 0x32
+                            | 0x38
+                            | 0x3A
+                            | 0x10
+                            | 0x12
+                            | 0x18
+                            | 0x1A
                     );
                 let (reg, is_reg, rm, ea_raw, ml) =
                     self.decode_modrm(ip, off + 1, rex_r, rex_x, rex_b, true)?;
                 let next = ip + (off + 1 + ml) as u64;
-                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let ea = if rm == 0x100 {
+                    next.wrapping_add(ea_raw)
+                } else {
+                    ea_raw
+                };
                 let width: u32 = if is_8 { 8 } else { w };
                 match op {
                     0x88 => {
@@ -2325,10 +2627,7 @@ impl Emu {
                             64 => self.regs[reg] = v,
                             32 => self.regs[reg] = v & 0xFFFF_FFFF,
                             // 16-bit: upper bits preserved
-                            _ => {
-                                self.regs[reg] =
-                                    (self.regs[reg] & !0xFFFF) | (v & 0xFFFF)
-                            }
+                            _ => self.regs[reg] = (self.regs[reg] & !0xFFFF) | (v & 0xFFFF),
                         }
                     }
                     0x8D => {
@@ -2367,8 +2666,21 @@ impl Emu {
                         // ALU r/m,r or r,r/m
                         let to_rm = matches!(
                             op,
-                            0x01 | 0x29 | 0x31 | 0x39 | 0x09 | 0x21 | 0x00 | 0x28 | 0x30
-                                | 0x38 | 0x08 | 0x20 | 0x10 | 0x18 | 0x11 | 0x19
+                            0x01 | 0x29
+                                | 0x31
+                                | 0x39
+                                | 0x09
+                                | 0x21
+                                | 0x00
+                                | 0x28
+                                | 0x30
+                                | 0x38
+                                | 0x08
+                                | 0x20
+                                | 0x10
+                                | 0x18
+                                | 0x11
+                                | 0x19
                         );
                         let omask: u64 = match width {
                             64 => u64::MAX,
@@ -2416,61 +2728,62 @@ impl Emu {
                         } else {
                             // add/sub/and/or/xor/cmp (no carry in)
                             let (res, is_sub, is_logic) = match op {
-                            0x01 | 0x03 | 0x00 | 0x02 => {
-                                (mv.wrapping_add(rv) & omask, false, false)
-                            }                            0x29 | 0x2B | 0x28 | 0x2A => (
+                                0x01 | 0x03 | 0x00 | 0x02 => {
+                                    (mv.wrapping_add(rv) & omask, false, false)
+                                }
+                                0x29 | 0x2B | 0x28 | 0x2A => (
+                                    if to_rm {
+                                        mv.wrapping_sub(rv) & omask
+                                    } else {
+                                        rv.wrapping_sub(mv) & omask
+                                    },
+                                    true,
+                                    false,
+                                ),
+                                0x31 | 0x33 | 0x30 | 0x32 => ((mv ^ rv) & omask, false, true),
+                                0x09 | 0x0B | 0x08 | 0x0A => ((mv | rv) & omask, false, true),
+                                0x21 | 0x23 | 0x20 | 0x22 => ((mv & rv) & omask, false, true),
+                                0x39 | 0x3B | 0x38 | 0x3A => (
+                                    if to_rm {
+                                        mv.wrapping_sub(rv) & omask
+                                    } else {
+                                        rv.wrapping_sub(mv) & omask
+                                    },
+                                    true,
+                                    false,
+                                ),
+                                _ => unreachable!(),
+                            };
+                            let is_cmp = matches!(op, 0x39 | 0x3B | 0x38 | 0x3A);
+                            if is_cmp {
+                                // cmp: set flags on (op1 - op2)
+                                let (a, b) = if to_rm { (mv, rv) } else { (rv, mv) };
+                                self.set_sub_flags(a, b, res, width);
+                            } else if is_logic {
+                                self.set_logic_flags(res, width);
                                 if to_rm {
-                                    mv.wrapping_sub(rv) & omask
+                                    self.write_rm(is_reg, rm, ea, width, res)?;
                                 } else {
-                                    rv.wrapping_sub(mv) & omask
-                                },
-                                true,
-                                false,
-                            ),
-                            0x31 | 0x33 | 0x30 | 0x32 => ((mv ^ rv) & omask, false, true),
-                            0x09 | 0x0B | 0x08 | 0x0A => ((mv | rv) & omask, false, true),
-                            0x21 | 0x23 | 0x20 | 0x22 => ((mv & rv) & omask, false, true),
-                            0x39 | 0x3B | 0x38 | 0x3A => (
+                                    self.write_rm(true, reg, 0, width, res)?;
+                                }
+                            } else if is_sub {
+                                let (a, b) = if to_rm { (mv, rv) } else { (rv, mv) };
+                                self.set_sub_flags(a, b, res, width);
                                 if to_rm {
-                                    mv.wrapping_sub(rv) & omask
+                                    self.write_rm(is_reg, rm, ea, width, res)?;
                                 } else {
-                                    rv.wrapping_sub(mv) & omask
-                                },
-                                true,
-                                false,
-                            ),
-                            _ => unreachable!(),
-                        };
-                        let is_cmp = matches!(op, 0x39 | 0x3B | 0x38 | 0x3A);
-                        if is_cmp {
-                            // cmp: set flags on (op1 - op2)
-                            let (a, b) = if to_rm { (mv, rv) } else { (rv, mv) };
-                            self.set_sub_flags(a, b, res, width);
-                        } else if is_logic {
-                            self.set_logic_flags(res, width);
-                            if to_rm {
-                                self.write_rm(is_reg, rm, ea, width, res)?;
+                                    self.write_rm(true, reg, 0, width, res)?;
+                                }
                             } else {
-                                self.write_rm(true, reg, 0, width, res)?;
+                                // add
+                                let (a, b) = if to_rm { (mv, rv) } else { (rv, mv) };
+                                self.set_add_flags(a, b, res, width);
+                                if to_rm {
+                                    self.write_rm(is_reg, rm, ea, width, res)?;
+                                } else {
+                                    self.write_rm(true, reg, 0, width, res)?;
+                                }
                             }
-                        } else if is_sub {
-                            let (a, b) = if to_rm { (mv, rv) } else { (rv, mv) };
-                            self.set_sub_flags(a, b, res, width);
-                            if to_rm {
-                                self.write_rm(is_reg, rm, ea, width, res)?;
-                            } else {
-                                self.write_rm(true, reg, 0, width, res)?;
-                            }
-                        } else {
-                            // add
-                            let (a, b) = if to_rm { (mv, rv) } else { (rv, mv) };
-                            self.set_add_flags(a, b, res, width);
-                            if to_rm {
-                                self.write_rm(is_reg, rm, ea, width, res)?;
-                            } else {
-                                self.write_rm(true, reg, 0, width, res)?;
-                            }
-                        }
                         } // end non-carry path
                     }
                 }
@@ -2639,20 +2952,18 @@ impl Emu {
                 let imm_off = off + 1 + ml;
                 // 0x83: imm8 sign-extended; 0x81: imm32 (imm16 with 0x66).
                 let (imm_raw, imm_len): (u64, usize) = if is8 {
-                    (
-                        self.read_u8(ip + imm_off as u64)? as i8 as i64 as u64,
-                        1,
-                    )
+                    (self.read_u8(ip + imm_off as u64)? as i8 as i64 as u64, 1)
                 } else if w == 16 {
                     (self.read_u16(ip + imm_off as u64)? as u64, 2)
                 } else {
-                    (
-                        self.read_u32(ip + imm_off as u64)? as i32 as i64 as u64,
-                        4,
-                    )
+                    (self.read_u32(ip + imm_off as u64)? as i32 as i64 as u64, 4)
                 };
                 let next = ip + (imm_off + imm_len) as u64;
-                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let ea = if rm == 0x100 {
+                    next.wrapping_add(ea_raw)
+                } else {
+                    ea_raw
+                };
                 // reg field selects op: /0 ADD /1 OR /2 ADC /3 SBB /4 AND /5 SUB /6 XOR /7 CMP
                 let omask: u64 = match w {
                     64 => u64::MAX,
@@ -2719,7 +3030,11 @@ impl Emu {
                     self.decode_modrm(ip, off + 1, rex_r, rex_x, rex_b, true)?;
                 let imm = self.read_u8(ip + (off + 1 + ml) as u64)? as u64;
                 let next = ip + (off + 1 + ml + 1) as u64;
-                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let ea = if rm == 0x100 {
+                    next.wrapping_add(ea_raw)
+                } else {
+                    ea_raw
+                };
                 let a = self.read_rm(is_reg, rm, ea, 8)?;
                 if reg_field == 2 || reg_field == 3 {
                     // ADC/SBB Eb,Ib: preserve the incoming carry while
@@ -2787,7 +3102,11 @@ impl Emu {
                     _ => (self.regs[1], 0), // 0xD2/0xD3: count in CL
                 };
                 let next = ip + (off + 1 + ml + imm_len) as u64;
-                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let ea = if rm == 0x100 {
+                    next.wrapping_add(ea_raw)
+                } else {
+                    ea_raw
+                };
                 let (mask, top) = match width {
                     64 => (u64::MAX, 63),
                     32 => (0xFFFF_FFFF, 31),
@@ -2860,11 +3179,9 @@ impl Emu {
                         };
                         s & mask
                     }
-                    _ => {
-                        return Err(format!(
-                            "unsupported rotate /{reg_field} at 0x{ip:016x} (only ROL/ROR/SHL/SHR/SAR)"
-                        ))
-                    }
+                    _ => return Err(format!(
+                        "unsupported rotate /{reg_field} at 0x{ip:016x} (only ROL/ROR/SHL/SHR/SAR)"
+                    )),
                 };
                 if count != 0 {
                     match reg_field {
@@ -2934,7 +3251,11 @@ impl Emu {
                     None
                 };
                 let next = ip + cursor as u64;
-                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let ea = if rm == 0x100 {
+                    next.wrapping_add(ea_raw)
+                } else {
+                    ea_raw
+                };
                 let mask: u64 = match width {
                     64 => u64::MAX,
                     32 => 0xFFFF_FFFF,
@@ -2970,8 +3291,7 @@ impl Emu {
                                     let r = self.regs[0] as u128 * opv as u128;
                                     (r as u64, (r >> 64) as u64, (r >> 64) != 0)
                                 } else {
-                                    let r = (self.regs[0] as i64 as i128)
-                                        * (opv as i64 as i128);
+                                    let r = (self.regs[0] as i64 as i128) * (opv as i64 as i128);
                                     let (lo, hi) = (r as u64, (r >> 64) as u64);
                                     let s = (lo as i64 >> 63) as u64;
                                     (lo, hi, hi != s)
@@ -2984,8 +3304,7 @@ impl Emu {
                                 } else {
                                     let r = (self.regs[0] as u32 as i32 as i64)
                                         * (opv as u32 as i32 as i64);
-                                    let (lo, hi) =
-                                        (r as u64 & mask, ((r >> 32) as u64) & mask);
+                                    let (lo, hi) = (r as u64 & mask, ((r >> 32) as u64) & mask);
                                     let s = ((lo as i64 >> 31) as u64) & mask;
                                     (lo, hi, hi != s)
                                 }
@@ -2997,8 +3316,7 @@ impl Emu {
                                 } else {
                                     let r = (self.regs[0] as u16 as i16 as i32)
                                         * (opv as u16 as i16 as i32);
-                                    let (lo, hi) =
-                                        ((r as u64) & mask, ((r >> 16) as u64) & mask);
+                                    let (lo, hi) = ((r as u64) & mask, ((r >> 16) as u64) & mask);
                                     let s = ((lo as i64 >> 15) as u64) & mask;
                                     (lo, hi, hi != s)
                                 }
@@ -3010,8 +3328,7 @@ impl Emu {
                                 } else {
                                     let r = (self.regs[0] as u8 as i8 as i16)
                                         * (opv as u8 as i8 as i16);
-                                    let (lo, hi) =
-                                        ((r as u64) & mask, ((r >> 8) as u64) & mask);
+                                    let (lo, hi) = ((r as u64) & mask, ((r >> 8) as u64) & mask);
                                     let s = ((lo as i64 >> 7) as u64) & mask;
                                     (lo, hi, hi != s)
                                 }
@@ -3087,8 +3404,7 @@ impl Emu {
                                     }
                                     (q, r)
                                 } else {
-                                    let d = (((dhi as u32 as i32 as i64) << 32)
-                                        | dlo as u32 as i64)
+                                    let d = (((dhi as u32 as i32 as i64) << 32) | dlo as u32 as i64)
                                         as i128;
                                     let o = opv as u32 as i32 as i128;
                                     if o == 0 {
@@ -3109,11 +3425,7 @@ impl Emu {
                                 // 16/8-bit share the u32 path with narrower limits
                                 let (dhi, dlo, bits) = match width {
                                     16 => (self.regs[2] & 0xFFFF, self.regs[0] & 0xFFFF, 16),
-                                    _ => (
-                                        (self.regs[0] >> 8) & 0xFF,
-                                        self.regs[0] & 0xFF,
-                                        8,
-                                    ),
+                                    _ => ((self.regs[0] >> 8) & 0xFF, self.regs[0] & 0xFF, 8),
                                 };
                                 if !signed {
                                     let d = (dhi << bits) | dlo;
@@ -3198,7 +3510,11 @@ impl Emu {
                 let (reg, is_reg, rm, ea_raw, ml) =
                     self.decode_modrm(ip, off + 1, rex_r, rex_x, rex_b, true)?;
                 let next = ip + (off + 1 + ml) as u64;
-                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let ea = if rm == 0x100 {
+                    next.wrapping_add(ea_raw)
+                } else {
+                    ea_raw
+                };
                 let a = self.read_rm(is_reg, rm, ea, width)?;
                 let b = match width {
                     64 => self.regs[reg],
@@ -3219,7 +3535,11 @@ impl Emu {
                 if op == 0xC6 {
                     let imm = self.read_u8(ip + (off + 1 + ml) as u64)?;
                     let next = ip + (off + 1 + ml + 1) as u64;
-                    let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                    let ea = if rm == 0x100 {
+                        next.wrapping_add(ea_raw)
+                    } else {
+                        ea_raw
+                    };
                     self.write_rm(is_reg, rm, ea, 8, imm as u64)?;
                     self.rip = next;
                 } else {
@@ -3230,7 +3550,11 @@ impl Emu {
                         (self.read_u32(ip + (off + 1 + ml) as u64)? as u64, 4)
                     };
                     let next = ip + (off + 1 + ml + imm_len) as u64;
-                    let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                    let ea = if rm == 0x100 {
+                        next.wrapping_add(ea_raw)
+                    } else {
+                        ea_raw
+                    };
                     let v = if w == 64 {
                         imm as i32 as i64 as u64
                     } else {
@@ -3385,7 +3709,10 @@ pub fn quote_arg(arg: &str) -> String {
     if arg.is_empty() {
         return "\"\"".to_string();
     }
-    if !arg.chars().any(|c| c == ' ' || c == '\t' || c == '"' || c == '\n') {
+    if !arg
+        .chars()
+        .any(|c| c == ' ' || c == '\t' || c == '"' || c == '\n')
+    {
         return arg.to_string();
     }
     let mut out = String::with_capacity(arg.len() + 2);
@@ -3472,8 +3799,11 @@ mod tests {
         let mut e = emu_with(&code);
         e.xmm[0] = 0x1122_3344_5566_7788_99AA_BBCC_DDEE_FF00;
         // preset a nonzero sentinel next to the cell to catch off-by-one stores
-        e.write_u128(BASE + 0x1000 + cell as u64, 0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF)
-            .unwrap();
+        e.write_u128(
+            BASE + 0x1000 + cell as u64,
+            0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF,
+        )
+        .unwrap();
         // step xorps -> zero
         assert!(matches!(e.step().unwrap(), StepResult::Continue));
         assert_eq!(e.xmm[0], 0);
@@ -3595,9 +3925,8 @@ mod tests {
     fn packed_word_immediate_shifts_cover_logical_and_arithmetic_forms() {
         // psrlw xmm0, 4; psraw xmm1, 20; psllw xmm2, 1
         let mut e = emu_with(&[
-            0x66, 0x0F, 0x71, 0xD0, 0x04,
-            0x66, 0x0F, 0x71, 0xE1, 0x14,
-            0x66, 0x0F, 0x71, 0xF2, 0x01,
+            0x66, 0x0F, 0x71, 0xD0, 0x04, 0x66, 0x0F, 0x71, 0xE1, 0x14, 0x66, 0x0F, 0x71, 0xF2,
+            0x01,
         ]);
         e.xmm[0] = u128::from_le_bytes([0x00, 0xF0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         e.xmm[1] = u128::from_le_bytes([0x00, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
@@ -3776,17 +4105,11 @@ mod tests {
         let e = run(&[0xB8, 0x80, 0x00, 0x00, 0x00, 0xC1, 0xE8, 0x03], 2);
         assert_eq!(e.regs[0], 0x10);
         // mov eax,-8; sar eax,1 -> -4, CF=0
-        let e = run(
-            &[0xB8, 0xF8, 0xFF, 0xFF, 0xFF, 0xC1, 0xF8, 0x01],
-            2,
-        );
+        let e = run(&[0xB8, 0xF8, 0xFF, 0xFF, 0xFF, 0xC1, 0xF8, 0x01], 2);
         assert_eq!(e.regs[0], 0xFFFF_FFFC);
         assert!(!e.cf);
         // shl by 1 sets CF from top bit: 0x80000000 << 1 -> 0, CF=1
-        let e = run(
-            &[0xB8, 0x00, 0x00, 0x00, 0x80, 0xC1, 0xE0, 0x01],
-            2,
-        );
+        let e = run(&[0xB8, 0x00, 0x00, 0x00, 0x80, 0xC1, 0xE0, 0x01], 2);
         assert_eq!(e.regs[0] & 0xFFFF_FFFF, 0);
         assert!(e.cf);
     }
@@ -3863,14 +4186,18 @@ mod tests {
         let base = 0x1400_0000_000u64 + 0x1000;
         for i in 0..16u64 {
             e.write_u8(base + cell_a as u64 + i, i as u8).unwrap();
-            e.write_u8(base + cell_b as u64 + i, (100 + i) as u8).unwrap();
+            e.write_u8(base + cell_b as u64 + i, (100 + i) as u8)
+                .unwrap();
         }
         step1(&[], &mut e);
         step1(&[], &mut e);
         step1(&[], &mut e);
         let got = e.read_bytes(base + cell_a as u64, 0).unwrap();
         let _ = got;
-        assert_eq!(e.xmm[0].to_le_bytes()[..], [0u8,100,1,101,2,102,3,103,4,104,5,105,6,106,7,107]);
+        assert_eq!(
+            e.xmm[0].to_le_bytes()[..],
+            [0u8, 100, 1, 101, 2, 102, 3, 103, 4, 104, 5, 105, 6, 106, 7, 107]
+        );
     }
 
     #[test]
@@ -3903,7 +4230,8 @@ mod tests {
         av[2] = 7;
         av[3] = 5;
         for i in 0..16u64 {
-            e.write_u8(base + cell_a as u64 + i, av[i as usize]).unwrap();
+            e.write_u8(base + cell_a as u64 + i, av[i as usize])
+                .unwrap();
             e.write_u8(base + cell_b as u64 + i, 7).unwrap();
         }
         for _ in 0..5 {
@@ -3942,15 +4270,15 @@ mod tests {
         code.extend_from_slice(&[0x66, 0x0F, 0xD7, 0xC0]);
         let cell = 96usize;
         // disp = target - (pos + len); movdqu is 8 bytes with F3 prefix
-        code[d0..d0 + 4]
-            .copy_from_slice(&((cell as i64 - (pos0 + 8) as i64) as i32).to_le_bytes());
+        code[d0..d0 + 4].copy_from_slice(&((cell as i64 - (pos0 + 8) as i64) as i32).to_le_bytes());
         let mut e = emu_with(&code);
         let base = 0x1400_0000_000u64 + 0x1000;
         // chunk: 0x72 at offset 9, zeros elsewhere... plus junk
         let mut chunk = [0x41u8; 16];
         chunk[9] = 0x72;
         for i in 0..16u64 {
-            e.write_u8(base + cell as u64 + i, chunk[i as usize]).unwrap();
+            e.write_u8(base + cell as u64 + i, chunk[i as usize])
+                .unwrap();
         }
         for _ in 0..8 {
             e.step().unwrap();
@@ -3985,8 +4313,7 @@ mod tests {
         // movdqu -0x10(%rdx,%r8,1),%xmm5
         // movdqu %xmm5,-0x10(%rcx,%r8,1)
         let mut e = emu_with(&[
-            0xF3, 0x42, 0x0F, 0x6F, 0x6C, 0x02, 0xF0,
-            0xF3, 0x42, 0x0F, 0x7F, 0x6C, 0x01, 0xF0,
+            0xF3, 0x42, 0x0F, 0x6F, 0x6C, 0x02, 0xF0, 0xF3, 0x42, 0x0F, 0x7F, 0x6C, 0x01, 0xF0,
         ]);
         let base = 0x1400_0000_000u64 + 0x2000;
         let src = base;
@@ -4123,10 +4450,7 @@ mod tests {
         e.regs[6] = base; // rsi
         e.regs[1] = 8; // rcx
         e.step().unwrap();
-        eprintln!(
-            "DBG xmm0={:032x}",
-            e.xmm[0]
-        );
+        eprintln!("DBG xmm0={:032x}", e.xmm[0]);
         assert_eq!(e.xmm[0].to_le_bytes()[..8], *b"IJKLMNOP", "xmm0");
         e.step().unwrap();
         assert_eq!(e.xmm[1].to_le_bytes()[..8], *b"IJKLMNOP", "xmm1");
@@ -4154,16 +4478,16 @@ mod tests {
         // F3 0F 10 C8: movss xmm1,xmm0 -> low 32 bits, high zeroed.
         let mut e = emu_with(&[0xF3, 0x0F, 0x10, 0xC8]);
         e.xmm[0] = u128::from_le_bytes([
-            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
-            0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00,
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
+            0xFF, 0x00,
         ]);
         e.xmm[1] = u128::from_le_bytes([0xFFu8; 16]);
         e.step().unwrap();
         assert_eq!(
             e.xmm[1].to_le_bytes(),
             [
-                0x11, 0x22, 0x33, 0x44, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x11, 0x22, 0x33, 0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00,
             ]
         );
         // F3 0F 11 m32,xmm: covered by the masked-loop integration below.
@@ -4251,18 +4575,20 @@ mod tests {
     fn adc_chains() {
         // stc; rax=-1; rbx=1; adc rax,rbx -> rax=1, CF=1
         let e = run(
-            &[0xF9, 0x48, 0xB8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-              0x48, 0xBB, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-              0x48, 0x11, 0xD8],
+            &[
+                0xF9, 0x48, 0xB8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x48, 0xBB, 0x01,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0x11, 0xD8,
+            ],
             4,
         );
         assert_eq!(e.regs[0], 1);
         assert!(e.cf);
         // clc; rax=5; rbx=3; adc rax,rbx -> 8, CF=0
         let e = run(
-            &[0xF8, 0x48, 0xB8, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-              0x48, 0xBB, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-              0x48, 0x11, 0xD8],
+            &[
+                0xF8, 0x48, 0xB8, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0xBB, 0x03,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0x11, 0xD8,
+            ],
             4,
         );
         assert_eq!(e.regs[0], 8);
@@ -4272,27 +4598,30 @@ mod tests {
     fn sbb_chains() {
         // clc; rax=5; rbx=3; sbb rax,rbx -> 2, CF=0
         let e = run(
-            &[0xF8, 0x48, 0xB8, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-              0x48, 0xBB, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-              0x48, 0x19, 0xD8],
+            &[
+                0xF8, 0x48, 0xB8, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0xBB, 0x03,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0x19, 0xD8,
+            ],
             4,
         );
         assert_eq!(e.regs[0], 2);
         assert!(!e.cf);
         // clc; rax=3; rbx=5; sbb -> 0xFFFF...FE, CF=1
         let e = run(
-            &[0xF8, 0x48, 0xB8, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-              0x48, 0xBB, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-              0x48, 0x19, 0xD8],
+            &[
+                0xF8, 0x48, 0xB8, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0xBB, 0x05,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0x19, 0xD8,
+            ],
             4,
         );
         assert_eq!(e.regs[0], 0xFFFF_FFFF_FFFF_FFFE);
         assert!(e.cf);
         // stc; rax=5; rbx=5; sbb -> -1, CF=1
         let e = run(
-            &[0xF9, 0x48, 0xB8, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-              0x48, 0xBB, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-              0x48, 0x19, 0xD8],
+            &[
+                0xF9, 0x48, 0xB8, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0xBB, 0x05,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0x19, 0xD8,
+            ],
             4,
         );
         assert_eq!(e.regs[0], 0xFFFF_FFFF_FFFF_FFFF);
@@ -4394,7 +4723,9 @@ mod tests {
     fn imul_imm() {
         // mov eax,7; imul eax,eax,6 -> 42
         let e = run2(
-            &[0xB8, 0x07, 0x00, 0x00, 0x00, 0x69, 0xC0, 0x06, 0x00, 0x00, 0x00],
+            &[
+                0xB8, 0x07, 0x00, 0x00, 0x00, 0x69, 0xC0, 0x06, 0x00, 0x00, 0x00,
+            ],
             2,
         );
         assert_eq!(e.regs[0] & 0xFFFF_FFFF, 42);
@@ -4423,10 +4754,9 @@ mod tests {
         // mov rax,42; mov rcx,5; xor edx,edx would zero rdx... use:
         // mov rax,42 (48 B8); mov rcx,5 (48 B9); mov rdx,0 (48 BA 0); div rcx (48 F7 F1)
         let mut e = emu_with(&[
-            0x48, 0xB8, 0x2A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x48, 0xB9, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x48, 0xBA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x48, 0xF7, 0xF1,
+            0x48, 0xB8, 0x2A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0xB9, 0x05, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0xBA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x48, 0xF7, 0xF1,
         ]);
         for _ in 0..4 {
             e.step().unwrap();
@@ -4495,7 +4825,8 @@ mod tests {
             0x41, 0x50, // push r8
             0x41, 0x5B, // pop r11
             0x4D, 0x89, 0xD9, // mov r9,r11
-            0x4D, 0x8B, 0xC3, // mov r8,rbx?? no: REX.WRB, 8B C3 = mov r8,rbx? modrm C3: reg 000 rm 011 +REX.B -> r11? rm=8+3=11=r11, reg=0+REX.R(1<<3)=8=r8: mov r8,r11
+            0x4D, 0x8B,
+            0xC3, // mov r8,rbx?? no: REX.WRB, 8B C3 = mov r8,rbx? modrm C3: reg 000 rm 011 +REX.B -> r11? rm=8+3=11=r11, reg=0+REX.R(1<<3)=8=r8: mov r8,r11
         ]);
         for _ in 0..7 {
             e.step().unwrap();
@@ -4580,12 +4911,7 @@ mod tests {
     fn subpd_addpd() {
         // Packed-double lanes, bit-identical via host f64 ops.
         let pack = |lo: f64, hi: f64| ((hi.to_bits() as u128) << 64) | lo.to_bits() as u128;
-        let unpack = |v: u128| {
-            (
-                f64::from_bits(v as u64),
-                f64::from_bits((v >> 64) as u64),
-            )
-        };
+        let unpack = |v: u128| (f64::from_bits(v as u64), f64::from_bits((v >> 64) as u64));
         // subpd xmm0,xmm7 (66 0F 5C C7).
         let mut e = emu_with(&[0x66, 0x0F, 0x5C, 0xC7]);
         e.xmm[0] = pack(1.5, 2.5);
@@ -4637,19 +4963,19 @@ mod tests {
         // unpckhpd xmm1,xmm0 (66 0F 15 C8): high qwords [d_hi, s_hi].
         let mut e = emu_with(&[0x66, 0x0F, 0x15, 0xC8]);
         e.xmm[1] = u128::from_le_bytes([
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-            0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+            0x0E, 0x0F,
         ]);
         e.xmm[0] = u128::from_le_bytes([
-            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
-            0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D,
+            0x1E, 0x1F,
         ]);
         e.step().unwrap();
         assert_eq!(
             e.xmm[1].to_le_bytes(),
             [
-                0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
-                0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
+                0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D,
+                0x1E, 0x1F,
             ]
         );
         // Plain UNPCKHPS fails clearly.
@@ -4662,8 +4988,8 @@ mod tests {
         // big to 0xFF), low 8 of each operand.
         let mut e = emu_with(&[0x66, 0x0F, 0x67, 0xC6]);
         e.xmm[0] = u128::from_le_bytes([
-            0xFF, 0xFF, 0x00, 0x01, 0xFF, 0x00, 0x00, 0x02,
-            0x7F, 0x00, 0x80, 0x00, 0xFF, 0x7F, 0x00, 0x80,
+            0xFF, 0xFF, 0x00, 0x01, 0xFF, 0x00, 0x00, 0x02, 0x7F, 0x00, 0x80, 0x00, 0xFF, 0x7F,
+            0x00, 0x80,
         ]);
         let mut hi = [0u8; 16];
         for i in 0..8 {
@@ -4675,8 +5001,8 @@ mod tests {
         assert_eq!(
             e.xmm[0].to_le_bytes(),
             [
-                0x00, 0xFF, 0xFF, 0xFF, 0x7F, 0x80, 0xFF, 0x00,
-                0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+                0x00, 0xFF, 0xFF, 0xFF, 0x7F, 0x80, 0xFF, 0x00, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
+                0x16, 0x17,
             ]
         );
     }
@@ -4731,19 +5057,19 @@ mod tests {
         // 66 0F 61 C6: interleave low words (a0,b0,a1,b1,...).
         let mut e = emu_with(&[0x66, 0x0F, 0x61, 0xC6]);
         e.xmm[0] = u128::from_le_bytes([
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-            0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+            0x0E, 0x0F,
         ]);
         e.xmm[6] = u128::from_le_bytes([
-            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
-            0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D,
+            0x1E, 0x1F,
         ]);
         e.step().unwrap();
         assert_eq!(
             e.xmm[0].to_le_bytes(),
             [
-                0x00, 0x01, 0x10, 0x11, 0x02, 0x03, 0x12, 0x13,
-                0x04, 0x05, 0x14, 0x15, 0x06, 0x07, 0x16, 0x17,
+                0x00, 0x01, 0x10, 0x11, 0x02, 0x03, 0x12, 0x13, 0x04, 0x05, 0x14, 0x15, 0x06, 0x07,
+                0x16, 0x17,
             ]
         );
     }
@@ -4753,19 +5079,19 @@ mod tests {
         // 66 0F 68 C6: xmm0 = interleave of high bytes (xmm0[8..], xmm6[8..]).
         let mut e = emu_with(&[0x66, 0x0F, 0x68, 0xC6]);
         e.xmm[0] = u128::from_le_bytes([
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-            0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+            0x0E, 0x0F,
         ]);
         e.xmm[6] = u128::from_le_bytes([
-            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
-            0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D,
+            0x1E, 0x1F,
         ]);
         e.step().unwrap();
         assert_eq!(
             e.xmm[0].to_le_bytes(),
             [
-                0x08, 0x18, 0x09, 0x19, 0x0A, 0x1A, 0x0B, 0x1B,
-                0x0C, 0x1C, 0x0D, 0x1D, 0x0E, 0x1E, 0x0F, 0x1F,
+                0x08, 0x18, 0x09, 0x19, 0x0A, 0x1A, 0x0B, 0x1B, 0x0C, 0x1C, 0x0D, 0x1D, 0x0E, 0x1E,
+                0x0F, 0x1F,
             ]
         );
     }
@@ -4774,19 +5100,19 @@ mod tests {
     fn unpcklps_reg() {
         let mut e = emu_with(&[0x0F, 0x14, 0xC6]);
         e.xmm[0] = u128::from_le_bytes([
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-            0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+            0x0E, 0x0F,
         ]);
         e.xmm[6] = u128::from_le_bytes([
-            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
-            0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D,
+            0x1E, 0x1F,
         ]);
         e.step().unwrap();
         assert_eq!(
             e.xmm[0].to_le_bytes(),
             [
-                0x00, 0x01, 0x02, 0x03, 0x10, 0x11, 0x12, 0x13,
-                0x08, 0x09, 0x0A, 0x0B, 0x18, 0x19, 0x1A, 0x1B,
+                0x00, 0x01, 0x02, 0x03, 0x10, 0x11, 0x12, 0x13, 0x08, 0x09, 0x0A, 0x0B, 0x18, 0x19,
+                0x1A, 0x1B,
             ]
         );
         // Prefixed spellings (UNPCKLPD et al.) fail clearly.
@@ -4794,7 +5120,8 @@ mod tests {
     }
 
     #[test]
-    fn bts_mem_bitstring() {        // bts qword [rip+cell],rax: bit 9 sets byte1 bit1 (string form).
+    fn bts_mem_bitstring() {
+        // bts qword [rip+cell],rax: bit 9 sets byte1 bit1 (string form).
         let cell = 32usize;
         let mut code = vec![0x48, 0x0F, 0xAB, 0x05];
         code.extend_from_slice(&rel32(0, 8, cell));
@@ -4808,5 +5135,4 @@ mod tests {
         assert_eq!(e.read_u8(base + cell as u64 + 1).unwrap(), 0x02);
         assert!(!e.cf);
     }
-
 }

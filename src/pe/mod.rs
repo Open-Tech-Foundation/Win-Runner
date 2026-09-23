@@ -170,6 +170,12 @@ pub const SUPPORTED_APIS: &[(&str, &str)] = &[
     ("KERNEL32.DLL", "Sleep"),
     ("KERNEL32.DLL", "SleepEx"),
     ("KERNEL32.DLL", "SwitchToThread"),
+    ("KERNEL32.DLL", "CreateThread"),
+    ("KERNEL32.DLL", "WaitForSingleObject"),
+    ("KERNEL32.DLL", "WaitForSingleObjectEx"),
+    ("API-MS-WIN-CORE-SYNCH-L1-2-0.DLL", "WaitOnAddress"),
+    ("API-MS-WIN-CORE-SYNCH-L1-2-0.DLL", "WakeByAddressAll"),
+    ("API-MS-WIN-CORE-SYNCH-L1-2-0.DLL", "WakeByAddressSingle"),
     ("KERNEL32.DLL", "TerminateProcess"),
     ("KERNEL32.DLL", "FlsAlloc"),
     ("KERNEL32.DLL", "FlsFree"),
@@ -193,9 +199,6 @@ pub const SUPPORTED_APIS: &[(&str, &str)] = &[
 /// `LastError=ERROR_CALL_NOT_IMPLEMENTED (120)`. Never silent success.
 /// Converted to real implementations on demand (execution traces decide).
 pub const STUB_APIS: &[(&str, &str)] = &[
-    ("API-MS-WIN-CORE-SYNCH-L1-2-0.DLL", "WaitOnAddress"),
-    ("API-MS-WIN-CORE-SYNCH-L1-2-0.DLL", "WakeByAddressAll"),
-    ("API-MS-WIN-CORE-SYNCH-L1-2-0.DLL", "WakeByAddressSingle"),
     ("NTDLL.DLL", "NtCreateNamedPipeFile"),
     ("NTDLL.DLL", "NtOpenFile"),
     ("NTDLL.DLL", "RtlNtStatusToDosError"),
@@ -206,7 +209,6 @@ pub const STUB_APIS: &[(&str, &str)] = &[
     ("KERNEL32.DLL", "CreateFileMappingW"),
     ("KERNEL32.DLL", "CreateMutexA"),
     ("KERNEL32.DLL", "CreateProcessW"),
-    ("KERNEL32.DLL", "CreateThread"),
     ("KERNEL32.DLL", "CreateWaitableTimerExW"),
     ("KERNEL32.DLL", "DuplicateHandle"),
     ("KERNEL32.DLL", "FlushFileBuffers"),
@@ -242,8 +244,6 @@ pub const STUB_APIS: &[(&str, &str)] = &[
     ("KERNEL32.DLL", "SetWaitableTimer"),
     ("KERNEL32.DLL", "UnhandledExceptionFilter"),
     ("KERNEL32.DLL", "UnmapViewOfFile"),
-    ("KERNEL32.DLL", "WaitForSingleObject"),
-    ("KERNEL32.DLL", "WaitForSingleObjectEx"),
     ("KERNEL32.DLL", "WriteFileEx"),
 ];
 
@@ -710,7 +710,9 @@ mod large_image_tests {
         exe[OPT + 56..OPT + 60].copy_from_slice(&(65 * 1024 * 1024u32).to_le_bytes());
         assert_eq!(load_lenient(&exe).unwrap().size_of_image, 65 * 1024 * 1024);
         exe[OPT + 56..OPT + 60].copy_from_slice(&(257 * 1024 * 1024u32).to_le_bytes());
-        assert!(load_lenient(&exe).unwrap_err().contains("invalid SizeOfImage"));
+        assert!(load_lenient(&exe)
+            .unwrap_err()
+            .contains("invalid SizeOfImage"));
     }
 
     #[test]
@@ -727,7 +729,9 @@ mod large_image_tests {
         exe[thunk..thunk + 8].copy_from_slice(&0x8000_0000_0000_0074u64.to_le_bytes());
         let image = load_lenient(&exe).unwrap();
         assert!(image.unsupported.iter().any(|item| item.func == "#116"));
-        assert!(load(&exe).unwrap_err().contains("ordinal imports not supported"));
+        assert!(load(&exe)
+            .unwrap_err()
+            .contains("ordinal imports not supported"));
     }
 
     #[test]
@@ -760,8 +764,13 @@ mod large_image_tests {
             .copy_from_slice(&(base + tls_rva as u64 + 0x50).to_le_bytes());
         exe[raw as usize + 0x50..raw as usize + 0x58]
             .copy_from_slice(&(base + SECTION_RVA as u64).to_le_bytes());
-        assert_eq!(load_lenient(&exe).unwrap().tls.unwrap().callbacks, vec![SECTION_RVA]);
-        assert!(load(&exe).unwrap_err().contains("TLS callbacks not supported"));
+        assert_eq!(
+            load_lenient(&exe).unwrap().tls.unwrap().callbacks,
+            vec![SECTION_RVA]
+        );
+        assert!(load(&exe)
+            .unwrap_err()
+            .contains("TLS callbacks not supported"));
         let report = crate::inspect::inspect_pe(&exe).unwrap();
         assert!(!report.runnable());
         assert_eq!(report.limitations, ["TLS callbacks unsupported: 1"]);

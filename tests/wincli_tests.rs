@@ -30,7 +30,11 @@ fn run_ps1_on_fs(fs: &mut WinFs, script: &str) -> Vec<u8> {
 
 fn tmp_path(name: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("wincli-test-{}-{}-{name}", std::process::id(), counter()));
+    p.push(format!(
+        "wincli-test-{}-{}-{name}",
+        std::process::id(),
+        counter()
+    ));
     p
 }
 
@@ -54,6 +58,96 @@ fn run_cli(file: &std::path::Path) -> (i32, String, String) {
         String::from_utf8_lossy(&output.stdout).to_string(),
         String::from_utf8_lossy(&output.stderr).to_string(),
     )
+}
+
+#[test]
+fn interpreter_guest_thread_waits_and_handle_errors() {
+    use pe::builder::{self, Asm};
+    let imports = [
+        ("KERNEL32.DLL", "CreateThread"),
+        ("KERNEL32.DLL", "WaitForSingleObject"),
+        ("KERNEL32.DLL", "Sleep"),
+        ("KERNEL32.DLL", "GetCurrentThreadId"),
+        ("KERNEL32.DLL", "CloseHandle"),
+        ("KERNEL32.DLL", "GetLastError"),
+        ("KERNEL32.DLL", "ExitProcess"),
+    ];
+    let mut a = Asm::new();
+    let shared = a.add_zeroed(8);
+    let fail = a.fresh_label();
+    a.sub_rsp(0x68);
+    a.xor_eax();
+    a.mov_rcx_rax();
+    a.mov_rdx_rax();
+    let start_patch = a.code.len() + 2;
+    a.emit(&[0x49, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0]); // mov r8, worker VA
+    a.lea_reg_rip(9, shared);
+    a.mov_rspoff_imm32(0x20, 0);
+    a.mov_rspoff_imm32(0x28, 0);
+    a.call_import(0);
+    a.test_rax_rax();
+    a.jz(fail);
+    a.mov_rspoff_rax(0x40);
+    a.mov_rcx_rax();
+    a.mov_edx_imm(0);
+    a.call_import(1);
+    a.cmp_eax_imm(258); // worker sleeps, so a zero-timeout poll must time out
+    a.jnz(fail);
+    a.mov_reg_rspoff(1, 0x40);
+    a.mov_edx_imm(u32::MAX);
+    a.call_import(1);
+    a.test_eax_eax();
+    a.jnz(fail);
+    a.mov_eax_mem_rip(shared);
+    a.cmp_eax_imm(42);
+    a.jnz(fail);
+    a.lea_reg_rip(1, shared);
+    a.emit(&[0x8B, 0x41, 0x04]); // mov eax, [rcx+4]
+    a.test_eax_eax();
+    a.jz(fail);
+    a.cmp_eax_imm(1); // worker ID differs from the main thread's ID
+    a.jz(fail);
+    a.mov_reg_rspoff(1, 0x40);
+    a.call_import(4);
+    a.cmp_eax_imm(1);
+    a.jnz(fail);
+    a.mov_reg_rspoff(1, 0x40);
+    a.mov_edx_imm(0);
+    a.call_import(1);
+    a.cmp_eax_imm(u32::MAX); // closed thread handle is invalid
+    a.jnz(fail);
+    a.call_import(5);
+    a.cmp_eax_imm(6); // ERROR_INVALID_HANDLE
+    a.jnz(fail);
+    a.mov_ecx_imm(42);
+    a.call_import(6);
+    a.mark(fail);
+    a.mov_ecx_imm(99);
+    a.call_import(6);
+
+    let worker_va = builder::IMAGE_BASE + u64::from(builder::SECTION_RVA) + a.code.len() as u64;
+    a.code[start_patch..start_patch + 8].copy_from_slice(&worker_va.to_le_bytes());
+    a.sub_rsp(0x38);
+    a.mov_rspoff_reg(0x30, 1); // preserve lpParameter across calls
+    a.mov_ecx_imm(5);
+    a.call_import(2);
+    a.call_import(3);
+    a.mov_reg_rspoff(1, 0x30);
+    a.emit(&[0x89, 0x41, 0x04]); // mov [rcx+4], eax (worker thread ID)
+    a.emit(&[0xC7, 0x01, 42, 0, 0, 0]); // mov dword [rcx], 42
+    a.mov_r32_imm(0, 7);
+    a.add_rsp(0x38);
+    a.ret();
+    let exe = builder::build(a, &imports);
+    let (code, _, _) = run_exe_on_fs(&exe, WinFs::new());
+    assert_eq!(code, 42);
+
+    let path = tmp_path("guest-thread.exe");
+    std::fs::write(&path, exe).unwrap();
+    let (code, stdout, stderr) = run_cli(&path);
+    std::fs::remove_file(&path).ok();
+    assert_eq!(code, 42, "stderr: {stderr}");
+    assert!(stdout.is_empty());
 }
 
 // ---------- 1: hello ----------
@@ -112,7 +206,10 @@ fn native_backend_runs_rust_argv_guest() {
 #[test]
 fn native_backend_runs_rust_fs_guest() {
     let bin = env!("CARGO_BIN_EXE_wincli");
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/artifacts/exe/rust_fs.exe");
+    let exe = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/artifacts/exe/rust_fs.exe"
+    );
     let output = Command::new(bin)
         .arg(exe)
         .env("WINCLI_BACKEND", "native")
@@ -126,7 +223,10 @@ fn native_backend_runs_rust_fs_guest() {
 #[test]
 fn native_backend_runs_rust_alloc_guest() {
     let bin = env!("CARGO_BIN_EXE_wincli");
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/artifacts/exe/rust_alloc.exe");
+    let exe = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/artifacts/exe/rust_alloc.exe"
+    );
     let output = Command::new(bin)
         .arg(exe)
         .env("WINCLI_BACKEND", "native")
@@ -157,7 +257,10 @@ fn native_backend_runs_rust_alloc_fs_guest() {
 #[test]
 fn native_backend_runs_rust_hashmap_guest() {
     let bin = env!("CARGO_BIN_EXE_wincli");
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/artifacts/exe/rust_hashmap.exe");
+    let exe = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/artifacts/exe/rust_hashmap.exe"
+    );
     let output = Command::new(bin)
         .arg(exe)
         .env("WINCLI_BACKEND", "native")
@@ -171,21 +274,30 @@ fn native_backend_runs_rust_hashmap_guest() {
 #[test]
 fn native_backend_runs_rust_lang_guest() {
     let bin = env!("CARGO_BIN_EXE_wincli");
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/artifacts/exe/rust_lang.exe");
+    let exe = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/artifacts/exe/rust_lang.exe"
+    );
     let output = Command::new(bin)
         .arg(exe)
         .env("WINCLI_BACKEND", "native")
         .output()
         .expect("spawn native backend");
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(output.stdout, b"P1\nP2\nP3\nP4\nP5\nP6\nP7\nP8\nP9\nP10\nP11\nP12\nP13\nP14\nP15\nP16\nPASS\n");
+    assert_eq!(
+        output.stdout,
+        b"P1\nP2\nP3\nP4\nP5\nP6\nP7\nP8\nP9\nP10\nP11\nP12\nP13\nP14\nP15\nP16\nPASS\n"
+    );
     assert!(output.stderr.is_empty());
 }
 
 #[test]
 fn native_backend_runs_rust_fp_guest() {
     let bin = env!("CARGO_BIN_EXE_wincli");
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/artifacts/exe/rust_fp.exe");
+    let exe = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/artifacts/exe/rust_fp.exe"
+    );
     let output = Command::new(bin)
         .arg(exe)
         .env("WINCLI_BACKEND", "native")
@@ -289,8 +401,14 @@ fn test4_ps1_file_ops() {
     "#;
     run_ps1_on_fs(&mut fs, script);
     // Set-Content adds trailing newline; Add-Content appends another line
-    assert_eq!(fs.read_file("C:\\psdir\\b.txt").unwrap(), b"hello-ps\nmore\n");
-    assert_eq!(fs.read_file("C:\\psdir\\d.txt").unwrap(), b"hello-ps\nmore\n");
+    assert_eq!(
+        fs.read_file("C:\\psdir\\b.txt").unwrap(),
+        b"hello-ps\nmore\n"
+    );
+    assert_eq!(
+        fs.read_file("C:\\psdir\\d.txt").unwrap(),
+        b"hello-ps\nmore\n"
+    );
     assert!(!fs.exists("C:\\psdir\\a.txt"));
     assert!(!fs.exists("C:\\psdir\\c.txt"));
 
@@ -308,7 +426,11 @@ fn test4_ps1_file_ops() {
 
     // end-to-end through CLI binary
     let p = tmp_path("ops.ps1");
-    std::fs::write(&p, "New-Item -Path \"C:\\x\" -ItemType Directory\nTest-Path \"C:\\x\"\n").unwrap();
+    std::fs::write(
+        &p,
+        "New-Item -Path \"C:\\x\" -ItemType Directory\nTest-Path \"C:\\x\"\n",
+    )
+    .unwrap();
     let (code, stdout, _) = run_cli(&p);
     std::fs::remove_file(&p).ok();
     assert_eq!(code, 0);
@@ -370,7 +492,10 @@ fn test6_dotdot_normalization() {
         &mut fs2,
         r#"New-Item -Path "C:\d1\d2" -ItemType Directory -Force"#,
     );
-    run_ps1_on_fs(&mut fs2, r#"Set-Content -Path "C:\d1\d2\x.txt" -Value "zz""#);
+    run_ps1_on_fs(
+        &mut fs2,
+        r#"Set-Content -Path "C:\d1\d2\x.txt" -Value "zz""#,
+    );
     let out = run_ps1_on_fs(&mut fs2, r#"Get-Content -Path "C:\d1\.\d2\..\d2\x.txt""#);
     assert_eq!(String::from_utf8(out).unwrap(), "zz\n");
 }
@@ -398,7 +523,11 @@ fn test7_no_host_side_effects() {
     assert!(fs.exists(&guest));
 
     // PS1 creates another
-    let sentinel2 = format!("wincli-sentinel-ps1-{}-{}.txt", std::process::id(), counter());
+    let sentinel2 = format!(
+        "wincli-sentinel-ps1-{}-{}.txt",
+        std::process::id(),
+        counter()
+    );
     let mut fs2 = WinFs::new();
     run_ps1_on_fs(
         &mut fs2,
@@ -407,7 +536,12 @@ fn test7_no_host_side_effects() {
     assert!(fs2.exists(&format!("C:\\{sentinel2}")));
 
     // host must still be clean (check cwd, /tmp, and crate root)
-    for dir in ["/tmp", ".", "target", "/media/G/WD_LINUX_FILES/projects/otf/Win-CLI"] {
+    for dir in [
+        "/tmp",
+        ".",
+        "target",
+        "/media/G/WD_LINUX_FILES/projects/otf/Win-CLI",
+    ] {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for e in entries.flatten() {
                 let n = e.file_name().to_string_lossy().to_string();
@@ -456,10 +590,7 @@ fn test9_exe_and_ps1_share_winfs() {
         std::any::type_name::<T>()
     }
     // Both runners are generic over the same concrete type.
-    assert_eq!(
-        type_name_of_val(&WinFs::new()),
-        "wincli::winfs::WinFs"
-    );
+    assert_eq!(type_name_of_val(&WinFs::new()), "wincli::winfs::WinFs");
 
     // EXE -> PS1 direction
     let mut fs = WinFs::new();
@@ -476,7 +607,10 @@ fn test9_exe_and_ps1_share_winfs() {
     // PS1 -> EXE direction
     let mut fs = WinFs::new();
     run_ps1_on_fs(&mut fs, r#"New-Item -Path "C:\shared" -ItemType Directory"#);
-    run_ps1_on_fs(&mut fs, r#"Set-Content -Path "C:\shared\back.txt" -Value "from-ps1""#);
+    run_ps1_on_fs(
+        &mut fs,
+        r#"Set-Content -Path "C:\shared\back.txt" -Value "from-ps1""#,
+    );
     let exe = pe::builder::read_file_to_stdout("C:\\shared\\back.txt");
     let (code, _, out) = run_exe_on_fs(&exe, fs);
     assert_eq!(code, 0);
@@ -763,9 +897,7 @@ fn test_install_inspect_run_offline_loop() {
     // cache layout: content-addressed blob + runnable + index
     assert!(cache.join("pkgs").join("demo.exe").is_file());
     assert!(cache.join("index").join("demo.json").is_file());
-    let blobs: Vec<_> = std::fs::read_dir(cache.join("archives"))
-        .unwrap()
-        .collect();
+    let blobs: Vec<_> = std::fs::read_dir(cache.join("archives")).unwrap().collect();
     assert_eq!(blobs.len(), 1);
 
     // inspect by cached package name
@@ -789,10 +921,16 @@ fn test_install_unknown_package() {
     let cc = cache.to_string_lossy().to_string();
     let (code, _, stderr) = run_wincli_env(
         &["install", "nope"],
-        &[("WINCLI_CACHE", cc.as_ref()), ("WINCLI_SOURCE", src.as_ref())],
+        &[
+            ("WINCLI_CACHE", cc.as_ref()),
+            ("WINCLI_SOURCE", src.as_ref()),
+        ],
     );
     assert_eq!(code, 1);
-    assert!(stderr.contains("package not found: nope"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("package not found: nope"),
+        "stderr: {stderr}"
+    );
     std::fs::remove_dir_all(&cache).ok();
 }
 
@@ -809,7 +947,10 @@ fn test_install_missing_source_dir() {
         .expect("spawn wincli");
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    assert!(stderr.contains("package source dir not found"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("package source dir not found"),
+        "stderr: {stderr}"
+    );
     std::fs::remove_dir_all(&cache).ok();
 }
 
@@ -817,12 +958,13 @@ fn test_install_missing_source_dir() {
 fn test_inspect_cache_miss_suggests_install() {
     let cache = isolated_cache("miss");
     let cc = cache.to_string_lossy().to_string();
-    let (code, _, stderr) = run_wincli_env(
-        &["inspect", "ghost-pkg"],
-        &[("WINCLI_CACHE", cc.as_ref())],
-    );
+    let (code, _, stderr) =
+        run_wincli_env(&["inspect", "ghost-pkg"], &[("WINCLI_CACHE", cc.as_ref())]);
     assert_eq!(code, 1);
-    assert!(stderr.contains("wincli install ghost-pkg"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("wincli install ghost-pkg"),
+        "stderr: {stderr}"
+    );
     std::fs::remove_dir_all(&cache).ok();
 }
 
@@ -863,7 +1005,12 @@ fn live_install_ripgrep() {
         .env_remove("WINCLI_SOURCE")
         .output()
         .expect("spawn wincli install");
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     assert!(stdout.starts_with("Installed rg "), "{stdout}");
     assert!(stdout.contains("→ C:\\bin\\rg.exe"), "{stdout}");
@@ -888,12 +1035,18 @@ fn live_install_ripgrep() {
     assert_eq!(stdout, "error: disk full\n");
     // A directory walk depends on distinct BY_HANDLE_FILE_INFORMATION IDs.
     let (code, stdout, stderr) = run_shell_env(
-        "New-Item C:\\data -ItemType Directory\nSet-Content C:\\data\\one.txt 'error: one'\nSet-Content C:\\data\\two.txt 'error: two'\nrg --threads 1 error C:\\data\nexit\n",
+        "New-Item C:\\data -ItemType Directory\nSet-Content C:\\data\\one.txt 'error: one'\nSet-Content C:\\data\\two.txt 'error: two'\nrg --threads 2 error C:\\data\nexit\n",
         &[("WINCLI_CACHE", cc.as_ref())],
     );
     assert_eq!(code, 0, "stderr: {stderr}");
-    assert!(stdout.contains("C:\\data\\one.txt:error: one\n"), "{stdout}");
-    assert!(stdout.contains("C:\\data\\two.txt:error: two\n"), "{stdout}");
+    assert!(
+        stdout.contains("C:\\data\\one.txt:error: one\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("C:\\data\\two.txt:error: two\n"),
+        "{stdout}"
+    );
     std::fs::remove_dir_all(&cache).ok();
 }
 
@@ -903,7 +1056,11 @@ fn live_install_ripgrep() {
 fn test_argv_echo_lib_level() {
     // controlled argv0 through the library
     let bytes = std::fs::read(artifact("exe/rust_argv.exe")).unwrap();
-    let args = ["hello".to_string(), "a b".to_string(), "--version".to_string()];
+    let args = [
+        "hello".to_string(),
+        "a b".to_string(),
+        "--version".to_string(),
+    ];
     let (code, _, out) =
         wincli::winapi::run_exe_argv(&bytes, WinFs::new(), "myprog.exe", &args).unwrap();
     assert_eq!(code, 0);
@@ -947,10 +1104,12 @@ fn test_bare_name_and_guest_path_resolution() {
 fn test_run_unknown_name_suggests_install() {
     let cache = isolated_cache("runknown");
     let cc = cache.to_string_lossy().to_string();
-    let (code, _, stderr) =
-        run_wincli_env(&["ghost-tool"], &[("WINCLI_CACHE", cc.as_ref())]);
+    let (code, _, stderr) = run_wincli_env(&["ghost-tool"], &[("WINCLI_CACHE", cc.as_ref())]);
     assert_eq!(code, 1);
-    assert!(stderr.contains("wincli install ghost-tool"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("wincli install ghost-tool"),
+        "stderr: {stderr}"
+    );
     std::fs::remove_dir_all(&cache).ok();
 }
 
@@ -961,7 +1120,10 @@ fn test_ps1_with_args_rejected() {
         &[],
     );
     assert_eq!(code, 2);
-    assert!(stderr.contains("script args not supported"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("script args not supported"),
+        "stderr: {stderr}"
+    );
 }
 
 #[test]
@@ -1139,7 +1301,11 @@ fn test_runner_boots_snapshot_file() {
     let input = tmp_path("snapshot-input");
     let path = tmp_path("runner.snap");
     std::fs::create_dir_all(input.join("C/actions-runner/_work")).unwrap();
-    std::fs::write(input.join("C/actions-runner/_work/from-snapshot.txt"), b"booted").unwrap();
+    std::fs::write(
+        input.join("C/actions-runner/_work/from-snapshot.txt"),
+        b"booted",
+    )
+    .unwrap();
     let bin = env!("CARGO_BIN_EXE_wincli");
     let built = Command::new(bin)
         .args(["snapshot", "build"])
@@ -1182,7 +1348,12 @@ fn test_named_instance_boot_status_and_destroy() {
         .env("WINCLI_INSTANCE_DIR", &state)
         .output()
         .expect("boot instance");
-    assert_eq!(boot.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&boot.stderr));
+    assert_eq!(
+        boot.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&boot.stderr)
+    );
     let status = Command::new(bin)
         .args(["instance", "status", &name])
         .env("WINCLI_INSTANCE_DIR", &state)
@@ -1203,7 +1374,12 @@ fn test_named_instance_boot_status_and_destroy() {
         .env("WINCLI_INSTANCE_DIR", &state)
         .output()
         .expect("write in instance");
-    assert_eq!(write.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&write.stderr));
+    assert_eq!(
+        write.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&write.stderr)
+    );
     let read = Command::new(bin)
         .args([
             "instance",
@@ -1216,14 +1392,24 @@ fn test_named_instance_boot_status_and_destroy() {
         .env("WINCLI_INSTANCE_DIR", &state)
         .output()
         .expect("read in instance");
-    assert_eq!(read.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&read.stderr));
+    assert_eq!(
+        read.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&read.stderr)
+    );
     assert_eq!(read.stdout, b"live\n");
     let destroy = Command::new(bin)
         .args(["instance", "destroy", &name])
         .env("WINCLI_INSTANCE_DIR", &state)
         .output()
         .expect("destroy instance");
-    assert_eq!(destroy.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&destroy.stderr));
+    assert_eq!(
+        destroy.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&destroy.stderr)
+    );
     std::fs::remove_dir_all(state).ok();
 }
 
@@ -1240,7 +1426,10 @@ fn test_shell_install_run_session_offline() {
     let input = "install demo\ndemo\nNew-Item C:\\shell-t.txt -Value hi\nGet-Content C:\\shell-t.txt\n$v = 42\necho \"v=$v\"\nif ($v -eq 42) { echo if-ok }\n$langs = @('a', 'b')\nif ('a' -in $langs) { echo in-ok }\nswitch ('q') { 'q' { echo sw-ok } }\nfunction Hi($n) { echo \"hi-$n\" }\nforeach ($i in @('a', 'b')) { Hi $i }\n$ht = @{}\n$ht['k'] = 'v'\nif ($ht.ContainsKey('k')) { echo ht-ok }\ntry { echo try-ok } catch { echo bad }\n$cap = Join-Path 'C:\\x' 'y'\necho $cap\necho $cap | Out-Null\n$m = 'aBc'\necho $m.ToUpper()\n[Environment]::SetEnvironmentVariable('WINCLI_E2E_XYZ', 'e2e-ok', 'User')\necho $([Environment]::GetEnvironmentVariable('WINCLI_E2E_XYZ'))\necho '[{\"tag_name\": \"esrun@0.24.0\"}, {\"tag_name\": \"other\"}]' | ForEach-Object { $_.tag_name } | Where-Object { $_ -match \"esrun\" } | Select-Object -First 1\necho done\nexit\n";
     let (code, stdout, stderr) = run_shell_env(input, &envs);
     assert_eq!(code, 0, "stderr: {stderr}");
-    assert!(stdout.contains("Installed demo 0.1.0 → C:\\bin\\demo.exe"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("Installed demo 0.1.0 → C:\\bin\\demo.exe"),
+        "stdout: {stdout}"
+    );
     assert!(stdout.contains("demo 0.1.0"), "stdout: {stdout}");
     assert!(stdout.contains("hi\n"), "stdout: {stdout}");
     assert!(stdout.contains("v=42\n"), "stdout: {stdout}");
@@ -1254,7 +1443,8 @@ fn test_shell_install_run_session_offline() {
     assert!(stdout.contains("ABC\n"), "stdout: {stdout}");
     assert!(stdout.contains("e2e-ok\n"), "stdout: {stdout}");
     assert!(stdout.contains("esrun@0.24.0\n"), "stdout: {stdout}");
-    assert!(stdout.ends_with("done\n"), "stdout: {stdout}");    assert!(cache.join("pkgs").join("demo.exe").is_file());
+    assert!(stdout.ends_with("done\n"), "stdout: {stdout}");
+    assert!(cache.join("pkgs").join("demo.exe").is_file());
     std::fs::remove_dir_all(&cache).ok();
 }
 
@@ -1262,7 +1452,8 @@ fn test_shell_install_run_session_offline() {
 fn test_shell_unknown_and_bad_exit() {
     let cache = isolated_cache("shell-err");
     let cc = cache.to_string_lossy().to_string();
-    let (code, stdout, stderr) = run_shell_env("frobnicate\nexit abc\n", &[("WINCLI_CACHE", cc.as_ref())]);
+    let (code, stdout, stderr) =
+        run_shell_env("frobnicate\nexit abc\n", &[("WINCLI_CACHE", cc.as_ref())]);
     // Errors print and the shell continues; a bad exit code is an error,
     // EOF ends the session cleanly.
     assert_eq!(code, 0, "stderr: {stderr}");

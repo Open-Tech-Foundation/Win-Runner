@@ -7,11 +7,12 @@
 //! GetConsoleOutputCP, SetConsoleTextAttribute, ReadConsoleW.
 //! Anything else fails at load time (`pe::load` rejects unknown imports).
 
-use crate::pe::emu::{Emu, StepResult};
-use crate::pe::PeImage;
+use crate::pe::emu::{CpuState, Emu, StepResult};
+use crate::pe::{PeImage, TlsDir};
 use crate::winfs::WinFs;
 use std::collections::HashMap;
 use std::io::IsTerminal;
+use std::time::{Duration, Instant};
 
 pub const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6; // -10
 pub const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5; // -11
@@ -42,6 +43,33 @@ struct FindSearch {
     index: usize,
 }
 
+enum ThreadState {
+    Runnable,
+    WaitingThread {
+        handle: u64,
+        deadline: Option<Instant>,
+    },
+    WaitingAddress {
+        address: u64,
+        expected: Vec<u8>,
+        deadline: Option<Instant>,
+    },
+    Sleeping(Instant),
+    WaitingCritical(u64),
+    Finished,
+}
+
+struct GuestThread {
+    id: u32,
+    handle: u64,
+    open: bool,
+    cpu: CpuState,
+    last_error: u32,
+    fls: Vec<Option<u64>>,
+    state: ThreadState,
+    critical_depth: u32,
+}
+
 pub struct Runner {
     pub emu: Emu,
     pub fs: WinFs,
@@ -64,12 +92,19 @@ pub struct Runner {
     /// Fiber-local slots (`FlsAlloc` family; index+1 is the DWORD value so
     /// slot 0 stays a valid index).
     fls: Vec<Option<u64>>,
+    fls_count: usize,
     /// argv0 as typed (for `GetModuleFileNameW` approximation).
     prog: String,
     /// QPC epoch.
     start: std::time::Instant,
     /// Cached `GetEnvironmentStringsW` block (0 = not built yet).
     env_block: u64,
+    threads: Vec<GuestThread>,
+    current_thread: usize,
+    next_thread_id: u32,
+    switch_requested: bool,
+    critical_sections: HashMap<u64, (usize, u32)>,
+    tls_template: Option<TlsDir>,
 }
 
 impl Runner {
@@ -93,6 +128,7 @@ impl Runner {
         let mut emu = Emu::new(img)?;
         emu.alloc_cmdline(prog, args)?;
         setup_tls(&mut emu, img)?;
+        let main_cpu = emu.cpu_state();
         Ok(Self {
             emu,
             fs,
@@ -106,9 +142,25 @@ impl Runner {
             last_error: 0,
             env_overlay: HashMap::new(),
             fls: Vec::new(),
+            fls_count: 0,
             prog: prog.to_string(),
             start: std::time::Instant::now(),
             env_block: 0,
+            threads: vec![GuestThread {
+                id: 1,
+                handle: 0,
+                open: false,
+                cpu: main_cpu,
+                last_error: 0,
+                fls: Vec::new(),
+                state: ThreadState::Runnable,
+                critical_depth: 0,
+            }],
+            current_thread: 0,
+            next_thread_id: 2,
+            switch_requested: false,
+            critical_sections: HashMap::new(),
+            tls_template: img.tls.clone(),
         })
     }
 
@@ -131,7 +183,10 @@ impl Runner {
                 })
                 .unwrap_or_else(|_| "(unmapped)".to_string())
         };
-        s.push_str(&format!("\nrip-32: {}", hex(self.emu.rip.wrapping_sub(32), 64)));
+        s.push_str(&format!(
+            "\nrip-32: {}",
+            hex(self.emu.rip.wrapping_sub(32), 64)
+        ));
         s.push_str(&format!("\nrsp:    {}", hex(self.emu.rsp(), 64)));
         for (name, r) in [("rsi", 6), ("rdi", 7), ("r14", 14), ("r15", 15)] {
             s.push_str(&format!("\n{name}:    {}", hex(self.emu.regs[r], 64)));
@@ -148,6 +203,118 @@ impl Runner {
         self.emu.stdout.extend_from_slice(data);
         if let Some(sink) = self.console_sink.as_mut() {
             sink(data);
+        }
+    }
+
+    fn thread_tls(&mut self) -> Result<u64, String> {
+        use crate::pe::emu::{TEB_PEB_OFF, TEB_SELF_OFF, TEB_SIZE, TEB_TLS_OFF};
+        let Some(tls) = &self.tls_template else {
+            return Ok(0);
+        };
+        let data = self
+            .emu
+            .heap_alloc((tls.raw_data.len() + tls.zero_fill as usize).max(8));
+        let array = self.emu.heap_alloc(64 * 8);
+        let teb = self.emu.heap_alloc(TEB_SIZE);
+        if data == 0 || array == 0 || teb == 0 {
+            return Err("out of guest memory for thread TLS".to_string());
+        }
+        self.emu.write_bytes(data, &tls.raw_data)?;
+        self.emu.write_u64(array, data)?;
+        self.emu.write_u64(teb + TEB_SELF_OFF, teb)?;
+        self.emu.write_u64(teb + TEB_TLS_OFF, array)?;
+        let peb = self.emu.read_u64(self.emu.gs_base + TEB_PEB_OFF)?;
+        self.emu.write_u64(teb + TEB_PEB_OFF, peb)?;
+        Ok(teb)
+    }
+
+    fn refresh_waiters(&mut self) -> Result<(), String> {
+        let now = Instant::now();
+        let finished: Vec<u64> = self
+            .threads
+            .iter()
+            .filter_map(|thread| {
+                if matches!(thread.state, ThreadState::Finished) {
+                    Some(thread.handle)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for thread in &mut self.threads {
+            let result = match &thread.state {
+                ThreadState::WaitingThread { handle, deadline } => {
+                    if finished.contains(handle) {
+                        Some(0)
+                    } else if deadline.is_some_and(|at| now >= at) {
+                        Some(258)
+                    } else {
+                        None
+                    }
+                }
+                ThreadState::WaitingAddress {
+                    address,
+                    expected,
+                    deadline,
+                } => {
+                    if self.emu.read_bytes(*address, expected.len())? != *expected {
+                        Some(1)
+                    } else if deadline.is_some_and(|at| now >= at) {
+                        Some(0)
+                    } else {
+                        None
+                    }
+                }
+                ThreadState::Sleeping(at) if now >= *at => Some(0),
+                _ => None,
+            };
+            if let Some(value) = result {
+                if value == 0 && matches!(thread.state, ThreadState::WaitingAddress { .. }) {
+                    thread.last_error = 1460; // ERROR_TIMEOUT
+                }
+                thread.cpu.regs[0] = value;
+                thread.state = ThreadState::Runnable;
+            }
+        }
+        Ok(())
+    }
+
+    fn schedule(&mut self) -> Result<(), String> {
+        let current = self.current_thread;
+        self.threads[current].cpu = self.emu.cpu_state();
+        self.threads[current].last_error = self.last_error;
+        self.threads[current].fls = std::mem::take(&mut self.fls);
+        loop {
+            self.refresh_waiters()?;
+            let next = (1..=self.threads.len())
+                .map(|offset| (current + offset) % self.threads.len())
+                .find(|&idx| matches!(self.threads[idx].state, ThreadState::Runnable));
+            if let Some(next) = next {
+                self.current_thread = next;
+                self.emu.restore_cpu(&self.threads[next].cpu);
+                self.last_error = self.threads[next].last_error;
+                self.fls = std::mem::take(&mut self.threads[next].fls);
+                self.switch_requested = false;
+                return Ok(());
+            }
+            let deadline = self
+                .threads
+                .iter()
+                .filter_map(|thread| match &thread.state {
+                    ThreadState::WaitingThread { deadline, .. }
+                    | ThreadState::WaitingAddress { deadline, .. } => *deadline,
+                    ThreadState::Sleeping(at) => Some(*at),
+                    _ => None,
+                })
+                .min();
+            let Some(deadline) = deadline else {
+                return Err("guest threads are deadlocked".to_string());
+            };
+            std::thread::sleep(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(1)),
+            );
         }
     }
 
@@ -224,7 +391,11 @@ impl Runner {
                 }]);
             }
             if self.fs.is_file(&full) {
-                let len = self.fs.read_file(&full).map(|v| v.len() as u64).unwrap_or(0);
+                let len = self
+                    .fs
+                    .read_file(&full)
+                    .map(|v| v.len() as u64)
+                    .unwrap_or(0);
                 return Ok(vec![FindEntry {
                     name: pat.to_string(),
                     attrs: 0x80,
@@ -244,13 +415,25 @@ impl Runner {
             }
             let full = format!("{}\\{name}", dir.trim_end_matches(['\\', '/']));
             if self.fs.is_dir(&full) {
-                out.push(FindEntry { name, attrs: 0x10, len: 0 });
+                out.push(FindEntry {
+                    name,
+                    attrs: 0x10,
+                    len: 0,
+                });
             } else if self.fs.is_file(&full) {
                 if dirs_only {
                     continue;
                 }
-                let len = self.fs.read_file(&full).map(|v| v.len() as u64).unwrap_or(0);
-                out.push(FindEntry { name, attrs: 0x80, len });
+                let len = self
+                    .fs
+                    .read_file(&full)
+                    .map(|v| v.len() as u64)
+                    .unwrap_or(0);
+                out.push(FindEntry {
+                    name,
+                    attrs: 0x80,
+                    len,
+                });
             }
         }
         Ok(out)
@@ -272,17 +455,19 @@ impl Runner {
     }
 
     pub fn run(mut self) -> Result<(u32, WinFs, Vec<u8>), String> {
-        let trace = std::env::var("WINCLI_TRACE").map(|v| v == "1").unwrap_or(false);
+        let trace = std::env::var("WINCLI_TRACE")
+            .map(|v| v == "1")
+            .unwrap_or(false);
         let dump = std::env::var("WINCLI_DUMP_ON_ERROR")
             .map(|v| v == "1")
             .unwrap_or(false);
         let mut last_steps = 0u64;
+        let mut slice_steps = 0u32;
         loop {
             let rip = self.emu.rip;
             let step_res = match self.emu.step() {
                 Err(e) => {
-                    let mut msg =
-                        format!("{e} (rip=0x{rip:016x} {})", self.emu.regs_summary());
+                    let mut msg = format!("{e} (rip=0x{rip:016x} {})", self.emu.regs_summary());
                     if dump {
                         msg.push_str(&self.post_mortem());
                     }
@@ -293,6 +478,12 @@ impl Runner {
             match step_res {
                 StepResult::Continue => {}
                 StepResult::Halted(code) => {
+                    if self.current_thread != 0 {
+                        self.threads[self.current_thread].state = ThreadState::Finished;
+                        self.schedule()?;
+                        slice_steps = 0;
+                        continue;
+                    }
                     if trace {
                         eprintln!("[trace] halt exit={code} steps={}", self.emu.step_count());
                     }
@@ -312,13 +503,31 @@ impl Runner {
                     }
                     if self.do_shim(index)? {
                         if trace {
-                            eprintln!("[trace] halt exit={} steps={}", self.exit_code.unwrap(), self.emu.step_count());
+                            eprintln!(
+                                "[trace] halt exit={} steps={}",
+                                self.exit_code.unwrap(),
+                                self.emu.step_count()
+                            );
                         }
                         let code = self.exit_code.unwrap();
                         let fs = std::mem::replace(&mut self.fs, WinFs::new());
                         return Ok((code, fs, std::mem::take(&mut self.emu.stdout)));
                     }
                 }
+            }
+            slice_steps += 1;
+            let blocked = !matches!(
+                self.threads[self.current_thread].state,
+                ThreadState::Runnable
+            );
+            if blocked
+                || self.switch_requested
+                || (slice_steps >= 10_000
+                    && self.threads.len() > 1
+                    && self.threads[self.current_thread].critical_depth == 0)
+            {
+                self.schedule()?;
+                slice_steps = 0;
             }
         }
     }
@@ -395,9 +604,10 @@ impl Runner {
                     // writing to stdin handle fails
                     ret_bool!(0);
                 } else {
-                    let fh = self.handles.get_mut(&h).ok_or_else(|| {
-                        format!("WriteFile: invalid handle 0x{h:016x}")
-                    })?;
+                    let fh = self
+                        .handles
+                        .get_mut(&h)
+                        .ok_or_else(|| format!("WriteFile: invalid handle 0x{h:016x}"))?;
                     // read-modify-write at offset
                     let mut content = self
                         .fs
@@ -509,9 +719,10 @@ impl Runner {
                 } else if h == 1 || h == 2 {
                     ret_bool!(0);
                 } else {
-                    let fh = self.handles.get_mut(&h).ok_or_else(|| {
-                        format!("ReadFile: invalid handle 0x{h:016x}")
-                    })?;
+                    let fh = self
+                        .handles
+                        .get_mut(&h)
+                        .ok_or_else(|| format!("ReadFile: invalid handle 0x{h:016x}"))?;
                     let content = self
                         .fs
                         .read_file(&fh.path)
@@ -534,7 +745,15 @@ impl Runner {
                 }
                 if self.handles.remove(&h).is_some() {
                     ret_bool!(1);
+                } else if let Some(thread) = self
+                    .threads
+                    .iter_mut()
+                    .find(|thread| thread.handle == h && thread.open)
+                {
+                    thread.open = false;
+                    ret_bool!(1);
                 } else {
+                    self.last_error = 6;
                     ret_bool!(0);
                 }
             }
@@ -795,8 +1014,7 @@ impl Runner {
                         ret_bool!(0);
                     }
                 };
-                let units: Vec<u16> =
-                    val.encode_utf16().chain(std::iter::once(0)).collect();
+                let units: Vec<u16> = val.encode_utf16().chain(std::iter::once(0)).collect();
                 if n == 0 {
                     ret_bool!(units.len() as u64);
                 }
@@ -925,7 +1143,7 @@ impl Runner {
                 ret_bool!(std::process::id() as u64);
             }
             "GetCurrentThreadId" => {
-                ret_bool!(1); // single-threaded guest model
+                ret_bool!(self.threads[self.current_thread].id as u64);
             }
             "GetFileType" => {
                 if rcx <= 2 {
@@ -941,8 +1159,12 @@ impl Runner {
                 // (nBufferLength, lpBuffer): length first.
                 let n = (rcx & 0xFFFF_FFFF) as usize;
                 let buf = rdx;
-                let units: Vec<u16> =
-                    self.fs.cwd().encode_utf16().chain(std::iter::once(0)).collect();
+                let units: Vec<u16> = self
+                    .fs
+                    .cwd()
+                    .encode_utf16()
+                    .chain(std::iter::once(0))
+                    .collect();
                 if n == 0 {
                     ret_bool!(units.len() as u64);
                 }
@@ -991,8 +1213,7 @@ impl Runner {
                     .get(&h)
                     .map(|fh| fh.path.clone())
                     .ok_or_else(|| format!("bad file handle 0x{h:016x}"))?;
-                let units: Vec<u16> =
-                    path.encode_utf16().chain(std::iter::once(0)).collect();
+                let units: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
                 if n == 0 {
                     ret_bool!(units.len() as u64);
                 }
@@ -1096,14 +1317,10 @@ impl Runner {
                     ));
                 }
                 if op > 1 {
-                    return Err(format!(
-                        "FindFirstFileExW: search op {op} is not supported"
-                    ));
+                    return Err(format!("FindFirstFileExW: search op {op} is not supported"));
                 }
                 if filter != 0 {
-                    return Err(
-                        "FindFirstFileExW: search filter is not supported".to_string()
-                    );
+                    return Err("FindFirstFileExW: search filter is not supported".to_string());
                 }
                 let entries = self.find_matches(&raw, op == 1)?;
                 if entries.is_empty() {
@@ -1275,20 +1492,141 @@ impl Runner {
                 }
             }
             "Sleep" => {
-                std::thread::sleep(std::time::Duration::from_millis(
-                    (rcx & 0xFFFF_FFFF) as u64,
-                ));
+                let millis = (rcx & 0xFFFF_FFFF) as u64;
+                if millis == 0 {
+                    self.switch_requested = true;
+                } else {
+                    self.threads[self.current_thread].state =
+                        ThreadState::Sleeping(Instant::now() + Duration::from_millis(millis));
+                }
                 ret_bool!(0);
             }
             "SleepEx" => {
-                std::thread::sleep(std::time::Duration::from_millis(
-                    (rcx & 0xFFFF_FFFF) as u64,
-                ));
+                let millis = (rcx & 0xFFFF_FFFF) as u64;
+                if millis == 0 {
+                    self.switch_requested = true;
+                } else {
+                    self.threads[self.current_thread].state =
+                        ThreadState::Sleeping(Instant::now() + Duration::from_millis(millis));
+                }
                 ret_bool!(0);
             }
             "SwitchToThread" => {
-                std::thread::yield_now();
+                let has_other = self.threads.iter().enumerate().any(|(index, thread)| {
+                    index != self.current_thread && matches!(thread.state, ThreadState::Runnable)
+                });
+                self.switch_requested = has_other;
+                ret_bool!(u64::from(has_other));
+            }
+            "CreateThread" => {
+                let flags = self.emu.stack_arg(4)? as u32;
+                let id_out = self.emu.stack_arg(5)?;
+                // Rust's Windows thread builder uses 0x10000 to mark the
+                // requested stack size as a reservation.
+                if r8 == 0 || flags & !0x10000 != 0 || self.next_thread_id == u32::MAX {
+                    self.last_error = 87;
+                    ret_bool!(0);
+                }
+                let gs_base = match self.thread_tls() {
+                    Ok(value) => value,
+                    Err(_) => {
+                        self.last_error = 8;
+                        ret_bool!(0);
+                    }
+                };
+                let cpu = match self.emu.thread_cpu(r8, r9, rdx as usize, gs_base) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        self.last_error = 8;
+                        ret_bool!(0);
+                    }
+                };
+                let id = self.next_thread_id;
+                self.next_thread_id += 1;
+                let handle = 0x8000_0000u64 + u64::from(id);
+                if id_out != 0 {
+                    self.emu.write_u32(id_out, id)?;
+                }
+                self.threads.push(GuestThread {
+                    id,
+                    handle,
+                    open: true,
+                    cpu,
+                    last_error: 0,
+                    fls: vec![None; self.fls_count],
+                    state: ThreadState::Runnable,
+                    critical_depth: 0,
+                });
+                self.switch_requested = true;
+                ret_bool!(handle);
+            }
+            "WaitForSingleObject" | "WaitForSingleObjectEx" => {
+                let millis = (rdx & 0xFFFF_FFFF) as u32;
+                let target = self
+                    .threads
+                    .iter()
+                    .find(|thread| thread.handle == rcx && thread.open);
+                match target {
+                    None => {
+                        self.last_error = 6;
+                        ret_bool!(0xFFFF_FFFF);
+                    }
+                    Some(thread) if matches!(thread.state, ThreadState::Finished) => ret_bool!(0),
+                    Some(_) if millis == 0 => ret_bool!(258),
+                    Some(_) => {
+                        let deadline = if millis == u32::MAX {
+                            None
+                        } else {
+                            Instant::now().checked_add(Duration::from_millis(u64::from(millis)))
+                        };
+                        self.threads[self.current_thread].state = ThreadState::WaitingThread {
+                            handle: rcx,
+                            deadline,
+                        };
+                        ret_bool!(0);
+                    }
+                }
+            }
+            "WaitOnAddress" => {
+                let size = r8 as usize;
+                if !matches!(size, 1 | 2 | 4 | 8) || rcx == 0 || rdx == 0 {
+                    self.last_error = 87;
+                    ret_bool!(0);
+                }
+                let expected = self.emu.read_bytes(rdx, size)?;
+                if self.emu.read_bytes(rcx, size)? != expected {
+                    ret_bool!(1);
+                }
+                let millis = (r9 & 0xFFFF_FFFF) as u32;
+                if millis == 0 {
+                    self.last_error = 1460;
+                    ret_bool!(0);
+                }
+                let deadline = if millis == u32::MAX {
+                    None
+                } else {
+                    Instant::now().checked_add(Duration::from_millis(u64::from(millis)))
+                };
+                self.threads[self.current_thread].state = ThreadState::WaitingAddress {
+                    address: rcx,
+                    expected,
+                    deadline,
+                };
                 ret_bool!(1);
+            }
+            "WakeByAddressSingle" | "WakeByAddressAll" => {
+                let single = name == "WakeByAddressSingle";
+                for thread in &mut self.threads {
+                    if matches!(thread.state, ThreadState::WaitingAddress { address, .. } if address == rcx)
+                    {
+                        thread.state = ThreadState::Runnable;
+                        thread.cpu.regs[0] = 1;
+                        if single {
+                            break;
+                        }
+                    }
+                }
+                ret_bool!(0);
             }
             "TerminateProcess" => {
                 if rcx == 0xFFFF_FFFF_FFFF_FFFF {
@@ -1297,17 +1635,29 @@ impl Runner {
                 stub!(0);
             }
             "FlsAlloc" => {
-                if self.fls.len() >= 128 {
+                if self.fls_count >= 128 {
                     self.last_error = 8;
                     ret_bool!(0xFFFF_FFFF);
                 }
+                let index = self.fls_count;
+                self.fls_count += 1;
                 self.fls.push(None);
-                ret_bool!((self.fls.len() - 1) as u64);
+                for (idx, thread) in self.threads.iter_mut().enumerate() {
+                    if idx != self.current_thread {
+                        thread.fls.push(None);
+                    }
+                }
+                ret_bool!(index as u64);
             }
             "FlsFree" => {
                 let i = rcx as usize;
-                if i < self.fls.len() {
+                if i < self.fls_count {
                     self.fls[i] = None;
+                    for (idx, thread) in self.threads.iter_mut().enumerate() {
+                        if idx != self.current_thread {
+                            thread.fls[i] = None;
+                        }
+                    }
                     ret_bool!(1);
                 } else {
                     ret_bool!(0);
@@ -1327,17 +1677,47 @@ impl Runner {
                 }
             }
             "InitializeCriticalSectionEx" => {
-                // Single-threaded guest model: no contention is possible
-                // (CreateThread stays a fail-stub), so init zeroes the
-                // 40-byte RTL_CRITICAL_SECTION and all ops are no-ops.
                 let cs = rcx;
                 let spin = (rdx & 0xFFFF_FFFF) as u32;
                 self.emu.write_bytes(cs, &[0u8; 40])?;
                 self.emu.write_u32(cs, 0xFFFF_FFFF)?; // LockCount = -1
                 self.emu.write_u32(cs + 32, spin)?; // SpinCount
+                self.critical_sections.remove(&cs);
                 ret_bool!(1);
             }
-            "EnterCriticalSection" | "LeaveCriticalSection" | "DeleteCriticalSection" => {
+            "EnterCriticalSection" => {
+                match self.critical_sections.get_mut(&rcx) {
+                    Some((owner, depth)) if *owner == self.current_thread => *depth += 1,
+                    Some(_) => {
+                        self.threads[self.current_thread].state = ThreadState::WaitingCritical(rcx);
+                        ret_bool!(0);
+                    }
+                    None => {
+                        self.critical_sections.insert(rcx, (self.current_thread, 1));
+                    }
+                }
+                self.threads[self.current_thread].critical_depth += 1;
+                ret_bool!(0);
+            }
+            "LeaveCriticalSection" => {
+                if let Some((owner, depth)) = self.critical_sections.get_mut(&rcx) {
+                    if *owner == self.current_thread {
+                        *depth -= 1;
+                        self.threads[self.current_thread].critical_depth -= 1;
+                        if *depth == 0 {
+                            self.critical_sections.remove(&rcx);
+                            if let Some(next) = self.threads.iter().position(|thread| matches!(thread.state, ThreadState::WaitingCritical(address) if address == rcx)) {
+                                self.critical_sections.insert(rcx, (next, 1));
+                                self.threads[next].critical_depth += 1;
+                                self.threads[next].state = ThreadState::Runnable;
+                            }
+                        }
+                    }
+                }
+                ret_bool!(0);
+            }
+            "DeleteCriticalSection" => {
+                self.critical_sections.remove(&rcx);
                 ret_bool!(0);
             }
             "InitializeSListHead" => {
@@ -1454,26 +1834,52 @@ impl Runner {
                 ret_bool!(s);
             }
             // ---- fail-stubs: loadable, fail clearly if called ----
-            "WaitOnAddress" | "WakeByAddressAll" | "WakeByAddressSingle"
-            | "NtCreateNamedPipeFile" | "NtOpenFile"
-            | "RtlNtStatusToDosError" | "GetUserProfileDirectoryW"
-            | "AddVectoredExceptionHandler" | "CompareStringOrdinal" | "CompareStringW"
-            | "CreateFileMappingW"             | "CreateMutexA" | "CreateProcessW" | "CreateThread"
-            | "CreateWaitableTimerExW" | "DuplicateHandle"
+            "NtCreateNamedPipeFile"
+            | "NtOpenFile"
+            | "RtlNtStatusToDosError"
+            | "GetUserProfileDirectoryW"
+            | "AddVectoredExceptionHandler"
+            | "CompareStringOrdinal"
+            | "CompareStringW"
+            | "CreateFileMappingW"
+            | "CreateMutexA"
+            | "CreateProcessW"
+            | "CreateWaitableTimerExW"
+            | "DuplicateHandle"
             | "FlushFileBuffers"
-            | "FormatMessageW" | "FreeLibrary" | "GetCPInfo" | "GetComputerNameExW"
-            | "GetConsoleScreenBufferInfo" | "GetExitCodeProcess"
-            | "GetProcAddress" | "GetStringTypeW"
-            | "GetSystemDirectoryW"             | "GetWindowsDirectoryW"
+            | "FormatMessageW"
+            | "FreeLibrary"
+            | "GetCPInfo"
+            | "GetComputerNameExW"
+            | "GetConsoleScreenBufferInfo"
+            | "GetExitCodeProcess"
+            | "GetProcAddress"
+            | "GetStringTypeW"
+            | "GetSystemDirectoryW"
+            | "GetWindowsDirectoryW"
             | "IsThreadAFiber"
-            | "LCMapStringW" | "LoadLibraryA"
-            | "LoadLibraryExW" | "MapViewOfFile" | "RaiseException" | "ReadFileEx"
-            | "ReleaseMutex" | "RtlCaptureContext" | "RtlLookupFunctionEntry"
-            | "RtlPcToFileHeader" | "RtlUnwindEx" | "RtlVirtualUnwind"
-            | "SetFileInformationByHandle" | "SetFilePointerEx" | "SetFileTime"
-            | "SetStdHandle" | "SetThreadStackGuarantee" | "SetUnhandledExceptionFilter"
-            | "SetWaitableTimer" | "UnhandledExceptionFilter" | "UnmapViewOfFile"
-            | "WaitForSingleObject" | "WaitForSingleObjectEx" | "WriteFileEx" => {
+            | "LCMapStringW"
+            | "LoadLibraryA"
+            | "LoadLibraryExW"
+            | "MapViewOfFile"
+            | "RaiseException"
+            | "ReadFileEx"
+            | "ReleaseMutex"
+            | "RtlCaptureContext"
+            | "RtlLookupFunctionEntry"
+            | "RtlPcToFileHeader"
+            | "RtlUnwindEx"
+            | "RtlVirtualUnwind"
+            | "SetFileInformationByHandle"
+            | "SetFilePointerEx"
+            | "SetFileTime"
+            | "SetStdHandle"
+            | "SetThreadStackGuarantee"
+            | "SetUnhandledExceptionFilter"
+            | "SetWaitableTimer"
+            | "UnhandledExceptionFilter"
+            | "UnmapViewOfFile"
+            | "WriteFileEx" => {
                 stub!(0);
             }
             other => {
@@ -1496,8 +1902,7 @@ fn wildcard_match(pat: &str, name: &str) -> bool {
     let (mut star, mut mark) = (None, 0usize);
     while ni < n.len() {
         if pi < p.len()
-            && (p[pi] == '?'
-                || p[pi].to_ascii_lowercase() == n[ni].to_ascii_lowercase())
+            && (p[pi] == '?' || p[pi].to_ascii_lowercase() == n[ni].to_ascii_lowercase())
         {
             pi += 1;
             ni += 1;
@@ -1542,7 +1947,9 @@ fn read_stdin_line() -> Option<String> {
 /// slot 0 is always ours. Images *with* TLS callbacks are rejected at
 /// load time (see `pe`).
 fn setup_tls(emu: &mut Emu, img: &PeImage) -> Result<(), String> {
-    use crate::pe::emu::{PEB_IMAGEBASE_OFF, PEB_LDR_OFF, PEB_OFF, TEB_PEB_OFF, TEB_SELF_OFF, TEB_TLS_OFF};
+    use crate::pe::emu::{
+        PEB_IMAGEBASE_OFF, PEB_LDR_OFF, PEB_OFF, TEB_PEB_OFF, TEB_SELF_OFF, TEB_TLS_OFF,
+    };
     let Some(tls) = &img.tls else {
         return Ok(());
     };
@@ -1624,7 +2031,7 @@ mod tests {
         a.mov_ecx_imm(0xFFFF_FFF5);
         a.call_import(GH);
         a.mov_rspoff_rax(0x28); // save handle
-        // GetConsoleOutputCP == 65001?
+                                // GetConsoleOutputCP == 65001?
         a.call_import(CP);
         a.cmp_eax_imm(65001);
         a.jnz(lbl_fail);
@@ -1795,7 +2202,7 @@ mod tests {
         a.cmp_rax_m1();
         a.jz(lbl_fail);
         a.emit(&[0x48, 0x89, 0x44, 0x24, 0x40]); // mov [rsp+0x40],rax
-        // GetFileSizeEx(handle, &sz): nonzero + low dword == 5
+                                                 // GetFileSizeEx(handle, &sz): nonzero + low dword == 5
         a.emit(&[0x48, 0x8B, 0x4C, 0x24, 0x40]); // mov rcx,[rsp+0x40]
         a.lea_reg_rip(2, d_sz);
         a.call_import(SZ);
@@ -1957,7 +2364,7 @@ mod tests {
         a.cmp_rax_m1();
         a.jz(lbl_fail);
         a.emit(&[0x48, 0x89, 0x44, 0x24, 0x40]); // mov [rsp+0x40],rax
-        // len = GetFinalPathNameByHandleW(handle, buf, 64, 0): == 11
+                                                 // len = GetFinalPathNameByHandleW(handle, buf, 64, 0): == 11
         a.emit(&[0x48, 0x8B, 0x4C, 0x24, 0x40]); // mov rcx,[rsp+0x40]
         a.lea_reg_rip(2, d_buf);
         a.mov_r8d_imm(64);
@@ -2053,7 +2460,7 @@ mod tests {
         a.cmp_rax_m1();
         a.jz(lbl_fail);
         a.emit(&[0x48, 0x89, 0x44, 0x24, 0x40]); // mov [rsp+0x40],rax
-        // NtReadFile(handle, 0,0,0, iosb, buf, 5, NULL, 0)
+                                                 // NtReadFile(handle, 0,0,0, iosb, buf, 5, NULL, 0)
         a.emit(&[0x48, 0x8B, 0x4C, 0x24, 0x40]); // mov rcx,[rsp+0x40]
         a.mov_edx_imm(0);
         a.mov_r8d_imm(0);
@@ -2197,7 +2604,7 @@ mod tests {
         a.cmp_rax_m1();
         a.jz(lbl_fail);
         a.emit(&[0x48, 0x89, 0x44, 0x24, 0x40]); // mov [rsp+0x40],rax
-        // first name must be a.txt: check buf+44 UTF-16 'a' (0x61)
+                                                 // first name must be a.txt: check buf+44 UTF-16 'a' (0x61)
         a.lea_reg_rip(0, d_buf);
         a.emit(&[0x48, 0x83, 0xC0, 0x2C]); // add rax,44
         a.emit(&[0x66, 0x8B, 0x00]); // mov ax,[rax]
@@ -2267,5 +2674,57 @@ mod tests {
         let img = crate::pe::load(&exe).unwrap();
         let r = Runner::new(&img, WinFs::new()).unwrap();
         assert!(!r.console_is_tty);
+    }
+
+    #[test]
+    fn guest_waiters_wake_on_memory_change_and_timeout() {
+        let exe = crate::pe::builder::hello("x");
+        let img = crate::pe::load(&exe).unwrap();
+        let mut runner = Runner::new(&img, WinFs::new()).unwrap();
+        let address = runner.emu.heap_alloc(8);
+        runner.emu.write_u32(address, 0).unwrap();
+        let cpu = runner
+            .emu
+            .thread_cpu(img.image_base + u64::from(img.entry_rva), address, 0, 0)
+            .unwrap();
+        let stack = cpu.regs[4];
+        assert_eq!(
+            runner.emu.read_u64(stack).unwrap(),
+            crate::pe::emu::ENTRY_SENTINEL
+        );
+        assert_ne!(stack, runner.emu.rsp());
+        runner.threads.push(GuestThread {
+            id: 2,
+            handle: 0x8000_0002,
+            open: true,
+            cpu,
+            last_error: 0,
+            fls: Vec::new(),
+            state: ThreadState::WaitingAddress {
+                address,
+                expected: vec![0, 0, 0, 0],
+                deadline: None,
+            },
+            critical_depth: 0,
+        });
+        runner.refresh_waiters().unwrap();
+        assert!(matches!(
+            runner.threads[1].state,
+            ThreadState::WaitingAddress { .. }
+        ));
+        runner.emu.write_u32(address, 1).unwrap();
+        runner.refresh_waiters().unwrap();
+        assert!(matches!(runner.threads[1].state, ThreadState::Runnable));
+        assert_eq!(runner.threads[1].cpu.regs[0], 1);
+
+        runner.threads[1].state = ThreadState::WaitingAddress {
+            address,
+            expected: vec![1, 0, 0, 0],
+            deadline: Some(Instant::now() - Duration::from_millis(1)),
+        };
+        runner.refresh_waiters().unwrap();
+        assert!(matches!(runner.threads[1].state, ThreadState::Runnable));
+        assert_eq!(runner.threads[1].cpu.regs[0], 0);
+        assert_eq!(runner.threads[1].last_error, 1460);
     }
 }

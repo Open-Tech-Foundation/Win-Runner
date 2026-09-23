@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- The interpreter now cooperatively schedules guest threads with separate CPU
+  registers, stacks, TLS and FLS, thread IDs, and last-error values. Thread
+  creation, waits, sleeps, address wakes, and critical sections allow ripgrep
+  to search directories with multiple workers.
 - Added `MOVMSKPS`, packed-integer arithmetic, packed-word immediate shifts,
   packed-dword interleaves, `PSADBW`, and carry-aware byte-immediate ALU
   operations, plus `PEXTRW`, allowing real ripgrep JSON output to progress
