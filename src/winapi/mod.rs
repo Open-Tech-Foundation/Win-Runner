@@ -186,6 +186,7 @@ pub struct Runner {
     once_states: HashMap<u64, OnceState>,
     wsa_startups: u32,
     sockets: HashMap<u64, (u32, u32, u32)>,
+    crypto_contexts: HashSet<u64>,
     semaphores: HashMap<u64, GuestSemaphore>,
     power_notifications: HashMap<u64, (u64, u64)>,
     module_handles: HashMap<String, u64>,
@@ -301,6 +302,7 @@ impl Runner {
             once_states: HashMap::new(),
             wsa_startups: 0,
             sockets: HashMap::new(),
+            crypto_contexts: HashSet::new(),
             semaphores: HashMap::new(),
             power_notifications: HashMap::new(),
             module_handles,
@@ -992,6 +994,50 @@ impl Runner {
         }
 
         match name {
+            "CryptAcquireContextW" => {
+                let flags = self.emu.stack_arg(4).unwrap_or(0) as u32;
+                // An ephemeral default RSA provider is sufficient for the
+                // random-byte path. Persistent key containers are not modeled.
+                if rcx == 0 || rdx != 0 || r8 != 0 || r9 != 1
+                    || flags & 0xF000_0000 != 0xF000_0000
+                {
+                    self.last_error = 87;
+                    ret_bool!(0);
+                }
+                let handle = self.next_handle;
+                self.next_handle += 1;
+                self.crypto_contexts.insert(handle);
+                self.emu.write_u64(rcx, handle)?;
+                ret_bool!(1);
+            }
+            "CryptGenRandom" => {
+                if !self.crypto_contexts.contains(&rcx) {
+                    self.last_error = 6; // ERROR_INVALID_HANDLE
+                    ret_bool!(0);
+                }
+                let n = (rdx & 0xFFFF_FFFF) as usize;
+                if n > 1_048_576 || (n != 0 && r8 == 0) {
+                    self.last_error = 87;
+                    ret_bool!(0);
+                }
+                let mut bytes = vec![0u8; n];
+                use std::io::Read;
+                if std::fs::File::open("/dev/urandom")
+                    .and_then(|mut file| file.read_exact(&mut bytes)).is_err()
+                {
+                    self.last_error = 31; // ERROR_GEN_FAILURE
+                    ret_bool!(0);
+                }
+                if n != 0 { self.emu.write_bytes(r8, &bytes)?; }
+                ret_bool!(1);
+            }
+            "CryptReleaseContext" => {
+                if rdx != 0 || !self.crypto_contexts.remove(&rcx) {
+                    self.last_error = if rdx != 0 { 87 } else { 6 };
+                    ret_bool!(0);
+                }
+                ret_bool!(1);
+            }
             "#8" | "#14" => ret_bool!((rcx as u32).swap_bytes() as u64),
             "#9" | "#15" => ret_bool!((rcx as u16).swap_bytes() as u64),
             "#111" => ret_bool!(self.last_error as u64), // WSAGetLastError
@@ -1217,9 +1263,11 @@ impl Runner {
                 match creation {
                     CREATE_NEW => {
                         if exists {
+                            self.last_error = 183; // ERROR_ALREADY_EXISTS
                             ret_bool!(INVALID_HANDLE);
                         }
                         if is_dir {
+                            self.last_error = 5; // ERROR_ACCESS_DENIED
                             ret_bool!(INVALID_HANDLE);
                         }
                         self.fs
@@ -1230,6 +1278,7 @@ impl Runner {
                     }
                     CREATE_ALWAYS => {
                         if is_dir {
+                            self.last_error = 5; // ERROR_ACCESS_DENIED
                             ret_bool!(INVALID_HANDLE);
                         }
                         self.fs
@@ -1240,6 +1289,7 @@ impl Runner {
                     }
                     OPEN_EXISTING => {
                         if !exists || (is_dir && !dir_handle_ok) {
+                            self.last_error = if !exists { 2 } else { 5 };
                             ret_bool!(INVALID_HANDLE);
                         }
                         let h = self.alloc_handle(path, 0);
@@ -1247,6 +1297,7 @@ impl Runner {
                     }
                     OPEN_ALWAYS => {
                         if is_dir && !dir_handle_ok {
+                            self.last_error = 5; // ERROR_ACCESS_DENIED
                             ret_bool!(INVALID_HANDLE);
                         }
                         if !exists {
@@ -1259,6 +1310,7 @@ impl Runner {
                     }
                     TRUNCATE_EXISTING => {
                         if !exists || is_dir {
+                            self.last_error = if !exists { 2 } else { 5 };
                             ret_bool!(INVALID_HANDLE);
                         }
                         self.fs
@@ -1268,6 +1320,7 @@ impl Runner {
                         ret_bool!(h);
                     }
                     _ => {
+                        self.last_error = 87; // ERROR_INVALID_PARAMETER
                         ret_bool!(INVALID_HANDLE);
                     }
                 }

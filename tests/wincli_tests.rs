@@ -888,6 +888,116 @@ fn verify_version_info_compares_windows_baseline_and_reports_mismatch() {
 }
 
 #[test]
+fn crypto_provider_generates_bytes_and_rejects_released_handle() {
+    use pe::builder::{build, Asm};
+    let mut a = Asm::new();
+    let handle = a.add_zeroed(8);
+    let random = a.add_zeroed(16);
+    let fail = a.fresh_label();
+    a.sub_rsp(0x48);
+    a.lea_reg_rip(1, handle);
+    a.mov_edx_imm(0);
+    a.mov_r8d_imm(0);
+    a.mov_r9d_imm(99); // unsupported provider type
+    a.mov_rspoff_imm32(0x20, 0xF000_0040); // VERIFYCONTEXT | SILENT
+    a.call_import(0); // CryptAcquireContextW must reject it
+    a.test_eax_eax();
+    a.jnz(fail);
+    a.call_import(3); // GetLastError
+    a.cmp_eax_imm(87);
+    a.jnz(fail);
+    a.lea_reg_rip(1, handle);
+    a.mov_edx_imm(0);
+    a.mov_r8d_imm(0);
+    a.mov_r9d_imm(1); // PROV_RSA_FULL
+    a.call_import(0); // CryptAcquireContextW
+    a.test_eax_eax();
+    a.jz(fail);
+    a.lea_reg_rip(1, handle);
+    a.emit(&[0x48, 0x8B, 0x09]); // mov rcx,[rcx]
+    a.mov_rspoff_reg(0x38, 1);
+    a.mov_edx_imm(16);
+    a.lea_reg_rip(8, random);
+    a.call_import(1); // CryptGenRandom
+    a.test_eax_eax();
+    a.jz(fail);
+    a.mov_reg_rspoff(1, 0x38);
+    a.mov_edx_imm(0);
+    a.call_import(2); // CryptReleaseContext
+    a.test_eax_eax();
+    a.jz(fail);
+    a.mov_reg_rspoff(1, 0x38);
+    a.mov_edx_imm(1);
+    a.lea_reg_rip(8, random);
+    a.call_import(1); // released handle must fail
+    a.test_eax_eax();
+    a.jnz(fail);
+    a.call_import(3); // GetLastError
+    a.cmp_eax_imm(6);
+    a.jnz(fail);
+    a.mov_ecx_imm(0);
+    a.call_import(4);
+    a.mark(fail);
+    a.mov_ecx_imm(1);
+    a.call_import(4);
+    let exe = build(a, &[
+        ("ADVAPI32.dll", "CryptAcquireContextW"),
+        ("ADVAPI32.dll", "CryptGenRandom"),
+        ("ADVAPI32.dll", "CryptReleaseContext"),
+        ("KERNEL32.dll", "GetLastError"),
+        ("KERNEL32.dll", "ExitProcess"),
+    ]);
+    assert_eq!(run_exe_on_fs(&exe, WinFs::new()).0, 0);
+}
+
+#[test]
+fn create_file_failure_sets_win32_last_error() {
+    use pe::builder::{build, Asm};
+    let mut a = Asm::new();
+    let missing = a.add_utf16("C:\\missing.cnf");
+    let directory = a.add_utf16("C:\\folder");
+    let existing = a.add_utf16("C:\\present.txt");
+    let fail = a.fresh_label();
+    a.sub_rsp(0x38);
+    for (path, creation, expected_error) in [
+        (missing, 3, 2),  // OPEN_EXISTING: ERROR_FILE_NOT_FOUND
+        (directory, 3, 5), // directory without backup semantics: ACCESS_DENIED
+        (existing, 1, 183), // CREATE_NEW: ERROR_ALREADY_EXISTS
+    ] {
+        a.mov_ecx_imm(203); // stale ERROR_ENVVAR_NOT_FOUND must be replaced
+        a.call_import(2); // SetLastError
+        a.lea_reg_rip(1, path);
+        a.mov_edx_imm(0);
+        a.mov_r8d_imm(0);
+        a.mov_r9d_imm(0);
+        a.mov_rspoff_imm32(0x20, creation);
+        a.mov_rspoff_imm32(0x28, 0);
+        a.mov_rspoff_imm32(0x30, 0);
+        a.call_import(0); // CreateFileW
+        a.cmp_rax_m1();
+        a.jnz(fail);
+        a.call_import(1); // GetLastError
+        a.cmp_eax_imm(expected_error);
+        a.jnz(fail);
+    }
+    a.mov_ecx_imm(0);
+    a.call_import(3);
+    a.mark(fail);
+    a.mov_ecx_imm(1);
+    a.call_import(3);
+    let exe = build(a, &[
+        ("KERNEL32.dll", "CreateFileW"),
+        ("KERNEL32.dll", "GetLastError"),
+        ("KERNEL32.dll", "SetLastError"),
+        ("KERNEL32.dll", "ExitProcess"),
+    ]);
+    let mut fs = WinFs::new();
+    fs.mkdir("C:\\folder").unwrap();
+    fs.write_file("C:\\present.txt", Vec::new()).unwrap();
+    assert_eq!(run_exe_on_fs(&exe, fs).0, 0);
+}
+
+#[test]
 fn nul_device_discards_writes_and_reads_eof_without_winfs_file() {
     use pe::builder::{build, Asm};
     let mut a = Asm::new();

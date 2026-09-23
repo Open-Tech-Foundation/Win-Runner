@@ -104,6 +104,9 @@ fn apply_base_relocations(
 
 /// APIs WinCLI implements. Anything else must fail clearly.
 pub const SUPPORTED_APIS: &[(&str, &str)] = &[
+    ("ADVAPI32.DLL", "CryptAcquireContextW"),
+    ("ADVAPI32.DLL", "CryptGenRandom"),
+    ("ADVAPI32.DLL", "CryptReleaseContext"),
     ("KERNEL32.DLL", "ExitProcess"),
     ("KERNEL32.DLL", "GetStdHandle"),
     ("KERNEL32.DLL", "WriteFile"),

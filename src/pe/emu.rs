@@ -919,6 +919,62 @@ impl Emu {
         // two-byte opcodes
         if op == 0x0F {
             let op2 = self.read_u8(ip + off as u64 + 1)?;
+            if op2 == 0x38 {
+                let op3 = self.read_u8(ip + off as u64 + 2)?;
+                if op3 != 0x00 || !opsz16 || rep || repne {
+                    return Err(format!("unsupported 0F 38 {op3:02X} at 0x{ip:016x}"));
+                }
+                // PSHUFB xmm, xmm/m128: low nibble chooses a byte of the
+                // original destination; bit 7 of a control byte zeroes it.
+                let (reg, is_reg, rm, ea_raw, ml) =
+                    self.decode_modrm(ip, off + 3, rex_r, rex_x, rex_b, true)?;
+                let next = ip + (off + 3 + ml) as u64;
+                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let source = self.xmm[reg].to_le_bytes();
+                let control = if is_reg {
+                    self.xmm[rm].to_le_bytes()
+                } else {
+                    self.read_u128(ea)?.to_le_bytes()
+                };
+                let mut result = [0u8; 16];
+                for i in 0..16 {
+                    if control[i] & 0x80 == 0 {
+                        result[i] = source[(control[i] & 0x0f) as usize];
+                    }
+                }
+                self.xmm[reg] = u128::from_le_bytes(result);
+                self.rip = next;
+                return Ok(StepResult::Continue);
+            }
+            if op2 == 0x3A {
+                let op3 = self.read_u8(ip + off as u64 + 2)?;
+                if op3 != 0x0F || !opsz16 || rep || repne {
+                    return Err(format!("unsupported 0F 3A {op3:02X} at 0x{ip:016x}"));
+                }
+                // PALIGNR: shift the 32-byte source|destination composite
+                // right by the immediate byte count, retaining its low 16.
+                let (reg, is_reg, rm, ea_raw, ml) =
+                    self.decode_modrm(ip, off + 3, rex_r, rex_x, rex_b, true)?;
+                let next = ip + (off + 3 + ml + 1) as u64;
+                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let source = if is_reg {
+                    self.xmm[rm].to_le_bytes()
+                } else {
+                    self.read_u128(ea)?.to_le_bytes()
+                };
+                let dest = self.xmm[reg].to_le_bytes();
+                let count = self.read_u8(next - 1)? as usize;
+                let mut result = [0u8; 16];
+                for (i, byte) in result.iter_mut().enumerate() {
+                    let index = i + count;
+                    *byte = if index < 16 { source[index] }
+                        else if index < 32 { dest[index - 16] }
+                        else { 0 };
+                }
+                self.xmm[reg] = u128::from_le_bytes(result);
+                self.rip = next;
+                return Ok(StepResult::Continue);
+            }
             if op2 == 0xAE {
                 let form = self.read_u8(ip + off as u64 + 2)?;
                 if matches!(form, 0xE8 | 0xF0 | 0xF8) && !rep && !repne && !opsz16 {
@@ -1565,6 +1621,18 @@ impl Emu {
                 self.rip = ip + (off + 2 + ml) as u64;
                 return Ok(StepResult::Continue);
             }
+            if op2 == 0x0D {
+                // PREFETCHW (/1) and PREFETCHWT1 (/2) are cache hints. Decode
+                // their memory operand for instruction length, but do not read
+                // it: prefetch must not fault on an inaccessible address.
+                let (hint, is_reg, _, _, ml) =
+                    self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
+                if is_reg || !matches!(hint, 1 | 2) {
+                    return Err(format!("unsupported 0F 0D /{hint} at 0x{ip:016x}"));
+                }
+                self.rip = ip + (off + 2 + ml) as u64;
+                return Ok(StepResult::Continue);
+            }
             if op2 == 0xA2 {
                 // CPUID: advertise exactly the emulated ISA subset so guests
                 // pick scalar/SSE2 code paths (no SSE3+, no AVX).
@@ -1778,6 +1846,33 @@ impl Emu {
                         }
                     };
                     out[start..start + 2].copy_from_slice(&shifted.to_le_bytes());
+                }
+                self.xmm[rm] = u128::from_le_bytes(out);
+                self.rip = ip + (off + 2 + ml + 1) as u64;
+                return Ok(StepResult::Continue);
+            }
+            if op2 == 0x72 {
+                // 66 0F 72 /2,/4,/6 ib: PSRLD/PSRAD/PSLLD xmm, imm8.
+                if !opsz16 || rep || repne {
+                    return Err(format!("unsupported MMX opcode 0F 72 at 0x{ip:016x}"));
+                }
+                let (group, is_reg, rm, _, ml) =
+                    self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
+                if !is_reg || !matches!(group, 2 | 4 | 6) {
+                    return Err(format!("unsupported packed-dword shift /{group} at 0x{ip:016x}"));
+                }
+                let count = self.read_u8(ip + (off + 2 + ml) as u64)? as u32;
+                let input = self.xmm[rm].to_le_bytes();
+                let mut out = [0u8; 16];
+                for lane in 0..4 {
+                    let start = lane * 4;
+                    let value = u32::from_le_bytes(input[start..start + 4].try_into().unwrap());
+                    let shifted = match group {
+                        2 => if count >= 32 { 0 } else { value >> count },
+                        4 => ((value as i32) >> count.min(31)) as u32,
+                        _ => if count >= 32 { 0 } else { value << count },
+                    };
+                    out[start..start + 4].copy_from_slice(&shifted.to_le_bytes());
                 }
                 self.xmm[rm] = u128::from_le_bytes(out);
                 self.rip = ip + (off + 2 + ml + 1) as u64;
@@ -5318,6 +5413,60 @@ mod tests {
     }
 
     #[test]
+    fn packed_dword_immediate_shifts_saturate_counts() {
+        for (opcode, count, expected) in [
+            (0xD0, 4, [0x0800_0000, 1, 0x0fff_ffff, 0]), // PSRLD
+            (0xE0, 40, [0xffff_ffff, 0, 0xffff_ffff, 0]), // PSRAD
+            (0xF0, 32, [0, 0, 0, 0]), // PSLLD
+        ] {
+            let mut emu = emu_with(&[0x66, 0x0F, 0x72, opcode, count]);
+            let input = [0x8000_0000u32, 0x10, 0xffff_ffff, 0];
+            let mut bytes = [0u8; 16];
+            for (i, lane) in input.iter().enumerate() {
+                bytes[4 * i..4 * i + 4].copy_from_slice(&lane.to_le_bytes());
+            }
+            emu.xmm[0] = u128::from_le_bytes(bytes);
+            emu.step().unwrap();
+            let result = emu.xmm[0].to_le_bytes();
+            for (i, lane) in expected.iter().enumerate() {
+                assert_eq!(u32::from_le_bytes(result[4 * i..4 * i + 4].try_into().unwrap()), *lane);
+            }
+        }
+    }
+
+    #[test]
+    fn pshufb_selects_low_nibble_and_zeroes_high_bit() {
+        let mut emu = emu_with(&[0x66, 0x0F, 0x38, 0x00, 0xC1]); // pshufb xmm0,xmm1
+        emu.xmm[0] = u128::from_le_bytes(*b"0123456789ABCDEF");
+        emu.xmm[1] = u128::from_le_bytes([
+            0x0f, 0x10, 0x80, 0x8f, 0x01, 0x0e, 0x00, 0x07,
+            0x02, 0x03, 0x04, 0x05, 0x06, 0x09, 0x0a, 0x0b,
+        ]);
+        emu.step().unwrap();
+        assert_eq!(emu.xmm[0].to_le_bytes(), *b"F0\0\01E07234569AB");
+
+        let mut emu = emu_with(&[0x0F, 0x38, 0x00, 0xC1]);
+        assert!(emu.step().unwrap_err().contains("unsupported 0F 38 00"));
+    }
+
+    #[test]
+    fn palignr_combines_source_and_destination_with_zero_tail() {
+        for (count, expected) in [
+            (0, *b"abcdefghijklmnop"),
+            (15, *b"p0123456789ABCDE"),
+            (16, *b"0123456789ABCDEF"),
+            (31, *b"F\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"),
+            (32, [0; 16]),
+        ] {
+            let mut emu = emu_with(&[0x66, 0x0F, 0x3A, 0x0F, 0xC1, count]);
+            emu.xmm[0] = u128::from_le_bytes(*b"0123456789ABCDEF");
+            emu.xmm[1] = u128::from_le_bytes(*b"abcdefghijklmnop");
+            emu.step().unwrap();
+            assert_eq!(emu.xmm[0].to_le_bytes(), expected);
+        }
+    }
+
+    #[test]
     fn pmuludq_multiplies_low_dword_of_each_qword_lane() {
         let mut emu = emu_with(&[0x66, 0x44, 0x0F, 0xF4, 0xC1]); // xmm8 *= xmm1
         emu.xmm[8] = 0xDEAD_BEEF_1234_5678_AAAA_AAAA_FFFF_FFFF;
@@ -5364,6 +5513,22 @@ mod tests {
         }
         let mut emu = emu_with(&[0x67, 0x8B, 0x04, 0x0A]);
         assert!(emu.step().unwrap_err().contains("unsupported address-size override"));
+    }
+
+    #[test]
+    fn prefetchw_decodes_memory_without_faulting_or_changing_flags() {
+        for hint in [0x4B, 0x53] { // /1 and /2, [rbx+0x14]
+            let mut emu = emu_with(&[0x0F, 0x0D, hint, 0x14, 0x90]);
+            emu.regs[3] = 0xFFFF_FFFF_FFFF_F000; // unmapped operand
+            emu.zf = true;
+            emu.cf = true;
+            let entry = emu.rip;
+            emu.step().unwrap();
+            assert_eq!(emu.rip, entry + 4);
+            assert!(emu.zf && emu.cf);
+        }
+        let mut emu = emu_with(&[0x0F, 0x0D, 0xC8]); // register operand
+        assert!(emu.step().unwrap_err().contains("unsupported 0F 0D /1"));
     }
 
     #[test]

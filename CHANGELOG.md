@@ -17,6 +17,13 @@ All notable changes to this project will be documented in this file.
 - The interpreter now handles truncating scalar and packed float-to-integer
   conversions, packed single-precision arithmetic, `PMULUDQ`, packed shifts,
   16-bit rotates/shifts, and the 32-bit-address SIB `LEA` form reached by Node.
+- The interpreter now decodes `PREFETCHW` and `PREFETCHWT1` cache hints reached
+  during Node.js script startup without reading the hinted address, and handles
+  packed-dword immediate shifts used in Node's runtime.
+- Added `PSHUFB` byte shuffles and `PALIGNR` byte alignment for Node's SSSE3
+  data-processing path.
+- Added ephemeral CryptoAPI provider contexts and cryptographically random
+  byte generation for Windows programs using `CryptGenRandom`.
 - `probe` streams guest output before a later blocker, and the tested
   `node.exe --version` path now prints its version and exits successfully.
 - Added one-time initialization callbacks with retry and waiter handling,
@@ -49,6 +56,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- `CreateFileW` now reports file-not-found, access-denied, already-exists, and
+  invalid-parameter errors on failed opens instead of leaking an unrelated
+  last-error value into the Windows CRT and OpenSSL.
 - Interpreter `MOVHLPS` and `MOVLHPS` register forms now copy the correct
   source qword, fixing ripgrep's multiworker setup before thread creation.
 - PE images up to 256 MiB can now be inspected and loaded, allowing large
