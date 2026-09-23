@@ -19,12 +19,14 @@ pub struct InspectReport {
     /// Loadable fail-stubs: program starts, but dies clearly if it calls one.
     pub stubbed: Vec<Import>,
     pub missing: Vec<Import>,
+    /// Loader features that prevent execution even if every import resolves.
+    pub limitations: Vec<String>,
 }
 
 impl InspectReport {
     /// Loadable (nothing fully unknown). Stubs may still fail at runtime.
     pub fn runnable(&self) -> bool {
-        self.missing.is_empty()
+        self.missing.is_empty() && self.limitations.is_empty()
     }
     pub fn total(&self) -> usize {
         self.supported.len() + self.stubbed.len() + self.missing.len()
@@ -33,6 +35,12 @@ impl InspectReport {
 
 pub fn inspect_pe(data: &[u8]) -> Result<InspectReport, String> {
     let img = load_lenient(data)?;
+    let mut limitations = Vec::new();
+    if let Some(tls) = &img.tls {
+        if !tls.callbacks.is_empty() {
+            limitations.push(format!("TLS callbacks unsupported: {}", tls.callbacks.len()));
+        }
+    }
     Ok(InspectReport {
         arch: "x86_64".to_string(),
         entry_rva: img.entry_rva,
@@ -40,6 +48,7 @@ pub fn inspect_pe(data: &[u8]) -> Result<InspectReport, String> {
         supported: img.imports,
         stubbed: img.stubs,
         missing: img.unsupported,
+        limitations,
     })
 }
 
@@ -54,6 +63,9 @@ pub fn render(report: &InspectReport) -> String {
         report.stubbed.len()
     ));
     s.push_str(&format!("Missing imports:   {}\n", report.missing.len()));
+    for limitation in &report.limitations {
+        s.push_str(&format!("Loader limitation: {limitation}\n"));
+    }
     for (title, list) in [
         ("Stubbed", &report.stubbed),
         ("Missing", &report.missing),

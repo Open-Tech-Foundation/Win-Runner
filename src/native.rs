@@ -3125,14 +3125,18 @@ mod imp {
                 .map(|data| data.len() as u64)
                 .unwrap_or(0)
         };
+        let file_id = match ctx.fs.file_id(path) {
+            Ok(value) => value,
+            Err(_) => return 0,
+        };
         unsafe {
             std::ptr::write_bytes(output, 0, 52);
             (output as *mut u32).write_unaligned(native_file_attributes(is_directory));
-            (output.add(28) as *mut u32).write_unaligned(1);
+            (output.add(28) as *mut u32).write_unaligned(0x5743_4C49);
             (output.add(32) as *mut u32).write_unaligned((size >> 32) as u32);
             (output.add(36) as *mut u32).write_unaligned(size as u32);
             (output.add(40) as *mut u32).write_unaligned(1);
-            (output.add(44) as *mut u32).write_unaligned(handle as u32);
+            (output.add(44) as *mut u64).write_unaligned(file_id);
         }
         1
     }

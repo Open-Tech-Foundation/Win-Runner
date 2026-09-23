@@ -1035,9 +1035,15 @@ impl Runner {
                 let (attrs, len) = self.file_attrs_len_by_handle(h)?;
                 let mut b = [0u8; 52];
                 b[0..4].copy_from_slice(&attrs.to_le_bytes());
+                b[28..32].copy_from_slice(&0x5743_4C49u32.to_le_bytes());
                 b[32..36].copy_from_slice(&((len >> 32) as u32).to_le_bytes());
                 b[36..40].copy_from_slice(&(len as u32).to_le_bytes());
                 b[40..44].copy_from_slice(&1u32.to_le_bytes());
+                let id = match self.handles.get(&h) {
+                    Some(fh) => self.fs.file_id(&fh.path)?,
+                    None => 0,
+                };
+                b[44..52].copy_from_slice(&id.to_le_bytes());
                 self.emu.write_bytes(info, &b)?;
                 ret_bool!(1);
             }
@@ -1835,6 +1841,17 @@ mod tests {
         a.emit(&[0x8B, 0x00]); // mov eax,[rax]
         a.cmp_eax_imm(5);
         a.jnz(lbl_fail);
+        // Volume serial and file ID must identify an actual WinFS object.
+        a.lea_reg_rip(0, d_info);
+        a.emit(&[0x48, 0x83, 0xC0, 0x1C]); // add rax,28
+        a.emit(&[0x8B, 0x00]); // mov eax,[rax]
+        a.test_eax_eax();
+        a.jz(lbl_fail);
+        a.lea_reg_rip(0, d_info);
+        a.emit(&[0x48, 0x83, 0xC0, 0x2C]); // add rax,44
+        a.emit(&[0x48, 0x8B, 0x00]); // mov rax,[rax]
+        a.emit(&[0x48, 0x85, 0xC0]); // test rax,rax
+        a.jz(lbl_fail);
         // CloseHandle(handle); exit 0
         a.emit(&[0x48, 0x8B, 0x4C, 0x24, 0x40]); // mov rcx,[rsp+0x40]
         a.call_import(CH);

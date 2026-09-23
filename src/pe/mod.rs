@@ -49,7 +49,7 @@ pub struct TlsDir {
     pub zero_fill: u32,
     /// RVA of the slot-index DWORD (loader writes the assigned index).
     pub index_rva: u32,
-    /// Callback RVAs (must be empty: callbacks are not supported).
+    /// Callback RVAs (retained for inspection; execution rejects them).
     pub callbacks: Vec<u32>,
 }
 
@@ -378,7 +378,9 @@ fn load_inner(data: &[u8], strict: bool) -> Result<PeImage, String> {
     };
     let _ = (section_align, file_align, size_of_headers);
 
-    if size_of_image == 0 || size_of_image > 64 * 1024 * 1024 {
+    // Large self-contained CLIs (notably Node.js) exceed 64 MiB.
+    // Keep a finite cap so malformed headers cannot request unbounded memory.
+    if size_of_image == 0 || size_of_image > 256 * 1024 * 1024 {
         return Err("invalid SizeOfImage".to_string());
     }
 
@@ -480,17 +482,21 @@ fn load_inner(data: &[u8], strict: bool) -> Result<PeImage, String> {
                 if ent == 0 {
                     break;
                 }
-                if ent & 0x8000_0000_0000_0000 != 0 {
-                    return Err(format!(
-                        "ordinal imports not supported: {dll} ordinal {}",
-                        ent & 0xffff
-                    ));
-                }
-                let hn_off = to_off(ent as u32)?;
-                if hn_off + 2 > data.len() {
-                    return Err("truncated hint/name".to_string());
-                }
-                let func = cstr_ascii(data, hn_off + 2)?;
+                let func = if ent & 0x8000_0000_0000_0000 != 0 {
+                    if strict {
+                        return Err(format!(
+                            "ordinal imports not supported: {dll} ordinal {}",
+                            ent & 0xffff
+                        ));
+                    }
+                    format!("#{}", ent & 0xffff)
+                } else {
+                    let hn_off = to_off(ent as u32)?;
+                    if hn_off + 2 > data.len() {
+                        return Err("truncated hint/name".to_string());
+                    }
+                    cstr_ascii(data, hn_off + 2)?
+                };
                 let imp = Import {
                     iat_rva: ft + idx * 8,
                     dll: dll.clone(),
@@ -508,7 +514,7 @@ fn load_inner(data: &[u8], strict: bool) -> Result<PeImage, String> {
                     imports.push(imp);
                 }
                 idx += 1;
-                if idx > 256 {
+                if idx > 4096 {
                     return Err("too many imports".to_string());
                 }
             }
@@ -576,7 +582,7 @@ fn load_inner(data: &[u8], strict: bool) -> Result<PeImage, String> {
                 callbacks.push(to_rva(f)?);
             }
         }
-        if !callbacks.is_empty() {
+        if strict && !callbacks.is_empty() {
             return Err(format!(
                 "TLS callbacks not supported ({} found)",
                 callbacks.len()
@@ -688,5 +694,76 @@ mod relocation_tests {
             0x1400_0010_0
         );
         assert!(apply_base_relocations(&mut image, &[12], 1, 2).is_err());
+    }
+}
+
+#[cfg(test)]
+mod large_image_tests {
+    use super::*;
+    use crate::pe::builder::{self, Asm, FILE_OFF, SECTION_RVA};
+
+    const OPT: usize = 0x80 + 4 + 20;
+
+    #[test]
+    fn accepts_large_images_with_a_finite_size_limit() {
+        let mut exe = builder::hello("hi");
+        exe[OPT + 56..OPT + 60].copy_from_slice(&(65 * 1024 * 1024u32).to_le_bytes());
+        assert_eq!(load_lenient(&exe).unwrap().size_of_image, 65 * 1024 * 1024);
+        exe[OPT + 56..OPT + 60].copy_from_slice(&(257 * 1024 * 1024u32).to_le_bytes());
+        assert!(load_lenient(&exe).unwrap_err().contains("invalid SizeOfImage"));
+    }
+
+    #[test]
+    fn lenient_load_reports_ordinals_and_more_than_256_imports() {
+        let imports = vec![("KERNEL32.dll", "ExitProcess"); 300];
+        let exe = builder::build(Asm::new(), &imports);
+        assert_eq!(load_lenient(&exe).unwrap().imports.len(), 300);
+
+        let mut exe = builder::hello("hi");
+        let import_rva = u32le(&exe, OPT + 120).unwrap();
+        let desc = FILE_OFF + (import_rva - SECTION_RVA) as usize;
+        let thunk_rva = u32le(&exe, desc).unwrap();
+        let thunk = FILE_OFF + (thunk_rva - SECTION_RVA) as usize;
+        exe[thunk..thunk + 8].copy_from_slice(&0x8000_0000_0000_0074u64.to_le_bytes());
+        let image = load_lenient(&exe).unwrap();
+        assert!(image.unsupported.iter().any(|item| item.func == "#116"));
+        assert!(load(&exe).unwrap_err().contains("ordinal imports not supported"));
+    }
+
+    #[test]
+    fn lenient_load_retains_tls_callbacks_for_inspection() {
+        let mut exe = builder::hello("hi");
+        let old_size = u32le(&exe, OPT + 56).unwrap();
+        let tls_rva = old_size;
+        let raw = exe.len() as u32;
+        let base = u64le(&exe, OPT + 24).unwrap();
+        exe[0x80 + 4 + 2..0x80 + 4 + 4].copy_from_slice(&2u16.to_le_bytes());
+        exe[OPT + 56..OPT + 60].copy_from_slice(&(old_size + 0x1000).to_le_bytes());
+        let tls_dir = OPT + 112 + 9 * 8;
+        exe[tls_dir..tls_dir + 4].copy_from_slice(&tls_rva.to_le_bytes());
+        exe[tls_dir + 4..tls_dir + 8].copy_from_slice(&40u32.to_le_bytes());
+        let header = OPT + 0xf0 + 40;
+        exe[header..header + 8].copy_from_slice(b".tls\0\0\0\0");
+        exe[header + 8..header + 12].copy_from_slice(&0x100u32.to_le_bytes());
+        exe[header + 12..header + 16].copy_from_slice(&tls_rva.to_le_bytes());
+        exe[header + 16..header + 20].copy_from_slice(&0x200u32.to_le_bytes());
+        exe[header + 20..header + 24].copy_from_slice(&raw.to_le_bytes());
+        exe[header + 36..header + 40].copy_from_slice(&0xc000_0040u32.to_le_bytes());
+        exe.resize(exe.len() + 0x200, 0);
+        exe[raw as usize..raw as usize + 8]
+            .copy_from_slice(&(base + tls_rva as u64 + 0x40).to_le_bytes());
+        exe[raw as usize + 8..raw as usize + 16]
+            .copy_from_slice(&(base + tls_rva as u64 + 0x40).to_le_bytes());
+        exe[raw as usize + 16..raw as usize + 24]
+            .copy_from_slice(&(base + tls_rva as u64 + 0x48).to_le_bytes());
+        exe[raw as usize + 24..raw as usize + 32]
+            .copy_from_slice(&(base + tls_rva as u64 + 0x50).to_le_bytes());
+        exe[raw as usize + 0x50..raw as usize + 0x58]
+            .copy_from_slice(&(base + SECTION_RVA as u64).to_le_bytes());
+        assert_eq!(load_lenient(&exe).unwrap().tls.unwrap().callbacks, vec![SECTION_RVA]);
+        assert!(load(&exe).unwrap_err().contains("TLS callbacks not supported"));
+        let report = crate::inspect::inspect_pe(&exe).unwrap();
+        assert!(!report.runnable());
+        assert_eq!(report.limitations, ["TLS callbacks unsupported: 1"]);
     }
 }

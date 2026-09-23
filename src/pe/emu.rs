@@ -205,17 +205,19 @@ impl Emu {
         if size > HEAP_SIZE || align == 0 || align & (align - 1) != 0 {
             return 0;
         }
-        let mut next = (self.heap_next + align - 1) & !(align - 1);
-        let end = next.checked_add(8 + size as u64);
+        let Some(payload) = self.heap_next.checked_add(8 + align - 1).map(|v| v & !(align - 1)) else {
+            return 0;
+        };
+        let next = payload - 8;
+        let end = payload.checked_add(size as u64);
         let limit = self.heap_base + HEAP_SIZE as u64;
         match end {
             Some(e) if e <= limit => {
                 // header: payload size
                 let off = (next - self.base) as usize;
                 self.mem[off..off + 8].copy_from_slice(&(size as u64).to_le_bytes());
-                next += 8;
-                self.heap_next = next + size as u64;
-                next
+                self.heap_next = e;
+                payload
             }
             _ => 0,
         }
@@ -3439,6 +3441,19 @@ mod tests {
             relocations: vec![],
         };
         Emu::new(&img).unwrap()
+    }
+
+    #[test]
+    fn heap_payloads_respect_alignment_and_keep_size_headers() {
+        let mut emu = emu_with(&[]);
+        for (size, align) in [(0, 16), (1, 16), (17, 16), (33, 64), (7, 32)] {
+            let address = emu.heap_alloc_aligned(size, align);
+            assert_ne!(address, 0);
+            assert_eq!(address % align, 0);
+            assert_eq!(emu.heap_size_of(address), size as u64);
+        }
+        assert_eq!(emu.heap_alloc_aligned(8, 3), 0);
+        assert_eq!(emu.heap_alloc(HEAP_SIZE + 1), 0);
     }
 
     /// RIP-relative disp32 for an instruction at `pos` with `len`, targeting `target_off`.

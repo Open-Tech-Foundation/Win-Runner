@@ -649,6 +649,26 @@ fn test_inspect_missing_imports() {
 }
 
 #[test]
+fn test_inspect_large_pe_with_ordinal_import() {
+    let mut exe = pe::builder::hello("hi");
+    let opt = 0x80 + 4 + 20;
+    exe[opt + 56..opt + 60].copy_from_slice(&(65 * 1024 * 1024u32).to_le_bytes());
+    let read_u32 = |offset: usize| u32::from_le_bytes(exe[offset..offset + 4].try_into().unwrap());
+    let import_rva = read_u32(opt + 120);
+    let desc = pe::builder::FILE_OFF + (import_rva - pe::builder::SECTION_RVA) as usize;
+    let thunk_rva = read_u32(desc);
+    let thunk = pe::builder::FILE_OFF + (thunk_rva - pe::builder::SECTION_RVA) as usize;
+    exe[thunk..thunk + 8].copy_from_slice(&0x8000_0000_0000_0074u64.to_le_bytes());
+    let path = tmp_path("large-ordinal.exe");
+    std::fs::write(&path, exe).unwrap();
+    let (code, stdout, stderr) = run_inspect(&path);
+    std::fs::remove_file(&path).ok();
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(stdout.contains("Missing imports:   1"), "{stdout}");
+    assert!(stdout.contains("KERNEL32.dll!#116"), "{stdout}");
+}
+
+#[test]
 fn test_inspect_rust_guest() {
     let (code, stdout, _) = run_inspect(&artifact("exe/rust_fs.exe"));
     assert_eq!(code, 0);
@@ -834,6 +854,14 @@ fn live_install_ripgrep() {
     );
     assert_eq!(code, 0);
     assert_eq!(stdout, "error: disk full\n");
+    // A directory walk depends on distinct BY_HANDLE_FILE_INFORMATION IDs.
+    let (code, stdout, stderr) = run_shell_env(
+        "New-Item C:\\data -ItemType Directory\nSet-Content C:\\data\\one.txt 'error: one'\nSet-Content C:\\data\\two.txt 'error: two'\nrg --threads 1 error C:\\data\nexit\n",
+        &[("WINCLI_CACHE", cc.as_ref())],
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("C:\\data\\one.txt:error: one\n"), "{stdout}");
+    assert!(stdout.contains("C:\\data\\two.txt:error: two\n"), "{stdout}");
     std::fs::remove_dir_all(&cache).ok();
 }
 

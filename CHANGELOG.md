@@ -13,6 +13,20 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- PE images up to 256 MiB can now be inspected and loaded, allowing large
+  Windows executables such as Node.js to reach import compatibility checks.
+- `inspect` now lists ordinal imports as missing APIs rather than rejecting
+  the entire PE, so large Windows programs receive a complete compatibility
+  report.
+- PE import parsing now accepts up to 4096 imports per DLL, enough to inspect
+  Node.js while retaining a finite malformed-input limit.
+- `inspect` now reports TLS callbacks as a loader limitation while continuing
+  to list imports; execution still rejects images with unsupported callbacks.
+- File information now reports distinct, stable IDs for WinFS paths in both
+  execution backends. This lets ripgrep's single-worker directory search
+  distinguish files instead of treating them all as the same object.
+- Interpreter heap allocations now align their payloads as requested, including
+  the 16-byte alignment used by `HeapAlloc`.
 - `GetFileAttributesW` now sets `ERROR_FILE_NOT_FOUND` when a guest path is
   absent, preventing stale last-error values from corrupting directory-walk
   error handling.

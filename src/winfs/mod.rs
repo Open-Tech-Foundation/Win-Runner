@@ -132,6 +132,15 @@ impl WinFs {
         .display()
     }
 
+    /// Stable identity for an open path within this in-memory filesystem.
+    /// Case variants and repeated opens of the same path have the same ID.
+    pub fn file_id(&self, path: &str) -> Result<u64, String> {
+        let key = self.normalize(path)?.key();
+        Ok(key.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3)
+        }))
+    }
+
     pub fn set_cwd(&mut self, path: &str) -> Result<(), String> {
         let p = self.normalize(path)?;
         // must exist and be a dir
@@ -640,6 +649,17 @@ impl WinFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_ids_match_case_variants_and_distinguish_paths() {
+        let fs = WinFs::new();
+        let first = fs.file_id(r"C:\Data\one.txt").unwrap();
+        assert_ne!(first, 0);
+        assert_eq!(first, fs.file_id(r"c:\data\.\ONE.txt").unwrap());
+        assert_ne!(first, fs.file_id(r"C:\Data\two.txt").unwrap());
+        assert_ne!(first, fs.file_id(r"C:\Data").unwrap());
+        assert!(fs.file_id(r"D:\Data").is_err());
+    }
 
     #[test]
     fn case_insensitive_preserve_case() {
