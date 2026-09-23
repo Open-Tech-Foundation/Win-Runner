@@ -199,6 +199,27 @@ pub const SUPPORTED_APIS: &[(&str, &str)] = &[
     ("KERNEL32.DLL", "ReleaseSRWLockExclusive"),
     ("KERNEL32.DLL", "ReleaseSRWLockShared"),
     ("KERNEL32.DLL", "InitializeConditionVariable"),
+    ("KERNEL32.DLL", "InitOnceExecuteOnce"),
+    ("KERNEL32.DLL", "InitOnceInitialize"),
+    ("KERNEL32.DLL", "SetErrorMode"),
+    ("KERNEL32.DLL", "FormatMessageA"),
+    ("KERNEL32.DLL", "FormatMessageW"),
+    ("KERNEL32.DLL", "LocalFree"),
+    ("KERNEL32.DLL", "GetProcAddress"),
+    ("KERNEL32.DLL", "LoadLibraryA"),
+    ("KERNEL32.DLL", "LoadLibraryExA"),
+    ("KERNEL32.DLL", "LoadLibraryExW"),
+    ("KERNEL32.DLL", "FreeLibrary"),
+    ("NTDLL.DLL", "RtlGetVersion"),
+    ("NTDLL.DLL", "RtlNtStatusToDosError"),
+    ("USER32.DLL", "GetSystemMetrics"),
+    // Stable Winsock ordinals (verified against Wine's ws2_32 export spec).
+    ("WS2_32.DLL", "#8"),  // htonl
+    ("WS2_32.DLL", "#9"),  // htons
+    ("WS2_32.DLL", "#14"), // ntohl
+    ("WS2_32.DLL", "#15"), // ntohs
+    ("WS2_32.DLL", "#115"), // WSAStartup
+    ("WS2_32.DLL", "#116"), // WSACleanup
     ("KERNEL32.DLL", "SleepConditionVariableCS"),
     ("KERNEL32.DLL", "SleepConditionVariableSRW"),
     ("KERNEL32.DLL", "WakeConditionVariable"),
@@ -219,7 +240,6 @@ pub const SUPPORTED_APIS: &[(&str, &str)] = &[
 pub const STUB_APIS: &[(&str, &str)] = &[
     ("NTDLL.DLL", "NtCreateNamedPipeFile"),
     ("NTDLL.DLL", "NtOpenFile"),
-    ("NTDLL.DLL", "RtlNtStatusToDosError"),
     ("USERENV.DLL", "GetUserProfileDirectoryW"),
     ("KERNEL32.DLL", "AddVectoredExceptionHandler"),
     ("KERNEL32.DLL", "CompareStringOrdinal"),
@@ -230,20 +250,15 @@ pub const STUB_APIS: &[(&str, &str)] = &[
     ("KERNEL32.DLL", "CreateWaitableTimerExW"),
     ("KERNEL32.DLL", "DuplicateHandle"),
     ("KERNEL32.DLL", "FlushFileBuffers"),
-    ("KERNEL32.DLL", "FormatMessageW"),
-    ("KERNEL32.DLL", "FreeLibrary"),
     ("KERNEL32.DLL", "GetCPInfo"),
     ("KERNEL32.DLL", "GetComputerNameExW"),
     ("KERNEL32.DLL", "GetConsoleScreenBufferInfo"),
     ("KERNEL32.DLL", "GetExitCodeProcess"),
-    ("KERNEL32.DLL", "GetProcAddress"),
     ("KERNEL32.DLL", "GetStringTypeW"),
     ("KERNEL32.DLL", "GetSystemDirectoryW"),
     ("KERNEL32.DLL", "GetWindowsDirectoryW"),
     ("KERNEL32.DLL", "IsThreadAFiber"),
     ("KERNEL32.DLL", "LCMapStringW"),
-    ("KERNEL32.DLL", "LoadLibraryA"),
-    ("KERNEL32.DLL", "LoadLibraryExW"),
     ("KERNEL32.DLL", "MapViewOfFile"),
     ("KERNEL32.DLL", "RaiseException"),
     ("KERNEL32.DLL", "ReadFileEx"),

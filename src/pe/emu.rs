@@ -24,6 +24,7 @@ pub fn max_steps() -> u64 {
 /// Sentinel return address placed at the bottom of the stack.
 pub const ENTRY_SENTINEL: u64 = 0xDEAD_BEEF_DEAD_BEEF;
 pub const TLS_RETURN_SENTINEL: u64 = 0xDEAD_BEEF_DEAD_BEEE;
+pub const INIT_ONCE_RETURN_SENTINEL: u64 = 0xDEAD_BEEF_DEAD_BEED;
 
 /// Minimal CPUID for feature detection. Reports the emulated subset:
 /// SSE/SSE2 baseline, nothing newer. Unknown leaves read as zero.
@@ -64,6 +65,7 @@ pub enum StepResult {
     CalledStub { index: usize },
     Halted(u32),
     TlsReturned,
+    InitOnceReturned,
 }
 
 /// Per-thread processor state. Guest memory and import tables stay in `Emu`
@@ -145,6 +147,13 @@ pub const PEB_IMAGEBASE_OFF: u64 = 0x10;
 pub const PEB_LDR_OFF: u64 = 0x20;
 
 impl Emu {
+    pub fn register_dynamic_shim(&mut self, dll: &str, func: &str) -> u64 {
+        let index = self.imports.len();
+        let address = STUB_BASE + index as u64 * 8;
+        self.imports.push(Import { iat_rva: 0, dll: dll.to_string(), func: func.to_string() });
+        self.stubs.insert(address, index);
+        address
+    }
     pub fn cpu_state(&self) -> CpuState {
         CpuState {
             regs: self.regs,
@@ -1256,12 +1265,8 @@ impl Emu {
                 return Ok(StepResult::Continue);
             }
             if op2 == 0x54 || op2 == 0x55 || op2 == 0x56 {
-                // ANDPD/ANDNPD/ORPD (66-mandatory). Bitwise, no flags.
-                if !opsz16 {
-                    return Err(format!(
-                        "unsupported MMX opcode 0F {op2:02X} at 0x{ip:016x}"
-                    ));
-                }
+                // ANDPS/ANDNPS/ORPS (plain) and packed-double aliases (66).
+                // All are 128-bit bitwise operations with identical results.
                 let (reg, is_reg, rm, ea_raw, ml) =
                     self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
                 let next = ip + (off + 2 + ml) as u64;
@@ -2591,6 +2596,9 @@ impl Emu {
             }
             0xC3 => {
                 let ret = self.pop_u64()?;
+                if ret == INIT_ONCE_RETURN_SENTINEL {
+                    return Ok(StepResult::InitOnceReturned);
+                }
                 if ret == TLS_RETURN_SENTINEL {
                     return Ok(StepResult::TlsReturned);
                 }
@@ -2604,6 +2612,9 @@ impl Emu {
             0xC2 => {
                 let imm = self.read_u16(ip + off as u64 + 1)? as u64;
                 let ret = self.pop_u64()?;
+                if ret == INIT_ONCE_RETURN_SENTINEL {
+                    return Ok(StepResult::InitOnceReturned);
+                }
                 if ret == TLS_RETURN_SENTINEL {
                     return Ok(StepResult::TlsReturned);
                 }
@@ -4806,6 +4817,15 @@ mod tests {
         code.extend_from_slice(&[0x66, 0x0F, 0x56, 0xC1]); // orpd xmm0,xmm1
         let e = run(&code, 5);
         assert_eq!(e.xmm[0], 0xFFF0_FFF0_FFF0_FFF0);
+    }
+
+    #[test]
+    fn orps_plain_encoding_combines_xmm_lanes() {
+        let mut emu = emu_with(&[0x0F, 0x56, 0xC1]);
+        emu.xmm[0] = 0x00FF_0000_00FF_0000;
+        emu.xmm[1] = 0x0000_FF00_0000_FF00;
+        emu.step().unwrap();
+        assert_eq!(emu.xmm[0], 0x00FF_FF00_00FF_FF00);
     }
 
     fn run2(code: &[u8], steps: usize) -> Emu {

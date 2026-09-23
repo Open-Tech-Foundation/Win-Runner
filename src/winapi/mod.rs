@@ -10,7 +10,7 @@
 use crate::pe::emu::{CpuState, Emu, StepResult};
 use crate::pe::{PeImage, TlsDir};
 use crate::winfs::WinFs;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::time::{Duration, Instant};
 
@@ -18,6 +18,22 @@ pub const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6; // -10
 pub const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5; // -11
 pub const STD_ERROR_HANDLE: u32 = 0xFFFF_FFF4; // -12
 pub const INVALID_HANDLE: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+
+fn system_message(code: u32) -> Option<&'static str> {
+    Some(match code {
+        2 => "The system cannot find the file specified.\r\n",
+        3 => "The system cannot find the path specified.\r\n",
+        5 => "Access is denied.\r\n",
+        6 => "The handle is invalid.\r\n",
+        87 => "The parameter is incorrect.\r\n",
+        120 => "This function is not supported on this system.\r\n",
+        122 => "The data area passed to a system call is too small.\r\n",
+        126 => "The specified module could not be found.\r\n",
+        127 => "The specified procedure could not be found.\r\n",
+        183 => "Cannot create a file when that file already exists.\r\n",
+        _ => return None,
+    })
+}
 
 const CREATE_NEW: u32 = 1;
 const CREATE_ALWAYS: u32 = 2;
@@ -59,6 +75,7 @@ enum ThreadState {
     WaitingSrw { address: u64, shared: bool },
     WaitingCondition { cv: u64, lock: u64, kind: CondLock, deadline: Option<Instant> },
     WaitingConditionLock { lock: u64, kind: CondLock },
+    WaitingInitOnce { once: u64, callback: u64, parameter: u64, context_out: u64 },
     Finished,
 }
 
@@ -78,6 +95,19 @@ struct GuestThread {
     tls_resume: Option<CpuState>,
     tls_next: usize,
     tls_reason: u32,
+    once_frames: Vec<OnceFrame>,
+}
+
+struct OnceFrame {
+    resume: CpuState,
+    once: u64,
+    context_out: u64,
+    callback_context: u64,
+}
+
+enum OnceState {
+    Running { owner: usize },
+    Complete { context: u64 },
 }
 
 #[derive(Default)]
@@ -102,6 +132,7 @@ pub struct Runner {
     console_is_tty: bool,
     /// Last-error code (`GetLastError`/`SetLastError`).
     last_error: u32,
+    error_mode: u32,
     /// Guest env overrides (`SetEnvironmentVariableW`); host env is never
     /// mutated, reads fall through to it.
     env_overlay: HashMap<String, Option<String>>,
@@ -123,8 +154,15 @@ pub struct Runner {
     switch_requested: bool,
     critical_sections: HashMap<u64, (usize, u32)>,
     srw_locks: HashMap<u64, SrwLock>,
+    once_states: HashMap<u64, OnceState>,
+    wsa_startups: u32,
+    module_handles: HashMap<String, u64>,
     tls_template: Option<TlsDir>,
     first_unsupported_index: usize,
+    unsupported_end_index: usize,
+    dynamic_shims: HashMap<(u64, String), u64>,
+    dynamic_unsupported: HashSet<usize>,
+    probe: bool,
 }
 
 impl Runner {
@@ -176,6 +214,14 @@ impl Runner {
             Vec::new()
         };
         let main_cpu = emu.cpu_state();
+        let mut module_handles = HashMap::new();
+        for dll in ["KERNEL32.DLL", "KERNELBASE.DLL", "NTDLL.DLL"].into_iter()
+            .chain(img.imports.iter().chain(img.stubs.iter()).chain(img.unsupported.iter())
+                .map(|imp| imp.dll.as_str())) {
+            let name = dll.to_ascii_uppercase();
+            let next = 0x6000_0000u64 + module_handles.len() as u64 * 0x1000;
+            module_handles.entry(name).or_insert(next);
+        }
         let mut runner = Self {
             emu,
             fs,
@@ -187,6 +233,7 @@ impl Runner {
             console_sink: None,
             console_is_tty: std::io::stdout().is_terminal(),
             last_error: 0,
+            error_mode: 0,
             env_overlay: HashMap::new(),
             fls: Vec::new(),
             fls_count: 0,
@@ -208,14 +255,22 @@ impl Runner {
                 tls_resume: None,
                 tls_next: 0,
                 tls_reason: 0,
+                once_frames: Vec::new(),
             }],
             current_thread: 0,
             next_thread_id: 2,
             switch_requested: false,
             critical_sections: HashMap::new(),
             srw_locks: HashMap::new(),
+            once_states: HashMap::new(),
+            wsa_startups: 0,
+            module_handles,
             tls_template: img.tls.clone(),
             first_unsupported_index: img.imports.len() + img.stubs.len(),
+            unsupported_end_index: img.imports.len() + img.stubs.len() + img.unsupported.len(),
+            dynamic_shims: HashMap::new(),
+            dynamic_unsupported: HashSet::new(),
+            probe,
         };
         runner.begin_tls_callbacks(0, 1)?; // DLL_PROCESS_ATTACH
         runner.emu.restore_cpu(&runner.threads[0].cpu);
@@ -286,6 +341,32 @@ impl Runner {
         Ok(teb)
     }
 
+    fn module_handle(&self, raw: &str) -> Option<u64> {
+        let name = raw.rsplit(['\\', '/']).next().unwrap_or(raw);
+        let exe = self.prog.rsplit(['\\', '/']).next().unwrap_or(&self.prog);
+        if name.eq_ignore_ascii_case(exe) { return Some(self.emu.base); }
+        self.module_handles.get(&name.to_ascii_uppercase()).copied()
+    }
+
+    fn load_module(&mut self, raw: &str) -> Option<u64> {
+        if let Some(handle) = self.module_handle(raw) { return Some(handle); }
+        let name = raw.rsplit(['\\', '/']).next().unwrap_or(raw).to_ascii_uppercase();
+        if !matches!(name.as_str(), "POWRPROF.DLL") { return None; }
+        let handle = 0x6000_0000u64 + self.module_handles.len() as u64 * 0x1000;
+        self.module_handles.insert(name, handle);
+        Some(handle)
+    }
+
+    fn read_guest_ansi(&self, address: u64) -> Result<String, String> {
+        let mut bytes = Vec::new();
+        for offset in 0..260u64 {
+            let byte = self.emu.read_u8(address + offset)?;
+            if byte == 0 { return Ok(String::from_utf8_lossy(&bytes).to_string()); }
+            bytes.push(byte);
+        }
+        Err("guest ANSI string is too long".to_string())
+    }
+
     fn begin_tls_callbacks(&mut self, index: usize, reason: u32) -> Result<(), String> {
         if self.tls_template.as_ref().is_none_or(|tls| tls.callbacks.is_empty()) {
             return Ok(());
@@ -309,6 +390,87 @@ impl Runner {
             )?;
         } else {
             thread.cpu = thread.tls_resume.take().unwrap();
+        }
+        Ok(())
+    }
+
+    fn start_once_callback(
+        &mut self,
+        index: usize,
+        once: u64,
+        callback: u64,
+        parameter: u64,
+        context_out: u64,
+    ) -> Result<(), String> {
+        self.emu.read_u8(callback)?;
+        let resume = if index == self.current_thread {
+            self.emu.cpu_state()
+        } else {
+            self.threads[index].cpu.clone()
+        };
+        let rsp = resume.regs[4].checked_sub(0x30)
+            .ok_or_else(|| "one-time callback stack underflow".to_string())?;
+        let callback_context = self.emu.heap_alloc(8);
+        if callback_context == 0 { return Err("out of guest memory for one-time context".to_string()); }
+        self.emu.write_u64(callback_context, 0)?;
+        self.emu.write_u64(rsp, crate::pe::emu::INIT_ONCE_RETURN_SENTINEL)?;
+        let mut cpu = resume.clone();
+        cpu.regs[1] = once;
+        cpu.regs[2] = parameter;
+        cpu.regs[8] = callback_context;
+        cpu.regs[4] = rsp;
+        cpu.rip = callback;
+        self.threads[index].once_frames.push(OnceFrame {
+            resume, once, context_out, callback_context,
+        });
+        self.threads[index].cpu = cpu;
+        self.threads[index].state = ThreadState::Runnable;
+        self.once_states.insert(once, OnceState::Running { owner: index });
+        if index == self.current_thread {
+            self.emu.restore_cpu(&self.threads[index].cpu);
+        }
+        Ok(())
+    }
+
+    fn finish_once_callback(&mut self) -> Result<(), String> {
+        let success = self.emu.regs[0] != 0;
+        let index = self.current_thread;
+        let frame = self.threads[index].once_frames.pop()
+            .ok_or_else(|| "one-time callback returned without pending call".to_string())?;
+        let context = self.emu.read_u64(frame.callback_context)?;
+        let success = success && context & 3 == 0;
+        if !success && context & 3 != 0 { self.last_error = 87; }
+        self.emu.restore_cpu(&frame.resume);
+        let return_address = self.emu.pop_u64()?;
+        self.emu.rip = return_address;
+        self.emu.regs[0] = u64::from(success);
+        if success {
+            self.emu.write_u64(frame.once, context | 2)?;
+            if frame.context_out != 0 { self.emu.write_u64(frame.context_out, context)?; }
+            self.once_states.insert(frame.once, OnceState::Complete { context });
+            for thread in &mut self.threads {
+                if let ThreadState::WaitingInitOnce { once, context_out, .. } = thread.state {
+                    if once == frame.once {
+                        if context_out != 0 { self.emu.write_u64(context_out, context)?; }
+                        let return_address = self.emu.read_u64(thread.cpu.regs[4])?;
+                        thread.cpu.regs[4] += 8;
+                        thread.cpu.rip = return_address;
+                        thread.cpu.regs[0] = 1;
+                        thread.state = ThreadState::Runnable;
+                    }
+                }
+            }
+        } else {
+            self.once_states.remove(&frame.once);
+            if let Some(waiter) = self.threads.iter().position(|thread|
+                matches!(thread.state, ThreadState::WaitingInitOnce { once, .. } if once == frame.once)) {
+                let (callback, parameter, context_out) = match self.threads[waiter].state {
+                    ThreadState::WaitingInitOnce { callback, parameter, context_out, .. } =>
+                        (callback, parameter, context_out),
+                    _ => unreachable!(),
+                };
+                self.start_once_callback(waiter, frame.once, callback, parameter, context_out)?;
+            }
         }
         Ok(())
     }
@@ -664,6 +826,10 @@ impl Runner {
                     self.emu.restore_cpu(&self.threads[self.current_thread].cpu);
                     continue;
                 }
+                StepResult::InitOnceReturned => {
+                    self.finish_once_callback()?;
+                    continue;
+                }
                 StepResult::Halted(code) => {
                     if self.current_thread != 0 {
                         self.threads[self.current_thread].state = ThreadState::Finished;
@@ -722,8 +888,17 @@ impl Runner {
     /// Execute the shim for import `index`. Returns Ok(true) if halted.
     fn do_shim(&mut self, index: usize) -> Result<bool, String> {
         let imp = self.emu.imports[index].clone();
-        if index >= self.first_unsupported_index {
-            return Err(format!("unsupported import reached: {}!{}", imp.dll, imp.func));
+        if (index >= self.first_unsupported_index && index < self.unsupported_end_index)
+            || self.dynamic_unsupported.contains(&index) {
+            let detail = if imp.func == "LoadLibraryExA" && self.emu.regs[1] != 0 {
+                format!(" requested={:?}", self.read_guest_ansi(self.emu.regs[1])?)
+            } else { String::new() };
+            return Err(format!(
+                "unsupported import reached: {}!{}{} (rcx=0x{:x} rdx=0x{:x} r8=0x{:x} r9=0x{:x} stack4=0x{:x} stack5=0x{:x} stack6=0x{:x})",
+                imp.dll, imp.func, detail, self.emu.regs[1], self.emu.regs[2], self.emu.regs[8],
+                self.emu.regs[9], self.emu.stack_arg(4).unwrap_or(0),
+                self.emu.stack_arg(5).unwrap_or(0), self.emu.stack_arg(6).unwrap_or(0),
+            ));
         }
         let rcx = self.emu.regs[1];
         let rdx = self.emu.regs[2];
@@ -760,6 +935,30 @@ impl Runner {
         }
 
         match name {
+            "#8" | "#14" => ret_bool!((rcx as u32).swap_bytes() as u64),
+            "#9" | "#15" => ret_bool!((rcx as u16).swap_bytes() as u64),
+            "#115" => { // WSAStartup, x64 WSADATA is 408 bytes
+                let version = rcx as u16;
+                if version & 0xff == 0 || version & 0xff > 2 || version >> 8 > 2 {
+                    ret_bool!(10092); // WSAVERNOTSUPPORTED
+                }
+                if rdx == 0 { ret_bool!(10014); } // WSAEFAULT
+                self.emu.write_bytes(rdx, &[0u8; 408])?;
+                self.emu.write_u16(rdx, version)?;
+                self.emu.write_u16(rdx + 2, 0x202)?;
+                self.emu.write_bytes(rdx + 16, b"WinSock 2.0\0")?;
+                self.emu.write_bytes(rdx + 273, b"Running\0")?;
+                self.wsa_startups = self.wsa_startups.saturating_add(1);
+                ret_bool!(0);
+            }
+            "#116" => { // WSACleanup
+                if self.wsa_startups == 0 {
+                    self.last_error = 10093; // WSANOTINITIALISED
+                    ret_bool!(u32::MAX as u64); // SOCKET_ERROR
+                }
+                self.wsa_startups -= 1;
+                ret_bool!(0);
+            }
             "ExitProcess" => {
                 ret_halt!((rcx & 0xFFFF_FFFF) as u32);
             }
@@ -1241,18 +1440,19 @@ impl Runner {
                 if rcx == 0 {
                     ret_bool!(self.emu.base); // main image
                 }
+                let name = self.emu.read_utf16(rcx)?;
+                if let Some(handle) = self.module_handle(&name) { ret_bool!(handle); }
                 self.last_error = 126; // MOD_NOT_FOUND
                 ret_bool!(0);
             }
             "GetModuleHandleA" => {
                 if rcx == 0 {
                     ret_bool!(self.emu.base);
-                } else {
-                    // read C string for a better error only
-                    let _ = self.emu.read_bytes(rcx, 64);
-                    self.last_error = 126;
-                    ret_bool!(0);
                 }
+                let name = self.read_guest_ansi(rcx)?;
+                if let Some(handle) = self.module_handle(&name) { ret_bool!(handle); }
+                self.last_error = 126;
+                ret_bool!(0);
             }
             "GetModuleHandleExW" => {
                 // (flags, name, &h): all three fit in registers.
@@ -1262,7 +1462,40 @@ impl Runner {
                     }
                     ret_bool!(1);
                 }
+                let handle = if rcx & 4 != 0 {
+                    if rdx >= self.emu.base && rdx < self.emu.base + self.emu.mem.len() as u64 {
+                        Some(self.emu.base)
+                    } else { None }
+                } else if rdx != 0 {
+                    self.module_handle(&self.emu.read_utf16(rdx)?)
+                } else { Some(self.emu.base) };
+                if let Some(handle) = handle {
+                    if r8 != 0 { self.emu.write_u64(r8, handle)?; }
+                    ret_bool!(1);
+                }
                 self.last_error = 126;
+                ret_bool!(0);
+            }
+            "LoadLibraryA" | "LoadLibraryExA" | "LoadLibraryExW" => {
+                let extended = name != "LoadLibraryA";
+                if rcx == 0 || (extended && (rdx != 0 || r8 & !0x800 != 0)) {
+                    self.last_error = 87;
+                    ret_bool!(0);
+                }
+                let module = if name == "LoadLibraryExW" {
+                    self.emu.read_utf16(rcx)?
+                } else {
+                    self.read_guest_ansi(rcx)?
+                };
+                if let Some(handle) = self.load_module(&module) { ret_bool!(handle); }
+                self.last_error = 126;
+                ret_bool!(0);
+            }
+            "FreeLibrary" => {
+                if self.module_handles.values().any(|&handle| handle == rcx) {
+                    ret_bool!(1);
+                }
+                self.last_error = 6;
                 ret_bool!(0);
             }
             "GetModuleFileNameW" => {
@@ -1808,6 +2041,7 @@ impl Runner {
                     tls_resume: None,
                     tls_next: 0,
                     tls_reason: 0,
+                    once_frames: Vec::new(),
                 });
                 self.begin_tls_callbacks(self.threads.len() - 1, 2)?; // DLL_THREAD_ATTACH
                 self.switch_requested = true;
@@ -1958,6 +2192,151 @@ impl Runner {
             "InitializeConditionVariable" => {
                 self.emu.write_u64(rcx, 0)?;
                 ret_bool!(0);
+            }
+            "InitOnceInitialize" => {
+                self.emu.write_u64(rcx, 0)?;
+                self.once_states.remove(&rcx);
+                ret_bool!(0);
+            }
+            "SetErrorMode" => {
+                let old = self.error_mode;
+                self.error_mode = (rcx as u32 & 0x8007) | (old & 0x4);
+                ret_bool!(old as u64);
+            }
+            "GetSystemMetrics" => {
+                // SM_CLEANBOOT: this emulated system starts normally. Other
+                // metrics need explicit modeling before programs rely on them.
+                if rcx as u32 != 67 {
+                    return Err(format!("unsupported GetSystemMetrics index {}", rcx as u32));
+                }
+                ret_bool!(0);
+            }
+            "FormatMessageA" | "FormatMessageW" => {
+                let flags = rcx as u32;
+                let id = r8 as u32;
+                let buffer = self.emu.stack_arg(4)?;
+                let size = self.emu.stack_arg(5)? as usize;
+                // System messages with no insert expansion are the supported
+                // subset; unsupported message sources fail explicitly.
+                if flags & 0x1000 == 0 || flags & (0x400 | 0x800) != 0 {
+                    self.last_error = 120;
+                    ret_bool!(0);
+                }
+                let Some(message) = system_message(id) else {
+                    self.last_error = 317; // ERROR_MR_MID_NOT_FOUND
+                    ret_bool!(0);
+                };
+                let wide = name == "FormatMessageW";
+                let mut bytes = Vec::new();
+                if wide {
+                    for unit in message.encode_utf16().chain(std::iter::once(0)) {
+                        bytes.extend_from_slice(&unit.to_le_bytes());
+                    }
+                } else {
+                    bytes.extend_from_slice(message.as_bytes());
+                    bytes.push(0);
+                }
+                let count = if wide { bytes.len() / 2 - 1 } else { bytes.len() - 1 };
+                if size > 64 * 1024 || count + 1 > 64 * 1024 {
+                    self.last_error = 122;
+                    ret_bool!(0);
+                }
+                if flags & 0x100 != 0 { // FORMAT_MESSAGE_ALLOCATE_BUFFER
+                    let alloc_size = size.max(count + 1) * if wide { 2 } else { 1 };
+                    let ptr = self.emu.heap_alloc(alloc_size);
+                    if ptr == 0 { self.last_error = 8; ret_bool!(0); }
+                    self.emu.write_bytes(ptr, &bytes)?;
+                    self.emu.write_u64(buffer, ptr)?;
+                } else {
+                    if size <= count { self.last_error = 122; ret_bool!(0); }
+                    self.emu.write_bytes(buffer, &bytes)?;
+                }
+                ret_bool!(count as u64);
+            }
+            "LocalFree" => {
+                if rcx != 0 { self.emu.read_u8(rcx)?; }
+                ret_bool!(0); // bump allocator cannot reclaim the block
+            }
+            "GetProcAddress" => {
+                if rdx <= 0xffff {
+                    self.last_error = 127; // ordinal lookup not mapped
+                    ret_bool!(0);
+                }
+                let function = self.read_guest_ansi(rdx)?;
+                if std::env::var("WINCLI_TRACE").as_deref() == Ok("1") {
+                    eprintln!("[trace] dynamic lookup handle=0x{rcx:x} function={function}");
+                }
+                let dll = self.module_handles.iter()
+                    .find_map(|(dll, &handle)| (handle == rcx).then_some(dll.clone()));
+                if let Some(dll) = dll.filter(|dll| crate::pe::is_supported(dll, &function) || self.probe) {
+                    let key = (rcx, function.clone());
+                    let address = if let Some(&address) = self.dynamic_shims.get(&key) {
+                        address
+                    } else {
+                        let index = self.emu.imports.len();
+                        let address = self.emu.register_dynamic_shim(&dll, &function);
+                        if !crate::pe::is_supported(&dll, &function) {
+                            self.dynamic_unsupported.insert(index);
+                        }
+                        self.dynamic_shims.insert(key, address);
+                        address
+                    };
+                    ret_bool!(address);
+                }
+                self.last_error = 127; // ERROR_PROC_NOT_FOUND
+                ret_bool!(0);
+            }
+            "RtlGetVersion" => {
+                let size = self.emu.read_u32(rcx)?;
+                if size < 276 { ret_bool!(0xC000_000D); } // STATUS_INVALID_PARAMETER
+                let len = (size as usize).min(284);
+                self.emu.write_bytes(rcx, &vec![0u8; len])?;
+                self.emu.write_u32(rcx, size)?;
+                self.emu.write_u32(rcx + 4, 10)?;
+                self.emu.write_u32(rcx + 8, 0)?;
+                self.emu.write_u32(rcx + 12, 19045)?; // emulated Windows 10 baseline
+                self.emu.write_u32(rcx + 16, 2)?; // VER_PLATFORM_WIN32_NT
+                ret_bool!(0); // STATUS_SUCCESS
+            }
+            "RtlNtStatusToDosError" => {
+                let code = match rcx as u32 {
+                    0 => 0,
+                    0xC000_0005 => 998, // ERROR_NOACCESS
+                    0xC000_0008 => 6,
+                    0xC000_000D => 87,
+                    0xC000_0017 => 8,
+                    0xC000_0022 => 5,
+                    0xC000_0034 => 2,
+                    0xC000_003A => 3,
+                    _ => 317, // ERROR_MR_MID_NOT_FOUND
+                };
+                ret_bool!(code);
+            }
+            "InitOnceExecuteOnce" => {
+                if rcx == 0 || rdx == 0 {
+                    self.last_error = 87;
+                    ret_bool!(0);
+                }
+                self.emu.read_u64(rcx)?;
+                match self.once_states.get(&rcx) {
+                    Some(OnceState::Complete { context }) => {
+                        if r9 != 0 { self.emu.write_u64(r9, *context)?; }
+                        ret_bool!(1);
+                    }
+                    Some(OnceState::Running { owner }) if *owner == self.current_thread => {
+                        return Err("recursive InitOnceExecuteOnce on the same object".to_string());
+                    }
+                    Some(OnceState::Running { .. }) => {
+                        self.threads[self.current_thread].state = ThreadState::WaitingInitOnce {
+                            once: rcx, callback: rdx, parameter: r8, context_out: r9,
+                        };
+                        return Ok(false); // keep the API return address on the stack
+                    }
+                    None => {
+                        self.start_once_callback(self.current_thread, rcx, rdx, r8, r9)?;
+                        return Ok(false); // resume in the guest callback
+                    }
+                }
             }
             "WakeConditionVariable" | "WakeAllConditionVariable" => {
                 let single = name == "WakeConditionVariable";
@@ -2155,7 +2534,6 @@ impl Runner {
             // ---- fail-stubs: loadable, fail clearly if called ----
             "NtCreateNamedPipeFile"
             | "NtOpenFile"
-            | "RtlNtStatusToDosError"
             | "GetUserProfileDirectoryW"
             | "AddVectoredExceptionHandler"
             | "CompareStringOrdinal"
@@ -2166,20 +2544,15 @@ impl Runner {
             | "CreateWaitableTimerExW"
             | "DuplicateHandle"
             | "FlushFileBuffers"
-            | "FormatMessageW"
-            | "FreeLibrary"
             | "GetCPInfo"
             | "GetComputerNameExW"
             | "GetConsoleScreenBufferInfo"
             | "GetExitCodeProcess"
-            | "GetProcAddress"
             | "GetStringTypeW"
             | "GetSystemDirectoryW"
             | "GetWindowsDirectoryW"
             | "IsThreadAFiber"
             | "LCMapStringW"
-            | "LoadLibraryA"
-            | "LoadLibraryExW"
             | "MapViewOfFile"
             | "RaiseException"
             | "ReadFileEx"
@@ -3028,6 +3401,7 @@ mod tests {
             tls_resume: None,
             tls_next: 0,
             tls_reason: 0,
+            once_frames: Vec::new(),
         });
         runner.refresh_waiters().unwrap();
         assert!(matches!(
@@ -3061,6 +3435,7 @@ mod tests {
             id: 2, handle: 0x8000_0002, open: true, cpu, last_error: 0,
             fls: Vec::new(), tls_values: Vec::new(), state: ThreadState::Runnable,
             critical_depth: 0, tls_resume: None, tls_next: 0, tls_reason: 0,
+            once_frames: Vec::new(),
         });
         assert!(runner.srw_acquire(address, false, false));
         runner.current_thread = 1;
@@ -3098,5 +3473,40 @@ mod tests {
         assert!(matches!(runner.threads[0].state, ThreadState::Runnable));
         assert_eq!(runner.critical_sections[&critical], (0, 1));
         assert_eq!(runner.threads[0].critical_depth, 1);
+    }
+
+    #[test]
+    fn init_once_success_wakes_waiter_with_context() {
+        let exe = crate::pe::builder::hello("x");
+        let img = crate::pe::load(&exe).unwrap();
+        let mut runner = Runner::new(&img, WinFs::new()).unwrap();
+        let once = runner.emu.heap_alloc(8);
+        let callback_context = runner.emu.heap_alloc(8);
+        let waiter_context = runner.emu.heap_alloc(8);
+        let waiter_stack = runner.emu.heap_alloc(8);
+        let waiter_return = img.image_base + u64::from(img.entry_rva);
+        runner.emu.write_u64(callback_context, 0x100).unwrap();
+        runner.emu.write_u64(waiter_stack, waiter_return).unwrap();
+        let mut waiter_cpu = runner.emu.cpu_state();
+        waiter_cpu.regs[4] = waiter_stack;
+        runner.threads.push(GuestThread {
+            id: 2, handle: 0x8000_0002, open: true, cpu: waiter_cpu,
+            last_error: 0, fls: Vec::new(), tls_values: Vec::new(),
+            state: ThreadState::WaitingInitOnce {
+                once, callback: waiter_return, parameter: 0, context_out: waiter_context,
+            }, critical_depth: 0, tls_resume: None, tls_next: 0, tls_reason: 0,
+            once_frames: Vec::new(),
+        });
+        runner.once_states.insert(once, OnceState::Running { owner: 0 });
+        runner.threads[0].once_frames.push(OnceFrame {
+            resume: runner.emu.cpu_state(), once, context_out: 0, callback_context,
+        });
+        runner.emu.regs[0] = 1;
+        runner.finish_once_callback().unwrap();
+        assert!(matches!(runner.once_states[&once], OnceState::Complete { context: 0x100 }));
+        assert!(matches!(runner.threads[1].state, ThreadState::Runnable));
+        assert_eq!(runner.threads[1].cpu.rip, waiter_return);
+        assert_eq!(runner.threads[1].cpu.regs[0], 1);
+        assert_eq!(runner.emu.read_u64(waiter_context).unwrap(), 0x100);
     }
 }

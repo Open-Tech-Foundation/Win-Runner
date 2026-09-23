@@ -239,6 +239,284 @@ fn dynamic_tls_slots_can_be_set_freed_and_reused() {
 }
 
 #[test]
+fn init_once_callback_retries_failure_then_caches_context() {
+    use pe::builder::{self, Asm};
+    let mut a = Asm::new();
+    let once = a.add_zeroed(8);
+    let count = a.add_zeroed(4);
+    let context = a.add_zeroed(8);
+    let fail = a.fresh_label();
+    let callback_fail = a.fresh_label();
+    let mut callback_patches = Vec::new();
+    a.sub_rsp(0x48);
+    for call in 0..3 {
+        a.lea_reg_rip(1, once);
+        callback_patches.push(a.code.len() + 2);
+        a.emit(&[0x48, 0xBA, 0, 0, 0, 0, 0, 0, 0, 0]); // mov rdx, callback VA
+        a.mov_r8d_imm(7);
+        a.lea_reg_rip(9, context);
+        a.call_import(0);
+        a.test_eax_eax();
+        if call == 0 { a.jnz(fail); } else { a.jz(fail); }
+    }
+    a.mov_eax_mem_rip(count);
+    a.cmp_eax_imm(2);
+    a.jnz(fail);
+    a.lea_reg_rip(0, context);
+    a.emit(&[0x8B, 0x00]); // mov eax, [rax]
+    a.cmp_eax_imm(0x100);
+    a.jnz(fail);
+    a.mov_ecx_imm(0);
+    a.call_import(1);
+    a.mark(fail);
+    a.mov_ecx_imm(1);
+    a.call_import(1);
+    let callback_rva = builder::SECTION_RVA + a.code.len() as u32;
+    let callback_va = builder::IMAGE_BASE + u64::from(callback_rva);
+    for patch in callback_patches {
+        a.code[patch..patch + 8].copy_from_slice(&callback_va.to_le_bytes());
+    }
+    a.lea_reg_rip(0, count);
+    a.emit(&[0xFF, 0x00]); // inc dword [rax]
+    a.mov_eax_mem_rip(count);
+    a.cmp_eax_imm(1);
+    a.jz(callback_fail);
+    a.emit(&[0x41, 0xC7, 0x00, 0, 1, 0, 0]); // mov dword [r8], 0x100
+    a.mov_r32_imm(0, 1);
+    a.ret();
+    a.mark(callback_fail);
+    a.xor_eax();
+    a.ret();
+    let exe = builder::build(a, &[
+        ("KERNEL32.dll", "InitOnceExecuteOnce"),
+        ("KERNEL32.dll", "ExitProcess"),
+    ]);
+    assert_eq!(run_exe_on_fs(&exe, WinFs::new()).0, 0);
+    let path = tmp_path("init-once.exe");
+    std::fs::write(&path, exe).unwrap();
+    let (code, _, stderr) = run_cli(&path);
+    std::fs::remove_file(&path).ok();
+    assert_eq!(code, 0, "stderr: {stderr}");
+}
+
+#[test]
+fn set_error_mode_returns_previous_process_flags() {
+    use pe::builder::{build, Asm};
+    let mut a = Asm::new();
+    let fail = a.fresh_label();
+    a.sub_rsp(0x28);
+    a.mov_ecx_imm(1);
+    a.call_import(0);
+    a.test_eax_eax();
+    a.jnz(fail);
+    a.mov_ecx_imm(0x8002);
+    a.call_import(0);
+    a.cmp_eax_imm(1);
+    a.jnz(fail);
+    a.mov_ecx_imm(0);
+    a.call_import(0);
+    a.cmp_eax_imm(0x8002);
+    a.jnz(fail);
+    a.mov_ecx_imm(0);
+    a.call_import(1);
+    a.mark(fail);
+    a.mov_ecx_imm(1);
+    a.call_import(1);
+    let exe = build(a, &[
+        ("KERNEL32.dll", "SetErrorMode"),
+        ("KERNEL32.dll", "ExitProcess"),
+    ]);
+    assert_eq!(run_exe_on_fs(&exe, WinFs::new()).0, 0);
+}
+
+#[test]
+fn system_metrics_reports_normal_boot_and_rejects_unmodeled_indices() {
+    use pe::builder::{build, Asm};
+    let mut a = Asm::new();
+    let fail = a.fresh_label();
+    a.sub_rsp(0x28);
+    a.mov_ecx_imm(67); // SM_CLEANBOOT
+    a.call_import(0);
+    a.test_eax_eax();
+    a.jnz(fail);
+    a.mov_ecx_imm(0);
+    a.call_import(1);
+    a.mark(fail);
+    a.mov_ecx_imm(1);
+    a.call_import(1);
+    let exe = build(a, &[("USER32.dll", "GetSystemMetrics"), ("KERNEL32.dll", "ExitProcess")]);
+    assert_eq!(run_exe_on_fs(&exe, WinFs::new()).0, 0);
+
+    let mut a = Asm::new();
+    a.sub_rsp(0x28);
+    a.mov_ecx_imm(9999);
+    a.call_import(0);
+    let exe = build(a, &[("USER32.dll", "GetSystemMetrics")]);
+    let error = winapi::run_exe(&exe, WinFs::new()).unwrap_err();
+    assert!(error.contains("unsupported GetSystemMetrics index 9999"), "{error}");
+}
+
+#[test]
+fn winsock_startup_initializes_data_and_tracks_cleanup() {
+    use pe::builder::{build, Asm};
+    let mut a = Asm::new();
+    let data = a.add_zeroed(408);
+    let fail = a.fresh_label();
+    a.sub_rsp(0x28);
+    a.call_import(1); // WSACleanup before startup
+    a.cmp_eax_imm(u32::MAX);
+    a.jnz(fail);
+    a.mov_ecx_imm(0x202);
+    a.lea_reg_rip(2, data); // RDX = WSADATA
+    a.call_import(0);
+    a.test_eax_eax();
+    a.jnz(fail);
+    a.lea_reg_rip(0, data);
+    a.emit(&[0x0f, 0xb7, 0x00]); // movzx eax, word [rax]
+    a.cmp_eax_imm(0x202);
+    a.jnz(fail);
+    a.call_import(1);
+    a.test_eax_eax();
+    a.jnz(fail);
+    a.mov_ecx_imm(0);
+    a.call_import(2);
+    a.mark(fail);
+    a.mov_ecx_imm(1);
+    a.call_import(2);
+    let exe = build(a, &[
+        ("WS2_32.dll", "#115"),
+        ("WS2_32.dll", "#116"),
+        ("KERNEL32.dll", "ExitProcess"),
+    ]);
+    assert_eq!(run_exe_on_fs(&exe, WinFs::new()).0, 0);
+
+    let mut a = Asm::new();
+    let fail = a.fresh_label();
+    a.sub_rsp(0x28);
+    a.mov_ecx_imm(0x303); // unsupported Winsock version
+    a.mov_edx_imm(0);
+    a.call_import(0);
+    a.cmp_eax_imm(10092);
+    a.jnz(fail);
+    a.mov_ecx_imm(0x202);
+    a.call_import(0); // null WSADATA
+    a.cmp_eax_imm(10014);
+    a.jnz(fail);
+    a.mov_ecx_imm(0);
+    a.call_import(1);
+    a.mark(fail);
+    a.mov_ecx_imm(1);
+    a.call_import(1);
+    let exe = build(a, &[("WS2_32.dll", "#115"), ("KERNEL32.dll", "ExitProcess")]);
+    assert_eq!(run_exe_on_fs(&exe, WinFs::new()).0, 0);
+}
+
+#[test]
+fn dynamic_ntdll_export_runs_and_unknown_export_fails() {
+    use pe::builder::{build, Asm};
+    let mut a = Asm::new();
+    let ntdll = a.add_utf16("ntdll.dll");
+    let export = a.add_data(b"RtlNtStatusToDosError\0".to_vec());
+    let unknown = a.add_data(b"NoSuchExportForTest\0".to_vec());
+    let fail = a.fresh_label();
+    a.sub_rsp(0x38);
+    a.lea_reg_rip(1, ntdll);
+    a.call_import(0); // GetModuleHandleW
+    a.test_rax_rax();
+    a.jz(fail);
+    a.mov_rspoff_reg(0x20, 0);
+    a.mov_rcx_rax();
+    a.lea_reg_rip(2, export);
+    a.call_import(1); // GetProcAddress
+    a.test_rax_rax();
+    a.jz(fail);
+    a.mov_ecx_imm(0xC000_0005);
+    a.emit(&[0xFF, 0xD0]); // call rax
+    a.cmp_eax_imm(998); // ERROR_NOACCESS
+    a.jnz(fail);
+    a.mov_reg_rspoff(1, 0x20);
+    a.lea_reg_rip(2, unknown);
+    a.call_import(1);
+    a.test_rax_rax();
+    a.jnz(fail);
+    a.call_import(2); // GetLastError
+    a.cmp_eax_imm(127); // ERROR_PROC_NOT_FOUND
+    a.jnz(fail);
+    a.mov_ecx_imm(0);
+    a.call_import(3);
+    a.mark(fail);
+    a.mov_ecx_imm(1);
+    a.call_import(3);
+    let exe = build(a, &[
+        ("KERNEL32.dll", "GetModuleHandleW"),
+        ("KERNEL32.dll", "GetProcAddress"),
+        ("KERNEL32.dll", "GetLastError"),
+        ("KERNEL32.dll", "ExitProcess"),
+    ]);
+    assert_eq!(run_exe_on_fs(&exe, WinFs::new()).0, 0);
+}
+
+#[test]
+fn format_message_allocates_ansi_and_wide_system_text() {
+    use pe::builder::{build, Asm};
+    let mut a = Asm::new();
+    let out_ptr = a.add_zeroed(8);
+    let fail = a.fresh_label();
+    a.sub_rsp(0x48);
+    for import in [0, 1] { // FormatMessageA then FormatMessageW
+        a.mov_ecx_imm(0x1300); // ALLOCATE_BUFFER | IGNORE_INSERTS | FROM_SYSTEM
+        a.mov_edx_imm(0);
+        a.mov_r8d_imm(126); // ERROR_MOD_NOT_FOUND
+        a.mov_r9d_imm(0);
+        a.lea_reg_rip(0, out_ptr);
+        a.mov_rspoff_rax(0x20);
+        a.mov_rspoff_imm32(0x28, 0);
+        a.mov_rspoff_imm32(0x30, 0);
+        a.call_import(import);
+        a.test_eax_eax();
+        a.jz(fail);
+        a.lea_reg_rip(0, out_ptr);
+        a.emit(&[0x48, 0x8B, 0x00]); // mov rax, [rax]
+        a.mov_rcx_rax();
+        a.call_import(2); // LocalFree
+        a.test_eax_eax();
+        a.jnz(fail);
+    }
+    a.mov_ecx_imm(0x1200);
+    a.mov_edx_imm(0);
+    a.mov_r8d_imm(9999);
+    a.mov_r9d_imm(0);
+    a.lea_reg_rip(0, out_ptr);
+    a.mov_rspoff_rax(0x20);
+    a.mov_rspoff_imm32(0x28, 0);
+    a.mov_rspoff_imm32(0x30, 0);
+    a.call_import(0);
+    a.test_eax_eax();
+    a.jnz(fail);
+    a.call_import(3); // GetLastError
+    a.cmp_eax_imm(317);
+    a.jnz(fail);
+    a.mov_ecx_imm(0);
+    a.call_import(4);
+    a.mark(fail);
+    a.mov_ecx_imm(1);
+    a.call_import(4);
+    let exe = build(a, &[
+        ("KERNEL32.dll", "FormatMessageA"),
+        ("KERNEL32.dll", "FormatMessageW"),
+        ("KERNEL32.dll", "LocalFree"),
+        ("KERNEL32.dll", "GetLastError"),
+        ("KERNEL32.dll", "ExitProcess"),
+    ]);
+    assert_eq!(run_exe_on_fs(&exe, WinFs::new()).0, 0);
+    let path = tmp_path("format-message.exe");
+    std::fs::write(&path, exe).unwrap();
+    let (code, _, stderr) = run_cli(&path);
+    std::fs::remove_file(&path).ok();
+    assert_eq!(code, 0, "stderr: {stderr}");
+}
+
+#[test]
 fn interpreter_guest_thread_waits_and_handle_errors() {
     use pe::builder::{self, Asm};
     let imports = [

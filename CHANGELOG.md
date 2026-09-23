@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added one-time initialization callbacks with retry and waiter handling,
+  process error-mode flags, system error formatting, and basic local-buffer
+  release for Windows runtime startup.
+- Added logical DLL handles, `GetProcAddress` runtime shims, optional
+  `powrprof.dll` loading, NTDLL version/status helpers, normal-boot metric
+  reporting, and Winsock byte-order and startup/cleanup exports. Probe mode
+  now reports calls to unsupported dynamically resolved exports.
+- The interpreter now executes packed single-precision `ANDPS`, `ANDNPS`,
+  and `ORPS` operations used during Node.js startup.
 - Added `wincli probe <app.exe> [args...]` to execute a leniently loaded PE
   under fail-on-call imports and report the first real runtime blocker without
   weakening normal strict loading.
