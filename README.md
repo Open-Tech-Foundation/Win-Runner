@@ -10,6 +10,7 @@ wincli rg --version       # cached package by bare name (or C:\bin\rg.exe)
 wincli script.ps1         # minimal PowerShell-like script execution
 wincli shell              # interactive shell: one in-memory WinFS per session
 wincli inspect app.exe    # PE compatibility report: supported vs missing imports
+wincli probe app.exe --version  # diagnostic: first API/instruction reached that fails
 ```
 
 ### Experimental native backend
@@ -148,7 +149,12 @@ at portable Windows CLI tools to drive expansion one program at a time:
 
 ```bash
 wincli inspect rg.exe
+wincli probe node.exe --version
 ```
+
+`probe` uses the interpreter and temporarily binds missing imports to
+fail-on-call thunks. It stops at the first unsupported API or instruction
+actually reached; normal execution still rejects unknown imports at load time.
 
 Planned next step is `wincli install <name>`: resolve portable Windows x64
 releases (preferred source: the WinGet catalog, portable EXE / ZIP only —

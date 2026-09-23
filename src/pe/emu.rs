@@ -276,7 +276,7 @@ impl Emu {
         // memory write: the loader may patch IAT slots inside executable
         // sections (old test artifacts do), like the real loader.
         let mut i = 0usize;
-        for imp in img.imports.iter().chain(img.stubs.iter()) {
+        for imp in img.imports.iter().chain(img.stubs.iter()).chain(img.unsupported.iter()) {
             let stub = STUB_BASE + i as u64 * 8;
             e.stubs.insert(stub, i);
             let va = base + imp.iat_rva as u64;
@@ -288,6 +288,7 @@ impl Emu {
             .imports
             .iter()
             .chain(img.stubs.iter())
+            .chain(img.unsupported.iter())
             .cloned()
             .collect();
         // Set up stack with sentinel return address.
@@ -855,7 +856,7 @@ impl Emu {
         let op = self.read_u8(ip + off as u64)?;
         // REP is only meaningful on string ops (below), PAUSE (F3 90),
         // and the SSE-move aliases (F3 0F 10/11/...).
-        if rep && !matches!(op, 0x90 | 0x0F | 0xA4 | 0xA5 | 0xAA | 0xAB | 0xAC | 0xAD) {
+        if rep && !matches!(op, 0x90 | 0x0F | 0xA4 | 0xA5 | 0xAA | 0xAB | 0xAC | 0xAD | 0xC3) {
             return Err(format!(
                 "unsupported REP string op 0x{op:02X} at 0x{ip:016x}"
             ));
@@ -903,10 +904,28 @@ impl Emu {
         // two-byte opcodes
         if op == 0x0F {
             let op2 = self.read_u8(ip + off as u64 + 1)?;
+            if op2 == 0xAE {
+                let form = self.read_u8(ip + off as u64 + 2)?;
+                if matches!(form, 0xE8 | 0xF0 | 0xF8) && !rep && !repne && !opsz16 {
+                    // LFENCE/MFENCE/SFENCE. Guest threads are cooperatively
+                    // scheduled, so host execution already preserves order.
+                    self.rip = ip + off as u64 + 3;
+                    return Ok(StepResult::Continue);
+                }
+            }
+            // CET indirect-branch landing pad. It is a no-op when CET is
+            // not enabled, but only this exact four-byte encoding qualifies.
+            if rep && op2 == 0x1E {
+                if self.read_u8(ip + off as u64 + 2)? == 0xFA {
+                    self.rip = ip + off as u64 + 3;
+                    return Ok(StepResult::Continue);
+                }
+                return Err(format!("unsupported REP-prefixed opcode 0F 1E at 0x{ip:016x}"));
+            }
             if rep
                 && !matches!(
                     op2,
-                    0x10 | 0x11
+                    0x10 | 0x11 | 0x2A | 0x58 | 0x59 | 0x5C | 0x5E
                         | 0x28
                         | 0x29
                         | 0x6E
@@ -1121,6 +1140,41 @@ impl Emu {
                 self.rip = next;
                 return Ok(StepResult::Continue);
             }
+            if rep && op2 == 0x2A {
+                // CVTSI2SS xmm, r/m32/64. Only the low single-precision
+                // lane changes; the remaining XMM bits are preserved.
+                let (reg, is_reg, rm, ea_raw, ml) =
+                    self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
+                let next = ip + (off + 2 + ml) as u64;
+                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let value = if rex_w {
+                    self.read_rm(is_reg, rm, ea, 64)? as i64 as f32
+                } else {
+                    self.read_rm(is_reg, rm, ea, 32)? as u32 as i32 as f32
+                };
+                self.xmm[reg] = (self.xmm[reg] & !0xFFFF_FFFFu128) | value.to_bits() as u128;
+                self.rip = next;
+                return Ok(StepResult::Continue);
+            }
+            if rep && matches!(op2, 0x58 | 0x59 | 0x5C | 0x5E) {
+                // Scalar single-precision arithmetic, preserving upper bits.
+                let (reg, is_reg, rm, ea_raw, ml) =
+                    self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
+                let next = ip + (off + 2 + ml) as u64;
+                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let a = f32::from_bits(self.xmm[reg] as u32);
+                let b = if is_reg { f32::from_bits(self.xmm[rm] as u32) }
+                    else { f32::from_bits(self.read_u32(ea)?) };
+                let result = match op2 {
+                    0x58 => a + b,
+                    0x59 => a * b,
+                    0x5C => a - b,
+                    _ => a / b,
+                };
+                self.xmm[reg] = (self.xmm[reg] & !0xFFFF_FFFFu128) | result.to_bits() as u128;
+                self.rip = next;
+                return Ok(StepResult::Continue);
+            }
             if opsz16 && matches!(op2, 0x58 | 0x59 | 0x5C | 0x5E) {
                 // Packed-double family (66-mandatory): ADDPD/MULPD/SUBPD/
                 // DIVPD. Per-lane host f64 ops, bit-identical under the
@@ -1158,10 +1212,7 @@ impl Emu {
                 return Ok(StepResult::Continue);
             }
             if op2 == 0x2E {
-                // UCOMISD xmm, xmm/m64 (66-mandatory; plain is single-prec).
-                if !opsz16 {
-                    return Err(format!("unsupported COMISS at 0x{ip:016x}"));
-                }
+                // UCOMISD (66) or UCOMISS (plain) comparisons.
                 let (reg, is_reg, rm, ea_raw, ml) =
                     self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
                 let next = ip + (off + 2 + ml) as u64;
@@ -1170,12 +1221,14 @@ impl Emu {
                 } else {
                     ea_raw
                 };
-                let a = f64::from_bits((self.xmm[reg] & 0xFFFF_FFFF_FFFF_FFFF) as u64);
-                let b = if is_reg {
-                    f64::from_bits((self.xmm[rm] & 0xFFFF_FFFF_FFFF_FFFF) as u64)
-                } else {
-                    f64::from_bits(self.read_u64(ea)?)
+                let lane = |bits: u128| {
+                    if opsz16 { f64::from_bits(bits as u64) }
+                    else { f32::from_bits(bits as u32) as f64 }
                 };
+                let a = lane(self.xmm[reg]);
+                let b = if is_reg { lane(self.xmm[rm]) }
+                    else if opsz16 { f64::from_bits(self.read_u64(ea)?) }
+                    else { f32::from_bits(self.read_u32(ea)?) as f64 };
                 // ZF/PF/CF only (gt:000 lt:001 eq:100 unord:111); SF/OF/AF untouched.
                 match a.partial_cmp(&b) {
                     None => {
@@ -3803,6 +3856,25 @@ mod tests {
     }
 
     #[test]
+    fn endbr64_is_exact_four_byte_noop() {
+        let mut emu = emu_with(&[0xF3, 0x0F, 0x1E, 0xFA, 0xC3]);
+        assert_eq!(emu.step().unwrap(), StepResult::Continue);
+        assert_eq!(emu.rip, BASE + 0x1004);
+        assert!(emu_with(&[0xF3, 0x0F, 0x1E, 0x00]).step().is_err());
+        assert_eq!(emu_with(&[0xF3, 0xC3]).step().unwrap(), StepResult::Halted(0));
+    }
+
+    #[test]
+    fn fences_are_exact_three_byte_noops() {
+        for form in [0xE8, 0xF0, 0xF8] {
+            let mut emu = emu_with(&[0x0F, 0xAE, form, 0xC3]);
+            assert_eq!(emu.step().unwrap(), StepResult::Continue);
+            assert_eq!(emu.rip, BASE + 0x1003);
+        }
+        assert!(emu_with(&[0x0F, 0xAE, 0x00]).step().is_err());
+    }
+
+    #[test]
     fn heap_payloads_respect_alignment_and_keep_size_headers() {
         let mut emu = emu_with(&[]);
         for (size, align) in [(0, 16), (1, 16), (17, 16), (33, 64), (7, 32)] {
@@ -4987,6 +5059,42 @@ mod tests {
         e.regs[0] = 0xFFFF_FFFF;
         e.step().unwrap();
         assert_eq!(e.xmm[0], (-1.0f64).to_bits() as u128);
+    }
+
+    #[test]
+    fn cvtsi2ss_preserves_upper_xmm_lanes() {
+        let mut emu = emu_with(&[0xF3, 0x48, 0x0F, 0x2A, 0xC0]);
+        emu.xmm[0] = 0x1234_5678_90AB_CDEF_1111_2222_3333_4444;
+        emu.regs[0] = (-7i64) as u64;
+        emu.step().unwrap();
+        assert_eq!(emu.xmm[0] >> 32, 0x1234_5678_90AB_CDEF_1111_2222);
+        assert_eq!(emu.xmm[0] as u32, (-7.0f32).to_bits());
+    }
+
+    #[test]
+    fn divss_preserves_upper_xmm_lanes() {
+        let mut emu = emu_with(&[0xF3, 0x0F, 0x5E, 0xC1]); // divss xmm0,xmm1
+        emu.xmm[0] = (0x1234_5678_90AB_CDEF_1111_2222u128 << 32) | 9.0f32.to_bits() as u128;
+        emu.xmm[1] = 3.0f32.to_bits() as u128;
+        emu.step().unwrap();
+        assert_eq!(emu.xmm[0] >> 32, 0x1234_5678_90AB_CDEF_1111_2222);
+        assert_eq!(emu.xmm[0] as u32, 3.0f32.to_bits());
+    }
+
+    #[test]
+    fn ucomiss_sets_ordering_and_unordered_flags() {
+        let mut emu = emu_with(&[0x0F, 0x2E, 0xC1]);
+        emu.xmm[0] = 1.0f32.to_bits() as u128;
+        emu.xmm[1] = 2.0f32.to_bits() as u128;
+        emu.step().unwrap();
+        assert!(emu.cf);
+        assert!(!emu.zf);
+        assert!(!emu.pf);
+        let mut emu = emu_with(&[0x0F, 0x2E, 0xC1]);
+        emu.xmm[0] = f32::NAN.to_bits() as u128;
+        emu.xmm[1] = 2.0f32.to_bits() as u128;
+        emu.step().unwrap();
+        assert!(emu.cf && emu.zf && emu.pf);
     }
 
     #[test]

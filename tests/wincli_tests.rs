@@ -61,6 +61,184 @@ fn run_cli(file: &std::path::Path) -> (i32, String, String) {
 }
 
 #[test]
+fn probe_reports_called_unknown_import_and_skips_unused_ones() {
+    use pe::builder::{build, Asm};
+    let path = tmp_path("probe-import.exe");
+    std::fs::write(&path, pe::builder::unknown_import()).unwrap();
+    let bin = env!("CARGO_BIN_EXE_wincli");
+    let output = Command::new(bin).args(["probe", path.to_str().unwrap()])
+        .output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("unsupported import reached: KERNEL32.dll!NoSuchApiForTest"));
+
+    let mut a = Asm::new();
+    a.sub_rsp(0x28);
+    a.mov_ecx_imm(0);
+    a.call_import(0);
+    let exe = build(a, &[
+        ("KERNEL32.dll", "ExitProcess"),
+        ("KERNEL32.dll", "NoSuchApiForTest"),
+    ]);
+    assert!(pe::load(&exe).is_err());
+    std::fs::write(&path, &exe).unwrap();
+    let output = Command::new(bin).args(["probe", path.to_str().unwrap()])
+        .output().unwrap();
+    std::fs::remove_file(&path).ok();
+    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn critical_section_spin_count_variant_runs_through_cli() {
+    use pe::builder::{build, Asm};
+    let mut a = Asm::new();
+    let section = a.add_zeroed(40);
+    let fail = a.fresh_label();
+    a.sub_rsp(0x28);
+    a.lea_reg_rip(1, section);
+    a.mov_edx_imm(123);
+    a.call_import(0);
+    a.test_eax_eax();
+    a.jz(fail);
+    a.lea_reg_rip(1, section);
+    a.call_import(1);
+    a.lea_reg_rip(1, section);
+    a.call_import(2);
+    a.mov_ecx_imm(0);
+    a.call_import(3);
+    a.mark(fail);
+    a.mov_ecx_imm(1);
+    a.call_import(3);
+    let exe = build(a, &[
+        ("KERNEL32.dll", "InitializeCriticalSectionAndSpinCount"),
+        ("KERNEL32.dll", "EnterCriticalSection"),
+        ("KERNEL32.dll", "LeaveCriticalSection"),
+        ("KERNEL32.dll", "ExitProcess"),
+    ]);
+    assert_eq!(run_exe_on_fs(&exe, WinFs::new()).0, 0);
+    let path = tmp_path("critical-spin.exe");
+    std::fs::write(&path, exe).unwrap();
+    let (code, _, stderr) = run_cli(&path);
+    std::fs::remove_file(&path).ok();
+    assert_eq!(code, 0, "stderr: {stderr}");
+}
+
+#[test]
+fn srw_condition_variable_wakes_worker_and_reacquires_lock() {
+    use pe::builder::{self, Asm};
+    let mut a = Asm::new();
+    let lock = a.add_zeroed(8);
+    let cv = a.add_zeroed(8);
+    let signal = a.add_zeroed(4);
+    a.sub_rsp(0x68);
+    a.lea_reg_rip(1, lock);
+    a.call_import(0); // InitializeSRWLock
+    a.lea_reg_rip(1, cv);
+    a.call_import(1); // InitializeConditionVariable
+    a.xor_eax();
+    a.mov_rcx_rax();
+    a.mov_rdx_rax();
+    let worker_patch = a.code.len() + 2;
+    a.emit(&[0x49, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0]);
+    a.mov_r9d_imm(0);
+    a.mov_rspoff_imm32(0x20, 0);
+    a.mov_rspoff_imm32(0x28, 0);
+    a.call_import(2); // CreateThread; scheduler runs worker until CV wait
+    a.mov_rspoff_rax(0x40);
+    a.lea_reg_rip(1, cv);
+    a.call_import(3); // WakeConditionVariable
+    a.mov_reg_rspoff(1, 0x40);
+    a.mov_edx_imm(u32::MAX);
+    a.call_import(4); // WaitForSingleObject
+    a.mov_eax_mem_rip(signal);
+    a.mov_rcx_rax();
+    a.call_import(8); // ExitProcess(signal)
+    let worker_rva = builder::SECTION_RVA + a.code.len() as u32;
+    a.code[worker_patch..worker_patch + 8]
+        .copy_from_slice(&(builder::IMAGE_BASE + u64::from(worker_rva)).to_le_bytes());
+    a.sub_rsp(0x38);
+    a.lea_reg_rip(1, lock);
+    a.call_import(5); // AcquireSRWLockExclusive
+    a.lea_reg_rip(1, cv);
+    a.lea_reg_rip(2, lock);
+    a.mov_r8d_imm(u32::MAX);
+    a.mov_r9d_imm(0);
+    a.call_import(6); // SleepConditionVariableSRW
+    a.lea_reg_rip(1, signal);
+    a.emit(&[0xC7, 0x01, 1, 0, 0, 0]); // mov dword [rcx], 1
+    a.lea_reg_rip(1, lock);
+    a.call_import(7); // ReleaseSRWLockExclusive
+    a.xor_eax();
+    a.add_rsp(0x38);
+    a.ret();
+    let exe = builder::build(a, &[
+        ("KERNEL32.dll", "InitializeSRWLock"),
+        ("KERNEL32.dll", "InitializeConditionVariable"),
+        ("KERNEL32.dll", "CreateThread"),
+        ("KERNEL32.dll", "WakeConditionVariable"),
+        ("KERNEL32.dll", "WaitForSingleObject"),
+        ("KERNEL32.dll", "AcquireSRWLockExclusive"),
+        ("KERNEL32.dll", "SleepConditionVariableSRW"),
+        ("KERNEL32.dll", "ReleaseSRWLockExclusive"),
+        ("KERNEL32.dll", "ExitProcess"),
+    ]);
+    assert_eq!(run_exe_on_fs(&exe, WinFs::new()).0, 1);
+    let path = tmp_path("srw-condition.exe");
+    std::fs::write(&path, exe).unwrap();
+    let (code, _, stderr) = run_cli(&path);
+    std::fs::remove_file(&path).ok();
+    assert_eq!(code, 1, "stderr: {stderr}");
+}
+
+#[test]
+fn dynamic_tls_slots_can_be_set_freed_and_reused() {
+    use pe::builder::{build, Asm};
+    let mut a = Asm::new();
+    let fail = a.fresh_label();
+    a.sub_rsp(0x48);
+    a.call_import(0); // TlsAlloc
+    a.mov_rspoff_rax(0x30);
+    a.mov_rcx_rax();
+    a.mov_edx_imm(123);
+    a.call_import(1); // TlsSetValue
+    a.test_eax_eax();
+    a.jz(fail);
+    a.mov_reg_rspoff(1, 0x30);
+    a.call_import(2); // TlsGetValue
+    a.cmp_eax_imm(123);
+    a.jnz(fail);
+    a.mov_reg_rspoff(1, 0x30);
+    a.call_import(3); // TlsFree
+    a.test_eax_eax();
+    a.jz(fail);
+    a.mov_reg_rspoff(1, 0x30);
+    a.call_import(2);
+    a.test_eax_eax();
+    a.jnz(fail);
+    a.call_import(4); // GetLastError
+    a.cmp_eax_imm(87); // ERROR_INVALID_PARAMETER
+    a.jnz(fail);
+    a.call_import(0); // TlsAlloc reuses the released index
+    a.mov_reg_rspoff(1, 0x30);
+    a.emit(&[0x48, 0x39, 0xC8]); // cmp rax, rcx
+    a.jnz(fail);
+    a.mov_ecx_imm(0);
+    a.call_import(5);
+    a.mark(fail);
+    a.mov_ecx_imm(1);
+    a.call_import(5);
+    let exe = build(a, &[
+        ("KERNEL32.dll", "TlsAlloc"),
+        ("KERNEL32.dll", "TlsSetValue"),
+        ("KERNEL32.dll", "TlsGetValue"),
+        ("KERNEL32.dll", "TlsFree"),
+        ("KERNEL32.dll", "GetLastError"),
+        ("KERNEL32.dll", "ExitProcess"),
+    ]);
+    assert_eq!(run_exe_on_fs(&exe, WinFs::new()).0, 0);
+}
+
+#[test]
 fn interpreter_guest_thread_waits_and_handle_errors() {
     use pe::builder::{self, Asm};
     let imports = [

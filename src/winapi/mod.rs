@@ -56,8 +56,14 @@ enum ThreadState {
     },
     Sleeping(Instant),
     WaitingCritical(u64),
+    WaitingSrw { address: u64, shared: bool },
+    WaitingCondition { cv: u64, lock: u64, kind: CondLock, deadline: Option<Instant> },
+    WaitingConditionLock { lock: u64, kind: CondLock },
     Finished,
 }
+
+#[derive(Clone, Copy)]
+enum CondLock { Critical, SrwExclusive, SrwShared }
 
 struct GuestThread {
     id: u32,
@@ -66,11 +72,18 @@ struct GuestThread {
     cpu: CpuState,
     last_error: u32,
     fls: Vec<Option<u64>>,
+    tls_values: Vec<u64>,
     state: ThreadState,
     critical_depth: u32,
     tls_resume: Option<CpuState>,
     tls_next: usize,
     tls_reason: u32,
+}
+
+#[derive(Default)]
+struct SrwLock {
+    exclusive: Option<usize>,
+    shared: HashMap<usize, u32>,
 }
 
 pub struct Runner {
@@ -96,6 +109,8 @@ pub struct Runner {
     /// slot 0 stays a valid index).
     fls: Vec<Option<u64>>,
     fls_count: usize,
+    tls_values: Vec<u64>,
+    tls_slots: Vec<bool>,
     /// argv0 as typed (for `GetModuleFileNameW` approximation).
     prog: String,
     /// QPC epoch.
@@ -107,7 +122,9 @@ pub struct Runner {
     next_thread_id: u32,
     switch_requested: bool,
     critical_sections: HashMap<u64, (usize, u32)>,
+    srw_locks: HashMap<u64, SrwLock>,
     tls_template: Option<TlsDir>,
+    first_unsupported_index: usize,
 }
 
 impl Runner {
@@ -122,7 +139,28 @@ impl Runner {
         prog: &str,
         args: &[String],
     ) -> Result<Self, String> {
-        if let Some(first) = img.unsupported.first() {
+        Self::with_argv_inner(img, fs, prog, args, false)
+    }
+
+    /// Diagnostic-only execution: unknown imports are bound to fail-on-call
+    /// thunks so a large PE can reveal its first actual startup blocker.
+    pub fn with_argv_probe(
+        img: &PeImage,
+        fs: WinFs,
+        prog: &str,
+        args: &[String],
+    ) -> Result<Self, String> {
+        Self::with_argv_inner(img, fs, prog, args, true)
+    }
+
+    fn with_argv_inner(
+        img: &PeImage,
+        fs: WinFs,
+        prog: &str,
+        args: &[String],
+        probe: bool,
+    ) -> Result<Self, String> {
+        if let Some(first) = img.unsupported.first().filter(|_| !probe) {
             return Err(format!(
                 "unsupported import: {}!{} (image came from lenient load; refusing to execute)",
                 first.dll, first.func
@@ -131,6 +169,12 @@ impl Runner {
         let mut emu = Emu::new(img)?;
         emu.alloc_cmdline(prog, args)?;
         setup_tls(&mut emu, img)?;
+        let static_tls = if img.tls.is_some() {
+            let array = emu.read_u64(emu.gs_base + crate::pe::emu::TEB_TLS_OFF)?;
+            vec![emu.read_u64(array)?]
+        } else {
+            Vec::new()
+        };
         let main_cpu = emu.cpu_state();
         let mut runner = Self {
             emu,
@@ -146,6 +190,8 @@ impl Runner {
             env_overlay: HashMap::new(),
             fls: Vec::new(),
             fls_count: 0,
+            tls_values: static_tls,
+            tls_slots: vec![true; usize::from(img.tls.is_some())],
             prog: prog.to_string(),
             start: std::time::Instant::now(),
             env_block: 0,
@@ -156,6 +202,7 @@ impl Runner {
                 cpu: main_cpu,
                 last_error: 0,
                 fls: Vec::new(),
+                tls_values: Vec::new(),
                 state: ThreadState::Runnable,
                 critical_depth: 0,
                 tls_resume: None,
@@ -166,7 +213,9 @@ impl Runner {
             next_thread_id: 2,
             switch_requested: false,
             critical_sections: HashMap::new(),
+            srw_locks: HashMap::new(),
             tls_template: img.tls.clone(),
+            first_unsupported_index: img.imports.len() + img.stubs.len(),
         };
         runner.begin_tls_callbacks(0, 1)?; // DLL_PROCESS_ATTACH
         runner.emu.restore_cpu(&runner.threads[0].cpu);
@@ -264,6 +313,91 @@ impl Runner {
         Ok(())
     }
 
+    fn srw_acquire(&mut self, address: u64, shared: bool, try_only: bool) -> bool {
+        let lock = self.srw_locks.entry(address).or_default();
+        let waiting_writer = self.threads.iter().any(|thread| matches!(thread.state,
+            ThreadState::WaitingSrw { address: at, shared: false } if at == address));
+        let available = lock.exclusive.is_none()
+            && (shared && !waiting_writer || !shared && lock.shared.is_empty());
+        if available {
+            if shared {
+                *lock.shared.entry(self.current_thread).or_default() += 1;
+            } else {
+                lock.exclusive = Some(self.current_thread);
+            }
+            true
+        } else {
+            if !try_only {
+                self.threads[self.current_thread].state = ThreadState::WaitingSrw { address, shared };
+            }
+            false
+        }
+    }
+
+    fn srw_release(&mut self, address: u64, shared: bool) -> Result<(), String> {
+        let lock = self.srw_locks.get_mut(&address)
+            .ok_or_else(|| "SRW lock was not acquired".to_string())?;
+        if shared {
+            let depth = lock.shared.get_mut(&self.current_thread)
+                .ok_or_else(|| "SRW shared lock owned by another thread".to_string())?;
+            *depth -= 1;
+            if *depth == 0 { lock.shared.remove(&self.current_thread); }
+        } else if lock.exclusive == Some(self.current_thread) {
+            lock.exclusive = None;
+        } else {
+            return Err("SRW exclusive lock owned by another thread".to_string());
+        }
+        if lock.exclusive.is_none() && lock.shared.is_empty() {
+            // Give the oldest waiter its lock, or a run of shared waiters.
+            for index in 0..self.threads.len() {
+                if let ThreadState::WaitingSrw { address: at, shared: waiter_shared } = self.threads[index].state {
+                    if at != address { continue; }
+                    if waiter_shared {
+                        *lock.shared.entry(index).or_default() += 1;
+                        self.threads[index].state = ThreadState::Runnable;
+                    } else if lock.shared.is_empty() {
+                        lock.exclusive = Some(index);
+                        self.threads[index].state = ThreadState::Runnable;
+                        break;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn reacquire_condition_locks(&mut self) {
+        for index in 0..self.threads.len() {
+            let (address, kind) = match self.threads[index].state {
+                ThreadState::WaitingConditionLock { lock, kind } => (lock, kind),
+                _ => continue,
+            };
+            let acquired = match kind {
+                CondLock::Critical => {
+                    if self.critical_sections.contains_key(&address) { false }
+                    else {
+                        self.critical_sections.insert(address, (index, 1));
+                        self.threads[index].critical_depth += 1;
+                        true
+                    }
+                }
+                CondLock::SrwExclusive => {
+                    let srw = self.srw_locks.entry(address).or_default();
+                    if srw.exclusive.is_some() || !srw.shared.is_empty() { false }
+                    else { srw.exclusive = Some(index); true }
+                }
+                CondLock::SrwShared => {
+                    let srw = self.srw_locks.entry(address).or_default();
+                    if srw.exclusive.is_some() { false }
+                    else { *srw.shared.entry(index).or_default() += 1; true }
+                }
+            };
+            if acquired { self.threads[index].state = ThreadState::Runnable; }
+        }
+    }
+
     fn refresh_waiters(&mut self) -> Result<(), String> {
         let now = Instant::now();
         let finished: Vec<u64> = self
@@ -302,9 +436,17 @@ impl Runner {
                     }
                 }
                 ThreadState::Sleeping(at) if now >= *at => Some(0),
+                ThreadState::WaitingCondition { deadline, .. }
+                    if deadline.is_some_and(|at| now >= at) => Some(0),
                 _ => None,
             };
             if let Some(value) = result {
+                if let ThreadState::WaitingCondition { lock, kind, .. } = thread.state {
+                    thread.last_error = 1460;
+                    thread.cpu.regs[0] = 0;
+                    thread.state = ThreadState::WaitingConditionLock { lock, kind };
+                    continue;
+                }
                 if value == 0 && matches!(thread.state, ThreadState::WaitingAddress { .. }) {
                     thread.last_error = 1460; // ERROR_TIMEOUT
                 }
@@ -312,6 +454,7 @@ impl Runner {
                 thread.state = ThreadState::Runnable;
             }
         }
+        self.reacquire_condition_locks();
         Ok(())
     }
 
@@ -320,6 +463,7 @@ impl Runner {
         self.threads[current].cpu = self.emu.cpu_state();
         self.threads[current].last_error = self.last_error;
         self.threads[current].fls = std::mem::take(&mut self.fls);
+        self.threads[current].tls_values = std::mem::take(&mut self.tls_values);
         loop {
             self.refresh_waiters()?;
             let next = (1..=self.threads.len())
@@ -330,6 +474,7 @@ impl Runner {
                 self.emu.restore_cpu(&self.threads[next].cpu);
                 self.last_error = self.threads[next].last_error;
                 self.fls = std::mem::take(&mut self.threads[next].fls);
+                self.tls_values = std::mem::take(&mut self.threads[next].tls_values);
                 self.switch_requested = false;
                 return Ok(());
             }
@@ -339,7 +484,8 @@ impl Runner {
                 .filter_map(|thread| match &thread.state {
                     ThreadState::WaitingThread { deadline, .. }
                     | ThreadState::WaitingAddress { deadline, .. } => *deadline,
-                    ThreadState::Sleeping(at) => Some(*at),
+                ThreadState::Sleeping(at) => Some(*at),
+                ThreadState::WaitingCondition { deadline, .. } => *deadline,
                     _ => None,
                 })
                 .min();
@@ -576,6 +722,9 @@ impl Runner {
     /// Execute the shim for import `index`. Returns Ok(true) if halted.
     fn do_shim(&mut self, index: usize) -> Result<bool, String> {
         let imp = self.emu.imports[index].clone();
+        if index >= self.first_unsupported_index {
+            return Err(format!("unsupported import reached: {}!{}", imp.dll, imp.func));
+        }
         let rcx = self.emu.regs[1];
         let rdx = self.emu.regs[2];
         let r8 = self.emu.regs[8];
@@ -1186,6 +1335,57 @@ impl Runner {
             "GetCurrentThreadId" => {
                 ret_bool!(self.threads[self.current_thread].id as u64);
             }
+            "TlsAlloc" => {
+                let slot = self.tls_slots.iter().position(|&used| !used);
+                let index = if let Some(index) = slot {
+                    self.tls_slots[index] = true;
+                    index
+                } else if self.tls_slots.len() < 1088 {
+                    let index = self.tls_slots.len();
+                    self.tls_slots.push(true);
+                    self.tls_values.push(0);
+                    for (i, thread) in self.threads.iter_mut().enumerate() {
+                        if i != self.current_thread { thread.tls_values.push(0); }
+                    }
+                    index
+                } else {
+                    self.last_error = 8;
+                    ret_bool!(u32::MAX as u64);
+                };
+                ret_bool!(index as u64);
+            }
+            "TlsFree" => {
+                let index = rcx as usize;
+                if !self.tls_slots.get(index).copied().unwrap_or(false)
+                    || (index == 0 && self.tls_template.is_some()) {
+                    self.last_error = 87;
+                    ret_bool!(0);
+                }
+                self.tls_slots[index] = false;
+                self.tls_values[index] = 0;
+                for (i, thread) in self.threads.iter_mut().enumerate() {
+                    if i != self.current_thread { thread.tls_values[index] = 0; }
+                }
+                ret_bool!(1);
+            }
+            "TlsGetValue" => {
+                let index = rcx as usize;
+                if !self.tls_slots.get(index).copied().unwrap_or(false) {
+                    self.last_error = 87;
+                    ret_bool!(0);
+                }
+                self.last_error = 0;
+                ret_bool!(self.tls_values[index]);
+            }
+            "TlsSetValue" => {
+                let index = rcx as usize;
+                if !self.tls_slots.get(index).copied().unwrap_or(false) {
+                    self.last_error = 87;
+                    ret_bool!(0);
+                }
+                self.tls_values[index] = rdx;
+                ret_bool!(1);
+            }
             "GetFileType" => {
                 if rcx <= 2 {
                     ret_bool!(2); // FILE_TYPE_CHAR
@@ -1595,6 +1795,14 @@ impl Runner {
                     cpu,
                     last_error: 0,
                     fls: vec![None; self.fls_count],
+                    tls_values: {
+                        let mut values = vec![0; self.tls_slots.len()];
+                        if self.tls_template.is_some() {
+                            let array = self.emu.read_u64(gs_base + crate::pe::emu::TEB_TLS_OFF)?;
+                            values[0] = self.emu.read_u64(array)?;
+                        }
+                        values
+                    },
                     state: ThreadState::Runnable,
                     critical_depth: 0,
                     tls_resume: None,
@@ -1721,13 +1929,79 @@ impl Runner {
                     ret_bool!(0);
                 }
             }
-            "InitializeCriticalSectionEx" => {
+            "InitializeCriticalSection" | "InitializeCriticalSectionEx" | "InitializeCriticalSectionAndSpinCount" => {
                 let cs = rcx;
-                let spin = (rdx & 0xFFFF_FFFF) as u32;
+                let spin = if name == "InitializeCriticalSection" { 0 }
+                    else { (rdx & 0xFFFF_FFFF) as u32 };
                 self.emu.write_bytes(cs, &[0u8; 40])?;
                 self.emu.write_u32(cs, 0xFFFF_FFFF)?; // LockCount = -1
                 self.emu.write_u32(cs + 32, spin)?; // SpinCount
                 self.critical_sections.remove(&cs);
+                ret_bool!(u64::from(name != "InitializeCriticalSection"));
+            }
+            "InitializeSRWLock" => {
+                self.emu.write_u64(rcx, 0)?;
+                self.srw_locks.insert(rcx, SrwLock::default());
+                ret_bool!(0);
+            }
+            "AcquireSRWLockExclusive" | "AcquireSRWLockShared" => {
+                self.srw_acquire(rcx, name == "AcquireSRWLockShared", false);
+                ret_bool!(0);
+            }
+            "TryAcquireSRWLockExclusive" | "TryAcquireSRWLockShared" => {
+                ret_bool!(u64::from(self.srw_acquire(rcx, name == "TryAcquireSRWLockShared", true)));
+            }
+            "ReleaseSRWLockExclusive" | "ReleaseSRWLockShared" => {
+                self.srw_release(rcx, name == "ReleaseSRWLockShared")?;
+                ret_bool!(0);
+            }
+            "InitializeConditionVariable" => {
+                self.emu.write_u64(rcx, 0)?;
+                ret_bool!(0);
+            }
+            "WakeConditionVariable" | "WakeAllConditionVariable" => {
+                let single = name == "WakeConditionVariable";
+                for thread in &mut self.threads {
+                    if let ThreadState::WaitingCondition { cv, lock, kind, .. } = thread.state {
+                        if cv == rcx {
+                            thread.state = ThreadState::WaitingConditionLock { lock, kind };
+                            thread.cpu.regs[0] = 1;
+                            if single { break; }
+                        }
+                    }
+                }
+                self.reacquire_condition_locks();
+                ret_bool!(0);
+            }
+            "SleepConditionVariableCS" | "SleepConditionVariableSRW" => {
+                let is_cs = name == "SleepConditionVariableCS";
+                let kind = if is_cs { CondLock::Critical }
+                    else if r9 & 1 != 0 { CondLock::SrwShared }
+                    else { CondLock::SrwExclusive };
+                if !is_cs && r9 & !1 != 0 {
+                    self.last_error = 87;
+                    ret_bool!(0);
+                }
+                if is_cs {
+                    if !matches!(self.critical_sections.get(&rdx), Some((owner, 1)) if *owner == self.current_thread) {
+                        return Err("condition wait requires an owned, nonrecursive critical section".to_string());
+                    }
+                    self.critical_sections.remove(&rdx);
+                    self.threads[self.current_thread].critical_depth -= 1;
+                    if let Some(next) = self.threads.iter().position(|thread| matches!(thread.state, ThreadState::WaitingCritical(address) if address == rdx)) {
+                        self.critical_sections.insert(rdx, (next, 1));
+                        self.threads[next].critical_depth += 1;
+                        self.threads[next].state = ThreadState::Runnable;
+                    }
+                } else {
+                    self.srw_release(rdx, matches!(kind, CondLock::SrwShared))?;
+                }
+                let millis = (r8 & 0xFFFF_FFFF) as u32;
+                let deadline = if millis == u32::MAX { None }
+                    else { Instant::now().checked_add(Duration::from_millis(u64::from(millis))) };
+                self.threads[self.current_thread].state = ThreadState::WaitingCondition {
+                    cv: rcx, lock: rdx, kind, deadline,
+                };
                 ret_bool!(1);
             }
             "EnterCriticalSection" => {
@@ -2744,6 +3018,7 @@ mod tests {
             cpu,
             last_error: 0,
             fls: Vec::new(),
+            tls_values: Vec::new(),
             state: ThreadState::WaitingAddress {
                 address,
                 expected: vec![0, 0, 0, 0],
@@ -2773,5 +3048,55 @@ mod tests {
         assert!(matches!(runner.threads[1].state, ThreadState::Runnable));
         assert_eq!(runner.threads[1].cpu.regs[0], 0);
         assert_eq!(runner.threads[1].last_error, 1460);
+    }
+
+    #[test]
+    fn srw_exclusive_waiter_wakes_after_release() {
+        let exe = crate::pe::builder::hello("x");
+        let img = crate::pe::load(&exe).unwrap();
+        let mut runner = Runner::new(&img, WinFs::new()).unwrap();
+        let address = runner.emu.heap_alloc(8);
+        let cpu = runner.emu.cpu_state();
+        runner.threads.push(GuestThread {
+            id: 2, handle: 0x8000_0002, open: true, cpu, last_error: 0,
+            fls: Vec::new(), tls_values: Vec::new(), state: ThreadState::Runnable,
+            critical_depth: 0, tls_resume: None, tls_next: 0, tls_reason: 0,
+        });
+        assert!(runner.srw_acquire(address, false, false));
+        runner.current_thread = 1;
+        assert!(!runner.srw_acquire(address, false, true));
+        assert!(matches!(runner.threads[1].state, ThreadState::Runnable));
+        assert!(!runner.srw_acquire(address, false, false));
+        assert!(matches!(runner.threads[1].state, ThreadState::WaitingSrw { .. }));
+        runner.current_thread = 0;
+        runner.srw_release(address, false).unwrap();
+        assert!(matches!(runner.threads[1].state, ThreadState::Runnable));
+        assert_eq!(runner.srw_locks[&address].exclusive, Some(1));
+    }
+
+    #[test]
+    fn condition_timeout_reacquires_lock_before_returning() {
+        let exe = crate::pe::builder::hello("x");
+        let img = crate::pe::load(&exe).unwrap();
+        let mut runner = Runner::new(&img, WinFs::new()).unwrap();
+        let lock = runner.emu.heap_alloc(8);
+        runner.threads[0].state = ThreadState::WaitingCondition {
+            cv: lock + 8, lock, kind: CondLock::SrwExclusive,
+            deadline: Some(Instant::now() - Duration::from_millis(1)),
+        };
+        runner.refresh_waiters().unwrap();
+        assert!(matches!(runner.threads[0].state, ThreadState::Runnable));
+        assert_eq!(runner.threads[0].cpu.regs[0], 0);
+        assert_eq!(runner.threads[0].last_error, 1460);
+        assert_eq!(runner.srw_locks[&lock].exclusive, Some(0));
+        let critical = runner.emu.heap_alloc(40);
+        runner.threads[0].state = ThreadState::WaitingCondition {
+            cv: critical + 40, lock: critical, kind: CondLock::Critical,
+            deadline: Some(Instant::now() - Duration::from_millis(1)),
+        };
+        runner.refresh_waiters().unwrap();
+        assert!(matches!(runner.threads[0].state, ThreadState::Runnable));
+        assert_eq!(runner.critical_sections[&critical], (0, 1));
+        assert_eq!(runner.threads[0].critical_depth, 1);
     }
 }

@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added `wincli probe <app.exe> [args...]` to execute a leniently loaded PE
+  under fail-on-call imports and report the first real runtime blocker without
+  weakening normal strict loading.
+- Added dynamic per-thread TLS slots, SRW locks, condition-variable waits and
+  wakes, and Windows critical-section initialization variants used during
+  Node.js startup. The interpreter also handles `ENDBR64`, `REP RET`, fences,
+  `CVTSI2SS`, scalar single-precision arithmetic, and `UCOMISS`.
 - PE TLS callbacks now run before the entry point and on guest thread attach,
   with their Windows x64 arguments and per-thread TLS initialized. Malformed
   or non-executable callback addresses are rejected by the loader.
