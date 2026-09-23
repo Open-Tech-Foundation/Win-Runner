@@ -13,6 +13,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Interpreter `MOVHLPS` and `MOVLHPS` register forms now copy the correct
+  source qword, fixing ripgrep's multiworker setup before thread creation.
 - PE images up to 256 MiB can now be inspected and loaded, allowing large
   Windows executables such as Node.js to reach import compatibility checks.
 - `inspect` now lists ordinal imports as missing APIs rather than rejecting

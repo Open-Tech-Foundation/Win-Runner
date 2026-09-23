@@ -1775,15 +1775,16 @@ impl Emu {
                 let next = ip + (off + 2 + ml) as u64;
                 let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
                 if op2 == 0x12 || op2 == 0x16 {
-                    let base = if op2 == 0x12 { 0 } else { 8 };
+                    let dest_base = if op2 == 0x12 { 0 } else { 8 };
                     let chunk: [u8; 8] = if is_reg {
                         let s = self.xmm[rm].to_le_bytes();
-                        s[base..base + 8].try_into().unwrap()
+                        let source_base = if op2 == 0x12 { 8 } else { 0 };
+                        s[source_base..source_base + 8].try_into().unwrap()
                     } else {
                         self.read_bytes(ea, 8)?.as_slice().try_into().unwrap()
                     };
                     let mut o = self.xmm[reg].to_le_bytes();
-                    o[base..base + 8].copy_from_slice(&chunk);
+                    o[dest_base..dest_base + 8].copy_from_slice(&chunk);
                     self.xmm[reg] = u128::from_le_bytes(o);
                 } else {
                     if is_reg {
@@ -4707,16 +4708,22 @@ mod tests {
                 "movhps store byte {i}"
             );
         }
-        // MOVHPS reg-reg merges the high qword (low preserved).
-        let mut e = emu_with(&[0x0F, 0x16, 0xC1]); // movhps xmm0,xmm1
+        // MOVLHPS reg-reg copies the source low qword into the destination high qword.
+        let mut e = emu_with(&[0x0F, 0x16, 0xC1]); // movlhps xmm0,xmm1
         e.xmm[0] = u128::from_le_bytes(*b"0123456789ABCDEF");
         e.xmm[1] = u128::from_le_bytes(*b"abcdefghijklmnop");
         e.step().unwrap();
         assert_eq!(
             e.xmm[0].to_le_bytes(),
-            *b"01234567ijklmnop",
-            "movhps reg-reg merges high qword"
+            *b"01234567abcdefgh",
+            "movlhps copies source low qword"
         );
+        // MOVHLPS takes the source high qword into the destination low qword.
+        let mut e = emu_with(&[0x0F, 0x12, 0xC1]); // movhlps xmm0,xmm1
+        e.xmm[0] = u128::from_le_bytes(*b"0123456789ABCDEF");
+        e.xmm[1] = u128::from_le_bytes(*b"abcdefghijklmnop");
+        e.step().unwrap();
+        assert_eq!(e.xmm[0].to_le_bytes(), *b"ijklmnop89ABCDEF");
     }
 
     #[test]

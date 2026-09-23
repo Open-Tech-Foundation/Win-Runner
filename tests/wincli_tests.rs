@@ -669,6 +669,38 @@ fn test_inspect_large_pe_with_ordinal_import() {
 }
 
 #[test]
+fn test_movlhps_guest_copies_source_low_qword() {
+    use pe::builder::{build, Asm};
+    let mut asm = Asm::new();
+    let src_left = asm.add_data([1u64.to_le_bytes(), 0u64.to_le_bytes()].concat());
+    let src_right = asm.add_data([42u64.to_le_bytes(), 0u64.to_le_bytes()].concat());
+    let output = asm.add_zeroed(16);
+    let fail = asm.fresh_label();
+    asm.sub_rsp(0x28);
+    asm.lea_reg_rip(6, src_left);
+    asm.emit(&[0x44, 0x0F, 0x10, 0x3E]); // movups xmm15,[rsi]
+    asm.lea_reg_rip(7, src_right);
+    asm.emit(&[0x0F, 0x10, 0x07]); // movups xmm0,[rdi]
+    asm.emit(&[0x44, 0x0F, 0x16, 0xF8]); // movlhps xmm15,xmm0
+    asm.lea_reg_rip(0, output);
+    asm.emit(&[0x44, 0x0F, 0x11, 0x38]); // movups [rax],xmm15
+    asm.emit(&[0x48, 0x8B, 0x40, 0x08]); // mov rax,[rax+8]
+    asm.cmp_eax_imm(42);
+    asm.jnz(fail);
+    asm.mov_ecx_imm(0);
+    asm.call_import(0);
+    asm.mark(fail);
+    asm.mov_ecx_imm(1);
+    asm.call_import(0);
+    let exe = build(asm, &[("KERNEL32.dll", "ExitProcess")]);
+    let path = tmp_path("movlhps.exe");
+    std::fs::write(&path, exe).unwrap();
+    let (code, _, stderr) = run_cli(&path);
+    std::fs::remove_file(&path).ok();
+    assert_eq!(code, 0, "stderr: {stderr}");
+}
+
+#[test]
 fn test_inspect_rust_guest() {
     let (code, stdout, _) = run_inspect(&artifact("exe/rust_fs.exe"));
     assert_eq!(code, 0);
