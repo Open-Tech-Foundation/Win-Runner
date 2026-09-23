@@ -1418,6 +1418,7 @@ mod imp {
         command_line_w: Vec<u16>,
         command_line_a: Vec<u8>,
         environment: Vec<(String, String)>,
+        environment_block: Vec<u16>,
         fs: Arc<Mutex<NativeFs>>,
         last_error: AtomicU32,
         gs_base: AtomicU64,
@@ -1452,6 +1453,7 @@ mod imp {
             command_line_w: vec![0],
             command_line_a: vec![0],
             environment: Vec::new(),
+            environment_block: vec![0, 0],
             fs: Arc::new(Mutex::new(NativeFs {
                 fs: WinFs::new(),
                 handles: HashMap::new(),
@@ -1533,6 +1535,19 @@ mod imp {
             out.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
             out.push((name.to_string(), value.to_string()));
         }
+    }
+
+    fn environment_strings(environment: &[(String, String)]) -> Vec<u16> {
+        let mut block = Vec::new();
+        for (name, value) in environment {
+            block.extend(format!("{name}={value}").encode_utf16());
+            block.push(0);
+        }
+        block.push(0);
+        if environment.is_empty() {
+            block.push(0);
+        }
+        block
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -1699,11 +1714,15 @@ mod imp {
     }
 
     extern "win64" fn native_get_environment_strings_w() -> *const u16 {
-        EMPTY_ENVIRONMENT_BLOCK.as_ptr()
+        process_ctx()
+            .map(|process| process.environment_block.as_ptr())
+            .unwrap_or(EMPTY_ENVIRONMENT_BLOCK.as_ptr())
     }
 
     extern "win64" fn native_free_environment_strings_w(block: *const u16) -> i32 {
-        (block == EMPTY_ENVIRONMENT_BLOCK.as_ptr()) as i32
+        process_ctx()
+            .map(|process| (block == process.environment_block.as_ptr()) as i32)
+            .unwrap_or((block == EMPTY_ENVIRONMENT_BLOCK.as_ptr()) as i32)
     }
 
     extern "win64" fn native_set_unhandled_exception_filter(filter: u64) -> u64 {
@@ -2739,6 +2758,7 @@ mod imp {
                 parent_process_id: parent.process_id,
                 command_line_a: command_line_a(&command_line_w),
                 command_line_w,
+                environment_block: environment_strings(&environment),
                 environment,
                 fs: Arc::clone(&context),
                 last_error: AtomicU32::new(0),
@@ -3503,6 +3523,7 @@ mod imp {
             command_line_w,
             command_line_a,
             environment: Vec::new(),
+            environment_block: vec![0, 0],
             fs,
             last_error: AtomicU32::new(0),
             gs_base: AtomicU64::new(0),
