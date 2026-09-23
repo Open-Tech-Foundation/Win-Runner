@@ -1504,6 +1504,24 @@ impl Emu {
                 self.rip = next;
                 return Ok(StepResult::Continue);
             }
+            if op2 == 0xC5 {
+                // PEXTRW r32, xmm, imm8: extract one 16-bit lane into a
+                // zero-extended general-purpose register. Rust's vectorized
+                // directory-filtering path uses this after byte compares.
+                if !opsz16 || rep || repne {
+                    return Err(format!("unsupported MMX opcode 0F C5 at 0x{ip:016x}"));
+                }
+                let (reg, is_reg, rm, _, ml) =
+                    self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
+                if !is_reg {
+                    return Err(format!("invalid PEXTRW memory source at 0x{ip:016x}"));
+                }
+                let lane = (self.read_u8(ip + (off + 2 + ml) as u64)? & 7) as usize;
+                let bytes = self.xmm[rm].to_le_bytes();
+                self.regs[reg] = u16::from_le_bytes([bytes[lane * 2], bytes[lane * 2 + 1]]) as u64;
+                self.rip = ip + (off + 2 + ml + 1) as u64;
+                return Ok(StepResult::Continue);
+            }
             if op2 == 0xF8 || op2 == 0xF9 || op2 == 0xFA || op2 == 0xFB {
                 // PSUBB/W/D/Q xmm, xmm/m128: wrapping lane subtract.
                 // Plain forms need 66 in 64-bit mode (MMX otherwise).
@@ -1608,6 +1626,31 @@ impl Emu {
                     }
                 }
                 self.xmm[reg] = u128::from_le_bytes(out);
+                self.rip = next;
+                return Ok(StepResult::Continue);
+            }
+            if op2 == 0xF6 {
+                // PSADBW xmm, xmm/m128: sum the absolute unsigned-byte
+                // differences in each eight-byte half into two 64-bit lanes.
+                // This is a common primitive in SIMD byte-search code.
+                if !opsz16 || rep || repne {
+                    return Err(format!("unsupported MMX opcode 0F F6 at 0x{ip:016x}"));
+                }
+                let (reg, is_reg, rm, ea_raw, ml) =
+                    self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
+                let next = ip + (off + 2 + ml) as u64;
+                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let a = self.xmm[reg].to_le_bytes();
+                let b: [u8; 16] = if is_reg {
+                    self.xmm[rm].to_le_bytes()
+                } else {
+                    self.read_u128(ea)?.to_le_bytes()
+                };
+                let mut sums = [0u64; 2];
+                for i in 0..16 {
+                    sums[i / 8] += (a[i] as i16 - b[i] as i16).unsigned_abs() as u64;
+                }
+                self.xmm[reg] = (sums[0] as u128) | ((sums[1] as u128) << 64);
                 self.rip = next;
                 return Ok(StepResult::Continue);
             }
@@ -2675,6 +2718,30 @@ impl Emu {
                 let next = ip + (off + 1 + ml + 1) as u64;
                 let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
                 let a = self.read_rm(is_reg, rm, ea, 8)?;
+                if reg_field == 2 || reg_field == 3 {
+                    // ADC/SBB Eb,Ib: preserve the incoming carry while
+                    // computing the result, then publish the new carry/borrow.
+                    let carry = u64::from(self.cf);
+                    let res = if reg_field == 2 {
+                        a.wrapping_add(imm).wrapping_add(carry) & 0xff
+                    } else {
+                        a.wrapping_sub(imm).wrapping_sub(carry) & 0xff
+                    };
+                    if reg_field == 2 {
+                        self.cf = a + imm + carry > 0xff;
+                        let rhs = imm.wrapping_add(carry) & 0xff;
+                        self.of = ((a ^ res) & (rhs ^ res) & 0x80) != 0;
+                    } else {
+                        self.cf = a < imm + carry;
+                        let rhs = imm.wrapping_add(carry) & 0xff;
+                        self.of = ((a ^ rhs) & (a ^ res) & 0x80) != 0;
+                    }
+                    self.zf = res == 0;
+                    self.sf = res & 0x80 != 0;
+                    self.write_rm(is_reg, rm, ea, 8, res)?;
+                    self.rip = next;
+                    return Ok(StepResult::Continue);
+                }
                 let res = match reg_field {
                     0 => a.wrapping_add(imm),
                     1 => a | imm,
@@ -2684,7 +2751,7 @@ impl Emu {
                     7 => a.wrapping_sub(imm),
                     _ => {
                         return Err(format!(
-                            "unsupported group1b sub-op /{} at 0x{ip:016x} (only ADD/OR/AND/SUB/XOR/CMP)",
+                            "unsupported group1b sub-op /{} at 0x{ip:016x} (only ADD/ADC/SBB/OR/AND/SUB/XOR/CMP)",
                             reg_field
                         ))
                     }
@@ -3453,6 +3520,43 @@ mod tests {
         assert_eq!(e.xmm[2] & 0xffff, 1);
         assert!(matches!(e.step().unwrap(), StepResult::Continue));
         assert_eq!(e.xmm[4] & 0xffff_ffff, 1);
+    }
+
+    #[test]
+    fn psadbw_sums_absolute_byte_differences_per_half() {
+        let mut e = emu_with(&[0x66, 0x0F, 0xF6, 0xC1]); // psadbw xmm0,xmm1
+        e.xmm[0] = u128::from_le_bytes([
+            0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150,
+        ]);
+        e.xmm[1] = u128::from_le_bytes([
+            1, 8, 25, 25, 50, 40, 65, 60, 70, 100, 90, 120, 110, 135, 130, 155,
+        ]);
+        assert!(matches!(e.step().unwrap(), StepResult::Continue));
+        assert_eq!(e.xmm[0] as u64, 48);
+        assert_eq!((e.xmm[0] >> 64) as u64, 70);
+    }
+
+    #[test]
+    fn group1b_adc_and_sbb_use_the_incoming_carry() {
+        // adc al, 1; sbb al, 1
+        let mut e = emu_with(&[0x80, 0xD0, 0x01, 0x80, 0xD8, 0x01]);
+        e.regs[0] = 0xff;
+        e.cf = true;
+        assert!(matches!(e.step().unwrap(), StepResult::Continue));
+        assert_eq!(e.regs[0] & 0xff, 1);
+        assert!(e.cf);
+        assert!(matches!(e.step().unwrap(), StepResult::Continue));
+        assert_eq!(e.regs[0] & 0xff, 0xff);
+        assert!(e.cf);
+    }
+
+    #[test]
+    fn pextrw_zero_extends_the_selected_word_lane() {
+        let mut e = emu_with(&[0x66, 0x44, 0x0F, 0xC5, 0xC1, 0x06]); // pextrw r8d,xmm1,6
+        e.xmm[1] = 0x8899_AABB_CCDD_EEFF_0011_2233_4455_6677;
+        e.regs[8] = u64::MAX;
+        assert!(matches!(e.step().unwrap(), StepResult::Continue));
+        assert_eq!(e.regs[8], 0xAABB);
     }
 
     #[test]

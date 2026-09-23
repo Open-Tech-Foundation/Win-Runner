@@ -6,8 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
-- Added `MOVMSKPS`, packed-integer addition, packed-word immediate shifts,
-  and packed-dword interleaves, allowing real ripgrep JSON output to progress
+- Added `MOVMSKPS`, packed-integer arithmetic, packed-word immediate shifts,
+  packed-dword interleaves, `PSADBW`, and carry-aware byte-immediate ALU
+  operations, plus `PEXTRW`, allowing real ripgrep JSON output to progress
   through its SIMD formatting path on the default interpreter backend.
 - Native `CreateProcessW` accepts bounded Unicode environment blocks; values
   are isolated to the child and available through `GetEnvironmentVariableW`
