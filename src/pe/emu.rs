@@ -1571,6 +1571,46 @@ impl Emu {
                 self.rip = next;
                 return Ok(StepResult::Continue);
             }
+            if op2 == 0xFC || op2 == 0xFD || op2 == 0xFE {
+                // PADDB/W/D xmm, xmm/m128: wrapping addition in byte, word,
+                // or dword lanes. These are the companion operations to
+                // PADDQ in compiler-generated SIMD search code.
+                if !opsz16 || rep || repne {
+                    return Err(format!("unsupported MMX opcode 0F {op2:02X} at 0x{ip:016x}"));
+                }
+                let (reg, is_reg, rm, ea_raw, ml) =
+                    self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
+                let next = ip + (off + 2 + ml) as u64;
+                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let a = self.xmm[reg].to_le_bytes();
+                let b: [u8; 16] = if is_reg {
+                    self.xmm[rm].to_le_bytes()
+                } else {
+                    self.read_u128(ea)?.to_le_bytes()
+                };
+                let lane_bytes = match op2 {
+                    0xFC => 1,
+                    0xFD => 2,
+                    _ => 4,
+                };
+                let mut out = [0u8; 16];
+                for lane in 0..16 / lane_bytes {
+                    let start = lane * lane_bytes;
+                    let mut left = 0u64;
+                    let mut right = 0u64;
+                    for byte in 0..lane_bytes {
+                        left |= (a[start + byte] as u64) << (8 * byte);
+                        right |= (b[start + byte] as u64) << (8 * byte);
+                    }
+                    let sum = left.wrapping_add(right);
+                    for byte in 0..lane_bytes {
+                        out[start + byte] = (sum >> (8 * byte)) as u8;
+                    }
+                }
+                self.xmm[reg] = u128::from_le_bytes(out);
+                self.rip = next;
+                return Ok(StepResult::Continue);
+            }
             if (0xC8..=0xCF).contains(&op2) {
                 // BSWAP r32/r64: register is in the opcode, no ModRM.
                 let r = (((rex_b as u8) << 3) | (op2 & 7)) as usize;
@@ -1605,10 +1645,10 @@ impl Emu {
                 self.rip = next;
                 return Ok(StepResult::Continue);
             }
-            if op2 == 0x60 || op2 == 0x68 || op2 == 0x6C || op2 == 0x61 || op2 == 0x69 {
+            if matches!(op2, 0x60 | 0x61 | 0x62 | 0x68 | 0x69 | 0x6A | 0x6C) {
                 // PUNPCKLBW/HBW (bytes->words), PUNPCKLWD/HWD (words->dwords),
-                // PUNPCKLQDQ (low qwords). All require the 0x66 prefix
-                // (plain forms are MMX).
+                // PUNPCKLDQ/HDQ (dwords->qwords), and PUNPCKLQDQ (low
+                // qwords). All require the 0x66 prefix (plain forms are MMX).
                 if !opsz16 {
                     return Err(format!(
                         "unsupported MMX opcode 0F {op2:02X} at 0x{ip:016x}"
@@ -1636,6 +1676,12 @@ impl Emu {
                     for i in 0..4 {
                         o[4 * i..4 * i + 2].copy_from_slice(&a[base + 2 * i..base + 2 * i + 2]);
                         o[4 * i + 2..4 * i + 4].copy_from_slice(&b[base + 2 * i..base + 2 * i + 2]);
+                    }
+                } else if op2 == 0x62 || op2 == 0x6A {
+                    let base = if op2 == 0x62 { 0 } else { 8 };
+                    for i in 0..2 {
+                        o[8 * i..8 * i + 4].copy_from_slice(&a[base + 4 * i..base + 4 * i + 4]);
+                        o[8 * i + 4..8 * i + 8].copy_from_slice(&b[base + 4 * i..base + 4 * i + 4]);
                     }
                 } else {
                     o[0..8].copy_from_slice(&a[0..8]);
@@ -3386,6 +3432,43 @@ mod tests {
         e.xmm[1] = 0x0000_0000_0000_0007_0000_0000_0000_0002;
         assert!(matches!(e.step().unwrap(), StepResult::Continue));
         assert_eq!(e.xmm[0], 0x0000_0000_0000_000C_0000_0000_0000_0001);
+    }
+
+    #[test]
+    fn packed_adds_wrap_within_byte_word_and_dword_lanes() {
+        let mut e = emu_with(&[
+            0x66, 0x0F, 0xFC, 0xC1, // paddb xmm0,xmm1
+            0x66, 0x0F, 0xFD, 0xD3, // paddw xmm2,xmm3
+            0x66, 0x0F, 0xFE, 0xE5, // paddd xmm4,xmm5
+        ]);
+        e.xmm[0] = 0xFF;
+        e.xmm[1] = 2;
+        e.xmm[2] = 0xFFFF;
+        e.xmm[3] = 2;
+        e.xmm[4] = 0xFFFF_FFFF;
+        e.xmm[5] = 2;
+        assert!(matches!(e.step().unwrap(), StepResult::Continue));
+        assert_eq!(e.xmm[0] & 0xff, 1);
+        assert!(matches!(e.step().unwrap(), StepResult::Continue));
+        assert_eq!(e.xmm[2] & 0xffff, 1);
+        assert!(matches!(e.step().unwrap(), StepResult::Continue));
+        assert_eq!(e.xmm[4] & 0xffff_ffff, 1);
+    }
+
+    #[test]
+    fn punpckldq_and_punpckhdq_interleave_dword_lanes() {
+        let mut e = emu_with(&[
+            0x66, 0x0F, 0x62, 0xC1, // punpckldq xmm0,xmm1
+            0x66, 0x0F, 0x6A, 0xD3, // punpckhdq xmm2,xmm3
+        ]);
+        e.xmm[0] = 0x0000_0004_0000_0003_0000_0002_0000_0001;
+        e.xmm[1] = 0x0000_0008_0000_0007_0000_0006_0000_0005;
+        e.xmm[2] = e.xmm[0];
+        e.xmm[3] = e.xmm[1];
+        assert!(matches!(e.step().unwrap(), StepResult::Continue));
+        assert_eq!(e.xmm[0], 0x0000_0006_0000_0002_0000_0005_0000_0001);
+        assert!(matches!(e.step().unwrap(), StepResult::Continue));
+        assert_eq!(e.xmm[2], 0x0000_0008_0000_0004_0000_0007_0000_0003);
     }
 
     #[test]

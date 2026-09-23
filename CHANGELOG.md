@@ -6,9 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
-- Added `MOVMSKPS`, packed-64-bit `PADDQ`, and packed-word immediate-shift
-  emulation, allowing real ripgrep JSON output to progress through its SIMD
-  formatting path on the default interpreter backend.
+- Added `MOVMSKPS`, packed-integer addition, packed-word immediate shifts,
+  and packed-dword interleaves, allowing real ripgrep JSON output to progress
+  through its SIMD formatting path on the default interpreter backend.
 - Native `CreateProcessW` accepts bounded Unicode environment blocks; values
   are isolated to the child and available through `GetEnvironmentVariableW`
   and `GetEnvironmentStringsW`; a null environment pointer inherits the
