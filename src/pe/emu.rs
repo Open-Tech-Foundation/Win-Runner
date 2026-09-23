@@ -23,6 +23,7 @@ pub fn max_steps() -> u64 {
 }
 /// Sentinel return address placed at the bottom of the stack.
 pub const ENTRY_SENTINEL: u64 = 0xDEAD_BEEF_DEAD_BEEF;
+pub const TLS_RETURN_SENTINEL: u64 = 0xDEAD_BEEF_DEAD_BEEE;
 
 /// Minimal CPUID for feature detection. Reports the emulated subset:
 /// SSE/SSE2 baseline, nothing newer. Unknown leaves read as zero.
@@ -62,6 +63,7 @@ pub enum StepResult {
     Continue,
     CalledStub { index: usize },
     Halted(u32),
+    TlsReturned,
 }
 
 /// Per-thread processor state. Guest memory and import tables stay in `Emu`
@@ -206,6 +208,29 @@ impl Emu {
         cpu.pf = false;
         cpu.df = false;
         cpu.gs_base = gs_base;
+        Ok(cpu)
+    }
+
+    /// Enter a TLS callback with Windows x64 shadow space. The caller's CPU
+    /// state is kept separately so callback register changes do not leak into
+    /// the thread entry point.
+    pub fn tls_callback_cpu(
+        &mut self,
+        resume: &CpuState,
+        callback: u64,
+        image_base: u64,
+        reason: u32,
+    ) -> Result<CpuState, String> {
+        self.read_u8(callback)?;
+        let rsp = resume.regs[4].checked_sub(0x30)
+            .ok_or_else(|| "TLS callback stack underflow".to_string())?;
+        self.write_u64(rsp, TLS_RETURN_SENTINEL)?;
+        let mut cpu = resume.clone();
+        cpu.regs[1] = image_base;
+        cpu.regs[2] = u64::from(reason);
+        cpu.regs[8] = 0;
+        cpu.regs[4] = rsp;
+        cpu.rip = callback;
         Ok(cpu)
     }
 
@@ -2513,6 +2538,9 @@ impl Emu {
             }
             0xC3 => {
                 let ret = self.pop_u64()?;
+                if ret == TLS_RETURN_SENTINEL {
+                    return Ok(StepResult::TlsReturned);
+                }
                 if ret == ENTRY_SENTINEL {
                     let code = (self.regs[0] & 0xFFFF_FFFF) as u32;
                     return Ok(StepResult::Halted(code));
@@ -2523,6 +2551,9 @@ impl Emu {
             0xC2 => {
                 let imm = self.read_u16(ip + off as u64 + 1)? as u64;
                 let ret = self.pop_u64()?;
+                if ret == TLS_RETURN_SENTINEL {
+                    return Ok(StepResult::TlsReturned);
+                }
                 if ret == ENTRY_SENTINEL {
                     let code = (self.regs[0] & 0xFFFF_FFFF) as u32;
                     return Ok(StepResult::Halted(code));

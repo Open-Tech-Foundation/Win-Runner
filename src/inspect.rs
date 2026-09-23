@@ -35,12 +35,7 @@ impl InspectReport {
 
 pub fn inspect_pe(data: &[u8]) -> Result<InspectReport, String> {
     let img = load_lenient(data)?;
-    let mut limitations = Vec::new();
-    if let Some(tls) = &img.tls {
-        if !tls.callbacks.is_empty() {
-            limitations.push(format!("TLS callbacks unsupported: {}", tls.callbacks.len()));
-        }
-    }
+    let limitations = Vec::new();
     Ok(InspectReport {
         arch: "x86_64".to_string(),
         entry_rva: img.entry_rva,

@@ -49,7 +49,7 @@ pub struct TlsDir {
     pub zero_fill: u32,
     /// RVA of the slot-index DWORD (loader writes the assigned index).
     pub index_rva: u32,
-    /// Callback RVAs (retained for inspection; execution rejects them).
+    /// Callback RVAs invoked before the entry point and on thread attach.
     pub callbacks: Vec<u32>,
 }
 
@@ -570,6 +570,7 @@ fn load_inner(data: &[u8], strict: bool) -> Result<PeImage, String> {
         let mut callbacks = Vec::new();
         if cb_va != 0 {
             let cb_rva = to_rva(cb_va)? as usize;
+            let mut terminated = false;
             for i in 0..64 {
                 let o = cb_rva + i * 8;
                 if o + 8 > image.len() {
@@ -577,16 +578,20 @@ fn load_inner(data: &[u8], strict: bool) -> Result<PeImage, String> {
                 }
                 let f = u64::from_le_bytes(image[o..o + 8].try_into().unwrap());
                 if f == 0 {
+                    terminated = true;
                     break;
                 }
-                callbacks.push(to_rva(f)?);
+                let callback_rva = to_rva(f)?;
+                if !secs.iter().any(|s| s.chars & 0x2000_0000 != 0
+                    && callback_rva >= s.vaddr
+                    && callback_rva < s.vaddr.saturating_add(s.vsize.max(s.fsize))) {
+                    return Err(format!("TLS callback 0x{callback_rva:08x} is not executable"));
+                }
+                callbacks.push(callback_rva);
             }
-        }
-        if strict && !callbacks.is_empty() {
-            return Err(format!(
-                "TLS callbacks not supported ({} found)",
-                callbacks.len()
-            ));
+            if !terminated {
+                return Err("TLS callback list is not terminated".to_string());
+            }
         }
         Some(TlsDir {
             raw_data: image[start..end].to_vec(),
@@ -735,7 +740,7 @@ mod large_image_tests {
     }
 
     #[test]
-    fn lenient_load_retains_tls_callbacks_for_inspection() {
+    fn tls_callbacks_are_loadable_and_visible_to_inspection() {
         let mut exe = builder::hello("hi");
         let old_size = u32le(&exe, OPT + 56).unwrap();
         let tls_rva = old_size;
@@ -768,11 +773,16 @@ mod large_image_tests {
             load_lenient(&exe).unwrap().tls.unwrap().callbacks,
             vec![SECTION_RVA]
         );
-        assert!(load(&exe)
-            .unwrap_err()
-            .contains("TLS callbacks not supported"));
+        assert_eq!(load(&exe).unwrap().tls.unwrap().callbacks, vec![SECTION_RVA]);
         let report = crate::inspect::inspect_pe(&exe).unwrap();
-        assert!(!report.runnable());
-        assert_eq!(report.limitations, ["TLS callbacks unsupported: 1"]);
+        assert!(report.runnable());
+        assert!(report.limitations.is_empty());
+        let mut invalid = exe.clone();
+        invalid[raw as usize + 0x50..raw as usize + 0x58]
+            .copy_from_slice(&(base + u64::from(tls_rva) + 0x40).to_le_bytes());
+        assert!(load(&invalid).unwrap_err().contains("not executable"));
+        invalid[raw as usize + 0x50..raw as usize + 0x58]
+            .copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(load(&invalid).unwrap_err().contains("TLS address out of image"));
     }
 }

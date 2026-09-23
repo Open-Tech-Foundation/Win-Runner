@@ -150,6 +150,75 @@ fn interpreter_guest_thread_waits_and_handle_errors() {
     assert!(stdout.is_empty());
 }
 
+#[test]
+fn interpreter_tls_callbacks_run_before_entry_and_on_worker_attach() {
+    use pe::builder::{self, Asm};
+    let mut a = Asm::new();
+    let counter = a.add_zeroed(4);
+    a.sub_rsp(0x68);
+    a.xor_eax();
+    a.mov_rcx_rax();
+    a.mov_rdx_rax();
+    let worker_patch = a.code.len() + 2;
+    a.emit(&[0x49, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0]); // mov r8, worker VA
+    a.mov_r9d_imm(0);
+    a.mov_rspoff_imm32(0x20, 0);
+    a.mov_rspoff_imm32(0x28, 0);
+    a.call_import(0); // CreateThread
+    a.mov_rcx_rax();
+    a.mov_edx_imm(u32::MAX);
+    a.call_import(1); // WaitForSingleObject
+    a.mov_eax_mem_rip(counter);
+    a.mov_rcx_rax();
+    a.call_import(2); // ExitProcess(counter)
+    let worker_rva = builder::SECTION_RVA + a.code.len() as u32;
+    a.code[worker_patch..worker_patch + 8]
+        .copy_from_slice(&(builder::IMAGE_BASE + u64::from(worker_rva)).to_le_bytes());
+    a.xor_eax();
+    a.ret();
+    let callback_rva = builder::SECTION_RVA + a.code.len() as u32;
+    a.lea_reg_rip(0, counter);
+    a.emit(&[0x83, 0x00, 0x01]); // add dword [rax], 1
+    a.ret();
+    let mut exe = builder::build(a, &[
+        ("KERNEL32.DLL", "CreateThread"),
+        ("KERNEL32.DLL", "WaitForSingleObject"),
+        ("KERNEL32.DLL", "ExitProcess"),
+    ]);
+
+    // Add a separate .tls section to the tiny test PE.
+    let opt = 0x80 + 4 + 20;
+    let old_size = u32::from_le_bytes(exe[opt + 56..opt + 60].try_into().unwrap());
+    let raw = exe.len();
+    exe[0x80 + 6..0x80 + 8].copy_from_slice(&2u16.to_le_bytes());
+    exe[opt + 56..opt + 60].copy_from_slice(&(old_size + 0x1000).to_le_bytes());
+    let tls_dir = opt + 112 + 9 * 8;
+    exe[tls_dir..tls_dir + 4].copy_from_slice(&old_size.to_le_bytes());
+    exe[tls_dir + 4..tls_dir + 8].copy_from_slice(&40u32.to_le_bytes());
+    let header = opt + 0xf0 + 40;
+    exe[header..header + 8].copy_from_slice(b".tls\0\0\0\0");
+    exe[header + 8..header + 12].copy_from_slice(&0x100u32.to_le_bytes());
+    exe[header + 12..header + 16].copy_from_slice(&old_size.to_le_bytes());
+    exe[header + 16..header + 20].copy_from_slice(&0x200u32.to_le_bytes());
+    exe[header + 20..header + 24].copy_from_slice(&(raw as u32).to_le_bytes());
+    exe[header + 36..header + 40].copy_from_slice(&0xc000_0040u32.to_le_bytes());
+    exe.resize(raw + 0x200, 0);
+    let base = builder::IMAGE_BASE + u64::from(old_size);
+    exe[raw..raw + 8].copy_from_slice(&(base + 0x40).to_le_bytes());
+    exe[raw + 8..raw + 16].copy_from_slice(&(base + 0x40).to_le_bytes());
+    exe[raw + 16..raw + 24].copy_from_slice(&(base + 0x48).to_le_bytes());
+    exe[raw + 24..raw + 32].copy_from_slice(&(base + 0x50).to_le_bytes());
+    exe[raw + 0x50..raw + 0x58]
+        .copy_from_slice(&(builder::IMAGE_BASE + u64::from(callback_rva)).to_le_bytes());
+
+    assert_eq!(run_exe_on_fs(&exe, WinFs::new()).0, 2);
+    let path = tmp_path("tls-thread.exe");
+    std::fs::write(&path, &exe).unwrap();
+    let (code, _, stderr) = run_cli(&path);
+    std::fs::remove_file(&path).ok();
+    assert_eq!(code, 2, "stderr: {stderr}");
+}
+
 // ---------- 1: hello ----------
 
 #[test]

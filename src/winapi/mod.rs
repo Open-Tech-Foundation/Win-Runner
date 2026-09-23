@@ -68,6 +68,9 @@ struct GuestThread {
     fls: Vec<Option<u64>>,
     state: ThreadState,
     critical_depth: u32,
+    tls_resume: Option<CpuState>,
+    tls_next: usize,
+    tls_reason: u32,
 }
 
 pub struct Runner {
@@ -129,7 +132,7 @@ impl Runner {
         emu.alloc_cmdline(prog, args)?;
         setup_tls(&mut emu, img)?;
         let main_cpu = emu.cpu_state();
-        Ok(Self {
+        let mut runner = Self {
             emu,
             fs,
             handles: HashMap::new(),
@@ -155,13 +158,19 @@ impl Runner {
                 fls: Vec::new(),
                 state: ThreadState::Runnable,
                 critical_depth: 0,
+                tls_resume: None,
+                tls_next: 0,
+                tls_reason: 0,
             }],
             current_thread: 0,
             next_thread_id: 2,
             switch_requested: false,
             critical_sections: HashMap::new(),
             tls_template: img.tls.clone(),
-        })
+        };
+        runner.begin_tls_callbacks(0, 1)?; // DLL_PROCESS_ATTACH
+        runner.emu.restore_cpu(&runner.threads[0].cpu);
+        Ok(runner)
     }
 
     pub fn with_console_sink(mut self, sink: Box<dyn FnMut(&[u8])>) -> Self {
@@ -226,6 +235,33 @@ impl Runner {
         let peb = self.emu.read_u64(self.emu.gs_base + TEB_PEB_OFF)?;
         self.emu.write_u64(teb + TEB_PEB_OFF, peb)?;
         Ok(teb)
+    }
+
+    fn begin_tls_callbacks(&mut self, index: usize, reason: u32) -> Result<(), String> {
+        if self.tls_template.as_ref().is_none_or(|tls| tls.callbacks.is_empty()) {
+            return Ok(());
+        }
+        let thread = &mut self.threads[index];
+        thread.tls_resume = Some(thread.cpu.clone());
+        thread.tls_next = 0;
+        thread.tls_reason = reason;
+        self.advance_tls_callback(index)
+    }
+
+    fn advance_tls_callback(&mut self, index: usize) -> Result<(), String> {
+        let thread = &mut self.threads[index];
+        let resume = thread.tls_resume.as_ref()
+            .ok_or_else(|| "TLS callback returned without pending invocation".to_string())?;
+        let callbacks = &self.tls_template.as_ref().unwrap().callbacks;
+        if let Some(&rva) = callbacks.get(thread.tls_next) {
+            thread.tls_next += 1;
+            thread.cpu = self.emu.tls_callback_cpu(
+                resume, self.emu.base + u64::from(rva), self.emu.base, thread.tls_reason,
+            )?;
+        } else {
+            thread.cpu = thread.tls_resume.take().unwrap();
+        }
+        Ok(())
     }
 
     fn refresh_waiters(&mut self) -> Result<(), String> {
@@ -477,6 +513,11 @@ impl Runner {
             };
             match step_res {
                 StepResult::Continue => {}
+                StepResult::TlsReturned => {
+                    self.advance_tls_callback(self.current_thread)?;
+                    self.emu.restore_cpu(&self.threads[self.current_thread].cpu);
+                    continue;
+                }
                 StepResult::Halted(code) => {
                     if self.current_thread != 0 {
                         self.threads[self.current_thread].state = ThreadState::Finished;
@@ -1556,7 +1597,11 @@ impl Runner {
                     fls: vec![None; self.fls_count],
                     state: ThreadState::Runnable,
                     critical_depth: 0,
+                    tls_resume: None,
+                    tls_next: 0,
+                    tls_reason: 0,
                 });
+                self.begin_tls_callbacks(self.threads.len() - 1, 2)?; // DLL_THREAD_ATTACH
                 self.switch_requested = true;
                 ret_bool!(handle);
             }
@@ -1943,9 +1988,8 @@ fn read_stdin_line() -> Option<String> {
 
 /// Map the image's TLS template (if any): allocate the per-thread block,
 /// point slot 0 of a fresh TLS array at it, publish the slot index, and
-/// install a minimal TEB (+PEB) as the GS base. Single-threaded model:
-/// slot 0 is always ours. Images *with* TLS callbacks are rejected at
-/// load time (see `pe`).
+/// install a minimal TEB (+PEB) as the GS base. Slot 0 is our TLS slot;
+/// process-attach callbacks run before the image entry point.
 fn setup_tls(emu: &mut Emu, img: &PeImage) -> Result<(), String> {
     use crate::pe::emu::{
         PEB_IMAGEBASE_OFF, PEB_LDR_OFF, PEB_OFF, TEB_PEB_OFF, TEB_SELF_OFF, TEB_TLS_OFF,
@@ -2706,6 +2750,9 @@ mod tests {
                 deadline: None,
             },
             critical_depth: 0,
+            tls_resume: None,
+            tls_next: 0,
+            tls_reason: 0,
         });
         runner.refresh_waiters().unwrap();
         assert!(matches!(

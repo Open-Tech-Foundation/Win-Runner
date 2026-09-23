@@ -6,6 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- PE TLS callbacks now run before the entry point and on guest thread attach,
+  with their Windows x64 arguments and per-thread TLS initialized. Malformed
+  or non-executable callback addresses are rejected by the loader.
 - The interpreter now cooperatively schedules guest threads with separate CPU
   registers, stacks, TLS and FLS, thread IDs, and last-error values. Thread
   creation, waits, sleeps, address wakes, and critical sections allow ripgrep
@@ -26,8 +29,6 @@ All notable changes to this project will be documented in this file.
   report.
 - PE import parsing now accepts up to 4096 imports per DLL, enough to inspect
   Node.js while retaining a finite malformed-input limit.
-- `inspect` now reports TLS callbacks as a loader limitation while continuing
-  to list imports; execution still rejects images with unsupported callbacks.
 - File information now reports distinct, stable IDs for WinFS paths in both
   execution backends. This lets ripgrep's single-worker directory search
   distinguish files instead of treating them all as the same object.
