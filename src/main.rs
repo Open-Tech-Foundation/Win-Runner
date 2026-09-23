@@ -257,11 +257,18 @@ fn probe_exe_file(path: &str, guest_args: &[String]) -> ! {
             std::process::exit(1);
         }
     };
-    match wincli::winapi::Runner::with_argv_probe(&img, WinFs::new(), path, guest_args)
-        .and_then(|runner| runner.run())
-    {
-        Ok((code, _, stdout)) => {
-            let _ = std::io::stdout().write_all(&stdout);
+    let runner = match wincli::winapi::Runner::with_argv_probe(&img, WinFs::new(), path, guest_args) {
+        Ok(runner) => runner,
+        Err(e) => {
+            eprintln!("wincli: probe stopped for {path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let runner = runner.with_console_sink(Box::new(|data| {
+        let _ = std::io::stdout().write_all(data);
+    }));
+    match runner.run() {
+        Ok((code, _, _)) => {
             std::process::exit(code as i32);
         }
         Err(e) => {

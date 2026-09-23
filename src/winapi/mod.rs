@@ -35,6 +35,22 @@ fn system_message(code: u32) -> Option<&'static str> {
     })
 }
 
+fn version_compare(actual: u32, requested: u32, condition: u8) -> Option<bool> {
+    Some(match condition {
+        1 => actual == requested, // VER_EQUAL
+        2 => actual > requested,
+        3 => actual >= requested,
+        4 => actual < requested,
+        5 => actual <= requested,
+        _ => return None,
+    })
+}
+
+fn is_nul_device(path: &str) -> bool {
+    path.rsplit(['\\', '/']).next().unwrap_or(path)
+        .trim_end_matches(':').eq_ignore_ascii_case("nul")
+}
+
 const CREATE_NEW: u32 = 1;
 const CREATE_ALWAYS: u32 = 2;
 const OPEN_EXISTING: u32 = 3;
@@ -44,6 +60,11 @@ const TRUNCATE_EXISTING: u32 = 5;
 struct FileHandle {
     path: String, // display path (original resolution; re-normalized per op)
     offset: u64,
+}
+
+struct GuestSemaphore {
+    count: i32,
+    maximum: i32,
 }
 
 /// One directory-enumeration result for FindFirst/NextFileW.
@@ -62,6 +83,10 @@ struct FindSearch {
 enum ThreadState {
     Runnable,
     WaitingThread {
+        handle: u64,
+        deadline: Option<Instant>,
+    },
+    WaitingSemaphore {
         handle: u64,
         deadline: Option<Instant>,
     },
@@ -106,7 +131,7 @@ struct OnceFrame {
 }
 
 enum OnceState {
-    Running { owner: usize },
+    Running { owner: usize, split: bool },
     Complete { context: u64 },
 }
 
@@ -120,6 +145,8 @@ pub struct Runner {
     pub emu: Emu,
     pub fs: WinFs,
     handles: HashMap<u64, FileHandle>,
+    null_handles: HashSet<u64>,
+    handle_flags: HashMap<u64, u32>,
     next_handle: u64,
     /// Live directory enumerations (separate handle space from files).
     finds: HashMap<u64, FindSearch>,
@@ -133,6 +160,8 @@ pub struct Runner {
     /// Last-error code (`GetLastError`/`SetLastError`).
     last_error: u32,
     error_mode: u32,
+    console_ctrl_handlers: Vec<u64>,
+    ignore_ctrl_c: bool,
     /// Guest env overrides (`SetEnvironmentVariableW`); host env is never
     /// mutated, reads fall through to it.
     env_overlay: HashMap<String, Option<String>>,
@@ -156,6 +185,9 @@ pub struct Runner {
     srw_locks: HashMap<u64, SrwLock>,
     once_states: HashMap<u64, OnceState>,
     wsa_startups: u32,
+    sockets: HashMap<u64, (u32, u32, u32)>,
+    semaphores: HashMap<u64, GuestSemaphore>,
+    power_notifications: HashMap<u64, (u64, u64)>,
     module_handles: HashMap<String, u64>,
     tls_template: Option<TlsDir>,
     first_unsupported_index: usize,
@@ -226,6 +258,8 @@ impl Runner {
             emu,
             fs,
             handles: HashMap::new(),
+            null_handles: HashSet::new(),
+            handle_flags: HashMap::new(),
             next_handle: 0x100,
             finds: HashMap::new(),
             next_find: 0x10000,
@@ -234,6 +268,8 @@ impl Runner {
             console_is_tty: std::io::stdout().is_terminal(),
             last_error: 0,
             error_mode: 0,
+            console_ctrl_handlers: Vec::new(),
+            ignore_ctrl_c: false,
             env_overlay: HashMap::new(),
             fls: Vec::new(),
             fls_count: 0,
@@ -264,6 +300,9 @@ impl Runner {
             srw_locks: HashMap::new(),
             once_states: HashMap::new(),
             wsa_startups: 0,
+            sockets: HashMap::new(),
+            semaphores: HashMap::new(),
+            power_notifications: HashMap::new(),
             module_handles,
             tls_template: img.tls.clone(),
             first_unsupported_index: img.imports.len() + img.stubs.len(),
@@ -425,7 +464,7 @@ impl Runner {
         });
         self.threads[index].cpu = cpu;
         self.threads[index].state = ThreadState::Runnable;
-        self.once_states.insert(once, OnceState::Running { owner: index });
+        self.once_states.insert(once, OnceState::Running { owner: index, split: false });
         if index == self.current_thread {
             self.emu.restore_cpu(&self.threads[index].cpu);
         }
@@ -584,6 +623,16 @@ impl Runner {
                         None
                     }
                 }
+                ThreadState::WaitingSemaphore { handle, deadline } => {
+                    if !self.semaphores.contains_key(handle) {
+                        thread.last_error = 6;
+                        Some(u32::MAX as u64)
+                    } else if deadline.is_some_and(|at| now >= at) {
+                        Some(258)
+                    } else {
+                        None
+                    }
+                }
                 ThreadState::WaitingAddress {
                     address,
                     expected,
@@ -645,6 +694,7 @@ impl Runner {
                 .iter()
                 .filter_map(|thread| match &thread.state {
                     ThreadState::WaitingThread { deadline, .. }
+                    | ThreadState::WaitingSemaphore { deadline, .. }
                     | ThreadState::WaitingAddress { deadline, .. } => *deadline,
                 ThreadState::Sleeping(at) => Some(*at),
                 ThreadState::WaitingCondition { deadline, .. } => *deadline,
@@ -677,6 +727,13 @@ impl Runner {
         self.next_handle += 1;
         self.handles.insert(h, FileHandle { path, offset });
         h
+    }
+
+    fn is_open_handle(&self, handle: u64) -> bool {
+        handle <= 2 || self.handles.contains_key(&handle)
+            || self.null_handles.contains(&handle) || self.semaphores.contains_key(&handle)
+            || self.sockets.contains_key(&handle)
+            || self.threads.iter().any(|thread| thread.handle == handle && thread.open)
     }
 
     /// (attrs, byte length) for an open handle's path (dirs: 0x10, len 0).
@@ -937,6 +994,11 @@ impl Runner {
         match name {
             "#8" | "#14" => ret_bool!((rcx as u32).swap_bytes() as u64),
             "#9" | "#15" => ret_bool!((rcx as u16).swap_bytes() as u64),
+            "#111" => ret_bool!(self.last_error as u64), // WSAGetLastError
+            "#112" => { // WSASetLastError
+                self.last_error = rcx as u32;
+                ret_bool!(0);
+            }
             "#115" => { // WSAStartup, x64 WSADATA is 408 bytes
                 let version = rcx as u16;
                 if version & 0xff == 0 || version & 0xff > 2 || version >> 8 > 2 {
@@ -957,7 +1019,113 @@ impl Runner {
                     ret_bool!(u32::MAX as u64); // SOCKET_ERROR
                 }
                 self.wsa_startups -= 1;
+                if self.wsa_startups == 0 {
+                    for handle in self.sockets.keys() { self.handle_flags.remove(handle); }
+                    self.sockets.clear();
+                }
                 ret_bool!(0);
+            }
+            "#23" => { // socket(af, type, protocol)
+                if self.wsa_startups == 0 {
+                    self.last_error = 10093; // WSANOTINITIALISED
+                    ret_bool!(INVALID_HANDLE);
+                }
+                let family = rcx as u32;
+                let kind = rdx as u32;
+                let protocol = r8 as u32;
+                let error = if !matches!(family, 2 | 23) { // AF_INET / AF_INET6
+                    Some(10047) // WSAEAFNOSUPPORT
+                } else if !matches!(kind, 1 | 2) { // SOCK_STREAM / SOCK_DGRAM
+                    Some(10044) // WSAESOCKTNOSUPPORT
+                } else if protocol != 0 && protocol != if kind == 1 { 6 } else { 17 } {
+                    Some(10043) // WSAEPROTONOSUPPORT
+                } else {
+                    None
+                };
+                if let Some(code) = error {
+                    self.last_error = code;
+                    ret_bool!(INVALID_HANDLE);
+                }
+                let handle = self.next_handle;
+                self.next_handle += 1;
+                self.sockets.insert(handle, (family, kind, protocol));
+                ret_bool!(handle);
+            }
+            "#3" => { // closesocket
+                if self.wsa_startups == 0 {
+                    self.last_error = 10093; // WSANOTINITIALISED
+                    ret_bool!(u32::MAX as u64);
+                }
+                if self.sockets.remove(&rcx).is_none() {
+                    self.last_error = 10038; // WSAENOTSOCK
+                    ret_bool!(u32::MAX as u64);
+                }
+                self.handle_flags.remove(&rcx);
+                ret_bool!(0);
+            }
+            "#7" => { // getsockopt
+                if self.wsa_startups == 0 {
+                    self.last_error = 10093; // WSANOTINITIALISED
+                    ret_bool!(u32::MAX as u64);
+                }
+                let Some(&(family, kind, protocol)) = self.sockets.get(&rcx) else {
+                    self.last_error = 10038; // WSAENOTSOCK
+                    ret_bool!(u32::MAX as u64);
+                };
+                let len_ptr = self.emu.stack_arg(4)?;
+                if r9 == 0 || len_ptr == 0 {
+                    self.last_error = 10014; // WSAEFAULT
+                    ret_bool!(u32::MAX as u64);
+                }
+                if rdx as u32 != 0xffff { // SOL_SOCKET
+                    self.last_error = 10022; // WSAEINVAL
+                    ret_bool!(u32::MAX as u64);
+                }
+                let value = match r8 as u32 {
+                    0x2005 => { // SO_PROTOCOL_INFOW: WSAPROTOCOL_INFOW
+                        let mut info = vec![0u8; 628];
+                        // This virtual socket does not promise IFS handles.
+                        info[44..48].copy_from_slice(&1u32.to_le_bytes()); // base protocol chain
+                        info[72..76].copy_from_slice(&2u32.to_le_bytes()); // iVersion
+                        info[76..80].copy_from_slice(&family.to_le_bytes());
+                        info[88..92].copy_from_slice(&kind.to_le_bytes());
+                        let actual_protocol = if protocol == 0 {
+                            if kind == 1 { 6u32 } else { 17u32 }
+                        } else { protocol };
+                        info[92..96].copy_from_slice(&actual_protocol.to_le_bytes());
+                        info
+                    }
+                    0x1008 => kind.to_le_bytes().to_vec(), // SO_TYPE
+                    _ => {
+                        self.last_error = 10042; // WSAENOPROTOOPT
+                        ret_bool!(u32::MAX as u64);
+                    }
+                };
+                if self.emu.read_u32(len_ptr)? < value.len() as u32 {
+                    self.last_error = 10014; // WSAEFAULT
+                    ret_bool!(u32::MAX as u64);
+                }
+                self.emu.write_bytes(r9, &value)?;
+                self.emu.write_u32(len_ptr, value.len() as u32)?;
+                ret_bool!(0);
+            }
+            "PowerRegisterSuspendResumeNotification" => {
+                if rcx != 2 || rdx == 0 || r8 == 0 { // DEVICE_NOTIFY_CALLBACK
+                    ret_bool!(87); // ERROR_INVALID_PARAMETER
+                }
+                let callback = self.emu.read_u64(rdx)?;
+                let context = self.emu.read_u64(rdx + 8)?;
+                if callback == 0 || self.emu.read_u8(callback).is_err() {
+                    ret_bool!(87);
+                }
+                let handle = self.next_handle;
+                self.next_handle += 1;
+                self.power_notifications.insert(handle, (callback, context));
+                self.emu.write_u64(r8, handle)?;
+                ret_bool!(0); // ERROR_SUCCESS
+            }
+            "PowerUnregisterSuspendResumeNotification" => {
+                ret_bool!(if self.power_notifications.remove(&rcx).is_some() { 0 } else { 6 });
             }
             "ExitProcess" => {
                 ret_halt!((rcx & 0xFFFF_FFFF) as u32);
@@ -983,6 +1151,10 @@ impl Runner {
                     ret_bool!(0);
                 }
                 let data = self.emu.read_bytes(buf, n)?;
+                if self.null_handles.contains(&h) {
+                    if p_written != 0 { self.emu.write_u32(p_written, n as u32)?; }
+                    ret_bool!(1);
+                }
                 if h == 1 || h == 2 {
                     self.console_out(&data);
                     if p_written != 0 {
@@ -1029,6 +1201,15 @@ impl Runner {
                 let creation = self.emu.stack_arg(4).unwrap_or(OPEN_EXISTING as u64) as u32;
                 let flags = self.emu.stack_arg(5).unwrap_or(0) as u32;
                 let path = self.emu.read_utf16(p_path)?;
+                if std::env::var("WINCLI_TRACE").as_deref() == Ok("1") {
+                    eprintln!("[trace] CreateFileW path={path:?} creation={creation} flags=0x{flags:x}");
+                }
+                if is_nul_device(&path) && creation == OPEN_EXISTING {
+                    let handle = self.next_handle;
+                    self.next_handle += 1;
+                    self.null_handles.insert(handle);
+                    ret_bool!(handle);
+                }
                 let exists = self.fs.exists(&path);
                 let is_dir = self.fs.is_dir(&path);
                 // Directories open only with FILE_FLAG_BACKUP_SEMANTICS.
@@ -1099,6 +1280,10 @@ impl Runner {
                 if n > 16 * 1024 * 1024 {
                     ret_bool!(0);
                 }
+                if self.null_handles.contains(&h) {
+                    if p_read != 0 { self.emu.write_u32(p_read, 0)?; }
+                    ret_bool!(1);
+                }
                 if h == 0 {
                     // stdin: no input -> 0 bytes
                     if p_read != 0 {
@@ -1129,10 +1314,21 @@ impl Runner {
             }
             "CloseHandle" => {
                 let h = rcx;
+                if self.handle_flags.get(&h).is_some_and(|flags| flags & 2 != 0) {
+                    self.last_error = 6;
+                    ret_bool!(0);
+                }
                 if h <= 2 {
                     ret_bool!(1);
                 }
                 if self.handles.remove(&h).is_some() {
+                    self.handle_flags.remove(&h);
+                    ret_bool!(1);
+                } else if self.null_handles.remove(&h) {
+                    self.handle_flags.remove(&h);
+                    ret_bool!(1);
+                } else if self.semaphores.remove(&h).is_some() {
+                    self.handle_flags.remove(&h);
                     ret_bool!(1);
                 } else if let Some(thread) = self
                     .threads
@@ -1140,6 +1336,7 @@ impl Runner {
                     .find(|thread| thread.handle == h && thread.open)
                 {
                     thread.open = false;
+                    self.handle_flags.remove(&h);
                     ret_bool!(1);
                 } else {
                     self.last_error = 6;
@@ -1620,7 +1817,7 @@ impl Runner {
                 ret_bool!(1);
             }
             "GetFileType" => {
-                if rcx <= 2 {
+                if rcx <= 2 || self.null_handles.contains(&rcx) {
                     ret_bool!(2); // FILE_TYPE_CHAR
                 } else if self.handles.contains_key(&rcx) {
                     ret_bool!(1); // FILE_TYPE_DISK
@@ -1940,7 +2137,7 @@ impl Runner {
                 }
                 ret_bool!(len);
             }
-            "EncodePointer" => {
+            "EncodePointer" | "DecodePointer" => {
                 // Fixed-cookie XOR (documented simplification).
                 ret_bool!(rcx ^ 0x9E37_79B9_7F4A_7C15);
             }
@@ -2047,8 +2244,61 @@ impl Runner {
                 self.switch_requested = true;
                 ret_bool!(handle);
             }
+            "CreateSemaphoreA" | "CreateSemaphoreW" => {
+                let initial = rdx as i32;
+                let maximum = r8 as i32;
+                if initial < 0 || maximum <= 0 || initial > maximum {
+                    self.last_error = 87; // ERROR_INVALID_PARAMETER
+                    ret_bool!(0);
+                }
+                if rcx != 0 || r9 != 0 {
+                    self.last_error = 120; // security attributes / named objects not modeled
+                    ret_bool!(0);
+                }
+                let handle = self.next_handle;
+                self.next_handle += 1;
+                self.semaphores.insert(handle, GuestSemaphore { count: initial, maximum });
+                ret_bool!(handle);
+            }
+            "ReleaseSemaphore" => {
+                let release = rdx as i32;
+                let Some(semaphore) = self.semaphores.get_mut(&rcx) else {
+                    self.last_error = 6;
+                    ret_bool!(0);
+                };
+                if release <= 0 || release > semaphore.maximum - semaphore.count {
+                    self.last_error = 87;
+                    ret_bool!(0);
+                }
+                let previous = semaphore.count;
+                semaphore.count += release;
+                if r8 != 0 { self.emu.write_u32(r8, previous as u32)?; }
+                for thread in &mut self.threads {
+                    if semaphore.count == 0 { break; }
+                    if matches!(thread.state, ThreadState::WaitingSemaphore { handle, .. } if handle == rcx) {
+                        semaphore.count -= 1;
+                        thread.cpu.regs[0] = 0; // WAIT_OBJECT_0
+                        thread.state = ThreadState::Runnable;
+                    }
+                }
+                ret_bool!(1);
+            }
             "WaitForSingleObject" | "WaitForSingleObjectEx" => {
                 let millis = (rdx & 0xFFFF_FFFF) as u32;
+                if let Some(semaphore) = self.semaphores.get_mut(&rcx) {
+                    if semaphore.count > 0 {
+                        semaphore.count -= 1;
+                        ret_bool!(0);
+                    }
+                    if millis == 0 { ret_bool!(258); }
+                    let deadline = if millis == u32::MAX { None } else {
+                        Instant::now().checked_add(Duration::from_millis(u64::from(millis)))
+                    };
+                    self.threads[self.current_thread].state = ThreadState::WaitingSemaphore {
+                        handle: rcx, deadline,
+                    };
+                    ret_bool!(0);
+                }
                 let target = self
                     .threads
                     .iter()
@@ -2198,10 +2448,194 @@ impl Runner {
                 self.once_states.remove(&rcx);
                 ret_bool!(0);
             }
+            "InitOnceBeginInitialize" => {
+                if rcx == 0 || r8 == 0 || rdx & !3 != 0 {
+                    self.last_error = 87;
+                    ret_bool!(0);
+                }
+                if rdx & 2 != 0 { // async mode needs parallel-completion arbitration
+                    self.last_error = 120;
+                    ret_bool!(0);
+                }
+                self.emu.read_u64(rcx)?;
+                match self.once_states.get(&rcx) {
+                    Some(OnceState::Complete { context }) => {
+                        self.emu.write_u32(r8, 0)?;
+                        if r9 != 0 { self.emu.write_u64(r9, *context)?; }
+                        ret_bool!(1);
+                    }
+                    Some(OnceState::Running { .. }) if rdx & 1 != 0 => {
+                        self.emu.write_u32(r8, 1)?;
+                        self.last_error = 997; // ERROR_IO_PENDING
+                        ret_bool!(0);
+                    }
+                    Some(OnceState::Running { .. }) => {
+                        self.last_error = 120; // synchronous contention not yet scheduled
+                        ret_bool!(0);
+                    }
+                    None if rdx & 1 != 0 => {
+                        self.emu.write_u32(r8, 1)?;
+                        self.last_error = 997;
+                        ret_bool!(0);
+                    }
+                    None => {
+                        self.once_states.insert(rcx, OnceState::Running { owner: self.current_thread, split: true });
+                        self.emu.write_u32(r8, 1)?;
+                        ret_bool!(1);
+                    }
+                }
+            }
+            "InitOnceComplete" => {
+                if rcx == 0 || rdx & !4 != 0 || (rdx & 4 != 0 && r8 != 0) || r8 & 3 != 0 {
+                    self.last_error = 87;
+                    ret_bool!(0);
+                }
+                if !matches!(self.once_states.get(&rcx),
+                    Some(OnceState::Running { owner, split: true }) if *owner == self.current_thread) {
+                    self.last_error = 87;
+                    ret_bool!(0);
+                }
+                if rdx & 4 != 0 { // INIT_ONCE_INIT_FAILED: allow retry
+                    self.once_states.remove(&rcx);
+                    self.emu.write_u64(rcx, 0)?;
+                } else {
+                    self.once_states.insert(rcx, OnceState::Complete { context: r8 });
+                    self.emu.write_u64(rcx, r8 | 2)?;
+                }
+                ret_bool!(1);
+            }
             "SetErrorMode" => {
                 let old = self.error_mode;
                 self.error_mode = (rcx as u32 & 0x8007) | (old & 0x4);
                 ret_bool!(old as u64);
+            }
+            "SetHandleInformation" => {
+                if !self.is_open_handle(rcx) {
+                    self.last_error = 6;
+                    ret_bool!(0);
+                }
+                if rdx & !3 != 0 {
+                    self.last_error = 87;
+                    ret_bool!(0);
+                }
+                let old = self.handle_flags.get(&rcx).copied().unwrap_or(0);
+                self.handle_flags.insert(rcx, (old & !(rdx as u32)) | ((r8 as u32) & rdx as u32));
+                ret_bool!(1);
+            }
+            "GetHandleInformation" => {
+                if !self.is_open_handle(rcx) {
+                    self.last_error = 6;
+                    ret_bool!(0);
+                }
+                if rdx == 0 {
+                    self.last_error = 87;
+                    ret_bool!(0);
+                }
+                self.emu.write_u32(rdx, self.handle_flags.get(&rcx).copied().unwrap_or(0))?;
+                ret_bool!(1);
+            }
+            "VerSetConditionMask" => {
+                // One three-bit comparison field per VER_* type; use the
+                // highest-priority set bit as Windows does.
+                let shift = match rdx as u32 {
+                    mask if mask & 0x80 != 0 => Some(21), // PRODUCT_TYPE
+                    mask if mask & 0x40 != 0 => Some(18), // SUITENAME
+                    mask if mask & 0x20 != 0 => Some(15), // SERVICEPACKMAJOR
+                    mask if mask & 0x10 != 0 => Some(12), // SERVICEPACKMINOR
+                    mask if mask & 0x08 != 0 => Some(9),  // PLATFORMID
+                    mask if mask & 0x04 != 0 => Some(6),  // BUILDNUMBER
+                    mask if mask & 0x02 != 0 => Some(3),  // MAJORVERSION
+                    mask if mask & 0x01 != 0 => Some(0),  // MINORVERSION
+                    _ => None,
+                };
+                ret_bool!(rcx | shift.map_or(0, |bits| (r8 & 7) << bits));
+            }
+            "VerifyVersionInfoW" | "VerifyVersionInfoA" => {
+                if rcx == 0 || rdx == 0 || r8 == 0 {
+                    self.last_error = 87;
+                    ret_bool!(0);
+                }
+                let size = self.emu.read_u32(rcx)?;
+                if size < 276 || (rdx & 0xf0 != 0 && size < 284) {
+                    self.last_error = 87;
+                    ret_bool!(0);
+                }
+                let mut matched = true;
+                for (bit, shift, actual, offset) in [
+                    (0x80u64, 21, 1u32, 282u64), // VER_PRODUCT_TYPE
+                    (0x08, 9, 2, 16),             // VER_PLATFORMID
+                    (0x04, 6, 19045, 12),         // VER_BUILDNUMBER
+                ] {
+                    if rdx & bit == 0 { continue; }
+                    let requested = if bit == 0x80 {
+                        self.emu.read_u8(rcx + offset)? as u32
+                    } else { self.emu.read_u32(rcx + offset)? };
+                    let condition = ((r8 >> shift) & 7) as u8;
+                    match version_compare(actual, requested, condition) {
+                        Some(true) => {},
+                        Some(false) => matched = false,
+                        None => { self.last_error = 87; ret_bool!(0); }
+                    }
+                }
+                if rdx & 0x40 != 0 { // VER_SUITENAME
+                    let suite = self.emu.read_u16(rcx + 280)?;
+                    let condition = ((r8 >> 18) & 7) as u8;
+                    matched &= match condition {
+                        6 => suite == 0, // VER_AND, emulated suite mask = 0
+                        7 => suite == 0, // VER_OR
+                        _ => { self.last_error = 87; ret_bool!(0); }
+                    };
+                }
+                let mut last_condition = 0u8;
+                let mut last_equal = true;
+                for (bit, shift, actual, offset, narrow) in [
+                    (0x02u64, 3, 10u32, 4u64, false),
+                    (0x01, 0, 0, 8, false),
+                    (0x20, 15, 0, 276, true),
+                    (0x10, 12, 0, 278, true),
+                ] {
+                    if rdx & bit == 0 { continue; }
+                    let requested = if narrow { self.emu.read_u16(rcx + offset)? as u32 }
+                        else { self.emu.read_u32(rcx + offset)? };
+                    let field_condition = ((r8 >> shift) & 7) as u8;
+                    let condition = if field_condition == 0 { last_condition } else { field_condition };
+                    if version_compare(actual, requested, condition).is_none() {
+                        self.last_error = 87;
+                        ret_bool!(0);
+                    }
+                    last_condition = condition;
+                    if actual != requested {
+                        matched &= version_compare(actual, requested, condition).unwrap();
+                        last_equal = false;
+                        break;
+                    }
+                }
+                if last_equal && last_condition != 0 {
+                    matched &= version_compare(0, 0, last_condition).unwrap();
+                }
+                if matched { ret_bool!(1); }
+                self.last_error = 1150; // ERROR_OLD_WIN_VERSION
+                ret_bool!(0);
+            }
+            "SetConsoleCtrlHandler" => {
+                if rcx == 0 {
+                    self.ignore_ctrl_c = rdx != 0;
+                    ret_bool!(1);
+                }
+                if rdx != 0 {
+                    if self.emu.read_u8(rcx).is_err() {
+                        self.last_error = 87;
+                        ret_bool!(0);
+                    }
+                    self.console_ctrl_handlers.push(rcx);
+                    ret_bool!(1);
+                }
+                if let Some(index) = self.console_ctrl_handlers.iter().rposition(|&h| h == rcx) {
+                    self.console_ctrl_handlers.remove(index);
+                    ret_bool!(1);
+                }
+                self.last_error = 87;
+                ret_bool!(0);
             }
             "GetSystemMetrics" => {
                 // SM_CLEANBOOT: this emulated system starts normally. Other
@@ -2323,7 +2757,7 @@ impl Runner {
                         if r9 != 0 { self.emu.write_u64(r9, *context)?; }
                         ret_bool!(1);
                     }
-                    Some(OnceState::Running { owner }) if *owner == self.current_thread => {
+                    Some(OnceState::Running { owner, .. }) if *owner == self.current_thread => {
                         return Err("recursive InitOnceExecuteOnce on the same object".to_string());
                     }
                     Some(OnceState::Running { .. }) => {
@@ -3425,6 +3859,41 @@ mod tests {
     }
 
     #[test]
+    fn semaphore_release_wakes_waiter_and_consumes_token() {
+        use crate::pe::builder::{build, Asm};
+        let mut a = Asm::new();
+        a.sub_rsp(0x28);
+        a.call_import(0);
+        let exe = build(a, &[("KERNEL32.dll", "ReleaseSemaphore")]);
+        let img = crate::pe::load(&exe).unwrap();
+        let mut runner = Runner::new(&img, WinFs::new()).unwrap();
+        let handle = 0x1234;
+        runner.semaphores.insert(handle, GuestSemaphore { count: 0, maximum: 2 });
+        runner.threads.push(GuestThread {
+            id: 2, handle: 0x8000_0002, open: true,
+            cpu: runner.emu.cpu_state(), last_error: 0, fls: Vec::new(),
+            tls_values: Vec::new(),
+            state: ThreadState::WaitingSemaphore { handle, deadline: None },
+            critical_depth: 0, tls_resume: None, tls_next: 0,
+            tls_reason: 0, once_frames: Vec::new(),
+        });
+        runner.emu.regs[1] = handle;
+        runner.emu.regs[2] = 1;
+        runner.emu.regs[8] = 0;
+        runner.do_shim(0).unwrap();
+        assert!(matches!(runner.threads[1].state, ThreadState::Runnable));
+        assert_eq!(runner.threads[1].cpu.regs[0], 0);
+        assert_eq!(runner.semaphores[&handle].count, 0);
+
+        runner.threads[1].state = ThreadState::WaitingSemaphore {
+            handle, deadline: Some(Instant::now() - Duration::from_millis(1)),
+        };
+        runner.refresh_waiters().unwrap();
+        assert!(matches!(runner.threads[1].state, ThreadState::Runnable));
+        assert_eq!(runner.threads[1].cpu.regs[0], 258);
+    }
+
+    #[test]
     fn srw_exclusive_waiter_wakes_after_release() {
         let exe = crate::pe::builder::hello("x");
         let img = crate::pe::load(&exe).unwrap();
@@ -3497,7 +3966,7 @@ mod tests {
             }, critical_depth: 0, tls_resume: None, tls_next: 0, tls_reason: 0,
             once_frames: Vec::new(),
         });
-        runner.once_states.insert(once, OnceState::Running { owner: 0 });
+        runner.once_states.insert(once, OnceState::Running { owner: 0, split: false });
         runner.threads[0].once_frames.push(OnceFrame {
             resume: runner.emu.cpu_state(), once, context_out: 0, callback_context,
         });

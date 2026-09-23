@@ -815,6 +815,7 @@ impl Emu {
         let mut rex_b = false;
         let mut rex_present = false;
         let mut opsz16 = false;
+        let mut addr32 = false;
         let mut rep = false;
         let mut repne = false;
         loop {
@@ -831,6 +832,9 @@ impl Emu {
                 }
             } else if b == 0x66 {
                 opsz16 = true; // repeatable; 16-bit only for whitelisted ops below
+                off += 1;
+            } else if b == 0x67 {
+                addr32 = true;
                 off += 1;
             } else if b == 0x2E || b == 0x36 || b == 0x3E || b == 0x26 {
                 // CS/DS/ES/SS overrides are no-ops in the flat 64-bit model
@@ -863,6 +867,12 @@ impl Emu {
         }
         self.cur_rex = rex_present;
         let op = self.read_u8(ip + off as u64)?;
+        if addr32 {
+            let modrm = self.read_u8(ip + off as u64 + 1)?;
+            if op != 0x8D || modrm >> 6 == 3 || modrm & 7 != 4 {
+                return Err(format!("unsupported address-size override at 0x{ip:016x}"));
+            }
+        }
         // REP is only meaningful on string ops (below), PAUSE (F3 90),
         // and the SSE-move aliases (F3 0F 10/11/...).
         if rep && !matches!(op, 0x90 | 0x0F | 0xA4 | 0xA5 | 0xAA | 0xAB | 0xAC | 0xAD | 0xC3) {
@@ -892,11 +902,7 @@ impl Emu {
                     | 0x86
                     | 0x87
                     | 0x8D
-                    | 0xC0
-                    | 0xC1
                     | 0xC6
-                    | 0xD1
-                    | 0xD3
                     | 0x05
                     | 0x2D
                     | 0x35
@@ -934,7 +940,7 @@ impl Emu {
             if rep
                 && !matches!(
                     op2,
-                    0x10 | 0x11 | 0x2A | 0x58 | 0x59 | 0x5C | 0x5E
+                    0x10 | 0x11 | 0x2A | 0x2C | 0x58 | 0x59 | 0x5B | 0x5C | 0x5E
                         | 0x28
                         | 0x29
                         | 0x6E
@@ -954,7 +960,7 @@ impl Emu {
             if repne
                 && !matches!(
                     op2,
-                    0x70 | 0x10 | 0x11 | 0x2A | 0x58 | 0x59 | 0x5C | 0x5E | 0xC2
+                    0x70 | 0x10 | 0x11 | 0x2A | 0x2C | 0x58 | 0x59 | 0x5C | 0x5E | 0xC2
                 )
             {
                 return Err(format!(
@@ -1045,6 +1051,29 @@ impl Emu {
                     self.regs[reg] = v & 0xFFFF_FFFF;
                 }
                 self.rip = ip + (off + 2 + ml) as u64;
+                return Ok(StepResult::Continue);
+            }
+            if repne && op2 == 0x2C {
+                // CVTTSD2SI r32/r64, xmm/m64: truncate toward zero. Invalid
+                // conversions produce the integer-indefinite minimum value.
+                let (reg, is_reg, rm, ea_raw, ml) =
+                    self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
+                let next = ip + (off + 2 + ml) as u64;
+                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let bits = if is_reg { self.xmm[rm] as u64 } else { self.read_u64(ea)? };
+                let value = f64::from_bits(bits);
+                self.regs[reg] = if rex_w {
+                    if !value.is_finite() || !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&value) {
+                        i64::MIN as u64
+                    } else {
+                        (value.trunc() as i64) as u64
+                    }
+                } else if !value.is_finite() || !(-2_147_483_648.0..2_147_483_648.0).contains(&value) {
+                    i32::MIN as u32 as u64
+                } else {
+                    (value.trunc() as i32) as u32 as u64
+                };
+                self.rip = next;
                 return Ok(StepResult::Continue);
             }
             if repne && matches!(op2, 0x10 | 0x11 | 0x2A | 0x58 | 0x59 | 0x5C | 0x5E | 0xC2) {
@@ -1149,6 +1178,24 @@ impl Emu {
                 self.rip = next;
                 return Ok(StepResult::Continue);
             }
+            if rep && op2 == 0x2C {
+                // CVTTSS2SI r32/r64, xmm/m32.
+                let (reg, is_reg, rm, ea_raw, ml) =
+                    self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
+                let next = ip + (off + 2 + ml) as u64;
+                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let bits = if is_reg { self.xmm[rm] as u32 } else { self.read_u32(ea)? };
+                let value = f32::from_bits(bits) as f64;
+                self.regs[reg] = if rex_w {
+                    if !value.is_finite() || !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&value) {
+                        i64::MIN as u64
+                    } else { (value.trunc() as i64) as u64 }
+                } else if !value.is_finite() || !(-2_147_483_648.0..2_147_483_648.0).contains(&value) {
+                    i32::MIN as u32 as u64
+                } else { (value.trunc() as i32) as u32 as u64 };
+                self.rip = next;
+                return Ok(StepResult::Continue);
+            }
             if rep && op2 == 0x2A {
                 // CVTSI2SS xmm, r/m32/64. Only the low single-precision
                 // lane changes; the remaining XMM bits are preserved.
@@ -1181,6 +1228,55 @@ impl Emu {
                     _ => a / b,
                 };
                 self.xmm[reg] = (self.xmm[reg] & !0xFFFF_FFFFu128) | result.to_bits() as u128;
+                self.rip = next;
+                return Ok(StepResult::Continue);
+            }
+            if rep && op2 == 0x5B {
+                // CVTTPS2DQ: four f32 lanes to signed i32, truncating;
+                // invalid conversions yield the integer-indefinite value.
+                let (reg, is_reg, rm, ea_raw, ml) =
+                    self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
+                let next = ip + (off + 2 + ml) as u64;
+                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let input = if is_reg { self.xmm[rm].to_le_bytes() }
+                    else { self.read_u128(ea)?.to_le_bytes() };
+                let mut output = [0u8; 16];
+                for lane in 0..4 {
+                    let start = lane * 4;
+                    let value = f32::from_le_bytes(input[start..start + 4].try_into().unwrap()) as f64;
+                    let converted = if !value.is_finite()
+                        || !(-2_147_483_648.0..2_147_483_648.0).contains(&value) {
+                        i32::MIN
+                    } else { value.trunc() as i32 };
+                    output[start..start + 4].copy_from_slice(&converted.to_le_bytes());
+                }
+                self.xmm[reg] = u128::from_le_bytes(output);
+                self.rip = next;
+                return Ok(StepResult::Continue);
+            }
+            if !rep && !repne && !opsz16 && matches!(op2, 0x58 | 0x59 | 0x5C | 0x5E) {
+                // ADDPS/MULPS/SUBPS/DIVPS: four independent f32 lanes.
+                let (reg, is_reg, rm, ea_raw, ml) =
+                    self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
+                let next = ip + (off + 2 + ml) as u64;
+                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let left = self.xmm[reg].to_le_bytes();
+                let right = if is_reg { self.xmm[rm].to_le_bytes() }
+                    else { self.read_u128(ea)?.to_le_bytes() };
+                let mut output = [0u8; 16];
+                for lane in 0..4 {
+                    let start = lane * 4;
+                    let a = f32::from_le_bytes(left[start..start + 4].try_into().unwrap());
+                    let b = f32::from_le_bytes(right[start..start + 4].try_into().unwrap());
+                    let value = match op2 {
+                        0x58 => a + b,
+                        0x59 => a * b,
+                        0x5C => a - b,
+                        _ => a / b,
+                    };
+                    output[start..start + 4].copy_from_slice(&value.to_le_bytes());
+                }
+                self.xmm[reg] = u128::from_le_bytes(output);
                 self.rip = next;
                 return Ok(StepResult::Continue);
             }
@@ -1687,6 +1783,38 @@ impl Emu {
                 self.rip = ip + (off + 2 + ml + 1) as u64;
                 return Ok(StepResult::Continue);
             }
+            if op2 == 0x73 {
+                // 66 0F 73 /2,/3,/6,/7 ib: PSRLQ/PSRLDQ/PSLLQ/PSLLDQ.
+                if !opsz16 || rep || repne {
+                    return Err(format!("unsupported MMX opcode 0F 73 at 0x{ip:016x}"));
+                }
+                let (group, is_reg, rm, _, ml) =
+                    self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
+                if !is_reg || !matches!(group, 2 | 3 | 6 | 7) {
+                    return Err(format!("unsupported packed-qword shift /{group} at 0x{ip:016x}"));
+                }
+                let count = self.read_u8(ip + (off + 2 + ml) as u64)? as usize;
+                let input = self.xmm[rm].to_le_bytes();
+                let mut out = [0u8; 16];
+                match group {
+                    3 if count < 16 => out[..16 - count].copy_from_slice(&input[count..]),
+                    7 if count < 16 => out[count..].copy_from_slice(&input[..16 - count]),
+                    2 | 6 => {
+                        for lane in 0..2 {
+                            let start = lane * 8;
+                            let value = u64::from_le_bytes(input[start..start + 8].try_into().unwrap());
+                            let shifted = if count >= 64 { 0 } else if group == 2 {
+                                value >> count
+                            } else { value << count };
+                            out[start..start + 8].copy_from_slice(&shifted.to_le_bytes());
+                        }
+                    }
+                    _ => {}, // byte shift of 16 or more zeroes the register
+                }
+                self.xmm[rm] = u128::from_le_bytes(out);
+                self.rip = ip + (off + 2 + ml + 1) as u64;
+                return Ok(StepResult::Continue);
+            }
             if op2 == 0x74 || op2 == 0x75 || op2 == 0x76 {
                 // PCMPEQB/W/D: per-lane equality masks (plain forms are MMX).
                 if !opsz16 {
@@ -1895,6 +2023,30 @@ impl Emu {
                     let left = u64::from_le_bytes(a[start..start + 8].try_into().unwrap());
                     let right = u64::from_le_bytes(b[start..start + 8].try_into().unwrap());
                     out[start..start + 8].copy_from_slice(&left.wrapping_add(right).to_le_bytes());
+                }
+                self.xmm[reg] = u128::from_le_bytes(out);
+                self.rip = next;
+                return Ok(StepResult::Continue);
+            }
+            if op2 == 0xF4 {
+                // PMULUDQ xmm, xmm/m128: multiply unsigned dwords 0 and 2
+                // into two qword results. The plain encoding is MMX.
+                if !opsz16 || rep || repne {
+                    return Err(format!("unsupported MMX opcode 0F F4 at 0x{ip:016x}"));
+                }
+                let (reg, is_reg, rm, ea_raw, ml) =
+                    self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
+                let next = ip + (off + 2 + ml) as u64;
+                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let left = self.xmm[reg].to_le_bytes();
+                let right = if is_reg { self.xmm[rm].to_le_bytes() }
+                    else { self.read_u128(ea)?.to_le_bytes() };
+                let mut out = [0u8; 16];
+                for lane in 0..2 {
+                    let start = lane * 8;
+                    let a = u32::from_le_bytes(left[start..start + 4].try_into().unwrap());
+                    let b = u32::from_le_bytes(right[start..start + 4].try_into().unwrap());
+                    out[start..start + 8].copy_from_slice(&(u64::from(a) * u64::from(b)).to_le_bytes());
                 }
                 self.xmm[reg] = u128::from_le_bytes(out);
                 self.rip = next;
@@ -2726,12 +2878,12 @@ impl Emu {
                         }
                     }
                     0x8D => {
-                        // lea: ea (full 64-bit), no flags
+                        // 67-prefixed SIB LEA uses 32-bit address arithmetic.
                         if is_reg {
                             return Err(format!("lea with register operand at 0x{ip:016x}"));
                         }
                         if rex_w || w == 64 {
-                            self.regs[reg] = ea;
+                            self.regs[reg] = if addr32 { ea as u32 as u64 } else { ea };
                         } else {
                             self.regs[reg] = ea & 0xFFFF_FFFF;
                         }
@@ -3186,9 +3338,6 @@ impl Emu {
                 // OF semantics below are the standard 1-bit rules;
                 // count==0 leaves flags alone; rotates never touch ZF/SF.
                 let width: u32 = if op == 0xC0 || op == 0xD0 { 8 } else { w };
-                if width == 16 {
-                    return Err(format!("unsupported 16-bit shift at 0x{ip:016x}"));
-                }
                 let (reg_field, is_reg, rm, ea_raw, ml) =
                     self.decode_modrm(ip, off + 1, rex_r, rex_x, rex_b, true)?;
                 let (count, imm_len) = match op {
@@ -3205,6 +3354,7 @@ impl Emu {
                 let (mask, top) = match width {
                     64 => (u64::MAX, 63),
                     32 => (0xFFFF_FFFF, 31),
+                    16 => (0xFFFF, 15),
                     _ => (0xFF, 7),
                 };
                 let a = self.read_rm(is_reg, rm, ea, width)? & mask;
@@ -3225,8 +3375,8 @@ impl Emu {
                         }
                     }
                     let res = v & mask;
-                    self.cf = cf;
-                    self.of = if count == 1 {
+                    if count != 0 { self.cf = cf; }
+                    self.of = if count == 0 { self.of } else if count == 1 {
                         if reg_field == 2 {
                             ((res >> top) & 1 == 1) != self.cf
                         } else {
@@ -3247,6 +3397,8 @@ impl Emu {
                             a.rotate_left(count)
                         } else if width == 32 {
                             (a as u32).rotate_left(count) as u64
+                        } else if width == 16 {
+                            (a as u16).rotate_left(count) as u64
                         } else {
                             (a as u8).rotate_left(count) as u64
                         };
@@ -3258,19 +3410,25 @@ impl Emu {
                             a.rotate_right(count)
                         } else if width == 32 {
                             (a as u32).rotate_right(count) as u64
+                        } else if width == 16 {
+                            (a as u16).rotate_right(count) as u64
                         } else {
                             (a as u8).rotate_right(count) as u64
                         };
                         r & mask
                     }
-                    4 | 6 => a.wrapping_shl(count) & mask, // SHL/SAL
-                    5 => a.wrapping_shr(count) & mask,     // SHR
+                    4 | 6 => if count >= width { 0 } else { a.wrapping_shl(count) & mask },
+                    5 => if count >= width { 0 } else { a.wrapping_shr(count) & mask },
                     7 => {
                         // SAR: arithmetic
                         let s = if width == 64 {
                             (a as i64).wrapping_shr(count) as u64
                         } else {
-                            ((a as u32 as i32).wrapping_shr(count) as u32) as u64
+                            if width == 16 {
+                                ((a as u16 as i16 as i32) >> count.min(15)) as u16 as u64
+                            } else {
+                                ((a as u32 as i32).wrapping_shr(count) as u32) as u64
+                            }
                         };
                         s & mask
                     }
@@ -3300,7 +3458,7 @@ impl Emu {
                             };
                         }
                         4 | 6 => {
-                            self.cf = ((a >> (width - count)) & 1) == 1;
+                            self.cf = count <= width && ((a >> (width - count)) & 1) == 1;
                             self.of = if count == 1 {
                                 ((res >> top) & 1 == 1) != self.cf
                             } else {
@@ -5079,6 +5237,160 @@ mod tests {
         e.regs[0] = 0xFFFF_FFFF;
         e.step().unwrap();
         assert_eq!(e.xmm[0], (-1.0f64).to_bits() as u128);
+    }
+
+    #[test]
+    fn cvttsd2si_truncates_and_returns_integer_indefinite_on_invalid_input() {
+        let mut emu = emu_with(&[0xF2, 0x0F, 0x2C, 0xC1]); // eax <- xmm1
+        emu.xmm[1] = (-7.9f64).to_bits() as u128;
+        emu.step().unwrap();
+        assert_eq!(emu.regs[0], (-7i32) as u32 as u64);
+
+        let mut emu = emu_with(&[0xF2, 0x48, 0x0F, 0x2C, 0xC1]); // rax <- xmm1
+        emu.xmm[1] = (4_294_967_296.75f64).to_bits() as u128;
+        emu.step().unwrap();
+        assert_eq!(emu.regs[0], 4_294_967_296);
+
+        for value in [f64::NAN, f64::INFINITY, 2_147_483_648.0] {
+            let mut emu = emu_with(&[0xF2, 0x0F, 0x2C, 0xC1]);
+            emu.xmm[1] = value.to_bits() as u128;
+            emu.step().unwrap();
+            assert_eq!(emu.regs[0], 0x8000_0000);
+        }
+
+        let cell = 64usize;
+        let mut code = vec![0xF2, 0x48, 0x0F, 0x2C, 0x05]; // rax <- [rip+cell]
+        code.extend_from_slice(&rel32(0, 9, cell));
+        let mut emu = emu_with(&code);
+        emu.write_u64(BASE + 0x1000 + cell as u64, (-3.5f64).to_bits()).unwrap();
+        emu.step().unwrap();
+        assert_eq!(emu.regs[0], (-3i64) as u64);
+    }
+
+    #[test]
+    fn cvttss2si_handles_register_memory_and_invalid_input() {
+        let mut emu = emu_with(&[0xF3, 0x0F, 0x2C, 0xC1]);
+        emu.xmm[1] = (-9.75f32).to_bits() as u128;
+        emu.step().unwrap();
+        assert_eq!(emu.regs[0], (-9i32) as u32 as u64);
+
+        let mut emu = emu_with(&[0xF3, 0x48, 0x0F, 0x2C, 0xC1]);
+        emu.xmm[1] = (4_294_967_296.0f32).to_bits() as u128;
+        emu.step().unwrap();
+        assert_eq!(emu.regs[0], 4_294_967_296);
+
+        let cell = 64usize;
+        let mut code = vec![0xF3, 0x0F, 0x2C, 0x05];
+        code.extend_from_slice(&rel32(0, 8, cell));
+        let mut emu = emu_with(&code);
+        emu.write_u32(BASE + 0x1000 + cell as u64, f32::NAN.to_bits()).unwrap();
+        emu.step().unwrap();
+        assert_eq!(emu.regs[0], 0x8000_0000);
+    }
+
+    #[test]
+    fn packed_qword_and_byte_shifts_obey_lane_boundaries() {
+        let input = u128::from_le_bytes(*b"0123456789ABCDEF");
+        let mut emu = emu_with(&[0x66, 0x0F, 0x73, 0xD8, 8]); // PSRLDQ xmm0,8
+        emu.xmm[0] = input;
+        emu.step().unwrap();
+        assert_eq!(emu.xmm[0].to_le_bytes(), *b"89ABCDEF\0\0\0\0\0\0\0\0");
+
+        let mut emu = emu_with(&[0x66, 0x0F, 0x73, 0xF8, 8]); // PSLLDQ xmm0,8
+        emu.xmm[0] = input;
+        emu.step().unwrap();
+        assert_eq!(emu.xmm[0].to_le_bytes(), *b"\0\0\0\0\0\0\0\001234567");
+
+        for (group, expected) in [
+            (0xD0, *b"1234567\09ABCDEF\0"),
+            (0xF0, *b"\00123456\089ABCDE"),
+        ] {
+            let mut emu = emu_with(&[0x66, 0x0F, 0x73, group, 8]);
+            emu.xmm[0] = input;
+            emu.step().unwrap();
+            assert_eq!(emu.xmm[0].to_le_bytes(), expected);
+        }
+
+        let mut emu = emu_with(&[0x66, 0x0F, 0x73, 0xD8, 16]);
+        emu.xmm[0] = input;
+        emu.step().unwrap();
+        assert_eq!(emu.xmm[0], 0);
+    }
+
+    #[test]
+    fn pmuludq_multiplies_low_dword_of_each_qword_lane() {
+        let mut emu = emu_with(&[0x66, 0x44, 0x0F, 0xF4, 0xC1]); // xmm8 *= xmm1
+        emu.xmm[8] = 0xDEAD_BEEF_1234_5678_AAAA_AAAA_FFFF_FFFF;
+        emu.xmm[1] = 0xBBBB_BBBB_0000_0003_CCCC_CCCC_0000_0002;
+        emu.step().unwrap();
+        let result = emu.xmm[8].to_le_bytes();
+        assert_eq!(u64::from_le_bytes(result[..8].try_into().unwrap()), 0x1_FFFF_FFFE);
+        assert_eq!(u64::from_le_bytes(result[8..].try_into().unwrap()), 0x369D_0368);
+    }
+
+    #[test]
+    fn packed_single_arithmetic_and_truncation_convert_each_lane() {
+        let pack = |lanes: [f32; 4]| -> u128 {
+            lanes.iter().enumerate().fold(0u128, |bits, (i, value)|
+                bits | (u128::from(value.to_bits()) << (i * 32)))
+        };
+        let mut emu = emu_with(&[0x0F, 0x59, 0xC1]); // MULPS xmm0,xmm1
+        emu.xmm[0] = pack([1.5, -2.0, 0.5, f32::NAN]);
+        emu.xmm[1] = pack([2.0, 3.0, 4.0, 1.0]);
+        emu.step().unwrap();
+        let result = emu.xmm[0].to_le_bytes();
+        for (lane, expected) in [3.0f32, -6.0, 2.0].iter().enumerate() {
+            assert_eq!(f32::from_le_bytes(result[lane * 4..lane * 4 + 4].try_into().unwrap()), *expected);
+        }
+        assert!(f32::from_le_bytes(result[12..16].try_into().unwrap()).is_nan());
+
+        let mut emu = emu_with(&[0xF3, 0x0F, 0x5B, 0xC1]); // CVTTPS2DQ xmm0,xmm1
+        emu.xmm[1] = pack([1.9, -2.9, f32::NAN, 2_147_483_648.0]);
+        emu.step().unwrap();
+        let result = emu.xmm[0].to_le_bytes();
+        for (lane, expected) in [1i32, -2, i32::MIN, i32::MIN].iter().enumerate() {
+            assert_eq!(i32::from_le_bytes(result[lane * 4..lane * 4 + 4].try_into().unwrap()), *expected);
+        }
+    }
+
+    #[test]
+    fn address_size_override_lea_wraps_sib_sum_to_32_bits() {
+        for code in [&[0x67, 0x8D, 0x04, 0x0A][..], &[0x67, 0x48, 0x8D, 0x04, 0x0A][..]] {
+            let mut emu = emu_with(code);
+            emu.regs[2] = 0xFFFF_FFFF_FFFF_FFF0;
+            emu.regs[1] = 0x1_0000_0020;
+            emu.step().unwrap();
+            assert_eq!(emu.regs[0], 0x10);
+        }
+        let mut emu = emu_with(&[0x67, 0x8B, 0x04, 0x0A]);
+        assert!(emu.step().unwrap_err().contains("unsupported address-size override"));
+    }
+
+    #[test]
+    fn word_rotate_and_shift_preserve_upper_register_bits() {
+        let mut emu = emu_with(&[0x66, 0x41, 0xC1, 0xC1, 8]); // rol r9w,8
+        emu.regs[9] = 0x1234_5678_9ABC_1122;
+        emu.step().unwrap();
+        assert_eq!(emu.regs[9], 0x1234_5678_9ABC_2211);
+
+        let mut emu = emu_with(&[0x66, 0xC1, 0xE0, 1]); // shl ax,1
+        emu.regs[0] = 0xFFFF_8001;
+        emu.step().unwrap();
+        assert_eq!(emu.regs[0], 0xFFFF_0002);
+        assert!(emu.cf);
+
+        let mut emu = emu_with(&[0x66, 0xC1, 0xF8, 20]); // sar ax,20
+        emu.regs[0] = 0x8000;
+        emu.step().unwrap();
+        assert_eq!(emu.regs[0], 0xFFFF);
+
+        let mut emu = emu_with(&[0x66, 0xC1, 0xC0, 0]); // rol ax,0
+        emu.regs[0] = 0x1234;
+        emu.cf = true;
+        emu.of = true;
+        emu.step().unwrap();
+        assert_eq!(emu.regs[0], 0x1234);
+        assert!(emu.cf && emu.of);
     }
 
     #[test]

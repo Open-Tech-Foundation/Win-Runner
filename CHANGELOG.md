@@ -6,6 +6,19 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added virtual Winsock socket handles with startup/cleanup, byte-order,
+  socket-option metadata, close, and error APIs. Added cooperative semaphore
+  counts, waits, releases, and handle closure for Node.js startup.
+- Added console-control registration, process handle flags, power-notification
+  registration, split-phase one-time initialization, and Windows version
+  condition checks used by Node.js.
+- Added `NUL` character-device handles: writes are discarded, reads return
+  EOF, and opening the device never creates a WinFS file.
+- The interpreter now handles truncating scalar and packed float-to-integer
+  conversions, packed single-precision arithmetic, `PMULUDQ`, packed shifts,
+  16-bit rotates/shifts, and the 32-bit-address SIB `LEA` form reached by Node.
+- `probe` streams guest output before a later blocker, and the tested
+  `node.exe --version` path now prints its version and exits successfully.
 - Added one-time initialization callbacks with retry and waiter handling,
   process error-mode flags, system error formatting, and basic local-buffer
   release for Windows runtime startup.

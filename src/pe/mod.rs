@@ -171,6 +171,7 @@ pub const SUPPORTED_APIS: &[(&str, &str)] = &[
     ("KERNEL32.DLL", "IsProcessorFeaturePresent"),
     ("KERNEL32.DLL", "lstrlenW"),
     ("KERNEL32.DLL", "EncodePointer"),
+    ("KERNEL32.DLL", "DecodePointer"),
     ("KERNEL32.DLL", "Sleep"),
     ("KERNEL32.DLL", "SleepEx"),
     ("KERNEL32.DLL", "SwitchToThread"),
@@ -201,7 +202,18 @@ pub const SUPPORTED_APIS: &[(&str, &str)] = &[
     ("KERNEL32.DLL", "InitializeConditionVariable"),
     ("KERNEL32.DLL", "InitOnceExecuteOnce"),
     ("KERNEL32.DLL", "InitOnceInitialize"),
+    ("KERNEL32.DLL", "InitOnceBeginInitialize"),
+    ("KERNEL32.DLL", "InitOnceComplete"),
     ("KERNEL32.DLL", "SetErrorMode"),
+    ("KERNEL32.DLL", "SetConsoleCtrlHandler"),
+    ("KERNEL32.DLL", "CreateSemaphoreA"),
+    ("KERNEL32.DLL", "CreateSemaphoreW"),
+    ("KERNEL32.DLL", "ReleaseSemaphore"),
+    ("KERNEL32.DLL", "VerSetConditionMask"),
+    ("KERNEL32.DLL", "VerifyVersionInfoW"),
+    ("KERNEL32.DLL", "VerifyVersionInfoA"),
+    ("KERNEL32.DLL", "SetHandleInformation"),
+    ("KERNEL32.DLL", "GetHandleInformation"),
     ("KERNEL32.DLL", "FormatMessageA"),
     ("KERNEL32.DLL", "FormatMessageW"),
     ("KERNEL32.DLL", "LocalFree"),
@@ -212,12 +224,19 @@ pub const SUPPORTED_APIS: &[(&str, &str)] = &[
     ("KERNEL32.DLL", "FreeLibrary"),
     ("NTDLL.DLL", "RtlGetVersion"),
     ("NTDLL.DLL", "RtlNtStatusToDosError"),
+    ("POWRPROF.DLL", "PowerRegisterSuspendResumeNotification"),
+    ("POWRPROF.DLL", "PowerUnregisterSuspendResumeNotification"),
     ("USER32.DLL", "GetSystemMetrics"),
     // Stable Winsock ordinals (verified against Wine's ws2_32 export spec).
     ("WS2_32.DLL", "#8"),  // htonl
     ("WS2_32.DLL", "#9"),  // htons
     ("WS2_32.DLL", "#14"), // ntohl
     ("WS2_32.DLL", "#15"), // ntohs
+    ("WS2_32.DLL", "#3"),  // closesocket
+    ("WS2_32.DLL", "#7"),  // getsockopt
+    ("WS2_32.DLL", "#23"), // socket
+    ("WS2_32.DLL", "#111"), // WSAGetLastError
+    ("WS2_32.DLL", "#112"), // WSASetLastError
     ("WS2_32.DLL", "#115"), // WSAStartup
     ("WS2_32.DLL", "#116"), // WSACleanup
     ("KERNEL32.DLL", "SleepConditionVariableCS"),

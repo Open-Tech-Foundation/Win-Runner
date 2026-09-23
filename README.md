@@ -154,7 +154,10 @@ wincli probe node.exe --version
 
 `probe` uses the interpreter and temporarily binds missing imports to
 fail-on-call thunks. It stops at the first unsupported API or instruction
-actually reached; normal execution still rejects unknown imports at load time.
+actually reached, while preserving guest output written before a stop. The
+tested Node.js 24.21.0 Windows executable completes `probe node.exe --version`;
+normal execution still rejects its unknown imports at load time, and broader
+Node.js workloads remain under compatibility development.
 
 Planned next step is `wincli install <name>`: resolve portable Windows x64
 releases (preferred source: the WinGet catalog, portable EXE / ZIP only —
