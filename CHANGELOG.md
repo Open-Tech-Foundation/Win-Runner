@@ -8,7 +8,8 @@ All notable changes to this project will be documented in this file.
 
 - Native `CreateProcessW` accepts bounded Unicode environment blocks; values
   are isolated to the child and available through `GetEnvironmentVariableW`
-  and `GetEnvironmentStringsW`.
+  and `GetEnvironmentStringsW`; a null environment pointer inherits the
+  parent process environment.
 - Native `CreateProcessW` now applies `lpCurrentDirectory` only to the child
   WinFs view, while preserving the parent's directory when child changes are
   merged. Its primary thread handle is independently waitable and closable.

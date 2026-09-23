@@ -2674,11 +2674,15 @@ mod imp {
                 return 0;
             }
         };
-        let environment = match environment_block(environment) {
-            Ok(environment) => environment,
-            Err(error) => {
-                native_set_last_error(error);
-                return 0;
+        let explicit_environment = if environment == 0 {
+            None
+        } else {
+            match environment_block(environment) {
+                Ok(environment) => Some(environment),
+                Err(error) => {
+                    native_set_last_error(error);
+                    return 0;
+                }
             }
         };
         let image = match load_native_child_image(&fs.fs, &launch) {
@@ -2718,6 +2722,7 @@ mod imp {
             native_set_last_error(6);
             return 0;
         };
+        let environment = explicit_environment.unwrap_or_else(|| parent.environment.clone());
         let (process_handle, thread_handle, child) = match parent.children.lock() {
             Ok(mut children) => children.allocate(parent.process_id),
             Err(_) => {
