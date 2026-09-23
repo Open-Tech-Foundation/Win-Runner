@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added cooperative I/O completion ports with FIFO post/dequeue, zero-timeout
+  polling, cross-thread wakeups, and handle closure for libuv's event loop.
+- Guest threads can start suspended and be resumed or suspended again; ETW
+  provider registration and no-listener event writes now have stable handles.
+- The interpreter now handles `PACKSSDW`, `PACKSSWB`, `COMISD`, `CVTDQ2PD`,
+  and per-thread `STMXCSR`/`LDMXCSR` control state used during V8 startup.
 - Added virtual Winsock socket handles with startup/cleanup, byte-order,
   socket-option metadata, close, and error APIs. Added cooperative semaphore
   counts, waits, releases, and handle closure for Node.js startup.
@@ -56,6 +62,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- `VirtualAlloc` now accepts an aligned fixed-address reservation over a
+  released virtual region and commits within it, allowing V8's reservation
+  retry without overwriting later guest heap allocations.
 - `CreateFileW` now reports file-not-found, access-denied, already-exists, and
   invalid-parameter errors on failed opens instead of leaking an unrelated
   last-error value into the Windows CRT and OpenSSL.

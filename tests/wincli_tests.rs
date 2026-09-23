@@ -888,6 +888,343 @@ fn verify_version_info_compares_windows_baseline_and_reports_mismatch() {
 }
 
 #[test]
+fn virtual_alloc_reclaims_released_range_for_aligned_reservation() {
+    use pe::builder::{build, Asm};
+    let mut a = Asm::new();
+    let fail = a.fresh_label();
+    a.sub_rsp(0x58);
+    a.mov_ecx_imm(0);
+    a.mov_edx_imm(0x80000);
+    a.mov_r8d_imm(0x2000); // MEM_RESERVE
+    a.mov_r9d_imm(1); // PAGE_NOACCESS
+    a.call_import(0); // VirtualAlloc
+    a.test_rax_rax();
+    a.jz(fail);
+    a.mov_rspoff_rax(0x40);
+    a.mov_rcx_rax();
+    a.mov_edx_imm(0);
+    a.mov_r8d_imm(0x8000); // MEM_RELEASE
+    a.call_import(1); // VirtualFree
+    a.test_eax_eax();
+    a.jz(fail);
+    a.mov_reg_rspoff(1, 0x40);
+    a.emit(&[0x48, 0x81, 0xC1, 0, 0x10, 0, 0]); // add rcx,0x1000
+    a.mov_rspoff_reg(0x48, 1);
+    a.mov_edx_imm(0x80000);
+    a.mov_r8d_imm(0x2000);
+    a.mov_r9d_imm(1);
+    a.call_import(0); // fixed reservation extends 4 KiB at frontier
+    a.emit(&[0x48, 0x3B, 0x44, 0x24, 0x48]); // cmp rax,[rsp+0x48]
+    a.jnz(fail);
+    a.mov_reg_rspoff(1, 0x48);
+    a.mov_edx_imm(0x1000);
+    a.mov_r8d_imm(0x1000); // MEM_COMMIT inside reservation
+    a.mov_r9d_imm(4);
+    a.call_import(0);
+    a.emit(&[0x48, 0x3B, 0x44, 0x24, 0x48]);
+    a.jnz(fail);
+    a.mov_reg_rspoff(1, 0x48);
+    a.mov_edx_imm(0x80000);
+    a.mov_r8d_imm(0x2000);
+    a.mov_r9d_imm(1);
+    a.call_import(0); // overlapping reservation fails
+    a.test_eax_eax();
+    a.jnz(fail);
+    a.call_import(2); // GetLastError
+    a.cmp_eax_imm(487);
+    a.jnz(fail);
+    a.mov_reg_rspoff(1, 0x48);
+    a.mov_edx_imm(0x1000);
+    a.mov_r8d_imm(0x8000); // MEM_RELEASE requires size zero
+    a.call_import(1);
+    a.test_eax_eax();
+    a.jnz(fail);
+    a.call_import(2);
+    a.cmp_eax_imm(87);
+    a.jnz(fail);
+    a.mov_ecx_imm(0);
+    a.call_import(3);
+    a.mark(fail);
+    a.mov_ecx_imm(1);
+    a.call_import(3);
+    let exe = build(a, &[
+        ("KERNEL32.dll", "VirtualAlloc"),
+        ("KERNEL32.dll", "VirtualFree"),
+        ("KERNEL32.dll", "GetLastError"),
+        ("KERNEL32.dll", "ExitProcess"),
+    ]);
+    assert_eq!(run_exe_on_fs(&exe, WinFs::new()).0, 0);
+}
+
+#[test]
+fn event_provider_registration_tracks_handle_without_active_session() {
+    use pe::builder::{build, Asm};
+    let mut a = Asm::new();
+    let guid = a.add_data(vec![1; 16]);
+    let provider = a.add_zeroed(8);
+    let fail = a.fresh_label();
+    a.sub_rsp(0x38);
+    a.lea_reg_rip(1, guid);
+    a.mov_edx_imm(0);
+    a.mov_r8d_imm(0);
+    a.lea_reg_rip(9, provider);
+    a.call_import(0); // EventRegister
+    a.test_eax_eax();
+    a.jnz(fail);
+    a.lea_reg_rip(1, provider);
+    a.emit(&[0x48, 0x8B, 0x09]); // mov rcx,[rcx]
+    a.mov_rspoff_reg(0x30, 1);
+    a.mov_edx_imm(2); // EventProviderSetTraits
+    a.lea_reg_rip(8, guid);
+    a.mov_r9d_imm(16);
+    a.call_import(1); // EventSetInformation
+    a.test_eax_eax();
+    a.jnz(fail);
+    a.mov_reg_rspoff(1, 0x30);
+    a.mov_edx_imm(0);
+    a.mov_r8d_imm(0);
+    a.mov_r9d_imm(0);
+    a.mov_rspoff_imm32(0x20, 0);
+    a.mov_rspoff_imm32(0x28, 0);
+    a.call_import(2); // EventWriteTransfer with no active listener
+    a.test_eax_eax();
+    a.jnz(fail);
+    a.mov_reg_rspoff(1, 0x30);
+    a.call_import(3); // EventUnregister
+    a.test_eax_eax();
+    a.jnz(fail);
+    a.mov_reg_rspoff(1, 0x30);
+    a.call_import(3); // double unregister
+    a.cmp_eax_imm(6);
+    a.jnz(fail);
+    a.mov_ecx_imm(0);
+    a.call_import(4);
+    a.mark(fail);
+    a.mov_ecx_imm(1);
+    a.call_import(4);
+    let exe = build(a, &[
+        ("ADVAPI32.dll", "EventRegister"),
+        ("ADVAPI32.dll", "EventSetInformation"),
+        ("ADVAPI32.dll", "EventWriteTransfer"),
+        ("ADVAPI32.dll", "EventUnregister"),
+        ("KERNEL32.dll", "ExitProcess"),
+    ]);
+    assert_eq!(run_exe_on_fs(&exe, WinFs::new()).0, 0);
+}
+
+#[test]
+fn suspended_worker_posts_completion_that_wakes_waiter() {
+    use pe::builder::{self, Asm};
+    let mut a = Asm::new();
+    let entries = a.add_zeroed(32);
+    let removed = a.add_zeroed(4);
+    let fail = a.fresh_label();
+    a.sub_rsp(0x68);
+    a.mov_rcx_imm64(u64::MAX);
+    a.mov_edx_imm(0);
+    a.mov_r8d_imm(0);
+    a.mov_r9d_imm(1);
+    a.call_import(0); // CreateIoCompletionPort
+    a.test_rax_rax();
+    a.jz(fail);
+    a.mov_rspoff_rax(0x40);
+    a.mov_ecx_imm(0);
+    a.mov_edx_imm(0);
+    let worker_patch = a.code.len() + 2;
+    a.emit(&[0x49, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0]); // mov r8, worker VA
+    a.mov_reg_rspoff(9, 0x40); // lpParameter = port
+    a.mov_rspoff_imm32(0x20, 4); // CREATE_SUSPENDED
+    a.mov_rspoff_imm32(0x28, 0);
+    a.call_import(1); // CreateThread
+    a.test_rax_rax();
+    a.jz(fail);
+    a.mov_rspoff_rax(0x48);
+    a.mov_rcx_rax();
+    a.call_import(9); // nested SuspendThread
+    a.cmp_eax_imm(1);
+    a.jnz(fail);
+    a.mov_reg_rspoff(1, 0x48);
+    a.call_import(4); // first resume leaves worker suspended
+    a.cmp_eax_imm(2);
+    a.jnz(fail);
+    a.mov_reg_rspoff(1, 0x40);
+    a.lea_reg_rip(2, entries);
+    a.mov_r8d_imm(1);
+    a.lea_reg_rip(9, removed);
+    a.mov_rspoff_imm32(0x20, 0);
+    a.mov_rspoff_imm32(0x28, 0);
+    a.call_import(3); // worker is suspended, so no packet yet
+    a.test_eax_eax();
+    a.jnz(fail);
+    a.mov_reg_rspoff(1, 0x48);
+    a.call_import(4); // ResumeThread returns previous suspend count
+    a.cmp_eax_imm(1);
+    a.jnz(fail);
+    a.mov_reg_rspoff(1, 0x40);
+    a.lea_reg_rip(2, entries);
+    a.mov_r8d_imm(1);
+    a.lea_reg_rip(9, removed);
+    a.mov_rspoff_imm32(0x20, u32::MAX); // wait infinitely
+    a.mov_rspoff_imm32(0x28, 0);
+    a.call_import(3);
+    a.test_eax_eax();
+    a.jz(fail);
+    a.mov_eax_mem_rip(removed);
+    a.cmp_eax_imm(1);
+    a.jnz(fail);
+    a.lea_reg_rip(1, entries);
+    a.emit(&[0x8B, 0x01]); // mov eax,[rcx] (completion key)
+    a.cmp_eax_imm(0x1234);
+    a.jnz(fail);
+    a.mov_reg_rspoff(1, 0x48);
+    a.mov_edx_imm(u32::MAX);
+    a.call_import(5); // wait for worker exit
+    a.test_eax_eax();
+    a.jnz(fail);
+    a.mov_ecx_imm(0);
+    a.call_import(7);
+    a.mark(fail);
+    a.mov_ecx_imm(1);
+    a.call_import(7);
+    let worker_va = builder::IMAGE_BASE + u64::from(builder::SECTION_RVA) + a.code.len() as u64;
+    a.code[worker_patch..worker_patch + 8].copy_from_slice(&worker_va.to_le_bytes());
+    a.sub_rsp(0x38);
+    a.mov_rspoff_reg(0x30, 1); // preserve port parameter
+    a.mov_ecx_imm(5);
+    a.call_import(8); // Sleep, allowing main thread to enter completion wait
+    a.mov_reg_rspoff(1, 0x30);
+    a.mov_edx_imm(9);
+    a.mov_r8d_imm(0x1234);
+    a.mov_r9d_imm(0);
+    a.call_import(2); // PostQueuedCompletionStatus
+    a.xor_eax();
+    a.add_rsp(0x38);
+    a.ret();
+    let exe = builder::build(a, &[
+        ("KERNEL32.dll", "CreateIoCompletionPort"),
+        ("KERNEL32.dll", "CreateThread"),
+        ("KERNEL32.dll", "PostQueuedCompletionStatus"),
+        ("KERNEL32.dll", "GetQueuedCompletionStatusEx"),
+        ("KERNEL32.dll", "ResumeThread"),
+        ("KERNEL32.dll", "WaitForSingleObject"),
+        ("KERNEL32.dll", "CloseHandle"),
+        ("KERNEL32.dll", "ExitProcess"),
+        ("KERNEL32.dll", "Sleep"),
+        ("KERNEL32.dll", "SuspendThread"),
+    ]);
+    assert_eq!(run_exe_on_fs(&exe, WinFs::new()).0, 0);
+}
+
+#[test]
+fn completion_port_posts_fifo_packets_and_times_out_empty_poll() {
+    use pe::builder::{build, Asm};
+    let mut a = Asm::new();
+    let entries = a.add_zeroed(64);
+    let removed = a.add_zeroed(4);
+    let written = a.add_zeroed(4);
+    let fail = a.fresh_label();
+    a.sub_rsp(0x58);
+    a.mov_rcx_imm64(u64::MAX); // INVALID_HANDLE_VALUE creates an unattached port
+    a.mov_edx_imm(0);
+    a.mov_r8d_imm(0);
+    a.mov_r9d_imm(1);
+    a.call_import(0); // CreateIoCompletionPort
+    a.test_rax_rax();
+    a.jz(fail);
+    a.mov_rspoff_rax(0x40);
+    a.mov_rcx_rax();
+    a.lea_reg_rip(2, entries);
+    a.mov_r8d_imm(0); // zero capacity is invalid
+    a.lea_reg_rip(9, removed);
+    a.mov_rspoff_imm32(0x20, 0);
+    a.mov_rspoff_imm32(0x28, 0);
+    a.call_import(2);
+    a.test_eax_eax();
+    a.jnz(fail);
+    a.call_import(4); // GetLastError
+    a.cmp_eax_imm(87);
+    a.jnz(fail);
+    a.mov_reg_rspoff(1, 0x40);
+    a.lea_reg_rip(2, entries);
+    a.mov_r8d_imm(2);
+    a.lea_reg_rip(9, removed);
+    a.mov_rspoff_imm32(0x20, 0);
+    a.mov_rspoff_imm32(0x28, 0);
+    a.call_import(2); // empty, zero-timeout GetQueuedCompletionStatusEx
+    a.test_eax_eax();
+    a.jnz(fail);
+    a.call_import(4); // GetLastError
+    a.cmp_eax_imm(258);
+    a.jnz(fail);
+    for (bytes, key, overlapped) in [(12, 0x1234, 0x5678), (7, 0x9abc, 0)] {
+        a.mov_reg_rspoff(1, 0x40);
+        a.mov_edx_imm(bytes);
+        a.mov_r8d_imm(key);
+        a.mov_r9d_imm(overlapped);
+        a.call_import(1); // PostQueuedCompletionStatus
+        a.test_eax_eax();
+        a.jz(fail);
+    }
+    a.mov_reg_rspoff(1, 0x40);
+    a.lea_reg_rip(2, entries);
+    a.mov_r8d_imm(2);
+    a.lea_reg_rip(9, removed);
+    a.mov_rspoff_imm32(0x20, 0);
+    a.mov_rspoff_imm32(0x28, 0);
+    a.call_import(2);
+    a.test_eax_eax();
+    a.jz(fail);
+    a.mov_eax_mem_rip(removed);
+    a.cmp_eax_imm(2);
+    a.jnz(fail);
+    a.mov_ecx_imm(1); // stdout
+    a.lea_reg_rip(2, entries);
+    a.mov_r8d_imm(64);
+    a.lea_reg_rip(9, written);
+    a.mov_rspoff_imm32(0x20, 0);
+    a.call_import(3); // WriteFile
+    a.test_eax_eax();
+    a.jz(fail);
+    a.mov_reg_rspoff(1, 0x40);
+    a.call_import(5); // CloseHandle
+    a.test_eax_eax();
+    a.jz(fail);
+    a.mov_reg_rspoff(1, 0x40);
+    a.mov_edx_imm(0);
+    a.mov_r8d_imm(0);
+    a.mov_r9d_imm(0);
+    a.call_import(1); // closed port cannot accept packets
+    a.test_eax_eax();
+    a.jnz(fail);
+    a.call_import(4);
+    a.cmp_eax_imm(6);
+    a.jnz(fail);
+    a.mov_ecx_imm(0);
+    a.call_import(6);
+    a.mark(fail);
+    a.mov_ecx_imm(1);
+    a.call_import(6);
+    let exe = build(a, &[
+        ("KERNEL32.dll", "CreateIoCompletionPort"),
+        ("KERNEL32.dll", "PostQueuedCompletionStatus"),
+        ("KERNEL32.dll", "GetQueuedCompletionStatusEx"),
+        ("KERNEL32.dll", "WriteFile"),
+        ("KERNEL32.dll", "GetLastError"),
+        ("KERNEL32.dll", "CloseHandle"),
+        ("KERNEL32.dll", "ExitProcess"),
+    ]);
+    let (code, _, stdout) = run_exe_on_fs(&exe, WinFs::new());
+    assert_eq!(code, 0);
+    assert_eq!(stdout.len(), 64);
+    assert_eq!(u64::from_le_bytes(stdout[0..8].try_into().unwrap()), 0x1234);
+    assert_eq!(u64::from_le_bytes(stdout[8..16].try_into().unwrap()), 0x5678);
+    assert_eq!(u32::from_le_bytes(stdout[24..28].try_into().unwrap()), 12);
+    assert_eq!(u64::from_le_bytes(stdout[32..40].try_into().unwrap()), 0x9abc);
+    assert_eq!(u64::from_le_bytes(stdout[40..48].try_into().unwrap()), 0);
+    assert_eq!(u32::from_le_bytes(stdout[56..60].try_into().unwrap()), 7);
+}
+
+#[test]
 fn crypto_provider_generates_bytes_and_rejects_released_handle() {
     use pe::builder::{build, Asm};
     let mut a = Asm::new();

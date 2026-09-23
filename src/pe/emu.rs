@@ -81,6 +81,7 @@ pub struct CpuState {
     pub of: bool,
     pub pf: bool,
     pub df: bool,
+    pub mxcsr: u32,
     pub gs_base: u64,
 }
 
@@ -89,9 +90,10 @@ pub struct Emu {
     pub mem: Vec<u8>,
     pub regs: [u64; 16],
     /// XMM0-15 as raw 128-bit lanes. Only bitwise/packed-integer moves are
-    /// supported (movaps/movups/xorps); no FP arithmetic, no MXCSR, and no
-    /// alignment faulting on movaps (guests are compiler-aligned).
+    /// supported (movaps/movups/xorps); no alignment faulting on movaps
+    /// (guests are compiler-aligned).
     pub xmm: [u128; 16],
+    pub mxcsr: u32,
     pub rip: u64,
     pub zf: bool,
     pub sf: bool,
@@ -165,6 +167,7 @@ impl Emu {
             of: self.of,
             pf: self.pf,
             df: self.df,
+            mxcsr: self.mxcsr,
             gs_base: self.gs_base,
         }
     }
@@ -179,6 +182,7 @@ impl Emu {
         self.of = state.of;
         self.pf = state.pf;
         self.df = state.df;
+        self.mxcsr = state.mxcsr;
         self.gs_base = state.gs_base;
     }
 
@@ -216,6 +220,7 @@ impl Emu {
         cpu.of = false;
         cpu.pf = false;
         cpu.df = false;
+        cpu.mxcsr = 0x1F80;
         cpu.gs_base = gs_base;
         Ok(cpu)
     }
@@ -259,6 +264,7 @@ impl Emu {
             mem,
             regs: [0u64; 16],
             xmm: [0u128; 16],
+            mxcsr: 0x1F80,
             rip: base + img.entry_rva as u64,
             zf: false,
             sf: false,
@@ -338,6 +344,24 @@ impl Emu {
             }
             _ => 0,
         }
+    }
+
+    /// Reclaim a previously released virtual reservation at a page-aligned
+    /// address. An aligned retry may extend beyond the old region only when
+    /// that region was at the bump frontier, so it cannot overwrite a later
+    /// heap allocation.
+    pub fn claim_released_virtual(&mut self, addr: u64, size: usize, released_end: u64) -> bool {
+        let Some(end) = addr.checked_add(size as u64) else { return false; };
+        if addr < self.heap_base || end > self.heap_base + HEAP_SIZE as u64
+            || (end > released_end && released_end != self.heap_next)
+        {
+            return false;
+        }
+        let start = (addr - self.base) as usize;
+        let finish = (end - self.base) as usize;
+        self.mem[start..finish].fill(0);
+        self.heap_next = self.heap_next.max(end);
+        true
     }
 
     /// Payload size recorded by [`Emu::heap_alloc`], 0 if untracked.
@@ -983,6 +1007,25 @@ impl Emu {
                     self.rip = ip + off as u64 + 3;
                     return Ok(StepResult::Continue);
                 }
+                if !rep && !repne && !opsz16 {
+                    let (group, is_reg, rm, ea_raw, ml) =
+                        self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
+                    if !is_reg && matches!(group, 2 | 3) {
+                        let next = ip + (off + 2 + ml) as u64;
+                        let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                        if group == 2 {
+                            let value = self.read_u32(ea)?;
+                            if value & 0xFFFF_0000 != 0 {
+                                return Err(format!("LDMXCSR reserved bits set at 0x{ip:016x}"));
+                            }
+                            self.mxcsr = value;
+                        } else {
+                            self.write_u32(ea, self.mxcsr)?;
+                        }
+                        self.rip = next;
+                        return Ok(StepResult::Continue);
+                    }
+                }
             }
             // CET indirect-branch landing pad. It is a no-op when CET is
             // not enabled, but only this exact four-byte encoding qualifies.
@@ -1007,6 +1050,7 @@ impl Emu {
                         | 0xBC
                         | 0xBD
                         | 0xD6
+                        | 0xE6
                 )
             {
                 return Err(format!(
@@ -1053,6 +1097,23 @@ impl Emu {
                 // half of the destination register.
                 self.regs[reg] = mask;
                 self.rip = ip + (off + 2 + ml) as u64;
+                return Ok(StepResult::Continue);
+            }
+            if op2 == 0xE6 {
+                // F3 0F E6 CVTDQ2PD: two signed dwords -> two f64 lanes.
+                if !rep || repne || opsz16 {
+                    return Err(format!("unsupported 0F E6 prefix at 0x{ip:016x}"));
+                }
+                let (reg, is_reg, rm, ea_raw, ml) =
+                    self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
+                let next = ip + (off + 2 + ml) as u64;
+                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let input = if is_reg { self.xmm[rm] as u64 }
+                    else { self.read_u64(ea)? };
+                let low = (input as u32 as i32 as f64).to_bits() as u128;
+                let high = ((input >> 32) as u32 as i32 as f64).to_bits() as u128;
+                self.xmm[reg] = low | (high << 64);
+                self.rip = next;
                 return Ok(StepResult::Continue);
             }
             if op2 == 0xB6 || op2 == 0xB7 || op2 == 0xBE || op2 == 0xBF {
@@ -1372,8 +1433,10 @@ impl Emu {
                 self.rip = next;
                 return Ok(StepResult::Continue);
             }
-            if op2 == 0x2E {
-                // UCOMISD (66) or UCOMISS (plain) comparisons.
+            if matches!(op2, 0x2E | 0x2F) {
+                // UCOMISD/COMISD (66) or UCOMISS/COMISS (plain).
+                // Both forms set the same ordering flags; floating-point
+                // exception differences are not modeled by the interpreter.
                 let (reg, is_reg, rm, ea_raw, ml) =
                     self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
                 let next = ip + (off + 2 + ml) as u64;
@@ -2341,6 +2404,58 @@ impl Emu {
                     o[8 + i] = sat(b[2 * i], b[2 * i + 1]);
                 }
                 self.xmm[reg] = u128::from_le_bytes(o);
+                self.rip = next;
+                return Ok(StepResult::Continue);
+            }
+            if op2 == 0x6B {
+                // PACKSSDW: saturate four signed dwords from each operand
+                // into eight signed words, destination lanes first.
+                if !opsz16 || rep || repne {
+                    return Err(format!("unsupported MMX opcode 0F 6B at 0x{ip:016x}"));
+                }
+                let (reg, is_reg, rm, ea_raw, ml) =
+                    self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
+                let next = ip + (off + 2 + ml) as u64;
+                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let dest = self.xmm[reg].to_le_bytes();
+                let source = if is_reg { self.xmm[rm].to_le_bytes() }
+                    else { self.read_u128(ea)?.to_le_bytes() };
+                let mut out = [0u8; 16];
+                for (half, input) in [dest, source].iter().enumerate() {
+                    for lane in 0..4 {
+                        let start = lane * 4;
+                        let value = i32::from_le_bytes(input[start..start + 4].try_into().unwrap());
+                        let packed = value.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                        let output = half * 8 + lane * 2;
+                        out[output..output + 2].copy_from_slice(&packed.to_le_bytes());
+                    }
+                }
+                self.xmm[reg] = u128::from_le_bytes(out);
+                self.rip = next;
+                return Ok(StepResult::Continue);
+            }
+            if op2 == 0x63 {
+                // PACKSSWB: saturate eight signed words from each operand
+                // into sixteen signed bytes, destination lanes first.
+                if !opsz16 || rep || repne {
+                    return Err(format!("unsupported MMX opcode 0F 63 at 0x{ip:016x}"));
+                }
+                let (reg, is_reg, rm, ea_raw, ml) =
+                    self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
+                let next = ip + (off + 2 + ml) as u64;
+                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let dest = self.xmm[reg].to_le_bytes();
+                let source = if is_reg { self.xmm[rm].to_le_bytes() }
+                    else { self.read_u128(ea)?.to_le_bytes() };
+                let mut out = [0u8; 16];
+                for (half, input) in [dest, source].iter().enumerate() {
+                    for lane in 0..8 {
+                        let start = lane * 2;
+                        let value = i16::from_le_bytes(input[start..start + 2].try_into().unwrap());
+                        out[half * 8 + lane] = value.clamp(i8::MIN as i16, i8::MAX as i16) as i8 as u8;
+                    }
+                }
+                self.xmm[reg] = u128::from_le_bytes(out);
                 self.rip = next;
                 return Ok(StepResult::Continue);
             }
@@ -5467,6 +5582,64 @@ mod tests {
     }
 
     #[test]
+    fn packssdw_saturates_signed_dwords_in_operand_order() {
+        let mut emu = emu_with(&[0x66, 0x0F, 0x6B, 0xC1]);
+        let mut dest = [0u8; 16];
+        let mut source = [0u8; 16];
+        for (i, value) in [-40_000i32, -32_768, 32_767, 40_000].iter().enumerate() {
+            dest[4 * i..4 * i + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        for (i, value) in [1i32, -1, i32::MIN, i32::MAX].iter().enumerate() {
+            source[4 * i..4 * i + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        emu.xmm[0] = u128::from_le_bytes(dest);
+        emu.xmm[1] = u128::from_le_bytes(source);
+        emu.step().unwrap();
+        let result = emu.xmm[0].to_le_bytes();
+        for (i, expected) in [-32_768i16, -32_768, 32_767, 32_767, 1, -1, -32_768, 32_767]
+            .iter().enumerate() {
+            assert_eq!(i16::from_le_bytes(result[2 * i..2 * i + 2].try_into().unwrap()), *expected);
+        }
+    }
+
+    #[test]
+    fn packsswb_saturates_signed_words_in_operand_order() {
+        let mut emu = emu_with(&[0x66, 0x0F, 0x63, 0xC1]);
+        let mut dest = [0u8; 16];
+        let mut source = [0u8; 16];
+        for (i, value) in [-200i16, -128, -1, 0, 1, 127, 128, 300].iter().enumerate() {
+            dest[2 * i..2 * i + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        for (i, value) in [10i16, 20, 30, 40, 50, -300, 300, -10].iter().enumerate() {
+            source[2 * i..2 * i + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        emu.xmm[0] = u128::from_le_bytes(dest);
+        emu.xmm[1] = u128::from_le_bytes(source);
+        emu.step().unwrap();
+        assert_eq!(emu.xmm[0].to_le_bytes(), [
+            0x80, 0x80, 0xff, 0, 1, 0x7f, 0x7f, 0x7f,
+            10, 20, 30, 40, 50, 0x80, 0x7f, 0xf6,
+        ]);
+    }
+
+    #[test]
+    fn mxcsr_load_store_tracks_thread_local_control_state() {
+        let mut emu = emu_with(&[
+            0x0F, 0xAE, 0x5C, 0x24, 0x08, // stmxcsr [rsp+8]
+            0x0F, 0xAE, 0x54, 0x24, 0x08, // ldmxcsr [rsp+8]
+        ]);
+        let cell = emu.regs[4] + 8;
+        emu.step().unwrap();
+        assert_eq!(emu.read_u32(cell).unwrap(), 0x1F80);
+        let original = emu.cpu_state();
+        emu.write_u32(cell, 0x9FC0).unwrap();
+        emu.step().unwrap();
+        assert_eq!(emu.mxcsr, 0x9FC0);
+        emu.restore_cpu(&original);
+        assert_eq!(emu.mxcsr, 0x1F80);
+    }
+
+    #[test]
     fn pmuludq_multiplies_low_dword_of_each_qword_lane() {
         let mut emu = emu_with(&[0x66, 0x44, 0x0F, 0xF4, 0xC1]); // xmm8 *= xmm1
         emu.xmm[8] = 0xDEAD_BEEF_1234_5678_AAAA_AAAA_FFFF_FFFF;
@@ -5592,6 +5765,31 @@ mod tests {
         emu.xmm[1] = 2.0f32.to_bits() as u128;
         emu.step().unwrap();
         assert!(emu.cf && emu.zf && emu.pf);
+    }
+
+    #[test]
+    fn comisd_sets_ordering_flags_for_equal_and_nan() {
+        for (left, right, expected) in [
+            (1.0f64, 1.0f64, (true, false, false)),
+            (f64::NAN, 1.0f64, (true, true, true)),
+        ] {
+            let mut emu = emu_with(&[0x66, 0x0F, 0x2F, 0xC1]);
+            emu.xmm[0] = left.to_bits() as u128;
+            emu.xmm[1] = right.to_bits() as u128;
+            emu.step().unwrap();
+            assert_eq!((emu.zf, emu.pf, emu.cf), expected);
+        }
+    }
+
+    #[test]
+    fn cvtdq2pd_converts_two_signed_dwords() {
+        let mut emu = emu_with(&[0xF3, 0x0F, 0xE6, 0xC1]);
+        emu.xmm[1] = ((-123i32 as u32 as u128) << 32) | 42;
+        emu.step().unwrap();
+        assert_eq!(f64::from_bits(emu.xmm[0] as u64), 42.0);
+        assert_eq!(f64::from_bits((emu.xmm[0] >> 64) as u64), -123.0);
+        assert!(emu_with(&[0x66, 0x0F, 0xE6, 0xC1]).step().unwrap_err()
+            .contains("unsupported 0F E6 prefix"));
     }
 
     #[test]

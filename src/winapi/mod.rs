@@ -10,7 +10,7 @@
 use crate::pe::emu::{CpuState, Emu, StepResult};
 use crate::pe::{PeImage, TlsDir};
 use crate::winfs::WinFs;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::IsTerminal;
 use std::time::{Duration, Instant};
 
@@ -67,6 +67,18 @@ struct GuestSemaphore {
     maximum: i32,
 }
 
+#[derive(Clone, Copy)]
+struct CompletionPacket {
+    bytes: u32,
+    key: u64,
+    overlapped: u64,
+}
+
+#[derive(Default)]
+struct CompletionPort {
+    queue: VecDeque<CompletionPacket>,
+}
+
 /// One directory-enumeration result for FindFirst/NextFileW.
 struct FindEntry {
     name: String, // file name only
@@ -82,12 +94,20 @@ struct FindSearch {
 
 enum ThreadState {
     Runnable,
+    Suspended(u32),
     WaitingThread {
         handle: u64,
         deadline: Option<Instant>,
     },
     WaitingSemaphore {
         handle: u64,
+        deadline: Option<Instant>,
+    },
+    WaitingCompletion {
+        handle: u64,
+        entries: u64,
+        capacity: u32,
+        removed: u64,
         deadline: Option<Instant>,
     },
     WaitingAddress {
@@ -187,6 +207,10 @@ pub struct Runner {
     wsa_startups: u32,
     sockets: HashMap<u64, (u32, u32, u32)>,
     crypto_contexts: HashSet<u64>,
+    completion_ports: HashMap<u64, CompletionPort>,
+    event_providers: HashSet<u64>,
+    virtual_regions: HashMap<u64, usize>,
+    released_virtual: Vec<(u64, usize)>,
     semaphores: HashMap<u64, GuestSemaphore>,
     power_notifications: HashMap<u64, (u64, u64)>,
     module_handles: HashMap<String, u64>,
@@ -303,6 +327,10 @@ impl Runner {
             wsa_startups: 0,
             sockets: HashMap::new(),
             crypto_contexts: HashSet::new(),
+            completion_ports: HashMap::new(),
+            event_providers: HashSet::new(),
+            virtual_regions: HashMap::new(),
+            released_virtual: Vec::new(),
             semaphores: HashMap::new(),
             power_notifications: HashMap::new(),
             module_handles,
@@ -601,8 +629,51 @@ impl Runner {
         }
     }
 
+    fn take_completion_packets(&mut self, handle: u64, entries: u64, capacity: u32, removed: u64) -> Result<bool, String> {
+        let Some(port) = self.completion_ports.get_mut(&handle) else { return Ok(false); };
+        if port.queue.is_empty() { return Ok(false); }
+        let count = (capacity as usize).min(port.queue.len());
+        let packets: Vec<_> = port.queue.drain(..count).collect();
+        for (index, packet) in packets.iter().enumerate() {
+            let entry = entries + index as u64 * 32;
+            self.emu.write_u64(entry, packet.key)?;
+            self.emu.write_u64(entry + 8, packet.overlapped)?;
+            self.emu.write_u64(entry + 16, 0)?; // Internal: successful posted packet
+            self.emu.write_u32(entry + 24, packet.bytes)?;
+            self.emu.write_u32(entry + 28, 0)?;
+        }
+        self.emu.write_u32(removed, count as u32)?;
+        Ok(true)
+    }
+
+    fn refresh_completion_waiters(&mut self, now: Instant) -> Result<(), String> {
+        for index in 0..self.threads.len() {
+            let (handle, entries, capacity, removed, deadline) = match &self.threads[index].state {
+                ThreadState::WaitingCompletion { handle, entries, capacity, removed, deadline } =>
+                    (*handle, *entries, *capacity, *removed, *deadline),
+                _ => continue,
+            };
+            let result = if !self.completion_ports.contains_key(&handle) {
+                self.emu.write_u32(removed, 0)?;
+                Some((false, 735)) // ERROR_ABANDONED_WAIT_0
+            } else if self.take_completion_packets(handle, entries, capacity, removed)? {
+                Some((true, 0))
+            } else if deadline.is_some_and(|at| now >= at) {
+                self.emu.write_u32(removed, 0)?;
+                Some((false, 258)) // WAIT_TIMEOUT
+            } else { None };
+            if let Some((success, error)) = result {
+                self.threads[index].cpu.regs[0] = u64::from(success);
+                if !success { self.threads[index].last_error = error; }
+                self.threads[index].state = ThreadState::Runnable;
+            }
+        }
+        Ok(())
+    }
+
     fn refresh_waiters(&mut self) -> Result<(), String> {
         let now = Instant::now();
+        self.refresh_completion_waiters(now)?;
         let finished: Vec<u64> = self
             .threads
             .iter()
@@ -697,6 +768,7 @@ impl Runner {
                 .filter_map(|thread| match &thread.state {
                     ThreadState::WaitingThread { deadline, .. }
                     | ThreadState::WaitingSemaphore { deadline, .. }
+                    | ThreadState::WaitingCompletion { deadline, .. }
                     | ThreadState::WaitingAddress { deadline, .. } => *deadline,
                 ThreadState::Sleeping(at) => Some(*at),
                 ThreadState::WaitingCondition { deadline, .. } => *deadline,
@@ -994,6 +1066,75 @@ impl Runner {
         }
 
         match name {
+            "EventRegister" => {
+                if rcx == 0 || r9 == 0 { ret_bool!(87); }
+                // No ETW sessions are active in the guest. Retain registration
+                // identity so writes and unregisters remain well-defined.
+                let handle = self.next_handle;
+                self.next_handle += 1;
+                self.event_providers.insert(handle);
+                self.emu.write_u64(r9, handle)?;
+                ret_bool!(0);
+            }
+            "EventUnregister" => {
+                ret_bool!(if self.event_providers.remove(&rcx) { 0 } else { 6 });
+            }
+            "EventWriteTransfer" | "EventSetInformation" => {
+                ret_bool!(if self.event_providers.contains(&rcx) { 0 } else { 6 });
+            }
+            "CreateIoCompletionPort" => {
+                // The unattached form is used to create libuv's event-loop
+                // port. File/socket association will be added with queued I/O.
+                if rcx != INVALID_HANDLE || rdx != 0 {
+                    self.last_error = 87;
+                    ret_bool!(0);
+                }
+                let handle = self.next_handle;
+                self.next_handle += 1;
+                self.completion_ports.insert(handle, CompletionPort::default());
+                ret_bool!(handle);
+            }
+            "PostQueuedCompletionStatus" => {
+                let Some(port) = self.completion_ports.get_mut(&rcx) else {
+                    self.last_error = 6;
+                    ret_bool!(0);
+                };
+                port.queue.push_back(CompletionPacket {
+                    bytes: rdx as u32,
+                    key: r8,
+                    overlapped: r9,
+                });
+                self.switch_requested = true;
+                ret_bool!(1);
+            }
+            "GetQueuedCompletionStatusEx" => {
+                let removed = r9;
+                let capacity = r8 as u32;
+                if !self.completion_ports.contains_key(&rcx) {
+                    self.last_error = 6;
+                    ret_bool!(0);
+                }
+                if rdx == 0 || removed == 0 || capacity == 0 || capacity > 4096 {
+                    self.last_error = 87;
+                    ret_bool!(0);
+                }
+                if self.take_completion_packets(rcx, rdx, capacity, removed)? {
+                    ret_bool!(1);
+                }
+                self.emu.write_u32(removed, 0)?;
+                let millis = self.emu.stack_arg(4)? as u32;
+                if millis == 0 {
+                    self.last_error = 258; // WAIT_TIMEOUT
+                    ret_bool!(0);
+                }
+                let deadline = if millis == u32::MAX { None } else {
+                    Instant::now().checked_add(Duration::from_millis(u64::from(millis)))
+                };
+                self.threads[self.current_thread].state = ThreadState::WaitingCompletion {
+                    handle: rcx, entries: rdx, capacity, removed, deadline,
+                };
+                ret_bool!(0); // scheduler sets the final result on wake
+            }
             "CryptAcquireContextW" => {
                 let flags = self.emu.stack_arg(4).unwrap_or(0) as u32;
                 // An ephemeral default RSA provider is sufficient for the
@@ -1383,6 +1524,9 @@ impl Runner {
                 } else if self.semaphores.remove(&h).is_some() {
                     self.handle_flags.remove(&h);
                     ret_bool!(1);
+                } else if self.completion_ports.remove(&h).is_some() {
+                    self.handle_flags.remove(&h);
+                    ret_bool!(1);
                 } else if let Some(thread) = self
                     .threads
                     .iter_mut()
@@ -1571,32 +1715,79 @@ impl Runner {
                 ret_bool!(self.emu.heap_size_of(r8));
             }
             "VirtualAlloc" => {
-                // Only anywhere-mapping (addr NULL); protection ignored;
-                // backed by the same 16-aligned bump region (rounded to pages).
-                if rcx != 0 {
-                    self.last_error = 487; // ERROR_INVALID_ADDRESS
-                    ret_bool!(0);
+                if std::env::var("WINCLI_TRACE").as_deref() == Ok("1") {
+                    eprintln!("[trace] VirtualAlloc addr=0x{rcx:x} size=0x{rdx:x} type=0x{r8:x} protect=0x{r9:x}");
                 }
-                let n = ((rdx + 0xFFF) & !0xFFF) as usize;
-                if n == 0 || n > 256 * 1024 * 1024 {
+                let allocation_type = r8 as u32;
+                let Some(rounded) = rdx.checked_add(0xFFF).map(|v| v & !0xFFF) else {
+                    self.last_error = 87;
+                    ret_bool!(0);
+                };
+                let Ok(n) = usize::try_from(rounded) else {
                     self.last_error = 8;
                     ret_bool!(0);
+                };
+                if n == 0 || n > crate::pe::emu::HEAP_SIZE || allocation_type & 0x3000 == 0 {
+                    self.last_error = 87;
+                    ret_bool!(0);
                 }
-                // page-align the bump cursor, then allocate
-                let p = self.emu.heap_alloc_aligned(n, 0x1000);
+                let p = if rcx == 0 {
+                    let p = self.emu.heap_alloc_aligned(n, 0x1000);
+                    if p != 0 { self.virtual_regions.insert(p, n); }
+                    p
+                } else if rcx & 0xFFF != 0 {
+                    0
+                } else if allocation_type & 0x2000 == 0 {
+                    // MEM_COMMIT within an existing reservation.
+                    let end = rcx.saturating_add(n as u64);
+                    if self.virtual_regions.iter().any(|(&base, &len)|
+                        rcx >= base && end <= base.saturating_add(len as u64)) { rcx } else { 0 }
+                } else {
+                    let end = rcx.saturating_add(n as u64);
+                    let released = self.released_virtual.iter().position(|&(base, len)|
+                        rcx >= base && rcx < base.saturating_add(len as u64));
+                    let overlap = self.virtual_regions.iter().any(|(&base, &len)|
+                        rcx < base.saturating_add(len as u64) && base < end);
+                    if let Some(index) = released.filter(|_| !overlap) {
+                        let (base, len) = self.released_virtual[index];
+                        if self.emu.claim_released_virtual(rcx, n, base + len as u64) {
+                            self.released_virtual.swap_remove(index);
+                            self.virtual_regions.insert(rcx, n);
+                            rcx
+                        } else { 0 }
+                    } else { 0 }
+                };
                 if p == 0 {
-                    self.last_error = 8;
+                    self.last_error = if rcx == 0 { 8 } else { 487 };
+                }
+                if std::env::var("WINCLI_TRACE").as_deref() == Ok("1") {
+                    eprintln!("[trace] VirtualAlloc result=0x{p:x}");
                 }
                 ret_bool!(p);
             }
             "VirtualFree" => {
-                // No-op by design (no reuse). MEM_RELEASE needs size 0.
-                let ftype = (r8 & 0xFFFF_FFFF) as u32;
-                if ftype == 0x8000 && rdx != 0 {
-                    self.last_error = 87; // ERROR_INVALID_PARAMETER
-                    ret_bool!(0);
+                if std::env::var("WINCLI_TRACE").as_deref() == Ok("1") {
+                    eprintln!("[trace] VirtualFree addr=0x{rcx:x} size=0x{rdx:x} type=0x{r8:x}");
                 }
-                ret_bool!(1);
+                let ftype = (r8 & 0xFFFF_FFFF) as u32;
+                match ftype {
+                    0x8000 if rdx == 0 => {
+                        let Some(len) = self.virtual_regions.remove(&rcx) else {
+                            self.last_error = 487;
+                            ret_bool!(0);
+                        };
+                        self.released_virtual.push((rcx, len));
+                        ret_bool!(1);
+                    }
+                    0x4000 if rdx != 0 && self.virtual_regions.iter().any(|(&base, &len)|
+                        rcx >= base && rcx.saturating_add(rdx) <= base.saturating_add(len as u64)) => {
+                        ret_bool!(1); // decommit: pages stay zero-backed in the interpreter
+                    }
+                    _ => {
+                        self.last_error = 87;
+                        ret_bool!(0);
+                    }
+                }
             }
             "VirtualProtect" => {
                 if r9 != 0 {
@@ -2245,9 +2436,12 @@ impl Runner {
             "CreateThread" => {
                 let flags = self.emu.stack_arg(4)? as u32;
                 let id_out = self.emu.stack_arg(5)?;
+                if std::env::var("WINCLI_TRACE").as_deref() == Ok("1") {
+                    eprintln!("[trace] CreateThread security=0x{rcx:x} stack=0x{rdx:x} start=0x{r8:x} param=0x{r9:x} flags=0x{flags:x} id_out=0x{id_out:x}");
+                }
                 // Rust's Windows thread builder uses 0x10000 to mark the
                 // requested stack size as a reservation.
-                if r8 == 0 || flags & !0x10000 != 0 || self.next_thread_id == u32::MAX {
+                if r8 == 0 || flags & !(0x10000 | 0x4) != 0 || self.next_thread_id == u32::MAX {
                     self.last_error = 87;
                     ret_bool!(0);
                 }
@@ -2286,7 +2480,8 @@ impl Runner {
                         }
                         values
                     },
-                    state: ThreadState::Runnable,
+                    state: if flags & 0x4 != 0 { ThreadState::Suspended(1) }
+                        else { ThreadState::Runnable },
                     critical_depth: 0,
                     tls_resume: None,
                     tls_next: 0,
@@ -2294,8 +2489,49 @@ impl Runner {
                     once_frames: Vec::new(),
                 });
                 self.begin_tls_callbacks(self.threads.len() - 1, 2)?; // DLL_THREAD_ATTACH
-                self.switch_requested = true;
+                self.switch_requested = flags & 0x4 == 0;
                 ret_bool!(handle);
+            }
+            "ResumeThread" => {
+                let Some(thread) = self.threads.iter_mut().find(|t| t.handle == rcx && t.open) else {
+                    self.last_error = 6;
+                    ret_bool!(u32::MAX as u64);
+                };
+                let previous = match thread.state {
+                    ThreadState::Suspended(count) => {
+                        if count == 1 { thread.state = ThreadState::Runnable; }
+                        else { thread.state = ThreadState::Suspended(count - 1); }
+                        count
+                    }
+                    ThreadState::Finished => {
+                        self.last_error = 6;
+                        ret_bool!(u32::MAX as u64);
+                    }
+                    _ => 0,
+                };
+                if previous == 1 { self.switch_requested = true; }
+                ret_bool!(previous as u64);
+            }
+            "SuspendThread" => {
+                let Some(thread) = self.threads.iter_mut().find(|t| t.handle == rcx && t.open) else {
+                    self.last_error = 6;
+                    ret_bool!(u32::MAX as u64);
+                };
+                let previous = match thread.state {
+                    ThreadState::Runnable => {
+                        thread.state = ThreadState::Suspended(1);
+                        0
+                    }
+                    ThreadState::Suspended(count) if count < u32::MAX => {
+                        thread.state = ThreadState::Suspended(count + 1);
+                        count
+                    }
+                    _ => {
+                        self.last_error = 120;
+                        ret_bool!(u32::MAX as u64);
+                    }
+                };
+                ret_bool!(previous as u64);
             }
             "CreateSemaphoreA" | "CreateSemaphoreW" => {
                 let initial = rdx as i32;
