@@ -785,6 +785,27 @@ impl Emu {
                 }
                 return Ok(StepResult::Continue);
             }
+            if op2 == 0x50 {
+                // MOVMSKPS r32, xmm: collect the sign bit from each packed
+                // single-precision lane.  This is commonly emitted by SIMD
+                // text/search code (including ripgrep's JSON output path).
+                // The source must be an XMM register; a memory form is #UD.
+                let (reg, is_reg, rm, _, ml) =
+                    self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
+                if !is_reg {
+                    return Err(format!("invalid MOVMSKPS memory source at 0x{ip:016x}"));
+                }
+                let lanes = self.xmm[rm].to_le_bytes();
+                let mut mask = 0u64;
+                for lane in 0..4 {
+                    mask |= (((lanes[lane * 4 + 3] >> 7) & 1) as u64) << lane;
+                }
+                // Like every 32-bit GPR write in long mode, clear the high
+                // half of the destination register.
+                self.regs[reg] = mask;
+                self.rip = ip + (off + 2 + ml) as u64;
+                return Ok(StepResult::Continue);
+            }
             if op2 == 0xB6 || op2 == 0xB7 || op2 == 0xBE || op2 == 0xBF {
                 // movzx/movsx r, r/m8(16). A 0x66 prefix would narrow the
                 // destination to 16 bits; refuse rather than mis-emulate.
@@ -1300,7 +1321,7 @@ impl Emu {
                 self.rip = next;
                 return Ok(StepResult::Continue);
             }
-                        if op2 == 0x70 {
+            if op2 == 0x70 {
                 // PSHUFD (66) / PSHUFLW (F2) / PSHUFHW (F3): shuffle
                 // 32-bit lanes / low words / high words by imm8.
                 if !opsz16 && !rep && !repne {
@@ -1344,6 +1365,40 @@ impl Emu {
                 }
                 self.xmm[reg] = u128::from_le_bytes(o);
                 self.rip = next;
+                return Ok(StepResult::Continue);
+            }
+            if op2 == 0x71 {
+                // 66 0F 71 /2,/4,/6 ib: PSRLW/PSRAW/PSLLW xmm, imm8.
+                // These packed-word shifts are used beside MOVMSKPS by
+                // vectorized formatting code. The ModRM r/m operand is the
+                // destination; ModRM.reg selects the operation.
+                if !opsz16 || rep || repne {
+                    return Err(format!("unsupported MMX opcode 0F 71 at 0x{ip:016x}"));
+                }
+                let (group, is_reg, rm, _, ml) =
+                    self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
+                if !is_reg || !matches!(group, 2 | 4 | 6) {
+                    return Err(format!("unsupported packed-word shift /{group} at 0x{ip:016x}"));
+                }
+                let count = self.read_u8(ip + (off + 2 + ml) as u64)? as u32;
+                let input = self.xmm[rm].to_le_bytes();
+                let mut out = [0u8; 16];
+                for lane in 0..8 {
+                    let start = lane * 2;
+                    let value = u16::from_le_bytes(input[start..start + 2].try_into().unwrap());
+                    let shifted = match group {
+                        2 => if count >= 16 { 0 } else { value >> count },
+                        4 => if count >= 16 {
+                            if value & 0x8000 != 0 { u16::MAX } else { 0 }
+                        } else {
+                            ((value as i16) >> count) as u16
+                        },
+                        _ => if count >= 16 { 0 } else { value << count },
+                    };
+                    out[start..start + 2].copy_from_slice(&shifted.to_le_bytes());
+                }
+                self.xmm[rm] = u128::from_le_bytes(out);
+                self.rip = ip + (off + 2 + ml + 1) as u64;
                 return Ok(StepResult::Continue);
             }
             if op2 == 0x74 || op2 == 0x75 || op2 == 0x76 {
@@ -1485,6 +1540,34 @@ impl Emu {
                     }
                 }
                 self.xmm[reg] = u128::from_le_bytes(o);
+                self.rip = next;
+                return Ok(StepResult::Continue);
+            }
+            if op2 == 0xD4 {
+                // PADDQ xmm, xmm/m128: wrapping addition of the two packed
+                // 64-bit lanes.  Rust's SIMD search/formatting paths use
+                // this to advance vectorized counters.
+                if !opsz16 || rep || repne {
+                    return Err(format!("unsupported MMX opcode 0F D4 at 0x{ip:016x}"));
+                }
+                let (reg, is_reg, rm, ea_raw, ml) =
+                    self.decode_modrm(ip, off + 2, rex_r, rex_x, rex_b, true)?;
+                let next = ip + (off + 2 + ml) as u64;
+                let ea = if rm == 0x100 { next.wrapping_add(ea_raw) } else { ea_raw };
+                let a = self.xmm[reg].to_le_bytes();
+                let b: [u8; 16] = if is_reg {
+                    self.xmm[rm].to_le_bytes()
+                } else {
+                    self.read_u128(ea)?.to_le_bytes()
+                };
+                let mut out = [0u8; 16];
+                for lane in 0..2 {
+                    let start = lane * 8;
+                    let left = u64::from_le_bytes(a[start..start + 8].try_into().unwrap());
+                    let right = u64::from_le_bytes(b[start..start + 8].try_into().unwrap());
+                    out[start..start + 8].copy_from_slice(&left.wrapping_add(right).to_le_bytes());
+                }
+                self.xmm[reg] = u128::from_le_bytes(out);
                 self.rip = next;
                 return Ok(StepResult::Continue);
             }
@@ -3284,6 +3367,44 @@ mod tests {
         );
         assert!(matches!(e.step().unwrap(), StepResult::Continue));
         assert_eq!(e.xmm[2], 0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF);
+    }
+
+    #[test]
+    fn movmskps_collects_packed_single_sign_bits() {
+        // MOVMSKPS r8d, xmm1. Lanes 0 and 2 have their sign bits set.
+        let mut e = emu_with(&[0x44, 0x0F, 0x50, 0xC1]);
+        e.xmm[1] = 0x0000_0000_8000_0000_0000_0000_8000_0000;
+        e.regs[8] = u64::MAX;
+        assert!(matches!(e.step().unwrap(), StepResult::Continue));
+        assert_eq!(e.regs[8], 0b0101);
+    }
+
+    #[test]
+    fn paddq_wraps_each_qword_lane() {
+        let mut e = emu_with(&[0x66, 0x0F, 0xD4, 0xC1]); // paddq xmm0,xmm1
+        e.xmm[0] = 0x0000_0000_0000_0005_FFFF_FFFF_FFFF_FFFF;
+        e.xmm[1] = 0x0000_0000_0000_0007_0000_0000_0000_0002;
+        assert!(matches!(e.step().unwrap(), StepResult::Continue));
+        assert_eq!(e.xmm[0], 0x0000_0000_0000_000C_0000_0000_0000_0001);
+    }
+
+    #[test]
+    fn packed_word_immediate_shifts_cover_logical_and_arithmetic_forms() {
+        // psrlw xmm0, 4; psraw xmm1, 20; psllw xmm2, 1
+        let mut e = emu_with(&[
+            0x66, 0x0F, 0x71, 0xD0, 0x04,
+            0x66, 0x0F, 0x71, 0xE1, 0x14,
+            0x66, 0x0F, 0x71, 0xF2, 0x01,
+        ]);
+        e.xmm[0] = u128::from_le_bytes([0x00, 0xF0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        e.xmm[1] = u128::from_le_bytes([0x00, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        e.xmm[2] = 1;
+        assert!(matches!(e.step().unwrap(), StepResult::Continue));
+        assert_eq!(e.xmm[0] & 0xffff, 0x0f00);
+        assert!(matches!(e.step().unwrap(), StepResult::Continue));
+        assert_eq!(e.xmm[1] & 0xffff, 0xffff);
+        assert!(matches!(e.step().unwrap(), StepResult::Continue));
+        assert_eq!(e.xmm[2] & 0xffff, 2);
     }
 
     #[test]
