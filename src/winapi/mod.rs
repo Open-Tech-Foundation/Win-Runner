@@ -1011,6 +1011,10 @@ impl Runner {
                 } else if self.fs.is_file(&path) {
                     ret_bool!(0x80);
                 } else {
+                    // INVALID_FILE_ATTRIBUTES alone is ambiguous to callers;
+                    // directory walkers use the accompanying last-error value
+                    // to distinguish a missing entry from other failures.
+                    self.last_error = 2; // ERROR_FILE_NOT_FOUND
                     ret_bool!(0xFFFF_FFFF);
                 }
             }
@@ -1861,6 +1865,45 @@ mod tests {
         let mut fs = WinFs::new();
         fs.write_file("C:\\stat.txt", b"hello".to_vec()).unwrap();
         let (code, _, _) = run_exe(&stat_probe(), fs).unwrap();
+        assert_eq!(code, 0);
+    }
+
+    fn missing_attributes_probe() -> Vec<u8> {
+        // GetFileAttributesW must pair INVALID_FILE_ATTRIBUTES with
+        // ERROR_FILE_NOT_FOUND, rather than leaking an earlier last error.
+        use crate::pe::builder::{build, Asm};
+        const ATTRS: usize = 0;
+        const LAST_ERROR: usize = 1;
+        const EXIT: usize = 2;
+        let mut a = Asm::new();
+        let path = a.add_utf16(r"C:\missing.txt");
+        let fail = a.fresh_label();
+        a.sub_rsp(0x28);
+        a.lea_reg_rip(1, path);
+        a.call_import(ATTRS);
+        a.cmp_eax_imm(u32::MAX);
+        a.jnz(fail);
+        a.call_import(LAST_ERROR);
+        a.cmp_eax_imm(2);
+        a.jnz(fail);
+        a.mov_ecx_imm(0);
+        a.call_import(EXIT);
+        a.mark(fail);
+        a.mov_ecx_imm(1);
+        a.call_import(EXIT);
+        build(
+            a,
+            &[
+                ("KERNEL32.dll", "GetFileAttributesW"),
+                ("KERNEL32.dll", "GetLastError"),
+                ("KERNEL32.dll", "ExitProcess"),
+            ],
+        )
+    }
+
+    #[test]
+    fn missing_file_attributes_set_not_found_error() {
+        let (code, _, _) = run_exe(&missing_attributes_probe(), WinFs::new()).unwrap();
         assert_eq!(code, 0);
     }
 

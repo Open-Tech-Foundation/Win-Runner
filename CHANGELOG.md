@@ -10,6 +10,12 @@ All notable changes to this project will be documented in this file.
   packed-dword interleaves, `PSADBW`, and carry-aware byte-immediate ALU
   operations, plus `PEXTRW`, allowing real ripgrep JSON output to progress
   through its SIMD formatting path on the default interpreter backend.
+
+### Fixed
+
+- `GetFileAttributesW` now sets `ERROR_FILE_NOT_FOUND` when a guest path is
+  absent, preventing stale last-error values from corrupting directory-walk
+  error handling.
 - Native `CreateProcessW` accepts bounded Unicode environment blocks; values
   are isolated to the child and available through `GetEnvironmentVariableW`
   and `GetEnvironmentStringsW`; a null environment pointer inherits the
