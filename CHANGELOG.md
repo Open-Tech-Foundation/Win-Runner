@@ -11,6 +11,10 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added `CancelIoEx` and same-thread `CancelIo` for pending native WinFS
+  operations, including canceled `OVERLAPPED` status, event signaling, and
+  failed IOCP completion packets. Native unit and PE tests cover cancellation
+  and its completion race.
 - Added a per-process bounded queue with four native workers for pending WinFS
   I/O, replacing one host thread per transfer. A real PE fixture now checks
   multiple concurrent completion packets and the queue-capacity boundary is

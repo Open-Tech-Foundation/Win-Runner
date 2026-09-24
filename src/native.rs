@@ -483,6 +483,12 @@ mod imp {
                 assert!(!super::native_file_io_queue_full(&state));
                 state.jobs.push_back(super::NativeFileIoJob {
                     process: std::sync::Arc::clone(&process),
+                    request: std::sync::Arc::new(super::NativePendingIo {
+                        handle: 0,
+                        overlapped: 0,
+                        cancelled: super::AtomicBool::new(false),
+                        issuer: std::thread::current().id(),
+                    }),
                     file: file.clone(),
                     overlapped: 0,
                     event: None,
@@ -502,6 +508,7 @@ mod imp {
                 super::native_enqueue_file_io(
                     &queue,
                     &process,
+                    0,
                     file,
                     ov.as_mut_ptr() as u64,
                     0,
@@ -513,6 +520,123 @@ mod imp {
             let mut state = queue.state.lock().unwrap();
             state.jobs.pop_front();
             assert!(!super::native_file_io_queue_full(&state));
+        }
+
+        #[test]
+        fn queued_file_io_cancellation_signals_event_and_posts_failure() {
+            let process = super::process_ctx().unwrap();
+            let port = std::sync::Arc::new(super::NativeCompletionPort {
+                queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
+                ready: std::sync::Condvar::new(),
+            });
+            let file = super::NativeFile {
+                path: r"C:\cancel_unit.txt".into(),
+                offset: 0,
+                overlapped: true,
+                completion: Some((std::sync::Arc::clone(&port), 0x1234)),
+            };
+            let handle = {
+                let mut fs = process.fs.lock().unwrap();
+                let handle = fs.next;
+                fs.next += 1;
+                fs.handles.insert(handle, file.clone());
+                handle
+            };
+            let event_handle = super::native_create_event_w(0, 1, 0, std::ptr::null());
+            assert_ne!(event_handle, 0);
+            let mut ov = [0u64; 4];
+            ov[3] = event_handle;
+            let pointer = ov.as_mut_ptr() as u64;
+            let event = super::native_prepare_overlapped_event(pointer).unwrap();
+            super::native_set_overlapped_status(pointer, super::STATUS_PENDING, 0);
+            let request = std::sync::Arc::new(super::NativePendingIo {
+                handle,
+                overlapped: pointer,
+                cancelled: super::AtomicBool::new(false),
+                issuer: std::thread::current().id(),
+            });
+            process
+                .pending_requests
+                .lock()
+                .unwrap()
+                .insert((handle, pointer), std::sync::Arc::clone(&request));
+            let before = process
+                .pending_file_io
+                .fetch_add(1, super::Ordering::AcqRel);
+            let queue = super::NativeFileIoQueue {
+                state: std::sync::Mutex::new(super::NativeFileIoQueueState {
+                    jobs: std::collections::VecDeque::from([super::NativeFileIoJob {
+                        process: std::sync::Arc::clone(&process),
+                        request,
+                        file,
+                        overlapped: pointer,
+                        event,
+                        offset: 0,
+                        operation: super::NativeFileIoOperation::Write { data: Vec::new() },
+                    }]),
+                    stop: false,
+                }),
+                ready: std::sync::Condvar::new(),
+            };
+            let another_issuer = std::thread::spawn(|| std::thread::current().id())
+                .join()
+                .unwrap();
+            assert_eq!(
+                super::native_cancel_file_io_requests(
+                    &process,
+                    &queue,
+                    handle,
+                    pointer,
+                    Some(another_issuer),
+                ),
+                Err(1168)
+            );
+            assert_eq!(
+                super::native_overlapped_status(pointer),
+                super::STATUS_PENDING
+            );
+            assert_eq!(
+                super::native_cancel_file_io_requests(
+                    &process,
+                    &queue,
+                    handle,
+                    pointer,
+                    Some(std::thread::current().id()),
+                ),
+                Ok(())
+            );
+            assert_eq!(
+                super::native_overlapped_status(pointer),
+                super::STATUS_CANCELLED
+            );
+            let mut bytes = 9;
+            assert_eq!(
+                super::native_get_overlapped_result(handle, pointer, &mut bytes, 0),
+                0
+            );
+            assert_eq!(super::native_get_last_error(), 995);
+            assert_eq!(super::native_wait_for_single_object(event_handle, 0), 0);
+            let packet = port.queue.lock().unwrap().pop_front().unwrap();
+            assert_eq!(
+                (packet.key, packet.overlapped, packet.bytes, packet.status),
+                (0x1234, pointer, 0, super::STATUS_CANCELLED)
+            );
+            assert!(queue.state.lock().unwrap().jobs.is_empty());
+            assert!(!process
+                .pending_requests
+                .lock()
+                .unwrap()
+                .contains_key(&(handle, pointer)));
+            assert_eq!(
+                process.pending_file_io.load(super::Ordering::Acquire),
+                before
+            );
+            assert_eq!(
+                super::native_cancel_file_io_requests(&process, &queue, handle, pointer, None),
+                Err(1168)
+            );
+            assert_eq!(super::native_close_handle(event_handle), 1);
+            process.fs.lock().unwrap().handles.remove(&handle);
         }
 
         #[test]
@@ -2281,6 +2405,7 @@ mod imp {
     const STATUS_PENDING: u64 = 0x103;
     const STATUS_END_OF_FILE: u64 = 0xC000_0011;
     const STATUS_UNSUCCESSFUL: u64 = 0xC000_0001;
+    const STATUS_CANCELLED: u64 = 0xC000_0120;
     const DEFERRED_FILE_IO_MIN: u32 = 64 * 1024;
     const FILE_IO_WORKERS: usize = 4;
     const MAX_QUEUED_FILE_IO: usize = 128;
@@ -2300,6 +2425,8 @@ mod imp {
     fn native_file_error(status: u64) -> u32 {
         if status == STATUS_END_OF_FILE {
             38
+        } else if status == STATUS_CANCELLED {
+            995 // ERROR_OPERATION_ABORTED
         } else {
             1
         }
@@ -2309,6 +2436,7 @@ mod imp {
         file: &NativeFile,
         overlapped: u64,
         event: Option<Arc<NativeEvent>>,
+        request: Arc<NativePendingIo>,
         result: Result<u32, u64>,
     ) {
         let (bytes, status) = match result {
@@ -2339,6 +2467,15 @@ mod imp {
         if let Ok(_guard) = process.io_wait.lock() {
             process.pending_file_io.fetch_sub(1, Ordering::AcqRel);
             process.io_ready.notify_all();
+        }
+        if let Ok(mut pending) = process.pending_requests.lock() {
+            let key = (request.handle, overlapped);
+            if pending
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, &request))
+            {
+                pending.remove(&key);
+            }
         }
     }
     fn native_wait_file_io(process: &NativeProcessContext) {
@@ -2385,17 +2522,19 @@ mod imp {
     }
     fn native_submit_file_io(
         process: &Arc<NativeProcessContext>,
+        handle: u64,
         file: NativeFile,
         overlapped: u64,
         offset: usize,
         operation: NativeFileIoOperation,
     ) -> Result<(), u32> {
         let queue = native_file_io_queue(process)?;
-        native_enqueue_file_io(&queue, process, file, overlapped, offset, operation)
+        native_enqueue_file_io(&queue, process, handle, file, overlapped, offset, operation)
     }
     fn native_enqueue_file_io(
         queue: &NativeFileIoQueue,
         process: &Arc<NativeProcessContext>,
+        handle: u64,
         file: NativeFile,
         overlapped: u64,
         offset: usize,
@@ -2405,11 +2544,23 @@ mod imp {
         if native_file_io_queue_full(&state) {
             return Err(8);
         }
+        let mut pending = process.pending_requests.lock().map_err(|_| 6u32)?;
+        if pending.contains_key(&(handle, overlapped)) {
+            return Err(87);
+        }
         let event = native_prepare_overlapped_event(overlapped)?;
+        let request = Arc::new(NativePendingIo {
+            handle,
+            overlapped,
+            cancelled: AtomicBool::new(false),
+            issuer: std::thread::current().id(),
+        });
         native_set_overlapped_status(overlapped, STATUS_PENDING, 0);
         process.pending_file_io.fetch_add(1, Ordering::AcqRel);
+        pending.insert((handle, overlapped), Arc::clone(&request));
         state.jobs.push_back(NativeFileIoJob {
             process: Arc::clone(process),
+            request,
             file,
             overlapped,
             event,
@@ -2436,57 +2587,162 @@ mod imp {
                 }
                 state.jobs.pop_front().unwrap()
             };
-            let result = match job.operation {
-                NativeFileIoOperation::Read { output, length } => match job.process.fs.lock() {
-                    Ok(fs) => match fs.fs.read_file(&job.file.path) {
-                        Ok(data) if job.offset >= data.len() => Err(STATUS_END_OF_FILE),
-                        Ok(data) => {
-                            let count = (data.len() - job.offset).min(length as usize);
-                            unsafe {
-                                std::ptr::copy_nonoverlapping(
-                                    data.as_ptr().add(job.offset),
-                                    output as *mut u8,
-                                    count,
-                                )
-                            };
-                            Ok(count as u32)
-                        }
-                        Err(_) => Err(STATUS_UNSUCCESSFUL),
-                    },
-                    Err(_) => Err(STATUS_UNSUCCESSFUL),
-                },
-                NativeFileIoOperation::Write { data } => match job.process.fs.lock() {
-                    Ok(mut fs) => match fs.fs.read_file(&job.file.path) {
-                        Ok(mut content) => match job.offset.checked_add(data.len()) {
-                            Some(end)
-                                if content
-                                    .try_reserve(end.saturating_sub(content.len()))
-                                    .is_ok() =>
-                            {
-                                if content.len() < end {
-                                    content.resize(end, 0);
+            let result = if job.request.cancelled.load(Ordering::Acquire) {
+                Err(STATUS_CANCELLED)
+            } else {
+                match job.operation {
+                    NativeFileIoOperation::Read { output, length } => match job.process.fs.lock() {
+                        Ok(fs) => match fs.fs.read_file(&job.file.path) {
+                            Ok(data) if job.offset >= data.len() => Err(STATUS_END_OF_FILE),
+                            Ok(data) => {
+                                if job.request.cancelled.load(Ordering::Acquire) {
+                                    Err(STATUS_CANCELLED)
+                                } else {
+                                    let count = (data.len() - job.offset).min(length as usize);
+                                    unsafe {
+                                        std::ptr::copy_nonoverlapping(
+                                            data.as_ptr().add(job.offset),
+                                            output as *mut u8,
+                                            count,
+                                        )
+                                    };
+                                    Ok(count as u32)
                                 }
-                                content[job.offset..end].copy_from_slice(&data);
-                                fs.fs
-                                    .write_file(&job.file.path, content)
-                                    .map(|_| data.len() as u32)
-                                    .map_err(|_| STATUS_UNSUCCESSFUL)
                             }
-                            _ => Err(STATUS_UNSUCCESSFUL),
+                            Err(_) => Err(STATUS_UNSUCCESSFUL),
                         },
                         Err(_) => Err(STATUS_UNSUCCESSFUL),
                     },
-                    Err(_) => Err(STATUS_UNSUCCESSFUL),
-                },
+                    NativeFileIoOperation::Write { data } => match job.process.fs.lock() {
+                        Ok(mut fs) => match fs.fs.read_file(&job.file.path) {
+                            Ok(mut content) => match job.offset.checked_add(data.len()) {
+                                Some(end)
+                                    if content
+                                        .try_reserve(end.saturating_sub(content.len()))
+                                        .is_ok() =>
+                                {
+                                    if job.request.cancelled.load(Ordering::Acquire) {
+                                        Err(STATUS_CANCELLED)
+                                    } else {
+                                        if content.len() < end {
+                                            content.resize(end, 0);
+                                        }
+                                        content[job.offset..end].copy_from_slice(&data);
+                                        fs.fs
+                                            .write_file(&job.file.path, content)
+                                            .map(|_| data.len() as u32)
+                                            .map_err(|_| STATUS_UNSUCCESSFUL)
+                                    }
+                                }
+                                _ => Err(STATUS_UNSUCCESSFUL),
+                            },
+                            Err(_) => Err(STATUS_UNSUCCESSFUL),
+                        },
+                        Err(_) => Err(STATUS_UNSUCCESSFUL),
+                    },
+                }
             };
             native_finish_pending_file_io(
                 &job.process,
                 &job.file,
                 job.overlapped,
                 job.event,
+                job.request,
                 result,
             );
         }
+    }
+    fn native_cancel_file_io_requests(
+        process: &Arc<NativeProcessContext>,
+        queue: &NativeFileIoQueue,
+        handle: u64,
+        overlapped: u64,
+        issuer: Option<std::thread::ThreadId>,
+    ) -> Result<(), u32> {
+        let matching = {
+            let pending = process.pending_requests.lock().map_err(|_| 6u32)?;
+            let matching: Vec<_> = pending
+                .values()
+                .filter(|request| {
+                    request.handle == handle
+                        && (overlapped == 0 || request.overlapped == overlapped)
+                        && issuer.is_none_or(|issuer| issuer == request.issuer)
+                })
+                .cloned()
+                .collect();
+            for request in &matching {
+                request.cancelled.store(true, Ordering::Release);
+            }
+            matching
+        };
+        if matching.is_empty() {
+            return Err(1168);
+        } // ERROR_NOT_FOUND
+        let mut removed = Vec::new();
+        {
+            let mut state = queue.state.lock().map_err(|_| 6u32)?;
+            let mut index = 0;
+            while index < state.jobs.len() {
+                if matching
+                    .iter()
+                    .any(|request| Arc::ptr_eq(request, &state.jobs[index].request))
+                {
+                    removed.push(state.jobs.remove(index).unwrap());
+                } else {
+                    index += 1;
+                }
+            }
+        }
+        for job in removed {
+            native_finish_pending_file_io(
+                &job.process,
+                &job.file,
+                job.overlapped,
+                job.event,
+                job.request,
+                Err(STATUS_CANCELLED),
+            );
+        }
+        Ok(())
+    }
+    fn native_cancel_file_io(
+        handle: u64,
+        overlapped: u64,
+        issuer: Option<std::thread::ThreadId>,
+    ) -> i32 {
+        let Some(process) = process_ctx() else {
+            return 0;
+        };
+        if !process
+            .fs
+            .lock()
+            .is_ok_and(|fs| fs.handles.contains_key(&handle))
+        {
+            native_set_last_error(6);
+            return 0;
+        }
+        let queue = process
+            .file_io_queue
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone());
+        let Some(queue) = queue else {
+            native_set_last_error(1168);
+            return 0;
+        };
+        match native_cancel_file_io_requests(&process, &queue, handle, overlapped, issuer) {
+            Ok(()) => 1,
+            Err(error) => {
+                native_set_last_error(error);
+                0
+            }
+        }
+    }
+    extern "win64" fn native_cancel_io_ex(handle: u64, overlapped: u64) -> i32 {
+        native_cancel_file_io(handle, overlapped, None)
+    }
+    extern "win64" fn native_cancel_io(handle: u64) -> i32 {
+        native_cancel_file_io(handle, 0, Some(std::thread::current().id()))
     }
     extern "win64" fn native_post_queued_completion_status(
         handle: u64,
@@ -2871,6 +3127,7 @@ mod imp {
         io_wait: Mutex<()>,
         io_ready: Condvar,
         pending_file_io: AtomicU64,
+        pending_requests: Mutex<HashMap<(u64, u64), Arc<NativePendingIo>>>,
         file_io_queue: Mutex<Option<Arc<NativeFileIoQueue>>>,
         duplicate_handles: Mutex<HashMap<u64, u64>>,
         duplicate_next: AtomicU64,
@@ -2912,11 +3169,18 @@ mod imp {
     }
     struct NativeFileIoJob {
         process: Arc<NativeProcessContext>,
+        request: Arc<NativePendingIo>,
         file: NativeFile,
         overlapped: u64,
         event: Option<Arc<NativeEvent>>,
         offset: usize,
         operation: NativeFileIoOperation,
+    }
+    struct NativePendingIo {
+        handle: u64,
+        overlapped: u64,
+        cancelled: AtomicBool,
+        issuer: std::thread::ThreadId,
     }
     enum NativeFileIoOperation {
         Read { output: u64, length: u32 },
@@ -3021,6 +3285,7 @@ mod imp {
             io_wait: Mutex::new(()),
             io_ready: Condvar::new(),
             pending_file_io: AtomicU64::new(0),
+            pending_requests: Mutex::new(HashMap::new()),
             file_io_queue: Mutex::new(None),
             duplicate_handles: Mutex::new(HashMap::new()),
             duplicate_next: AtomicU64::new(0xa000_0000),
@@ -5084,6 +5349,7 @@ mod imp {
                 drop(ctx);
                 let result = native_submit_file_io(
                     &process,
+                    handle,
                     file,
                     overlapped,
                     offset,
@@ -5357,6 +5623,7 @@ mod imp {
                 io_wait: Mutex::new(()),
                 io_ready: Condvar::new(),
                 pending_file_io: AtomicU64::new(0),
+                pending_requests: Mutex::new(HashMap::new()),
                 file_io_queue: Mutex::new(None),
                 duplicate_handles: Mutex::new(HashMap::new()),
                 duplicate_next: AtomicU64::new(0xa000_0000),
@@ -6282,6 +6549,7 @@ mod imp {
             drop(ctx);
             let result = native_submit_file_io(
                 &process,
+                h,
                 file,
                 ov,
                 offset,
@@ -6599,6 +6867,8 @@ mod imp {
             "GetOverlappedResult" => {
                 Some(native_get_overlapped_result as *const () as usize as u64)
             }
+            "CancelIoEx" => Some(native_cancel_io_ex as *const () as usize as u64),
+            "CancelIo" => Some(native_cancel_io as *const () as usize as u64),
             "VerSetConditionMask" => {
                 Some(native_ver_set_condition_mask as *const () as usize as u64)
             }
@@ -7535,6 +7805,7 @@ mod imp {
             io_wait: Mutex::new(()),
             io_ready: Condvar::new(),
             pending_file_io: AtomicU64::new(0),
+            pending_requests: Mutex::new(HashMap::new()),
             file_io_queue: Mutex::new(None),
             duplicate_handles: Mutex::new(HashMap::new()),
             duplicate_next: AtomicU64::new(0xa000_0000),

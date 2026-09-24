@@ -12,6 +12,8 @@ CreateIoCompletionPort
 GetQueuedCompletionStatus
 GetQueuedCompletionStatusEx
 GetOverlappedResult
+CancelIoEx
+CancelIo
 CreateEventW
 CreateEventA
 CreateEventExW

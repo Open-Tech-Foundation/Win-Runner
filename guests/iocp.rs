@@ -24,6 +24,8 @@ extern "C" {
     ) -> i32;
     fn GetLastError() -> u32;
     fn GetOverlappedResult(file: u64, ov: *mut Overlapped, bytes: *mut u32, wait: i32) -> i32;
+    fn CancelIoEx(file: u64, ov: *mut Overlapped) -> i32;
+    fn CancelIo(file: u64) -> i32;
     fn CreateEventW(attrs: u64, manual: i32, initial: i32, name: *const u16) -> u64;
     fn CreateEventA(attrs: u64, manual: i32, initial: i32, name: *const u8) -> u64;
     fn CreateEventExW(attrs: u64, name: *const u16, flags: u32, access: u32) -> u64;
@@ -298,6 +300,57 @@ pub extern "C" fn guest_entry() {
         check(matched);
         i += 1;
     }
+    check(unsafe { CancelIoEx(!0, core::ptr::null_mut()) } == 0);
+    check(unsafe { GetLastError() } == 6);
+    let mut unknown_ov = ov(0);
+    check(unsafe { CancelIoEx(file, &mut unknown_ov) } == 0);
+    check(unsafe { GetLastError() } == 1168);
+    let mut cancelled = [ov(0); 8];
+    let mut cancelled_seen = [false; 8];
+    i = 0;
+    while i < cancelled.len() {
+        let destination = unsafe { batch_output.add(i * 65536) };
+        check(unsafe { ReadFile(file, destination, 65536, &mut count, &mut cancelled[i]) } == 0);
+        check(unsafe { GetLastError() } == 997);
+        i += 1;
+    }
+    let cancel_one = unsafe { CancelIoEx(file, &mut cancelled[7]) };
+    check(cancel_one != 0 || unsafe { GetLastError() } == 1168);
+    let cancel_all = unsafe { CancelIo(file) };
+    check(cancel_all != 0 || unsafe { GetLastError() } == 1168);
+    i = 0;
+    while i < cancelled.len() {
+        let completed = unsafe {
+            GetQueuedCompletionStatus(port, &mut bytes, &mut key, &mut returned, u32::MAX)
+        };
+        let error = if completed == 0 {
+            unsafe { GetLastError() }
+        } else {
+            0
+        };
+        check(key == 0x7777);
+        check((completed != 0 && bytes == 65536) || (error == 995 && bytes == 0));
+        let mut matched = false;
+        let mut j = 0;
+        while j < cancelled.len() {
+            if returned == (&mut cancelled[j] as *mut Overlapped as u64) {
+                check(!cancelled_seen[j]);
+                cancelled_seen[j] = true;
+                let result = unsafe { GetOverlappedResult(file, &mut cancelled[j], &mut count, 1) };
+                check(
+                    (completed != 0 && result != 0 && count == 65536)
+                        || (error == 995 && result == 0 && unsafe { GetLastError() } == 995),
+                );
+                matched = true;
+                break;
+            }
+            j += 1;
+        }
+        check(matched);
+        i += 1;
+    }
+    check(unsafe { GetQueuedCompletionStatus(port, &mut bytes, &mut key, &mut returned, 0) } == 0);
+    check(unsafe { GetLastError() } == 258 && returned == 0);
     check(unsafe { CloseHandle(file) } != 0 && unsafe { CloseHandle(port) } != 0);
     check(unsafe { CloseHandle(event) } != 0);
     unsafe { ExitProcess(0) }
