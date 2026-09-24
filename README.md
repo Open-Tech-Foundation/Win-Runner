@@ -17,8 +17,9 @@ wincli inspect app.exe    # PE compatibility report: supported vs missing import
 On Linux/x86-64, `wincli app.exe` executes PE instructions directly on the
 host CPU in a forked child. `WINCLI_BACKEND=native` and
 `WINCLI_BACKEND=native-linux-x64` select the same backend explicitly. Windows
-imports require native shims; unsupported imports fail before guest entry and
-are listed by `wincli inspect`. Other host platforms currently have no PE
+imports require native shims; an unsupported import fails with its name if the
+guest calls it. Set `WINCLI_NATIVE_STRICT_IMPORTS=1` to reject unsupported
+imports before entry. `wincli inspect` lists static shim coverage. Other host platforms currently have no PE
 execution backend.
 
 The native loader has experimental TLS/TEB/PEB initialization. It is not yet
@@ -39,7 +40,8 @@ src/ps1/     minimal interpreter: New-Item, Set-Content, Add-Content,
 tests/artifacts/  committed test artifacts (see below)
 ```
 
-Unsupported PE imports fail with a named error before guest execution.
+Unsupported PE imports fail with a named error when called. Strict import
+binding is available through `WINCLI_NATIVE_STRICT_IMPORTS=1`.
 
 ## Test artifacts
 
@@ -136,16 +138,19 @@ at portable Windows CLI tools to drive expansion one program at a time:
 wincli inspect rg.exe
 ```
 
-The official Node.js 24.21.0 Windows x64 `node.exe` is a native compatibility
-target. Its 424 static imports currently include 317 without native
-trampolines; execution stops at `CRYPT32.dll!CertCloseStore`. Node.js does not yet run on
-the native backend. The downloaded binary is kept locally under
-`target/nodejs/` for development and is not committed to this repository.
-For development, `WINCLI_NATIVE_DIAGNOSTIC=1 wincli node.exe --version` binds
-missing imports to native fail-on-call trampolines and names any missing API
-the guest actually calls. This mode does not make unsupported APIs functional.
-The current diagnostic run reaches a missing dynamic `NtDeviceIoControlFile`
-export and then the guest calls `DebugBreak`.
+The official Node.js 24.21.0 Windows x64 `node.exe` runs on the Linux native
+backend for version reporting and simple JavaScript evaluation:
+
+```bash
+WINCLI_BACKEND=native wincli node.exe --version
+WINCLI_BACKEND=native wincli node.exe -e 'console.log(1 + 2)'
+```
+
+The downloaded binary is kept locally under `target/nodejs/` for development
+and is not committed to this repository. Node still imports Windows APIs that
+WinCLI does not implement; untested Node features may stop at a named missing
+API. Set `WINCLI_NATIVE_DIAGNOSTIC=1` to log dynamic import misses and native
+startup calls.
 Set `WINCLI_NODE_EXE=target/nodejs/node-v24.21.0-win-x64.exe` when running
 `cargo test --test node_native` to include the real binary check. The executable
 comes from `https://nodejs.org/download/release/v24.21.0/win-x64/node.exe`;

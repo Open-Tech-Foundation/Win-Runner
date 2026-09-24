@@ -1,7 +1,7 @@
 use std::process::Command;
 use wincli::pe::builder::{build, Asm};
 
-fn run_guest(bytes: &[u8], diagnostic: bool) -> std::process::Output {
+fn run_guest(bytes: &[u8], diagnostic: bool, strict: bool) -> std::process::Output {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let path = std::env::temp_dir().join(format!(
         "wincli-native-diag-{}-{}.exe",
@@ -14,6 +14,9 @@ fn run_guest(bytes: &[u8], diagnostic: bool) -> std::process::Output {
     if diagnostic {
         command.env("WINCLI_NATIVE_DIAGNOSTIC", "1");
     }
+    if strict {
+        command.env("WINCLI_NATIVE_STRICT_IMPORTS", "1");
+    }
     let output = command.output().unwrap();
     std::fs::remove_file(path).ok();
     output
@@ -21,27 +24,33 @@ fn run_guest(bytes: &[u8], diagnostic: bool) -> std::process::Output {
 
 #[test]
 fn diagnostic_names_a_called_missing_import_in_native_guest() {
-    let output = run_guest(&wincli::pe::builder::unknown_import(), true);
+    let output = run_guest(&wincli::pe::builder::unknown_import(), true, false);
     assert_eq!(output.status.code(), Some(126));
     assert!(String::from_utf8_lossy(&output.stderr)
         .contains("unsupported native import called: KERNEL32.dll!NoSuchApiForTest"));
 }
 
 #[test]
-fn diagnostic_allows_an_unused_missing_import_but_normal_mode_rejects_it() {
+fn unused_missing_import_runs_by_default_but_strict_mode_rejects_it() {
     let mut asm = Asm::new();
     asm.sub_rsp(0x28);
     asm.mov_ecx_imm(0);
     asm.call_import(0);
-    let exe = build(asm, &[
-        ("KERNEL32.dll", "ExitProcess"),
-        ("KERNEL32.dll", "NoSuchApiForTest"),
-    ]);
-    let strict = run_guest(&exe, false);
+    let exe = build(
+        asm,
+        &[
+            ("KERNEL32.dll", "ExitProcess"),
+            ("KERNEL32.dll", "NoSuchApiForTest"),
+        ],
+    );
+    let strict = run_guest(&exe, false, true);
     assert_eq!(strict.status.code(), Some(1));
-    let diagnostic = run_guest(&exe, true);
+    assert!(String::from_utf8_lossy(&strict.stderr).contains("NoSuchApiForTest"));
+    let normal = run_guest(&exe, false, false);
+    assert_eq!(normal.status.code(), Some(0));
+    let diagnostic = run_guest(&exe, true, false);
     assert_eq!(diagnostic.status.code(), Some(0));
-    assert!(diagnostic.stderr.is_empty());
+    assert!(!String::from_utf8_lossy(&diagnostic.stderr).contains("unsupported native import called"));
 }
 
 #[test]
@@ -85,16 +94,24 @@ fn native_tls_slots_clear_values_when_reused_and_report_invalid_indices() {
     asm.mark(fail);
     asm.mov_ecx_imm(1);
     asm.call_import(5);
-    let exe = build(asm, &[
-        ("KERNEL32.dll", "TlsAlloc"),
-        ("KERNEL32.dll", "TlsSetValue"),
-        ("KERNEL32.dll", "TlsGetValue"),
-        ("KERNEL32.dll", "TlsFree"),
-        ("KERNEL32.dll", "GetLastError"),
-        ("KERNEL32.dll", "ExitProcess"),
-    ]);
-    let output = run_guest(&exe, false);
-    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+    let exe = build(
+        asm,
+        &[
+            ("KERNEL32.dll", "TlsAlloc"),
+            ("KERNEL32.dll", "TlsSetValue"),
+            ("KERNEL32.dll", "TlsGetValue"),
+            ("KERNEL32.dll", "TlsFree"),
+            ("KERNEL32.dll", "GetLastError"),
+            ("KERNEL32.dll", "ExitProcess"),
+        ],
+    );
+    let output = run_guest(&exe, false, false);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -119,10 +136,18 @@ fn native_error_mode_returns_previous_process_flags() {
     asm.mark(fail);
     asm.mov_ecx_imm(1);
     asm.call_import(1);
-    let exe = build(asm, &[
-        ("KERNEL32.dll", "SetErrorMode"),
-        ("KERNEL32.dll", "ExitProcess"),
-    ]);
-    let output = run_guest(&exe, false);
-    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+    let exe = build(
+        asm,
+        &[
+            ("KERNEL32.dll", "SetErrorMode"),
+            ("KERNEL32.dll", "ExitProcess"),
+        ],
+    );
+    let output = run_guest(&exe, false, false);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

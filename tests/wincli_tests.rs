@@ -19,9 +19,9 @@ use wincli::winfs::WinFs;
 
 fn run_exe_on_fs(data: &[u8], fs: WinFs) -> (u32, WinFs, Vec<u8>) {
     let image = pe::load(data).expect("PE should load with native imports");
-    let (code, output, fs) = wincli::native::run_rust_baseline_argv_with_fs(
-        &image, fs, "test.exe", &[],
-    ).expect("native PE should run");
+    let (code, output, fs) =
+        wincli::native::run_rust_baseline_argv_with_fs(&image, fs, "test.exe", &[])
+            .expect("native PE should run");
     (code, fs, output)
 }
 
@@ -237,15 +237,18 @@ fn native_timer_imports_run_on_the_host_clock() {
     a.mark(fail);
     a.mov_ecx_imm(1);
     a.call_import(2);
-    let exe = build(a, &[
-        ("KERNEL32.dll", "Sleep"),
-        ("WINMM.dll", "timeGetTime"),
-        ("KERNEL32.dll", "ExitProcess"),
-    ]);
+    let exe = build(
+        a,
+        &[
+            ("KERNEL32.dll", "Sleep"),
+            ("WINMM.dll", "timeGetTime"),
+            ("KERNEL32.dll", "ExitProcess"),
+        ],
+    );
     let image = pe::load_lenient(&exe).unwrap();
-    let (code, _, _) = wincli::native::run_rust_baseline_argv_with_fs(
-        &image, WinFs::new(), "timer.exe", &[],
-    ).unwrap();
+    let (code, _, _) =
+        wincli::native::run_rust_baseline_argv_with_fs(&image, WinFs::new(), "timer.exe", &[])
+            .unwrap();
     assert_eq!(code, 0);
 }
 
@@ -271,32 +274,43 @@ fn native_global_memory_status_ex_validates_and_populates_guest_buffer() {
     a.mark(fail);
     a.mov_ecx_imm(1);
     a.call_import(1);
-    let image = pe::load(&build(a, &[
-        ("KERNEL32.dll", "GlobalMemoryStatusEx"),
-        ("KERNEL32.dll", "ExitProcess"),
-    ])).unwrap();
-    let (code, _, _) = wincli::native::run_rust_baseline_argv_with_fs(
-        &image, WinFs::new(), "memory.exe", &[],
-    ).unwrap();
+    let image = pe::load(&build(
+        a,
+        &[
+            ("KERNEL32.dll", "GlobalMemoryStatusEx"),
+            ("KERNEL32.dll", "ExitProcess"),
+        ],
+    ))
+    .unwrap();
+    let (code, _, _) =
+        wincli::native::run_rust_baseline_argv_with_fs(&image, WinFs::new(), "memory.exe", &[])
+            .unwrap();
     assert_eq!(code, 0);
 }
 
 #[test]
-fn native_rejects_imports_without_a_platform_shim() {
+fn native_allows_unused_imports_without_a_platform_shim() {
     use pe::builder::{build, Asm};
     let mut a = Asm::new();
     a.sub_rsp(0x28);
     a.mov_ecx_imm(0);
     a.call_import(1);
-    let exe = build(a, &[
-        ("KERNEL32.dll", "GetLocaleInfoEx"),
-        ("KERNEL32.dll", "ExitProcess"),
-    ]);
+    let exe = build(
+        a,
+        &[
+            ("KERNEL32.dll", "NoSuchApiForTest"),
+            ("KERNEL32.dll", "ExitProcess"),
+        ],
+    );
     let image = pe::load_lenient(&exe).unwrap();
-    let err = wincli::native::run_rust_baseline_argv_with_fs(
-        &image, WinFs::new(), "unsupported.exe", &[],
-    ).err().expect("missing native shim should fail before execution");
-    assert!(err.contains("unsupported native import: KERNEL32.dll!GetLocaleInfoEx"));
+    let (code, _, _) = wincli::native::run_rust_baseline_argv_with_fs(
+        &image,
+        WinFs::new(),
+        "unsupported.exe",
+        &[],
+    )
+    .expect("unused import should bind to a fail-on-call trampoline");
+    assert_eq!(code, 0);
 }
 
 #[test]
@@ -1051,9 +1065,9 @@ fn test_argv_echo_lib_level() {
         "--version".to_string(),
     ];
     let image = pe::load(&bytes).unwrap();
-    let (code, out, _) = wincli::native::run_rust_baseline_argv_with_fs(
-        &image, WinFs::new(), "myprog.exe", &args,
-    ).unwrap();
+    let (code, out, _) =
+        wincli::native::run_rust_baseline_argv_with_fs(&image, WinFs::new(), "myprog.exe", &args)
+            .unwrap();
     assert_eq!(code, 0);
     assert_eq!(out, b"myprog.exe hello \"a b\" --version\n");
 }

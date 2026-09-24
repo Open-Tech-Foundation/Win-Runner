@@ -5,7 +5,7 @@ use std::path::Path;
 use std::process::Command;
 
 #[test]
-fn official_node_exposes_current_native_import_gap() {
+fn official_windows_node_runs_version_and_javascript_natively() {
     let Ok(path) = std::env::var("WINCLI_NODE_EXE") else {
         return;
     };
@@ -14,7 +14,10 @@ fn official_node_exposes_current_native_import_gap() {
     let report = wincli::inspect::inspect_pe(&bytes).expect("parse Windows node.exe");
     assert_eq!(report.arch, "x86_64");
     assert!(report.total() > 400, "unexpected Node.js import table");
-    assert!(!report.runnable(), "Node.js requires more native API shims");
+    assert!(
+        !report.runnable(),
+        "inspection still lists optional static imports"
+    );
 
     let output = Command::new(env!("CARGO_BIN_EXE_wincli"))
         .arg(path)
@@ -22,7 +25,25 @@ fn official_node_exposes_current_native_import_gap() {
         .env("WINCLI_BACKEND", "native")
         .output()
         .expect("start native WinCLI");
-    assert_eq!(output.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("unsupported native import: CRYPT32.dll!CertCloseStore"), "{stderr}");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "v24.21.0");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_wincli"))
+        .arg(path)
+        .args(["-e", "console.log(1 + 2)"])
+        .env("WINCLI_BACKEND", "native")
+        .output()
+        .expect("evaluate JavaScript through native WinCLI");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "3");
 }

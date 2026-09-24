@@ -738,12 +738,13 @@ pub fn read_file_to_stdout(path: &str) -> Vec<u8> {
     }
     // stdout = GetStdHandle(-11)
     a.mov_ecx_imm(0xFFFF_FFF5);
-    // need to preserve r8 across call! push r8 / pop after.
-    a.emit(&[0x41, 0x50]); // push r8
+    // Preserve r8 in the local stack frame; push would break Win64's
+    // 16-byte alignment requirement before the imported call.
+    a.emit(&[0x4C, 0x89, 0x44, 0x24, 0x38]); // mov [rsp+0x38], r8
     a.call_import(2);
     a.mov_rcx_rax(); // rcx = stdout
-    a.emit(&[0x41, 0x58]); // pop r8
-                           // rdx = buf
+    a.emit(&[0x4C, 0x8B, 0x44, 0x24, 0x38]); // mov r8, [rsp+0x38]
+                                             // rdx = buf
     a.lea_reg_rip(2, d_buf);
     // r9 = &written
     a.lea_reg_rip(9, d_written);

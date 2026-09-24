@@ -108,7 +108,7 @@ pub fn run_rust_baseline_argv_with_fs_streaming(
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod imp {
-    use super::{PeImage, COMMAND_LINE_BYTES, quote_arg};
+    use super::{quote_arg, PeImage, COMMAND_LINE_BYTES};
     use crate::winfs::WinFs;
     use std::collections::HashMap;
     use std::ffi::c_void;
@@ -127,6 +127,8 @@ mod imp {
     const MAP_FIXED_NOREPLACE: i32 = 0x100000;
     const MAP_FAILED: *mut c_void = usize::MAX as *mut c_void;
     const PROCESS_HEAP_HANDLE: u64 = 0x400;
+    const STD_HANDLE_BASE: u64 = 0x5000_0000;
+    const CRYPTO_PROVIDER_HANDLE: u64 = 0x4352_5950_544f_0001;
     // A child-local stand-in for the API-set modules dynamically requested by
     // the Universal CRT. It is deliberately not a host `dlopen` handle.
     const API_SET_MODULE: u64 = 0x5749_4e43_4c49_0001;
@@ -169,6 +171,7 @@ mod imp {
         ) -> *mut c_void;
         fn mprotect(addr: *mut c_void, len: usize, prot: i32) -> i32;
         fn munmap(addr: *mut c_void, len: usize) -> i32;
+        fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
         fn pipe(fds: *mut i32) -> i32;
         fn fork() -> i32;
         #[cfg(test)]
@@ -184,7 +187,16 @@ mod imp {
         fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void;
         fn free(ptr: *mut c_void);
         fn getrandom(buf: *mut c_void, buflen: usize, flags: u32) -> isize;
+        fn isatty(fd: i32) -> i32;
         fn clock_gettime(clock_id: i32, time: *mut NativeTimespec) -> i32;
+        fn socket(domain: i32, kind: i32, protocol: i32) -> i32;
+        fn getsockopt(
+            fd: i32,
+            level: i32,
+            option: i32,
+            value: *mut c_void,
+            length: *mut u32,
+        ) -> i32;
     }
 
     #[repr(C)]
@@ -229,43 +241,40 @@ mod imp {
     mod protection_tests {
         use super::{
             _exit, command_line_a, environment_block, linux_protection, load_native_child_image,
-            native_add_vectored_exception_handler, native_close_handle, native_create_process_w,
-            native_create_waitable_timer_ex_w, native_delete_critical_section,
+            native_acquire_srw_lock_exclusive, native_add_vectored_exception_handler,
+            native_close_handle, native_create_process_w, native_create_waitable_timer_ex_w,
+            native_decode_pointer, native_delete_critical_section, native_encode_pointer,
             native_enter_critical_section, native_extended_path, native_file_attributes,
-            native_encode_pointer, native_decode_pointer,
-            native_format_message_w, native_free_environment_strings_w, native_get_acp,
-            native_format_message_a,
-            native_get_computer_name_ex_w, native_get_console_mode, native_get_console_output_cp,
-            native_get_console_screen_buffer_info, native_get_cp_info,
-            native_get_current_directory_w, native_get_current_process,
+            native_format_message_a, native_format_message_w, native_free_environment_strings_w,
+            native_get_acp, native_get_computer_name_ex_w, native_get_console_mode,
+            native_get_console_output_cp, native_get_console_screen_buffer_info,
+            native_get_cp_info, native_get_current_directory_w, native_get_current_process,
             native_get_current_process_id, native_get_current_thread,
             native_get_environment_strings_w, native_get_environment_variable_w,
             native_get_exit_code_process, native_get_file_type, native_get_full_path_name_w,
             native_get_last_error, native_get_module_file_name_w, native_get_module_handle_a,
-            native_global_memory_status_ex, NativeMemoryStatus,
             native_get_module_handle_ex_w, native_get_module_handle_w, native_get_oem_cp,
             native_get_proc_address, native_get_startup_info_w, native_get_string_type_w,
-            native_get_system_info, native_get_user_profile_directory_w, native_heap_alloc,
-            native_heap_free, native_heap_realloc, native_initialize_critical_section_ex,
-            native_heap_size,
+            native_get_system_info, native_get_user_profile_directory_w,
+            native_global_memory_status_ex, native_heap_alloc, native_heap_free,
+            native_heap_realloc, native_heap_size, native_init_once_execute_once,
+            native_initialize_condition_variable,
             native_initialize_critical_section_and_spin_count,
-            native_initialize_srw_lock,
-            native_is_processor_feature_present,
-            native_rtl_get_version, native_rtl_nt_status_to_dos_error,
-            native_acquire_srw_lock_exclusive, native_release_srw_lock_exclusive,
-            native_try_acquire_srw_lock_shared, native_release_srw_lock_shared,
-            native_initialize_condition_variable, native_sleep_condition_variable_srw,
-            native_wake_all_condition_variable,
-            native_init_once_execute_once,
-            native_initialize_slist_head, native_is_valid_code_page, native_launch_spec,
-            native_lc_map_string_w, native_leave_critical_section, native_multi_byte_to_wide_char,
-            native_process_prng, native_query_performance_frequency, native_set_console_mode,
-            native_set_file_time, native_set_last_error, native_set_thread_stack_guarantee,
+            native_initialize_critical_section_ex, native_initialize_slist_head,
+            native_initialize_srw_lock, native_is_processor_feature_present,
+            native_is_valid_code_page, native_launch_spec, native_lc_map_string_w,
+            native_leave_critical_section, native_multi_byte_to_wide_char, native_process_prng,
+            native_query_performance_frequency, native_release_srw_lock_exclusive,
+            native_release_srw_lock_shared, native_rtl_get_version,
+            native_rtl_nt_status_to_dos_error, native_set_console_mode, native_set_file_time,
+            native_set_last_error, native_set_thread_stack_guarantee,
             native_set_unhandled_exception_filter, native_set_waitable_timer,
-            native_terminate_process, native_wait_for_single_object, native_wait_on_address,
+            native_sleep_condition_variable_srw, native_terminate_process,
+            native_try_acquire_srw_lock_shared, native_wait_for_single_object,
+            native_wait_on_address, native_wake_all_condition_variable,
             native_wide_char_to_multi_byte, native_write_console_w, parse_windows_command_line,
             process_ctx, uppercase_ascii_utf16, waitpid, write_process_information,
-            NativeLaunchSpec, API_SET_MODULE, PROT_EXEC, PROT_READ, PROT_WRITE,
+            NativeLaunchSpec, NativeMemoryStatus, API_SET_MODULE, PROT_EXEC, PROT_READ, PROT_WRITE,
         };
         use crate::winfs::WinFs;
 
@@ -280,6 +289,35 @@ mod imp {
                 linux_protection(0x40),
                 Some(PROT_READ | PROT_WRITE | PROT_EXEC)
             );
+        }
+
+        #[test]
+        fn system_info_uses_windows_x64_field_offsets() {
+            let mut info = [0u8; 48];
+            native_get_system_info(info.as_mut_ptr());
+            assert_eq!(u32::from_le_bytes(info[4..8].try_into().unwrap()), 4096);
+            assert_eq!(u32::from_le_bytes(info[32..36].try_into().unwrap()), 1);
+            assert_eq!(u32::from_le_bytes(info[36..40].try_into().unwrap()), 8664);
+            assert_eq!(u32::from_le_bytes(info[40..44].try_into().unwrap()), 65_536);
+        }
+
+        #[test]
+        fn locale_name_query_supports_sizing_and_short_buffers() {
+            assert_eq!(
+                super::native_get_locale_info_ex(std::ptr::null(), 0x5c, std::ptr::null_mut(), 0),
+                6
+            );
+            let mut short = [0u16; 2];
+            assert_eq!(
+                super::native_get_locale_info_ex(std::ptr::null(), 0x5c, short.as_mut_ptr(), 2),
+                0
+            );
+            let mut value = [0u16; 6];
+            assert_eq!(
+                super::native_get_locale_info_ex(std::ptr::null(), 0x5c, value.as_mut_ptr(), 6),
+                6
+            );
+            assert_eq!(String::from_utf16_lossy(&value[..5]), "en-US");
         }
 
         #[test]
@@ -300,9 +338,15 @@ mod imp {
         #[test]
         fn initializes_critical_section_with_spin_count() {
             let mut section = [0x5au8; 40];
-            assert_eq!(native_initialize_critical_section_and_spin_count(section.as_mut_ptr(), 4000), 1);
+            assert_eq!(
+                native_initialize_critical_section_and_spin_count(section.as_mut_ptr(), 4000),
+                1
+            );
             assert_eq!(section, [0; 40]);
-            assert_eq!(native_initialize_critical_section_and_spin_count(std::ptr::null_mut(), 0), 0);
+            assert_eq!(
+                native_initialize_critical_section_and_spin_count(std::ptr::null_mut(), 0),
+                0
+            );
         }
 
         #[test]
@@ -319,13 +363,22 @@ mod imp {
             let ptr = super::native_heap_alloc(super::PROCESS_HEAP_HANDLE, 0x8, 3);
             assert_ne!(ptr, 0);
             assert_eq!(native_heap_size(super::PROCESS_HEAP_HANDLE, 0, ptr), 3);
-            assert_eq!(unsafe { std::slice::from_raw_parts(ptr as *const u8, 3) }, &[0, 0, 0]);
+            assert_eq!(
+                unsafe { std::slice::from_raw_parts(ptr as *const u8, 3) },
+                &[0, 0, 0]
+            );
             let grown = native_heap_realloc(super::PROCESS_HEAP_HANDLE, 0x8, ptr, 9);
             assert_ne!(grown, 0);
             assert_eq!(native_heap_size(super::PROCESS_HEAP_HANDLE, 0, grown), 9);
-            assert_eq!(unsafe { std::slice::from_raw_parts(grown as *const u8, 9) }, &[0; 9]);
+            assert_eq!(
+                unsafe { std::slice::from_raw_parts(grown as *const u8, 9) },
+                &[0; 9]
+            );
             assert_eq!(native_heap_free(super::PROCESS_HEAP_HANDLE, 0, grown), 1);
-            assert_eq!(native_heap_size(super::PROCESS_HEAP_HANDLE, 0, grown), usize::MAX);
+            assert_eq!(
+                native_heap_size(super::PROCESS_HEAP_HANDLE, 0, grown),
+                usize::MAX
+            );
             assert_eq!(native_heap_free(super::PROCESS_HEAP_HANDLE, 0, grown), 0);
         }
 
@@ -351,7 +404,10 @@ mod imp {
         #[test]
         fn processor_feature_query_reports_host_isa_and_rejects_unknown_ids() {
             assert_eq!(native_is_processor_feature_present(10), 1); // SSE2 is required by x86-64
-            assert_eq!(native_is_processor_feature_present(40), std::is_x86_feature_detected!("avx2") as i32);
+            assert_eq!(
+                native_is_processor_feature_present(40),
+                std::is_x86_feature_detected!("avx2") as i32
+            );
             assert_eq!(native_is_processor_feature_present(999), 0);
         }
 
@@ -375,14 +431,20 @@ mod imp {
             native_initialize_srw_lock(&mut lock);
             native_initialize_condition_variable(&mut condition);
             native_acquire_srw_lock_exclusive(&mut lock);
-            assert_eq!(native_sleep_condition_variable_srw(&mut condition, &mut lock, 0, 0), 0);
+            assert_eq!(
+                native_sleep_condition_variable_srw(&mut condition, &mut lock, 0, 0),
+                0
+            );
             assert_eq!(native_try_acquire_srw_lock_shared(&mut lock), 0);
             let condition_address = (&mut condition as *mut u64) as usize;
             let worker = std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(5));
                 native_wake_all_condition_variable(condition_address as *mut u64);
             });
-            assert_eq!(native_sleep_condition_variable_srw(&mut condition, &mut lock, 1000, 0), 1);
+            assert_eq!(
+                native_sleep_condition_variable_srw(&mut condition, &mut lock, 1000, 0),
+                1
+            );
             native_release_srw_lock_exclusive(&mut lock);
             worker.join().unwrap();
         }
@@ -391,7 +453,9 @@ mod imp {
         fn init_once_retries_failed_callback_and_caches_context() {
             extern "win64" fn callback(_once: *mut u64, parameter: u64, context: *mut u64) -> i32 {
                 let calls = unsafe { &*(parameter as *const std::sync::atomic::AtomicU32) };
-                if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 { return 0; }
+                if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    return 0;
+                }
                 unsafe { context.write(0x1234) };
                 1
             }
@@ -400,11 +464,20 @@ mod imp {
             let mut context = 0u64;
             let param = (&calls as *const std::sync::atomic::AtomicU32) as u64;
             let cb = callback as *const () as usize as u64;
-            assert_eq!(native_init_once_execute_once(&mut once, cb, param, &mut context), 0);
-            assert_eq!(native_init_once_execute_once(&mut once, cb, param, &mut context), 1);
+            assert_eq!(
+                native_init_once_execute_once(&mut once, cb, param, &mut context),
+                0
+            );
+            assert_eq!(
+                native_init_once_execute_once(&mut once, cb, param, &mut context),
+                1
+            );
             assert_eq!(context, 0x1234);
             context = 0;
-            assert_eq!(native_init_once_execute_once(&mut once, cb, param, &mut context), 1);
+            assert_eq!(
+                native_init_once_execute_once(&mut once, cb, param, &mut context),
+                1
+            );
             assert_eq!(context, 0x1234);
             assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
         }
@@ -413,9 +486,15 @@ mod imp {
         fn validates_native_memory_status_buffer_length() {
             assert_eq!(native_global_memory_status_ex(std::ptr::null_mut()), 0);
             let mut status = NativeMemoryStatus {
-                length: 63, load: 0, total_physical: 0, available_physical: 0,
-                total_page_file: 0, available_page_file: 0, total_virtual: 0,
-                available_virtual: 0, available_extended_virtual: 0,
+                length: 63,
+                load: 0,
+                total_physical: 0,
+                available_physical: 0,
+                total_page_file: 0,
+                available_page_file: 0,
+                total_virtual: 0,
+                available_virtual: 0,
+                available_extended_virtual: 0,
             };
             assert_eq!(native_global_memory_status_ex(&mut status), 0);
             assert_eq!(status.total_physical, 0);
@@ -746,7 +825,7 @@ mod imp {
             assert_eq!(u16::from_le_bytes(output[..2].try_into().unwrap()), 9);
             assert_eq!(u32::from_le_bytes(output[4..8].try_into().unwrap()), 4096);
             assert_eq!(
-                u32::from_le_bytes(output[36..40].try_into().unwrap()),
+                u32::from_le_bytes(output[40..44].try_into().unwrap()),
                 65_536
             );
         }
@@ -859,7 +938,10 @@ mod imp {
         #[test]
         fn formats_ansi_system_error_and_rejects_short_buffer() {
             let mut short = [0u8; 4];
-            assert_eq!(native_format_message_a(0x1000, 0, 5, 0, short.as_mut_ptr(), 4, 0), 0);
+            assert_eq!(
+                native_format_message_a(0x1000, 0, 5, 0, short.as_mut_ptr(), 4, 0),
+                0
+            );
             let mut output = [0u8; 64];
             let count = native_format_message_a(0x1000, 0, 5, 0, output.as_mut_ptr(), 64, 0);
             assert_eq!(&output[..count as usize], b"WinCLI native error.\r\n");
@@ -891,7 +973,10 @@ mod imp {
                 native_get_proc_address(API_SET_MODULE, c"GetEnvironmentVariableW".as_ptr().cast()),
                 native_get_environment_variable_w as *const () as usize as u64
             );
-            assert_ne!(native_get_proc_address(API_SET_MODULE, c"FlsAlloc".as_ptr().cast()), 0);
+            assert_ne!(
+                native_get_proc_address(API_SET_MODULE, c"FlsAlloc".as_ptr().cast()),
+                0
+            );
             assert_eq!(
                 native_get_proc_address(API_SET_MODULE, c"UnknownExport".as_ptr().cast()),
                 0
@@ -944,10 +1029,17 @@ mod imp {
         }
 
         #[test]
-        fn classifies_native_standard_descriptors_as_console_handles() {
-            assert_eq!(native_get_file_type(0), 2);
-            assert_eq!(native_get_file_type(1), 2);
-            assert_eq!(native_get_file_type(2), 2);
+        fn classifies_native_standard_descriptors_by_terminal_state() {
+            for fd in 0..=2 {
+                assert_eq!(
+                    native_get_file_type(fd),
+                    if unsafe { super::isatty(fd as i32) } != 0 {
+                        2
+                    } else {
+                        3
+                    }
+                );
+            }
             assert_eq!(native_get_file_type(0x100), 0);
         }
 
@@ -966,9 +1058,15 @@ mod imp {
 
         #[test]
         fn resolves_loaded_windows_module_names_in_wide_form() {
-            let kernel: Vec<u16> = "KERNEL32.dll".encode_utf16().chain(std::iter::once(0)).collect();
+            let kernel: Vec<u16> = "KERNEL32.dll"
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
             assert_eq!(native_get_module_handle_w(kernel.as_ptr()), API_SET_MODULE);
-            let missing: Vec<u16> = "missing.dll".encode_utf16().chain(std::iter::once(0)).collect();
+            let missing: Vec<u16> = "missing.dll"
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
             assert_eq!(native_get_module_handle_w(missing.as_ptr()), 0);
         }
 
@@ -1261,10 +1359,7 @@ mod imp {
             .lock()
             .map_err(|_| "native backend execution lock is poisoned".to_string())?;
         if !img.imports.is_empty() || !img.unsupported.is_empty() {
-            return Err(
-                "import-free native entry point cannot bind PE imports"
-                    .to_string(),
-            );
+            return Err("import-free native entry point cannot bind PE imports".to_string());
         }
         if img.tls.is_some() {
             return Err("import-free native entry point cannot initialize TLS".to_string());
@@ -1321,6 +1416,39 @@ mod imp {
     fn put64(dst: &mut [u8], off: usize, value: u64) {
         dst[off..off + 8].copy_from_slice(&value.to_le_bytes());
     }
+    fn set_teb_stack_bounds(teb: &mut [u8; 0x1000]) {
+        let marker = 0u8;
+        let stack_pointer = (&marker as *const u8) as usize;
+        if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
+            for line in maps.lines() {
+                let Some((range, _)) = line.split_once(' ') else {
+                    continue;
+                };
+                let Some((start, end)) = range.split_once('-') else {
+                    continue;
+                };
+                let (Ok(start), Ok(end)) = (
+                    usize::from_str_radix(start, 16),
+                    usize::from_str_radix(end, 16),
+                ) else {
+                    continue;
+                };
+                if start <= stack_pointer && stack_pointer < end {
+                    let limit = if line.contains("[stack]") {
+                        end.saturating_sub(8 * 1024 * 1024)
+                    } else {
+                        start
+                    };
+                    put64(teb, 0x08, end as u64); // NT_TIB.StackBase
+                    put64(teb, 0x10, limit as u64); // NT_TIB.StackLimit
+                    if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+                        eprintln!("native TEB stack base={end:#x} limit={limit:#x} rsp={stack_pointer:#x}");
+                    }
+                    return;
+                }
+            }
+        }
+    }
     fn setup_tls(mapping: &Mapping, img: &PeImage) -> Result<Option<NativeTls>, String> {
         let Some(tls) = &img.tls else { return Ok(None) };
         let mut data = tls.raw_data.clone();
@@ -1356,7 +1484,7 @@ mod imp {
         stack_size: usize,
         start: u64,
         parameter: u64,
-        _flags: u32,
+        flags: u32,
         thread_id: *mut u32,
     ) -> u64 {
         if start == 0 {
@@ -1375,9 +1503,24 @@ mod imp {
         let handle = process.thread_next.fetch_add(1, Ordering::AcqRel);
         let builder = std::thread::Builder::new().stack_size(stack_size.max(64 * 1024));
         let thread_process = Arc::clone(&process);
+        let suspension = Arc::new((Mutex::new((flags & 4 != 0) as u32), Condvar::new()));
+        let thread_suspension = Arc::clone(&suspension);
         let spawned = builder.spawn(move || {
-            let _tls = tls;
-            if let Some(tls) = _tls.as_ref() {
+            THREAD_NATIVE_HANDLE.set(handle);
+            let (count, ready) = &*thread_suspension;
+            let Ok(mut count) = count.lock() else {
+                return 1;
+            };
+            while *count != 0 {
+                count = match ready.wait(count) {
+                    Ok(count) => count,
+                    Err(_) => return 1,
+                };
+            }
+            drop(count);
+            let mut _tls = tls;
+            if let Some(tls) = _tls.as_mut() {
+                set_teb_stack_bounds(&mut tls.teb);
                 if !unsafe { set_gs(tls.teb.as_ptr() as u64) } {
                     return 1;
                 }
@@ -1396,7 +1539,14 @@ mod imp {
         }
         let result = match process.threads.lock() {
             Ok(mut threads) => {
-                threads.insert(handle, NativeThread { join: Some(join), exit_code: None });
+                threads.insert(
+                    handle,
+                    NativeThread {
+                        join: Some(join),
+                        exit_code: None,
+                        suspension,
+                    },
+                );
                 handle
             }
             Err(_) => {
@@ -1404,25 +1554,105 @@ mod imp {
                 0
             }
         };
+        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+            eprintln!("native CreateThread start={start:#x} handle={result:#x}");
+        }
         result
     }
+    extern "win64" fn native_resume_thread(handle: u64) -> u32 {
+        let Some(suspension) = process_ctx().and_then(|process| {
+            process.threads.lock().ok().and_then(|threads| {
+                threads
+                    .get(&handle)
+                    .map(|thread| Arc::clone(&thread.suspension))
+            })
+        }) else {
+            native_set_last_error(6);
+            return u32::MAX;
+        };
+        let (count, ready) = &*suspension;
+        let Ok(mut count) = count.lock() else {
+            return u32::MAX;
+        };
+        let previous = *count;
+        if *count > 0 {
+            *count -= 1;
+            if *count == 0 {
+                ready.notify_one();
+            }
+        }
+        previous
+    }
     extern "win64" fn native_wait_for_single_object(handle: u64, milliseconds: u32) -> u32 {
+        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+            eprintln!("native WaitForSingleObject handle={handle:#x} timeout={milliseconds}");
+        }
         let process = process_ctx();
-        if process.as_ref().is_some_and(|process| process.threads.lock().ok()
-            .is_some_and(|threads| threads.contains_key(&handle))) {
-            let deadline = if milliseconds == u32::MAX { None } else {
+        if let Some(semaphore) = process.as_ref().and_then(|process| {
+            process
+                .semaphores
+                .lock()
+                .ok()
+                .and_then(|semaphores| semaphores.get(&handle).cloned())
+        }) {
+            let Ok(mut count) = semaphore.count.lock() else {
+                return u32::MAX;
+            };
+            if milliseconds == u32::MAX {
+                while *count == 0 {
+                    count = match semaphore.changed.wait(count) {
+                        Ok(count) => count,
+                        Err(_) => return u32::MAX,
+                    };
+                }
+            } else {
+                let Ok((new_count, _)) = semaphore.changed.wait_timeout_while(
+                    count,
+                    std::time::Duration::from_millis(milliseconds as u64),
+                    |count| *count == 0,
+                ) else {
+                    return u32::MAX;
+                };
+                count = new_count;
+                if *count == 0 {
+                    return 258;
+                } // WAIT_TIMEOUT
+            }
+            *count -= 1;
+            return 0; // WAIT_OBJECT_0
+        }
+        if process.as_ref().is_some_and(|process| {
+            process
+                .threads
+                .lock()
+                .ok()
+                .is_some_and(|threads| threads.contains_key(&handle))
+        }) {
+            let deadline = if milliseconds == u32::MAX {
+                None
+            } else {
                 std::time::Instant::now()
                     .checked_add(std::time::Duration::from_millis(milliseconds as u64))
             };
             loop {
                 let join = {
-                    let Some(process) = process.as_ref() else { return 0xffff_ffff; };
-                    let Ok(mut threads) = process.threads.lock() else { return 0xffff_ffff; };
-                    let Some(thread) = threads.get_mut(&handle) else { return 0xffff_ffff; };
-                    if thread.exit_code.is_some() { return 0; }
+                    let Some(process) = process.as_ref() else {
+                        return 0xffff_ffff;
+                    };
+                    let Ok(mut threads) = process.threads.lock() else {
+                        return 0xffff_ffff;
+                    };
+                    let Some(thread) = threads.get_mut(&handle) else {
+                        return 0xffff_ffff;
+                    };
+                    if thread.exit_code.is_some() {
+                        return 0;
+                    }
                     if thread.join.as_ref().is_some_and(|join| join.is_finished()) {
                         thread.join.take()
-                    } else { None }
+                    } else {
+                        None
+                    }
                 };
                 if let Some(join) = join {
                     let code = join.join().unwrap_or(1);
@@ -1480,6 +1710,208 @@ mod imp {
                 result
             }
         }
+    }
+    extern "win64" fn native_create_semaphore_a(
+        _attributes: *const u8,
+        initial: i32,
+        maximum: i32,
+        _name: *const u8,
+    ) -> u64 {
+        if initial < 0 || maximum <= 0 || initial > maximum {
+            native_set_last_error(87); // ERROR_INVALID_PARAMETER
+            return 0;
+        }
+        let Some(process) = process_ctx() else {
+            return 0;
+        };
+        let handle = process.semaphore_next.fetch_add(1, Ordering::AcqRel);
+        let semaphore = Arc::new(NativeSemaphore {
+            count: Mutex::new(initial),
+            changed: Condvar::new(),
+            maximum,
+        });
+        if process.semaphores.lock().is_ok_and(|mut values| {
+            values.insert(handle, semaphore);
+            true
+        }) {
+            handle
+        } else {
+            0
+        }
+    }
+    extern "win64" fn native_release_semaphore(
+        handle: u64,
+        release: i32,
+        previous: *mut i32,
+    ) -> i32 {
+        let Some(semaphore) = process_ctx().and_then(|process| {
+            process
+                .semaphores
+                .lock()
+                .ok()
+                .and_then(|values| values.get(&handle).cloned())
+        }) else {
+            native_set_last_error(6);
+            return 0;
+        };
+        let Ok(mut count) = semaphore.count.lock() else {
+            return 0;
+        };
+        if release <= 0 || release > semaphore.maximum - *count {
+            native_set_last_error(298); // ERROR_TOO_MANY_POSTS
+            return 0;
+        }
+        if !previous.is_null() {
+            unsafe { previous.write(*count) };
+        }
+        *count += release;
+        semaphore.changed.notify_all();
+        1
+    }
+    extern "win64" fn native_create_io_completion_port(
+        file: u64,
+        existing_port: u64,
+        _completion_key: u64,
+        _concurrent_threads: u32,
+    ) -> u64 {
+        let Some(process) = process_ctx() else {
+            return 0;
+        };
+        if existing_port != 0 {
+            let valid = process
+                .completion_ports
+                .lock()
+                .is_ok_and(|values| values.contains_key(&existing_port));
+            if !valid {
+                native_set_last_error(6);
+                return 0;
+            }
+            return existing_port;
+        }
+        if file != u64::MAX && file != 0 {
+            native_set_last_error(87); // A new port requires INVALID_HANDLE_VALUE.
+            return 0;
+        }
+        let handle = process.completion_next.fetch_add(1, Ordering::AcqRel);
+        let port = Arc::new(NativeCompletionPort {
+            queue: Mutex::new(std::collections::VecDeque::new()),
+            ready: Condvar::new(),
+        });
+        if process.completion_ports.lock().is_ok_and(|mut values| {
+            values.insert(handle, port);
+            true
+        }) {
+            handle
+        } else {
+            0
+        }
+    }
+    extern "win64" fn native_post_queued_completion_status(
+        handle: u64,
+        bytes: u32,
+        key: u64,
+        overlapped: u64,
+    ) -> i32 {
+        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+            eprintln!("native PostQueuedCompletionStatus key={key:#x} overlap={overlapped:#x}");
+        }
+        let Some(port) = process_ctx().and_then(|process| {
+            process
+                .completion_ports
+                .lock()
+                .ok()
+                .and_then(|values| values.get(&handle).cloned())
+        }) else {
+            native_set_last_error(6);
+            return 0;
+        };
+        let Ok(mut queue) = port.queue.lock() else {
+            return 0;
+        };
+        queue.push_back(NativeCompletion {
+            key,
+            overlapped,
+            bytes,
+        });
+        port.ready.notify_one();
+        1
+    }
+    #[repr(C)]
+    struct NativeOverlappedEntry {
+        key: u64,
+        overlapped: u64,
+        internal: u64,
+        bytes: u32,
+        _padding: u32,
+    }
+    extern "win64" fn native_get_queued_completion_status_ex(
+        handle: u64,
+        entries: *mut NativeOverlappedEntry,
+        count: u32,
+        removed: *mut u32,
+        timeout: u32,
+        _alertable: i32,
+    ) -> i32 {
+        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+            eprintln!("native GetQueuedCompletionStatusEx timeout={timeout} count={count}");
+        }
+        if entries.is_null() || removed.is_null() || count == 0 {
+            native_set_last_error(87);
+            return 0;
+        }
+        let Some(port) = process_ctx().and_then(|process| {
+            process
+                .completion_ports
+                .lock()
+                .ok()
+                .and_then(|values| values.get(&handle).cloned())
+        }) else {
+            native_set_last_error(6);
+            return 0;
+        };
+        let Ok(mut queue) = port.queue.lock() else {
+            return 0;
+        };
+        if timeout == u32::MAX {
+            while queue.is_empty() {
+                queue = match port.ready.wait(queue) {
+                    Ok(queue) => queue,
+                    Err(_) => return 0,
+                };
+            }
+        } else if queue.is_empty() {
+            let Ok((new_queue, _)) = port.ready.wait_timeout_while(
+                queue,
+                std::time::Duration::from_millis(timeout as u64),
+                |queue| queue.is_empty(),
+            ) else {
+                return 0;
+            };
+            queue = new_queue;
+        }
+        if queue.is_empty() {
+            unsafe { removed.write(0) };
+            native_set_last_error(258); // WAIT_TIMEOUT
+            return 0;
+        }
+        let mut n = 0;
+        while n < count {
+            let Some(completion) = queue.pop_front() else {
+                break;
+            };
+            unsafe {
+                entries.add(n as usize).write(NativeOverlappedEntry {
+                    key: completion.key,
+                    overlapped: completion.overlapped,
+                    internal: 0,
+                    bytes: completion.bytes,
+                    _padding: 0,
+                })
+            };
+            n += 1;
+        }
+        unsafe { removed.write(n) };
+        1
     }
     extern "win64" fn native_wait_on_address(
         address: *const u8,
@@ -1647,16 +2079,27 @@ mod imp {
         command_line_a: Vec<u8>,
         environment: Vec<(String, String)>,
         environment_block: Vec<u16>,
+        std_handles: [AtomicU64; 3],
         fs: Arc<Mutex<NativeFs>>,
         last_error: AtomicU32,
         error_mode: AtomicU32,
         pointer_cookie: u64,
         heap_allocations: Mutex<HashMap<u64, usize>>,
+        virtual_allocations: Mutex<HashMap<u64, NativeVirtualAllocation>>,
+        file_mappings: Mutex<HashMap<u64, (usize, u32)>>,
+        mapping_views: Mutex<HashMap<u64, usize>>,
+        mapping_next: AtomicU64,
         gs_base: AtomicU64,
         tls_template: Mutex<Option<NativeTls>>,
         dynamic_tls: Mutex<DynamicTlsSlots>,
         threads: Mutex<HashMap<u64, NativeThread>>,
         thread_next: AtomicU64,
+        semaphores: Mutex<HashMap<u64, Arc<NativeSemaphore>>>,
+        semaphore_next: AtomicU64,
+        completion_ports: Mutex<HashMap<u64, Arc<NativeCompletionPort>>>,
+        completion_next: AtomicU64,
+        duplicate_handles: Mutex<HashMap<u64, u64>>,
+        duplicate_next: AtomicU64,
         timer_next: AtomicU64,
         state_fd: AtomicU32,
         fls_value: AtomicU64,
@@ -1670,6 +2113,26 @@ mod imp {
     struct NativeThread {
         join: Option<std::thread::JoinHandle<u32>>,
         exit_code: Option<u32>,
+        suspension: Arc<(Mutex<u32>, Condvar)>,
+    }
+
+    struct NativeSemaphore {
+        count: Mutex<i32>,
+        changed: Condvar,
+        maximum: i32,
+    }
+
+    struct NativeVirtualAllocation {
+        length: usize,
+    }
+    struct NativeCompletionPort {
+        queue: Mutex<std::collections::VecDeque<NativeCompletion>>,
+        ready: Condvar,
+    }
+    struct NativeCompletion {
+        key: u64,
+        overlapped: u64,
+        bytes: u32,
     }
 
     struct DynamicTlsSlots {
@@ -1688,12 +2151,18 @@ mod imp {
         fn new(static_tls: bool) -> Self {
             let mut active = [false; 64];
             active[0] = static_tls;
-            Self { active, generation: [0; 64], reserved_static: static_tls }
+            Self {
+                active,
+                generation: [0; 64],
+                reserved_static: static_tls,
+            }
         }
     }
     thread_local! {
         static THREAD_TLS_VALUES: std::cell::RefCell<[(u64, u64); 64]> =
             const { std::cell::RefCell::new([(0, 0); 64]) };
+        static THREAD_WSA_ERROR: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+        static THREAD_NATIVE_HANDLE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
 
     // Import trampolines have no guest-context argument. This is therefore a
@@ -1715,6 +2184,11 @@ mod imp {
             command_line_a: vec![0],
             environment: Vec::new(),
             environment_block: vec![0, 0],
+            std_handles: [
+                AtomicU64::new(STD_HANDLE_BASE),
+                AtomicU64::new(STD_HANDLE_BASE + 1),
+                AtomicU64::new(STD_HANDLE_BASE + 2),
+            ],
             fs: Arc::new(Mutex::new(NativeFs {
                 fs: WinFs::new(),
                 handles: HashMap::new(),
@@ -1725,11 +2199,21 @@ mod imp {
             error_mode: AtomicU32::new(0),
             pointer_cookie: random_pointer_cookie(),
             heap_allocations: Mutex::new(HashMap::new()),
+            virtual_allocations: Mutex::new(HashMap::new()),
+            file_mappings: Mutex::new(HashMap::new()),
+            mapping_views: Mutex::new(HashMap::new()),
+            mapping_next: AtomicU64::new(0x9800_0000),
             gs_base: AtomicU64::new(0),
             tls_template: Mutex::new(None),
             dynamic_tls: Mutex::new(DynamicTlsSlots::new(false)),
             threads: Mutex::new(HashMap::new()),
             thread_next: AtomicU64::new(0x8000_0000),
+            semaphores: Mutex::new(HashMap::new()),
+            semaphore_next: AtomicU64::new(0x6000_0000),
+            completion_ports: Mutex::new(HashMap::new()),
+            completion_next: AtomicU64::new(0x9000_0000),
+            duplicate_handles: Mutex::new(HashMap::new()),
+            duplicate_next: AtomicU64::new(0xa000_0000),
             timer_next: AtomicU64::new(0x7000_0000),
             state_fd: AtomicU32::new(u32::MAX),
             fls_value: AtomicU64::new(0),
@@ -1924,18 +2408,149 @@ mod imp {
     }
 
     extern "win64" fn native_get_std_handle(which: u32) -> u64 {
-        match which as i32 {
+        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+            eprintln!("native GetStdHandle which={which:#x}");
+        }
+        let index = match which as i32 {
             -10 => 0,
             -11 => 1,
             -12 => 2,
-            _ => u64::MAX,
+            _ => return u64::MAX,
+        };
+        process_ctx()
+            .map(|process| process.std_handles[index].load(Ordering::Acquire))
+            .unwrap_or(u64::MAX)
+    }
+
+    extern "win64" fn native_set_std_handle(which: u32, handle: u64) -> i32 {
+        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+            eprintln!(
+                "native SetStdHandle which={} handle={handle:#x}",
+                which as i32
+            );
+        }
+        let index = match which as i32 {
+            -10 => 0,
+            -11 => 1,
+            -12 => 2,
+            _ => {
+                native_set_last_error(87);
+                return 0;
+            }
+        };
+        let Some(process) = process_ctx() else {
+            return 0;
+        };
+        process.std_handles[index].store(handle, Ordering::Release);
+        1
+    }
+
+    extern "win64" fn native_set_handle_information(handle: u64, mask: u32, _flags: u32) -> i32 {
+        if mask & !0x3 != 0 {
+            native_set_last_error(87);
+            return 0;
+        }
+        if host_standard_fd(handle).is_some()
+            || fs_ctx().is_some_and(|context| {
+                context
+                    .lock()
+                    .is_ok_and(|fs| fs.handles.contains_key(&handle))
+            })
+        {
+            return 1;
+        }
+        native_set_last_error(6);
+        0
+    }
+    extern "win64" fn native_duplicate_handle(
+        source_process: u64,
+        source_handle: u64,
+        target_process: u64,
+        target_handle: *mut u64,
+        desired_access: u32,
+        inherit: i32,
+        options: u32,
+    ) -> i32 {
+        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+            eprintln!("native DuplicateHandle source_process={source_process:#x} source={source_handle:#x} target_process={target_process:#x} desired={desired_access:#x} inherit={inherit} options={options:#x}");
+        }
+        if target_handle.is_null() {
+            native_set_last_error(87);
+            return 0;
+        }
+        let Some(process) = process_ctx() else {
+            return 0;
+        };
+        if source_process != process.process_handle || target_process != process.process_handle {
+            native_set_last_error(6);
+            return 0;
+        }
+        let original = process
+            .duplicate_handles
+            .lock()
+            .ok()
+            .and_then(|values| values.get(&source_handle).copied())
+            .unwrap_or(source_handle);
+        let valid = matches!(original, u64::MAX | 0xffff_ffff_ffff_fffe)
+            || host_standard_fd(original).is_some()
+            || process
+                .threads
+                .lock()
+                .is_ok_and(|values| values.contains_key(&original))
+            || process
+                .completion_ports
+                .lock()
+                .is_ok_and(|values| values.contains_key(&original))
+            || fs_ctx().is_some_and(|context| {
+                context
+                    .lock()
+                    .is_ok_and(|fs| fs.handles.contains_key(&original))
+            });
+        if !valid {
+            native_set_last_error(6);
+            return 0;
+        }
+        let duplicate = process.duplicate_next.fetch_add(1, Ordering::AcqRel);
+        match process.duplicate_handles.lock() {
+            Ok(mut values) => {
+                values.insert(duplicate, original);
+            }
+            Err(_) => return 0,
+        }
+        unsafe { target_handle.write(duplicate) };
+        if options & 1 != 0 && source_handle != original {
+            if let Ok(mut values) = process.duplicate_handles.lock() {
+                values.remove(&source_handle);
+            }
+        }
+        1
+    }
+
+    fn host_standard_fd(handle: u64) -> Option<i32> {
+        match handle {
+            0..=2 => Some(handle as i32),
+            STD_HANDLE_BASE..=0x5000_0002 => Some((handle - STD_HANDLE_BASE) as i32),
+            _ => process_ctx()
+                .and_then(|process| {
+                    process
+                        .duplicate_handles
+                        .lock()
+                        .ok()
+                        .and_then(|values| values.get(&handle).copied())
+                })
+                .and_then(|original| match original {
+                    0..=2 => Some(original as i32),
+                    STD_HANDLE_BASE..=0x5000_0002 => Some((original - STD_HANDLE_BASE) as i32),
+                    _ => None,
+                }),
         }
     }
 
     extern "win64" fn native_get_file_type(handle: u64) -> u32 {
-        match handle {
-            0..=2 => 0x0002, // FILE_TYPE_CHAR
-            _ => 0,
+        match host_standard_fd(handle) {
+            Some(fd) if unsafe { isatty(fd) } != 0 => 0x0002,
+            Some(_) => 0x0003, // anonymous launcher pipes
+            None => 0,
         }
     }
 
@@ -1962,16 +2577,36 @@ mod imp {
             wide(name)
                 .filter(|name| native_module_name_supported(name))
                 .map(|_| API_SET_MODULE)
-                .unwrap_or_else(|| { native_set_last_error(126); 0 })
+                .unwrap_or_else(|| {
+                    native_set_last_error(126);
+                    0
+                })
         }
     }
     fn native_module_name_supported(name: &str) -> bool {
-        let module = name.rsplit(['\\', '/']).next().unwrap_or(name).to_ascii_lowercase();
-        matches!(module.as_str(),
-            "kernel32" | "kernel32.dll" | "kernelbase" | "kernelbase.dll" |
-            "ntdll" | "ntdll.dll" | "advapi32" | "advapi32.dll" |
-            "bcryptprimitives" | "bcryptprimitives.dll" | "userenv" | "userenv.dll" |
-            "winmm" | "winmm.dll" | "ws2_32" | "ws2_32.dll"
+        let module = name
+            .rsplit(['\\', '/'])
+            .next()
+            .unwrap_or(name)
+            .to_ascii_lowercase();
+        matches!(
+            module.as_str(),
+            "kernel32"
+                | "kernel32.dll"
+                | "kernelbase"
+                | "kernelbase.dll"
+                | "ntdll"
+                | "ntdll.dll"
+                | "advapi32"
+                | "advapi32.dll"
+                | "bcryptprimitives"
+                | "bcryptprimitives.dll"
+                | "userenv"
+                | "userenv.dll"
+                | "winmm"
+                | "winmm.dll"
+                | "ws2_32"
+                | "ws2_32.dll"
         )
     }
     extern "win64" fn native_get_module_handle_ex_w(
@@ -2022,6 +2657,20 @@ mod imp {
                 .store(handler, Ordering::Release);
         }
         handler | 1
+    }
+    extern "win64" fn native_remove_vectored_exception_handler(handle: u64) -> u32 {
+        let Some(process) = process_ctx() else {
+            return 0;
+        };
+        let current = process.vectored_exception_handler.load(Ordering::Acquire);
+        if current != 0 && handle == current | 1 {
+            process
+                .vectored_exception_handler
+                .store(0, Ordering::Release);
+            1
+        } else {
+            0
+        }
     }
 
     extern "win64" fn native_set_thread_stack_guarantee(size: *mut u32) -> i32 {
@@ -2391,8 +3040,12 @@ mod imp {
         std::thread::sleep(std::time::Duration::from_millis(milliseconds as u64));
     }
     extern "win64" fn native_time_get_time() -> u32 {
-        let mut time = NativeTimespec { seconds: 0, nanoseconds: 0 };
-        if unsafe { clock_gettime(1, &mut time) } != 0 { // CLOCK_MONOTONIC
+        let mut time = NativeTimespec {
+            seconds: 0,
+            nanoseconds: 0,
+        };
+        if unsafe { clock_gettime(1, &mut time) } != 0 {
+            // CLOCK_MONOTONIC
             return 0;
         }
         (time.seconds as u64 * 1000 + time.nanoseconds as u64 / 1_000_000) as u32
@@ -2492,33 +3145,57 @@ mod imp {
     extern "win64" fn native_acquire_srw_lock_exclusive(lock: *mut u64) {
         if let Some(host) = native_srw_lock(lock) {
             let guard = host.write().unwrap_or_else(|poison| poison.into_inner());
-            HELD_SRW_LOCKS.with(|held| held.borrow_mut().push((lock as usize, HeldSrwLock::Exclusive(guard))));
+            HELD_SRW_LOCKS.with(|held| {
+                held.borrow_mut()
+                    .push((lock as usize, HeldSrwLock::Exclusive(guard)))
+            });
         }
     }
     extern "win64" fn native_acquire_srw_lock_shared(lock: *mut u64) {
         if let Some(host) = native_srw_lock(lock) {
             let guard = host.read().unwrap_or_else(|poison| poison.into_inner());
-            HELD_SRW_LOCKS.with(|held| held.borrow_mut().push((lock as usize, HeldSrwLock::Shared(guard))));
+            HELD_SRW_LOCKS.with(|held| {
+                held.borrow_mut()
+                    .push((lock as usize, HeldSrwLock::Shared(guard)))
+            });
         }
     }
     extern "win64" fn native_try_acquire_srw_lock_exclusive(lock: *mut u64) -> i32 {
-        let Some(host) = native_srw_lock(lock) else { return 0 };
-        let Ok(guard) = host.try_write() else { return 0 };
-        HELD_SRW_LOCKS.with(|held| held.borrow_mut().push((lock as usize, HeldSrwLock::Exclusive(guard))));
+        let Some(host) = native_srw_lock(lock) else {
+            return 0;
+        };
+        let Ok(guard) = host.try_write() else {
+            return 0;
+        };
+        HELD_SRW_LOCKS.with(|held| {
+            held.borrow_mut()
+                .push((lock as usize, HeldSrwLock::Exclusive(guard)))
+        });
         1
     }
     extern "win64" fn native_try_acquire_srw_lock_shared(lock: *mut u64) -> i32 {
-        let Some(host) = native_srw_lock(lock) else { return 0 };
+        let Some(host) = native_srw_lock(lock) else {
+            return 0;
+        };
         let Ok(guard) = host.try_read() else { return 0 };
-        HELD_SRW_LOCKS.with(|held| held.borrow_mut().push((lock as usize, HeldSrwLock::Shared(guard))));
+        HELD_SRW_LOCKS.with(|held| {
+            held.borrow_mut()
+                .push((lock as usize, HeldSrwLock::Shared(guard)))
+        });
         1
     }
     fn take_srw_lock(lock: *mut u64, exclusive: bool) -> Option<HeldSrwLock> {
         HELD_SRW_LOCKS.with(|held| {
             let mut held = held.borrow_mut();
-            held.iter().rposition(|(address, guard)| {
-                *address == lock as usize && matches!((exclusive, guard), (true, HeldSrwLock::Exclusive(_)) | (false, HeldSrwLock::Shared(_)))
-            }).map(|index| held.remove(index).1)
+            held.iter()
+                .rposition(|(address, guard)| {
+                    *address == lock as usize
+                        && matches!(
+                            (exclusive, guard),
+                            (true, HeldSrwLock::Exclusive(_)) | (false, HeldSrwLock::Shared(_))
+                        )
+                })
+                .map(|index| held.remove(index).1)
         })
     }
     fn native_release_srw_lock(lock: *mut u64, exclusive: bool) {
@@ -2551,7 +3228,8 @@ mod imp {
         let mut value = slot.load(Ordering::Acquire);
         if value == 0 {
             let created = Box::into_raw(Box::new(NativeInitOnce {
-                state: Mutex::new(InitOnceState::Uninitialized), ready: Condvar::new(),
+                state: Mutex::new(InitOnceState::Uninitialized),
+                ready: Condvar::new(),
             })) as u64;
             match slot.compare_exchange(0, created, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => value = created,
@@ -2578,12 +3256,19 @@ mod imp {
             native_set_last_error(87);
             return 0;
         }
-        let Some(init) = native_init_once(once) else { native_set_last_error(87); return 0 };
+        let Some(init) = native_init_once(once) else {
+            native_set_last_error(87);
+            return 0;
+        };
         loop {
-            let Ok(mut state) = init.state.lock() else { return 0 };
+            let Ok(mut state) = init.state.lock() else {
+                return 0;
+            };
             match *state {
                 InitOnceState::Complete(context) => {
-                    if !context_out.is_null() { unsafe { context_out.write_unaligned(context) }; }
+                    if !context_out.is_null() {
+                        unsafe { context_out.write_unaligned(context) };
+                    }
                     return 1;
                 }
                 InitOnceState::Running => {
@@ -2593,16 +3278,92 @@ mod imp {
                     *state = InitOnceState::Running;
                     drop(state);
                     let mut context = 0u64;
-                    let callback: unsafe extern "win64" fn(*mut u64, u64, *mut u64) -> i32 = unsafe { std::mem::transmute(callback) };
+                    let callback: unsafe extern "win64" fn(*mut u64, u64, *mut u64) -> i32 =
+                        unsafe { std::mem::transmute(callback) };
                     let success = unsafe { callback(once, parameter, &mut context) } != 0;
-                    let Ok(mut state) = init.state.lock() else { return 0 };
-                    *state = if success { InitOnceState::Complete(context) } else { InitOnceState::Uninitialized };
+                    let Ok(mut state) = init.state.lock() else {
+                        return 0;
+                    };
+                    *state = if success {
+                        InitOnceState::Complete(context)
+                    } else {
+                        InitOnceState::Uninitialized
+                    };
                     init.ready.notify_all();
-                    if success && !context_out.is_null() { unsafe { context_out.write_unaligned(context) }; }
+                    if success && !context_out.is_null() {
+                        unsafe { context_out.write_unaligned(context) };
+                    }
                     return success as i32;
                 }
             }
         }
+    }
+    extern "win64" fn native_init_once_begin_initialize(
+        once: *mut u64,
+        flags: u32,
+        pending: *mut i32,
+        context_out: *mut u64,
+    ) -> i32 {
+        if pending.is_null() || flags & !0x3 != 0 {
+            native_set_last_error(87);
+            return 0;
+        }
+        let Some(init) = native_init_once(once) else {
+            native_set_last_error(87);
+            return 0;
+        };
+        loop {
+            let Ok(mut state) = init.state.lock() else {
+                return 0;
+            };
+            match *state {
+                InitOnceState::Complete(context) => {
+                    unsafe { pending.write(0) };
+                    if !context_out.is_null() {
+                        unsafe { context_out.write(context) };
+                    }
+                    return 1;
+                }
+                InitOnceState::Uninitialized => {
+                    unsafe { pending.write(1) };
+                    if flags & 1 == 0 {
+                        *state = InitOnceState::Running;
+                    }
+                    return 1;
+                }
+                InitOnceState::Running => {
+                    if flags & 1 != 0 {
+                        unsafe { pending.write(1) };
+                        return 1;
+                    }
+                    drop(init.ready.wait(state));
+                }
+            }
+        }
+    }
+    extern "win64" fn native_init_once_complete(once: *mut u64, flags: u32, context: u64) -> i32 {
+        if flags & !0x6 != 0 || (flags & 4 != 0 && context != 0) {
+            native_set_last_error(87);
+            return 0;
+        }
+        let Some(init) = native_init_once(once) else {
+            native_set_last_error(87);
+            return 0;
+        };
+        let Ok(mut state) = init.state.lock() else {
+            return 0;
+        };
+        if !matches!(*state, InitOnceState::Running) {
+            native_set_last_error(87);
+            return 0;
+        }
+        *state = if flags & 4 != 0 {
+            InitOnceState::Uninitialized
+        } else {
+            InitOnceState::Complete(context)
+        };
+        init.ready.notify_all();
+        1
     }
     fn native_condition_variable(ptr: *mut u64) -> Option<&'static NativeConditionVariable> {
         if ptr.is_null() || (ptr as usize) % std::mem::align_of::<AtomicU64>() != 0 {
@@ -2612,7 +3373,8 @@ mod imp {
         let mut value = slot.load(Ordering::Acquire);
         if value == 0 {
             let created = Box::into_raw(Box::new(NativeConditionVariable {
-                generation: Mutex::new(0), ready: Condvar::new(),
+                generation: Mutex::new(0),
+                ready: Condvar::new(),
             })) as u64;
             match slot.compare_exchange(0, created, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => value = created,
@@ -2656,23 +3418,92 @@ mod imp {
             return 0;
         }
         let shared = flags & 1 != 0;
-        let Some(cv) = native_condition_variable(condition) else { native_set_last_error(87); return 0 };
-        let Ok(generation) = cv.generation.lock() else { return 0 };
+        let Some(cv) = native_condition_variable(condition) else {
+            native_set_last_error(87);
+            return 0;
+        };
+        let Ok(generation) = cv.generation.lock() else {
+            return 0;
+        };
         let before = *generation;
-        let Some(guard) = take_srw_lock(lock, !shared) else { native_set_last_error(87); return 0 };
+        let Some(guard) = take_srw_lock(lock, !shared) else {
+            native_set_last_error(87);
+            return 0;
+        };
         drop(guard);
         let awakened = if milliseconds == u32::MAX {
-            cv.ready.wait_while(generation, |value| *value == before).is_ok()
+            cv.ready
+                .wait_while(generation, |value| *value == before)
+                .is_ok()
         } else {
-            cv.ready.wait_timeout_while(generation, std::time::Duration::from_millis(milliseconds as u64), |value| *value == before)
-                .map(|(value, _)| *value != before).unwrap_or(false)
+            cv.ready
+                .wait_timeout_while(
+                    generation,
+                    std::time::Duration::from_millis(milliseconds as u64),
+                    |value| *value == before,
+                )
+                .map(|(value, _)| *value != before)
+                .unwrap_or(false)
         };
-        if shared { native_acquire_srw_lock_shared(lock); } else { native_acquire_srw_lock_exclusive(lock); }
-        if awakened { 1 } else { native_set_last_error(1460); 0 }
+        if shared {
+            native_acquire_srw_lock_shared(lock);
+        } else {
+            native_acquire_srw_lock_exclusive(lock);
+        }
+        if awakened {
+            1
+        } else {
+            native_set_last_error(1460);
+            0
+        }
+    }
+    extern "win64" fn native_sleep_condition_variable_cs(
+        condition: *mut u64,
+        critical_section: *mut u8,
+        milliseconds: u32,
+    ) -> i32 {
+        if critical_section.is_null() {
+            native_set_last_error(87);
+            return 0;
+        }
+        let Some(cv) = native_condition_variable(condition) else {
+            native_set_last_error(87);
+            return 0;
+        };
+        let Ok(generation) = cv.generation.lock() else {
+            return 0;
+        };
+        let before = *generation;
+        native_leave_critical_section(critical_section);
+        let awakened = if milliseconds == u32::MAX {
+            cv.ready
+                .wait_while(generation, |value| *value == before)
+                .is_ok()
+        } else {
+            cv.ready
+                .wait_timeout_while(
+                    generation,
+                    std::time::Duration::from_millis(milliseconds as u64),
+                    |value| *value == before,
+                )
+                .map(|(value, _)| *value != before)
+                .unwrap_or(false)
+        };
+        native_enter_critical_section(critical_section);
+        if awakened {
+            1
+        } else {
+            native_set_last_error(1460);
+            0
+        }
     }
     extern "win64" fn native_tls_alloc() -> u32 {
-        let Some(process) = process_ctx() else { return u32::MAX };
-        let Ok(mut slots) = process.dynamic_tls.lock() else { return u32::MAX };
+        let Some(process) = process_ctx() else {
+            return u32::MAX;
+        };
+        let Ok(mut slots) = process.dynamic_tls.lock() else {
+            return u32::MAX;
+        };
         let Some(index) = slots.active.iter().position(|active| !active) else {
             native_set_last_error(8);
             return u32::MAX;
@@ -2682,8 +3513,12 @@ mod imp {
         index as u32
     }
     extern "win64" fn native_tls_free(index: u32) -> i32 {
-        let Some(process) = process_ctx() else { return 0 };
-        let Ok(mut slots) = process.dynamic_tls.lock() else { return 0 };
+        let Some(process) = process_ctx() else {
+            return 0;
+        };
+        let Ok(mut slots) = process.dynamic_tls.lock() else {
+            return 0;
+        };
         let reserved = index == 0 && slots.reserved_static;
         let Some(active) = slots.active.get_mut(index as usize) else {
             native_set_last_error(87);
@@ -2698,8 +3533,12 @@ mod imp {
         1
     }
     extern "win64" fn native_tls_get_value(index: u32) -> u64 {
-        let Some(process) = process_ctx() else { return 0 };
-        let Ok(slots) = process.dynamic_tls.lock() else { return 0 };
+        let Some(process) = process_ctx() else {
+            return 0;
+        };
+        let Ok(slots) = process.dynamic_tls.lock() else {
+            return 0;
+        };
         if !slots.active.get(index as usize).copied().unwrap_or(false) {
             native_set_last_error(87);
             return 0;
@@ -2707,14 +3546,22 @@ mod imp {
         let generation = slots.generation[index as usize];
         let value = THREAD_TLS_VALUES.with(|values| {
             let (slot_generation, value) = values.borrow()[index as usize];
-            if slot_generation == generation { value } else { 0 }
+            if slot_generation == generation {
+                value
+            } else {
+                0
+            }
         });
         native_set_last_error(0);
         value
     }
     extern "win64" fn native_tls_set_value(index: u32, value: u64) -> i32 {
-        let Some(process) = process_ctx() else { return 0 };
-        let Ok(slots) = process.dynamic_tls.lock() else { return 0 };
+        let Some(process) = process_ctx() else {
+            return 0;
+        };
+        let Ok(slots) = process.dynamic_tls.lock() else {
+            return 0;
+        };
         if !slots.active.get(index as usize).copied().unwrap_or(false) {
             native_set_last_error(87);
             return 0;
@@ -2725,11 +3572,15 @@ mod imp {
         1
     }
     extern "win64" fn native_encode_pointer(value: u64) -> u64 {
-        let cookie = process_ctx().map(|process| process.pointer_cookie).unwrap_or(1);
+        let cookie = process_ctx()
+            .map(|process| process.pointer_cookie)
+            .unwrap_or(1);
         value.rotate_left(17) ^ cookie
     }
     extern "win64" fn native_decode_pointer(value: u64) -> u64 {
-        let cookie = process_ctx().map(|process| process.pointer_cookie).unwrap_or(1);
+        let cookie = process_ctx()
+            .map(|process| process.pointer_cookie)
+            .unwrap_or(1);
         (value ^ cookie).rotate_right(17)
     }
     extern "win64" fn native_is_processor_feature_present(feature: u32) -> i32 {
@@ -2829,8 +3680,14 @@ mod imp {
         if flags & 0x8 != 0 {
             unsafe { std::ptr::write_bytes(ptr as *mut u8, 0, size) };
         }
-        let Some(process) = process_ctx() else { unsafe { free(ptr as *mut c_void) }; return 0 };
-        let Ok(mut allocations) = process.heap_allocations.lock() else { unsafe { free(ptr as *mut c_void) }; return 0 };
+        let Some(process) = process_ctx() else {
+            unsafe { free(ptr as *mut c_void) };
+            return 0;
+        };
+        let Ok(mut allocations) = process.heap_allocations.lock() else {
+            unsafe { free(ptr as *mut c_void) };
+            return 0;
+        };
         allocations.insert(ptr, size);
         ptr
     }
@@ -2839,8 +3696,12 @@ mod imp {
             native_set_last_error(87);
             return 0;
         }
-        let Some(process) = process_ctx() else { return 0 };
-        let Ok(mut allocations) = process.heap_allocations.lock() else { return 0 };
+        let Some(process) = process_ctx() else {
+            return 0;
+        };
+        let Ok(mut allocations) = process.heap_allocations.lock() else {
+            return 0;
+        };
         let Some(old_size) = allocations.get(&ptr).copied() else {
             native_set_last_error(87);
             return 0;
@@ -2851,7 +3712,9 @@ mod imp {
             return 0;
         }
         if flags & 0x8 != 0 && size > old_size {
-            unsafe { std::ptr::write_bytes((new_ptr as *mut u8).add(old_size), 0, size - old_size) };
+            unsafe {
+                std::ptr::write_bytes((new_ptr as *mut u8).add(old_size), 0, size - old_size)
+            };
         }
         allocations.remove(&ptr);
         allocations.insert(new_ptr, size);
@@ -2862,8 +3725,13 @@ mod imp {
             native_set_last_error(87);
             return usize::MAX;
         }
-        let size = process_ctx()
-            .and_then(|process| process.heap_allocations.lock().ok().and_then(|allocations| allocations.get(&ptr).copied()));
+        let size = process_ctx().and_then(|process| {
+            process
+                .heap_allocations
+                .lock()
+                .ok()
+                .and_then(|allocations| allocations.get(&ptr).copied())
+        });
         match size {
             Some(size) => size,
             None => {
@@ -2873,13 +3741,95 @@ mod imp {
         }
     }
     extern "win64" fn native_process_prng(out: *mut u8, len: usize) -> i32 {
+        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+            eprintln!("native ProcessPrng length={len}");
+        }
         if out.is_null() && len != 0 {
             return 0;
         }
         (unsafe { getrandom(out.cast(), len, 0) } == len as isize) as i32
     }
+
+    fn fill_random_bytes(out: *mut u8, len: usize) -> bool {
+        if out.is_null() && len != 0 {
+            return false;
+        }
+        let mut offset = 0;
+        while offset < len {
+            let n = unsafe { getrandom(out.add(offset).cast(), len - offset, 0) };
+            if n <= 0 {
+                return false;
+            }
+            offset += n as usize;
+        }
+        true
+    }
+    extern "win64" fn native_crypt_acquire_context_w(
+        provider_out: *mut u64,
+        _container: *const u16,
+        _provider: *const u16,
+        _provider_type: u32,
+        _flags: u32,
+    ) -> i32 {
+        if provider_out.is_null() {
+            native_set_last_error(87);
+            return 0;
+        }
+        unsafe { provider_out.write(CRYPTO_PROVIDER_HANDLE) };
+        1
+    }
+    extern "win64" fn native_crypt_gen_random(provider: u64, len: u32, out: *mut u8) -> i32 {
+        if provider != CRYPTO_PROVIDER_HANDLE || !fill_random_bytes(out, len as usize) {
+            native_set_last_error(6);
+            return 0;
+        }
+        1
+    }
+    extern "win64" fn native_crypt_release_context(provider: u64, _flags: u32) -> i32 {
+        if provider != CRYPTO_PROVIDER_HANDLE {
+            native_set_last_error(6);
+            return 0;
+        }
+        1
+    }
+    extern "win64" fn native_rtl_gen_random(out: *mut u8, len: u32) -> i32 {
+        fill_random_bytes(out, len as usize) as i32
+    }
+    extern "win64" fn native_event_register(
+        provider_id: *const u8,
+        _callback: u64,
+        _context: u64,
+        registration: *mut u64,
+    ) -> u32 {
+        if provider_id.is_null() || registration.is_null() {
+            return 87;
+        }
+        unsafe { registration.write(0x4554_5700_0000_0001) };
+        0
+    }
+    extern "win64" fn native_event_unregister(_registration: u64) -> u32 {
+        0
+    }
+    extern "win64" fn native_event_set_information(
+        _registration: u64,
+        _class: u32,
+        _information: *const u8,
+        _length: u32,
+    ) -> u32 {
+        0
+    }
+    extern "win64" fn native_event_write_transfer(
+        _registration: u64,
+        _descriptor: *const u8,
+        _activity: *const u8,
+        _related_activity: *const u8,
+        _count: u32,
+        _data: *const u8,
+    ) -> u32 {
+        0
+    }
     extern "win64" fn native_get_console_mode(handle: u64, mode: *mut u32) -> i32 {
-        if !matches!(handle, 0..=2) || mode.is_null() {
+        if host_standard_fd(handle).is_none() || mode.is_null() {
             return 0;
         }
         // ENABLE_PROCESSED_OUTPUT. The native child exposes only its three
@@ -2891,7 +3841,7 @@ mod imp {
         native_get_acp()
     }
     extern "win64" fn native_get_console_screen_buffer_info(handle: u64, output: *mut u8) -> i32 {
-        if !matches!(handle, 0..=2) || output.is_null() {
+        if host_standard_fd(handle).is_none() || output.is_null() {
             return 0;
         }
         unsafe {
@@ -2907,7 +3857,7 @@ mod imp {
         1
     }
     extern "win64" fn native_set_console_mode(handle: u64, _mode: u32) -> i32 {
-        matches!(handle, 0..=2) as i32
+        host_standard_fd(handle).is_some() as i32
     }
     extern "win64" fn native_format_message_w(
         _flags: u32,
@@ -3052,8 +4002,9 @@ mod imp {
             (output.add(8) as *mut u64).write_unaligned(0x1_0000);
             (output.add(16) as *mut u64).write_unaligned(0x7fff_ffff_ffff);
             (output.add(24) as *mut u64).write_unaligned(1);
-            (output.add(32) as *mut u32).write_unaligned(8664);
-            (output.add(36) as *mut u32).write_unaligned(65_536);
+            (output.add(32) as *mut u32).write_unaligned(1);
+            (output.add(36) as *mut u32).write_unaligned(8664);
+            (output.add(40) as *mut u32).write_unaligned(65_536);
         }
     }
     extern "win64" fn native_get_full_path_name_w(
@@ -3225,15 +4176,19 @@ mod imp {
         _access: *const u64,
         _write: *const u64,
     ) -> i32 {
-        matches!(handle, 0..=2) as i32
+        host_standard_fd(handle).is_some() as i32
     }
     extern "win64" fn native_heap_free(heap: u64, _flags: u32, ptr: u64) -> i32 {
         if heap != PROCESS_HEAP_HANDLE || ptr == 0 {
             native_set_last_error(87);
             return 0;
         }
-        let Some(process) = process_ctx() else { return 0 };
-        let Ok(mut allocations) = process.heap_allocations.lock() else { return 0 };
+        let Some(process) = process_ctx() else {
+            return 0;
+        };
+        let Ok(mut allocations) = process.heap_allocations.lock() else {
+            return 0;
+        };
         if allocations.remove(&ptr).is_none() {
             native_set_last_error(87);
             return 0;
@@ -3259,10 +4214,13 @@ mod imp {
         written: *mut u32,
         _overlapped: u64,
     ) -> i32 {
+        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+            eprintln!("native WriteFile handle={handle:#x} len={len}");
+        }
         if buf.is_null() || len > 16 * 1024 * 1024 {
             return 0;
         }
-        if handle != 1 && handle != 2 {
+        if !matches!(host_standard_fd(handle), Some(1 | 2)) {
             let context = match fs_ctx() {
                 Some(v) => v,
                 None => return 0,
@@ -3304,7 +4262,7 @@ mod imp {
         }
         // SAFETY: the guest supplied `buf`/`len`; a bad pointer terminates
         // only its isolated native child, never the parent runtime.
-        let n = unsafe { write(handle as i32, buf.cast(), len as usize) };
+        let n = unsafe { write(host_standard_fd(handle).unwrap(), buf.cast(), len as usize) };
         if n < 0 {
             return 0;
         }
@@ -3322,7 +4280,7 @@ mod imp {
         written: *mut u32,
         _reserved: u64,
     ) -> i32 {
-        if !matches!(handle, 1 | 2) || (text.is_null() && len != 0) {
+        if !matches!(host_standard_fd(handle), Some(1 | 2)) || (text.is_null() && len != 0) {
             return 0;
         }
         let units = if len == 0 {
@@ -3331,7 +4289,10 @@ mod imp {
             unsafe { std::slice::from_raw_parts(text, len as usize) }
         };
         let encoded = String::from_utf16_lossy(units);
-        if unsafe { write(handle as i32, encoded.as_ptr().cast(), encoded.len()) } < 0 {
+        let Some(fd) = host_standard_fd(handle) else {
+            return 0;
+        };
+        if unsafe { write(fd, encoded.as_ptr().cast(), encoded.len()) } < 0 {
             return 0;
         }
         if !written.is_null() {
@@ -3341,6 +4302,9 @@ mod imp {
     }
 
     extern "win64" fn native_exit_process(code: u32) -> ! {
+        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+            eprintln!("native ExitProcess code={code:#x}");
+        }
         // Closing stdout lets the parent drain console output before the
         // snapshot pipe can block on a large guest disk image.
         unsafe { close(1) };
@@ -3488,16 +4452,31 @@ mod imp {
                 command_line_w,
                 environment_block: environment_strings(&environment),
                 environment,
+                std_handles: [
+                    AtomicU64::new(STD_HANDLE_BASE),
+                    AtomicU64::new(STD_HANDLE_BASE + 1),
+                    AtomicU64::new(STD_HANDLE_BASE + 2),
+                ],
                 fs: Arc::clone(&context),
                 last_error: AtomicU32::new(0),
                 error_mode: AtomicU32::new(0),
                 pointer_cookie: random_pointer_cookie(),
                 heap_allocations: Mutex::new(HashMap::new()),
+                virtual_allocations: Mutex::new(HashMap::new()),
+                file_mappings: Mutex::new(HashMap::new()),
+                mapping_views: Mutex::new(HashMap::new()),
+                mapping_next: AtomicU64::new(0x9800_0000),
                 gs_base: AtomicU64::new(0),
                 tls_template: Mutex::new(tls.as_ref().map(NativeTls::clone_for_thread)),
                 dynamic_tls: Mutex::new(DynamicTlsSlots::new(tls.is_some())),
                 threads: Mutex::new(HashMap::new()),
                 thread_next: AtomicU64::new(0x8000_0000),
+                semaphores: Mutex::new(HashMap::new()),
+                semaphore_next: AtomicU64::new(0x6000_0000),
+                completion_ports: Mutex::new(HashMap::new()),
+                completion_next: AtomicU64::new(0x9000_0000),
+                duplicate_handles: Mutex::new(HashMap::new()),
+                duplicate_next: AtomicU64::new(0xa000_0000),
                 timer_next: AtomicU64::new(0x7000_0000),
                 state_fd: AtomicU32::new(state_fds[1] as u32),
                 fls_value: AtomicU64::new(0),
@@ -3513,7 +4492,9 @@ mod imp {
             if protect_exec(&mapping).is_err() {
                 unsafe { _exit(127) };
             }
-            if let Some(tls) = tls.as_ref() {
+            let mut tls = tls;
+            if let Some(tls) = tls.as_mut() {
+                set_teb_stack_bounds(&mut tls.teb);
                 if !unsafe { set_gs(tls.teb.as_ptr() as u64) } {
                     unsafe { _exit(127) };
                 }
@@ -3684,6 +4665,15 @@ mod imp {
         (!path.is_null()).then_some(API_SET_MODULE).unwrap_or(0)
     }
 
+    extern "win64" fn native_load_library_ex_a(path: *const u8, _file: u64, _flags: u32) -> u64 {
+        if unsafe { ascii_z(path) }.is_some() {
+            API_SET_MODULE
+        } else {
+            native_set_last_error(126); // ERROR_MOD_NOT_FOUND
+            0
+        }
+    }
+
     extern "win64" fn native_get_module_handle_a(name: *const u8) -> u64 {
         match unsafe { ascii_z(name) } {
             Some(value) if native_module_name_supported(value) => API_SET_MODULE,
@@ -3704,6 +4694,27 @@ mod imp {
             Some("GetCurrentDirectoryW") => {
                 native_get_current_directory_w as *const () as usize as u64
             }
+            Some("NtDeviceIoControlFile") => {
+                native_nt_device_io_control_file as *const () as usize as u64
+            }
+            Some("NtQueryInformationFile") => {
+                native_nt_query_information_file as *const () as usize as u64
+            }
+            Some("NtSetInformationFile") => {
+                native_nt_set_information_file as *const () as usize as u64
+            }
+            Some("NtQueryVolumeInformationFile") => {
+                native_nt_query_volume_information_file as *const () as usize as u64
+            }
+            Some("NtQueryDirectoryFile") => {
+                native_nt_query_directory_file as *const () as usize as u64
+            }
+            Some("NtQuerySystemInformation") => {
+                native_nt_query_system_information as *const () as usize as u64
+            }
+            Some("NtQueryInformationProcess") => {
+                native_nt_query_information_process as *const () as usize as u64
+            }
             Some(function) => baseline_trampoline(function).unwrap_or_else(|| {
                 if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
                     let message = format!("unsupported native dynamic import: {function}\n");
@@ -3712,8 +4723,162 @@ mod imp {
                 native_set_last_error(127); // ERROR_PROC_NOT_FOUND
                 0
             }),
-            None => { native_set_last_error(127); 0 },
+            None => {
+                native_set_last_error(127);
+                0
+            }
         }
+    }
+
+    // libuv resolves this NTDLL entry during startup. Until a device-I/O
+    // translation exists, return a real NT failure code to callers instead
+    // of pretending that the operation succeeded.
+    extern "win64" fn native_nt_device_io_control_file(
+        _file: u64,
+        _event: u64,
+        _apc_routine: u64,
+        _apc_context: u64,
+        io_status: *mut u8,
+        _control_code: u32,
+        _input: *const u8,
+        _input_len: u32,
+        _output: *mut u8,
+        _output_len: u32,
+    ) -> u32 {
+        const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
+        if !io_status.is_null() {
+            unsafe {
+                (io_status as *mut u32).write_unaligned(STATUS_NOT_IMPLEMENTED);
+                (io_status.add(8) as *mut u64).write_unaligned(0);
+            }
+        }
+        STATUS_NOT_IMPLEMENTED
+    }
+
+    extern "win64" fn native_nt_query_information_file(
+        file: u64,
+        io_status: *mut u8,
+        information: *mut u8,
+        length: u32,
+        information_class: u32,
+    ) -> u32 {
+        let original = process_ctx()
+            .and_then(|process| {
+                process
+                    .duplicate_handles
+                    .lock()
+                    .ok()
+                    .and_then(|values| values.get(&file).copied())
+            })
+            .unwrap_or(file);
+        if let Some(fd) = host_standard_fd(original) {
+            if !information.is_null() && length >= 4 && matches!(information_class, 8 | 16) {
+                let value = match information_class {
+                    8 if fd == 0 => 1, // FILE_READ_DATA
+                    8 => 2,            // FILE_WRITE_DATA
+                    16 => 0x20,        // FILE_SYNCHRONOUS_IO_NONALERT
+                    _ => unreachable!(),
+                };
+                unsafe { (information as *mut u32).write_unaligned(value) };
+                if !io_status.is_null() {
+                    unsafe {
+                        (io_status as *mut u32).write_unaligned(0);
+                        (io_status.add(8) as *mut u64).write_unaligned(4);
+                    }
+                }
+                return 0;
+            }
+        }
+        const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
+        if !io_status.is_null() {
+            unsafe {
+                (io_status as *mut u32).write_unaligned(STATUS_NOT_IMPLEMENTED);
+                (io_status.add(8) as *mut u64).write_unaligned(0);
+            }
+        }
+        STATUS_NOT_IMPLEMENTED
+    }
+
+    extern "win64" fn native_nt_set_information_file(
+        _file: u64,
+        io_status: *mut u8,
+        _information: *const u8,
+        _length: u32,
+        _information_class: u32,
+    ) -> u32 {
+        const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
+        if !io_status.is_null() {
+            unsafe {
+                (io_status as *mut u32).write_unaligned(STATUS_NOT_IMPLEMENTED);
+                (io_status.add(8) as *mut u64).write_unaligned(0);
+            }
+        }
+        STATUS_NOT_IMPLEMENTED
+    }
+
+    extern "win64" fn native_nt_query_volume_information_file(
+        _file: u64,
+        io_status: *mut u8,
+        _information: *mut u8,
+        _length: u32,
+        _information_class: u32,
+    ) -> u32 {
+        const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
+        if !io_status.is_null() {
+            unsafe {
+                (io_status as *mut u32).write_unaligned(STATUS_NOT_IMPLEMENTED);
+                (io_status.add(8) as *mut u64).write_unaligned(0);
+            }
+        }
+        STATUS_NOT_IMPLEMENTED
+    }
+
+    extern "win64" fn native_nt_query_directory_file(
+        _file: u64,
+        _event: u64,
+        _apc_routine: u64,
+        _apc_context: u64,
+        io_status: *mut u8,
+        _information: *mut u8,
+        _length: u32,
+        _information_class: u32,
+        _return_single_entry: u8,
+        _file_name: *const u8,
+        _restart_scan: u8,
+    ) -> u32 {
+        const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
+        if !io_status.is_null() {
+            unsafe {
+                (io_status as *mut u32).write_unaligned(STATUS_NOT_IMPLEMENTED);
+                (io_status.add(8) as *mut u64).write_unaligned(0);
+            }
+        }
+        STATUS_NOT_IMPLEMENTED
+    }
+
+    extern "win64" fn native_nt_query_system_information(
+        _information_class: u32,
+        _information: *mut u8,
+        _length: u32,
+        return_length: *mut u32,
+    ) -> u32 {
+        if !return_length.is_null() {
+            unsafe { return_length.write(0) };
+        }
+        0xC000_0002 // STATUS_NOT_IMPLEMENTED
+    }
+
+    extern "win64" fn native_nt_query_information_process(
+        _process: u64,
+        _information_class: u32,
+        _information: *mut u8,
+        _length: u32,
+        return_length: *mut u32,
+    ) -> u32 {
+        if !return_length.is_null() {
+            unsafe { return_length.write(0) };
+        }
+        0xC000_0002 // STATUS_NOT_IMPLEMENTED
     }
 
     extern "win64" fn native_free_library(module: u64) -> i32 {
@@ -3759,6 +4924,177 @@ mod imp {
         1
     }
 
+    extern "win64" fn native_virtual_alloc(
+        address: *mut u8,
+        size: usize,
+        allocation_type: u32,
+        protection: u32,
+    ) -> *mut u8 {
+        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+            eprintln!("native VirtualAlloc address={address:p} size={size:#x} type={allocation_type:#x} protection={protection:#x}");
+        }
+        const MEM_COMMIT: u32 = 0x1000;
+        const MEM_RESERVE: u32 = 0x2000;
+        const MEM_RESET: u32 = 0x80000;
+        if allocation_type == MEM_RESET {
+            let Ok(length) = page_len(size) else {
+                native_set_last_error(87);
+                return ptr::null_mut();
+            };
+            if address.is_null() || unsafe { madvise(address.cast(), length, 4) } != 0 {
+                native_set_last_error(487);
+                return ptr::null_mut();
+            }
+            return address;
+        }
+        if size == 0 || allocation_type & (MEM_COMMIT | MEM_RESERVE) == 0 {
+            native_set_last_error(87);
+            return ptr::null_mut();
+        }
+        let Some(host_protection) = linux_protection(protection) else {
+            native_set_last_error(87);
+            return ptr::null_mut();
+        };
+        let Ok(length) = page_len(size) else {
+            native_set_last_error(8);
+            return ptr::null_mut();
+        };
+        let Some(process) = process_ctx() else {
+            return ptr::null_mut();
+        };
+        if allocation_type & MEM_RESERVE == 0 {
+            if address.is_null() || (address as usize) & 4095 != 0 {
+                native_set_last_error(487); // ERROR_INVALID_ADDRESS
+                return ptr::null_mut();
+            }
+            let inside_reservation = process.virtual_allocations.lock().is_ok_and(|allocations| {
+                allocations.iter().any(|(&base, allocation)| {
+                    (address as u64) >= base
+                        && (address as u64)
+                            .checked_add(length as u64)
+                            .is_some_and(|end| end <= base + allocation.length as u64)
+                })
+            });
+            if !inside_reservation
+                || unsafe { mprotect(address.cast(), length, host_protection) } != 0
+            {
+                native_set_last_error(487);
+                return ptr::null_mut();
+            }
+            return address;
+        }
+        if !address.is_null() && (address as usize) & 0xffff != 0 {
+            native_set_last_error(487);
+            return ptr::null_mut();
+        }
+        let initial_protection = if allocation_type & MEM_COMMIT != 0 {
+            host_protection
+        } else {
+            0
+        };
+        let result = if address.is_null() {
+            let Some(overlength) = length.checked_add(0x10000) else {
+                native_set_last_error(8);
+                return ptr::null_mut();
+            };
+            let raw = unsafe {
+                mmap(
+                    ptr::null_mut(),
+                    overlength,
+                    initial_protection,
+                    MAP_PRIVATE | MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if raw == MAP_FAILED {
+                native_set_last_error(8);
+                return ptr::null_mut();
+            }
+            let base = raw as usize;
+            let aligned = (base + 0xffff) & !0xffff;
+            let prefix = aligned - base;
+            let suffix = overlength - prefix - length;
+            if prefix != 0 {
+                unsafe { munmap(raw, prefix) };
+            }
+            if suffix != 0 {
+                unsafe { munmap((aligned + length) as *mut c_void, suffix) };
+            }
+            aligned as *mut u8
+        } else {
+            let raw = unsafe {
+                mmap(
+                    address.cast(),
+                    length,
+                    initial_protection,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+                    -1,
+                    0,
+                )
+            };
+            if raw == MAP_FAILED {
+                native_set_last_error(487);
+                return ptr::null_mut();
+            }
+            raw.cast()
+        };
+        if let Ok(mut allocations) = process.virtual_allocations.lock() {
+            allocations.insert(result as u64, NativeVirtualAllocation { length });
+        }
+        result
+    }
+
+    extern "win64" fn native_virtual_free(address: *mut u8, size: usize, free_type: u32) -> i32 {
+        let Some(process) = process_ctx() else {
+            return 0;
+        };
+        if address.is_null() {
+            native_set_last_error(87);
+            return 0;
+        }
+        if free_type == 0x8000 {
+            // MEM_RELEASE
+            if size != 0 {
+                native_set_last_error(87);
+                return 0;
+            }
+            let allocation = process
+                .virtual_allocations
+                .lock()
+                .ok()
+                .and_then(|mut values| values.remove(&(address as u64)));
+            let Some(allocation) = allocation else {
+                native_set_last_error(487);
+                return 0;
+            };
+            return (unsafe { munmap(address.cast(), allocation.length) } == 0) as i32;
+        }
+        if free_type == 0x4000 {
+            // MEM_DECOMMIT
+            let Ok(length) = page_len(size) else {
+                native_set_last_error(87);
+                return 0;
+            };
+            let inside_reservation = process.virtual_allocations.lock().is_ok_and(|values| {
+                values.iter().any(|(&base, allocation)| {
+                    (address as u64) >= base
+                        && (address as u64)
+                            .checked_add(length as u64)
+                            .is_some_and(|end| end <= base + allocation.length as u64)
+                })
+            });
+            if !inside_reservation || unsafe { mprotect(address.cast(), length, 0) } != 0 {
+                native_set_last_error(487);
+                return 0;
+            }
+            unsafe { madvise(address.cast(), length, 4) }; // MADV_DONTNEED
+            return 1;
+        }
+        native_set_last_error(87);
+        0
+    }
+
     extern "win64" fn native_create_file_w(
         path: *const u16,
         _access: u32,
@@ -3770,7 +5106,10 @@ mod imp {
     ) -> u64 {
         let path = match wide(path) {
             Some(v) => v.strip_prefix(r"\\?\").unwrap_or(&v).to_string(),
-            None => return u64::MAX,
+            None => {
+                native_set_last_error(87);
+                return u64::MAX;
+            }
         };
         let context = match fs_ctx() {
             Some(v) => v,
@@ -3790,6 +5129,7 @@ mod imp {
             _ => Err("unsupported create".into()),
         };
         if ok.is_err() {
+            native_set_last_error(if creation == 3 && !exists { 2 } else { 87 });
             return u64::MAX;
         }
         let h = ctx.next;
@@ -3881,11 +5221,24 @@ mod imp {
         h: u64,
         buf: *mut u8,
         n: u32,
-        read: *mut u32,
+        read_count: *mut u32,
         _ov: u64,
     ) -> i32 {
+        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+            eprintln!("native ReadFile handle={h:#x} len={n} buf={buf:p}");
+        }
         if buf.is_null() {
             return 0;
+        }
+        if let Some(fd) = host_standard_fd(h) {
+            let count = unsafe { read(fd, buf.cast(), n as usize) };
+            if count < 0 {
+                return 0;
+            }
+            if !read_count.is_null() {
+                unsafe { read_count.write(count as u32) };
+            }
+            return 1;
         }
         let context = match fs_ctx() {
             Some(v) => v,
@@ -3903,21 +5256,69 @@ mod imp {
             Ok(v) => v,
             Err(_) => return 0,
         };
+        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+            eprintln!(
+                "native ReadFile path={path} offset={offset} available={} image_base={:#x}",
+                data.len(),
+                process_ctx().map_or(0, |p| p.image_base)
+            );
+        }
         let k = (data.len().saturating_sub(offset)).min(n as usize);
         unsafe { std::ptr::copy_nonoverlapping(data.as_ptr().add(offset), buf, k) };
+        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+            eprintln!("native ReadFile copied={k}");
+        }
         if let Some(file) = ctx.handles.get_mut(&h) {
             file.offset = offset + k;
         }
-        if !read.is_null() {
-            unsafe { read.write(k as u32) };
+        if !read_count.is_null() {
+            unsafe { read_count.write(k as u32) };
         }
         1
     }
     extern "win64" fn native_close_handle(h: u64) -> i32 {
         let process = process_ctx();
+        if process.as_ref().is_some_and(|process| {
+            process
+                .duplicate_handles
+                .lock()
+                .is_ok_and(|mut values| values.remove(&h).is_some())
+        }) {
+            return 1;
+        }
+        if process.as_ref().is_some_and(|process| {
+            process
+                .semaphores
+                .lock()
+                .is_ok_and(|mut values| values.remove(&h).is_some())
+        }) {
+            return 1;
+        }
+        if process.as_ref().is_some_and(|process| {
+            process
+                .completion_ports
+                .lock()
+                .is_ok_and(|mut values| values.remove(&h).is_some())
+        }) {
+            return 1;
+        }
+        if process.as_ref().is_some_and(|process| {
+            process
+                .file_mappings
+                .lock()
+                .is_ok_and(|mut values| values.remove(&h).is_some())
+        }) {
+            return 1;
+        }
         if process
             .as_ref()
-            .and_then(|process| process.threads.lock().ok().map(|mut threads| threads.remove(&h).is_some()))
+            .and_then(|process| {
+                process
+                    .threads
+                    .lock()
+                    .ok()
+                    .map(|mut threads| threads.remove(&h).is_some())
+            })
             .unwrap_or(false)
         {
             return 1;
@@ -4019,13 +5420,46 @@ mod imp {
             "WINMM.DLL" => func == "timeGetTime",
             "USERENV.DLL" => func == "GetUserProfileDirectoryW",
             "BCRYPTPRIMITIVES.DLL" => func == "ProcessPrng",
+            "ADVAPI32.DLL" => matches!(
+                func,
+                "CryptAcquireContextW"
+                    | "CryptGenRandom"
+                    | "CryptReleaseContext"
+                    | "SystemFunction036"
+                    | "EventRegister"
+                    | "EventUnregister"
+                    | "EventSetInformation"
+                    | "EventWriteTransfer"
+                    | "RegOpenKeyExW"
+            ),
+            "WS2_32.DLL" => matches!(
+                func,
+                "#3" | "#7"
+                    | "#8"
+                    | "#9"
+                    | "#14"
+                    | "#15"
+                    | "#23"
+                    | "#111"
+                    | "#112"
+                    | "#115"
+                    | "#116"
+            ),
+            "USER32.DLL" => func == "GetSystemMetrics",
             "NTDLL.DLL" => matches!(func, "RtlGetVersion" | "RtlNtStatusToDosError"),
             "API-MS-WIN-CORE-SYNCH-L1-2-0.DLL" => {
-                matches!(func, "WaitOnAddress" | "WakeByAddressAll" | "WakeByAddressSingle")
+                matches!(
+                    func,
+                    "WaitOnAddress" | "WakeByAddressAll" | "WakeByAddressSingle"
+                )
             }
-            "KERNEL32.DLL" | "KERNELBASE.DLL" => !matches!(
-                func, "timeGetTime" | "GetUserProfileDirectoryW" | "ProcessPrng"
-            ),
+            "KERNEL32.DLL" | "KERNELBASE.DLL" => {
+                !func.starts_with('#')
+                    && !matches!(
+                        func,
+                        "timeGetTime" | "GetUserProfileDirectoryW" | "ProcessPrng"
+                    )
+            }
             _ => false,
         };
         allowed && baseline_trampoline(func).is_some()
@@ -4033,6 +5467,68 @@ mod imp {
 
     fn baseline_trampoline(name: &str) -> Option<u64> {
         match name {
+            // Winsock's stable ordinal exports for byte-order conversion.
+            "#8" | "#14" => Some(native_network_u32 as *const () as usize as u64),
+            "#9" | "#15" => Some(native_network_u16 as *const () as usize as u64),
+            "#115" => Some(native_wsa_startup as *const () as usize as u64),
+            "#116" => Some(native_wsa_cleanup as *const () as usize as u64),
+            "#23" => Some(native_socket as *const () as usize as u64),
+            "#3" => Some(native_close_socket as *const () as usize as u64),
+            "#7" => Some(native_getsockopt as *const () as usize as u64),
+            "#111" => Some(native_wsa_get_last_error as *const () as usize as u64),
+            "#112" => Some(native_wsa_set_last_error as *const () as usize as u64),
+            "GetSystemMetrics" => Some(native_get_system_metrics as *const () as usize as u64),
+            "GetLocaleInfoEx" => Some(native_get_locale_info_ex as *const () as usize as u64),
+            "AreFileApisANSI" => Some(native_are_file_apis_ansi as *const () as usize as u64),
+            "LocalFree" => Some(native_local_free as *const () as usize as u64),
+            "FreeLibraryAndExitThread" => {
+                Some(native_free_library_and_exit_thread as *const () as usize as u64)
+            }
+            "GetNumberOfConsoleInputEvents" => {
+                Some(native_get_number_of_console_input_events as *const () as usize as u64)
+            }
+            "SetNamedPipeHandleState" => {
+                Some(native_set_named_pipe_handle_state as *const () as usize as u64)
+            }
+            "GetNamedPipeHandleStateW" => {
+                Some(native_get_named_pipe_handle_state_w as *const () as usize as u64)
+            }
+            "RegOpenKeyExW" => Some(native_reg_open_key_ex_w as *const () as usize as u64),
+            "CreateFileMappingW" => Some(native_create_file_mapping_w as *const () as usize as u64),
+            "MapViewOfFile" => Some(native_map_view_of_file as *const () as usize as u64),
+            "UnmapViewOfFile" => Some(native_unmap_view_of_file as *const () as usize as u64),
+            "CryptAcquireContextW" => {
+                Some(native_crypt_acquire_context_w as *const () as usize as u64)
+            }
+            "CryptGenRandom" => Some(native_crypt_gen_random as *const () as usize as u64),
+            "CryptReleaseContext" => {
+                Some(native_crypt_release_context as *const () as usize as u64)
+            }
+            "SystemFunction036" => Some(native_rtl_gen_random as *const () as usize as u64),
+            "EventRegister" => Some(native_event_register as *const () as usize as u64),
+            "EventUnregister" => Some(native_event_unregister as *const () as usize as u64),
+            "EventSetInformation" => {
+                Some(native_event_set_information as *const () as usize as u64)
+            }
+            "EventWriteTransfer" => Some(native_event_write_transfer as *const () as usize as u64),
+            "SetConsoleCtrlHandler" => {
+                Some(native_set_console_ctrl_handler as *const () as usize as u64)
+            }
+            "CreateSemaphoreA" => Some(native_create_semaphore_a as *const () as usize as u64),
+            "ReleaseSemaphore" => Some(native_release_semaphore as *const () as usize as u64),
+            "CreateIoCompletionPort" => {
+                Some(native_create_io_completion_port as *const () as usize as u64)
+            }
+            "PostQueuedCompletionStatus" => {
+                Some(native_post_queued_completion_status as *const () as usize as u64)
+            }
+            "GetQueuedCompletionStatusEx" => {
+                Some(native_get_queued_completion_status_ex as *const () as usize as u64)
+            }
+            "VerSetConditionMask" => {
+                Some(native_ver_set_condition_mask as *const () as usize as u64)
+            }
+            "VerifyVersionInfoW" => Some(native_verify_version_info_w as *const () as usize as u64),
             "GetCommandLineW" => Some(native_get_command_line_w as *const () as usize as u64),
             "GetCommandLineA" => Some(native_get_command_line_a as *const () as usize as u64),
             "GetLastError" => Some(native_get_last_error as *const () as usize as u64),
@@ -4050,7 +5546,10 @@ mod imp {
             "GetCurrentThread" => Some(native_get_current_thread as *const () as usize as u64),
             "GetModuleHandleA" => Some(native_get_module_handle_a as *const () as usize as u64),
             "VirtualProtect" => Some(native_virtual_protect as *const () as usize as u64),
+            "VirtualAlloc" => Some(native_virtual_alloc as *const () as usize as u64),
+            "VirtualFree" => Some(native_virtual_free as *const () as usize as u64),
             "LoadLibraryExW" => Some(native_load_library_ex_w as *const () as usize as u64),
+            "LoadLibraryExA" => Some(native_load_library_ex_a as *const () as usize as u64),
             "GetProcAddress" => Some(native_get_proc_address as *const () as usize as u64),
             "FreeLibrary" => Some(native_free_library as *const () as usize as u64),
             "QueryPerformanceCounter" => {
@@ -4074,27 +5573,60 @@ mod imp {
                 Some(native_initialize_critical_section as *const () as usize as u64)
             }
             "InitializeSRWLock" => Some(native_initialize_srw_lock as *const () as usize as u64),
-            "AcquireSRWLockExclusive" => Some(native_acquire_srw_lock_exclusive as *const () as usize as u64),
-            "AcquireSRWLockShared" => Some(native_acquire_srw_lock_shared as *const () as usize as u64),
-            "TryAcquireSRWLockExclusive" => Some(native_try_acquire_srw_lock_exclusive as *const () as usize as u64),
-            "TryAcquireSRWLockShared" => Some(native_try_acquire_srw_lock_shared as *const () as usize as u64),
-            "ReleaseSRWLockExclusive" => Some(native_release_srw_lock_exclusive as *const () as usize as u64),
-            "ReleaseSRWLockShared" => Some(native_release_srw_lock_shared as *const () as usize as u64),
-            "InitializeConditionVariable" => Some(native_initialize_condition_variable as *const () as usize as u64),
-            "WakeConditionVariable" => Some(native_wake_condition_variable as *const () as usize as u64),
-            "WakeAllConditionVariable" => Some(native_wake_all_condition_variable as *const () as usize as u64),
-            "SleepConditionVariableSRW" => Some(native_sleep_condition_variable_srw as *const () as usize as u64),
+            "AcquireSRWLockExclusive" => {
+                Some(native_acquire_srw_lock_exclusive as *const () as usize as u64)
+            }
+            "AcquireSRWLockShared" => {
+                Some(native_acquire_srw_lock_shared as *const () as usize as u64)
+            }
+            "TryAcquireSRWLockExclusive" => {
+                Some(native_try_acquire_srw_lock_exclusive as *const () as usize as u64)
+            }
+            "TryAcquireSRWLockShared" => {
+                Some(native_try_acquire_srw_lock_shared as *const () as usize as u64)
+            }
+            "ReleaseSRWLockExclusive" => {
+                Some(native_release_srw_lock_exclusive as *const () as usize as u64)
+            }
+            "ReleaseSRWLockShared" => {
+                Some(native_release_srw_lock_shared as *const () as usize as u64)
+            }
+            "InitializeConditionVariable" => {
+                Some(native_initialize_condition_variable as *const () as usize as u64)
+            }
+            "WakeConditionVariable" => {
+                Some(native_wake_condition_variable as *const () as usize as u64)
+            }
+            "WakeAllConditionVariable" => {
+                Some(native_wake_all_condition_variable as *const () as usize as u64)
+            }
+            "SleepConditionVariableSRW" => {
+                Some(native_sleep_condition_variable_srw as *const () as usize as u64)
+            }
+            "SleepConditionVariableCS" => {
+                Some(native_sleep_condition_variable_cs as *const () as usize as u64)
+            }
             "InitOnceInitialize" => Some(native_init_once_initialize as *const () as usize as u64),
-            "InitOnceExecuteOnce" => Some(native_init_once_execute_once as *const () as usize as u64),
+            "InitOnceExecuteOnce" => {
+                Some(native_init_once_execute_once as *const () as usize as u64)
+            }
+            "InitOnceBeginInitialize" => {
+                Some(native_init_once_begin_initialize as *const () as usize as u64)
+            }
+            "InitOnceComplete" => Some(native_init_once_complete as *const () as usize as u64),
             "TlsAlloc" => Some(native_tls_alloc as *const () as usize as u64),
             "TlsFree" => Some(native_tls_free as *const () as usize as u64),
             "TlsGetValue" => Some(native_tls_get_value as *const () as usize as u64),
             "TlsSetValue" => Some(native_tls_set_value as *const () as usize as u64),
             "EncodePointer" => Some(native_encode_pointer as *const () as usize as u64),
             "DecodePointer" => Some(native_decode_pointer as *const () as usize as u64),
-            "IsProcessorFeaturePresent" => Some(native_is_processor_feature_present as *const () as usize as u64),
+            "IsProcessorFeaturePresent" => {
+                Some(native_is_processor_feature_present as *const () as usize as u64)
+            }
             "RtlGetVersion" => Some(native_rtl_get_version as *const () as usize as u64),
-            "RtlNtStatusToDosError" => Some(native_rtl_nt_status_to_dos_error as *const () as usize as u64),
+            "RtlNtStatusToDosError" => {
+                Some(native_rtl_nt_status_to_dos_error as *const () as usize as u64)
+            }
             "EnterCriticalSection" => {
                 Some(native_enter_critical_section as *const () as usize as u64)
             }
@@ -4122,6 +5654,11 @@ mod imp {
                 Some(native_get_user_profile_directory_w as *const () as usize as u64)
             }
             "GetStdHandle" => Some(native_get_std_handle as *const () as usize as u64),
+            "SetStdHandle" => Some(native_set_std_handle as *const () as usize as u64),
+            "SetHandleInformation" => {
+                Some(native_set_handle_information as *const () as usize as u64)
+            }
+            "DuplicateHandle" => Some(native_duplicate_handle as *const () as usize as u64),
             "GetFileType" => Some(native_get_file_type as *const () as usize as u64),
             "GetModuleFileNameW" => {
                 Some(native_get_module_file_name_w as *const () as usize as u64)
@@ -4141,6 +5678,9 @@ mod imp {
             }
             "AddVectoredExceptionHandler" => {
                 Some(native_add_vectored_exception_handler as *const () as usize as u64)
+            }
+            "RemoveVectoredExceptionHandler" => {
+                Some(native_remove_vectored_exception_handler as *const () as usize as u64)
             }
             "SetThreadStackGuarantee" => {
                 Some(native_set_thread_stack_guarantee as *const () as usize as u64)
@@ -4193,6 +5733,7 @@ mod imp {
             "FindNextFileW" => Some(native_find_next_file_w as *const () as usize as u64),
             "FindClose" => Some(native_find_close as *const () as usize as u64),
             "CreateThread" => Some(native_create_thread as *const () as usize as u64),
+            "ResumeThread" => Some(native_resume_thread as *const () as usize as u64),
             "WaitForSingleObject" => {
                 Some(native_wait_for_single_object as *const () as usize as u64)
             }
@@ -4212,6 +5753,452 @@ mod imp {
             "MoveFileW" => Some(native_move_file_w as *const () as usize as u64),
             "CopyFileW" => Some(native_copy_file_w as *const () as usize as u64),
             _ => None,
+        }
+    }
+
+    extern "win64" fn native_network_u16(value: u16) -> u16 {
+        value.swap_bytes()
+    }
+
+    extern "win64" fn native_network_u32(value: u32) -> u32 {
+        value.swap_bytes()
+    }
+
+    extern "win64" fn native_get_system_metrics(_index: i32) -> i32 {
+        // The native CLI guest has no Windows desktop session. The documented
+        // value for absent/unsupported system metrics is zero.
+        0
+    }
+
+    extern "win64" fn native_get_locale_info_ex(
+        locale: *const u16,
+        kind: u32,
+        output: *mut u16,
+        capacity: i32,
+    ) -> i32 {
+        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+            eprintln!(
+                "native GetLocaleInfoEx locale={:?} kind={kind:#x}",
+                wide(locale)
+            );
+        }
+        if kind == 0x5c {
+            let value: Vec<u16> = "en-US\0".encode_utf16().collect();
+            if capacity == 0 {
+                return value.len() as i32;
+            }
+            if capacity > 0 && (capacity as usize) >= value.len() && !output.is_null() {
+                unsafe { ptr::copy_nonoverlapping(value.as_ptr(), output, value.len()) };
+                return value.len() as i32;
+            }
+            native_set_last_error(122);
+            return 0;
+        }
+        native_set_last_error(87);
+        0
+    }
+
+    extern "win64" fn native_are_file_apis_ansi() -> i32 {
+        1
+    }
+    extern "win64" fn native_get_number_of_console_input_events(
+        handle: u64,
+        count: *mut u32,
+    ) -> i32 {
+        if count.is_null() || host_standard_fd(handle) != Some(0) {
+            native_set_last_error(6);
+            return 0;
+        }
+        unsafe { count.write(0) };
+        1
+    }
+    extern "win64" fn native_set_named_pipe_handle_state(
+        handle: u64,
+        mode: *const u32,
+        _max_collection_count: *const u32,
+        _collect_data_timeout: *const u32,
+    ) -> i32 {
+        if host_standard_fd(handle).is_some_and(|fd| unsafe { isatty(fd) } == 0)
+            && (mode.is_null() || unsafe { mode.read() } & !0x3 == 0)
+        {
+            return 1;
+        }
+        native_set_last_error(6);
+        0
+    }
+    extern "win64" fn native_get_named_pipe_handle_state_w(
+        handle: u64,
+        mode: *mut u32,
+        _current_instances: *mut u32,
+        _max_collection_count: *mut u32,
+        _collect_data_timeout: *mut u32,
+        _user_name: *mut u16,
+        _max_user_name_size: u32,
+    ) -> i32 {
+        if !host_standard_fd(handle).is_some_and(|fd| unsafe { isatty(fd) } == 0) {
+            native_set_last_error(6);
+            return 0;
+        }
+        if !mode.is_null() {
+            unsafe { mode.write(0) };
+        }
+        1
+    }
+    extern "win64" fn native_reg_open_key_ex_w(
+        _key: u64,
+        _name: *const u16,
+        _options: u32,
+        _access: u32,
+        out: *mut u64,
+    ) -> u32 {
+        if !out.is_null() {
+            unsafe { out.write(0) };
+        }
+        2 // ERROR_FILE_NOT_FOUND: no registry is mounted in the guest.
+    }
+
+    extern "win64" fn native_local_free(value: u64) -> u64 {
+        if value == 0 {
+            return 0;
+        }
+        let Some(process) = process_ctx() else {
+            return value;
+        };
+        if process
+            .heap_allocations
+            .lock()
+            .is_ok_and(|mut values| values.remove(&value).is_some())
+        {
+            unsafe { free(value as *mut c_void) };
+            0
+        } else {
+            native_set_last_error(6);
+            value
+        }
+    }
+    extern "win64" fn native_free_library_and_exit_thread(_module: u64, _code: u32) -> ! {
+        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+            eprintln!("native FreeLibraryAndExitThread");
+        }
+        let handle = THREAD_NATIVE_HANDLE.get();
+        if let Some(process) = process_ctx() {
+            if let Ok(mut threads) = process.threads.lock() {
+                if let Some(thread) = threads.get_mut(&handle) {
+                    thread.exit_code = Some(_code);
+                }
+            }
+        }
+        // SYS_exit terminates only this Linux thread. pthread_exit would
+        // force-unwind across PE and Rust frames and abort the guest process.
+        unsafe {
+            core::arch::asm!("syscall", in("rax") 60u64, in("rdi") _code as u64, options(noreturn))
+        }
+    }
+
+    extern "win64" fn native_create_file_mapping_w(
+        file: u64,
+        _attributes: u64,
+        protection: u32,
+        size_high: u32,
+        size_low: u32,
+        _name: *const u16,
+    ) -> u64 {
+        let size = ((size_high as u64) << 32) | size_low as u64;
+        if file != u64::MAX
+            || size == 0
+            || size > usize::MAX as u64
+            || linux_protection(protection).is_none()
+        {
+            native_set_last_error(87);
+            return 0;
+        }
+        let Some(process) = process_ctx() else {
+            return 0;
+        };
+        let handle = process.mapping_next.fetch_add(1, Ordering::AcqRel);
+        let result = if let Ok(mut values) = process.file_mappings.lock() {
+            values.insert(handle, (size as usize, protection));
+            handle
+        } else {
+            0
+        };
+        result
+    }
+
+    extern "win64" fn native_map_view_of_file(
+        mapping: u64,
+        access: u32,
+        offset_high: u32,
+        offset_low: u32,
+        bytes: usize,
+    ) -> *mut u8 {
+        let Some(process) = process_ctx() else {
+            return ptr::null_mut();
+        };
+        let Some((size, protection)) = process
+            .file_mappings
+            .lock()
+            .ok()
+            .and_then(|values| values.get(&mapping).copied())
+        else {
+            native_set_last_error(6);
+            return ptr::null_mut();
+        };
+        let offset = ((offset_high as u64) << 32) | offset_low as u64;
+        let length = if bytes == 0 {
+            size.saturating_sub(offset as usize)
+        } else {
+            bytes
+        };
+        if offset != 0 || length == 0 || length > size {
+            native_set_last_error(87);
+            return ptr::null_mut();
+        }
+        let host_protection = if access & 2 != 0 {
+            PROT_READ | PROT_WRITE
+        } else if access & 4 != 0 {
+            PROT_READ
+        } else {
+            linux_protection(protection).unwrap_or(PROT_READ)
+        };
+        let Ok(mapped_length) = page_len(length) else {
+            native_set_last_error(8);
+            return ptr::null_mut();
+        };
+        let result = unsafe {
+            mmap(
+                ptr::null_mut(),
+                mapped_length,
+                host_protection,
+                MAP_PRIVATE | MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if result == MAP_FAILED {
+            native_set_last_error(8);
+            return ptr::null_mut();
+        }
+        if let Ok(mut views) = process.mapping_views.lock() {
+            views.insert(result as u64, mapped_length);
+        }
+        result.cast()
+    }
+
+    extern "win64" fn native_unmap_view_of_file(address: *mut c_void) -> i32 {
+        let Some(process) = process_ctx() else {
+            return 0;
+        };
+        let Some(length) = process
+            .mapping_views
+            .lock()
+            .ok()
+            .and_then(|mut values| values.remove(&(address as u64)))
+        else {
+            native_set_last_error(487);
+            return 0;
+        };
+        (unsafe { munmap(address, length) } == 0) as i32
+    }
+
+    extern "win64" fn native_set_console_ctrl_handler(_handler: u64, _add: i32) -> i32 {
+        // The CLI guest currently has no Windows console-control delivery.
+        // Registration succeeds so applications can install their handler;
+        // Linux signals still terminate the isolated guest process normally.
+        1
+    }
+
+    #[repr(C)]
+    struct NativeWsaData {
+        version: u16,
+        high_version: u16,
+        description: [u8; 257],
+        system_status: [u8; 129],
+        max_sockets: u16,
+        max_udp_datagram: u16,
+        vendor_info: *const u8,
+    }
+
+    extern "win64" fn native_wsa_startup(requested: u16, data: *mut NativeWsaData) -> i32 {
+        if data.is_null() {
+            return 10014; // WSAEFAULT
+        }
+        let major = requested as u8;
+        let minor = (requested >> 8) as u8;
+        if !matches!(major, 1 | 2) || (major == 2 && minor > 2) {
+            return 10092; // WSAVERNOTSUPPORTED
+        }
+        let negotiated = if major == 1 {
+            requested
+        } else {
+            0x0200 | minor as u16
+        };
+        let mut value = NativeWsaData {
+            version: negotiated,
+            high_version: 0x0202,
+            description: [0; 257],
+            system_status: [0; 129],
+            max_sockets: 0,
+            max_udp_datagram: 0,
+            vendor_info: std::ptr::null(),
+        };
+        value.description[..6].copy_from_slice(b"WinCLI");
+        value.system_status[..7].copy_from_slice(b"Running");
+        unsafe { data.write(value) };
+        0
+    }
+
+    extern "win64" fn native_wsa_cleanup() -> i32 {
+        0
+    }
+
+    const SOCKET_HANDLE_TAG: u64 = 0x534f_434b_0000_0000;
+
+    extern "win64" fn native_socket(domain: i32, kind: i32, protocol: i32) -> u64 {
+        let host_domain = match domain {
+            2 => 2,   // AF_INET
+            23 => 10, // AF_INET6
+            _ => {
+                native_wsa_set_last_error(10047); // WSAEAFNOSUPPORT
+                return u64::MAX;
+            }
+        };
+        let fd = unsafe { socket(host_domain, kind, protocol) };
+        if fd < 0 {
+            native_wsa_set_last_error(10047);
+            u64::MAX
+        } else {
+            SOCKET_HANDLE_TAG | fd as u64
+        }
+    }
+
+    extern "win64" fn native_close_socket(handle: u64) -> i32 {
+        if handle & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG {
+            native_wsa_set_last_error(10038); // WSAENOTSOCK
+            return -1;
+        }
+        if unsafe { close(handle as i32) } == 0 {
+            0
+        } else {
+            native_wsa_set_last_error(10038);
+            -1
+        }
+    }
+
+    extern "win64" fn native_getsockopt(
+        handle: u64,
+        level: i32,
+        option: i32,
+        value: *mut c_void,
+        length: *mut u32,
+    ) -> i32 {
+        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+            eprintln!("native getsockopt level={level:#x} option={option:#x}");
+        }
+        if handle & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG
+            || value.is_null()
+            || length.is_null()
+        {
+            native_wsa_set_last_error(10014); // WSAEFAULT
+            return -1;
+        }
+        let (host_level, host_option) = match (level, option) {
+            (0xffff, 0x1008) => (1, 3),  // SOL_SOCKET, SO_TYPE
+            (0xffff, 0x1007) => (1, 4),  // SO_ERROR
+            (0xffff, 0x1002) => (1, 8),  // SO_RCVBUF
+            (0xffff, 0x1001) => (1, 7),  // SO_SNDBUF
+            (0xffff, 0x0002) => (1, 30), // SO_ACCEPTCONN
+            (41, 27) => (41, 26),        // IPV6_V6ONLY
+            _ => {
+                native_wsa_set_last_error(10042); // WSAENOPROTOOPT
+                return -1;
+            }
+        };
+        let result = unsafe { getsockopt(handle as i32, host_level, host_option, value, length) };
+        if result != 0 {
+            native_wsa_set_last_error(10042);
+        }
+        result
+    }
+
+    extern "win64" fn native_wsa_get_last_error() -> i32 {
+        THREAD_WSA_ERROR.with(|error| error.get())
+    }
+
+    extern "win64" fn native_wsa_set_last_error(value: i32) {
+        THREAD_WSA_ERROR.with(|error| error.set(value));
+    }
+
+    extern "win64" fn native_ver_set_condition_mask(mask: u64, types: u32, condition: u8) -> u64 {
+        let shift = if types & 0x80 != 0 {
+            21
+        }
+        // VER_PRODUCT_TYPE
+        else if types & 0x40 != 0 {
+            18
+        }
+        // VER_SUITENAME
+        else if types & 0x20 != 0 {
+            15
+        }
+        // VER_SERVICEPACKMAJOR
+        else if types & 0x10 != 0 {
+            12
+        }
+        // VER_SERVICEPACKMINOR
+        else if types & 0x08 != 0 {
+            9
+        }
+        // VER_PLATFORMID
+        else if types & 0x04 != 0 {
+            6
+        }
+        // VER_BUILDNUMBER
+        else if types & 0x02 != 0 {
+            3
+        }
+        // VER_MAJORVERSION
+        else if types & 0x01 != 0 {
+            0
+        }
+        // VER_MINORVERSION
+        else {
+            return mask;
+        };
+        mask | (((condition & 7) as u64) << shift)
+    }
+
+    extern "win64" fn native_verify_version_info_w(info: *const u8, types: u32, mask: u64) -> i32 {
+        if info.is_null() || types == 0 {
+            native_set_last_error(87);
+            return 0;
+        }
+        let read32 = |offset| unsafe { (info.add(offset) as *const u32).read_unaligned() };
+        let read16 = |offset| unsafe { (info.add(offset) as *const u16).read_unaligned() };
+        let matches = |actual: u32, expected: u32, shift: u32| match (mask >> shift) & 7 {
+            1 => actual == expected,
+            2 => actual > expected,
+            3 => actual >= expected,
+            4 => actual < expected,
+            5 => actual <= expected,
+            _ => false,
+        };
+        let checks = [
+            (0x02, 10, read32(4), 3),
+            (0x01, 0, read32(8), 0),
+            (0x04, 19045, read32(12), 6),
+            (0x08, 2, read32(16), 9),
+            (0x20, 0, read16(276) as u32, 15),
+            (0x10, 0, read16(278) as u32, 12),
+            (0x80, 1, unsafe { *info.add(282) } as u32, 21),
+        ];
+        if checks.iter().any(|(bit, actual, expected, shift)| {
+            types & bit != 0 && !matches(*actual, *expected, *shift)
+        }) {
+            native_set_last_error(1150); // ERROR_OLD_WIN_VERSION
+            0
+        } else {
+            1
         }
     }
 
@@ -4235,23 +6222,54 @@ mod imp {
     fn patch_baseline_imports(
         mapping: &Mapping,
         img: &PeImage,
-        diagnostic: bool,
+        strict_imports: bool,
     ) -> Result<Option<MissingImportStubs>, String> {
         let imports: Vec<_> = img.imports.iter().chain(&img.unsupported).collect();
-        let missing = imports.iter().filter(|import| !supports_import(&import.dll, &import.func)).count();
-        if missing > 0 && !diagnostic {
-            let import = imports.iter().find(|import| !supports_import(&import.dll, &import.func)).unwrap();
-            return Err(format!("unsupported native import: {}!{}", import.dll, import.func));
+        let missing = imports
+            .iter()
+            .filter(|import| !supports_import(&import.dll, &import.func))
+            .count();
+        if missing > 0 && strict_imports {
+            let import = imports
+                .iter()
+                .find(|import| !supports_import(&import.dll, &import.func))
+                .unwrap();
+            return Err(format!(
+                "unsupported native import: {}!{}",
+                import.dll, import.func
+            ));
         }
         let mut stubs = if missing == 0 {
             None
         } else {
-            let size = page_len(missing.checked_mul(32).ok_or("too many native import stubs")?)?;
-            let ptr = unsafe { mmap(ptr::null_mut(), size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) };
+            let size = page_len(
+                missing
+                    .checked_mul(32)
+                    .ok_or("too many native import stubs")?,
+            )?;
+            let ptr = unsafe {
+                mmap(
+                    ptr::null_mut(),
+                    size,
+                    PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
             if ptr == MAP_FAILED {
-                return Err(format!("native import stub allocation failed: {}", std::io::Error::last_os_error()));
+                return Err(format!(
+                    "native import stub allocation failed: {}",
+                    std::io::Error::last_os_error()
+                ));
             }
-            Some(MissingImportStubs { _code: Mapping { ptr: ptr.cast(), len: size }, _messages: Vec::with_capacity(missing) })
+            Some(MissingImportStubs {
+                _code: Mapping {
+                    ptr: ptr.cast(),
+                    len: size,
+                },
+                _messages: Vec::with_capacity(missing),
+            })
         };
         let mut stub_index = 0;
         for import in imports {
@@ -4259,17 +6277,25 @@ mod imp {
                 baseline_trampoline(&import.func).unwrap()
             } else {
                 let stubs = stubs.as_mut().unwrap();
-                let message = format!("unsupported native import called: {}!{}\n", import.dll, import.func).into_bytes();
+                let message = format!(
+                    "unsupported native import called: {}!{}\n",
+                    import.dll, import.func
+                )
+                .into_bytes();
                 let message_ptr = message.as_ptr() as u64;
                 let message_len = message.len() as u64;
                 stubs._messages.push(message);
-                let code = unsafe { std::slice::from_raw_parts_mut(stubs._code.ptr.add(stub_index * 32), 32) };
+                let code = unsafe {
+                    std::slice::from_raw_parts_mut(stubs._code.ptr.add(stub_index * 32), 32)
+                };
                 code[0..2].copy_from_slice(&[0x48, 0xB9]); // mov rcx, message
                 code[2..10].copy_from_slice(&message_ptr.to_le_bytes());
                 code[10..12].copy_from_slice(&[0x48, 0xBA]); // mov rdx, length
                 code[12..20].copy_from_slice(&message_len.to_le_bytes());
                 code[20..22].copy_from_slice(&[0x48, 0xB8]); // mov rax, handler
-                code[22..30].copy_from_slice(&(native_missing_import as *const () as usize as u64).to_le_bytes());
+                code[22..30].copy_from_slice(
+                    &(native_missing_import as *const () as usize as u64).to_le_bytes(),
+                );
                 code[30..32].copy_from_slice(&[0xFF, 0xE0]); // jmp rax
                 stub_index += 1;
                 code.as_ptr() as u64
@@ -4285,8 +6311,18 @@ mod imp {
             unsafe { (mapping.ptr.add(off) as *mut u64).write_unaligned(value) };
         }
         if let Some(stubs) = &stubs {
-            if unsafe { mprotect(stubs._code.ptr.cast(), stubs._code.len, PROT_READ | PROT_EXEC) } != 0 {
-                return Err(format!("native import stubs could not be made executable: {}", std::io::Error::last_os_error()));
+            if unsafe {
+                mprotect(
+                    stubs._code.ptr.cast(),
+                    stubs._code.len,
+                    PROT_READ | PROT_EXEC,
+                )
+            } != 0
+            {
+                return Err(format!(
+                    "native import stubs could not be made executable: {}",
+                    std::io::Error::last_os_error()
+                ));
             }
         }
         Ok(stubs)
@@ -4370,8 +6406,8 @@ mod imp {
             .map_err(|_| "native backend execution lock is poisoned".to_string())?;
         let entry = entry(img)?;
         let mapping = map(img)?;
-        let diagnostic = std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1");
-        let _import_stubs = patch_baseline_imports(&mapping, img, diagnostic)?;
+        let strict_imports = std::env::var("WINCLI_NATIVE_STRICT_IMPORTS").as_deref() == Ok("1");
+        let _import_stubs = patch_baseline_imports(&mapping, img, strict_imports)?;
         let tls = setup_tls(&mapping, img)?;
         let fs = Arc::new(Mutex::new(NativeFs {
             fs: instance_fs,
@@ -4390,16 +6426,31 @@ mod imp {
             command_line_a,
             environment: Vec::new(),
             environment_block: vec![0, 0],
+            std_handles: [
+                AtomicU64::new(STD_HANDLE_BASE),
+                AtomicU64::new(STD_HANDLE_BASE + 1),
+                AtomicU64::new(STD_HANDLE_BASE + 2),
+            ],
             fs,
             last_error: AtomicU32::new(0),
             error_mode: AtomicU32::new(0),
             pointer_cookie: random_pointer_cookie(),
             heap_allocations: Mutex::new(HashMap::new()),
+            virtual_allocations: Mutex::new(HashMap::new()),
+            file_mappings: Mutex::new(HashMap::new()),
+            mapping_views: Mutex::new(HashMap::new()),
+            mapping_next: AtomicU64::new(0x9800_0000),
             gs_base: AtomicU64::new(0),
             tls_template: Mutex::new(tls.as_ref().map(NativeTls::clone_for_thread)),
             dynamic_tls: Mutex::new(DynamicTlsSlots::new(tls.is_some())),
             threads: Mutex::new(HashMap::new()),
             thread_next: AtomicU64::new(0x8000_0000),
+            semaphores: Mutex::new(HashMap::new()),
+            semaphore_next: AtomicU64::new(0x6000_0000),
+            completion_ports: Mutex::new(HashMap::new()),
+            completion_next: AtomicU64::new(0x9000_0000),
+            duplicate_handles: Mutex::new(HashMap::new()),
+            duplicate_next: AtomicU64::new(0xa000_0000),
             timer_next: AtomicU64::new(0x7000_0000),
             state_fd: AtomicU32::new(u32::MAX),
             fls_value: AtomicU64::new(0),
@@ -4460,21 +6511,34 @@ mod imp {
             if protect_exec(&mapping).is_err() {
                 unsafe { _exit(127) };
             }
-            if let Some(tls) = tls.as_ref() {
-                process
-                    .gs_base
-                    .store(tls.teb.as_ptr() as u64, Ordering::Release);
-                if !unsafe { set_gs(tls.teb.as_ptr() as u64) } {
-                    unsafe { _exit(127) };
-                }
-            }
-            // SAFETY: the entry is in the child-owned RX PE mapping. Its
-            // imported ExitProcess trampoline terminates this child.
-            let guest: unsafe extern "win64" fn() -> u32 = unsafe { std::mem::transmute(entry) };
-            let code = unsafe { guest() };
+            // Launcher threads can have 64 KiB stacks. V8 needs a larger
+            // Windows thread stack, with bounds reflected in the guest TEB.
+            let guest_process = Arc::clone(&process);
+            let guest_thread = std::thread::Builder::new()
+                .stack_size(16 * 1024 * 1024)
+                .spawn(move || {
+                    let mut tls = tls;
+                    if let Some(tls) = tls.as_mut() {
+                        set_teb_stack_bounds(&mut tls.teb);
+                        guest_process
+                            .gs_base
+                            .store(tls.teb.as_ptr() as u64, Ordering::Release);
+                        if !unsafe { set_gs(tls.teb.as_ptr() as u64) } {
+                            return 127;
+                        }
+                    }
+                    // SAFETY: entry is in the child-owned RX PE mapping.
+                    let guest: unsafe extern "win64" fn() -> u32 =
+                        unsafe { std::mem::transmute(entry) };
+                    unsafe { guest() as i32 }
+                });
+            let code = guest_thread
+                .ok()
+                .and_then(|thread| thread.join().ok())
+                .unwrap_or(127);
             unsafe { close(1) };
             native_flush_instance_state();
-            unsafe { _exit(code as i32) };
+            unsafe { _exit(code) };
         }
         unsafe {
             close(fds[1]);
