@@ -197,7 +197,7 @@ impl Shell {
 
     /// Run an EXE with the session filesystem; the FS comes back with the
     /// exit code. A failed run resets the session to a clean runner image
-    /// (the interpreter runner has consumed its filesystem state).
+    /// (the native runner has consumed its filesystem state).
     fn run_exe_file(
         &mut self,
         path: &str,
@@ -222,7 +222,7 @@ impl Shell {
         out: &mut Vec<u8>,
         sink: Option<backend::OutputSink>,
     ) -> Result<ShellFlow, String> {
-        let img = pe::load(data).map_err(|e| format!("failed to load {prog}: {e}"))?;
+        let img = pe::load_lenient(data).map_err(|e| format!("failed to load {prog}: {e}"))?;
         let fs = std::mem::replace(&mut self.fs, WinFs::ephemeral_runner());
         let backend = backend::configured().map_err(|e| format!("failed to select backend: {e}"))?;
         let streaming = sink.is_some();

@@ -3,7 +3,7 @@
 //! - No mapping to the Linux host filesystem.
 //! - Case-insensitive lookup, original casing preserved for listings.
 //! - Supports `C:\`, `C:\test\a.txt`, relative paths, `.` and `..`.
-//! - Single shared API used by both EXE shims (`winapi`) and PS1 (`ps1`).
+//! - Single shared API used by native PE shims and PS1 (`ps1`).
 
 use std::collections::HashMap;
 
@@ -333,6 +333,27 @@ impl WinFs {
             visit(root, &format!("{drive}:"), &mut out);
         }
         out.sort_by(|left, right| left.0.cmp(&right.0));
+        out
+    }
+
+    /// Return all directories below drive roots, including empty ones.
+    pub fn directories(&self) -> Vec<String> {
+        fn visit(node: &Node, path: &str, out: &mut Vec<String>) {
+            if let Node::Dir { children, .. } = node {
+                for child in children.values() {
+                    let child_path = format!("{path}\\{}", child.name());
+                    if child.is_dir() {
+                        out.push(child_path.clone());
+                    }
+                    visit(child, &child_path, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for (drive, root) in &self.drives {
+            visit(root, &format!("{drive}:"), &mut out);
+        }
+        out.sort();
         out
     }
 

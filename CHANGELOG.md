@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Removed
+
+- Removed the PE instruction interpreter, its interpreter-only WinAPI shims,
+  and the `wincli probe` command. PE execution now uses the Linux native
+  platform backend by default.
+
+### Changed
+
+- Native PE import binding now reports the exact unsupported Windows import
+  before guest execution instead of routing it to a zero-return fallback.
+- The Linux native backend now handles `Sleep`, `timeGetTime`, and
+  `GlobalMemoryStatusEx` with a monotonic timer and a bounded guest memory
+  budget.
+- PE inspection now reports native trampoline coverage. Native child snapshots
+  preserve empty directories as well as files.
+- Verified the official Node.js 24.21.0 Windows x64 executable and documented
+  the remaining native import gap.
+
 ### Added
 
 - Added cooperative I/O completion ports with FIFO post/dequeue, zero-timeout

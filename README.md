@@ -10,48 +10,36 @@ wincli rg --version       # cached package by bare name (or C:\bin\rg.exe)
 wincli script.ps1         # minimal PowerShell-like script execution
 wincli shell              # interactive shell: one in-memory WinFS per session
 wincli inspect app.exe    # PE compatibility report: supported vs missing imports
-wincli probe app.exe --version  # diagnostic: first API/instruction reached that fails
 ```
 
-### Experimental native backend
+### Native platform backend
 
-On Linux/x86-64, `WINCLI_BACKEND=native wincli app.exe` selects the native
-execution bring-up path. It executes PE instructions directly in a forked
-child, but currently supports only the import set used by `rust_hello.exe`
-`rust_argv.exe`, and `rust_fs.exe`: console, command-line, and basic WinFS
-file/directory operations, plus the process heap used by `rust_alloc.exe`.
-The combined `rust_alloc_fs.exe` guest also passes. All other programs should
-use the default interpreter backend; `rust_hashmap.exe` is covered as a
-native heap stress test, and `rust_lang.exe` / `rust_fp.exe` cover broader
-control-flow and floating-point code. This is not yet a general-purpose native
-PE runner.
+On Linux/x86-64, `wincli app.exe` executes PE instructions directly on the
+host CPU in a forked child. `WINCLI_BACKEND=native` and
+`WINCLI_BACKEND=native-linux-x64` select the same backend explicitly. Windows
+imports require native shims; unsupported imports fail before guest entry and
+are listed by `wincli inspect`. Other host platforms currently have no PE
+execution backend.
 
-The native loader also has experimental TLS/TEB/PEB initialization for
-real-program diagnostics. It is not sufficient for general Windows CRT
-startup or exception handling yet.
+The native loader has experimental TLS/TEB/PEB initialization. It is not yet
+sufficient for general Windows CRT startup or exception handling.
 
-Both share the exact same in-memory `WinFS`: case-insensitive lookup with
+PE programs and PS1 scripts share the exact same in-memory `WinFS`: case-insensitive lookup with
 original casing preserved, `C:\` + relative paths, `.`/`..` normalization.
 
 ## Layout
 
 ```text
 src/winfs/   in-memory Windows filesystem (shared by EXE shims and PS1)
-src/pe/      PE32+ loader, minimal x86_64 interpreter, test-EXE builder
-src/winapi/  Win32 shims: ExitProcess, GetStdHandle, WriteFile,
-             CreateFileW, ReadFile, CloseHandle, CreateDirectoryW,
-             RemoveDirectoryW, DeleteFileW, MoveFileW, CopyFileW,
-             GetCommandLineW/A, GetConsoleMode, SetConsoleMode,
-             WriteConsoleW, GetConsoleOutputCP, SetConsoleTextAttribute,
-             ReadConsoleW
+src/pe/      PE32+ loader and test-EXE builder
+src/native.rs Linux x86-64 PE execution and Windows API shims
 src/ps1/     minimal interpreter: New-Item, Set-Content, Add-Content,
              Get-Content, Get-ChildItem, Remove-Item, Copy-Item,
              Move-Item, Test-Path, text pipelines (|), irm, iex
 tests/artifacts/  committed test artifacts (see below)
 ```
 
-Unsupported PE imports and unemulated opcodes fail with a clear error instead
-of silently succeeding.
+Unsupported PE imports fail with a named error before guest execution.
 
 ## Test artifacts
 
@@ -81,15 +69,12 @@ no mingw/xwin):
 
 This compiles `guests/*.rs` (`hello.rs`, `fs_selftest.rs`, `argv_echo.rs`,
 `lang.rs`, `fp.rs`, `alloc.rs`, `alloc_fs.rs`; shared scaffold in
-`guests/support.rs`), links with `guests/kernel32.def` (exactly the supported
-API set — keep in sync with `pe::SUPPORTED_APIS`) plus the sysroot
+`guests/support.rs`), links with `guests/kernel32.def` (the guest import set
+must have native trampolines) plus the sysroot
 `alloc`/`core` rlibs (so `extern crate alloc`, bounds-check panics,
 and slice helpers resolve without CRT), and copies the results to
-`tests/artifacts/exe/rust_*.exe`. Guests are `no_std` self-tests: new rustc
-output not yet emulated fails with a clear `unsupported opcode` error, which
-drives emulator growth (so far: `xorps`/`movaps`/`movups`, `CMP r/m8,imm8`,
-`SETcc`, `TEST r/m8`, 16-bit ops, `CMOVcc`, shifts/rotates, `XCHG`, `CPUID`,
-string ops, Grp3 mul/div, 8-bit ALU, scalar-double + `UCOMISD`).
+`tests/artifacts/exe/rust_*.exe`. Guests are `no_std` self-tests running on the
+native backend.
 Guest rules: no CRT (`_fltused`, `memcpy`/`memset`, `__chkstk`,
 `strlen`, `__CxxFrameHandler3` stubs live in the guest); toolchain-specific
 `__rustc::` alloc link gates are defined in-guest and fail loudly at link
@@ -149,15 +134,18 @@ at portable Windows CLI tools to drive expansion one program at a time:
 
 ```bash
 wincli inspect rg.exe
-wincli probe node.exe --version
 ```
 
-`probe` uses the interpreter and temporarily binds missing imports to
-fail-on-call thunks. It stops at the first unsupported API or instruction
-actually reached, while preserving guest output written before a stop. The
-tested Node.js 24.21.0 Windows executable completes `probe node.exe --version`;
-normal execution still rejects its unknown imports at load time, and broader
-Node.js workloads remain under compatibility development.
+The official Node.js 24.21.0 Windows x64 `node.exe` is a native compatibility
+target. Its 424 static imports currently include 341 without native
+trampolines; execution stops at `CRYPT32.dll!CertCloseStore`. Node.js does not yet run on
+the native backend. The downloaded binary is kept locally under
+`target/nodejs/` for development and is not committed to this repository.
+Set `WINCLI_NODE_EXE=target/nodejs/node-v24.21.0-win-x64.exe` when running
+`cargo test --test node_native` to include the real binary check. The executable
+comes from `https://nodejs.org/download/release/v24.21.0/win-x64/node.exe`;
+its official SHA-256 is
+`ba4e6d110e8c1592a1ecd390f6b05f3da124b13871a5be62b341a07a853c6c32`.
 
 Planned next step is `wincli install <name>`: resolve portable Windows x64
 releases (preferred source: the WinGet catalog, portable EXE / ZIP only —

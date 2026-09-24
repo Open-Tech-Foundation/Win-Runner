@@ -1,8 +1,7 @@
 //! Minimal PE32+ (x86_64) loader: parse + validate, extract imports.
-//! Execution lives in `emu`; Win32 shims live in `winapi`.
+//! Execution is delegated to the selected platform backend.
 
 pub mod builder;
-pub mod emu;
 
 #[derive(Debug, Clone)]
 pub struct Import {
@@ -21,16 +20,11 @@ pub struct PeImage {
     /// `image[rva] == byte at image_base + rva`.
     pub image: Vec<u8>,
     pub imports: Vec<Import>,
-    /// Loadable fail-stubs (`STUB_APIS`): resolved like imports, but calling
-    /// one fails clearly with LastError=120. Never silently succeeds.
-    pub stubs: Vec<Import>,
-    /// Imports outside `SUPPORTED_APIS`. Always empty from `load` (strict);
-    /// populated by `load_lenient` for `inspect`. Never executable.
+    /// Imports without native platform trampolines. Empty from strict `load`;
+    /// populated by `load_lenient` for diagnostics and rejected before entry.
     pub unsupported: Vec<Import>,
     /// Thread-local storage template (TLS directory), if present.
     pub tls: Option<TlsDir>,
-    /// (iat_rva -> import index)
-    pub iat_slots: Vec<u32>,
     /// Executable-but-not-writable section ranges as absolute VAs (for W^X
     /// enforcement: guest writes there fail loudly instead of corrupting
     /// code; RWX sections stay writable).
@@ -102,226 +96,9 @@ fn apply_base_relocations(
     Ok(())
 }
 
-/// APIs WinCLI implements. Anything else must fail clearly.
-pub const SUPPORTED_APIS: &[(&str, &str)] = &[
-    ("ADVAPI32.DLL", "CryptAcquireContextW"),
-    ("ADVAPI32.DLL", "CryptGenRandom"),
-    ("ADVAPI32.DLL", "CryptReleaseContext"),
-    ("ADVAPI32.DLL", "EventRegister"),
-    ("ADVAPI32.DLL", "EventUnregister"),
-    ("ADVAPI32.DLL", "EventWriteTransfer"),
-    ("ADVAPI32.DLL", "EventSetInformation"),
-    ("KERNEL32.DLL", "ExitProcess"),
-    ("KERNEL32.DLL", "GetStdHandle"),
-    ("KERNEL32.DLL", "WriteFile"),
-    ("KERNEL32.DLL", "CreateFileW"),
-    ("KERNEL32.DLL", "CreateIoCompletionPort"),
-    ("KERNEL32.DLL", "PostQueuedCompletionStatus"),
-    ("KERNEL32.DLL", "GetQueuedCompletionStatusEx"),
-    ("KERNEL32.DLL", "ReadFile"),
-    ("KERNEL32.DLL", "CloseHandle"),
-    ("KERNEL32.DLL", "CreateDirectoryW"),
-    ("KERNEL32.DLL", "RemoveDirectoryW"),
-    ("KERNEL32.DLL", "DeleteFileW"),
-    ("KERNEL32.DLL", "MoveFileW"),
-    ("KERNEL32.DLL", "CopyFileW"),
-    ("KERNEL32.DLL", "GetCommandLineW"),
-    ("KERNEL32.DLL", "GetCommandLineA"),
-    ("KERNEL32.DLL", "GetConsoleMode"),
-    ("KERNEL32.DLL", "SetConsoleMode"),
-    ("KERNEL32.DLL", "WriteConsoleW"),
-    ("KERNEL32.DLL", "GetConsoleOutputCP"),
-    ("KERNEL32.DLL", "SetConsoleTextAttribute"),
-    ("KERNEL32.DLL", "ReadConsoleW"),
-    ("KERNEL32.DLL", "GetLastError"),
-    ("KERNEL32.DLL", "SetLastError"),
-    ("KERNEL32.DLL", "GetProcessHeap"),
-    ("KERNEL32.DLL", "HeapAlloc"),
-    ("KERNEL32.DLL", "HeapFree"),
-    ("KERNEL32.DLL", "HeapReAlloc"),
-    ("KERNEL32.DLL", "HeapSize"),
-    ("KERNEL32.DLL", "VirtualAlloc"),
-    ("KERNEL32.DLL", "VirtualFree"),
-    ("KERNEL32.DLL", "VirtualProtect"),
-    ("KERNEL32.DLL", "GetEnvironmentStringsW"),
-    ("KERNEL32.DLL", "FreeEnvironmentStringsW"),
-    ("KERNEL32.DLL", "GetEnvironmentVariableW"),
-    ("KERNEL32.DLL", "SetEnvironmentVariableW"),
-    ("KERNEL32.DLL", "GetStartupInfoW"),
-    ("KERNEL32.DLL", "GetModuleHandleW"),
-    ("KERNEL32.DLL", "GetModuleHandleA"),
-    ("KERNEL32.DLL", "GetModuleHandleExW"),
-    ("KERNEL32.DLL", "GetModuleFileNameW"),
-    ("KERNEL32.DLL", "GetSystemInfo"),
-    ("KERNEL32.DLL", "GetSystemTimeAsFileTime"),
-    ("KERNEL32.DLL", "QueryPerformanceCounter"),
-    ("KERNEL32.DLL", "QueryPerformanceFrequency"),
-    ("KERNEL32.DLL", "GetCurrentProcess"),
-    ("KERNEL32.DLL", "GetCurrentThread"),
-    ("KERNEL32.DLL", "GetCurrentProcessId"),
-    ("KERNEL32.DLL", "GetCurrentThreadId"),
-    ("KERNEL32.DLL", "TlsAlloc"),
-    ("KERNEL32.DLL", "TlsFree"),
-    ("KERNEL32.DLL", "TlsGetValue"),
-    ("KERNEL32.DLL", "TlsSetValue"),
-    ("KERNEL32.DLL", "GetFileType"),
-    ("KERNEL32.DLL", "GetCurrentDirectoryW"),
-    ("KERNEL32.DLL", "GetFullPathNameW"),
-    ("KERNEL32.DLL", "GetFinalPathNameByHandleW"),
-    ("KERNEL32.DLL", "GetFileAttributesW"),
-    ("KERNEL32.DLL", "GetFileSizeEx"),
-    ("KERNEL32.DLL", "GetFileInformationByHandle"),
-    ("KERNEL32.DLL", "GetFileInformationByHandleEx"),
-    ("KERNEL32.DLL", "MultiByteToWideChar"),
-    ("KERNEL32.DLL", "WideCharToMultiByte"),
-    ("KERNEL32.DLL", "GetACP"),
-    ("KERNEL32.DLL", "GetOEMCP"),
-    ("KERNEL32.DLL", "IsValidCodePage"),
-    ("KERNEL32.DLL", "IsDebuggerPresent"),
-    ("KERNEL32.DLL", "IsProcessorFeaturePresent"),
-    ("KERNEL32.DLL", "lstrlenW"),
-    ("KERNEL32.DLL", "EncodePointer"),
-    ("KERNEL32.DLL", "DecodePointer"),
-    ("KERNEL32.DLL", "Sleep"),
-    ("KERNEL32.DLL", "SleepEx"),
-    ("KERNEL32.DLL", "SwitchToThread"),
-    ("KERNEL32.DLL", "CreateThread"),
-    ("KERNEL32.DLL", "ResumeThread"),
-    ("KERNEL32.DLL", "SuspendThread"),
-    ("KERNEL32.DLL", "WaitForSingleObject"),
-    ("KERNEL32.DLL", "WaitForSingleObjectEx"),
-    ("API-MS-WIN-CORE-SYNCH-L1-2-0.DLL", "WaitOnAddress"),
-    ("API-MS-WIN-CORE-SYNCH-L1-2-0.DLL", "WakeByAddressAll"),
-    ("API-MS-WIN-CORE-SYNCH-L1-2-0.DLL", "WakeByAddressSingle"),
-    ("KERNEL32.DLL", "TerminateProcess"),
-    ("KERNEL32.DLL", "FlsAlloc"),
-    ("KERNEL32.DLL", "FlsFree"),
-    ("KERNEL32.DLL", "FlsGetValue"),
-    ("KERNEL32.DLL", "FlsSetValue"),
-    ("KERNEL32.DLL", "FindClose"),
-    ("KERNEL32.DLL", "FindFirstFileExW"),
-    ("KERNEL32.DLL", "FindNextFileW"),
-    ("KERNEL32.DLL", "InitializeCriticalSectionEx"),
-    ("KERNEL32.DLL", "InitializeCriticalSection"),
-    ("KERNEL32.DLL", "InitializeCriticalSectionAndSpinCount"),
-    ("KERNEL32.DLL", "InitializeSRWLock"),
-    ("KERNEL32.DLL", "AcquireSRWLockExclusive"),
-    ("KERNEL32.DLL", "AcquireSRWLockShared"),
-    ("KERNEL32.DLL", "TryAcquireSRWLockExclusive"),
-    ("KERNEL32.DLL", "TryAcquireSRWLockShared"),
-    ("KERNEL32.DLL", "ReleaseSRWLockExclusive"),
-    ("KERNEL32.DLL", "ReleaseSRWLockShared"),
-    ("KERNEL32.DLL", "InitializeConditionVariable"),
-    ("KERNEL32.DLL", "InitOnceExecuteOnce"),
-    ("KERNEL32.DLL", "InitOnceInitialize"),
-    ("KERNEL32.DLL", "InitOnceBeginInitialize"),
-    ("KERNEL32.DLL", "InitOnceComplete"),
-    ("KERNEL32.DLL", "SetErrorMode"),
-    ("KERNEL32.DLL", "SetConsoleCtrlHandler"),
-    ("KERNEL32.DLL", "CreateSemaphoreA"),
-    ("KERNEL32.DLL", "CreateSemaphoreW"),
-    ("KERNEL32.DLL", "ReleaseSemaphore"),
-    ("KERNEL32.DLL", "VerSetConditionMask"),
-    ("KERNEL32.DLL", "VerifyVersionInfoW"),
-    ("KERNEL32.DLL", "VerifyVersionInfoA"),
-    ("KERNEL32.DLL", "SetHandleInformation"),
-    ("KERNEL32.DLL", "GetHandleInformation"),
-    ("KERNEL32.DLL", "FormatMessageA"),
-    ("KERNEL32.DLL", "FormatMessageW"),
-    ("KERNEL32.DLL", "LocalFree"),
-    ("KERNEL32.DLL", "GetProcAddress"),
-    ("KERNEL32.DLL", "LoadLibraryA"),
-    ("KERNEL32.DLL", "LoadLibraryExA"),
-    ("KERNEL32.DLL", "LoadLibraryExW"),
-    ("KERNEL32.DLL", "FreeLibrary"),
-    ("NTDLL.DLL", "RtlGetVersion"),
-    ("NTDLL.DLL", "RtlNtStatusToDosError"),
-    ("POWRPROF.DLL", "PowerRegisterSuspendResumeNotification"),
-    ("POWRPROF.DLL", "PowerUnregisterSuspendResumeNotification"),
-    ("USER32.DLL", "GetSystemMetrics"),
-    // Stable Winsock ordinals (verified against Wine's ws2_32 export spec).
-    ("WS2_32.DLL", "#8"),  // htonl
-    ("WS2_32.DLL", "#9"),  // htons
-    ("WS2_32.DLL", "#14"), // ntohl
-    ("WS2_32.DLL", "#15"), // ntohs
-    ("WS2_32.DLL", "#3"),  // closesocket
-    ("WS2_32.DLL", "#7"),  // getsockopt
-    ("WS2_32.DLL", "#23"), // socket
-    ("WS2_32.DLL", "#111"), // WSAGetLastError
-    ("WS2_32.DLL", "#112"), // WSASetLastError
-    ("WS2_32.DLL", "#115"), // WSAStartup
-    ("WS2_32.DLL", "#116"), // WSACleanup
-    ("KERNEL32.DLL", "SleepConditionVariableCS"),
-    ("KERNEL32.DLL", "SleepConditionVariableSRW"),
-    ("KERNEL32.DLL", "WakeConditionVariable"),
-    ("KERNEL32.DLL", "WakeAllConditionVariable"),
-    ("KERNEL32.DLL", "EnterCriticalSection"),
-    ("KERNEL32.DLL", "LeaveCriticalSection"),
-    ("KERNEL32.DLL", "DeleteCriticalSection"),
-    ("KERNEL32.DLL", "InitializeSListHead"),
-    ("BCRYPTPRIMITIVES.DLL", "ProcessPrng"),
-    ("NTDLL.DLL", "NtWriteFile"),
-    ("NTDLL.DLL", "NtReadFile"),
-];
-
-/// Loadable-but-unimplemented APIs: the loader resolves them so real
-/// binaries start, but calling one fails clearly with
-/// `LastError=ERROR_CALL_NOT_IMPLEMENTED (120)`. Never silent success.
-/// Converted to real implementations on demand (execution traces decide).
-pub const STUB_APIS: &[(&str, &str)] = &[
-    ("NTDLL.DLL", "NtCreateNamedPipeFile"),
-    ("NTDLL.DLL", "NtOpenFile"),
-    ("USERENV.DLL", "GetUserProfileDirectoryW"),
-    ("KERNEL32.DLL", "AddVectoredExceptionHandler"),
-    ("KERNEL32.DLL", "CompareStringOrdinal"),
-    ("KERNEL32.DLL", "CompareStringW"),
-    ("KERNEL32.DLL", "CreateFileMappingW"),
-    ("KERNEL32.DLL", "CreateMutexA"),
-    ("KERNEL32.DLL", "CreateProcessW"),
-    ("KERNEL32.DLL", "CreateWaitableTimerExW"),
-    ("KERNEL32.DLL", "DuplicateHandle"),
-    ("KERNEL32.DLL", "FlushFileBuffers"),
-    ("KERNEL32.DLL", "GetCPInfo"),
-    ("KERNEL32.DLL", "GetComputerNameExW"),
-    ("KERNEL32.DLL", "GetConsoleScreenBufferInfo"),
-    ("KERNEL32.DLL", "GetExitCodeProcess"),
-    ("KERNEL32.DLL", "GetStringTypeW"),
-    ("KERNEL32.DLL", "GetSystemDirectoryW"),
-    ("KERNEL32.DLL", "GetWindowsDirectoryW"),
-    ("KERNEL32.DLL", "IsThreadAFiber"),
-    ("KERNEL32.DLL", "LCMapStringW"),
-    ("KERNEL32.DLL", "MapViewOfFile"),
-    ("KERNEL32.DLL", "RaiseException"),
-    ("KERNEL32.DLL", "ReadFileEx"),
-    ("KERNEL32.DLL", "ReleaseMutex"),
-    ("KERNEL32.DLL", "RtlCaptureContext"),
-    ("KERNEL32.DLL", "RtlLookupFunctionEntry"),
-    ("KERNEL32.DLL", "RtlPcToFileHeader"),
-    ("KERNEL32.DLL", "RtlUnwindEx"),
-    ("KERNEL32.DLL", "RtlVirtualUnwind"),
-    ("KERNEL32.DLL", "SetFileInformationByHandle"),
-    ("KERNEL32.DLL", "SetFilePointerEx"),
-    ("KERNEL32.DLL", "SetFileTime"),
-    ("KERNEL32.DLL", "SetStdHandle"),
-    ("KERNEL32.DLL", "SetThreadStackGuarantee"),
-    ("KERNEL32.DLL", "SetUnhandledExceptionFilter"),
-    ("KERNEL32.DLL", "SetWaitableTimer"),
-    ("KERNEL32.DLL", "UnhandledExceptionFilter"),
-    ("KERNEL32.DLL", "UnmapViewOfFile"),
-    ("KERNEL32.DLL", "WriteFileEx"),
-];
-
+/// True when the selected native platform backend has an import trampoline.
 pub fn is_supported(dll: &str, func: &str) -> bool {
-    SUPPORTED_APIS
-        .iter()
-        .any(|(d, f)| d.eq_ignore_ascii_case(dll) && *f == func)
-}
-
-/// True for loadable fail-stubs (see `STUB_APIS`).
-pub fn is_stub(dll: &str, func: &str) -> bool {
-    STUB_APIS
-        .iter()
-        .any(|(d, f)| d.eq_ignore_ascii_case(dll) && *f == func)
+    crate::native::supports_import(dll, func)
 }
 
 fn u16le(b: &[u8], off: usize) -> Result<u16, String> {
@@ -370,9 +147,8 @@ pub fn load(data: &[u8]) -> Result<PeImage, String> {
     load_inner(data, true)
 }
 
-/// Parse without rejecting unknown imports: they land in
-/// [`PeImage::unsupported`] for reporting by `inspect`.
-/// The result must not be executed (`Runner::new` refuses it).
+/// Parse without rejecting unknown imports. The native backend checks every
+/// import before guest execution and names unsupported APIs in its error.
 pub fn load_lenient(data: &[u8]) -> Result<PeImage, String> {
     load_inner(data, false)
 }
@@ -506,7 +282,6 @@ fn load_inner(data: &[u8], strict: bool) -> Result<PeImage, String> {
 
     // Parse imports (from file offsets via RVA->file mapping)
     let mut imports: Vec<Import> = Vec::new();
-    let mut stubs: Vec<Import> = Vec::new();
     let mut unsupported: Vec<Import> = Vec::new();
     if import_rva != 0 {
         if import_size == 0 {
@@ -567,9 +342,7 @@ fn load_inner(data: &[u8], strict: bool) -> Result<PeImage, String> {
                     func,
                 };
                 if !is_supported(&imp.dll, &imp.func) {
-                    if is_stub(&imp.dll, &imp.func) {
-                        stubs.push(imp);
-                    } else if strict {
+                    if strict {
                         return Err(format!("unsupported import: {}!{}", imp.dll, imp.func));
                     } else {
                         unsupported.push(imp);
@@ -588,8 +361,6 @@ fn load_inner(data: &[u8], strict: bool) -> Result<PeImage, String> {
             }
         }
     }
-
-    let iat_slots = imports.iter().map(|i| i.iat_rva).collect();
 
     // Executable-but-not-writable section ranges (absolute VAs) for W^X
     // enforcement (RWX sections stay writable, like real Windows).
@@ -673,10 +444,8 @@ fn load_inner(data: &[u8], strict: bool) -> Result<PeImage, String> {
         size_of_image,
         image,
         imports,
-        stubs,
         unsupported,
         tls,
-        iat_slots,
         code_ranges,
         relocations,
     })

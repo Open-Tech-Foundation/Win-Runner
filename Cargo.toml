@@ -2,7 +2,7 @@
 name = "wincli"
 version = "0.1.0"
 edition = "2021"
-description = "WinCLI: minimal in-memory Windows-style FS + PE32+ runner + PS1 interpreter (no Wine/VM)"
+description = "WinCLI: Linux-native PE32+ execution with in-memory WinFS and PS1 scripting"
 license = "Apache-2.0"
 
 [[bin]]

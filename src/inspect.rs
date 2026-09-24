@@ -1,7 +1,7 @@
 //! `wincli inspect`: static compatibility report for a Windows PE.
 //!
-//! Lists every import with its supported/missing verdict against
-//! [`SUPPORTED_APIS`](crate::pe::SUPPORTED_APIS). Uses [`load_lenient`](crate::pe::load_lenient),
+//! Lists every import with its supported/missing verdict against the active
+//! native platform backend. Uses [`load_lenient`](crate::pe::load_lenient),
 //! so binaries WinCLI cannot (yet) run still produce a full missing-API list —
 //! the fast path for expanding support one real program at a time.
 //!
@@ -16,20 +16,17 @@ pub struct InspectReport {
     pub entry_rva: u32,
     pub image_base: u64,
     pub supported: Vec<Import>,
-    /// Loadable fail-stubs: program starts, but dies clearly if it calls one.
-    pub stubbed: Vec<Import>,
     pub missing: Vec<Import>,
     /// Loader features that prevent execution even if every import resolves.
     pub limitations: Vec<String>,
 }
 
 impl InspectReport {
-    /// Loadable (nothing fully unknown). Stubs may still fail at runtime.
     pub fn runnable(&self) -> bool {
         self.missing.is_empty() && self.limitations.is_empty()
     }
     pub fn total(&self) -> usize {
-        self.supported.len() + self.stubbed.len() + self.missing.len()
+        self.supported.len() + self.missing.len()
     }
 }
 
@@ -41,7 +38,6 @@ pub fn inspect_pe(data: &[u8]) -> Result<InspectReport, String> {
         entry_rva: img.entry_rva,
         image_base: img.image_base,
         supported: img.imports,
-        stubbed: img.stubs,
         missing: img.unsupported,
         limitations,
     })
@@ -53,18 +49,11 @@ pub fn render(report: &InspectReport) -> String {
     s.push_str(&format!("Entry: 0x{:08x}\n", report.entry_rva));
     s.push_str(&format!("Imports: {}\n", report.total()));
     s.push_str(&format!("Supported imports: {}\n", report.supported.len()));
-    s.push_str(&format!(
-        "Stubbed imports (fail if called): {}\n",
-        report.stubbed.len()
-    ));
     s.push_str(&format!("Missing imports:   {}\n", report.missing.len()));
     for limitation in &report.limitations {
         s.push_str(&format!("Loader limitation: {limitation}\n"));
     }
-    for (title, list) in [
-        ("Stubbed", &report.stubbed),
-        ("Missing", &report.missing),
-    ] {
+    for (title, list) in [("Missing", &report.missing)] {
         if !list.is_empty() {
             s.push_str(&format!("\n{title}:\n"));
             let mut sorted = list.clone();

@@ -7,15 +7,50 @@
 //! personality around that code (DLL loading, import trampolines, TEB/PEB,
 //! exceptions, threads, and isolation).
 //!
-//! The first bridge supports the three APIs used by `rust_hello.exe`:
-//! `GetStdHandle`, `WriteFile`, and `ExitProcess`.  Other images deliberately
-//! remain on the interpreter until their imports have real trampolines. It is
-//! intentionally opt-in and is not used by the normal CLI execution path.
+//! PE instructions execute in a contained Linux child. Windows APIs require
+//! explicit native trampolines; unsupported imports fail before guest entry.
 
 use crate::pe::PeImage;
 
+const COMMAND_LINE_BYTES: usize = 0x10000;
+
+fn quote_arg(arg: &str) -> String {
+    if arg.is_empty() {
+        return "\"\"".to_string();
+    }
+    if !arg.chars().any(|ch| matches!(ch, ' ' | '\t' | '"' | '\n')) {
+        return arg.to_string();
+    }
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('"');
+    let mut backslashes = 0;
+    for ch in arg.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                out.extend(std::iter::repeat('\\').take(backslashes * 2 + 1));
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                out.extend(std::iter::repeat('\\').take(backslashes));
+                backslashes = 0;
+                out.push(ch);
+            }
+        }
+    }
+    out.extend(std::iter::repeat('\\').take(backslashes * 2));
+    out.push('"');
+    out
+}
+
 /// True when this build can execute the initial native backend.
 pub const AVAILABLE: bool = cfg!(all(target_os = "linux", target_arch = "x86_64"));
+
+/// Whether this host backend can bind a PE import without a fallback thunk.
+pub fn supports_import(dll: &str, func: &str) -> bool {
+    imp::supports_import(dll, func)
+}
 
 /// Run an import-free PE entry point directly on the host CPU.
 ///
@@ -73,7 +108,7 @@ pub fn run_rust_baseline_argv_with_fs_streaming(
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod imp {
-    use super::PeImage;
+    use super::{PeImage, COMMAND_LINE_BYTES, quote_arg};
     use crate::winfs::WinFs;
     use std::collections::HashMap;
     use std::ffi::c_void;
@@ -148,6 +183,13 @@ mod imp {
         fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void;
         fn free(ptr: *mut c_void);
         fn getrandom(buf: *mut c_void, buflen: usize, flags: u32) -> isize;
+        fn clock_gettime(clock_id: i32, time: *mut NativeTimespec) -> i32;
+    }
+
+    #[repr(C)]
+    struct NativeTimespec {
+        seconds: i64,
+        nanoseconds: i64,
     }
 
     struct Mapping {
@@ -197,6 +239,7 @@ mod imp {
             native_get_environment_strings_w, native_get_environment_variable_w,
             native_get_exit_code_process, native_get_file_type, native_get_full_path_name_w,
             native_get_last_error, native_get_module_file_name_w, native_get_module_handle_a,
+            native_global_memory_status_ex, NativeMemoryStatus,
             native_get_module_handle_ex_w, native_get_module_handle_w, native_get_oem_cp,
             native_get_proc_address, native_get_startup_info_w, native_get_string_type_w,
             native_get_system_info, native_get_user_profile_directory_w, native_heap_alloc,
@@ -230,6 +273,31 @@ mod imp {
         fn rejects_unsupported_windows_page_protections() {
             assert_eq!(linux_protection(0x08), None);
             assert_eq!(linux_protection(0x100), None);
+        }
+
+        #[test]
+        fn import_binding_checks_the_dll_as_well_as_the_function() {
+            assert!(super::supports_import("KERNEL32.dll", "ExitProcess"));
+            assert!(super::supports_import("WINMM.dll", "timeGetTime"));
+            assert!(!super::supports_import("USER32.dll", "ExitProcess"));
+            assert!(!super::supports_import("KERNEL32.dll", "timeGetTime"));
+            assert!(!super::supports_import("KERNEL32.dll", "NoSuchApi"));
+        }
+
+        #[test]
+        fn validates_native_memory_status_buffer_length() {
+            assert_eq!(native_global_memory_status_ex(std::ptr::null_mut()), 0);
+            let mut status = NativeMemoryStatus {
+                length: 63, load: 0, total_physical: 0, available_physical: 0,
+                total_page_file: 0, available_page_file: 0, total_virtual: 0,
+                available_virtual: 0, available_extended_virtual: 0,
+            };
+            assert_eq!(native_global_memory_status_ex(&mut status), 0);
+            assert_eq!(status.total_physical, 0);
+            status.length = 64;
+            assert_eq!(native_global_memory_status_ex(&mut status), 1);
+            assert_eq!(status.total_physical, 512 * 1024 * 1024);
+            assert_eq!(status.available_physical, 256 * 1024 * 1024);
         }
 
         #[test]
@@ -1006,10 +1074,8 @@ mod imp {
                 size_of_image: 16,
                 image: bytes,
                 imports: vec![],
-                stubs: vec![],
                 unsupported: vec![],
                 tls: None,
-                iat_slots: vec![],
                 code_ranges: vec![],
                 relocations: vec![0],
             };
@@ -1050,16 +1116,14 @@ mod imp {
         let _run = NATIVE_RUN_LOCK
             .lock()
             .map_err(|_| "native backend execution lock is poisoned".to_string())?;
-        if !img.imports.is_empty() || !img.stubs.is_empty() {
+        if !img.imports.is_empty() || !img.unsupported.is_empty() {
             return Err(
-                "native backend does not yet support PE imports; use the interpreter backend"
+                "import-free native entry point cannot bind PE imports"
                     .to_string(),
             );
         }
         if img.tls.is_some() {
-            return Err(
-                "native backend does not yet set up TLS; use the interpreter backend".to_string(),
-            );
+            return Err("import-free native entry point cannot initialize TLS".to_string());
         }
         let entry = img
             .image_base
@@ -1188,7 +1252,7 @@ mod imp {
         }
         let result = match process.threads.lock() {
             Ok(mut threads) => {
-                threads.insert(handle, join);
+                threads.insert(handle, NativeThread { join: Some(join), exit_code: None });
                 handle
             }
             Err(_) => {
@@ -1199,24 +1263,44 @@ mod imp {
         result
     }
     extern "win64" fn native_wait_for_single_object(handle: u64, milliseconds: u32) -> u32 {
-        let join = match process_ctx().and_then(|process| {
-            process
-                .threads
-                .lock()
-                .ok()
-                .and_then(|mut threads| threads.remove(&handle))
-        }) {
-            Some(join) => Some(join),
-            None => None,
-        };
-        match join {
-            Some(join) => {
-                let _ = join.join();
-                0
+        let process = process_ctx();
+        if process.as_ref().is_some_and(|process| process.threads.lock().ok()
+            .is_some_and(|threads| threads.contains_key(&handle))) {
+            let deadline = if milliseconds == u32::MAX { None } else {
+                std::time::Instant::now()
+                    .checked_add(std::time::Duration::from_millis(milliseconds as u64))
+            };
+            loop {
+                let join = {
+                    let Some(process) = process.as_ref() else { return 0xffff_ffff; };
+                    let Ok(mut threads) = process.threads.lock() else { return 0xffff_ffff; };
+                    let Some(thread) = threads.get_mut(&handle) else { return 0xffff_ffff; };
+                    if thread.exit_code.is_some() { return 0; }
+                    if thread.join.as_ref().is_some_and(|join| join.is_finished()) {
+                        thread.join.take()
+                    } else { None }
+                };
+                if let Some(join) = join {
+                    let code = join.join().unwrap_or(1);
+                    if let Some(process) = process.as_ref() {
+                        if let Ok(mut threads) = process.threads.lock() {
+                            if let Some(thread) = threads.get_mut(&handle) {
+                                thread.exit_code = Some(code);
+                            }
+                        }
+                    }
+                    return 0;
+                }
+                if milliseconds == 0 || deadline.is_some_and(|at| std::time::Instant::now() >= at) {
+                    return 258; // WAIT_TIMEOUT; handle remains valid
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
-            None if (0x7000_0000..0x8000_0000).contains(&handle) => 0,
-            None => {
-                let Some(process) = process_ctx() else {
+        }
+        match handle {
+            0x7000_0000..0x8000_0000 => 0,
+            _ => {
+                let Some(process) = process else {
                     return 0xffff_ffff; // WAIT_FAILED
                 };
                 let Some(child) = child_process(&process, handle) else {
@@ -1423,7 +1507,7 @@ mod imp {
         last_error: AtomicU32,
         gs_base: AtomicU64,
         tls_template: Mutex<Option<NativeTls>>,
-        threads: Mutex<HashMap<u64, std::thread::JoinHandle<u32>>>,
+        threads: Mutex<HashMap<u64, NativeThread>>,
         thread_next: AtomicU64,
         timer_next: AtomicU64,
         state_fd: AtomicU32,
@@ -1433,6 +1517,11 @@ mod imp {
         exit_status: AtomicU32,
         exited: AtomicBool,
         children: Mutex<NativeProcessTable>,
+    }
+
+    struct NativeThread {
+        join: Option<std::thread::JoinHandle<u32>>,
+        exit_code: Option<u32>,
     }
 
     // Import trampolines have no guest-context argument. This is therefore a
@@ -2108,6 +2197,55 @@ mod imp {
             return 0;
         }
         unsafe { out.write_unaligned(1_000_000_000) };
+        1
+    }
+    extern "win64" fn native_sleep(milliseconds: u32) {
+        std::thread::sleep(std::time::Duration::from_millis(milliseconds as u64));
+    }
+    extern "win64" fn native_time_get_time() -> u32 {
+        let mut time = NativeTimespec { seconds: 0, nanoseconds: 0 };
+        if unsafe { clock_gettime(1, &mut time) } != 0 { // CLOCK_MONOTONIC
+            return 0;
+        }
+        (time.seconds as u64 * 1000 + time.nanoseconds as u64 / 1_000_000) as u32
+    }
+    #[repr(C)]
+    struct NativeMemoryStatus {
+        length: u32,
+        load: u32,
+        total_physical: u64,
+        available_physical: u64,
+        total_page_file: u64,
+        available_page_file: u64,
+        total_virtual: u64,
+        available_virtual: u64,
+        available_extended_virtual: u64,
+    }
+    extern "win64" fn native_global_memory_status_ex(status: *mut NativeMemoryStatus) -> i32 {
+        if status.is_null() {
+            native_set_last_error(998); // ERROR_NOACCESS
+            return 0;
+        }
+        if unsafe { std::ptr::addr_of!((*status).length).read_unaligned() } != 64 {
+            native_set_last_error(87); // ERROR_INVALID_PARAMETER
+            return 0;
+        }
+        // Keep the reported budget consistent with the guest's finite WinFS
+        // process model rather than exposing an arbitrary host memory size.
+        let budget = 512 * 1024 * 1024u64;
+        let available = budget / 2;
+        let value = NativeMemoryStatus {
+            length: 64,
+            load: 50,
+            total_physical: budget,
+            available_physical: available,
+            total_page_file: budget,
+            available_page_file: available,
+            total_virtual: budget,
+            available_virtual: available,
+            available_extended_virtual: 0,
+        };
+        unsafe { status.write_unaligned(value) };
         1
     }
     extern "win64" fn native_initialize_critical_section_ex(
@@ -2854,10 +2992,6 @@ mod imp {
         unsafe { close(fd as i32) };
         process.state_fd.store(u32::MAX, Ordering::Release);
     }
-    extern "win64" fn native_unimplemented() -> u64 {
-        0
-    }
-
     extern "win64" fn native_get_last_error() -> u32 {
         process_ctx()
             .map(|process| process.last_error.load(Ordering::Acquire))
@@ -3180,6 +3314,13 @@ mod imp {
         let process = process_ctx();
         if process
             .as_ref()
+            .and_then(|process| process.threads.lock().ok().map(|mut threads| threads.remove(&h).is_some()))
+            .unwrap_or(false)
+        {
+            return 1;
+        }
+        if process
+            .as_ref()
             .is_some_and(|process| h == process.process_handle || h == u64::MAX - 1)
         {
             native_set_last_error(6); // pseudo handles cannot be closed
@@ -3269,6 +3410,23 @@ mod imp {
             .unwrap_or(false) as i32
     }
 
+    pub(super) fn supports_import(dll: &str, func: &str) -> bool {
+        let module = dll.to_ascii_uppercase();
+        let allowed = match module.as_str() {
+            "WINMM.DLL" => func == "timeGetTime",
+            "USERENV.DLL" => func == "GetUserProfileDirectoryW",
+            "BCRYPTPRIMITIVES.DLL" => func == "ProcessPrng",
+            "API-MS-WIN-CORE-SYNCH-L1-2-0.DLL" => {
+                matches!(func, "WaitOnAddress" | "WakeByAddressAll" | "WakeByAddressSingle")
+            }
+            "KERNEL32.DLL" | "KERNELBASE.DLL" => !matches!(
+                func, "timeGetTime" | "GetUserProfileDirectoryW" | "ProcessPrng"
+            ),
+            _ => false,
+        };
+        allowed && baseline_trampoline(func).is_some()
+    }
+
     fn baseline_trampoline(name: &str) -> Option<u64> {
         match name {
             "GetCommandLineW" => Some(native_get_command_line_w as *const () as usize as u64),
@@ -3295,6 +3453,11 @@ mod imp {
             }
             "QueryPerformanceFrequency" => {
                 Some(native_query_performance_frequency as *const () as usize as u64)
+            }
+            "Sleep" => Some(native_sleep as *const () as usize as u64),
+            "timeGetTime" => Some(native_time_get_time as *const () as usize as u64),
+            "GlobalMemoryStatusEx" => {
+                Some(native_global_memory_status_ex as *const () as usize as u64)
             }
             "InitializeCriticalSectionEx" => {
                 Some(native_initialize_critical_section_ex as *const () as usize as u64)
@@ -3413,16 +3576,17 @@ mod imp {
             "DeleteFileW" => Some(native_delete_file_w as *const () as usize as u64),
             "MoveFileW" => Some(native_move_file_w as *const () as usize as u64),
             "CopyFileW" => Some(native_copy_file_w as *const () as usize as u64),
-            _ => Some(native_unimplemented as *const () as usize as u64),
+            _ => None,
         }
     }
 
     fn patch_baseline_imports(mapping: &Mapping, img: &PeImage) -> Result<(), String> {
-        // `stubs` are loader-recognized APIs that normally route to an
-        // interpreter fail-stub. Native mode gives them a contained fallback
-        // (or a real native trampoline when one has been added) as well.
-        for import in img.imports.iter().chain(&img.stubs) {
-            let value = baseline_trampoline(&import.func).expect("fallback trampoline exists");
+        for import in img.imports.iter().chain(&img.unsupported) {
+            let value = supports_import(&import.dll, &import.func)
+                .then(|| baseline_trampoline(&import.func).unwrap())
+                .ok_or_else(|| {
+                format!("unsupported native import: {}!{}", import.dll, import.func)
+                })?;
             let off = import.iat_rva as usize;
             if off.checked_add(8).is_none_or(|end| end > mapping.len) {
                 return Err(format!(
@@ -3448,13 +3612,13 @@ mod imp {
     }
 
     fn command_line_w(prog: &str, args: &[String]) -> Result<Vec<u16>, String> {
-        let mut line = crate::pe::emu::quote_arg(prog);
+        let mut line = quote_arg(prog);
         for arg in args {
             line.push(' ');
-            line.push_str(&crate::pe::emu::quote_arg(arg));
+            line.push_str(&quote_arg(arg));
         }
         let wide: Vec<u16> = line.encode_utf16().chain(std::iter::once(0)).collect();
-        if wide.len() * 2 > crate::pe::emu::CMDLINE_SIZE {
+        if wide.len() * 2 > COMMAND_LINE_BYTES {
             return Err("command line too long (64K guest block)".to_string());
         }
         Ok(wide)
@@ -3698,6 +3862,10 @@ mod imp {
 mod imp {
     use super::PeImage;
 
+    pub(super) fn supports_import(_: &str, _: &str) -> bool {
+        false
+    }
+
     pub(super) fn run_import_free(_: &PeImage) -> Result<u32, String> {
         Err("native backend is available only on Linux x86_64".to_string())
     }
@@ -3749,12 +3917,12 @@ mod tests {
     }
 
     #[test]
-    fn imports_remain_on_the_interpreter_until_trampolines_exist() {
+    fn import_free_entry_rejects_imported_images() {
         let mut asm = Asm::new();
         asm.ret();
         let img = load(&build(asm, &[("KERNEL32.DLL", "ExitProcess")])).expect("fixture PE loads");
         let err = run_import_free(&img).expect_err("imports need shims");
-        assert!(err.contains("does not yet support PE imports"));
+        assert!(err.contains("cannot bind PE imports"));
     }
 
     #[test]

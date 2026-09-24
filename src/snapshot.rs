@@ -9,7 +9,7 @@
 //! files/C/Windows/...                more guest files
 //! ```
 //!
-//! Directories are implicit. Entry names must use `/`, begin with `files/C/`,
+//! Directories may be explicit. Entry names must use `/`, begin with `files/C/`,
 //! and may not contain `.` or `..` components. Loading always starts with the
 //! built-in empty runner image; the archive only adds or replaces files.
 
@@ -67,7 +67,10 @@ pub fn load(bytes: &[u8]) -> Result<WinFs, String> {
     let mut fs = WinFs::ephemeral_runner();
     for entry in entries.iter().filter(|entry| entry.name.starts_with(FILE_PREFIX)) {
         if entry.is_dir {
-            validate_name(entry.name.trim_end_matches('/'))?;
+            let name = entry.name.trim_end_matches('/');
+            let guest = guest_path(name)?;
+            fs.mkdir(&guest)
+                .map_err(|e| format!("snapshot cannot create {guest}: {e}"))?;
             continue;
         }
         let guest = guest_path(&entry.name)?;
@@ -87,6 +90,10 @@ pub fn load(bytes: &[u8]) -> Result<WinFs, String> {
 /// the host controller without mounting the host filesystem.
 pub fn encode(fs: &WinFs) -> Vec<u8> {
     let mut entries = vec![(MARKER.to_string(), MARKER_CONTENTS.to_vec())];
+    for path in fs.directories() {
+        let path = path.strip_prefix("C:\\").unwrap_or(&path).replace('\\', "/");
+        entries.push((format!("files/C/{path}/"), Vec::new()));
+    }
     for (path, data) in fs.files() {
         let path = path.strip_prefix("C:\\").unwrap_or(&path).replace('\\', "/");
         entries.push((format!("files/C/{path}"), data));
@@ -271,5 +278,14 @@ mod tests {
             restored.read_file(r"C:\actions-runner\_work\result.txt").unwrap(),
             b"done"
         );
+    }
+
+    #[test]
+    fn preserves_empty_directories_across_native_child_snapshot() {
+        let mut fs = WinFs::new();
+        fs.mkdir(r"C:\Empty\Nested").unwrap();
+        let restored = load(&encode(&fs)).unwrap();
+        assert!(restored.is_dir(r"C:\Empty\Nested"));
+        assert_eq!(restored.list_dir(r"C:\Empty\Nested").unwrap(), Vec::<String>::new());
     }
 }

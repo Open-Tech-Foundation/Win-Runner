@@ -15,7 +15,6 @@ fn usage() -> ! {
     eprintln!("  wincli instance status|destroy <name>");
     eprintln!("  wincli instance exec <name> -- <command> [args...]");
     eprintln!("  wincli inspect <app.exe|pkg>  report PE imports vs supported APIs");
-    eprintln!("  wincli probe <app.exe> [args...]  trace the first runtime blocker");
     eprintln!("  wincli install <pkg>          install a package into the cache");
     eprintln!("env: WINCLI_CACHE (default ~/.cache/wincli), WINCLI_SOURCE (package dir)");
     std::process::exit(2);
@@ -40,9 +39,6 @@ fn main() {
     }
     if args.len() == 3 && args[1] == "inspect" {
         inspect_target(&args[2]);
-    }
-    if args.len() >= 3 && args[1] == "probe" {
-        probe_exe_file(&args[2], &args[3..]);
     }
     if args.len() == 3 && args[1] == "install" {
         install_pkg(&args[2]);
@@ -199,7 +195,7 @@ fn run_target(target: &str, guest_args: &[String]) {
             }
         };
         let label = exe_path.display().to_string();
-        let img = match pe::load(&bytes) {
+        let img = match pe::load_lenient(&bytes) {
             Ok(img) => img,
             Err(e) => {
                 eprintln!("wincli: failed to load {label}: {e}");
@@ -232,24 +228,6 @@ fn run_exe_file(path: &str, prog: &str, guest_args: &[String]) {    // NOTE: thi
             std::process::exit(1);
         }
     };
-    let img = match pe::load(&data) {
-        Ok(img) => img,
-        Err(e) => {
-            eprintln!("wincli: failed to load {path}: {e}");
-            std::process::exit(1);
-        }
-    };
-    run_with_runner(&img, path, prog, guest_args);
-}
-
-fn probe_exe_file(path: &str, guest_args: &[String]) -> ! {
-    let data = match std::fs::read(path) {
-        Ok(data) => data,
-        Err(e) => {
-            eprintln!("wincli: cannot read {path}: {e}");
-            std::process::exit(1);
-        }
-    };
     let img = match pe::load_lenient(&data) {
         Ok(img) => img,
         Err(e) => {
@@ -257,25 +235,7 @@ fn probe_exe_file(path: &str, guest_args: &[String]) -> ! {
             std::process::exit(1);
         }
     };
-    let runner = match wincli::winapi::Runner::with_argv_probe(&img, WinFs::new(), path, guest_args) {
-        Ok(runner) => runner,
-        Err(e) => {
-            eprintln!("wincli: probe stopped for {path}: {e}");
-            std::process::exit(1);
-        }
-    };
-    let runner = runner.with_console_sink(Box::new(|data| {
-        let _ = std::io::stdout().write_all(data);
-    }));
-    match runner.run() {
-        Ok((code, _, _)) => {
-            std::process::exit(code as i32);
-        }
-        Err(e) => {
-            eprintln!("wincli: probe stopped for {path}: {e}");
-            std::process::exit(1);
-        }
-    }
+    run_with_runner(&img, path, prog, guest_args);
 }
 
 /// Execute a loaded image through the configured platform backend.

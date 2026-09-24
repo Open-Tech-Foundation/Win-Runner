@@ -1,7 +1,7 @@
 //! Test-EXE builder: constructs minimal PE32+ (x86_64) binaries in-memory.
 //!
 //! Used by integration tests (and only tests) so `cargo test` needs no
-//! external assembler. Emits only opcodes `emu` understands.
+//! external assembler. Generated code runs through the native PE backend.
 
 use std::collections::HashMap;
 
@@ -72,7 +72,7 @@ impl Asm {
         self.labels.insert(id, self.code.len());
     }
 
-    // ---- instruction helpers (all emu-supported) ----
+    // ---- instruction helpers for small x86-64 PE fixtures ----
     pub fn sub_rsp(&mut self, n: u8) {
         self.emit(&[0x48, 0x83, 0xEC, n]);
     }
@@ -507,8 +507,8 @@ pub fn build(mut asm: Asm, imports: &[(&str, &str)]) -> Vec<u8> {
     f.extend_from_slice(&0u32.to_le_bytes());
     f.extend_from_slice(&0u16.to_le_bytes());
     f.extend_from_slice(&0u16.to_le_bytes());
-    // CODE|EXECUTE|READ|WRITE: test probes keep data and the IAT in the
-    // single code section, and the emulator enforces W^X.
+    // CODE|EXECUTE|READ|WRITE: test fixtures keep data and the IAT in the
+    // single code section.
     f.extend_from_slice(&0xE000_0020u32.to_le_bytes());
     while f.len() < size_of_headers as usize {
         f.push(0);

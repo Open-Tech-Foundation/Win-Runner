@@ -9,6 +9,5 @@ pub mod ps1;
 pub mod protocol;
 pub mod shell;
 pub mod snapshot;
-pub mod winapi;
 pub mod winfs;
 pub mod winget;

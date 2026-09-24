@@ -1,6 +1,6 @@
 ; Import definitions for the Win32 APIs WinCLI implements.
 ; Used by guests/build.sh to generate kernel32.lib via rust-lld.
-; Keep in sync with `pe::SUPPORTED_APIS` in src/pe/mod.rs.
+; Imported functions must have native trampolines in src/native.rs.
 LIBRARY KERNEL32
 EXPORTS
 GetStdHandle
