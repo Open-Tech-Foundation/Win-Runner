@@ -330,6 +330,8 @@ mod imp {
                     super::NativeFile {
                         path: path.into(),
                         offset: 0,
+                        overlapped: false,
+                        completion: None,
                     },
                 );
                 handle
@@ -390,6 +392,17 @@ mod imp {
             let mut fs = context.lock().unwrap();
             fs.handles.remove(&handle);
             fs.fs.delete_file(path).unwrap();
+        }
+
+        #[test]
+        fn overlapped_offset_combines_both_dwords() {
+            let mut overlapped = [0u8; 32];
+            overlapped[16..20].copy_from_slice(&0x89ab_cdefu32.to_le_bytes());
+            overlapped[20..24].copy_from_slice(&0x1234u32.to_le_bytes());
+            assert_eq!(
+                super::native_overlapped_offset(overlapped.as_ptr() as u64),
+                Some(0x1234_89ab_cdefusize)
+            );
         }
 
         #[test]
@@ -1469,6 +1482,8 @@ mod imp {
     struct NativeFile {
         path: String,
         offset: usize,
+        overlapped: bool,
+        completion: Option<(Arc<NativeCompletionPort>, u64)>,
     }
     struct NativeFind {
         names: Vec<String>,
@@ -1857,40 +1872,85 @@ mod imp {
     extern "win64" fn native_create_io_completion_port(
         file: u64,
         existing_port: u64,
-        _completion_key: u64,
+        completion_key: u64,
         _concurrent_threads: u32,
     ) -> u64 {
         let Some(process) = process_ctx() else {
             return 0;
         };
-        if existing_port != 0 {
-            let valid = process
-                .completion_ports
-                .lock()
-                .is_ok_and(|values| values.contains_key(&existing_port));
-            if !valid {
-                native_set_last_error(6);
-                return 0;
-            }
-            return existing_port;
-        }
-        if file != u64::MAX && file != 0 {
-            native_set_last_error(87); // A new port requires INVALID_HANDLE_VALUE.
+        if file == u64::MAX && existing_port != 0 {
+            native_set_last_error(87);
             return 0;
         }
-        let handle = process.completion_next.fetch_add(1, Ordering::AcqRel);
-        let port = Arc::new(NativeCompletionPort {
-            queue: Mutex::new(std::collections::VecDeque::new()),
-            ready: Condvar::new(),
-        });
-        if process.completion_ports.lock().is_ok_and(|mut values| {
-            values.insert(handle, port);
-            true
-        }) {
-            handle
-        } else {
-            0
+        let mut fs = match process.fs.lock() {
+            Ok(fs) => fs,
+            Err(_) => return 0,
+        };
+        if file != u64::MAX {
+            let Some(open) = fs.handles.get(&file) else {
+                native_set_last_error(6);
+                return 0;
+            };
+            if !open.overlapped || open.completion.is_some() {
+                native_set_last_error(87);
+                return 0;
+            }
         }
+        let (handle, port) = if existing_port != 0 {
+            let Some(port) = process
+                .completion_ports
+                .lock()
+                .ok()
+                .and_then(|ports| ports.get(&existing_port).cloned())
+            else {
+                native_set_last_error(6);
+                return 0;
+            };
+            (existing_port, port)
+        } else {
+            let handle = process.completion_next.fetch_add(1, Ordering::AcqRel);
+            let port = Arc::new(NativeCompletionPort {
+                queue: Mutex::new(std::collections::VecDeque::new()),
+                ready: Condvar::new(),
+            });
+            let Ok(mut ports) = process.completion_ports.lock() else {
+                return 0;
+            };
+            ports.insert(handle, port.clone());
+            (handle, port)
+        };
+        if file != u64::MAX {
+            fs.handles.get_mut(&file).unwrap().completion = Some((port, completion_key));
+        }
+        handle
+    }
+    fn native_complete_file_io(file: &NativeFile, overlapped: u64, bytes: u32) {
+        if overlapped == 0 {
+            return;
+        }
+        unsafe {
+            (overlapped as *mut u64).write_unaligned(0); // OVERLAPPED.Internal = STATUS_SUCCESS
+            ((overlapped + 8) as *mut u64).write_unaligned(bytes as u64); // InternalHigh
+        }
+        if let Some((port, key)) = &file.completion {
+            // The low bit of hEvent suppresses completion-port notification.
+            let event = unsafe { ((overlapped + 24) as *const u64).read_unaligned() };
+            if event & 1 == 0 {
+                if let Ok(mut queue) = port.queue.lock() {
+                    queue.push_back(NativeCompletion {
+                        key: *key,
+                        overlapped,
+                        bytes,
+                    });
+                    port.ready.notify_one();
+                }
+            }
+        }
+    }
+    fn native_overlapped_offset(overlapped: u64) -> Option<usize> {
+        let low = unsafe { ((overlapped + 16) as *const u32).read_unaligned() };
+        let high = unsafe { ((overlapped + 20) as *const u32).read_unaligned() };
+        usize::try_from(((high as u64) << 32) | low as u64).ok()
     }
     extern "win64" fn native_post_queued_completion_status(
         handle: u64,
@@ -1997,6 +2057,38 @@ mod imp {
             n += 1;
         }
         unsafe { removed.write(n) };
+        1
+    }
+    extern "win64" fn native_get_queued_completion_status(
+        handle: u64,
+        bytes: *mut u32,
+        key: *mut u64,
+        overlapped: *mut u64,
+        timeout: u32,
+    ) -> i32 {
+        if bytes.is_null() || key.is_null() || overlapped.is_null() {
+            native_set_last_error(87);
+            return 0;
+        }
+        let mut entry = NativeOverlappedEntry {
+            key: 0,
+            overlapped: 0,
+            internal: 0,
+            bytes: 0,
+            _padding: 0,
+        };
+        let mut removed = 0;
+        if native_get_queued_completion_status_ex(handle, &mut entry, 1, &mut removed, timeout, 0)
+            == 0
+        {
+            unsafe { overlapped.write(0) };
+            return 0;
+        }
+        unsafe {
+            bytes.write(entry.bytes);
+            key.write(entry.key);
+            overlapped.write(entry.overlapped);
+        }
         1
     }
     extern "win64" fn native_wait_on_address(
@@ -4298,12 +4390,13 @@ mod imp {
         buf: *const u8,
         len: u32,
         written: *mut u32,
-        _overlapped: u64,
+        overlapped: u64,
     ) -> i32 {
         if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
             eprintln!("native WriteFile handle={handle:#x} len={len}");
         }
-        if buf.is_null() || len > 16 * 1024 * 1024 {
+        if (buf.is_null() && len != 0) || len > 16 * 1024 * 1024 {
+            native_set_last_error(87);
             return 0;
         }
         if !matches!(host_standard_fd(handle), Some(1 | 2)) {
@@ -4316,10 +4409,32 @@ mod imp {
                 Err(_) => return 0,
             };
             let (path, offset) = match ctx.handles.get(&handle) {
-                Some(v) => (v.path.clone(), v.offset),
-                None => return 0,
+                Some(v) => {
+                    if v.overlapped && overlapped == 0 {
+                        native_set_last_error(87);
+                        return 0;
+                    }
+                    let offset = if overlapped == 0 {
+                        Some(v.offset)
+                    } else {
+                        native_overlapped_offset(overlapped)
+                    };
+                    let Some(offset) = offset else {
+                        native_set_last_error(87);
+                        return 0;
+                    };
+                    (v.path.clone(), offset)
+                }
+                None => {
+                    native_set_last_error(6);
+                    return 0;
+                }
             };
-            let data = unsafe { std::slice::from_raw_parts(buf, len as usize) };
+            let data = if len == 0 {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(buf, len as usize) }
+            };
             let mut content = match ctx.fs.read_file(&path) {
                 Ok(v) => v,
                 Err(_) => return 0,
@@ -4329,6 +4444,10 @@ mod imp {
                 None => return 0,
             };
             if content.len() < end {
+                if content.try_reserve(end - content.len()).is_err() {
+                    native_set_last_error(8); // ERROR_NOT_ENOUGH_MEMORY
+                    return 0;
+                }
                 content.resize(end, 0);
             }
             content[offset..end].copy_from_slice(data);
@@ -4336,7 +4455,10 @@ mod imp {
                 return 0;
             }
             if let Some(file) = ctx.handles.get_mut(&handle) {
-                file.offset = end;
+                if overlapped == 0 {
+                    file.offset = end;
+                }
+                native_complete_file_io(file, overlapped, len);
             }
             if !written.is_null() {
                 unsafe { written.write(len) };
@@ -5284,7 +5406,7 @@ mod imp {
         _share: u32,
         _sec: u64,
         creation: u32,
-        _flags: u32,
+        flags: u32,
         _tmpl: u64,
     ) -> u64 {
         let path = match wide(path) {
@@ -5317,7 +5439,15 @@ mod imp {
         }
         let h = ctx.next;
         ctx.next += 1;
-        ctx.handles.insert(h, NativeFile { path, offset: 0 });
+        ctx.handles.insert(
+            h,
+            NativeFile {
+                path,
+                offset: 0,
+                overlapped: flags & 0x4000_0000 != 0,
+                completion: None,
+            },
+        );
         h
     }
     fn native_file_attributes(is_directory: bool) -> u32 {
@@ -5405,12 +5535,13 @@ mod imp {
         buf: *mut u8,
         n: u32,
         read_count: *mut u32,
-        _ov: u64,
+        ov: u64,
     ) -> i32 {
         if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
             eprintln!("native ReadFile handle={h:#x} len={n} buf={buf:p}");
         }
-        if buf.is_null() {
+        if buf.is_null() && n != 0 {
+            native_set_last_error(87);
             return 0;
         }
         if let Some(fd) = host_standard_fd(h) {
@@ -5432,8 +5563,26 @@ mod imp {
             Err(_) => return 0,
         };
         let (path, offset) = match ctx.handles.get(&h) {
-            Some(v) => (v.path.clone(), v.offset),
-            None => return 0,
+            Some(v) => {
+                if v.overlapped && ov == 0 {
+                    native_set_last_error(87);
+                    return 0;
+                }
+                let offset = if ov == 0 {
+                    Some(v.offset)
+                } else {
+                    native_overlapped_offset(ov)
+                };
+                let Some(offset) = offset else {
+                    native_set_last_error(87);
+                    return 0;
+                };
+                (v.path.clone(), offset)
+            }
+            None => {
+                native_set_last_error(6);
+                return 0;
+            }
         };
         let data = match ctx.fs.read_file(&path) {
             Ok(v) => v,
@@ -5446,13 +5595,22 @@ mod imp {
                 process_ctx().map_or(0, |p| p.image_base)
             );
         }
+        if ov != 0 && n != 0 && offset >= data.len() {
+            native_set_last_error(38); // ERROR_HANDLE_EOF
+            return 0;
+        }
         let k = (data.len().saturating_sub(offset)).min(n as usize);
-        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr().add(offset), buf, k) };
+        if k != 0 {
+            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr().add(offset), buf, k) };
+        }
         if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
             eprintln!("native ReadFile copied={k}");
         }
         if let Some(file) = ctx.handles.get_mut(&h) {
-            file.offset = offset + k;
+            if ov == 0 {
+                file.offset = offset + k;
+            }
+            native_complete_file_io(file, ov, k as u32);
         }
         if !read_count.is_null() {
             unsafe { read_count.write(k as u32) };
@@ -5710,6 +5868,9 @@ mod imp {
             }
             "GetQueuedCompletionStatusEx" => {
                 Some(native_get_queued_completion_status_ex as *const () as usize as u64)
+            }
+            "GetQueuedCompletionStatus" => {
+                Some(native_get_queued_completion_status as *const () as usize as u64)
             }
             "VerSetConditionMask" => {
                 Some(native_ver_set_condition_mask as *const () as usize as u64)

@@ -132,6 +132,24 @@ fn native_backend_runs_rust_fs_guest() {
 }
 
 #[test]
+fn native_backend_runs_overlapped_iocp_guest() {
+    let output = Command::new(env!("CARGO_BIN_EXE_wincli"))
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/artifacts/exe/rust_iocp.exe"
+        ))
+        .env("WINCLI_BACKEND", "native")
+        .output()
+        .expect("spawn native backend");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn native_backend_runs_rust_alloc_guest() {
     let bin = env!("CARGO_BIN_EXE_wincli");
     let exe = concat!(

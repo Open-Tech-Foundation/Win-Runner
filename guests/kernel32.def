@@ -8,6 +8,9 @@ WriteFile
 ExitProcess
 CreateFileW
 ReadFile
+CreateIoCompletionPort
+GetQueuedCompletionStatus
+GetQueuedCompletionStatusEx
 CloseHandle
 CreateDirectoryW
 RemoveDirectoryW

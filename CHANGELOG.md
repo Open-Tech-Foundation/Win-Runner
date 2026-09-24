@@ -11,6 +11,9 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added overlapped WinFS reads and writes with explicit offsets, immediate
+  completion packets, per-file IOCP keys, and `GetQueuedCompletionStatus` on
+  the native backend. A real Windows PE fixture covers success and error paths.
 - Added synchronous `NtReadFile` for WinFS handles with current or explicit
   offsets, EOF status, and NT I/O status blocks. The official Windows ripgrep
   15.2.0 binary now searches guest files and directories, lists files, and
