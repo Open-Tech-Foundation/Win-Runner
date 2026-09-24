@@ -11,6 +11,9 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added background completion for larger overlapped WinFS reads and writes,
+  including `ERROR_IO_PENDING`, waitable `GetOverlappedResult`, and failed
+  completion packets for deferred EOF. Native PE tests cover both paths.
 - Added overlapped WinFS reads and writes with explicit offsets, immediate
   completion packets, per-file IOCP keys, and `GetQueuedCompletionStatus` on
   the native backend. A real Windows PE fixture covers success and error paths.

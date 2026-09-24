@@ -11,6 +11,7 @@ ReadFile
 CreateIoCompletionPort
 GetQueuedCompletionStatus
 GetQueuedCompletionStatusEx
+GetOverlappedResult
 CloseHandle
 CreateDirectoryW
 RemoveDirectoryW

@@ -23,6 +23,7 @@ extern "C" {
         timeout: u32,
     ) -> i32;
     fn GetLastError() -> u32;
+    fn GetOverlappedResult(file: u64, ov: *mut Overlapped, bytes: *mut u32, wait: i32) -> i32;
     fn CloseHandle(h: u64) -> i32;
     fn ExitProcess(code: u32) -> !;
 }
@@ -35,6 +36,9 @@ struct Overlapped {
     offset_high: u32,
     event: u64,
 }
+
+static LARGE: [u8; 65536] = [b'Q'; 65536];
+static mut OUTPUT: [u8; 65536] = [0; 65536];
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -132,5 +136,60 @@ pub extern "C" fn guest_entry() {
     check(unsafe { ReadFile(file, all.as_mut_ptr(), 6, &mut count, core::ptr::null_mut()) } != 0);
     check(count == 6 && &all == b"aXYdef");
     check(unsafe { CloseHandle(file) } != 0);
+
+    // Large transfers are dispatched to a host worker and complete later.
+    let file = unsafe { CreateFileW(path.as_ptr(), 0xc000_0000, 0, 0, 2, 0x80, 0) };
+    check(file != !0);
+    check(
+        unsafe {
+            WriteFile(
+                file,
+                LARGE.as_ptr(),
+                LARGE.len() as u32,
+                &mut count,
+                core::ptr::null_mut(),
+            )
+        } != 0,
+    );
+    check(count == LARGE.len() as u32 && unsafe { CloseHandle(file) } != 0);
+    let file = unsafe { CreateFileW(path.as_ptr(), 0xc000_0000, 0, 0, 3, 0x4000_0080, 0) };
+    check(file != !0);
+    let port = unsafe { CreateIoCompletionPort(file, 0, 0x7777, 0) };
+    check(port != 0);
+    let output = core::ptr::addr_of_mut!(OUTPUT).cast::<u8>();
+    let mut large_ov = ov(0);
+    check(unsafe { ReadFile(file, output, 65536, &mut count, &mut large_ov) } == 0);
+    check(unsafe { GetLastError() } == 997 && count == 0);
+    check(unsafe { GetOverlappedResult(file, &mut large_ov, &mut count, 1) } != 0);
+    check(count == 65536 && unsafe { output.read() == b'Q' && output.add(65535).read() == b'Q' });
+    check(
+        unsafe { GetQueuedCompletionStatus(port, &mut bytes, &mut key, &mut returned, u32::MAX) }
+            != 0,
+    );
+    check(bytes == 65536 && key == 0x7777 && returned == (&mut large_ov as *mut Overlapped as u64));
+
+    let mut write_ov = ov(0);
+    check(unsafe { WriteFile(file, LARGE.as_ptr(), 65536, &mut count, &mut write_ov) } == 0);
+    check(unsafe { GetLastError() } == 997 && count == 0);
+    check(
+        unsafe { GetOverlappedResult(file, &mut write_ov, &mut count, 1) } != 0 && count == 65536,
+    );
+    check(
+        unsafe { GetQueuedCompletionStatus(port, &mut bytes, &mut key, &mut returned, u32::MAX) }
+            != 0,
+    );
+    check(bytes == 65536 && key == 0x7777 && returned == (&mut write_ov as *mut Overlapped as u64));
+
+    let mut eof_ov = ov(65536);
+    check(unsafe { ReadFile(file, output, 65536, &mut count, &mut eof_ov) } == 0);
+    check(unsafe { GetLastError() } == 997);
+    check(unsafe { GetOverlappedResult(file, &mut eof_ov, &mut count, 1) } == 0);
+    check(unsafe { GetLastError() } == 38);
+    check(
+        unsafe { GetQueuedCompletionStatus(port, &mut bytes, &mut key, &mut returned, u32::MAX) }
+            == 0,
+    );
+    check(unsafe { GetLastError() } == 38 && returned == (&mut eof_ov as *mut Overlapped as u64));
+    check(unsafe { CloseHandle(file) } != 0 && unsafe { CloseHandle(port) } != 0);
     unsafe { ExitProcess(0) }
 }
