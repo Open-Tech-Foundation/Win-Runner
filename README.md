@@ -137,10 +137,15 @@ wincli inspect rg.exe
 ```
 
 The official Node.js 24.21.0 Windows x64 `node.exe` is a native compatibility
-target. Its 424 static imports currently include 341 without native
+target. Its 424 static imports currently include 317 without native
 trampolines; execution stops at `CRYPT32.dll!CertCloseStore`. Node.js does not yet run on
 the native backend. The downloaded binary is kept locally under
 `target/nodejs/` for development and is not committed to this repository.
+For development, `WINCLI_NATIVE_DIAGNOSTIC=1 wincli node.exe --version` binds
+missing imports to native fail-on-call trampolines and names any missing API
+the guest actually calls. This mode does not make unsupported APIs functional.
+The current diagnostic run reaches a missing dynamic `NtDeviceIoControlFile`
+export and then the guest calls `DebugBreak`.
 Set `WINCLI_NODE_EXE=target/nodejs/node-v24.21.0-win-x64.exe` when running
 `cargo test --test node_native` to include the real binary check. The executable
 comes from `https://nodejs.org/download/release/v24.21.0/win-x64/node.exe`;

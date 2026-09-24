@@ -126,6 +126,7 @@ mod imp {
     // Linux-specific. Unlike MAP_FIXED, this never replaces an existing map.
     const MAP_FIXED_NOREPLACE: i32 = 0x100000;
     const MAP_FAILED: *mut c_void = usize::MAX as *mut c_void;
+    const PROCESS_HEAP_HANDLE: u64 = 0x400;
     // A child-local stand-in for the API-set modules dynamically requested by
     // the Universal CRT. It is deliberately not a host `dlopen` handle.
     const API_SET_MODULE: u64 = 0x5749_4e43_4c49_0001;
@@ -231,7 +232,9 @@ mod imp {
             native_add_vectored_exception_handler, native_close_handle, native_create_process_w,
             native_create_waitable_timer_ex_w, native_delete_critical_section,
             native_enter_critical_section, native_extended_path, native_file_attributes,
+            native_encode_pointer, native_decode_pointer,
             native_format_message_w, native_free_environment_strings_w, native_get_acp,
+            native_format_message_a,
             native_get_computer_name_ex_w, native_get_console_mode, native_get_console_output_cp,
             native_get_console_screen_buffer_info, native_get_cp_info,
             native_get_current_directory_w, native_get_current_process,
@@ -244,6 +247,16 @@ mod imp {
             native_get_proc_address, native_get_startup_info_w, native_get_string_type_w,
             native_get_system_info, native_get_user_profile_directory_w, native_heap_alloc,
             native_heap_free, native_heap_realloc, native_initialize_critical_section_ex,
+            native_heap_size,
+            native_initialize_critical_section_and_spin_count,
+            native_initialize_srw_lock,
+            native_is_processor_feature_present,
+            native_rtl_get_version, native_rtl_nt_status_to_dos_error,
+            native_acquire_srw_lock_exclusive, native_release_srw_lock_exclusive,
+            native_try_acquire_srw_lock_shared, native_release_srw_lock_shared,
+            native_initialize_condition_variable, native_sleep_condition_variable_srw,
+            native_wake_all_condition_variable,
+            native_init_once_execute_once,
             native_initialize_slist_head, native_is_valid_code_page, native_launch_spec,
             native_lc_map_string_w, native_leave_critical_section, native_multi_byte_to_wide_char,
             native_process_prng, native_query_performance_frequency, native_set_console_mode,
@@ -282,6 +295,118 @@ mod imp {
             assert!(!super::supports_import("USER32.dll", "ExitProcess"));
             assert!(!super::supports_import("KERNEL32.dll", "timeGetTime"));
             assert!(!super::supports_import("KERNEL32.dll", "NoSuchApi"));
+        }
+
+        #[test]
+        fn initializes_critical_section_with_spin_count() {
+            let mut section = [0x5au8; 40];
+            assert_eq!(native_initialize_critical_section_and_spin_count(section.as_mut_ptr(), 4000), 1);
+            assert_eq!(section, [0; 40]);
+            assert_eq!(native_initialize_critical_section_and_spin_count(std::ptr::null_mut(), 0), 0);
+        }
+
+        #[test]
+        fn pointer_encoding_round_trips_null_and_non_null_values() {
+            for value in [0, 1, 0x1234_5678_9abc_def0] {
+                let encoded = native_encode_pointer(value);
+                assert_ne!(encoded, value);
+                assert_eq!(native_decode_pointer(encoded), value);
+            }
+        }
+
+        #[test]
+        fn tracks_exact_native_heap_sizes_and_rejects_freed_blocks() {
+            let ptr = super::native_heap_alloc(super::PROCESS_HEAP_HANDLE, 0x8, 3);
+            assert_ne!(ptr, 0);
+            assert_eq!(native_heap_size(super::PROCESS_HEAP_HANDLE, 0, ptr), 3);
+            assert_eq!(unsafe { std::slice::from_raw_parts(ptr as *const u8, 3) }, &[0, 0, 0]);
+            let grown = native_heap_realloc(super::PROCESS_HEAP_HANDLE, 0x8, ptr, 9);
+            assert_ne!(grown, 0);
+            assert_eq!(native_heap_size(super::PROCESS_HEAP_HANDLE, 0, grown), 9);
+            assert_eq!(unsafe { std::slice::from_raw_parts(grown as *const u8, 9) }, &[0; 9]);
+            assert_eq!(native_heap_free(super::PROCESS_HEAP_HANDLE, 0, grown), 1);
+            assert_eq!(native_heap_size(super::PROCESS_HEAP_HANDLE, 0, grown), usize::MAX);
+            assert_eq!(native_heap_free(super::PROCESS_HEAP_HANDLE, 0, grown), 0);
+        }
+
+        #[test]
+        fn initializes_srw_lock_to_unlocked_state() {
+            let mut lock = u64::MAX;
+            native_initialize_srw_lock(&mut lock);
+            assert_eq!(lock, 0);
+            native_initialize_srw_lock(std::ptr::null_mut());
+        }
+
+        #[test]
+        fn srw_lock_blocks_shared_try_while_exclusive_is_held() {
+            let mut lock = 0u64;
+            native_initialize_srw_lock(&mut lock);
+            native_acquire_srw_lock_exclusive(&mut lock);
+            assert_eq!(native_try_acquire_srw_lock_shared(&mut lock), 0);
+            native_release_srw_lock_exclusive(&mut lock);
+            assert_eq!(native_try_acquire_srw_lock_shared(&mut lock), 1);
+            native_release_srw_lock_shared(&mut lock);
+        }
+
+        #[test]
+        fn processor_feature_query_reports_host_isa_and_rejects_unknown_ids() {
+            assert_eq!(native_is_processor_feature_present(10), 1); // SSE2 is required by x86-64
+            assert_eq!(native_is_processor_feature_present(40), std::is_x86_feature_detected!("avx2") as i32);
+            assert_eq!(native_is_processor_feature_present(999), 0);
+        }
+
+        #[test]
+        fn ntdll_version_and_status_translation_report_windows_baseline() {
+            let mut info = [0u8; 276];
+            info[..4].copy_from_slice(&276u32.to_le_bytes());
+            assert_eq!(native_rtl_get_version(info.as_mut_ptr()), 0);
+            assert_eq!(u32::from_le_bytes(info[4..8].try_into().unwrap()), 10);
+            assert_eq!(u32::from_le_bytes(info[12..16].try_into().unwrap()), 19045);
+            info[..4].copy_from_slice(&275u32.to_le_bytes());
+            assert_eq!(native_rtl_get_version(info.as_mut_ptr()), 0xC000_000D);
+            assert_eq!(native_rtl_nt_status_to_dos_error(0xC000_0022), 5);
+            assert_eq!(native_rtl_nt_status_to_dos_error(0xDEAD_BEEF), 317);
+        }
+
+        #[test]
+        fn condition_wait_releases_and_reacquires_exclusive_srw_lock() {
+            let mut lock = 0u64;
+            let mut condition = 0u64;
+            native_initialize_srw_lock(&mut lock);
+            native_initialize_condition_variable(&mut condition);
+            native_acquire_srw_lock_exclusive(&mut lock);
+            assert_eq!(native_sleep_condition_variable_srw(&mut condition, &mut lock, 0, 0), 0);
+            assert_eq!(native_try_acquire_srw_lock_shared(&mut lock), 0);
+            let condition_address = (&mut condition as *mut u64) as usize;
+            let worker = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                native_wake_all_condition_variable(condition_address as *mut u64);
+            });
+            assert_eq!(native_sleep_condition_variable_srw(&mut condition, &mut lock, 1000, 0), 1);
+            native_release_srw_lock_exclusive(&mut lock);
+            worker.join().unwrap();
+        }
+
+        #[test]
+        fn init_once_retries_failed_callback_and_caches_context() {
+            extern "win64" fn callback(_once: *mut u64, parameter: u64, context: *mut u64) -> i32 {
+                let calls = unsafe { &*(parameter as *const std::sync::atomic::AtomicU32) };
+                if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 { return 0; }
+                unsafe { context.write(0x1234) };
+                1
+            }
+            let calls = std::sync::atomic::AtomicU32::new(0);
+            let mut once = 0u64;
+            let mut context = 0u64;
+            let param = (&calls as *const std::sync::atomic::AtomicU32) as u64;
+            let cb = callback as *const () as usize as u64;
+            assert_eq!(native_init_once_execute_once(&mut once, cb, param, &mut context), 0);
+            assert_eq!(native_init_once_execute_once(&mut once, cb, param, &mut context), 1);
+            assert_eq!(context, 0x1234);
+            context = 0;
+            assert_eq!(native_init_once_execute_once(&mut once, cb, param, &mut context), 1);
+            assert_eq!(context, 0x1234);
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
         }
 
         #[test]
@@ -522,16 +647,16 @@ mod imp {
 
         #[test]
         fn reallocates_process_heap_memory_without_losing_contents() {
-            let allocation = native_heap_alloc(1, 0, 4);
+            let allocation = native_heap_alloc(super::PROCESS_HEAP_HANDLE, 0, 4);
             assert_ne!(allocation, 0);
             unsafe { std::ptr::copy_nonoverlapping(b"rg!\0".as_ptr(), allocation as *mut u8, 4) };
-            let grown = native_heap_realloc(1, 0, allocation, 8);
+            let grown = native_heap_realloc(super::PROCESS_HEAP_HANDLE, 0, allocation, 8);
             assert_ne!(grown, 0);
             assert_eq!(
                 unsafe { std::slice::from_raw_parts(grown as *const u8, 4) },
                 b"rg!\0"
             );
-            assert_eq!(native_heap_free(1, 0, grown), 1);
+            assert_eq!(native_heap_free(super::PROCESS_HEAP_HANDLE, 0, grown), 1);
         }
 
         #[test]
@@ -732,6 +857,16 @@ mod imp {
         }
 
         #[test]
+        fn formats_ansi_system_error_and_rejects_short_buffer() {
+            let mut short = [0u8; 4];
+            assert_eq!(native_format_message_a(0x1000, 0, 5, 0, short.as_mut_ptr(), 4, 0), 0);
+            let mut output = [0u8; 64];
+            let count = native_format_message_a(0x1000, 0, 5, 0, output.as_mut_ptr(), 64, 0);
+            assert_eq!(&output[..count as usize], b"WinCLI native error.\r\n");
+            assert_eq!(output[count as usize], 0);
+        }
+
+        #[test]
         fn exposes_the_main_module_handle() {
             assert_eq!(native_get_module_handle_w(std::ptr::null()), 0x1400_0000_0);
         }
@@ -747,7 +882,7 @@ mod imp {
         }
 
         #[test]
-        fn resolves_only_the_supported_dynamic_api_set_export() {
+        fn resolves_supported_dynamic_api_set_exports() {
             assert_ne!(
                 native_get_proc_address(API_SET_MODULE, c"CompareStringEx".as_ptr().cast()),
                 0
@@ -756,6 +891,7 @@ mod imp {
                 native_get_proc_address(API_SET_MODULE, c"GetEnvironmentVariableW".as_ptr().cast()),
                 native_get_environment_variable_w as *const () as usize as u64
             );
+            assert_ne!(native_get_proc_address(API_SET_MODULE, c"FlsAlloc".as_ptr().cast()), 0);
             assert_eq!(
                 native_get_proc_address(API_SET_MODULE, c"UnknownExport".as_ptr().cast()),
                 0
@@ -826,6 +962,14 @@ mod imp {
             let mut short = [0; 3];
             assert_eq!(native_get_module_file_name_w(0, short.as_mut_ptr(), 3), 3);
             assert_eq!(short, ['C' as u16, ':' as u16, '\\' as u16]);
+        }
+
+        #[test]
+        fn resolves_loaded_windows_module_names_in_wide_form() {
+            let kernel: Vec<u16> = "KERNEL32.dll".encode_utf16().chain(std::iter::once(0)).collect();
+            assert_eq!(native_get_module_handle_w(kernel.as_ptr()), API_SET_MODULE);
+            let missing: Vec<u16> = "missing.dll".encode_utf16().chain(std::iter::once(0)).collect();
+            assert_eq!(native_get_module_handle_w(missing.as_ptr()), 0);
         }
 
         #[test]
@@ -1505,8 +1649,12 @@ mod imp {
         environment_block: Vec<u16>,
         fs: Arc<Mutex<NativeFs>>,
         last_error: AtomicU32,
+        error_mode: AtomicU32,
+        pointer_cookie: u64,
+        heap_allocations: Mutex<HashMap<u64, usize>>,
         gs_base: AtomicU64,
         tls_template: Mutex<Option<NativeTls>>,
+        dynamic_tls: Mutex<DynamicTlsSlots>,
         threads: Mutex<HashMap<u64, NativeThread>>,
         thread_next: AtomicU64,
         timer_next: AtomicU64,
@@ -1522,6 +1670,30 @@ mod imp {
     struct NativeThread {
         join: Option<std::thread::JoinHandle<u32>>,
         exit_code: Option<u32>,
+    }
+
+    struct DynamicTlsSlots {
+        active: [bool; 64],
+        generation: [u64; 64],
+        reserved_static: bool,
+    }
+    fn random_pointer_cookie() -> u64 {
+        let mut cookie = 0u64;
+        if unsafe { getrandom((&mut cookie as *mut u64).cast(), 8, 0) } != 8 {
+            cookie = 0x7f3a_5e91_c62d_b408;
+        }
+        cookie | 1
+    }
+    impl DynamicTlsSlots {
+        fn new(static_tls: bool) -> Self {
+            let mut active = [false; 64];
+            active[0] = static_tls;
+            Self { active, generation: [0; 64], reserved_static: static_tls }
+        }
+    }
+    thread_local! {
+        static THREAD_TLS_VALUES: std::cell::RefCell<[(u64, u64); 64]> =
+            const { std::cell::RefCell::new([(0, 0); 64]) };
     }
 
     // Import trampolines have no guest-context argument. This is therefore a
@@ -1550,8 +1722,12 @@ mod imp {
                 next: 0x100,
             })),
             last_error: AtomicU32::new(0),
+            error_mode: AtomicU32::new(0),
+            pointer_cookie: random_pointer_cookie(),
+            heap_allocations: Mutex::new(HashMap::new()),
             gs_base: AtomicU64::new(0),
             tls_template: Mutex::new(None),
+            dynamic_tls: Mutex::new(DynamicTlsSlots::new(false)),
             threads: Mutex::new(HashMap::new()),
             thread_next: AtomicU64::new(0x8000_0000),
             timer_next: AtomicU64::new(0x7000_0000),
@@ -1783,8 +1959,20 @@ mod imp {
         if name.is_null() {
             process_ctx().map(|process| process.image_base).unwrap_or(0)
         } else {
-            0
+            wide(name)
+                .filter(|name| native_module_name_supported(name))
+                .map(|_| API_SET_MODULE)
+                .unwrap_or_else(|| { native_set_last_error(126); 0 })
         }
+    }
+    fn native_module_name_supported(name: &str) -> bool {
+        let module = name.rsplit(['\\', '/']).next().unwrap_or(name).to_ascii_lowercase();
+        matches!(module.as_str(),
+            "kernel32" | "kernel32.dll" | "kernelbase" | "kernelbase.dll" |
+            "ntdll" | "ntdll.dll" | "advapi32" | "advapi32.dll" |
+            "bcryptprimitives" | "bcryptprimitives.dll" | "userenv" | "userenv.dll" |
+            "winmm" | "winmm.dll" | "ws2_32" | "ws2_32.dll"
+        )
     }
     extern "win64" fn native_get_module_handle_ex_w(
         _flags: u32,
@@ -2075,7 +2263,7 @@ mod imp {
     }
 
     extern "win64" fn native_get_process_heap() -> u64 {
-        0x400
+        PROCESS_HEAP_HANDLE
     }
     extern "win64" fn native_get_current_thread_id() -> u32 {
         1
@@ -2259,6 +2447,332 @@ mod imp {
         unsafe { std::ptr::write_bytes(section, 0, 40) };
         1
     }
+    extern "win64" fn native_initialize_critical_section_and_spin_count(
+        section: *mut u8,
+        spin_count: u32,
+    ) -> i32 {
+        native_initialize_critical_section_ex(section, spin_count, 0)
+    }
+    extern "win64" fn native_initialize_critical_section(section: *mut u8) {
+        let _ = native_initialize_critical_section_ex(section, 0, 0);
+    }
+    extern "win64" fn native_initialize_srw_lock(lock: *mut u64) {
+        if !lock.is_null() {
+            unsafe { lock.write_unaligned(0) };
+        }
+    }
+    // The guard fields are held for their lock lifetime and released by Drop.
+    #[allow(dead_code)]
+    enum HeldSrwLock {
+        Shared(std::sync::RwLockReadGuard<'static, ()>),
+        Exclusive(std::sync::RwLockWriteGuard<'static, ()>),
+    }
+    thread_local! {
+        static HELD_SRW_LOCKS: std::cell::RefCell<Vec<(usize, HeldSrwLock)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    fn native_srw_lock(lock: *mut u64) -> Option<&'static std::sync::RwLock<()>> {
+        if lock.is_null() || (lock as usize) % std::mem::align_of::<AtomicU64>() != 0 {
+            return None;
+        }
+        let slot = unsafe { &*(lock as *const AtomicU64) };
+        let mut value = slot.load(Ordering::Acquire);
+        if value == 0 {
+            let created = Box::into_raw(Box::new(std::sync::RwLock::new(()))) as u64;
+            match slot.compare_exchange(0, created, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => value = created,
+                Err(existing) => {
+                    unsafe { drop(Box::from_raw(created as *mut std::sync::RwLock<()>)) };
+                    value = existing;
+                }
+            }
+        }
+        (value != 0).then(|| unsafe { &*(value as *const std::sync::RwLock<()>) })
+    }
+    extern "win64" fn native_acquire_srw_lock_exclusive(lock: *mut u64) {
+        if let Some(host) = native_srw_lock(lock) {
+            let guard = host.write().unwrap_or_else(|poison| poison.into_inner());
+            HELD_SRW_LOCKS.with(|held| held.borrow_mut().push((lock as usize, HeldSrwLock::Exclusive(guard))));
+        }
+    }
+    extern "win64" fn native_acquire_srw_lock_shared(lock: *mut u64) {
+        if let Some(host) = native_srw_lock(lock) {
+            let guard = host.read().unwrap_or_else(|poison| poison.into_inner());
+            HELD_SRW_LOCKS.with(|held| held.borrow_mut().push((lock as usize, HeldSrwLock::Shared(guard))));
+        }
+    }
+    extern "win64" fn native_try_acquire_srw_lock_exclusive(lock: *mut u64) -> i32 {
+        let Some(host) = native_srw_lock(lock) else { return 0 };
+        let Ok(guard) = host.try_write() else { return 0 };
+        HELD_SRW_LOCKS.with(|held| held.borrow_mut().push((lock as usize, HeldSrwLock::Exclusive(guard))));
+        1
+    }
+    extern "win64" fn native_try_acquire_srw_lock_shared(lock: *mut u64) -> i32 {
+        let Some(host) = native_srw_lock(lock) else { return 0 };
+        let Ok(guard) = host.try_read() else { return 0 };
+        HELD_SRW_LOCKS.with(|held| held.borrow_mut().push((lock as usize, HeldSrwLock::Shared(guard))));
+        1
+    }
+    fn take_srw_lock(lock: *mut u64, exclusive: bool) -> Option<HeldSrwLock> {
+        HELD_SRW_LOCKS.with(|held| {
+            let mut held = held.borrow_mut();
+            held.iter().rposition(|(address, guard)| {
+                *address == lock as usize && matches!((exclusive, guard), (true, HeldSrwLock::Exclusive(_)) | (false, HeldSrwLock::Shared(_)))
+            }).map(|index| held.remove(index).1)
+        })
+    }
+    fn native_release_srw_lock(lock: *mut u64, exclusive: bool) {
+        drop(take_srw_lock(lock, exclusive));
+    }
+    extern "win64" fn native_release_srw_lock_exclusive(lock: *mut u64) {
+        native_release_srw_lock(lock, true);
+    }
+    extern "win64" fn native_release_srw_lock_shared(lock: *mut u64) {
+        native_release_srw_lock(lock, false);
+    }
+    struct NativeConditionVariable {
+        generation: Mutex<u64>,
+        ready: Condvar,
+    }
+    struct NativeInitOnce {
+        state: Mutex<InitOnceState>,
+        ready: Condvar,
+    }
+    enum InitOnceState {
+        Uninitialized,
+        Running,
+        Complete(u64),
+    }
+    fn native_init_once(ptr: *mut u64) -> Option<&'static NativeInitOnce> {
+        if ptr.is_null() || (ptr as usize) % std::mem::align_of::<AtomicU64>() != 0 {
+            return None;
+        }
+        let slot = unsafe { &*(ptr as *const AtomicU64) };
+        let mut value = slot.load(Ordering::Acquire);
+        if value == 0 {
+            let created = Box::into_raw(Box::new(NativeInitOnce {
+                state: Mutex::new(InitOnceState::Uninitialized), ready: Condvar::new(),
+            })) as u64;
+            match slot.compare_exchange(0, created, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => value = created,
+                Err(existing) => {
+                    unsafe { drop(Box::from_raw(created as *mut NativeInitOnce)) };
+                    value = existing;
+                }
+            }
+        }
+        (value != 0).then(|| unsafe { &*(value as *const NativeInitOnce) })
+    }
+    extern "win64" fn native_init_once_initialize(ptr: *mut u64) {
+        if !ptr.is_null() {
+            unsafe { ptr.write_unaligned(0) };
+        }
+    }
+    extern "win64" fn native_init_once_execute_once(
+        once: *mut u64,
+        callback: u64,
+        parameter: u64,
+        context_out: *mut u64,
+    ) -> i32 {
+        if callback == 0 {
+            native_set_last_error(87);
+            return 0;
+        }
+        let Some(init) = native_init_once(once) else { native_set_last_error(87); return 0 };
+        loop {
+            let Ok(mut state) = init.state.lock() else { return 0 };
+            match *state {
+                InitOnceState::Complete(context) => {
+                    if !context_out.is_null() { unsafe { context_out.write_unaligned(context) }; }
+                    return 1;
+                }
+                InitOnceState::Running => {
+                    drop(init.ready.wait(state));
+                }
+                InitOnceState::Uninitialized => {
+                    *state = InitOnceState::Running;
+                    drop(state);
+                    let mut context = 0u64;
+                    let callback: unsafe extern "win64" fn(*mut u64, u64, *mut u64) -> i32 = unsafe { std::mem::transmute(callback) };
+                    let success = unsafe { callback(once, parameter, &mut context) } != 0;
+                    let Ok(mut state) = init.state.lock() else { return 0 };
+                    *state = if success { InitOnceState::Complete(context) } else { InitOnceState::Uninitialized };
+                    init.ready.notify_all();
+                    if success && !context_out.is_null() { unsafe { context_out.write_unaligned(context) }; }
+                    return success as i32;
+                }
+            }
+        }
+    }
+    fn native_condition_variable(ptr: *mut u64) -> Option<&'static NativeConditionVariable> {
+        if ptr.is_null() || (ptr as usize) % std::mem::align_of::<AtomicU64>() != 0 {
+            return None;
+        }
+        let slot = unsafe { &*(ptr as *const AtomicU64) };
+        let mut value = slot.load(Ordering::Acquire);
+        if value == 0 {
+            let created = Box::into_raw(Box::new(NativeConditionVariable {
+                generation: Mutex::new(0), ready: Condvar::new(),
+            })) as u64;
+            match slot.compare_exchange(0, created, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => value = created,
+                Err(existing) => {
+                    unsafe { drop(Box::from_raw(created as *mut NativeConditionVariable)) };
+                    value = existing;
+                }
+            }
+        }
+        (value != 0).then(|| unsafe { &*(value as *const NativeConditionVariable) })
+    }
+    extern "win64" fn native_initialize_condition_variable(ptr: *mut u64) {
+        if !ptr.is_null() {
+            unsafe { ptr.write_unaligned(0) };
+        }
+    }
+    extern "win64" fn native_wake_condition_variable(ptr: *mut u64) {
+        if let Some(cv) = native_condition_variable(ptr) {
+            if let Ok(mut generation) = cv.generation.lock() {
+                *generation = generation.wrapping_add(1);
+                cv.ready.notify_one();
+            }
+        }
+    }
+    extern "win64" fn native_wake_all_condition_variable(ptr: *mut u64) {
+        if let Some(cv) = native_condition_variable(ptr) {
+            if let Ok(mut generation) = cv.generation.lock() {
+                *generation = generation.wrapping_add(1);
+                cv.ready.notify_all();
+            }
+        }
+    }
+    extern "win64" fn native_sleep_condition_variable_srw(
+        condition: *mut u64,
+        lock: *mut u64,
+        milliseconds: u32,
+        flags: u32,
+    ) -> i32 {
+        if flags & !1 != 0 {
+            native_set_last_error(87);
+            return 0;
+        }
+        let shared = flags & 1 != 0;
+        let Some(cv) = native_condition_variable(condition) else { native_set_last_error(87); return 0 };
+        let Ok(generation) = cv.generation.lock() else { return 0 };
+        let before = *generation;
+        let Some(guard) = take_srw_lock(lock, !shared) else { native_set_last_error(87); return 0 };
+        drop(guard);
+        let awakened = if milliseconds == u32::MAX {
+            cv.ready.wait_while(generation, |value| *value == before).is_ok()
+        } else {
+            cv.ready.wait_timeout_while(generation, std::time::Duration::from_millis(milliseconds as u64), |value| *value == before)
+                .map(|(value, _)| *value != before).unwrap_or(false)
+        };
+        if shared { native_acquire_srw_lock_shared(lock); } else { native_acquire_srw_lock_exclusive(lock); }
+        if awakened { 1 } else { native_set_last_error(1460); 0 }
+    }
+    extern "win64" fn native_tls_alloc() -> u32 {
+        let Some(process) = process_ctx() else { return u32::MAX };
+        let Ok(mut slots) = process.dynamic_tls.lock() else { return u32::MAX };
+        let Some(index) = slots.active.iter().position(|active| !active) else {
+            native_set_last_error(8);
+            return u32::MAX;
+        };
+        slots.active[index] = true;
+        slots.generation[index] = slots.generation[index].wrapping_add(1);
+        index as u32
+    }
+    extern "win64" fn native_tls_free(index: u32) -> i32 {
+        let Some(process) = process_ctx() else { return 0 };
+        let Ok(mut slots) = process.dynamic_tls.lock() else { return 0 };
+        let reserved = index == 0 && slots.reserved_static;
+        let Some(active) = slots.active.get_mut(index as usize) else {
+            native_set_last_error(87);
+            return 0;
+        };
+        if !*active || reserved {
+            native_set_last_error(87);
+            return 0;
+        }
+        *active = false;
+        slots.generation[index as usize] = slots.generation[index as usize].wrapping_add(1);
+        1
+    }
+    extern "win64" fn native_tls_get_value(index: u32) -> u64 {
+        let Some(process) = process_ctx() else { return 0 };
+        let Ok(slots) = process.dynamic_tls.lock() else { return 0 };
+        if !slots.active.get(index as usize).copied().unwrap_or(false) {
+            native_set_last_error(87);
+            return 0;
+        }
+        let generation = slots.generation[index as usize];
+        let value = THREAD_TLS_VALUES.with(|values| {
+            let (slot_generation, value) = values.borrow()[index as usize];
+            if slot_generation == generation { value } else { 0 }
+        });
+        native_set_last_error(0);
+        value
+    }
+    extern "win64" fn native_tls_set_value(index: u32, value: u64) -> i32 {
+        let Some(process) = process_ctx() else { return 0 };
+        let Ok(slots) = process.dynamic_tls.lock() else { return 0 };
+        if !slots.active.get(index as usize).copied().unwrap_or(false) {
+            native_set_last_error(87);
+            return 0;
+        }
+        let generation = slots.generation[index as usize];
+        THREAD_TLS_VALUES.with(|values| values.borrow_mut()[index as usize] = (generation, value));
+        native_set_last_error(0);
+        1
+    }
+    extern "win64" fn native_encode_pointer(value: u64) -> u64 {
+        let cookie = process_ctx().map(|process| process.pointer_cookie).unwrap_or(1);
+        value.rotate_left(17) ^ cookie
+    }
+    extern "win64" fn native_decode_pointer(value: u64) -> u64 {
+        let cookie = process_ctx().map(|process| process.pointer_cookie).unwrap_or(1);
+        (value ^ cookie).rotate_right(17)
+    }
+    extern "win64" fn native_is_processor_feature_present(feature: u32) -> i32 {
+        let present = match feature {
+            2 | 3 | 6 | 8 | 9 | 10 | 12 => true,
+            13 => std::is_x86_feature_detected!("sse3"),
+            17 => std::is_x86_feature_detected!("xsave"),
+            36 => std::is_x86_feature_detected!("ssse3"),
+            37 => std::is_x86_feature_detected!("sse4.1"),
+            38 => std::is_x86_feature_detected!("sse4.2"),
+            39 => std::is_x86_feature_detected!("avx"),
+            40 => std::is_x86_feature_detected!("avx2"),
+            41 => std::is_x86_feature_detected!("avx512f"),
+            60 => std::is_x86_feature_detected!("bmi2"),
+            _ => false,
+        };
+        present as i32
+    }
+    extern "win64" fn native_rtl_get_version(info: *mut u8) -> u32 {
+        if info.is_null() || unsafe { (info as *const u32).read_unaligned() } < 276 {
+            return 0xC000_000D; // STATUS_INVALID_PARAMETER
+        }
+        unsafe {
+            (info.add(4) as *mut u32).write_unaligned(10);
+            (info.add(8) as *mut u32).write_unaligned(0);
+            (info.add(12) as *mut u32).write_unaligned(19045);
+            (info.add(16) as *mut u32).write_unaligned(2); // VER_PLATFORM_WIN32_NT
+            std::ptr::write_bytes(info.add(20), 0, 256);
+        }
+        0
+    }
+    extern "win64" fn native_rtl_nt_status_to_dos_error(status: u32) -> u32 {
+        match status {
+            0 => 0,
+            0xC000_0005 => 998, // STATUS_ACCESS_VIOLATION
+            0xC000_0008 => 6,   // STATUS_INVALID_HANDLE
+            0xC000_000D => 87,  // STATUS_INVALID_PARAMETER
+            0xC000_0017 => 8,   // STATUS_NO_MEMORY
+            0xC000_0022 => 5,   // STATUS_ACCESS_DENIED
+            0xC000_0034 => 2,   // STATUS_OBJECT_NAME_NOT_FOUND
+            _ => 317,           // ERROR_MR_MID_NOT_FOUND
+        }
+    }
     extern "win64" fn native_fls_alloc(_callback: u64) -> u32 {
         0
     }
@@ -2302,15 +2816,61 @@ mod imp {
             .saturating_add(116_444_736_000_000_000);
         unsafe { out.write_unaligned(ticks) };
     }
-    extern "win64" fn native_heap_alloc(_heap: u64, _flags: u32, size: u32) -> u64 {
-        let size = (size as usize).max(1);
-        unsafe { malloc(size).cast::<u8>() as u64 }
-    }
-    extern "win64" fn native_heap_realloc(_heap: u64, _flags: u32, ptr: u64, size: u32) -> u64 {
-        if ptr == 0 {
+    extern "win64" fn native_heap_alloc(heap: u64, flags: u32, size: usize) -> u64 {
+        if heap != PROCESS_HEAP_HANDLE {
+            native_set_last_error(6);
             return 0;
         }
-        unsafe { realloc(ptr as *mut c_void, (size as usize).max(1)) as u64 }
+        let ptr = unsafe { malloc(size.max(1)) } as u64;
+        if ptr == 0 {
+            native_set_last_error(8);
+            return 0;
+        }
+        if flags & 0x8 != 0 {
+            unsafe { std::ptr::write_bytes(ptr as *mut u8, 0, size) };
+        }
+        let Some(process) = process_ctx() else { unsafe { free(ptr as *mut c_void) }; return 0 };
+        let Ok(mut allocations) = process.heap_allocations.lock() else { unsafe { free(ptr as *mut c_void) }; return 0 };
+        allocations.insert(ptr, size);
+        ptr
+    }
+    extern "win64" fn native_heap_realloc(heap: u64, flags: u32, ptr: u64, size: usize) -> u64 {
+        if heap != PROCESS_HEAP_HANDLE || ptr == 0 {
+            native_set_last_error(87);
+            return 0;
+        }
+        let Some(process) = process_ctx() else { return 0 };
+        let Ok(mut allocations) = process.heap_allocations.lock() else { return 0 };
+        let Some(old_size) = allocations.get(&ptr).copied() else {
+            native_set_last_error(87);
+            return 0;
+        };
+        let new_ptr = unsafe { realloc(ptr as *mut c_void, size.max(1)) } as u64;
+        if new_ptr == 0 {
+            native_set_last_error(8);
+            return 0;
+        }
+        if flags & 0x8 != 0 && size > old_size {
+            unsafe { std::ptr::write_bytes((new_ptr as *mut u8).add(old_size), 0, size - old_size) };
+        }
+        allocations.remove(&ptr);
+        allocations.insert(new_ptr, size);
+        new_ptr
+    }
+    extern "win64" fn native_heap_size(heap: u64, _flags: u32, ptr: u64) -> usize {
+        if heap != PROCESS_HEAP_HANDLE || ptr == 0 {
+            native_set_last_error(87);
+            return usize::MAX;
+        }
+        let size = process_ctx()
+            .and_then(|process| process.heap_allocations.lock().ok().and_then(|allocations| allocations.get(&ptr).copied()));
+        match size {
+            Some(size) => size,
+            None => {
+                native_set_last_error(87);
+                usize::MAX
+            }
+        }
     }
     extern "win64" fn native_process_prng(out: *mut u8, len: usize) -> i32 {
         if out.is_null() && len != 0 {
@@ -2389,6 +2949,26 @@ mod imp {
             output.copy_from_nonoverlapping(MESSAGE.as_ptr(), MESSAGE.len());
             output.add(MESSAGE.len()).write(0)
         };
+        MESSAGE.len() as u32
+    }
+    extern "win64" fn native_format_message_a(
+        flags: u32,
+        _source: u64,
+        _message_id: u32,
+        _language: u32,
+        output: *mut u8,
+        output_len: u32,
+        _arguments: u64,
+    ) -> u32 {
+        const MESSAGE: &[u8] = b"WinCLI native error.\r\n";
+        if flags & 0x100 != 0 || output.is_null() || output_len <= MESSAGE.len() as u32 {
+            native_set_last_error(122);
+            return 0;
+        }
+        unsafe {
+            output.copy_from_nonoverlapping(MESSAGE.as_ptr(), MESSAGE.len());
+            output.add(MESSAGE.len()).write(0);
+        }
         MESSAGE.len() as u32
     }
     extern "win64" fn native_get_environment_variable_w(
@@ -2647,13 +3227,18 @@ mod imp {
     ) -> i32 {
         matches!(handle, 0..=2) as i32
     }
-    extern "win64" fn native_heap_free(_heap: u64, _flags: u32, ptr: u64) -> i32 {
-        if ptr == 0 {
+    extern "win64" fn native_heap_free(heap: u64, _flags: u32, ptr: u64) -> i32 {
+        if heap != PROCESS_HEAP_HANDLE || ptr == 0 {
+            native_set_last_error(87);
             return 0;
         }
-        unsafe {
-            free(ptr as *mut c_void);
+        let Some(process) = process_ctx() else { return 0 };
+        let Ok(mut allocations) = process.heap_allocations.lock() else { return 0 };
+        if allocations.remove(&ptr).is_none() {
+            native_set_last_error(87);
+            return 0;
         }
+        unsafe { free(ptr as *mut c_void) };
         1
     }
     extern "win64" fn native_enter_critical_section(_section: *mut u8) {}
@@ -2838,7 +3423,7 @@ mod imp {
                 return 0;
             }
         };
-        if patch_baseline_imports(&mapping, &image).is_err() {
+        if patch_baseline_imports(&mapping, &image, false).is_err() {
             native_set_last_error(193);
             return 0;
         }
@@ -2905,8 +3490,12 @@ mod imp {
                 environment,
                 fs: Arc::clone(&context),
                 last_error: AtomicU32::new(0),
+                error_mode: AtomicU32::new(0),
+                pointer_cookie: random_pointer_cookie(),
+                heap_allocations: Mutex::new(HashMap::new()),
                 gs_base: AtomicU64::new(0),
                 tls_template: Mutex::new(tls.as_ref().map(NativeTls::clone_for_thread)),
+                dynamic_tls: Mutex::new(DynamicTlsSlots::new(tls.is_some())),
                 threads: Mutex::new(HashMap::new()),
                 thread_next: AtomicU64::new(0x8000_0000),
                 timer_next: AtomicU64::new(0x7000_0000),
@@ -3003,6 +3592,11 @@ mod imp {
             process.last_error.store(error, Ordering::Release);
         }
     }
+    extern "win64" fn native_set_error_mode(mode: u32) -> u32 {
+        process_ctx()
+            .map(|process| process.error_mode.swap(mode, Ordering::AcqRel))
+            .unwrap_or(0)
+    }
 
     extern "win64" fn native_get_startup_info_w(startup_info: *mut u8) {
         if startup_info.is_null() {
@@ -3092,13 +3686,14 @@ mod imp {
 
     extern "win64" fn native_get_module_handle_a(name: *const u8) -> u64 {
         match unsafe { ascii_z(name) } {
-            Some(value) if value.eq_ignore_ascii_case("kernel32") => API_SET_MODULE,
+            Some(value) if native_module_name_supported(value) => API_SET_MODULE,
             _ => 0,
         }
     }
 
     extern "win64" fn native_get_proc_address(module: u64, name: *const u8) -> u64 {
         if module != API_SET_MODULE {
+            native_set_last_error(6);
             return 0;
         }
         match unsafe { ascii_z(name) } {
@@ -3109,7 +3704,15 @@ mod imp {
             Some("GetCurrentDirectoryW") => {
                 native_get_current_directory_w as *const () as usize as u64
             }
-            _ => 0,
+            Some(function) => baseline_trampoline(function).unwrap_or_else(|| {
+                if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+                    let message = format!("unsupported native dynamic import: {function}\n");
+                    unsafe { write(2, message.as_ptr().cast(), message.len()) };
+                }
+                native_set_last_error(127); // ERROR_PROC_NOT_FOUND
+                0
+            }),
+            None => { native_set_last_error(127); 0 },
         }
     }
 
@@ -3416,6 +4019,7 @@ mod imp {
             "WINMM.DLL" => func == "timeGetTime",
             "USERENV.DLL" => func == "GetUserProfileDirectoryW",
             "BCRYPTPRIMITIVES.DLL" => func == "ProcessPrng",
+            "NTDLL.DLL" => matches!(func, "RtlGetVersion" | "RtlNtStatusToDosError"),
             "API-MS-WIN-CORE-SYNCH-L1-2-0.DLL" => {
                 matches!(func, "WaitOnAddress" | "WakeByAddressAll" | "WakeByAddressSingle")
             }
@@ -3433,6 +4037,7 @@ mod imp {
             "GetCommandLineA" => Some(native_get_command_line_a as *const () as usize as u64),
             "GetLastError" => Some(native_get_last_error as *const () as usize as u64),
             "SetLastError" => Some(native_set_last_error as *const () as usize as u64),
+            "SetErrorMode" => Some(native_set_error_mode as *const () as usize as u64),
             "GetStartupInfoW" => Some(native_get_startup_info_w as *const () as usize as u64),
             "GetProcessHeap" => Some(native_get_process_heap as *const () as usize as u64),
             "GetCurrentThreadId" => Some(native_get_current_thread_id as *const () as usize as u64),
@@ -3462,6 +4067,34 @@ mod imp {
             "InitializeCriticalSectionEx" => {
                 Some(native_initialize_critical_section_ex as *const () as usize as u64)
             }
+            "InitializeCriticalSectionAndSpinCount" => {
+                Some(native_initialize_critical_section_and_spin_count as *const () as usize as u64)
+            }
+            "InitializeCriticalSection" => {
+                Some(native_initialize_critical_section as *const () as usize as u64)
+            }
+            "InitializeSRWLock" => Some(native_initialize_srw_lock as *const () as usize as u64),
+            "AcquireSRWLockExclusive" => Some(native_acquire_srw_lock_exclusive as *const () as usize as u64),
+            "AcquireSRWLockShared" => Some(native_acquire_srw_lock_shared as *const () as usize as u64),
+            "TryAcquireSRWLockExclusive" => Some(native_try_acquire_srw_lock_exclusive as *const () as usize as u64),
+            "TryAcquireSRWLockShared" => Some(native_try_acquire_srw_lock_shared as *const () as usize as u64),
+            "ReleaseSRWLockExclusive" => Some(native_release_srw_lock_exclusive as *const () as usize as u64),
+            "ReleaseSRWLockShared" => Some(native_release_srw_lock_shared as *const () as usize as u64),
+            "InitializeConditionVariable" => Some(native_initialize_condition_variable as *const () as usize as u64),
+            "WakeConditionVariable" => Some(native_wake_condition_variable as *const () as usize as u64),
+            "WakeAllConditionVariable" => Some(native_wake_all_condition_variable as *const () as usize as u64),
+            "SleepConditionVariableSRW" => Some(native_sleep_condition_variable_srw as *const () as usize as u64),
+            "InitOnceInitialize" => Some(native_init_once_initialize as *const () as usize as u64),
+            "InitOnceExecuteOnce" => Some(native_init_once_execute_once as *const () as usize as u64),
+            "TlsAlloc" => Some(native_tls_alloc as *const () as usize as u64),
+            "TlsFree" => Some(native_tls_free as *const () as usize as u64),
+            "TlsGetValue" => Some(native_tls_get_value as *const () as usize as u64),
+            "TlsSetValue" => Some(native_tls_set_value as *const () as usize as u64),
+            "EncodePointer" => Some(native_encode_pointer as *const () as usize as u64),
+            "DecodePointer" => Some(native_decode_pointer as *const () as usize as u64),
+            "IsProcessorFeaturePresent" => Some(native_is_processor_feature_present as *const () as usize as u64),
+            "RtlGetVersion" => Some(native_rtl_get_version as *const () as usize as u64),
+            "RtlNtStatusToDosError" => Some(native_rtl_nt_status_to_dos_error as *const () as usize as u64),
             "EnterCriticalSection" => {
                 Some(native_enter_critical_section as *const () as usize as u64)
             }
@@ -3484,6 +4117,7 @@ mod imp {
             "GetSystemInfo" => Some(native_get_system_info as *const () as usize as u64),
             "GetFullPathNameW" => Some(native_get_full_path_name_w as *const () as usize as u64),
             "FormatMessageW" => Some(native_format_message_w as *const () as usize as u64),
+            "FormatMessageA" => Some(native_format_message_a as *const () as usize as u64),
             "GetUserProfileDirectoryW" => {
                 Some(native_get_user_profile_directory_w as *const () as usize as u64)
             }
@@ -3525,6 +4159,7 @@ mod imp {
             }
             "HeapAlloc" => Some(native_heap_alloc as *const () as usize as u64),
             "HeapReAlloc" => Some(native_heap_realloc as *const () as usize as u64),
+            "HeapSize" => Some(native_heap_size as *const () as usize as u64),
             "HeapFree" => Some(native_heap_free as *const () as usize as u64),
             "ProcessPrng" => Some(native_process_prng as *const () as usize as u64),
             "GetConsoleMode" => Some(native_get_console_mode as *const () as usize as u64),
@@ -3580,13 +4215,65 @@ mod imp {
         }
     }
 
-    fn patch_baseline_imports(mapping: &Mapping, img: &PeImage) -> Result<(), String> {
-        for import in img.imports.iter().chain(&img.unsupported) {
-            let value = supports_import(&import.dll, &import.func)
-                .then(|| baseline_trampoline(&import.func).unwrap())
-                .ok_or_else(|| {
-                format!("unsupported native import: {}!{}", import.dll, import.func)
-                })?;
+    struct MissingImportStubs {
+        _code: Mapping,
+        _messages: Vec<Vec<u8>>,
+    }
+
+    extern "win64" fn native_missing_import(message: *const u8, len: u64) -> ! {
+        let mut offset = 0;
+        while offset < len as usize {
+            let written = unsafe { write(2, message.add(offset).cast(), len as usize - offset) };
+            if written <= 0 {
+                break;
+            }
+            offset += written as usize;
+        }
+        unsafe { _exit(126) }
+    }
+
+    fn patch_baseline_imports(
+        mapping: &Mapping,
+        img: &PeImage,
+        diagnostic: bool,
+    ) -> Result<Option<MissingImportStubs>, String> {
+        let imports: Vec<_> = img.imports.iter().chain(&img.unsupported).collect();
+        let missing = imports.iter().filter(|import| !supports_import(&import.dll, &import.func)).count();
+        if missing > 0 && !diagnostic {
+            let import = imports.iter().find(|import| !supports_import(&import.dll, &import.func)).unwrap();
+            return Err(format!("unsupported native import: {}!{}", import.dll, import.func));
+        }
+        let mut stubs = if missing == 0 {
+            None
+        } else {
+            let size = page_len(missing.checked_mul(32).ok_or("too many native import stubs")?)?;
+            let ptr = unsafe { mmap(ptr::null_mut(), size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) };
+            if ptr == MAP_FAILED {
+                return Err(format!("native import stub allocation failed: {}", std::io::Error::last_os_error()));
+            }
+            Some(MissingImportStubs { _code: Mapping { ptr: ptr.cast(), len: size }, _messages: Vec::with_capacity(missing) })
+        };
+        let mut stub_index = 0;
+        for import in imports {
+            let value = if supports_import(&import.dll, &import.func) {
+                baseline_trampoline(&import.func).unwrap()
+            } else {
+                let stubs = stubs.as_mut().unwrap();
+                let message = format!("unsupported native import called: {}!{}\n", import.dll, import.func).into_bytes();
+                let message_ptr = message.as_ptr() as u64;
+                let message_len = message.len() as u64;
+                stubs._messages.push(message);
+                let code = unsafe { std::slice::from_raw_parts_mut(stubs._code.ptr.add(stub_index * 32), 32) };
+                code[0..2].copy_from_slice(&[0x48, 0xB9]); // mov rcx, message
+                code[2..10].copy_from_slice(&message_ptr.to_le_bytes());
+                code[10..12].copy_from_slice(&[0x48, 0xBA]); // mov rdx, length
+                code[12..20].copy_from_slice(&message_len.to_le_bytes());
+                code[20..22].copy_from_slice(&[0x48, 0xB8]); // mov rax, handler
+                code[22..30].copy_from_slice(&(native_missing_import as *const () as usize as u64).to_le_bytes());
+                code[30..32].copy_from_slice(&[0xFF, 0xE0]); // jmp rax
+                stub_index += 1;
+                code.as_ptr() as u64
+            };
             let off = import.iat_rva as usize;
             if off.checked_add(8).is_none_or(|end| end > mapping.len) {
                 return Err(format!(
@@ -3597,7 +4284,12 @@ mod imp {
             // SAFETY: the mapping is still RW and the checked IAT slot is in it.
             unsafe { (mapping.ptr.add(off) as *mut u64).write_unaligned(value) };
         }
-        Ok(())
+        if let Some(stubs) = &stubs {
+            if unsafe { mprotect(stubs._code.ptr.cast(), stubs._code.len, PROT_READ | PROT_EXEC) } != 0 {
+                return Err(format!("native import stubs could not be made executable: {}", std::io::Error::last_os_error()));
+            }
+        }
+        Ok(stubs)
     }
 
     fn entry(img: &PeImage) -> Result<u64, String> {
@@ -3678,7 +4370,8 @@ mod imp {
             .map_err(|_| "native backend execution lock is poisoned".to_string())?;
         let entry = entry(img)?;
         let mapping = map(img)?;
-        patch_baseline_imports(&mapping, img)?;
+        let diagnostic = std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1");
+        let _import_stubs = patch_baseline_imports(&mapping, img, diagnostic)?;
         let tls = setup_tls(&mapping, img)?;
         let fs = Arc::new(Mutex::new(NativeFs {
             fs: instance_fs,
@@ -3699,8 +4392,12 @@ mod imp {
             environment_block: vec![0, 0],
             fs,
             last_error: AtomicU32::new(0),
+            error_mode: AtomicU32::new(0),
+            pointer_cookie: random_pointer_cookie(),
+            heap_allocations: Mutex::new(HashMap::new()),
             gs_base: AtomicU64::new(0),
             tls_template: Mutex::new(tls.as_ref().map(NativeTls::clone_for_thread)),
+            dynamic_tls: Mutex::new(DynamicTlsSlots::new(tls.is_some())),
             threads: Mutex::new(HashMap::new()),
             thread_next: AtomicU64::new(0x8000_0000),
             timer_next: AtomicU64::new(0x7000_0000),

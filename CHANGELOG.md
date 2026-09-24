@@ -12,6 +12,14 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Added an opt-in native import diagnostic that binds missing imports to
+  per-import fail-on-call trampolines. Normal execution remains strict.
+- Native startup shims now cover process TLS slots, SRW locks, condition
+  variables, one-time initialization, pointer encoding, heap-size tracking,
+  CPU feature checks, error mode, ANSI system-message formatting, and NTDLL
+  version/status helpers.
+- Dynamic `GetProcAddress` now resolves implemented native exports and reports
+  `ERROR_PROC_NOT_FOUND` for missing ones.
 - Native PE import binding now reports the exact unsupported Windows import
   before guest execution instead of routing it to a zero-return fallback.
 - The Linux native backend now handles `Sleep`, `timeGetTime`, and
