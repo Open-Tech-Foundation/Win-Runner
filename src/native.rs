@@ -447,6 +447,26 @@ mod imp {
         }
 
         #[test]
+        fn overlapped_event_resets_before_io_and_signals_on_completion() {
+            let handle = super::native_create_event_w(0, 1, 1, std::ptr::null());
+            assert_ne!(handle, 0);
+            assert_eq!(super::native_wait_for_single_object(handle, 0), 0);
+            let mut ov = [0u64; 4];
+            ov[3] = handle | 1;
+            let event = super::native_prepare_overlapped_event(ov.as_ptr() as u64)
+                .unwrap()
+                .unwrap();
+            assert_eq!(super::native_wait_for_single_object(handle, 0), 258);
+            super::native_signal_event(&event);
+            assert_eq!(super::native_wait_for_single_object(handle, 0), 0);
+            assert_eq!(super::native_close_handle(handle), 1);
+            assert_eq!(
+                super::native_prepare_overlapped_event(ov.as_ptr() as u64).err(),
+                Some(6)
+            );
+        }
+
+        #[test]
         fn last_error_is_private_to_each_native_thread() {
             native_set_last_error(87);
             let other = std::thread::spawn(|| {
@@ -1731,6 +1751,15 @@ mod imp {
             eprintln!("native WaitForSingleObject handle={handle:#x} timeout={milliseconds}");
         }
         let process = process_ctx();
+        if let Some(event) = process.as_ref().and_then(|process| {
+            process
+                .events
+                .lock()
+                .ok()
+                .and_then(|events| events.get(&handle).cloned())
+        }) {
+            return native_wait_event(&event, milliseconds);
+        }
         if let Some(semaphore) = process.as_ref().and_then(|process| {
             process
                 .semaphores
@@ -1818,9 +1847,11 @@ mod imp {
             0x7000_0000..0x8000_0000 => 0,
             _ => {
                 let Some(process) = process else {
+                    native_set_last_error(6);
                     return 0xffff_ffff; // WAIT_FAILED
                 };
                 let Some(child) = child_process(&process, handle) else {
+                    native_set_last_error(6);
                     return 0xffff_ffff;
                 };
                 let Ok(mut state) = child.state.lock() else {
@@ -1853,6 +1884,181 @@ mod imp {
                 result
             }
         }
+    }
+    fn native_wait_event(event: &NativeEvent, milliseconds: u32) -> u32 {
+        let Ok(mut signaled) = event.signaled.lock() else {
+            return u32::MAX;
+        };
+        if milliseconds == u32::MAX {
+            while !*signaled {
+                signaled = match event.ready.wait(signaled) {
+                    Ok(state) => state,
+                    Err(_) => return u32::MAX,
+                };
+            }
+        } else if !*signaled {
+            let Ok((state, _)) = event.ready.wait_timeout_while(
+                signaled,
+                std::time::Duration::from_millis(milliseconds as u64),
+                |state| !*state,
+            ) else {
+                return u32::MAX;
+            };
+            signaled = state;
+        }
+        if !*signaled {
+            return 258;
+        }
+        if !event.manual_reset {
+            *signaled = false;
+        }
+        0
+    }
+    fn native_signal_event(event: &NativeEvent) {
+        if let Ok(mut signaled) = event.signaled.lock() {
+            *signaled = true;
+            if event.manual_reset {
+                event.ready.notify_all();
+            } else {
+                event.ready.notify_one();
+            }
+        }
+    }
+    extern "win64" fn native_create_event_w(
+        _attributes: u64,
+        manual_reset: i32,
+        initial_state: i32,
+        name: *const u16,
+    ) -> u64 {
+        let Some(process) = process_ctx() else {
+            return 0;
+        };
+        let name = if name.is_null() {
+            None
+        } else {
+            match wide(name) {
+                Some(name) if !name.is_empty() => Some(name),
+                _ => {
+                    native_set_last_error(87);
+                    return 0;
+                }
+            }
+        };
+        let event = if let Some(name) = name {
+            let Ok(mut names) = process.event_names.lock() else {
+                return 0;
+            };
+            if let Some(event) = names.get(&name).and_then(std::sync::Weak::upgrade) {
+                native_set_last_error(183); // ERROR_ALREADY_EXISTS
+                event
+            } else {
+                let event = Arc::new(NativeEvent {
+                    signaled: Mutex::new(initial_state != 0),
+                    ready: Condvar::new(),
+                    manual_reset: manual_reset != 0,
+                });
+                names.insert(name, Arc::downgrade(&event));
+                native_set_last_error(0);
+                event
+            }
+        } else {
+            Arc::new(NativeEvent {
+                signaled: Mutex::new(initial_state != 0),
+                ready: Condvar::new(),
+                manual_reset: manual_reset != 0,
+            })
+        };
+        let handle = process.event_next.fetch_add(4, Ordering::AcqRel);
+        let result = match process.events.lock() {
+            Ok(mut events) => {
+                events.insert(handle, event);
+                handle
+            }
+            Err(_) => 0,
+        };
+        result
+    }
+    extern "win64" fn native_create_event_ex_w(
+        attributes: u64,
+        name: *const u16,
+        flags: u32,
+        _access: u32,
+    ) -> u64 {
+        if flags & !3 != 0 {
+            native_set_last_error(87);
+            return 0;
+        }
+        native_create_event_w(attributes, (flags & 1) as i32, (flags & 2) as i32, name)
+    }
+    extern "win64" fn native_create_event_a(
+        attributes: u64,
+        manual_reset: i32,
+        initial_state: i32,
+        name: *const u8,
+    ) -> u64 {
+        if name.is_null() {
+            return native_create_event_w(
+                attributes,
+                manual_reset,
+                initial_state,
+                std::ptr::null(),
+            );
+        }
+        let Some((bytes, _)) = (unsafe { multibyte_input(name, -1) }) else {
+            native_set_last_error(87);
+            return 0;
+        };
+        let wide: Vec<u16> = bytes
+            .into_iter()
+            .map(u16::from)
+            .chain(std::iter::once(0))
+            .collect();
+        native_create_event_w(attributes, manual_reset, initial_state, wide.as_ptr())
+    }
+    extern "win64" fn native_create_event_ex_a(
+        attributes: u64,
+        name: *const u8,
+        flags: u32,
+        _access: u32,
+    ) -> u64 {
+        if flags & !3 != 0 {
+            native_set_last_error(87);
+            return 0;
+        }
+        native_create_event_a(attributes, (flags & 1) as i32, (flags & 2) as i32, name)
+    }
+    extern "win64" fn native_set_event(handle: u64) -> i32 {
+        let event = process_ctx().and_then(|process| {
+            process
+                .events
+                .lock()
+                .ok()
+                .and_then(|events| events.get(&handle).cloned())
+        });
+        let Some(event) = event else {
+            native_set_last_error(6);
+            return 0;
+        };
+        native_signal_event(&event);
+        1
+    }
+    extern "win64" fn native_reset_event(handle: u64) -> i32 {
+        let event = process_ctx().and_then(|process| {
+            process
+                .events
+                .lock()
+                .ok()
+                .and_then(|events| events.get(&handle).cloned())
+        });
+        let Some(event) = event else {
+            native_set_last_error(6);
+            return 0;
+        };
+        let Ok(mut signaled) = event.signaled.lock() else {
+            return 0;
+        };
+        *signaled = false;
+        1
     }
     extern "win64" fn native_create_semaphore_a(
         _attributes: *const u8,
@@ -1966,13 +2172,41 @@ mod imp {
         }
         handle
     }
-    fn native_complete_file_io(file: &NativeFile, overlapped: u64, bytes: u32) {
+    fn native_prepare_overlapped_event(overlapped: u64) -> Result<Option<Arc<NativeEvent>>, u32> {
+        if overlapped == 0 {
+            return Ok(None);
+        }
+        let raw = unsafe { ((overlapped + 24) as *const u64).read_unaligned() };
+        let handle = raw & !1;
+        if handle == 0 {
+            return Ok(None);
+        }
+        let process = process_ctx().ok_or(6u32)?;
+        let event = process
+            .events
+            .lock()
+            .map_err(|_| 6u32)?
+            .get(&handle)
+            .cloned()
+            .ok_or(6u32)?;
+        *event.signaled.lock().map_err(|_| 6u32)? = false;
+        Ok(Some(event))
+    }
+    fn native_complete_file_io(
+        file: &NativeFile,
+        overlapped: u64,
+        bytes: u32,
+        event: Option<&Arc<NativeEvent>>,
+    ) {
         if overlapped == 0 {
             return;
         }
         unsafe {
             (overlapped as *mut u64).write_unaligned(0); // OVERLAPPED.Internal = STATUS_SUCCESS
             ((overlapped + 8) as *mut u64).write_unaligned(bytes as u64); // InternalHigh
+        }
+        if let Some(event) = event {
+            native_signal_event(event);
         }
         if let Some((port, key)) = &file.completion {
             // The low bit of hEvent suppresses completion-port notification.
@@ -2020,6 +2254,7 @@ mod imp {
         process: &NativeProcessContext,
         file: &NativeFile,
         overlapped: u64,
+        event: Option<Arc<NativeEvent>>,
         result: Result<u32, u64>,
     ) {
         let (bytes, status) = match result {
@@ -2029,6 +2264,9 @@ mod imp {
         if let Ok(_guard) = process.io_wait.lock() {
             native_set_overlapped_status(overlapped, status, bytes);
             process.io_ready.notify_all();
+        }
+        if let Some(event) = event {
+            native_signal_event(&event);
         }
         if let Some((port, key)) = &file.completion {
             let event = unsafe { ((overlapped + 24) as *const u64).read_unaligned() };
@@ -2435,6 +2673,9 @@ mod imp {
         thread_next: AtomicU64,
         semaphores: Mutex<HashMap<u64, Arc<NativeSemaphore>>>,
         semaphore_next: AtomicU64,
+        events: Mutex<HashMap<u64, Arc<NativeEvent>>>,
+        event_names: Mutex<HashMap<String, std::sync::Weak<NativeEvent>>>,
+        event_next: AtomicU64,
         completion_ports: Mutex<HashMap<u64, Arc<NativeCompletionPort>>>,
         completion_next: AtomicU64,
         io_wait: Mutex<()>,
@@ -2462,6 +2703,12 @@ mod imp {
         count: Mutex<i32>,
         changed: Condvar,
         maximum: i32,
+    }
+
+    struct NativeEvent {
+        signaled: Mutex<bool>,
+        ready: Condvar,
+        manual_reset: bool,
     }
 
     struct NativeVirtualAllocation {
@@ -2554,6 +2801,9 @@ mod imp {
             thread_next: AtomicU64::new(0x8000_0000),
             semaphores: Mutex::new(HashMap::new()),
             semaphore_next: AtomicU64::new(0x6000_0000),
+            events: Mutex::new(HashMap::new()),
+            event_names: Mutex::new(HashMap::new()),
+            event_next: AtomicU64::new(0x6100_0000),
             completion_ports: Mutex::new(HashMap::new()),
             completion_next: AtomicU64::new(0x9000_0000),
             io_wait: Mutex::new(()),
@@ -4600,13 +4850,23 @@ mod imp {
                 }
             };
             if overlapped != 0
+                && ctx.handles.get(&handle).is_some_and(|file| file.overlapped)
+                && (overlapped & 7 != 0 || native_overlapped_status(overlapped) == STATUS_PENDING)
+            {
+                native_set_last_error(87);
+                return 0;
+            }
+            let event = match native_prepare_overlapped_event(overlapped) {
+                Ok(event) => event,
+                Err(error) => {
+                    native_set_last_error(error);
+                    return 0;
+                }
+            };
+            if overlapped != 0
                 && len >= DEFERRED_FILE_IO_MIN
                 && ctx.handles.get(&handle).is_some_and(|file| file.overlapped)
             {
-                if overlapped & 7 != 0 || native_overlapped_status(overlapped) == STATUS_PENDING {
-                    native_set_last_error(87);
-                    return 0;
-                }
                 let Some(process) = process_ctx() else {
                     return 0;
                 };
@@ -4619,6 +4879,7 @@ mod imp {
                 process.pending_file_io.fetch_add(1, Ordering::AcqRel);
                 drop(ctx);
                 let worker_process = Arc::clone(&process);
+                let worker_event = event.clone();
                 let spawned = std::thread::Builder::new().spawn(move || {
                     let result = match worker_process.fs.lock() {
                         Ok(mut fs) => match fs.fs.read_file(&file.path) {
@@ -4643,11 +4904,23 @@ mod imp {
                         },
                         Err(_) => Err(STATUS_UNSUCCESSFUL),
                     };
-                    native_finish_pending_file_io(&worker_process, &file, overlapped, result);
+                    native_finish_pending_file_io(
+                        &worker_process,
+                        &file,
+                        overlapped,
+                        worker_event,
+                        result,
+                    );
                 });
                 if spawned.is_err() {
                     native_set_overlapped_status(overlapped, STATUS_UNSUCCESSFUL, 0);
-                    process.pending_file_io.fetch_sub(1, Ordering::AcqRel);
+                    if let Ok(_guard) = process.io_wait.lock() {
+                        process.pending_file_io.fetch_sub(1, Ordering::AcqRel);
+                        process.io_ready.notify_all();
+                    }
+                    if let Some(event) = event {
+                        native_signal_event(&event);
+                    }
                     native_set_last_error(8);
                 } else {
                     native_set_last_error(997); // ERROR_IO_PENDING
@@ -4682,7 +4955,7 @@ mod imp {
                 if overlapped == 0 {
                     file.offset = end;
                 }
-                native_complete_file_io(file, overlapped, len);
+                native_complete_file_io(file, overlapped, len, event.as_ref());
             }
             if !written.is_null() {
                 unsafe { written.write(len) };
@@ -4904,6 +5177,9 @@ mod imp {
                 thread_next: AtomicU64::new(0x8000_0000),
                 semaphores: Mutex::new(HashMap::new()),
                 semaphore_next: AtomicU64::new(0x6000_0000),
+                events: Mutex::new(HashMap::new()),
+                event_names: Mutex::new(HashMap::new()),
+                event_next: AtomicU64::new(0x6100_0000),
                 completion_ports: Mutex::new(HashMap::new()),
                 completion_next: AtomicU64::new(0x9000_0000),
                 io_wait: Mutex::new(()),
@@ -5813,13 +6089,23 @@ mod imp {
             }
         };
         if ov != 0
+            && ctx.handles.get(&h).is_some_and(|file| file.overlapped)
+            && (ov & 7 != 0 || native_overlapped_status(ov) == STATUS_PENDING)
+        {
+            native_set_last_error(87);
+            return 0;
+        }
+        let event = match native_prepare_overlapped_event(ov) {
+            Ok(event) => event,
+            Err(error) => {
+                native_set_last_error(error);
+                return 0;
+            }
+        };
+        if ov != 0
             && n >= DEFERRED_FILE_IO_MIN
             && ctx.handles.get(&h).is_some_and(|file| file.overlapped)
         {
-            if ov & 7 != 0 || native_overlapped_status(ov) == STATUS_PENDING {
-                native_set_last_error(87);
-                return 0;
-            }
             let Some(process) = process_ctx() else {
                 return 0;
             };
@@ -5831,6 +6117,7 @@ mod imp {
             process.pending_file_io.fetch_add(1, Ordering::AcqRel);
             drop(ctx);
             let worker_process = Arc::clone(&process);
+            let worker_event = event.clone();
             let output = buf as u64;
             let spawned = std::thread::Builder::new().spawn(move || {
                 let result = match worker_process.fs.lock() {
@@ -5851,11 +6138,17 @@ mod imp {
                     },
                     Err(_) => Err(STATUS_UNSUCCESSFUL),
                 };
-                native_finish_pending_file_io(&worker_process, &file, ov, result);
+                native_finish_pending_file_io(&worker_process, &file, ov, worker_event, result);
             });
             if spawned.is_err() {
                 native_set_overlapped_status(ov, STATUS_UNSUCCESSFUL, 0);
-                process.pending_file_io.fetch_sub(1, Ordering::AcqRel);
+                if let Ok(_guard) = process.io_wait.lock() {
+                    process.pending_file_io.fetch_sub(1, Ordering::AcqRel);
+                    process.io_ready.notify_all();
+                }
+                if let Some(event) = event {
+                    native_signal_event(&event);
+                }
                 native_set_last_error(8);
             } else {
                 native_set_last_error(997);
@@ -5888,7 +6181,7 @@ mod imp {
             if ov == 0 {
                 file.offset = offset + k;
             }
-            native_complete_file_io(file, ov, k as u32);
+            native_complete_file_io(file, ov, k as u32, event.as_ref());
         }
         if !read_count.is_null() {
             unsafe { read_count.write(k as u32) };
@@ -5908,6 +6201,14 @@ mod imp {
         if process.as_ref().is_some_and(|process| {
             process
                 .semaphores
+                .lock()
+                .is_ok_and(|mut values| values.remove(&h).is_some())
+        }) {
+            return 1;
+        }
+        if process.as_ref().is_some_and(|process| {
+            process
+                .events
                 .lock()
                 .is_ok_and(|mut values| values.remove(&h).is_some())
         }) {
@@ -6366,6 +6667,12 @@ mod imp {
             "WaitForSingleObject" => {
                 Some(native_wait_for_single_object as *const () as usize as u64)
             }
+            "CreateEventW" => Some(native_create_event_w as *const () as usize as u64),
+            "CreateEventA" => Some(native_create_event_a as *const () as usize as u64),
+            "CreateEventExW" => Some(native_create_event_ex_w as *const () as usize as u64),
+            "CreateEventExA" => Some(native_create_event_ex_a as *const () as usize as u64),
+            "SetEvent" => Some(native_set_event as *const () as usize as u64),
+            "ResetEvent" => Some(native_reset_event as *const () as usize as u64),
             "WaitOnAddress" => Some(native_wait_on_address as *const () as usize as u64),
             "WakeByAddressAll" | "WakeByAddressSingle" => {
                 Some(native_wake_by_address as *const () as usize as u64)
@@ -7075,6 +7382,9 @@ mod imp {
             thread_next: AtomicU64::new(0x8000_0000),
             semaphores: Mutex::new(HashMap::new()),
             semaphore_next: AtomicU64::new(0x6000_0000),
+            events: Mutex::new(HashMap::new()),
+            event_names: Mutex::new(HashMap::new()),
+            event_next: AtomicU64::new(0x6100_0000),
             completion_ports: Mutex::new(HashMap::new()),
             completion_next: AtomicU64::new(0x9000_0000),
             io_wait: Mutex::new(()),

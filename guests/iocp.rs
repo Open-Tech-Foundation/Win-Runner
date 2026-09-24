@@ -24,6 +24,13 @@ extern "C" {
     ) -> i32;
     fn GetLastError() -> u32;
     fn GetOverlappedResult(file: u64, ov: *mut Overlapped, bytes: *mut u32, wait: i32) -> i32;
+    fn CreateEventW(attrs: u64, manual: i32, initial: i32, name: *const u16) -> u64;
+    fn CreateEventA(attrs: u64, manual: i32, initial: i32, name: *const u8) -> u64;
+    fn CreateEventExW(attrs: u64, name: *const u16, flags: u32, access: u32) -> u64;
+    fn CreateEventExA(attrs: u64, name: *const u8, flags: u32, access: u32) -> u64;
+    fn SetEvent(handle: u64) -> i32;
+    fn ResetEvent(handle: u64) -> i32;
+    fn WaitForSingleObject(handle: u64, timeout: u32) -> u32;
     fn CloseHandle(h: u64) -> i32;
     fn ExitProcess(code: u32) -> !;
 }
@@ -62,6 +69,52 @@ fn ov(offset: u32) -> Overlapped {
 #[no_mangle]
 pub extern "C" fn guest_entry() {
     let path: [u16; 12] = [67, 58, 92, 105, 111, 99, 112, 46, 116, 120, 116, 0]; // C:\iocp.txt
+    let event = unsafe { CreateEventW(0, 1, 0, core::ptr::null()) };
+    check(event != 0 && event & 1 == 0);
+    check(unsafe { WaitForSingleObject(event, 0) } == 258);
+    check(unsafe { SetEvent(event) } != 0);
+    check(unsafe { WaitForSingleObject(event, 0) } == 0);
+    check(unsafe { WaitForSingleObject(event, 0) } == 0);
+    check(unsafe { ResetEvent(event) } != 0);
+    check(unsafe { WaitForSingleObject(event, 0) } == 258);
+    let auto = unsafe { CreateEventW(0, 0, 1, core::ptr::null()) };
+    check(auto != 0 && unsafe { WaitForSingleObject(auto, 0) } == 0);
+    check(unsafe { WaitForSingleObject(auto, 0) } == 258);
+    check(unsafe { SetEvent(auto) } != 0 && unsafe { WaitForSingleObject(auto, 0) } == 0);
+    check(unsafe { CloseHandle(auto) } != 0);
+    check(unsafe { SetEvent(auto) } == 0 && unsafe { GetLastError() } == 6);
+    check(unsafe { ResetEvent(auto) } == 0 && unsafe { GetLastError() } == 6);
+    check(unsafe { WaitForSingleObject(auto, 0) } == u32::MAX);
+    check(unsafe { GetLastError() } == 6);
+    check(unsafe { CreateEventExW(0, core::ptr::null(), 4, 0x1f0003) } == 0);
+    check(unsafe { GetLastError() } == 87);
+    let ex = unsafe { CreateEventExW(0, core::ptr::null(), 3, 0x1f0003) };
+    check(ex != 0 && unsafe { WaitForSingleObject(ex, 0) } == 0);
+    check(unsafe { WaitForSingleObject(ex, 0) } == 0 && unsafe { CloseHandle(ex) } != 0);
+    let ex_auto = unsafe { CreateEventExA(0, core::ptr::null(), 2, 0x1f0003) };
+    check(ex_auto != 0 && unsafe { WaitForSingleObject(ex_auto, 0) } == 0);
+    check(
+        unsafe { WaitForSingleObject(ex_auto, 0) } == 258 && unsafe { CloseHandle(ex_auto) } != 0,
+    );
+    let name: [u16; 10] = [119, 105, 110, 99, 108, 105, 45, 105, 111, 0];
+    let named = unsafe { CreateEventW(0, 1, 0, name.as_ptr()) };
+    check(named != 0);
+    let named_again = unsafe { CreateEventW(0, 0, 1, name.as_ptr()) };
+    check(named_again != 0 && named_again != named && unsafe { GetLastError() } == 183);
+    check(unsafe { WaitForSingleObject(named_again, 0) } == 258);
+    check(unsafe { SetEvent(named) } != 0 && unsafe { WaitForSingleObject(named_again, 0) } == 0);
+    let named_ansi = unsafe { CreateEventA(0, 0, 0, b"wincli-io\0".as_ptr()) };
+    check(named_ansi != 0 && unsafe { GetLastError() } == 183);
+    check(
+        unsafe { WaitForSingleObject(named_ansi, 0) } == 0
+            && unsafe { CloseHandle(named_ansi) } != 0,
+    );
+    check(unsafe { CloseHandle(named) } != 0 && unsafe { CloseHandle(named_again) } != 0);
+    let reopened = unsafe { CreateEventW(0, 1, 1, name.as_ptr()) };
+    check(reopened != 0 && unsafe { GetLastError() } == 0);
+    check(
+        unsafe { WaitForSingleObject(reopened, 0) } == 0 && unsafe { CloseHandle(reopened) } != 0,
+    );
     let mut count = 0;
     let file = unsafe { CreateFileW(path.as_ptr(), 0xc000_0000, 0, 0, 2, 0x80, 0) };
     check(file != !0);
@@ -92,9 +145,15 @@ pub extern "C" fn guest_entry() {
     let mut buf = [0u8; 4];
     check(unsafe { ReadFile(file, buf.as_mut_ptr(), 2, &mut count, core::ptr::null_mut()) } == 0);
     check(unsafe { GetLastError() } == 87);
+    let mut bad_event_ov = ov(0);
+    bad_event_ov.event = auto;
+    check(unsafe { ReadFile(file, buf.as_mut_ptr(), 1, &mut count, &mut bad_event_ov) } == 0);
+    check(unsafe { GetLastError() } == 6);
 
     let mut read_ov = ov(2);
+    read_ov.event = event;
     check(unsafe { ReadFile(file, buf.as_mut_ptr(), 3, &mut count, &mut read_ov) } != 0);
+    check(unsafe { WaitForSingleObject(event, 0) } == 0);
     check(count == 3 && &buf[..3] == b"cde" && read_ov.internal == 0 && read_ov.internal_high == 3);
     let mut bytes = 0;
     let mut key = 0;
@@ -123,8 +182,10 @@ pub extern "C" fn guest_entry() {
     check(bytes == 1 && key == 0x5678 && returned == (&mut second_ov as *mut Overlapped as u64));
     // The low event bit requests no IOCP packet for this operation.
     let mut quiet_ov = ov(0);
-    quiet_ov.event = 1;
+    quiet_ov.event = event | 1;
+    check(unsafe { ResetEvent(event) } != 0);
     check(unsafe { ReadFile(second, buf.as_mut_ptr(), 1, &mut count, &mut quiet_ov) } != 0);
+    check(unsafe { WaitForSingleObject(event, 0) } == 0);
     check(unsafe { GetQueuedCompletionStatus(port, &mut bytes, &mut key, &mut returned, 0) } == 0);
     check(unsafe { GetLastError() } == 258);
     check(unsafe { CloseHandle(second) } != 0);
@@ -158,8 +219,11 @@ pub extern "C" fn guest_entry() {
     check(port != 0);
     let output = core::ptr::addr_of_mut!(OUTPUT).cast::<u8>();
     let mut large_ov = ov(0);
+    large_ov.event = event;
+    check(unsafe { SetEvent(event) } != 0);
     check(unsafe { ReadFile(file, output, 65536, &mut count, &mut large_ov) } == 0);
     check(unsafe { GetLastError() } == 997 && count == 0);
+    check(unsafe { WaitForSingleObject(event, u32::MAX) } == 0);
     check(unsafe { GetOverlappedResult(file, &mut large_ov, &mut count, 1) } != 0);
     check(count == 65536 && unsafe { output.read() == b'Q' && output.add(65535).read() == b'Q' });
     check(
@@ -169,8 +233,11 @@ pub extern "C" fn guest_entry() {
     check(bytes == 65536 && key == 0x7777 && returned == (&mut large_ov as *mut Overlapped as u64));
 
     let mut write_ov = ov(0);
+    write_ov.event = event;
+    check(unsafe { ResetEvent(event) } != 0);
     check(unsafe { WriteFile(file, LARGE.as_ptr(), 65536, &mut count, &mut write_ov) } == 0);
     check(unsafe { GetLastError() } == 997 && count == 0);
+    check(unsafe { WaitForSingleObject(event, u32::MAX) } == 0);
     check(
         unsafe { GetOverlappedResult(file, &mut write_ov, &mut count, 1) } != 0 && count == 65536,
     );
@@ -181,8 +248,11 @@ pub extern "C" fn guest_entry() {
     check(bytes == 65536 && key == 0x7777 && returned == (&mut write_ov as *mut Overlapped as u64));
 
     let mut eof_ov = ov(65536);
+    eof_ov.event = event;
+    check(unsafe { ResetEvent(event) } != 0);
     check(unsafe { ReadFile(file, output, 65536, &mut count, &mut eof_ov) } == 0);
     check(unsafe { GetLastError() } == 997);
+    check(unsafe { WaitForSingleObject(event, u32::MAX) } == 0);
     check(unsafe { GetOverlappedResult(file, &mut eof_ov, &mut count, 1) } == 0);
     check(unsafe { GetLastError() } == 38);
     check(
@@ -191,5 +261,6 @@ pub extern "C" fn guest_entry() {
     );
     check(unsafe { GetLastError() } == 38 && returned == (&mut eof_ov as *mut Overlapped as u64));
     check(unsafe { CloseHandle(file) } != 0 && unsafe { CloseHandle(port) } != 0);
+    check(unsafe { CloseHandle(event) } != 0);
     unsafe { ExitProcess(0) }
 }

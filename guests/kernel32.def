@@ -12,6 +12,13 @@ CreateIoCompletionPort
 GetQueuedCompletionStatus
 GetQueuedCompletionStatusEx
 GetOverlappedResult
+CreateEventW
+CreateEventA
+CreateEventExW
+CreateEventExA
+SetEvent
+ResetEvent
+WaitForSingleObject
 CloseHandle
 CreateDirectoryW
 RemoveDirectoryW

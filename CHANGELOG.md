@@ -11,6 +11,9 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added native manual and auto reset event handles, named event reopening,
+  `CreateEventA/W`/`CreateEventExA/W`, `SetEvent`, and `ResetEvent`. Overlapped
+  WinFS operations now reset and signal `hEvent`, including deferred failures.
 - Added background completion for larger overlapped WinFS reads and writes,
   including `ERROR_IO_PENDING`, waitable `GetOverlappedResult`, and failed
   completion packets for deferred EOF. Native PE tests cover both paths.
