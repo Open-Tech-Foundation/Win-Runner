@@ -11,6 +11,9 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added native WinFS file attributes, disk handle types, and NT file metadata
+  queries used by Node.js. The real Windows Node binary now reads and stats
+  files supplied through the guest filesystem.
 - Added `CancelIoEx` and same-thread `CancelIo` for pending native WinFS
   operations, including canceled `OVERLAPPED` status, event signaling, and
   failed IOCP completion packets. Native unit and PE tests cover cancellation

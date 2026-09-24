@@ -859,7 +859,7 @@ fn test_movlhps_guest_copies_source_low_qword() {
 fn test_inspect_rust_guest() {
     let (code, stdout, _) = run_inspect(&artifact("exe/rust_fs.exe"));
     assert_eq!(code, 0);
-    assert!(stdout.contains("Supported imports: 11"));
+    assert!(stdout.contains("Supported imports: 14"));
 }
 
 #[test]

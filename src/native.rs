@@ -1217,6 +1217,100 @@ mod imp {
         fn classifies_native_file_metadata_attributes() {
             assert_eq!(native_file_attributes(true), 0x10);
             assert_eq!(native_file_attributes(false), 0x80);
+            assert_eq!(
+                super::native_get_file_attributes_w(std::ptr::null()),
+                u32::MAX
+            );
+            assert_eq!(super::native_get_last_error(), 87);
+        }
+
+        #[test]
+        fn nt_file_metadata_reports_winfs_size_type_and_id() {
+            let process = super::process_ctx().unwrap();
+            let handle = {
+                let mut fs = process.fs.lock().unwrap();
+                let handle = fs.next;
+                fs.next += 1;
+                let path = format!(r"C:\nt_metadata_{handle}.txt");
+                fs.fs.write_file(&path, b"metadata".to_vec()).unwrap();
+                fs.handles.insert(
+                    handle,
+                    super::NativeFile {
+                        path,
+                        offset: 0,
+                        overlapped: false,
+                        completion: None,
+                    },
+                );
+                handle
+            };
+            let mut io_status = [0u8; 16];
+            let mut device = [0u8; 8];
+            assert_eq!(
+                super::native_nt_query_volume_information_file(
+                    handle,
+                    io_status.as_mut_ptr(),
+                    device.as_mut_ptr(),
+                    device.len() as u32,
+                    4,
+                ),
+                0
+            );
+            assert_eq!(u32::from_le_bytes(device[..4].try_into().unwrap()), 7);
+            assert_eq!(u64::from_le_bytes(io_status[8..16].try_into().unwrap()), 8);
+            let mut info = [0u8; 104];
+            assert_eq!(
+                super::native_nt_query_information_file(
+                    handle,
+                    io_status.as_mut_ptr(),
+                    info.as_mut_ptr(),
+                    info.len() as u32,
+                    18,
+                ),
+                0
+            );
+            assert_eq!(u32::from_le_bytes(info[32..36].try_into().unwrap()), 0x80);
+            assert_eq!(u64::from_le_bytes(info[48..56].try_into().unwrap()), 8);
+            assert_eq!(u32::from_le_bytes(info[56..60].try_into().unwrap()), 1);
+            assert_ne!(u64::from_le_bytes(info[64..72].try_into().unwrap()), 0);
+            assert_eq!(
+                u64::from_le_bytes(io_status[8..16].try_into().unwrap()),
+                104
+            );
+            assert_eq!(&info[96..104], &[0; 8]);
+            assert_eq!(
+                super::native_nt_query_information_file(
+                    handle,
+                    io_status.as_mut_ptr(),
+                    info.as_mut_ptr(),
+                    8,
+                    18,
+                ),
+                0xC000_0004
+            );
+            assert_eq!(
+                super::native_nt_query_volume_information_file(
+                    handle + 1000,
+                    io_status.as_mut_ptr(),
+                    device.as_mut_ptr(),
+                    device.len() as u32,
+                    4,
+                ),
+                0xC000_0008
+            );
+            assert_eq!(
+                super::native_nt_query_information_file(
+                    handle,
+                    io_status.as_mut_ptr(),
+                    info.as_mut_ptr(),
+                    info.len() as u32,
+                    7,
+                ),
+                0xC000_0002
+            );
+            let mut fs = process.fs.lock().unwrap();
+            let path = fs.handles.remove(&handle).unwrap().path;
+            fs.fs.delete_file(&path).unwrap();
         }
 
         #[test]
@@ -3625,7 +3719,18 @@ mod imp {
         match host_standard_fd(handle) {
             Some(fd) if unsafe { isatty(fd) } != 0 => 0x0002,
             Some(_) => 0x0003, // anonymous launcher pipes
-            None => 0,
+            None => {
+                if fs_ctx().is_some_and(|context| {
+                    context
+                        .lock()
+                        .is_ok_and(|fs| fs.handles.contains_key(&handle))
+                }) {
+                    0x0001 // FILE_TYPE_DISK
+                } else {
+                    native_set_last_error(6);
+                    0
+                }
+            }
         }
     }
 
@@ -6038,6 +6143,55 @@ mod imp {
                 return 0;
             }
         }
+        if information_class == 18 && !information.is_null() && length >= 96 {
+            if let Some(context) = fs_ctx() {
+                if let Ok(ctx) = context.lock() {
+                    if let Some(file) = ctx.handles.get(&original) {
+                        let is_directory = ctx.fs.is_dir(&file.path);
+                        let size = if is_directory {
+                            0
+                        } else {
+                            ctx.fs
+                                .read_file(&file.path)
+                                .map_or(0, |data| data.len() as u64)
+                        };
+                        let file_id = ctx.fs.file_id(&file.path).unwrap_or(0);
+                        let written = length.min(104) as usize;
+                        unsafe {
+                            std::ptr::write_bytes(information, 0, written);
+                            (information.add(32) as *mut u32)
+                                .write_unaligned(native_file_attributes(is_directory));
+                            (information.add(40) as *mut u64).write_unaligned(size);
+                            (information.add(48) as *mut u64).write_unaligned(size);
+                            (information.add(56) as *mut u32).write_unaligned(1);
+                            information.add(61).write(is_directory as u8);
+                            (information.add(64) as *mut u64).write_unaligned(file_id);
+                        }
+                        if !io_status.is_null() {
+                            unsafe {
+                                (io_status as *mut u32).write_unaligned(0);
+                                (io_status.add(8) as *mut u64).write_unaligned(written as u64);
+                            }
+                        }
+                        return 0;
+                    }
+                }
+            }
+        }
+        if information_class == 18 {
+            let status = if information.is_null() || length < 96 {
+                0xC000_0004 // STATUS_INFO_LENGTH_MISMATCH
+            } else {
+                0xC000_0008 // STATUS_INVALID_HANDLE
+            };
+            if !io_status.is_null() {
+                unsafe {
+                    (io_status as *mut u32).write_unaligned(status);
+                    (io_status.add(8) as *mut u64).write_unaligned(0);
+                }
+            }
+            return status;
+        }
         const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
         if !io_status.is_null() {
             unsafe {
@@ -6066,12 +6220,45 @@ mod imp {
     }
 
     extern "win64" fn native_nt_query_volume_information_file(
-        _file: u64,
+        file: u64,
         io_status: *mut u8,
-        _information: *mut u8,
-        _length: u32,
-        _information_class: u32,
+        information: *mut u8,
+        length: u32,
+        information_class: u32,
     ) -> u32 {
+        if information_class == 4 && !information.is_null() && length >= 8 {
+            if fs_ctx().is_some_and(|context| {
+                context
+                    .lock()
+                    .is_ok_and(|fs| fs.handles.contains_key(&file))
+            }) {
+                unsafe {
+                    (information as *mut u32).write_unaligned(7); // FILE_DEVICE_DISK
+                    (information.add(4) as *mut u32).write_unaligned(0);
+                }
+                if !io_status.is_null() {
+                    unsafe {
+                        (io_status as *mut u32).write_unaligned(0);
+                        (io_status.add(8) as *mut u64).write_unaligned(8);
+                    }
+                }
+                return 0;
+            }
+        }
+        if information_class == 4 {
+            let status = if information.is_null() || length < 8 {
+                0xC000_0004 // STATUS_INFO_LENGTH_MISMATCH
+            } else {
+                0xC000_0008 // STATUS_INVALID_HANDLE
+            };
+            if !io_status.is_null() {
+                unsafe {
+                    (io_status as *mut u32).write_unaligned(status);
+                    (io_status.add(8) as *mut u64).write_unaligned(0);
+                }
+            }
+            return status;
+        }
         const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
         if !io_status.is_null() {
             unsafe {
@@ -6399,6 +6586,29 @@ mod imp {
             0x10
         } else {
             0x80
+        }
+    }
+    extern "win64" fn native_get_file_attributes_w(path: *const u16) -> u32 {
+        let Some(path) = wide(path) else {
+            native_set_last_error(87);
+            return u32::MAX;
+        };
+        let path = path.strip_prefix(r"\\?\").unwrap_or(&path);
+        let Some(context) = fs_ctx() else {
+            native_set_last_error(2);
+            return u32::MAX;
+        };
+        let Ok(ctx) = context.lock() else {
+            native_set_last_error(6);
+            return u32::MAX;
+        };
+        if ctx.fs.is_dir(path) {
+            native_file_attributes(true)
+        } else if ctx.fs.is_file(path) {
+            native_file_attributes(false)
+        } else {
+            native_set_last_error(2);
+            u32::MAX
         }
     }
     fn native_extended_path(path: &str) -> String {
@@ -7068,6 +7278,7 @@ mod imp {
             "ExitProcess" => Some(native_exit_process as *const () as usize as u64),
             "CreateProcessW" => Some(native_create_process_w as *const () as usize as u64),
             "CreateFileW" => Some(native_create_file_w as *const () as usize as u64),
+            "GetFileAttributesW" => Some(native_get_file_attributes_w as *const () as usize as u64),
             "GetFileInformationByHandle" => {
                 Some(native_get_file_information_by_handle as *const () as usize as u64)
             }

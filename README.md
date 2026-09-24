@@ -151,6 +151,9 @@ and is not committed to this repository. Node still imports Windows APIs that
 WinCLI does not implement; untested Node features may stop at a named missing
 API. Set `WINCLI_NATIVE_DIAGNOSTIC=1` to log dynamic import misses and native
 startup calls.
+Node can read and stat files in WinFS. Loading a JavaScript file as a module,
+including npm's CLI, currently stops at the missing `RtlCaptureContext` shim;
+`npm install` has not reached package resolution yet.
 Set `WINCLI_NODE_EXE=target/nodejs/node-v24.21.0-win-x64.exe` when running
 `cargo test --test node_native` to include the real binary check. The executable
 comes from `https://nodejs.org/download/release/v24.21.0/win-x64/node.exe`;

@@ -31,6 +31,9 @@ extern "C" {
     fn DeleteFileW(path: *const u16) -> i32;
     fn MoveFileW(src: *const u16, dst: *const u16) -> i32;
     fn CopyFileW(src: *const u16, dst: *const u16, fail_if_exists: i32) -> i32;
+    fn GetFileAttributesW(path: *const u16) -> u32;
+    fn GetFileType(handle: u64) -> u32;
+    fn GetLastError() -> u32;
 }
 
 const INVALID_HANDLE: u64 = 0xFFFF_FFFF_FFFF_FFFF;
@@ -47,7 +50,13 @@ fn on_panic(_: &core::panic::PanicInfo) -> ! {
 fn print(s: &[u8]) {
     unsafe {
         let mut written: u32 = 0;
-        WriteFile(GetStdHandle(-11), s.as_ptr(), s.len() as u32, &mut written, 0);
+        WriteFile(
+            GetStdHandle(-11),
+            s.as_ptr(),
+            s.len() as u32,
+            &mut written,
+            0,
+        );
     }
 }
 
@@ -107,14 +116,19 @@ pub extern "C" fn guest_entry() {
     // mkdir: success, then duplicate must fail.
     check(unsafe { CreateDirectoryW(dir, 0) } != 0);
     check(unsafe { CreateDirectoryW(dir, 0) } == 0);
+    check(unsafe { GetFileAttributesW(dir) } == 0x10);
 
     // create + write a.
     let h = open(a, GENERIC_WRITE, CREATE_ALWAYS);
     check(h != INVALID_HANDLE);
+    check(unsafe { GetFileType(h) } == 1);
     let mut w: u32 = 0;
     check(unsafe { WriteFile(h, data.as_ptr(), data.len() as u32, &mut w, 0) } != 0);
     check(w == data.len() as u32);
     check(unsafe { CloseHandle(h) } != 0);
+    check(unsafe { GetFileAttributesW(a) } == 0x80);
+    check(unsafe { GetFileAttributesW(c) } == u32::MAX);
+    check(unsafe { GetLastError() } == 2);
 
     // open + read a back, verify length and bytes.
     let h = open(a, GENERIC_READ, OPEN_EXISTING);
@@ -151,6 +165,10 @@ pub extern "C" fn guest_entry() {
     // rmdir, then duplicate must fail.
     check(unsafe { RemoveDirectoryW(dir) } != 0);
     check(unsafe { RemoveDirectoryW(dir) } == 0);
+    check(unsafe { GetFileAttributesW(dir) } == u32::MAX);
+    check(unsafe { GetLastError() } == 2);
+    check(unsafe { GetFileType(INVALID_HANDLE) } == 0);
+    check(unsafe { GetLastError() } == 6);
 
     print(b"PASS\n");
     unsafe { ExitProcess(0) }
