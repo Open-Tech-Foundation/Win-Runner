@@ -157,10 +157,21 @@ comes from `https://nodejs.org/download/release/v24.21.0/win-x64/node.exe`;
 its official SHA-256 is
 `ba4e6d110e8c1592a1ecd390f6b05f3da124b13871a5be62b341a07a853c6c32`.
 
-Planned next step is `wincli install <name>`: resolve portable Windows x64
-releases (preferred source: the WinGet catalog, portable EXE / ZIP only —
-no MSI/MSIX/setup emulation), cache the PE on the host, and run it through
-the runtime with its filesystem activity landing in WinFS.
+The official ripgrep 15.2.0 Windows x64 `rg.exe` is a smaller native
+filesystem target. With a guest file created in `wincli shell`, it searches
+files and directories, lists paths, filters globs, and writes JSON results.
+Its Windows x64 zip is available from the [ripgrep release page](https://github.com/BurntSushi/ripgrep/releases/tag/15.2.0).
+The archive SHA-256 is
+`71b2fef860abe467217a538ff31de02f5258807c0129f771846f87bd029aafc5`.
+Keep the extracted executable under `target/compat/rg.exe` and run the real
+binary checks with:
+
+```bash
+WINCLI_RG_EXE=target/compat/rg.exe cargo test --test rg_native
+```
+
+Like Node, ripgrep has optional static imports that `wincli inspect` lists as
+missing even when these tested paths run successfully.
 
 ## Console contract
 
@@ -171,8 +182,8 @@ the host terminal, and pipes (`wincli rg … | head`) behave identically.
 - Console writes are forwarded to host stdout (buffered per run;
   streamed live in CLI runs via a sink).
 - `WriteFile` bytes pass through bit-identical; `WriteConsoleW` transcodes
-  UTF-16→UTF-8 (invalid sequences → U+FFFD); `GetConsoleMode` succeeds iff
-  host stdout is a TTY (so `--color=auto` works); `GetConsoleOutputCP`
-  reports UTF-8; input is line-buffered (`ReadConsoleW`).
+  UTF-16→UTF-8 (invalid sequences → U+FFFD); `GetConsoleOutputCP`
+  reports UTF-8. `GetConsoleMode` currently reports a basic console mode for
+  standard handles, so some programs emit ANSI color into redirected output.
 - Cursor/screen-buffer APIs and Ctrl-C handling are non-goals; unsupported
   console APIs fail clearly so guests fall back.

@@ -8,7 +8,8 @@
 //! exceptions, threads, and isolation).
 //!
 //! PE instructions execute in a contained Linux child. Windows APIs require
-//! explicit native trampolines; unsupported imports fail before guest entry.
+//! explicit native trampolines; unsupported imports fail if guest code calls
+//! them. Strict pre-entry validation is optional.
 
 use crate::pe::PeImage;
 
@@ -61,12 +62,7 @@ pub fn run_import_free(img: &PeImage) -> Result<u32, String> {
     imp::run_import_free(img)
 }
 
-/// Run the initial native Rust-guest baseline in a child process.
-///
-/// The supported imports are exactly `GetStdHandle`, `WriteFile`, and
-/// `ExitProcess`. Guest stdout is captured and returned. The child boundary
-/// makes `ExitProcess` safe and is the beginning of the native backend's
-/// isolation model.
+/// Run a PE guest in a child process and capture its stdout.
 pub fn run_rust_baseline(img: &PeImage) -> Result<(u32, Vec<u8>), String> {
     run_rust_baseline_argv(img, "<exe>", &[])
 }
@@ -318,6 +314,95 @@ mod imp {
                 6
             );
             assert_eq!(String::from_utf16_lossy(&value[..5]), "en-US");
+        }
+
+        #[test]
+        fn nt_read_file_tracks_offsets_and_reports_eof_and_invalid_handles() {
+            let path = r"C:\nt_read_file_unit.txt";
+            let context = super::fs_ctx().unwrap();
+            let handle = {
+                let mut fs = context.lock().unwrap();
+                fs.fs.write_file(path, b"abcde".to_vec()).unwrap();
+                let handle = fs.next;
+                fs.next += 1;
+                fs.handles.insert(
+                    handle,
+                    super::NativeFile {
+                        path: path.into(),
+                        offset: 0,
+                    },
+                );
+                handle
+            };
+            let mut io_status = [0u8; 16];
+            let mut buffer = [0u8; 3];
+            let read = |handle, offset: *const i64, io: &mut [u8; 16], output: &mut [u8; 3]| {
+                super::native_nt_read_file(
+                    handle,
+                    0,
+                    0,
+                    0,
+                    io.as_mut_ptr(),
+                    output.as_mut_ptr(),
+                    3,
+                    offset,
+                    std::ptr::null(),
+                )
+            };
+            assert_eq!(
+                read(handle, std::ptr::null(), &mut io_status, &mut buffer),
+                0
+            );
+            assert_eq!(&buffer, b"abc");
+            assert_eq!(u64::from_le_bytes(io_status[8..16].try_into().unwrap()), 3);
+            let explicit = 1i64;
+            assert_eq!(read(handle, &explicit, &mut io_status, &mut buffer), 0);
+            assert_eq!(&buffer, b"bcd");
+            assert_eq!(
+                read(handle, std::ptr::null(), &mut io_status, &mut buffer),
+                0
+            );
+            assert_eq!(io_status[8], 1);
+            assert_eq!(buffer[0], b'e');
+            assert_eq!(
+                read(handle, std::ptr::null(), &mut io_status, &mut buffer),
+                0xC000_0011
+            );
+            assert_eq!(u64::from_le_bytes(io_status[8..16].try_into().unwrap()), 0);
+            assert_eq!(
+                read(u64::MAX - 10, std::ptr::null(), &mut io_status, &mut buffer),
+                0xC000_0008
+            );
+            assert_eq!(
+                super::native_nt_read_file(
+                    handle,
+                    1,
+                    0,
+                    0,
+                    io_status.as_mut_ptr(),
+                    buffer.as_mut_ptr(),
+                    3,
+                    std::ptr::null(),
+                    std::ptr::null()
+                ),
+                0xC000_00BB
+            );
+            let mut fs = context.lock().unwrap();
+            fs.handles.remove(&handle);
+            fs.fs.delete_file(path).unwrap();
+        }
+
+        #[test]
+        fn last_error_is_private_to_each_native_thread() {
+            native_set_last_error(87);
+            let other = std::thread::spawn(|| {
+                assert_eq!(native_get_last_error(), 0);
+                native_set_last_error(6);
+                native_get_last_error()
+            });
+            assert_eq!(other.join().unwrap(), 6);
+            assert_eq!(native_get_last_error(), 87);
+            native_set_last_error(0);
         }
 
         #[test]
@@ -1524,6 +1609,7 @@ mod imp {
                 if !unsafe { set_gs(tls.teb.as_ptr() as u64) } {
                     return 1;
                 }
+                THREAD_TEB_BASE.set(tls.teb.as_ptr() as u64);
             } else if thread_process.gs_base.load(Ordering::Acquire) != 0 {
                 return 1;
             }
@@ -2081,7 +2167,6 @@ mod imp {
         environment_block: Vec<u16>,
         std_handles: [AtomicU64; 3],
         fs: Arc<Mutex<NativeFs>>,
-        last_error: AtomicU32,
         error_mode: AtomicU32,
         pointer_cookie: u64,
         heap_allocations: Mutex<HashMap<u64, usize>>,
@@ -2163,6 +2248,8 @@ mod imp {
             const { std::cell::RefCell::new([(0, 0); 64]) };
         static THREAD_WSA_ERROR: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
         static THREAD_NATIVE_HANDLE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        static THREAD_LAST_ERROR: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        static THREAD_TEB_BASE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
 
     // Import trampolines have no guest-context argument. This is therefore a
@@ -2195,7 +2282,6 @@ mod imp {
                 finds: HashMap::new(),
                 next: 0x100,
             })),
-            last_error: AtomicU32::new(0),
             error_mode: AtomicU32::new(0),
             pointer_cookie: random_pointer_cookie(),
             heap_allocations: Mutex::new(HashMap::new()),
@@ -4458,7 +4544,6 @@ mod imp {
                     AtomicU64::new(STD_HANDLE_BASE + 2),
                 ],
                 fs: Arc::clone(&context),
-                last_error: AtomicU32::new(0),
                 error_mode: AtomicU32::new(0),
                 pointer_cookie: random_pointer_cookie(),
                 heap_allocations: Mutex::new(HashMap::new()),
@@ -4498,6 +4583,9 @@ mod imp {
                 if !unsafe { set_gs(tls.teb.as_ptr() as u64) } {
                     unsafe { _exit(127) };
                 }
+                THREAD_TEB_BASE.set(tls.teb.as_ptr() as u64);
+            } else {
+                THREAD_TEB_BASE.set(0);
             }
             let guest: unsafe extern "win64" fn() -> u32 = unsafe { std::mem::transmute(entry) };
             let code = unsafe { guest() };
@@ -4563,14 +4651,19 @@ mod imp {
         process.state_fd.store(u32::MAX, Ordering::Release);
     }
     extern "win64" fn native_get_last_error() -> u32 {
-        process_ctx()
-            .map(|process| process.last_error.load(Ordering::Acquire))
-            .unwrap_or(6)
+        let base = THREAD_TEB_BASE.get();
+        if base != 0 {
+            unsafe { ((base + 0x68) as *const u32).read_unaligned() }
+        } else {
+            THREAD_LAST_ERROR.get()
+        }
     }
 
     extern "win64" fn native_set_last_error(error: u32) {
-        if let Some(process) = process_ctx() {
-            process.last_error.store(error, Ordering::Release);
+        THREAD_LAST_ERROR.set(error);
+        let base = THREAD_TEB_BASE.get();
+        if base != 0 {
+            unsafe { ((base + 0x68) as *mut u32).write_unaligned(error) };
         }
     }
     extern "win64" fn native_set_error_mode(mode: u32) -> u32 {
@@ -4753,6 +4846,96 @@ mod imp {
             }
         }
         STATUS_NOT_IMPLEMENTED
+    }
+
+    extern "win64" fn native_nt_read_file(
+        file: u64,
+        event: u64,
+        apc_routine: u64,
+        _apc_context: u64,
+        io_status: *mut u8,
+        buffer: *mut u8,
+        length: u32,
+        byte_offset: *const i64,
+        _key: *const u32,
+    ) -> u32 {
+        const STATUS_SUCCESS: u32 = 0;
+        const STATUS_END_OF_FILE: u32 = 0xC000_0011;
+        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
+        let finish = |status: u32, bytes: usize| {
+            if !io_status.is_null() {
+                unsafe {
+                    (io_status as *mut u32).write_unaligned(status);
+                    (io_status.add(8) as *mut u64).write_unaligned(bytes as u64);
+                }
+            }
+            status
+        };
+        if io_status.is_null() || (buffer.is_null() && length != 0) {
+            return finish(STATUS_INVALID_PARAMETER, 0);
+        }
+        if event != 0 || apc_routine != 0 {
+            return finish(STATUS_NOT_SUPPORTED, 0);
+        }
+        if length == 0 {
+            return finish(STATUS_SUCCESS, 0);
+        }
+        let requested_offset = if byte_offset.is_null() {
+            None
+        } else {
+            let value = unsafe { byte_offset.read_unaligned() };
+            if value == -2 {
+                None
+            } else if value < 0 {
+                return finish(STATUS_INVALID_PARAMETER, 0);
+            } else {
+                Some(value as u64)
+            }
+        };
+        if let Some(fd) = host_standard_fd(file) {
+            if requested_offset.is_some() {
+                return finish(STATUS_INVALID_PARAMETER, 0);
+            }
+            let count = unsafe { read(fd, buffer.cast(), length as usize) };
+            return if count < 0 {
+                finish(0xC000_0001, 0)
+            } else if count == 0 {
+                finish(STATUS_END_OF_FILE, 0)
+            } else {
+                finish(STATUS_SUCCESS, count as usize)
+            };
+        }
+        let Some(context) = fs_ctx() else {
+            return finish(STATUS_INVALID_HANDLE, 0);
+        };
+        let Ok(mut fs) = context.lock() else {
+            return finish(0xC000_0001, 0);
+        };
+        let Some((path, current_offset)) = fs
+            .handles
+            .get(&file)
+            .map(|item| (item.path.clone(), item.offset))
+        else {
+            return finish(STATUS_INVALID_HANDLE, 0);
+        };
+        let offset = requested_offset.unwrap_or(current_offset as u64);
+        let Ok(offset) = usize::try_from(offset) else {
+            return finish(STATUS_INVALID_PARAMETER, 0);
+        };
+        let Ok(contents) = fs.fs.read_file(&path) else {
+            return finish(STATUS_INVALID_HANDLE, 0);
+        };
+        if offset >= contents.len() {
+            return finish(STATUS_END_OF_FILE, 0);
+        }
+        let count = (contents.len() - offset).min(length as usize);
+        unsafe { ptr::copy_nonoverlapping(contents.as_ptr().add(offset), buffer, count) };
+        if let Some(item) = fs.handles.get_mut(&file) {
+            item.offset = offset + count;
+        }
+        finish(STATUS_SUCCESS, count)
     }
 
     extern "win64" fn native_nt_query_information_file(
@@ -5446,7 +5629,10 @@ mod imp {
                     | "#116"
             ),
             "USER32.DLL" => func == "GetSystemMetrics",
-            "NTDLL.DLL" => matches!(func, "RtlGetVersion" | "RtlNtStatusToDosError"),
+            "NTDLL.DLL" => matches!(
+                func,
+                "RtlGetVersion" | "RtlNtStatusToDosError" | "NtReadFile"
+            ),
             "API-MS-WIN-CORE-SYNCH-L1-2-0.DLL" => {
                 matches!(
                     func,
@@ -5624,6 +5810,7 @@ mod imp {
                 Some(native_is_processor_feature_present as *const () as usize as u64)
             }
             "RtlGetVersion" => Some(native_rtl_get_version as *const () as usize as u64),
+            "NtReadFile" => Some(native_nt_read_file as *const () as usize as u64),
             "RtlNtStatusToDosError" => {
                 Some(native_rtl_nt_status_to_dos_error as *const () as usize as u64)
             }
@@ -6432,7 +6619,6 @@ mod imp {
                 AtomicU64::new(STD_HANDLE_BASE + 2),
             ],
             fs,
-            last_error: AtomicU32::new(0),
             error_mode: AtomicU32::new(0),
             pointer_cookie: random_pointer_cookie(),
             heap_allocations: Mutex::new(HashMap::new()),
@@ -6526,6 +6712,7 @@ mod imp {
                         if !unsafe { set_gs(tls.teb.as_ptr() as u64) } {
                             return 127;
                         }
+                        THREAD_TEB_BASE.set(tls.teb.as_ptr() as u64);
                     }
                     // SAFETY: entry is in the child-owned RX PE mapping.
                     let guest: unsafe extern "win64" fn() -> u32 =

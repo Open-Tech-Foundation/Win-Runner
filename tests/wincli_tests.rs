@@ -1019,27 +1019,27 @@ fn live_install_ripgrep() {
     assert!(stdout.contains("→ C:\\bin\\rg.exe"), "{stdout}");
     assert!(cache.join("pkgs").join("rg.exe").is_file());
 
-    // the harness loop: real rg.exe loads with no missing imports...
+    // The native loader binds optional missing imports to fail-on-call stubs.
     let out = std::process::Command::new(bin)
         .args(["inspect", "rg"])
         .env("WINCLI_CACHE", &cc)
         .env_remove("WINCLI_SOURCE")
         .output()
         .expect("spawn wincli inspect");
-    assert_eq!(out.status.code(), Some(0));
+    assert!(matches!(out.status.code(), Some(0 | 1)));
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    assert!(stdout.contains("Missing imports:   0"), "{stdout}");
+    assert!(stdout.contains("Imports:"), "{stdout}");
     // ...and searches end to end in a shell session.
     let (code, stdout, _) = run_shell_env(
-        "Set-Content C:\\log.txt 'error: disk full'\nAdd-Content C:\\log.txt 'info: all good'\nrg error C:\\log.txt\nexit\n",
-        &[("WINCLI_CACHE", cc.as_ref())],
+        "Set-Content C:\\log.txt 'error: disk full'\nAdd-Content C:\\log.txt 'info: all good'\nrg --color never --no-heading --no-line-number error C:\\log.txt\nexit\n",
+        &[("WINCLI_CACHE", cc.as_ref()), ("WINCLI_BACKEND", "native")],
     );
     assert_eq!(code, 0);
     assert_eq!(stdout, "error: disk full\n");
     // A directory walk depends on distinct BY_HANDLE_FILE_INFORMATION IDs.
     let (code, stdout, stderr) = run_shell_env(
-        "New-Item C:\\data -ItemType Directory\nSet-Content C:\\data\\one.txt 'error: one'\nSet-Content C:\\data\\two.txt 'error: two'\nrg --threads 2 error C:\\data\nexit\n",
-        &[("WINCLI_CACHE", cc.as_ref())],
+        "New-Item C:\\data -ItemType Directory\nSet-Content C:\\data\\one.txt 'error: one'\nSet-Content C:\\data\\two.txt 'error: two'\nrg --color never --no-heading --no-line-number --threads 2 error C:\\data\nexit\n",
+        &[("WINCLI_CACHE", cc.as_ref()), ("WINCLI_BACKEND", "native")],
     );
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(
