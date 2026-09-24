@@ -11,6 +11,10 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added a per-process bounded queue with four native workers for pending WinFS
+  I/O, replacing one host thread per transfer. A real PE fixture now checks
+  multiple concurrent completion packets and the queue-capacity boundary is
+  covered by a unit test.
 - Added native manual and auto reset event handles, named event reopening,
   `CreateEventA/W`/`CreateEventExA/W`, `SetEvent`, and `ResetEvent`. Overlapped
   WinFS operations now reset and signal `hEvent`, including deferred failures.

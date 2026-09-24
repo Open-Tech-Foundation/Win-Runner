@@ -467,6 +467,55 @@ mod imp {
         }
 
         #[test]
+        fn file_io_queue_reaches_its_fixed_capacity() {
+            let process = super::process_ctx().unwrap();
+            let file = super::NativeFile {
+                path: r"C:\queue_unit.txt".into(),
+                offset: 0,
+                overlapped: true,
+                completion: None,
+            };
+            let mut state = super::NativeFileIoQueueState {
+                jobs: std::collections::VecDeque::new(),
+                stop: false,
+            };
+            for _ in 0..super::MAX_QUEUED_FILE_IO {
+                assert!(!super::native_file_io_queue_full(&state));
+                state.jobs.push_back(super::NativeFileIoJob {
+                    process: std::sync::Arc::clone(&process),
+                    file: file.clone(),
+                    overlapped: 0,
+                    event: None,
+                    offset: 0,
+                    operation: super::NativeFileIoOperation::Write { data: Vec::new() },
+                });
+            }
+            assert!(super::native_file_io_queue_full(&state));
+            let queue = super::NativeFileIoQueue {
+                state: std::sync::Mutex::new(state),
+                ready: std::sync::Condvar::new(),
+            };
+            let mut ov = [0u64; 4];
+            ov[0] = 0x77;
+            ov[3] = 0xdead; // invalid event must not be consulted when the queue is full
+            assert_eq!(
+                super::native_enqueue_file_io(
+                    &queue,
+                    &process,
+                    file,
+                    ov.as_mut_ptr() as u64,
+                    0,
+                    super::NativeFileIoOperation::Write { data: Vec::new() },
+                ),
+                Err(8)
+            );
+            assert_eq!(ov[0], 0x77);
+            let mut state = queue.state.lock().unwrap();
+            state.jobs.pop_front();
+            assert!(!super::native_file_io_queue_full(&state));
+        }
+
+        #[test]
         fn last_error_is_private_to_each_native_thread() {
             native_set_last_error(87);
             let other = std::thread::spawn(|| {
@@ -2233,6 +2282,11 @@ mod imp {
     const STATUS_END_OF_FILE: u64 = 0xC000_0011;
     const STATUS_UNSUCCESSFUL: u64 = 0xC000_0001;
     const DEFERRED_FILE_IO_MIN: u32 = 64 * 1024;
+    const FILE_IO_WORKERS: usize = 4;
+    const MAX_QUEUED_FILE_IO: usize = 128;
+    fn native_file_io_queue_full(state: &NativeFileIoQueueState) -> bool {
+        state.jobs.len() >= MAX_QUEUED_FILE_IO
+    }
     fn native_overlapped_status(overlapped: u64) -> u64 {
         unsafe { (*(overlapped as *const AtomicU64)).load(Ordering::Acquire) }
     }
@@ -2296,6 +2350,142 @@ mod imp {
                 Ok(guard) => guard,
                 Err(_) => return,
             };
+        }
+    }
+    fn native_file_io_queue(
+        process: &Arc<NativeProcessContext>,
+    ) -> Result<Arc<NativeFileIoQueue>, u32> {
+        let mut slot = process.file_io_queue.lock().map_err(|_| 6u32)?;
+        if let Some(queue) = slot.as_ref() {
+            return Ok(Arc::clone(queue));
+        }
+        let queue = Arc::new(NativeFileIoQueue {
+            state: Mutex::new(NativeFileIoQueueState {
+                jobs: std::collections::VecDeque::new(),
+                stop: false,
+            }),
+            ready: Condvar::new(),
+        });
+        for index in 0..FILE_IO_WORKERS {
+            let worker_queue = Arc::clone(&queue);
+            if std::thread::Builder::new()
+                .name(format!("wincli-file-io-{index}"))
+                .spawn(move || native_file_io_worker(worker_queue))
+                .is_err()
+            {
+                if let Ok(mut state) = queue.state.lock() {
+                    state.stop = true;
+                    queue.ready.notify_all();
+                }
+                return Err(8);
+            }
+        }
+        *slot = Some(Arc::clone(&queue));
+        Ok(queue)
+    }
+    fn native_submit_file_io(
+        process: &Arc<NativeProcessContext>,
+        file: NativeFile,
+        overlapped: u64,
+        offset: usize,
+        operation: NativeFileIoOperation,
+    ) -> Result<(), u32> {
+        let queue = native_file_io_queue(process)?;
+        native_enqueue_file_io(&queue, process, file, overlapped, offset, operation)
+    }
+    fn native_enqueue_file_io(
+        queue: &NativeFileIoQueue,
+        process: &Arc<NativeProcessContext>,
+        file: NativeFile,
+        overlapped: u64,
+        offset: usize,
+        operation: NativeFileIoOperation,
+    ) -> Result<(), u32> {
+        let mut state = queue.state.lock().map_err(|_| 6u32)?;
+        if native_file_io_queue_full(&state) {
+            return Err(8);
+        }
+        let event = native_prepare_overlapped_event(overlapped)?;
+        native_set_overlapped_status(overlapped, STATUS_PENDING, 0);
+        process.pending_file_io.fetch_add(1, Ordering::AcqRel);
+        state.jobs.push_back(NativeFileIoJob {
+            process: Arc::clone(process),
+            file,
+            overlapped,
+            event,
+            offset,
+            operation,
+        });
+        queue.ready.notify_one();
+        Ok(())
+    }
+    fn native_file_io_worker(queue: Arc<NativeFileIoQueue>) {
+        loop {
+            let job = {
+                let Ok(mut state) = queue.state.lock() else {
+                    return;
+                };
+                while state.jobs.is_empty() && !state.stop {
+                    state = match queue.ready.wait(state) {
+                        Ok(state) => state,
+                        Err(_) => return,
+                    };
+                }
+                if state.stop {
+                    return;
+                }
+                state.jobs.pop_front().unwrap()
+            };
+            let result = match job.operation {
+                NativeFileIoOperation::Read { output, length } => match job.process.fs.lock() {
+                    Ok(fs) => match fs.fs.read_file(&job.file.path) {
+                        Ok(data) if job.offset >= data.len() => Err(STATUS_END_OF_FILE),
+                        Ok(data) => {
+                            let count = (data.len() - job.offset).min(length as usize);
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    data.as_ptr().add(job.offset),
+                                    output as *mut u8,
+                                    count,
+                                )
+                            };
+                            Ok(count as u32)
+                        }
+                        Err(_) => Err(STATUS_UNSUCCESSFUL),
+                    },
+                    Err(_) => Err(STATUS_UNSUCCESSFUL),
+                },
+                NativeFileIoOperation::Write { data } => match job.process.fs.lock() {
+                    Ok(mut fs) => match fs.fs.read_file(&job.file.path) {
+                        Ok(mut content) => match job.offset.checked_add(data.len()) {
+                            Some(end)
+                                if content
+                                    .try_reserve(end.saturating_sub(content.len()))
+                                    .is_ok() =>
+                            {
+                                if content.len() < end {
+                                    content.resize(end, 0);
+                                }
+                                content[job.offset..end].copy_from_slice(&data);
+                                fs.fs
+                                    .write_file(&job.file.path, content)
+                                    .map(|_| data.len() as u32)
+                                    .map_err(|_| STATUS_UNSUCCESSFUL)
+                            }
+                            _ => Err(STATUS_UNSUCCESSFUL),
+                        },
+                        Err(_) => Err(STATUS_UNSUCCESSFUL),
+                    },
+                    Err(_) => Err(STATUS_UNSUCCESSFUL),
+                },
+            };
+            native_finish_pending_file_io(
+                &job.process,
+                &job.file,
+                job.overlapped,
+                job.event,
+                result,
+            );
         }
     }
     extern "win64" fn native_post_queued_completion_status(
@@ -2681,6 +2871,7 @@ mod imp {
         io_wait: Mutex<()>,
         io_ready: Condvar,
         pending_file_io: AtomicU64,
+        file_io_queue: Mutex<Option<Arc<NativeFileIoQueue>>>,
         duplicate_handles: Mutex<HashMap<u64, u64>>,
         duplicate_next: AtomicU64,
         timer_next: AtomicU64,
@@ -2709,6 +2900,27 @@ mod imp {
         signaled: Mutex<bool>,
         ready: Condvar,
         manual_reset: bool,
+    }
+
+    struct NativeFileIoQueue {
+        state: Mutex<NativeFileIoQueueState>,
+        ready: Condvar,
+    }
+    struct NativeFileIoQueueState {
+        jobs: std::collections::VecDeque<NativeFileIoJob>,
+        stop: bool,
+    }
+    struct NativeFileIoJob {
+        process: Arc<NativeProcessContext>,
+        file: NativeFile,
+        overlapped: u64,
+        event: Option<Arc<NativeEvent>>,
+        offset: usize,
+        operation: NativeFileIoOperation,
+    }
+    enum NativeFileIoOperation {
+        Read { output: u64, length: u32 },
+        Write { data: Vec<u8> },
     }
 
     struct NativeVirtualAllocation {
@@ -2809,6 +3021,7 @@ mod imp {
             io_wait: Mutex::new(()),
             io_ready: Condvar::new(),
             pending_file_io: AtomicU64::new(0),
+            file_io_queue: Mutex::new(None),
             duplicate_handles: Mutex::new(HashMap::new()),
             duplicate_next: AtomicU64::new(0xa000_0000),
             timer_next: AtomicU64::new(0x7000_0000),
@@ -4856,13 +5069,6 @@ mod imp {
                 native_set_last_error(87);
                 return 0;
             }
-            let event = match native_prepare_overlapped_event(overlapped) {
-                Ok(event) => event,
-                Err(error) => {
-                    native_set_last_error(error);
-                    return 0;
-                }
-            };
             if overlapped != 0
                 && len >= DEFERRED_FILE_IO_MIN
                 && ctx.handles.get(&handle).is_some_and(|file| file.overlapped)
@@ -4875,58 +5081,24 @@ mod imp {
                 if !written.is_null() {
                     unsafe { written.write(0) };
                 }
-                native_set_overlapped_status(overlapped, STATUS_PENDING, 0);
-                process.pending_file_io.fetch_add(1, Ordering::AcqRel);
                 drop(ctx);
-                let worker_process = Arc::clone(&process);
-                let worker_event = event.clone();
-                let spawned = std::thread::Builder::new().spawn(move || {
-                    let result = match worker_process.fs.lock() {
-                        Ok(mut fs) => match fs.fs.read_file(&file.path) {
-                            Ok(mut content) => match offset.checked_add(data.len()) {
-                                Some(end)
-                                    if content
-                                        .try_reserve(end.saturating_sub(content.len()))
-                                        .is_ok() =>
-                                {
-                                    if content.len() < end {
-                                        content.resize(end, 0);
-                                    }
-                                    content[offset..end].copy_from_slice(&data);
-                                    fs.fs
-                                        .write_file(&file.path, content)
-                                        .map(|_| data.len() as u32)
-                                        .map_err(|_| STATUS_UNSUCCESSFUL)
-                                }
-                                _ => Err(STATUS_UNSUCCESSFUL),
-                            },
-                            Err(_) => Err(STATUS_UNSUCCESSFUL),
-                        },
-                        Err(_) => Err(STATUS_UNSUCCESSFUL),
-                    };
-                    native_finish_pending_file_io(
-                        &worker_process,
-                        &file,
-                        overlapped,
-                        worker_event,
-                        result,
-                    );
-                });
-                if spawned.is_err() {
-                    native_set_overlapped_status(overlapped, STATUS_UNSUCCESSFUL, 0);
-                    if let Ok(_guard) = process.io_wait.lock() {
-                        process.pending_file_io.fetch_sub(1, Ordering::AcqRel);
-                        process.io_ready.notify_all();
-                    }
-                    if let Some(event) = event {
-                        native_signal_event(&event);
-                    }
-                    native_set_last_error(8);
-                } else {
-                    native_set_last_error(997); // ERROR_IO_PENDING
-                }
+                let result = native_submit_file_io(
+                    &process,
+                    file,
+                    overlapped,
+                    offset,
+                    NativeFileIoOperation::Write { data },
+                );
+                native_set_last_error(result.err().unwrap_or(997)); // ERROR_IO_PENDING
                 return 0;
             }
+            let event = match native_prepare_overlapped_event(overlapped) {
+                Ok(event) => event,
+                Err(error) => {
+                    native_set_last_error(error);
+                    return 0;
+                }
+            };
             let data = if len == 0 {
                 &[][..]
             } else {
@@ -5185,6 +5357,7 @@ mod imp {
                 io_wait: Mutex::new(()),
                 io_ready: Condvar::new(),
                 pending_file_io: AtomicU64::new(0),
+                file_io_queue: Mutex::new(None),
                 duplicate_handles: Mutex::new(HashMap::new()),
                 duplicate_next: AtomicU64::new(0xa000_0000),
                 timer_next: AtomicU64::new(0x7000_0000),
@@ -6095,13 +6268,6 @@ mod imp {
             native_set_last_error(87);
             return 0;
         }
-        let event = match native_prepare_overlapped_event(ov) {
-            Ok(event) => event,
-            Err(error) => {
-                native_set_last_error(error);
-                return 0;
-            }
-        };
         if ov != 0
             && n >= DEFERRED_FILE_IO_MIN
             && ctx.handles.get(&h).is_some_and(|file| file.overlapped)
@@ -6113,48 +6279,27 @@ mod imp {
             if !read_count.is_null() {
                 unsafe { read_count.write(0) };
             }
-            native_set_overlapped_status(ov, STATUS_PENDING, 0);
-            process.pending_file_io.fetch_add(1, Ordering::AcqRel);
             drop(ctx);
-            let worker_process = Arc::clone(&process);
-            let worker_event = event.clone();
-            let output = buf as u64;
-            let spawned = std::thread::Builder::new().spawn(move || {
-                let result = match worker_process.fs.lock() {
-                    Ok(fs) => match fs.fs.read_file(&file.path) {
-                        Ok(data) if offset >= data.len() => Err(STATUS_END_OF_FILE),
-                        Ok(data) => {
-                            let k = (data.len() - offset).min(n as usize);
-                            unsafe {
-                                std::ptr::copy_nonoverlapping(
-                                    data.as_ptr().add(offset),
-                                    output as *mut u8,
-                                    k,
-                                )
-                            };
-                            Ok(k as u32)
-                        }
-                        Err(_) => Err(STATUS_UNSUCCESSFUL),
-                    },
-                    Err(_) => Err(STATUS_UNSUCCESSFUL),
-                };
-                native_finish_pending_file_io(&worker_process, &file, ov, worker_event, result);
-            });
-            if spawned.is_err() {
-                native_set_overlapped_status(ov, STATUS_UNSUCCESSFUL, 0);
-                if let Ok(_guard) = process.io_wait.lock() {
-                    process.pending_file_io.fetch_sub(1, Ordering::AcqRel);
-                    process.io_ready.notify_all();
-                }
-                if let Some(event) = event {
-                    native_signal_event(&event);
-                }
-                native_set_last_error(8);
-            } else {
-                native_set_last_error(997);
-            }
+            let result = native_submit_file_io(
+                &process,
+                file,
+                ov,
+                offset,
+                NativeFileIoOperation::Read {
+                    output: buf as u64,
+                    length: n,
+                },
+            );
+            native_set_last_error(result.err().unwrap_or(997));
             return 0;
         }
+        let event = match native_prepare_overlapped_event(ov) {
+            Ok(event) => event,
+            Err(error) => {
+                native_set_last_error(error);
+                return 0;
+            }
+        };
         let data = match ctx.fs.read_file(&path) {
             Ok(v) => v,
             Err(_) => return 0,
@@ -7390,6 +7535,7 @@ mod imp {
             io_wait: Mutex::new(()),
             io_ready: Condvar::new(),
             pending_file_io: AtomicU64::new(0),
+            file_io_queue: Mutex::new(None),
             duplicate_handles: Mutex::new(HashMap::new()),
             duplicate_next: AtomicU64::new(0xa000_0000),
             timer_next: AtomicU64::new(0x7000_0000),

@@ -36,6 +36,7 @@ extern "C" {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct Overlapped {
     internal: u64,
     internal_high: u64,
@@ -46,6 +47,7 @@ struct Overlapped {
 
 static LARGE: [u8; 65536] = [b'Q'; 65536];
 static mut OUTPUT: [u8; 65536] = [0; 65536];
+static mut BATCH_OUTPUT: [[u8; 65536]; 8] = [[0; 65536]; 8];
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -260,6 +262,42 @@ pub extern "C" fn guest_entry() {
             == 0,
     );
     check(unsafe { GetLastError() } == 38 && returned == (&mut eof_ov as *mut Overlapped as u64));
+    let mut requests = [ov(0); 8];
+    let mut seen = [false; 8];
+    let batch_output = core::ptr::addr_of_mut!(BATCH_OUTPUT).cast::<u8>();
+    let mut i = 0;
+    while i < requests.len() {
+        let destination = unsafe { batch_output.add(i * 65536) };
+        check(unsafe { ReadFile(file, destination, 65536, &mut count, &mut requests[i]) } == 0);
+        check(unsafe { GetLastError() } == 997 && count == 0);
+        i += 1;
+    }
+    i = 0;
+    while i < requests.len() {
+        check(
+            unsafe {
+                GetQueuedCompletionStatus(port, &mut bytes, &mut key, &mut returned, u32::MAX)
+            } != 0,
+        );
+        check(bytes == 65536 && key == 0x7777);
+        let mut matched = false;
+        let mut j = 0;
+        while j < requests.len() {
+            if returned == (&mut requests[j] as *mut Overlapped as u64) {
+                check(!seen[j]);
+                seen[j] = true;
+                check(unsafe {
+                    batch_output.add(j * 65536).read() == b'Q'
+                        && batch_output.add(j * 65536 + 65535).read() == b'Q'
+                });
+                matched = true;
+                break;
+            }
+            j += 1;
+        }
+        check(matched);
+        i += 1;
+    }
     check(unsafe { CloseHandle(file) } != 0 && unsafe { CloseHandle(port) } != 0);
     check(unsafe { CloseHandle(event) } != 0);
     unsafe { ExitProcess(0) }
