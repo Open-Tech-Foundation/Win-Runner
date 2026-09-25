@@ -220,6 +220,8 @@ mod imp {
         fn gethostname(name: *mut i8, length: usize) -> i32;
         fn clock_gettime(clock_id: i32, time: *mut NativeTimespec) -> i32;
         fn socket(domain: i32, kind: i32, protocol: i32) -> i32;
+        fn ioctl(fd: i32, request: usize, argp: *mut c_void) -> i32;
+        fn connect(fd: i32, address: *const u8, length: u32) -> i32;
         fn getsockopt(
             fd: i32,
             level: i32,
@@ -361,13 +363,14 @@ mod imp {
         use super::{
             _exit, command_line_a, environment_block, linux_protection, load_native_child_image,
             native_acquire_srw_lock_exclusive, native_add_vectored_exception_handler,
-            native_close_handle, native_create_process_w, native_create_waitable_timer_ex_w,
-            native_decode_pointer, native_delete_critical_section, native_encode_pointer,
-            native_enter_critical_section, native_extended_path, native_file_attributes,
-            native_format_message_a, native_format_message_w, native_free_environment_strings_w,
-            native_get_acp, native_get_computer_name_ex_w, native_get_console_mode,
-            native_get_console_output_cp, native_get_console_screen_buffer_info,
-            native_get_cp_info, native_get_current_directory_w, native_get_current_process,
+            native_close_handle, native_connect_socket, native_create_process_w,
+            native_create_waitable_timer_ex_w, native_decode_pointer,
+            native_delete_critical_section, native_encode_pointer, native_enter_critical_section,
+            native_extended_path, native_file_attributes, native_format_message_a,
+            native_format_message_w, native_free_environment_strings_w, native_get_acp,
+            native_get_computer_name_ex_w, native_get_console_mode, native_get_console_output_cp,
+            native_get_console_screen_buffer_info, native_get_cp_info,
+            native_get_current_directory_w, native_get_current_process,
             native_get_current_process_id, native_get_current_thread, native_get_current_thread_id,
             native_get_environment_strings_w, native_get_environment_variable_w,
             native_get_exit_code_process, native_get_file_type, native_get_full_path_name_w,
@@ -382,21 +385,22 @@ mod imp {
             native_initialize_critical_section_ex, native_initialize_slist_head,
             native_initialize_srw_lock, native_interlocked_flush_slist,
             native_interlocked_pop_entry_slist, native_interlocked_push_entry_slist,
-            native_is_processor_feature_present, native_is_valid_code_page, native_launch_spec,
-            native_lc_map_string_w, native_leave_critical_section, native_multi_byte_to_wide_char,
-            native_process_prng, native_query_depth_slist, native_query_performance_frequency,
-            native_release_srw_lock_exclusive, native_release_srw_lock_shared,
-            native_resolve_code_page, native_rtl_get_version, native_rtl_nt_status_to_dos_error,
-            native_set_console_mode, native_set_environment_variable_w, native_set_file_time,
-            native_set_last_error, native_set_thread_stack_guarantee,
-            native_set_unhandled_exception_filter, native_set_waitable_timer,
-            native_sleep_condition_variable_srw, native_terminate_process,
-            native_try_acquire_srw_lock_shared, native_wait_for_single_object,
-            native_wait_on_address, native_wake_all_condition_variable, native_wake_by_address_all,
-            native_wide_char_to_multi_byte, native_write_console_w, parse_windows_command_line,
-            process_ctx, uppercase_ascii_utf16, waitpid, write_process_information,
-            NativeLaunchSpec, NativeMemoryStatus, API_SET_MODULE, PROT_EXEC, PROT_READ, PROT_WRITE,
-            THREAD_NATIVE_HANDLE,
+            native_ioctlsocket, native_is_processor_feature_present, native_is_valid_code_page,
+            native_launch_spec, native_lc_map_string_w, native_leave_critical_section,
+            native_multi_byte_to_wide_char, native_process_prng, native_query_depth_slist,
+            native_query_performance_frequency, native_release_srw_lock_exclusive,
+            native_release_srw_lock_shared, native_resolve_code_page, native_rtl_get_version,
+            native_rtl_nt_status_to_dos_error, native_set_console_mode,
+            native_set_environment_variable_w, native_set_file_time, native_set_last_error,
+            native_set_thread_stack_guarantee, native_set_unhandled_exception_filter,
+            native_set_waitable_timer, native_sleep_condition_variable_srw,
+            native_terminate_process, native_try_acquire_srw_lock_shared,
+            native_wait_for_single_object, native_wait_on_address,
+            native_wake_all_condition_variable, native_wake_by_address_all,
+            native_wide_char_to_multi_byte, native_write_console_w, native_wsa_get_last_error,
+            native_wsa_inet_addr, parse_windows_command_line, process_ctx, uppercase_ascii_utf16,
+            waitpid, write_process_information, NativeLaunchSpec, NativeMemoryStatus,
+            API_SET_MODULE, PROT_EXEC, PROT_READ, PROT_WRITE, THREAD_NATIVE_HANDLE,
         };
         use crate::winfs::WinFs;
 
@@ -518,6 +522,142 @@ mod imp {
             let mut fs = context.lock().unwrap();
             fs.handles.remove(&handle);
             fs.fs.delete_file(path).unwrap();
+        }
+
+        #[test]
+        fn nt_write_file_creates_and_extends_guest_files() {
+            let path = r"C:\nt_write_file_unit.txt";
+            let context = super::fs_ctx().unwrap();
+            let handle = {
+                let mut fs = context.lock().unwrap();
+                fs.fs.write_file(path, b"abc".to_vec()).unwrap();
+                let handle = fs.next;
+                fs.next += 1;
+                fs.handles.insert(
+                    handle,
+                    super::NativeFile {
+                        path: path.into(),
+                        offset: 0,
+                        overlapped: false,
+                        completion: None,
+                    },
+                );
+                handle
+            };
+            let mut io_status = [0u8; 16];
+            let replacement = *b"XY";
+            assert_eq!(
+                super::native_nt_write_file(
+                    handle,
+                    0,
+                    0,
+                    0,
+                    io_status.as_mut_ptr(),
+                    replacement.as_ptr(),
+                    replacement.len() as u32,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                ),
+                0
+            );
+            assert_eq!(u64::from_le_bytes(io_status[8..16].try_into().unwrap()), 2);
+            assert_eq!(context.lock().unwrap().fs.read_file(path).unwrap(), b"XYc");
+
+            let offset = 4i64;
+            assert_eq!(
+                super::native_nt_write_file(
+                    handle,
+                    0,
+                    0,
+                    0,
+                    io_status.as_mut_ptr(),
+                    replacement.as_ptr(),
+                    replacement.len() as u32,
+                    &offset,
+                    std::ptr::null(),
+                ),
+                0
+            );
+            assert_eq!(
+                context.lock().unwrap().fs.read_file(path).unwrap(),
+                b"XYc\0XY"
+            );
+
+            let mut fs = context.lock().unwrap();
+            fs.handles.remove(&handle);
+            fs.fs.delete_file(path).unwrap();
+        }
+
+        #[test]
+        fn get_file_information_by_handle_ex_reports_basic_metadata() {
+            let path = r"C:\handle_ex_unit.txt";
+            let context = super::fs_ctx().unwrap();
+            let handle = {
+                let mut fs = context.lock().unwrap();
+                fs.fs.write_file(path, b"abcde".to_vec()).unwrap();
+                let handle = fs.next;
+                fs.next += 1;
+                fs.handles.insert(
+                    handle,
+                    super::NativeFile {
+                        path: path.into(),
+                        offset: 0,
+                        overlapped: false,
+                        completion: None,
+                    },
+                );
+                handle
+            };
+
+            let mut standard = [0u8; 24];
+            assert_eq!(
+                super::native_get_file_information_by_handle_ex(
+                    handle,
+                    1,
+                    standard.as_mut_ptr(),
+                    standard.len() as u32,
+                ),
+                1
+            );
+            assert_eq!(i64::from_le_bytes(standard[8..16].try_into().unwrap()), 5);
+            assert_eq!(u32::from_le_bytes(standard[16..20].try_into().unwrap()), 1);
+            assert_eq!(standard[21], 0);
+            let mut file_size = -1i64;
+            assert_eq!(super::native_get_file_size_ex(handle, &mut file_size), 1);
+            assert_eq!(file_size, 5);
+
+            let mut attrs = [0u8; 8];
+            assert_eq!(
+                super::native_get_file_information_by_handle_ex(
+                    handle,
+                    9,
+                    attrs.as_mut_ptr(),
+                    attrs.len() as u32,
+                ),
+                1
+            );
+            assert_eq!(u32::from_le_bytes(attrs[..4].try_into().unwrap()), 0x80);
+
+            assert_eq!(
+                super::native_get_file_information_by_handle_ex(
+                    handle,
+                    1,
+                    standard.as_mut_ptr(),
+                    8,
+                ),
+                0
+            );
+            assert_eq!(super::native_get_last_error(), 122);
+            assert_eq!(
+                super::native_get_file_information_by_handle_ex(
+                    u64::MAX,
+                    1,
+                    standard.as_mut_ptr(),
+                    standard.len() as u32,
+                ),
+                0
+            );
+            assert_eq!(super::native_get_last_error(), 6);
         }
 
         #[test]
@@ -791,6 +931,9 @@ mod imp {
             assert!(!super::supports_import("USER32.dll", "ExitProcess"));
             assert!(!super::supports_import("KERNEL32.dll", "timeGetTime"));
             assert!(!super::supports_import("KERNEL32.dll", "NoSuchApi"));
+            assert!(super::supports_import("WS2_32.dll", "#4"));
+            assert!(super::supports_import("WS2_32.dll", "#10"));
+            assert!(super::supports_import("WS2_32.dll", "#11"));
         }
 
         #[test]
@@ -1683,6 +1826,35 @@ mod imp {
             let mut header = [0xa5; 16];
             native_initialize_slist_head(header.as_mut_ptr());
             assert_eq!(header, [0; 16]);
+        }
+
+        #[test]
+        fn ioctlsocket_and_connect_validate_handles_and_arguments() {
+            let socket = 0x534f_434b_0000_0003;
+            let mut argument = 1u32;
+            assert_eq!(
+                native_ioctlsocket(3, 0x8004_667e_u32 as i32, &mut argument),
+                -1
+            );
+            assert_eq!(native_wsa_get_last_error(), 10038);
+            assert_eq!(native_ioctlsocket(socket, 0x1234, &mut argument), -1);
+            assert_eq!(native_wsa_get_last_error(), 10022);
+            assert_eq!(
+                native_ioctlsocket(socket, 0x8004_667e_u32 as i32, std::ptr::null_mut()),
+                -1
+            );
+            assert_eq!(native_wsa_get_last_error(), 10014);
+            assert_eq!(native_connect_socket(socket, std::ptr::null(), 16), -1);
+            assert_eq!(native_wsa_get_last_error(), 10014);
+        }
+
+        #[test]
+        fn inet_addr_uses_its_correct_ws2_32_ordinal() {
+            assert_eq!(
+                native_wsa_inet_addr(c"127.0.0.1".as_ptr().cast()),
+                u32::from_ne_bytes([127, 0, 0, 1])
+            );
+            assert_eq!(native_wsa_inet_addr(c"invalid".as_ptr().cast()), u32::MAX);
         }
 
         #[test]
@@ -6954,6 +7126,102 @@ mod imp {
         finish(STATUS_SUCCESS, count)
     }
 
+    extern "win64" fn native_nt_write_file(
+        file: u64,
+        event: u64,
+        apc_routine: u64,
+        _apc_context: u64,
+        io_status: *mut u8,
+        buffer: *const u8,
+        length: u32,
+        byte_offset: *const i64,
+        _key: *const u32,
+    ) -> u32 {
+        const STATUS_SUCCESS: u32 = 0;
+        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
+        let finish = |status: u32, bytes: usize| {
+            if !io_status.is_null() {
+                unsafe {
+                    (io_status as *mut u32).write_unaligned(status);
+                    (io_status.add(8) as *mut u64).write_unaligned(bytes as u64);
+                }
+            }
+            status
+        };
+        if io_status.is_null() || (buffer.is_null() && length != 0) {
+            return finish(STATUS_INVALID_PARAMETER, 0);
+        }
+        if event != 0 || apc_routine != 0 {
+            return finish(STATUS_NOT_SUPPORTED, 0);
+        }
+        if length == 0 {
+            return finish(STATUS_SUCCESS, 0);
+        }
+        let requested_offset = if byte_offset.is_null() {
+            None
+        } else {
+            let value = unsafe { byte_offset.read_unaligned() };
+            if value == -2 {
+                None
+            } else if value < 0 {
+                return finish(STATUS_INVALID_PARAMETER, 0);
+            } else {
+                Some(value as u64)
+            }
+        };
+        if let Some(fd) = host_standard_fd(file) {
+            if requested_offset.is_some() {
+                return finish(STATUS_INVALID_PARAMETER, 0);
+            }
+            let count = unsafe { write(fd, buffer.cast(), length as usize) };
+            return if count < 0 {
+                finish(0xC000_0001, 0)
+            } else {
+                finish(STATUS_SUCCESS, count as usize)
+            };
+        }
+        let Some(context) = fs_ctx() else {
+            return finish(STATUS_INVALID_HANDLE, 0);
+        };
+        let Ok(mut fs) = context.lock() else {
+            return finish(0xC000_0001, 0);
+        };
+        let Some((path, current_offset)) = fs
+            .handles
+            .get(&file)
+            .map(|item| (item.path.clone(), item.offset))
+        else {
+            return finish(STATUS_INVALID_HANDLE, 0);
+        };
+        let offset = requested_offset.unwrap_or(current_offset as u64);
+        let Ok(offset) = usize::try_from(offset) else {
+            return finish(STATUS_INVALID_PARAMETER, 0);
+        };
+        let Ok(mut contents) = fs.fs.read_file(&path) else {
+            return finish(STATUS_INVALID_HANDLE, 0);
+        };
+        let count = length as usize;
+        let Some(end) = offset.checked_add(count) else {
+            return finish(STATUS_INVALID_PARAMETER, 0);
+        };
+        if contents.len() < end {
+            if contents.try_reserve(end - contents.len()).is_err() {
+                return finish(0xC000_0017, 0); // STATUS_NO_MEMORY
+            }
+            contents.resize(end, 0);
+        }
+        unsafe { ptr::copy_nonoverlapping(buffer, contents.as_mut_ptr().add(offset), count) };
+        if fs.fs.write_file(&path, contents).is_err() {
+            return finish(0xC000_0001, 0);
+        }
+        if let Some(item) = fs.handles.get_mut(&file) {
+            item.offset = end;
+        }
+        finish(STATUS_SUCCESS, count)
+    }
+
     extern "win64" fn native_nt_query_information_file(
         file: u64,
         io_status: *mut u8,
@@ -7529,6 +7797,112 @@ mod imp {
         }
         1
     }
+    extern "win64" fn native_get_file_information_by_handle_ex(
+        handle: u64,
+        information_class: i32,
+        output: *mut u8,
+        output_size: u32,
+    ) -> i32 {
+        if output.is_null() {
+            native_set_last_error(998); // ERROR_NOACCESS
+            return 0;
+        }
+        let Some(context) = fs_ctx() else {
+            native_set_last_error(6);
+            return 0;
+        };
+        let Ok(ctx) = context.lock() else {
+            native_set_last_error(6);
+            return 0;
+        };
+        let Some(file) = ctx.handles.get(&handle) else {
+            native_set_last_error(6); // ERROR_INVALID_HANDLE
+            return 0;
+        };
+        let is_directory = ctx.fs.is_dir(&file.path);
+        let size = if is_directory {
+            0
+        } else {
+            match ctx.fs.read_file(&file.path) {
+                Ok(data) => data.len() as u64,
+                Err(_) => {
+                    native_set_last_error(2);
+                    return 0;
+                }
+            }
+        };
+        let required_size = match information_class {
+            0 => 40,  // FileBasicInfo
+            1 => 24,  // FileStandardInfo
+            9 => 8,   // FileAttributeTagInfo
+            18 => 24, // FileIdInfo
+            _ => {
+                native_set_last_error(87); // ERROR_INVALID_PARAMETER
+                return 0;
+            }
+        };
+        if output_size < required_size {
+            native_set_last_error(122); // ERROR_INSUFFICIENT_BUFFER
+            return 0;
+        }
+        unsafe {
+            ptr::write_bytes(output, 0, required_size as usize);
+            match information_class {
+                0 => {
+                    (output.add(32) as *mut u32)
+                        .write_unaligned(native_file_attributes(is_directory));
+                }
+                1 => {
+                    let allocation_size = size.saturating_add(4095) & !4095;
+                    (output as *mut i64).write_unaligned(allocation_size as i64);
+                    (output.add(8) as *mut i64).write_unaligned(size as i64);
+                    (output.add(16) as *mut u32).write_unaligned(1);
+                    *output.add(21) = u8::from(is_directory);
+                }
+                9 => {
+                    (output as *mut u32).write_unaligned(native_file_attributes(is_directory));
+                }
+                18 => {
+                    (output as *mut u64).write_unaligned(0x5743_4C49);
+                    (output.add(8) as *mut u64)
+                        .write_unaligned(ctx.fs.file_id(&file.path).unwrap_or_default());
+                }
+                _ => unreachable!(),
+            }
+        }
+        1
+    }
+    extern "win64" fn native_get_file_size_ex(handle: u64, output: *mut i64) -> i32 {
+        if output.is_null() {
+            native_set_last_error(998); // ERROR_NOACCESS
+            return 0;
+        }
+        let Some(context) = fs_ctx() else {
+            native_set_last_error(6);
+            return 0;
+        };
+        let Ok(ctx) = context.lock() else {
+            native_set_last_error(6);
+            return 0;
+        };
+        let Some(file) = ctx.handles.get(&handle) else {
+            native_set_last_error(6); // ERROR_INVALID_HANDLE
+            return 0;
+        };
+        let size = if ctx.fs.is_dir(&file.path) {
+            0
+        } else {
+            match ctx.fs.read_file(&file.path) {
+                Ok(data) => data.len() as i64,
+                Err(_) => {
+                    native_set_last_error(2);
+                    return 0;
+                }
+            }
+        };
+        unsafe { output.write_unaligned(size) };
+        1
+    }
     extern "win64" fn native_set_file_pointer_ex(
         handle: u64,
         distance: i64,
@@ -7892,7 +8266,9 @@ mod imp {
             ),
             "WS2_32.DLL" => matches!(
                 func,
-                "#3" | "#7"
+                "#3" | "#4"
+                    | "#7"
+                    | "#11"
                     | "#10"
                     | "#8"
                     | "#9"
@@ -7911,7 +8287,11 @@ mod imp {
             "IPHLPAPI.DLL" => func == "GetAdaptersAddresses",
             "NTDLL.DLL" => matches!(
                 func,
-                "RtlCaptureContext" | "RtlGetVersion" | "RtlNtStatusToDosError" | "NtReadFile"
+                "RtlCaptureContext"
+                    | "RtlGetVersion"
+                    | "RtlNtStatusToDosError"
+                    | "NtReadFile"
+                    | "NtWriteFile"
             ),
             "API-MS-WIN-CORE-SYNCH-L1-2-0.DLL" => {
                 matches!(
@@ -7939,7 +8319,9 @@ mod imp {
             // Winsock's stable ordinal exports for byte-order conversion.
             "#8" | "#14" => Some(native_network_u32 as *const () as usize as u64),
             "#9" | "#15" => Some(native_network_u16 as *const () as usize as u64),
-            "#10" => Some(native_wsa_inet_addr as *const () as usize as u64),
+            "#10" => Some(native_ioctlsocket as *const () as usize as u64),
+            "#11" => Some(native_wsa_inet_addr as *const () as usize as u64),
+            "#4" => Some(native_connect_socket as *const () as usize as u64),
             "#57" => Some(native_wsa_get_host_name as *const () as usize as u64),
             "GetAddrInfoW" => Some(native_get_addr_info_w as *const () as usize as u64),
             "FreeAddrInfoW" => Some(native_free_addr_info_w as *const () as usize as u64),
@@ -7969,6 +8351,7 @@ mod imp {
             "RegOpenKeyExW" => Some(native_reg_open_key_ex_w as *const () as usize as u64),
             "RegOpenKeyExA" => Some(native_reg_open_key_ex_a as *const () as usize as u64),
             "CreateFileMappingW" => Some(native_create_file_mapping_w as *const () as usize as u64),
+            "CreateFileMappingA" => Some(native_create_file_mapping_a as *const () as usize as u64),
             "MapViewOfFile" => Some(native_map_view_of_file as *const () as usize as u64),
             "UnmapViewOfFile" => Some(native_unmap_view_of_file as *const () as usize as u64),
             "CryptAcquireContextW" => {
@@ -8116,6 +8499,7 @@ mod imp {
             }
             "RtlGetVersion" => Some(native_rtl_get_version as *const () as usize as u64),
             "NtReadFile" => Some(native_nt_read_file as *const () as usize as u64),
+            "NtWriteFile" => Some(native_nt_write_file as *const () as usize as u64),
             "RtlNtStatusToDosError" => {
                 Some(native_rtl_nt_status_to_dos_error as *const () as usize as u64)
             }
@@ -8246,6 +8630,10 @@ mod imp {
             "GetFileInformationByHandle" => {
                 Some(native_get_file_information_by_handle as *const () as usize as u64)
             }
+            "GetFileInformationByHandleEx" => {
+                Some(native_get_file_information_by_handle_ex as *const () as usize as u64)
+            }
+            "GetFileSizeEx" => Some(native_get_file_size_ex as *const () as usize as u64),
             "GetFinalPathNameByHandleW" => {
                 Some(native_get_final_path_name_by_handle_w as *const () as usize as u64)
             }
@@ -8475,6 +8863,24 @@ mod imp {
         result
     }
 
+    extern "win64" fn native_create_file_mapping_a(
+        file: u64,
+        attributes: u64,
+        protection: u32,
+        size_high: u32,
+        size_low: u32,
+        _name: *const u8,
+    ) -> u64 {
+        native_create_file_mapping_w(
+            file,
+            attributes,
+            protection,
+            size_high,
+            size_low,
+            std::ptr::null(),
+        )
+    }
+
     extern "win64" fn native_map_view_of_file(
         mapping: u64,
         access: u32,
@@ -8622,6 +9028,65 @@ mod imp {
             name.add(bytes.len()).write(0);
         }
         0
+    }
+
+    extern "win64" fn native_connect_socket(socket: u64, address: *const u8, length: i32) -> i32 {
+        if socket & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG {
+            native_wsa_set_last_error(10038); // WSAENOTSOCK
+            return -1;
+        }
+        if address.is_null() || length < 2 || length as usize > 128 {
+            native_wsa_set_last_error(10014); // WSAEFAULT
+            return -1;
+        }
+        let mut translated = [0u8; 128];
+        unsafe {
+            ptr::copy_nonoverlapping(address, translated.as_mut_ptr(), length as usize);
+            let family = (translated.as_ptr() as *const u16).read_unaligned();
+            if family == 23 {
+                (translated.as_mut_ptr() as *mut u16).write_unaligned(10);
+            } else if family != 2 {
+                native_wsa_set_last_error(10047); // WSAEAFNOSUPPORT
+                return -1;
+            }
+        }
+        if unsafe { connect(socket as i32, translated.as_ptr(), length as u32) } == 0 {
+            return 0;
+        }
+        native_wsa_set_last_error(match std::io::Error::last_os_error().raw_os_error() {
+            Some(11 | 114 | 115) => 10035, // WSAEWOULDBLOCK / in progress
+            Some(111) => 10061,            // WSAECONNREFUSED
+            Some(110) => 10060,            // WSAETIMEDOUT
+            Some(99) => 10049,             // WSAEADDRNOTAVAIL
+            Some(101) => 10051,            // WSAENETUNREACH
+            _ => 10022,                    // WSAEINVAL
+        });
+        -1
+    }
+
+    extern "win64" fn native_ioctlsocket(socket: u64, command: i32, argument: *mut u32) -> i32 {
+        if socket & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG {
+            native_wsa_set_last_error(10038); // WSAENOTSOCK
+            return -1;
+        }
+        if argument.is_null() {
+            native_wsa_set_last_error(10014); // WSAEFAULT
+            return -1;
+        }
+        let host_command = match command as u32 {
+            0x8004_667e => 0x5421, // FIONBIO
+            0x4004_667f => 0x541b, // FIONREAD
+            _ => {
+                native_wsa_set_last_error(10022); // WSAEINVAL
+                return -1;
+            }
+        };
+        if unsafe { ioctl(socket as i32, host_command, argument.cast()) } == 0 {
+            0
+        } else {
+            native_wsa_set_last_error(10022);
+            -1
+        }
     }
 
     extern "win64" fn native_wsa_inet_addr(address: *const u8) -> u32 {

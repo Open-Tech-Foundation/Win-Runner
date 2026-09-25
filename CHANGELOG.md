@@ -13,7 +13,8 @@ All notable changes to this project will be documented in this file.
 
 - Added Windows-sized default stacks for native guest threads, recursive
   thread-aware critical sections, per-thread Windows IDs, address wait/wake
-  synchronization, and native DNS address resolution for Node.js.
+  synchronization, native DNS resolution, and initial Winsock socket setup for
+  Node.js.
 - Added optional real-binary E2E coverage that seeds the MIT-licensed
   `is-number@7.0.0` npm package into guest `node_modules` and executes it with
   the official Windows Node binary.
@@ -24,6 +25,8 @@ All notable changes to this project will be documented in this file.
 - Added native WinFS file attributes, disk handle types, and NT file metadata
   queries used by Node.js. The real Windows Node binary now reads and stats
   files supplied through the guest filesystem.
+- Added `GetFileInformationByHandleEx`, `GetFileSizeEx`, ANSI file mappings, and
+  synchronous `NtWriteFile` support for native Windows processes.
 - Added `CancelIoEx` and same-thread `CancelIo` for pending native WinFS
   operations, including canceled `OVERLAPPED` status, event signaling, and
   failed IOCP completion packets. Native unit and PE tests cover cancellation
