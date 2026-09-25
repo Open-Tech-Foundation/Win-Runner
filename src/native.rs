@@ -123,6 +123,7 @@ mod imp {
     const MAP_FIXED_NOREPLACE: i32 = 0x100000;
     const MAP_FAILED: *mut c_void = usize::MAX as *mut c_void;
     const PROCESS_HEAP_HANDLE: u64 = 0x400;
+    const PROCESS_TOKEN_HANDLE: u64 = 0x544f_4b45_4e00_0001;
     const STD_HANDLE_BASE: u64 = 0x5000_0000;
     const CRYPTO_PROVIDER_HANDLE: u64 = 0x4352_5950_544f_0001;
     // A child-local stand-in for the API-set modules dynamically requested by
@@ -261,16 +262,17 @@ mod imp {
             native_is_valid_code_page, native_launch_spec, native_lc_map_string_w,
             native_leave_critical_section, native_multi_byte_to_wide_char, native_process_prng,
             native_query_performance_frequency, native_release_srw_lock_exclusive,
-            native_release_srw_lock_shared, native_rtl_get_version,
-            native_rtl_nt_status_to_dos_error, native_set_console_mode, native_set_file_time,
-            native_set_last_error, native_set_thread_stack_guarantee,
-            native_set_unhandled_exception_filter, native_set_waitable_timer,
-            native_sleep_condition_variable_srw, native_terminate_process,
-            native_try_acquire_srw_lock_shared, native_wait_for_single_object,
-            native_wait_on_address, native_wake_all_condition_variable,
-            native_wide_char_to_multi_byte, native_write_console_w, parse_windows_command_line,
-            process_ctx, uppercase_ascii_utf16, waitpid, write_process_information,
-            NativeLaunchSpec, NativeMemoryStatus, API_SET_MODULE, PROT_EXEC, PROT_READ, PROT_WRITE,
+            native_release_srw_lock_shared, native_resolve_code_page, native_rtl_get_version,
+            native_rtl_nt_status_to_dos_error, native_set_console_mode,
+            native_set_environment_variable_w, native_set_file_time, native_set_last_error,
+            native_set_thread_stack_guarantee, native_set_unhandled_exception_filter,
+            native_set_waitable_timer, native_sleep_condition_variable_srw,
+            native_terminate_process, native_try_acquire_srw_lock_shared,
+            native_wait_for_single_object, native_wait_on_address,
+            native_wake_all_condition_variable, native_wide_char_to_multi_byte,
+            native_write_console_w, parse_windows_command_line, process_ctx, uppercase_ascii_utf16,
+            waitpid, write_process_information, NativeLaunchSpec, NativeMemoryStatus,
+            API_SET_MODULE, PROT_EXEC, PROT_READ, PROT_WRITE,
         };
         use crate::winfs::WinFs;
 
@@ -1124,6 +1126,45 @@ mod imp {
         }
 
         #[test]
+        fn sets_reads_and_removes_a_guest_environment_variable() {
+            let name: Vec<u16> = "WINCLI_TEST_NODE_ENV"
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let value: Vec<u16> = "node-value"
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            assert_eq!(
+                native_set_environment_variable_w(name.as_ptr(), value.as_ptr()),
+                1
+            );
+            let mut output = [0u16; 16];
+            assert_eq!(
+                native_get_environment_variable_w(
+                    name.as_ptr(),
+                    output.as_mut_ptr(),
+                    output.len() as u32
+                ),
+                10
+            );
+            assert_eq!(String::from_utf16(&output[..10]).unwrap(), "node-value");
+            assert_eq!(
+                native_set_environment_variable_w(name.as_ptr(), std::ptr::null()),
+                1
+            );
+            assert_eq!(
+                native_get_environment_variable_w(
+                    name.as_ptr(),
+                    output.as_mut_ptr(),
+                    output.len() as u32
+                ),
+                0
+            );
+            assert_eq!(native_get_last_error(), 203);
+        }
+
+        #[test]
         fn supplies_a_root_current_directory() {
             let mut output = [0; 4];
             assert_eq!(native_get_current_directory_w(4, output.as_mut_ptr()), 3);
@@ -1539,7 +1580,48 @@ mod imp {
         fn validates_only_implemented_code_pages() {
             assert_eq!(native_is_valid_code_page(1252), 1);
             assert_eq!(native_is_valid_code_page(65001), 1);
+            assert_eq!(native_is_valid_code_page(0), 1);
+            assert_eq!(native_is_valid_code_page(1), 1);
+            assert_eq!(native_is_valid_code_page(3), 1);
             assert_eq!(native_is_valid_code_page(932), 0);
+            assert_eq!(native_resolve_code_page(0), native_get_acp());
+            assert_eq!(native_resolve_code_page(1), native_get_oem_cp());
+            assert_eq!(native_resolve_code_page(3), native_get_acp());
+        }
+
+        #[test]
+        fn converts_using_the_acp_and_oem_code_page_aliases() {
+            let input = [0xe9];
+            let mut wide = [0u16; 1];
+            for code_page in [0, 1, 3] {
+                assert_eq!(
+                    native_multi_byte_to_wide_char(
+                        code_page,
+                        0,
+                        input.as_ptr(),
+                        input.len() as i32,
+                        wide.as_mut_ptr(),
+                        wide.len() as i32,
+                    ),
+                    1
+                );
+                assert_eq!(wide, [0xe9]);
+            }
+            let mut byte = [0];
+            assert_eq!(
+                native_wide_char_to_multi_byte(
+                    1,
+                    0,
+                    wide.as_ptr(),
+                    1,
+                    byte.as_mut_ptr(),
+                    1,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                ),
+                1
+            );
+            assert_eq!(byte, input);
         }
 
         #[test]
@@ -3195,8 +3277,8 @@ mod imp {
         parent_process_id: u32,
         command_line_w: Vec<u16>,
         command_line_a: Vec<u8>,
-        environment: Vec<(String, String)>,
-        environment_block: Vec<u16>,
+        environment: Mutex<Vec<(String, String)>>,
+        environment_block: Mutex<Vec<u16>>,
         std_handles: [AtomicU64; 3],
         fs: Arc<Mutex<NativeFs>>,
         error_mode: AtomicU32,
@@ -3344,8 +3426,8 @@ mod imp {
             parent_process_id: 0,
             command_line_w: vec![0],
             command_line_a: vec![0],
-            environment: Vec::new(),
-            environment_block: vec![0, 0],
+            environment: Mutex::new(Vec::new()),
+            environment_block: Mutex::new(vec![0, 0]),
             std_handles: [
                 AtomicU64::new(STD_HANDLE_BASE),
                 AtomicU64::new(STD_HANDLE_BASE + 1),
@@ -3807,13 +3889,24 @@ mod imp {
 
     extern "win64" fn native_get_environment_strings_w() -> *const u16 {
         process_ctx()
-            .map(|process| process.environment_block.as_ptr())
+            .and_then(|process| {
+                process
+                    .environment_block
+                    .lock()
+                    .ok()
+                    .map(|block| block.as_ptr())
+            })
             .unwrap_or(EMPTY_ENVIRONMENT_BLOCK.as_ptr())
     }
 
     extern "win64" fn native_free_environment_strings_w(block: *const u16) -> i32 {
         process_ctx()
-            .map(|process| (block == process.environment_block.as_ptr()) as i32)
+            .map(|process| {
+                process
+                    .environment_block
+                    .lock()
+                    .is_ok_and(|value| block == value.as_ptr()) as i32
+            })
             .unwrap_or((block == EMPTY_ENVIRONMENT_BLOCK.as_ptr()) as i32)
     }
 
@@ -3865,15 +3958,23 @@ mod imp {
         1252
     }
 
+    fn native_resolve_code_page(code_page: u32) -> u32 {
+        match code_page {
+            0 | 3 => native_get_acp(), // CP_ACP, CP_THREAD_ACP
+            1 => native_get_oem_cp(),  // CP_OEMCP
+            _ => code_page,
+        }
+    }
+
     extern "win64" fn native_is_valid_code_page(code_page: u32) -> i32 {
-        matches!(code_page, 1252 | 65001) as i32
+        matches!(native_resolve_code_page(code_page), 1252 | 65001) as i32
     }
 
     extern "win64" fn native_get_cp_info(code_page: u32, info: *mut u8) -> i32 {
         if info.is_null() {
             return 0;
         }
-        let max_char_size = match code_page {
+        let max_char_size = match native_resolve_code_page(code_page) {
             1252 => 1,
             65001 => 4,
             _ => return 0,
@@ -3925,7 +4026,7 @@ mod imp {
             Some(value) => value,
             None => return 0,
         };
-        let mut wide: Vec<u16> = match code_page {
+        let mut wide: Vec<u16> = match native_resolve_code_page(code_page) {
             1252 => input.into_iter().map(u16::from).collect(),
             65001 => match std::str::from_utf8(&input) {
                 Ok(value) => value.encode_utf16().collect(),
@@ -4057,7 +4158,7 @@ mod imp {
         };
         let units = unsafe { std::slice::from_raw_parts(input, len) };
         let mut used_default = false;
-        let mut bytes = match code_page {
+        let mut bytes = match native_resolve_code_page(code_page) {
             1252 => units
                 .iter()
                 .map(|unit| {
@@ -4218,6 +4319,143 @@ mod imp {
     }
     extern "win64" fn native_sleep(milliseconds: u32) {
         std::thread::sleep(std::time::Duration::from_millis(milliseconds as u64));
+    }
+    extern "win64" fn native_switch_to_thread() -> i32 {
+        std::thread::yield_now();
+        1
+    }
+    extern "win64" fn native_get_time_zone_information(output: *mut u8) -> u32 {
+        if output.is_null() {
+            native_set_last_error(87);
+            return u32::MAX;
+        }
+        #[repr(C)]
+        struct HostTm {
+            sec: i32,
+            min: i32,
+            hour: i32,
+            mday: i32,
+            mon: i32,
+            year: i32,
+            wday: i32,
+            yday: i32,
+            is_dst: i32,
+            gmtoff: i64,
+            zone: *const i8,
+        }
+        unsafe extern "C" {
+            fn localtime_r(time: *const i64, result: *mut HostTm) -> *mut HostTm;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_secs() as i64)
+            .unwrap_or(0);
+        let mut host_tm = std::mem::MaybeUninit::<HostTm>::uninit();
+        let local = unsafe { localtime_r(&now, host_tm.as_mut_ptr()) };
+        if local.is_null() {
+            native_set_last_error(87);
+            return u32::MAX;
+        }
+        let host_tm = unsafe { host_tm.assume_init() };
+        let bias = -((host_tm.gmtoff / 60) as i32);
+        unsafe {
+            std::ptr::write_bytes(output, 0, 172);
+            (output as *mut i32).write_unaligned(bias);
+            // GetTimeZoneInformation returns the current local offset with no
+            // transition dates; the guest still formats local Date values
+            // using the Linux process timezone.
+            0 // TIME_ZONE_ID_UNKNOWN
+        }
+    }
+    extern "win64" fn native_get_dynamic_time_zone_information(output: *mut u8) -> u32 {
+        if output.is_null() {
+            native_set_last_error(87);
+            return u32::MAX;
+        }
+        #[repr(C)]
+        struct HostTm {
+            sec: i32,
+            min: i32,
+            hour: i32,
+            mday: i32,
+            mon: i32,
+            year: i32,
+            wday: i32,
+            yday: i32,
+            is_dst: i32,
+            gmtoff: i64,
+            zone: *const i8,
+        }
+        unsafe extern "C" {
+            fn localtime_r(time: *const i64, result: *mut HostTm) -> *mut HostTm;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_secs() as i64)
+            .unwrap_or(0);
+        let mut host_tm = std::mem::MaybeUninit::<HostTm>::uninit();
+        let local = unsafe { localtime_r(&now, host_tm.as_mut_ptr()) };
+        if local.is_null() {
+            native_set_last_error(87);
+            return u32::MAX;
+        }
+        let host_tm = unsafe { host_tm.assume_init() };
+        let bias = -((host_tm.gmtoff / 60) as i32);
+        unsafe {
+            std::ptr::write_bytes(output, 0, 432);
+            (output as *mut i32).write_unaligned(bias);
+            (output.add(428) as *mut u32).write_unaligned(0);
+        }
+        let write_wide = |offset: usize, value: &str, capacity: usize| {
+            let encoded: Vec<u16> = value.encode_utf16().collect();
+            let count = encoded.len().min(capacity.saturating_sub(1));
+            unsafe {
+                let target = output.add(offset) as *mut u16;
+                target.copy_from_nonoverlapping(encoded.as_ptr(), count);
+                target.add(count).write(0);
+            }
+        };
+        write_wide(4, "Local Standard Time", 32);
+        write_wide(88, "Local Daylight Time", 32);
+        write_wide(172, "Local", 128);
+        0 // TIME_ZONE_ID_UNKNOWN
+    }
+    extern "win64" fn native_open_process_token(
+        process: u64,
+        _access: u32,
+        token: *mut u64,
+    ) -> i32 {
+        if token.is_null() {
+            native_set_last_error(87);
+            return 0;
+        }
+        if process != u64::MAX
+            && !process_ctx().is_some_and(|context| context.process_handle == process)
+        {
+            native_set_last_error(6);
+            return 0;
+        }
+        unsafe { token.write(PROCESS_TOKEN_HANDLE) };
+        1
+    }
+    extern "win64" fn native_get_user_name_w(name: *mut u16, size: *mut u32) -> i32 {
+        if name.is_null() || size.is_null() {
+            native_set_last_error(87);
+            return 0;
+        }
+        let value = std::env::var("USERNAME").unwrap_or_else(|_| "WinCLI".to_string());
+        let encoded: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+        let capacity = unsafe { size.read() } as usize;
+        if capacity < encoded.len() {
+            unsafe { size.write(encoded.len() as u32) };
+            native_set_last_error(122); // ERROR_INSUFFICIENT_BUFFER
+            return 0;
+        }
+        unsafe {
+            name.copy_from_nonoverlapping(encoded.as_ptr(), encoded.len());
+            size.write(encoded.len() as u32);
+        }
+        1
     }
     extern "win64" fn native_time_get_time() -> u32 {
         let mut time = NativeTimespec {
@@ -5039,6 +5277,74 @@ mod imp {
     extern "win64" fn native_set_console_mode(handle: u64, _mode: u32) -> i32 {
         host_standard_fd(handle).is_some() as i32
     }
+    extern "win64" fn native_set_console_title_w(title: *const u16) -> i32 {
+        if title.is_null() {
+            native_set_last_error(87);
+            return 0;
+        }
+        1
+    }
+    extern "win64" fn native_get_logical_processor_information(
+        buffer: *mut u8,
+        returned_length: *mut u32,
+    ) -> i32 {
+        const ENTRY_SIZE: u32 = 32;
+        if returned_length.is_null() {
+            native_set_last_error(87);
+            return 0;
+        }
+        if buffer.is_null() {
+            unsafe { returned_length.write(ENTRY_SIZE) };
+            native_set_last_error(122); // ERROR_INSUFFICIENT_BUFFER
+            return 0;
+        }
+        // SYSTEM_LOGICAL_PROCESSOR_INFORMATION is 32 bytes on x64. Report
+        // one processor core, matching the CPU affinity exposed to a guest.
+        unsafe {
+            std::ptr::write_bytes(buffer, 0, ENTRY_SIZE as usize);
+            (buffer as *mut u64).write_unaligned(1);
+            (buffer.add(8) as *mut u32).write_unaligned(0); // RelationProcessorCore
+            returned_length.write(ENTRY_SIZE);
+        }
+        1
+    }
+    extern "win64" fn native_get_adapters_addresses(
+        family: u32,
+        _flags: u32,
+        _reserved: u64,
+        adapters: *mut u8,
+        size: *mut u32,
+    ) -> u32 {
+        const REQUIRED: u32 = 240;
+        const STRUCT_SIZE: u32 = 176;
+        if size.is_null() || !matches!(family, 0 | 2 | 23) {
+            return 87; // ERROR_INVALID_PARAMETER
+        }
+        if adapters.is_null() || unsafe { size.read() } < REQUIRED {
+            unsafe { size.write(REQUIRED) };
+            return 111; // ERROR_BUFFER_OVERFLOW
+        }
+        let base = adapters as usize;
+        unsafe {
+            std::ptr::write_bytes(adapters, 0, REQUIRED as usize);
+            (adapters as *mut u32).write_unaligned(STRUCT_SIZE);
+            (adapters.add(4) as *mut u32).write_unaligned(1); // IfIndex
+            (adapters.add(16) as *mut *const u8).write_unaligned((base + 192) as *const u8);
+            (adapters.add(72) as *mut *const u16).write_unaligned((base + 208) as *const u16);
+            (adapters.add(88) as *mut u32).write_unaligned(0); // no MAC address
+            (adapters.add(100) as *mut u32).write_unaligned(24); // IF_TYPE_SOFTWARE_LOOPBACK
+            (adapters.add(104) as *mut u32).write_unaligned(1); // IfOperStatusUp
+            (adapters.add(108) as *mut u32).write_unaligned(1); // Ipv6IfIndex
+            adapters
+                .add(192)
+                .copy_from_nonoverlapping(b"lo\0".as_ptr(), 3);
+            (adapters.add(208) as *mut u16).write_unaligned(b'l' as u16);
+            (adapters.add(210) as *mut u16).write_unaligned(b'o' as u16);
+            (adapters.add(212) as *mut u16).write_unaligned(0);
+            size.write(REQUIRED);
+        }
+        0
+    }
     extern "win64" fn native_format_message_w(
         _flags: u32,
         _source: u64,
@@ -5115,10 +5421,11 @@ mod imp {
             return 0;
         };
         let Some(value) = process_ctx().and_then(|process| {
-            process
-                .environment
-                .iter()
-                .find_map(|(key, value)| key.eq_ignore_ascii_case(&name).then(|| value.clone()))
+            process.environment.lock().ok().and_then(|environment| {
+                environment
+                    .iter()
+                    .find_map(|(key, value)| key.eq_ignore_ascii_case(&name).then(|| value.clone()))
+            })
         }) else {
             native_set_last_error(203); // ERROR_ENVVAR_NOT_FOUND
             return 0;
@@ -5136,6 +5443,42 @@ mod imp {
             output.add(value.len()).write(0);
         }
         value.len() as u32
+    }
+    extern "win64" fn native_set_environment_variable_w(
+        name: *const u16,
+        value: *const u16,
+    ) -> i32 {
+        let (Some(name), value) = (wide(name), if value.is_null() { None } else { wide(value) })
+        else {
+            native_set_last_error(87);
+            return 0;
+        };
+        if name.is_empty() || name.contains('=') {
+            native_set_last_error(87);
+            return 0;
+        }
+        let Some(process) = process_ctx() else {
+            return 0;
+        };
+        let Ok(mut environment) = process.environment.lock() else {
+            return 0;
+        };
+        if let Some(index) = environment
+            .iter()
+            .position(|(key, _)| key.eq_ignore_ascii_case(&name))
+        {
+            if let Some(value) = value {
+                environment[index].1 = value;
+            } else {
+                environment.remove(index);
+            }
+        } else if let Some(value) = value {
+            environment.push((name, value));
+        }
+        if let Ok(mut block) = process.environment_block.lock() {
+            *block = environment_strings(&environment);
+        }
+        1
     }
     extern "win64" fn native_get_current_directory_w(output_len: u32, output: *mut u16) -> u32 {
         let cwd = fs_ctx()
@@ -5186,6 +5529,9 @@ mod imp {
             (output.add(36) as *mut u32).write_unaligned(8664);
             (output.add(40) as *mut u32).write_unaligned(65_536);
         }
+    }
+    extern "win64" fn native_get_native_system_info(output: *mut u8) {
+        native_get_system_info(output)
     }
     extern "win64" fn native_get_full_path_name_w(
         input: *const u16,
@@ -5657,7 +6003,13 @@ mod imp {
             native_set_last_error(6);
             return 0;
         };
-        let environment = explicit_environment.unwrap_or_else(|| parent.environment.clone());
+        let environment = explicit_environment.unwrap_or_else(|| {
+            parent
+                .environment
+                .lock()
+                .map(|environment| environment.clone())
+                .unwrap_or_default()
+        });
         let (process_handle, thread_handle, child) = match parent.children.lock() {
             Ok(mut children) => children.allocate(parent.process_id),
             Err(_) => {
@@ -5698,8 +6050,8 @@ mod imp {
                 parent_process_id: parent.process_id,
                 command_line_a: command_line_a(&command_line_w),
                 command_line_w,
-                environment_block: environment_strings(&environment),
-                environment,
+                environment_block: Mutex::new(environment_strings(&environment)),
+                environment: Mutex::new(environment),
                 std_handles: [
                     AtomicU64::new(STD_HANDLE_BASE),
                     AtomicU64::new(STD_HANDLE_BASE + 1),
@@ -6684,6 +7036,70 @@ mod imp {
         }
         1
     }
+    extern "win64" fn native_set_file_pointer_ex(
+        handle: u64,
+        distance: i64,
+        new_position: *mut i64,
+        method: u32,
+    ) -> i32 {
+        if host_standard_fd(handle).is_some() {
+            native_set_last_error(1); // ERROR_INVALID_FUNCTION
+            return 0;
+        }
+        let context = match fs_ctx() {
+            Some(value) => value,
+            None => return 0,
+        };
+        let mut ctx = match context.lock() {
+            Ok(value) => value,
+            Err(_) => return 0,
+        };
+        let Some(file) = ctx.handles.get(&handle) else {
+            native_set_last_error(6); // ERROR_INVALID_HANDLE
+            return 0;
+        };
+        let base = match method {
+            0 => 0_i64, // FILE_BEGIN
+            1 => match i64::try_from(file.offset) {
+                Ok(offset) => offset,
+                Err(_) => {
+                    native_set_last_error(87);
+                    return 0;
+                }
+            },
+            2 => match ctx.fs.read_file(&file.path) {
+                Ok(data) => match i64::try_from(data.len()) {
+                    Ok(length) => length,
+                    Err(_) => {
+                        native_set_last_error(87);
+                        return 0;
+                    }
+                },
+                Err(_) => {
+                    native_set_last_error(6);
+                    return 0;
+                }
+            },
+            _ => {
+                native_set_last_error(87); // ERROR_INVALID_PARAMETER
+                return 0;
+            }
+        };
+        let Some(position) = base.checked_add(distance) else {
+            native_set_last_error(131); // ERROR_NEGATIVE_SEEK / overflow
+            return 0;
+        };
+        if position < 0 {
+            native_set_last_error(131);
+            return 0;
+        }
+        let file = ctx.handles.get_mut(&handle).unwrap();
+        file.offset = position as usize;
+        if !new_position.is_null() {
+            unsafe { new_position.write(position) };
+        }
+        1
+    }
     extern "win64" fn native_read_file(
         h: u64,
         buf: *mut u8,
@@ -6812,6 +7228,9 @@ mod imp {
         1
     }
     extern "win64" fn native_close_handle(h: u64) -> i32 {
+        if h == PROCESS_TOKEN_HANDLE {
+            return 1;
+        }
         let process = process_ctx();
         if process.as_ref().is_some_and(|process| {
             process
@@ -6974,6 +7393,8 @@ mod imp {
                     | "EventSetInformation"
                     | "EventWriteTransfer"
                     | "RegOpenKeyExW"
+                    | "OpenProcessToken"
+                    | "GetUserNameW"
             ),
             "WS2_32.DLL" => matches!(
                 func,
@@ -6989,6 +7410,7 @@ mod imp {
                     | "#116"
             ),
             "USER32.DLL" => func == "GetSystemMetrics",
+            "IPHLPAPI.DLL" => func == "GetAdaptersAddresses",
             "NTDLL.DLL" => matches!(
                 func,
                 "RtlGetVersion" | "RtlNtStatusToDosError" | "NtReadFile"
@@ -7095,6 +7517,8 @@ mod imp {
                 Some(native_get_current_process_id as *const () as usize as u64)
             }
             "GetCurrentProcess" => Some(native_get_current_process as *const () as usize as u64),
+            "OpenProcessToken" => Some(native_open_process_token as *const () as usize as u64),
+            "GetUserNameW" => Some(native_get_user_name_w as *const () as usize as u64),
             "GetExitCodeProcess" => Some(native_get_exit_code_process as *const () as usize as u64),
             "TerminateProcess" => Some(native_terminate_process as *const () as usize as u64),
             "GetCurrentThread" => Some(native_get_current_thread as *const () as usize as u64),
@@ -7113,6 +7537,13 @@ mod imp {
                 Some(native_query_performance_frequency as *const () as usize as u64)
             }
             "Sleep" => Some(native_sleep as *const () as usize as u64),
+            "SwitchToThread" => Some(native_switch_to_thread as *const () as usize as u64),
+            "GetTimeZoneInformation" => {
+                Some(native_get_time_zone_information as *const () as usize as u64)
+            }
+            "GetDynamicTimeZoneInformation" => {
+                Some(native_get_dynamic_time_zone_information as *const () as usize as u64)
+            }
             "timeGetTime" => Some(native_time_get_time as *const () as usize as u64),
             "GlobalMemoryStatusEx" => {
                 Some(native_global_memory_status_ex as *const () as usize as u64)
@@ -7202,6 +7633,9 @@ mod imp {
                 Some(native_get_system_time_as_file_time as *const () as usize as u64)
             }
             "GetSystemInfo" => Some(native_get_system_info as *const () as usize as u64),
+            "GetNativeSystemInfo" => {
+                Some(native_get_native_system_info as *const () as usize as u64)
+            }
             "GetFullPathNameW" => Some(native_get_full_path_name_w as *const () as usize as u64),
             "FormatMessageW" => Some(native_format_message_w as *const () as usize as u64),
             "FormatMessageA" => Some(native_format_message_a as *const () as usize as u64),
@@ -7263,8 +7697,18 @@ mod imp {
                 Some(native_get_console_screen_buffer_info as *const () as usize as u64)
             }
             "SetConsoleMode" => Some(native_set_console_mode as *const () as usize as u64),
+            "SetConsoleTitleW" => Some(native_set_console_title_w as *const () as usize as u64),
+            "GetLogicalProcessorInformation" => {
+                Some(native_get_logical_processor_information as *const () as usize as u64)
+            }
+            "GetAdaptersAddresses" => {
+                Some(native_get_adapters_addresses as *const () as usize as u64)
+            }
             "GetEnvironmentVariableW" => {
                 Some(native_get_environment_variable_w as *const () as usize as u64)
+            }
+            "SetEnvironmentVariableW" => {
+                Some(native_set_environment_variable_w as *const () as usize as u64)
             }
             "GetCurrentDirectoryW" => {
                 Some(native_get_current_directory_w as *const () as usize as u64)
@@ -7273,6 +7717,7 @@ mod imp {
                 Some(native_get_computer_name_ex_w as *const () as usize as u64)
             }
             "SetFileTime" => Some(native_set_file_time as *const () as usize as u64),
+            "SetFilePointerEx" => Some(native_set_file_pointer_ex as *const () as usize as u64),
             "WriteFile" => Some(native_write_file as *const () as usize as u64),
             "WriteConsoleW" => Some(native_write_console_w as *const () as usize as u64),
             "ExitProcess" => Some(native_exit_process as *const () as usize as u64),
@@ -7986,8 +8431,8 @@ mod imp {
             parent_process_id: 0,
             command_line_w,
             command_line_a,
-            environment: Vec::new(),
-            environment_block: vec![0, 0],
+            environment: Mutex::new(Vec::new()),
+            environment_block: Mutex::new(vec![0, 0]),
             std_handles: [
                 AtomicU64::new(STD_HANDLE_BASE),
                 AtomicU64::new(STD_HANDLE_BASE + 1),

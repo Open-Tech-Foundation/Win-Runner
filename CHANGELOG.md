@@ -11,6 +11,10 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added native code-page aliases, file seeking, environment updates, and process,
+  console, timezone, CPU, and network information queried by Node.js and npm.
+- Added optional real-binary E2E coverage for the staged npm CLI `--version`
+  path on the native backend.
 - Added native WinFS file attributes, disk handle types, and NT file metadata
   queries used by Node.js. The real Windows Node binary now reads and stats
   files supplied through the guest filesystem.

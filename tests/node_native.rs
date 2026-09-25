@@ -2,7 +2,7 @@
 //! Set WINCLI_NODE_EXE to an official Windows x64 node.exe to run it.
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 #[test]
@@ -87,4 +87,86 @@ fn official_windows_node_reads_guest_file_metadata_and_contents() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(output.stdout, b"10:npm-probe\n");
+}
+
+#[test]
+fn official_windows_node_runs_the_staged_npm_cli_natively() {
+    let Ok(node) = std::env::var("WINCLI_NODE_EXE") else {
+        return;
+    };
+    let node = Path::new(&node)
+        .canonicalize()
+        .expect("Windows node.exe exists");
+    let npm = std::env::var_os("WINCLI_NPM_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| node.parent().unwrap().join("npm-stage/C/npm"));
+    if !npm.join("bin/npm-cli.js").is_file() {
+        return;
+    }
+    let npm = npm.canonicalize().expect("npm root exists");
+    let expected_version = std::fs::read_to_string(npm.join("package.json"))
+        .expect("read npm package metadata")
+        .lines()
+        .find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            (key.trim() == "\"version\"").then(|| {
+                value
+                    .trim()
+                    .trim_end_matches(',')
+                    .trim_matches('"')
+                    .to_string()
+            })
+        })
+        .expect("npm package version exists");
+
+    let mut files = Vec::new();
+    collect_files(&npm, &mut files);
+    files.sort();
+    let mut script = String::new();
+    for file in files {
+        let relative = file.strip_prefix(&npm).unwrap();
+        let guest = format!("C:\\npm\\{}", relative.to_string_lossy().replace('/', "\\"));
+        script.push_str(&format!("@seed \"{}\" {guest}\n", file.display()));
+    }
+    script.push_str(&format!(
+        "\"{}\" C:\\npm\\bin\\npm-cli.js --version\nexit\n",
+        node.display()
+    ));
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wincli"))
+        .arg("shell")
+        .env("WINCLI_BACKEND", "native")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start native WinCLI shell");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .expect("seed npm and run its CLI");
+    let output = child.wait_with_output().expect("read npm output");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        expected_version
+    );
+}
+
+fn collect_files(root: &Path, output: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(root).expect("read npm directory") {
+        let path = entry.expect("read npm entry").path();
+        if path.is_dir() {
+            collect_files(&path, output);
+        } else if path.is_file() {
+            output.push(path);
+        }
+    }
 }
