@@ -1,9 +1,24 @@
 //! Optional real Node.js Windows binary compatibility check.
 //! Set WINCLI_NODE_EXE to an official Windows x64 node.exe to run it.
 
+#[cfg(unix)]
+use std::io::Read;
 use std::io::Write;
+#[cfg(unix)]
+use std::net::{TcpListener, TcpStream};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+#[cfg(unix)]
+use std::thread;
+#[cfg(unix)]
+use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn kill(pid: i32, signal: i32) -> i32;
+}
 
 #[test]
 fn official_windows_node_runs_version_and_javascript_natively() {
@@ -47,6 +62,89 @@ fn official_windows_node_runs_version_and_javascript_natively() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "3");
+}
+
+#[test]
+#[cfg(unix)]
+fn official_windows_node_serves_an_http_request_natively() {
+    let Ok(node) = std::env::var("WINCLI_NODE_EXE") else {
+        return;
+    };
+    let node = Path::new(&node)
+        .canonicalize()
+        .expect("Windows node.exe exists");
+    let reservation = TcpListener::bind(("127.0.0.1", 0)).expect("reserve a local test port");
+    let port = reservation.local_addr().unwrap().port();
+    drop(reservation);
+    let source = format!(
+        "require('node:http').createServer((req,res)=>res.end('native-node-http-ok')).listen({port},'127.0.0.1')"
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_wincli"));
+    command
+        .arg(node)
+        .args(["-e", &source])
+        .env("WINCLI_BACKEND", "native")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command.process_group(0);
+    let mut child = command.spawn().expect("start native Node HTTP server");
+
+    let response = (|| -> Result<Vec<u8>, String> {
+        let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+                return Err(format!("Node exited before listening: {status}"));
+            }
+            if Instant::now() >= deadline {
+                return Err("Node HTTP server did not accept a connection within 10s".into());
+            }
+            match TcpStream::connect_timeout(&address, Duration::from_millis(250)) {
+                Ok(mut stream) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .map_err(|error| error.to_string())?;
+                    stream
+                        .write_all(
+                            b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                        )
+                        .map_err(|error| error.to_string())?;
+                    let mut response = Vec::new();
+                    stream
+                        .read_to_end(&mut response)
+                        .map_err(|error| error.to_string())?;
+                    return Ok(response);
+                }
+                Err(_) => thread::sleep(Duration::from_millis(50)),
+            }
+        }
+    })();
+    unsafe {
+        kill(-(child.id() as i32), 15);
+    }
+    let output = child.wait_with_output().expect("collect Node output");
+    let response = response.unwrap_or_else(|error| {
+        format!(
+            "{error}\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into_bytes()
+    });
+    assert!(
+        response
+            .windows(b"HTTP/1.1 200".len())
+            .any(|window| window == b"HTTP/1.1 200"),
+        "unexpected native Node HTTP response: {}",
+        String::from_utf8_lossy(&response)
+    );
+    assert!(
+        response
+            .windows(b"native-node-http-ok".len())
+            .any(|window| window == b"native-node-http-ok"),
+        "native Node HTTP body is missing: {}",
+        String::from_utf8_lossy(&response)
+    );
 }
 
 #[test]

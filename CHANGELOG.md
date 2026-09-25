@@ -14,6 +14,12 @@ All notable changes to this project will be documented in this file.
 - Added native Winsock IOCP association, completion-mode handling, `ConnectEx`,
   and zero-byte overlapped receive readiness used by Node.js TLS and npm registry
   installs. Native E2E coverage can verify live registry installs.
+- Added native Winsock `listen`, `AcceptEx`, `shutdown`, and accepted-socket
+  context support for Node.js TCP servers.
+- Added an optional native Node.js E2E test that verifies a host HTTP request
+  can reach and receive a response from a guest TCP server.
+- Added WinFS-backed `GetFileAttributesExW` metadata and `SetFileAttributesW`
+  attributes for files and directories used by npm package discovery.
 - Added Windows-sized default stacks for native guest threads, recursive
   thread-aware critical sections, per-thread Windows IDs, address wait/wake
   synchronization, native DNS resolution, and initial Winsock socket setup for
