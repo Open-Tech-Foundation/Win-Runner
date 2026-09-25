@@ -7610,20 +7610,66 @@ mod imp {
     }
 
     extern "win64" fn native_nt_set_information_file(
-        _file: u64,
+        file: u64,
         io_status: *mut u8,
-        _information: *const u8,
-        _length: u32,
-        _information_class: u32,
+        information: *const u8,
+        length: u32,
+        information_class: u32,
     ) -> u32 {
-        const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
-        if !io_status.is_null() {
-            unsafe {
-                (io_status as *mut u32).write_unaligned(STATUS_NOT_IMPLEMENTED);
-                (io_status.add(8) as *mut u64).write_unaligned(0);
+        const STATUS_SUCCESS: u32 = 0;
+        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
+        const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+        let finish = |status: u32, information: u64| {
+            if !io_status.is_null() {
+                unsafe {
+                    (io_status as *mut u32).write_unaligned(status);
+                    (io_status.add(8) as *mut u64).write_unaligned(information);
+                }
             }
+            status
+        };
+        let disposition = match information_class {
+            13 if !information.is_null() && length >= 1 => unsafe {
+                u32::from(information.read() != 0)
+            },
+            // FILE_DISPOSITION_INFORMATION_EX: Flags is a ULONG; DELETE is
+            // bit 0. libuv uses this class for recursive fs.rm/unlink on
+            // current Windows releases.
+            64 if !information.is_null() && length >= 4 => unsafe {
+                information.cast::<u32>().read_unaligned()
+            },
+            13 | 64 => return finish(STATUS_INVALID_PARAMETER, 0),
+            _ => return finish(0xC000_0002, 0), // STATUS_NOT_IMPLEMENTED
+        };
+        // A zero disposition cancels deletion. The in-memory filesystem only
+        // removes names on a set operation, so clearing is a successful no-op.
+        if disposition == 0 {
+            return finish(STATUS_SUCCESS, 0);
         }
-        STATUS_NOT_IMPLEMENTED
+        if disposition & !0x3f != 0 {
+            return finish(STATUS_INVALID_PARAMETER, 0);
+        }
+        let Some(context) = fs_ctx() else {
+            return finish(STATUS_INVALID_HANDLE, 0);
+        };
+        let Ok(mut context) = context.lock() else {
+            return finish(STATUS_INVALID_HANDLE, 0);
+        };
+        let Some(path) = context.handles.get(&file).map(|handle| handle.path.clone()) else {
+            return finish(STATUS_INVALID_HANDLE, 0);
+        };
+        let status = if context.fs.is_dir(&path) {
+            context.fs.rmdir(&path)
+        } else {
+            context.fs.delete_file(&path)
+        };
+        match status {
+            Ok(()) => finish(STATUS_SUCCESS, 0),
+            Err(_) if !context.fs.exists(&path) => finish(STATUS_OBJECT_NAME_NOT_FOUND, 0),
+            Err(_) => finish(STATUS_ACCESS_DENIED, 0),
+        }
     }
 
     extern "win64" fn native_nt_query_volume_information_file(
@@ -8598,34 +8644,84 @@ mod imp {
         closed as i32
     }
     extern "win64" fn native_create_directory_w(p: *const u16, _s: u64) -> i32 {
-        fs_ctx()
-            .and_then(|context| {
-                context
-                    .lock()
-                    .ok()
-                    .and_then(|mut c| wide(p).map(|p| c.fs.mkdir_one(&p).is_ok()))
-            })
-            .unwrap_or(false) as i32
+        let path = wide(p);
+        let Some(path) = path else {
+            native_set_last_error(87); // ERROR_INVALID_PARAMETER
+            return 0;
+        };
+        let Some(context) = fs_ctx() else {
+            native_set_last_error(6); // ERROR_INVALID_HANDLE
+            return 0;
+        };
+        let Ok(mut context) = context.lock() else {
+            native_set_last_error(6);
+            return 0;
+        };
+        match context.fs.mkdir_one(&path) {
+            Ok(()) => 1,
+            Err(_) if context.fs.exists(&path) => {
+                native_set_last_error(183); // ERROR_ALREADY_EXISTS
+                0
+            }
+            Err(_) => {
+                native_set_last_error(3); // ERROR_PATH_NOT_FOUND
+                0
+            }
+        }
     }
     extern "win64" fn native_remove_directory_w(p: *const u16) -> i32 {
-        fs_ctx()
-            .and_then(|context| {
-                context
-                    .lock()
-                    .ok()
-                    .and_then(|mut c| wide(p).map(|p| c.fs.rmdir(&p).is_ok()))
-            })
-            .unwrap_or(false) as i32
+        let Some(path) = wide(p) else {
+            native_set_last_error(87);
+            return 0;
+        };
+        let Some(context) = fs_ctx() else {
+            native_set_last_error(6);
+            return 0;
+        };
+        let Ok(mut context) = context.lock() else {
+            native_set_last_error(6);
+            return 0;
+        };
+        match context.fs.rmdir(&path) {
+            Ok(()) => 1,
+            Err(_) if context.fs.is_file(&path) => {
+                native_set_last_error(3); // ERROR_PATH_NOT_FOUND
+                0
+            }
+            Err(_) if !context.fs.exists(&path) => {
+                native_set_last_error(3); // ERROR_PATH_NOT_FOUND
+                0
+            }
+            Err(_) => {
+                native_set_last_error(145); // ERROR_DIR_NOT_EMPTY
+                0
+            }
+        }
     }
     extern "win64" fn native_delete_file_w(p: *const u16) -> i32 {
-        fs_ctx()
-            .and_then(|context| {
-                context
-                    .lock()
-                    .ok()
-                    .and_then(|mut c| wide(p).map(|p| c.fs.delete_file(&p).is_ok()))
-            })
-            .unwrap_or(false) as i32
+        let Some(path) = wide(p) else {
+            native_set_last_error(87);
+            return 0;
+        };
+        let Some(context) = fs_ctx() else {
+            native_set_last_error(6);
+            return 0;
+        };
+        let Ok(mut context) = context.lock() else {
+            native_set_last_error(6);
+            return 0;
+        };
+        match context.fs.delete_file(&path) {
+            Ok(()) => 1,
+            Err(_) if context.fs.is_dir(&path) => {
+                native_set_last_error(5); // ERROR_ACCESS_DENIED
+                0
+            }
+            Err(_) => {
+                native_set_last_error(2); // ERROR_FILE_NOT_FOUND
+                0
+            }
+        }
     }
     extern "win64" fn native_move_file_w(a: *const u16, b: *const u16) -> i32 {
         let (a, b) = match (wide(a), wide(b)) {

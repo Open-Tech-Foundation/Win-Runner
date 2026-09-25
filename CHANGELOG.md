@@ -33,6 +33,10 @@ All notable changes to this project will be documented in this file.
 - Added file-backed `CreateFileMappingW` views with flush/unmap persistence, the
   common `CreateFileW` creation dispositions, and `MoveFileExW` replacement
   support used by package managers and other Windows applications.
+- Added WinFS handling for Windows extended-length DOS/NT paths and native
+  file-disposition information, including the Windows APIs npm uses for cache
+  paths and temporary-file cleanup. The native Node.js E2E now installs the
+  real `is-number@7.0.0` tarball with npm before executing it.
 - Added `CancelIoEx` and same-thread `CancelIo` for pending native WinFS
   operations, including canceled `OVERLAPPED` status, event signaling, and
   failed IOCP completion packets. Native unit and PE tests cover cancellation

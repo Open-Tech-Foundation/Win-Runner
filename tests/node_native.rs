@@ -161,32 +161,39 @@ fn official_windows_node_runs_the_staged_npm_cli_natively() {
 }
 
 #[test]
-fn official_windows_node_runs_a_real_npm_package_natively() {
+fn official_windows_node_installs_and_runs_a_real_npm_package_natively() {
     let Ok(node) = std::env::var("WINCLI_NODE_EXE") else {
         return;
     };
     let node = Path::new(&node)
         .canonicalize()
         .expect("Windows node.exe exists");
-    let package = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/artifacts/node/is-number");
+    let npm = std::env::var_os("WINCLI_NPM_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| node.parent().unwrap().join("npm-stage/C/npm"));
+    if !npm.join("bin/npm-cli.js").is_file() {
+        return;
+    }
+    let npm = npm.canonicalize().expect("npm root exists");
+    let artifacts = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/artifacts/node");
     let mut files = Vec::new();
-    collect_files(&package, &mut files);
+    collect_files(&npm, &mut files);
     files.sort();
     let mut script = String::from(
-        "New-Item -ItemType Directory -Force C:\\project\\node_modules\\is-number | Out-Null\n",
+        "New-Item -ItemType Directory -Force C:\\Users\\wincli\\npm-cache\\_cacache\\tmp | Out-Null\nNew-Item -ItemType Directory -Force C:\\Users\\wincli\\npm-cache\\_logs | Out-Null\nNew-Item -ItemType Directory -Force C:\\project | Out-Null\n",
     );
     for file in files {
-        let relative = file.strip_prefix(&package).unwrap();
-        let guest = format!(
-            "C:\\project\\node_modules\\is-number\\{}",
-            relative.to_string_lossy().replace('/', "\\")
-        );
+        let relative = file.strip_prefix(&npm).unwrap();
+        let guest = format!("C:\\npm\\{}", relative.to_string_lossy().replace('/', "\\"));
         script.push_str(&format!("@seed \"{}\" {guest}\n", file.display()));
     }
-    let probe = package.parent().unwrap().join("is-number-probe.js");
+    let tarball = artifacts.join("is-number-7.0.0.tgz");
+    let probe = artifacts.join("is-number-probe.js");
     script.push_str(&format!(
-        "@seed \"{}\" C:\\project\\probe.js\n\"{}\" C:\\project\\probe.js\nexit\n",
+        "@seed \"{}\" C:\\project\\is-number-7.0.0.tgz\n@seed \"{}\" C:\\project\\probe.js\n\"{}\" C:\\npm\\bin\\npm-cli.js --prefix C:\\project install C:\\project\\is-number-7.0.0.tgz --offline --no-update-notifier --no-audit --no-fund --no-package-lock --ignore-scripts\n\"{}\" C:\\project\\probe.js\nexit\n",
+        tarball.display(),
         probe.display(),
+        node.display(),
         node.display()
     ));
 
@@ -203,7 +210,7 @@ fn official_windows_node_runs_a_real_npm_package_natively() {
         .take()
         .unwrap()
         .write_all(script.as_bytes())
-        .expect("seed and run the npm package");
+        .expect("install and run the npm package");
     let output = child.wait_with_output().expect("read package output");
     assert_eq!(
         output.status.code(),
@@ -211,10 +218,14 @@ fn official_windows_node_runs_a_real_npm_package_natively() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout).trim(),
-        "true false false"
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with("added 1 package")),
+        "npm did not report installing the package: {stdout}"
     );
+    assert_eq!(stdout.lines().last(), Some("true false false"));
 }
 
 fn collect_files(root: &Path, output: &mut Vec<PathBuf>) {

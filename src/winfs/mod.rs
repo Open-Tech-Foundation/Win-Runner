@@ -160,7 +160,17 @@ impl WinFs {
             return Err("empty path".to_string());
         }
         // Normalize separators to backslash for parsing (but keep case).
-        let s = s.replace('/', "\\");
+        let mut s = s.replace('/', "\\");
+        // Win32 and libuv use the extended-length DOS namespace to bypass
+        // MAX_PATH handling. It has the same drive/path semantics as a DOS
+        // path for this filesystem; normalize the prefix before parsing so
+        // recursive mkdir/stat operations don't mistake `\\?` for a path
+        // component. `\??\` is the corresponding NT object-manager prefix.
+        if let Some(rest) = s.strip_prefix("\\\\?\\") {
+            s = rest.to_string();
+        } else if let Some(rest) = s.strip_prefix("\\??\\") {
+            s = rest.to_string();
+        }
 
         let (drive, rest): (char, &str) = if s.len() >= 2
             && is_drive_letter(s.chars().next().unwrap())
@@ -704,6 +714,24 @@ mod tests {
         fs.set_cwd("C:\\a\\b").unwrap();
         assert_eq!(fs.read_file(".\\f.txt").unwrap(), b"x");
         assert_eq!(fs.read_file("..\\b\\f.txt").unwrap(), b"x");
+    }
+
+    #[test]
+    fn extended_dos_and_nt_paths_resolve_like_dos_paths() {
+        let mut fs = WinFs::new();
+        fs.mkdir(r"C:\Users\wincli\npm-cache\_cacache\tmp")
+            .unwrap();
+        for extended in [
+            r"\\?\C:\Users\wincli\npm-cache\_cacache\tmp",
+            r"\??\C:\Users\wincli\npm-cache\_cacache\tmp",
+        ] {
+            assert!(fs.is_dir(extended), "{extended}");
+            assert_eq!(
+                fs.normalize(extended).unwrap(),
+                fs.normalize(r"C:\Users\wincli\npm-cache\_cacache\tmp")
+                    .unwrap()
+            );
+        }
     }
 
     #[test]
