@@ -148,6 +148,33 @@ fn official_windows_node_serves_an_http_request_natively() {
 }
 
 #[test]
+fn official_windows_node_receives_winfs_directory_changes_natively() {
+    let Ok(node) = std::env::var("WINCLI_NODE_EXE") else {
+        return;
+    };
+    let node = Path::new(&node)
+        .canonicalize()
+        .expect("Windows node.exe exists");
+    let source = "const fs=require('node:fs');fs.mkdirSync('C:/watch');const timeout=setTimeout(()=>process.exit(2),5000);const watcher=fs.watch('C:/watch',{recursive:true},(event,name)=>{if(name==='probe.txt'){clearTimeout(timeout);watcher.close();console.log('winfs-watch-ok:'+event+':'+name)}});setTimeout(()=>fs.writeFileSync('C:/watch/probe.txt','changed'),200)";
+    let output = Command::new(env!("CARGO_BIN_EXE_wincli"))
+        .arg(node)
+        .args(["-e", source])
+        .env("WINCLI_BACKEND", "native")
+        .output()
+        .expect("run native Node fs.watch check");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "winfs-watch-ok:rename:probe.txt"
+    );
+}
+
+#[test]
 fn official_windows_node_reads_guest_file_metadata_and_contents() {
     let Ok(node) = std::env::var("WINCLI_NODE_EXE") else {
         return;

@@ -662,9 +662,9 @@ mod imp {
                 loop {
                     let next = u32::from_le_bytes(entries[offset..offset + 4].try_into().unwrap())
                         as usize;
-                    let name_len = u32::from_le_bytes(
-                        entries[offset + 60..offset + 64].try_into().unwrap(),
-                    ) as usize;
+                    let name_len =
+                        u32::from_le_bytes(entries[offset + 60..offset + 64].try_into().unwrap())
+                            as usize;
                     let name = std::char::decode_utf16(
                         entries[offset + 64..offset + 64 + name_len]
                             .chunks_exact(2)
@@ -714,7 +714,9 @@ mod imp {
                 );
                 let mut fs = context.lock().unwrap();
                 fs.handles.remove(&handle);
-                fs.fs.delete_file(&format!(r"{directory}\alpha.txt")).unwrap();
+                fs.fs
+                    .delete_file(&format!(r"{directory}\alpha.txt"))
+                    .unwrap();
                 fs.fs
                     .delete_file(&format!(r"{directory}\nested\beta.txt"))
                     .unwrap();
@@ -1894,10 +1896,7 @@ mod imp {
                 fs.fs.mkdir(directory_path).unwrap();
             }
             let file_path_wide = file_path.encode_utf16().chain([0]).collect::<Vec<_>>();
-            let directory_path_wide = directory_path
-                .encode_utf16()
-                .chain([0])
-                .collect::<Vec<_>>();
+            let directory_path_wide = directory_path.encode_utf16().chain([0]).collect::<Vec<_>>();
             let mut data = [0u32; 9];
             assert_eq!(
                 super::native_get_file_attributes_ex_w(
@@ -3259,6 +3258,9 @@ mod imp {
         completion_key: u64,
         _concurrent_threads: u32,
     ) -> u64 {
+        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+            eprintln!("native CreateIoCompletionPort file={file:#x} existing={existing_port:#x} key={completion_key:#x}");
+        }
         let Some(process) = process_ctx() else {
             return 0;
         };
@@ -3458,6 +3460,309 @@ mod imp {
                 }
             }
         }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct NativeDirectoryEntry {
+        is_directory: bool,
+        size: usize,
+        content_hash: u64,
+    }
+
+    fn native_directory_snapshot(
+        fs: &WinFs,
+        directory: &str,
+        subtree: bool,
+    ) -> HashMap<String, NativeDirectoryEntry> {
+        fn visit(
+            fs: &WinFs,
+            directory: &str,
+            prefix: &str,
+            recursive: bool,
+            output: &mut HashMap<String, NativeDirectoryEntry>,
+        ) {
+            let Ok(names) = fs.list_dir(directory) else {
+                return;
+            };
+            for name in names {
+                let full_path = format!("{directory}\\{name}");
+                let relative = if prefix.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{prefix}\\{name}")
+                };
+                let is_directory = fs.is_dir(&full_path);
+                let bytes = if is_directory {
+                    Vec::new()
+                } else {
+                    fs.read_file(&full_path).unwrap_or_default()
+                };
+                let content_hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+                    (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3)
+                });
+                output.insert(
+                    relative.clone(),
+                    NativeDirectoryEntry {
+                        is_directory,
+                        size: bytes.len(),
+                        content_hash,
+                    },
+                );
+                if recursive && is_directory {
+                    visit(fs, &full_path, &relative, true, output);
+                }
+            }
+        }
+        let mut entries = HashMap::new();
+        visit(fs, directory, "", subtree, &mut entries);
+        entries
+    }
+
+    fn native_directory_changes(
+        before: &HashMap<String, NativeDirectoryEntry>,
+        after: &HashMap<String, NativeDirectoryEntry>,
+        filter: u32,
+    ) -> Vec<(u32, String)> {
+        let mut changes = Vec::new();
+        for (name, entry) in after {
+            match before.get(name) {
+                None if (entry.is_directory && filter & 0x2 != 0)
+                    || (!entry.is_directory && filter & 0x1 != 0) =>
+                {
+                    changes.push((1, name.clone())); // FILE_ACTION_ADDED
+                }
+                Some(old)
+                    if (old.size != entry.size || old.content_hash != entry.content_hash)
+                        && !entry.is_directory
+                        && filter & (0x8 | 0x10) != 0 =>
+                {
+                    changes.push((3, name.clone())); // FILE_ACTION_MODIFIED
+                }
+                _ => {}
+            }
+        }
+        for (name, entry) in before {
+            if !after.contains_key(name)
+                && ((entry.is_directory && filter & 0x2 != 0)
+                    || (!entry.is_directory && filter & 0x1 != 0))
+            {
+                changes.push((2, name.clone())); // FILE_ACTION_REMOVED
+            }
+        }
+        changes.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+        changes
+    }
+
+    fn native_encode_directory_changes(
+        changes: &[(u32, String)],
+        capacity: usize,
+    ) -> Option<Vec<u8>> {
+        let mut output = Vec::new();
+        for (index, (action, name)) in changes.iter().enumerate() {
+            let encoded: Vec<u16> = name.encode_utf16().collect();
+            let name_bytes = encoded.len().checked_mul(2)?;
+            let entry_len = 12usize.checked_add(name_bytes)?;
+            let padded_len = (entry_len + 3) & !3;
+            let offset = output.len();
+            if offset.checked_add(padded_len)? > capacity {
+                return None;
+            }
+            output.resize(offset + padded_len, 0);
+            let next = if index + 1 == changes.len() {
+                0
+            } else {
+                padded_len as u32
+            };
+            output[offset..offset + 4].copy_from_slice(&next.to_le_bytes());
+            output[offset + 4..offset + 8].copy_from_slice(&action.to_le_bytes());
+            output[offset + 8..offset + 12].copy_from_slice(&(name_bytes as u32).to_le_bytes());
+            for (i, unit) in encoded.iter().enumerate() {
+                output[offset + 12 + i * 2..offset + 14 + i * 2]
+                    .copy_from_slice(&unit.to_le_bytes());
+            }
+        }
+        Some(output)
+    }
+
+    #[cfg(test)]
+    mod directory_change_tests {
+        use super::*;
+
+        #[test]
+        fn snapshots_recursive_changes_and_encodes_win32_records() {
+            let mut fs = WinFs::new();
+            fs.mkdir(r"C:\watch\nested").unwrap();
+            fs.write_file(r"C:\watch\old.txt", b"old".to_vec()).unwrap();
+            let before = native_directory_snapshot(&fs, r"C:\watch", true);
+            fs.delete_file(r"C:\watch\old.txt").unwrap();
+            fs.write_file(r"C:\watch\nested\new.txt", b"new".to_vec())
+                .unwrap();
+            let after = native_directory_snapshot(&fs, r"C:\watch", true);
+            let changes = native_directory_changes(&before, &after, 0x1 | 0x2);
+            assert_eq!(
+                changes,
+                vec![(1, "nested\\new.txt".into()), (2, "old.txt".into())]
+            );
+
+            let records = native_encode_directory_changes(&changes, 80).unwrap();
+            assert_eq!(u32::from_le_bytes(records[0..4].try_into().unwrap()), 40);
+            assert_eq!(u32::from_le_bytes(records[4..8].try_into().unwrap()), 1);
+            assert_eq!(u32::from_le_bytes(records[8..12].try_into().unwrap()), 28);
+            assert_eq!(u32::from_le_bytes(records[40..44].try_into().unwrap()), 0);
+            assert_eq!(u32::from_le_bytes(records[44..48].try_into().unwrap()), 2);
+            assert!(native_encode_directory_changes(&changes, 40).is_none());
+        }
+
+        #[test]
+        fn filters_file_content_updates_by_win32_change_filter() {
+            let mut fs = WinFs::new();
+            fs.mkdir(r"C:\watch").unwrap();
+            fs.write_file(r"C:\watch\item.txt", b"a".to_vec()).unwrap();
+            let before = native_directory_snapshot(&fs, r"C:\watch", false);
+            fs.write_file(r"C:\watch\item.txt", b"changed".to_vec())
+                .unwrap();
+            let after = native_directory_snapshot(&fs, r"C:\watch", false);
+            assert!(native_directory_changes(&before, &after, 0x1).is_empty());
+            assert_eq!(
+                native_directory_changes(&before, &after, 0x8),
+                vec![(3, "item.txt".into())]
+            );
+        }
+    }
+
+    extern "win64" fn native_read_directory_changes_w(
+        handle: u64,
+        buffer: *mut u8,
+        length: u32,
+        subtree: i32,
+        filter: u32,
+        bytes_returned: *mut u32,
+        overlapped: u64,
+        _completion_routine: u64,
+    ) -> i32 {
+        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+            eprintln!("native ReadDirectoryChangesW handle={handle:#x} length={length} subtree={subtree} filter={filter:#x} overlapped={overlapped:#x}");
+        }
+        const VALID_FILTER: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x100;
+        if buffer.is_null()
+            || length < 12
+            || overlapped == 0
+            || overlapped & 7 != 0
+            || filter == 0
+            || filter & !VALID_FILTER != 0
+        {
+            if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+                eprintln!("native ReadDirectoryChangesW invalid args");
+            }
+            native_set_last_error(87);
+            return 0;
+        }
+        let Some(process) = process_ctx() else {
+            native_set_last_error(6);
+            return 0;
+        };
+        let (file, directory, baseline) = {
+            let Ok(fs) = process.fs.lock() else {
+                native_set_last_error(6);
+                return 0;
+            };
+            let Some(file) = fs.handles.get(&handle).cloned() else {
+                native_set_last_error(6);
+                return 0;
+            };
+            if !fs.fs.is_dir(&file.path) {
+                if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+                    eprintln!(
+                        "native ReadDirectoryChangesW not directory path={}",
+                        file.path
+                    );
+                }
+                native_set_last_error(267); // ERROR_DIRECTORY
+                return 0;
+            }
+            if !file.overlapped || native_overlapped_status(overlapped) == STATUS_PENDING {
+                if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+                    eprintln!("native ReadDirectoryChangesW invalid handle mode overlapped={} status={:#x}", file.overlapped, native_overlapped_status(overlapped));
+                }
+                native_set_last_error(87);
+                return 0;
+            }
+            let baseline = native_directory_snapshot(&fs.fs, &file.path, subtree != 0);
+            (file.clone(), file.path.clone(), baseline)
+        };
+        let event = match native_prepare_overlapped_event(overlapped) {
+            Ok(event) => event,
+            Err(error) => {
+                if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+                    eprintln!("native ReadDirectoryChangesW event error={error}");
+                }
+                native_set_last_error(error);
+                return 0;
+            }
+        };
+        let buffer_address = buffer as usize;
+        native_set_overlapped_status(overlapped, STATUS_PENDING, 0);
+        if !bytes_returned.is_null() {
+            unsafe { bytes_returned.write(0) };
+        }
+        native_set_last_error(997); // ERROR_IO_PENDING
+        std::thread::spawn(move || {
+            let mut previous = baseline;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                if native_overlapped_status(overlapped) != STATUS_PENDING {
+                    return;
+                }
+                let current = {
+                    let Ok(fs) = process.fs.lock() else { return };
+                    if !fs.handles.contains_key(&handle) || !fs.fs.is_dir(&directory) {
+                        return;
+                    }
+                    native_directory_snapshot(&fs.fs, &directory, subtree != 0)
+                };
+                let changes = native_directory_changes(&previous, &current, filter);
+                if changes.is_empty() {
+                    previous = current;
+                    continue;
+                }
+                let Some(encoded) = native_encode_directory_changes(&changes, length as usize)
+                else {
+                    native_set_overlapped_status(overlapped, 0x8000_0005, 0); // STATUS_BUFFER_OVERFLOW
+                    if let Some(event) = &event {
+                        native_signal_event(event);
+                    }
+                    if let Some((port, key)) = &file.completion {
+                        let event_value =
+                            unsafe { ((overlapped + 24) as *const u64).read_unaligned() };
+                        if event_value & 1 == 0 {
+                            if let Ok(mut queue) = port.queue.lock() {
+                                queue.push_back(NativeCompletion {
+                                    key: *key,
+                                    overlapped,
+                                    bytes: 0,
+                                    status: 0x8000_0005,
+                                });
+                                port.ready.notify_one();
+                            }
+                        }
+                    }
+                    return;
+                };
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        encoded.as_ptr(),
+                        buffer_address as *mut u8,
+                        encoded.len(),
+                    );
+                }
+                native_complete_file_io(&file, overlapped, encoded.len() as u32, event.as_ref());
+                return;
+            }
+        });
+        // libuv treats a false return as an immediate failure, even when the
+        // last error is ERROR_IO_PENDING. Windows reports that the async
+        // notification request was successfully queued with a nonzero return.
+        1
     }
     fn native_overlapped_offset(overlapped: u64) -> Option<usize> {
         let low = unsafe { ((overlapped + 16) as *const u32).read_unaligned() };
@@ -7587,6 +7892,52 @@ mod imp {
         }
     }
 
+    extern "win64" fn native_compare_string_ordinal(
+        left: *const u16,
+        left_len: i32,
+        right: *const u16,
+        right_len: i32,
+        ignore_case: i32,
+    ) -> i32 {
+        let (mut left, mut right) = match unsafe {
+            (
+                utf16_argument(left, left_len),
+                utf16_argument(right, right_len),
+            )
+        } {
+            (Some(left), Some(right)) => (left, right),
+            _ => return 0,
+        };
+        if ignore_case != 0 {
+            uppercase_ascii_utf16(&mut left);
+            uppercase_ascii_utf16(&mut right);
+        }
+        match left.cmp(&right) {
+            std::cmp::Ordering::Less => 1,
+            std::cmp::Ordering::Equal => 2,
+            std::cmp::Ordering::Greater => 3,
+        }
+    }
+
+    #[cfg(test)]
+    mod compare_string_ordinal_tests {
+        use super::*;
+
+        #[test]
+        fn compares_utf16_text_case_sensitively_or_ordinally() {
+            let left: Vec<u16> = "npm".encode_utf16().chain([0]).collect();
+            let right: Vec<u16> = "NPM".encode_utf16().chain([0]).collect();
+            assert_eq!(
+                native_compare_string_ordinal(left.as_ptr(), -1, right.as_ptr(), -1, 1),
+                2
+            );
+            assert_eq!(
+                native_compare_string_ordinal(left.as_ptr(), -1, right.as_ptr(), -1, 0),
+                3
+            );
+        }
+    }
+
     extern "win64" fn native_load_library_ex_w(path: *const u16, _file: u64, _flags: u32) -> u64 {
         (!path.is_null()).then_some(API_SET_MODULE).unwrap_or(0)
     }
@@ -7614,6 +7965,9 @@ mod imp {
         }
         match unsafe { ascii_z(name) } {
             Some("CompareStringEx") => native_compare_string_ex as *const () as usize as u64,
+            Some("CompareStringOrdinal") => {
+                native_compare_string_ordinal as *const () as usize as u64
+            }
             Some("GetEnvironmentVariableW") => {
                 native_get_environment_variable_w as *const () as usize as u64
             }
@@ -8475,7 +8829,7 @@ mod imp {
         let h = ctx.next;
         ctx.next += 1;
         if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
-            eprintln!("native CreateFileW opened path={path} handle={h:#x}");
+            eprintln!("native CreateFileW opened path={path} handle={h:#x} flags={flags:#x} access={_access:#x}");
         }
         ctx.handles.insert(
             h,
@@ -8497,7 +8851,11 @@ mod imp {
     }
     fn native_file_attributes_at(ctx: &NativeFs, path: &str, is_directory: bool) -> u32 {
         let base = native_file_attributes(is_directory);
-        let Some(key) = ctx.fs.normalize(path).ok().map(|path| path.display().to_lowercase())
+        let Some(key) = ctx
+            .fs
+            .normalize(path)
+            .ok()
+            .map(|path| path.display().to_lowercase())
         else {
             return base;
         };
@@ -8528,6 +8886,41 @@ mod imp {
             native_set_last_error(2);
             u32::MAX
         }
+    }
+
+    extern "win64" fn native_get_long_path_name_w(
+        path: *const u16,
+        output: *mut u16,
+        capacity: u32,
+    ) -> u32 {
+        let Some(path) = wide(path) else {
+            native_set_last_error(87);
+            return 0;
+        };
+        let Some(process) = process_ctx() else {
+            native_set_last_error(6);
+            return 0;
+        };
+        let Ok(fs) = process.fs.lock() else {
+            native_set_last_error(6);
+            return 0;
+        };
+        let normalized = match fs.fs.normalize(&path) {
+            Ok(path) => path.display(),
+            Err(_) => {
+                native_set_last_error(3);
+                return 0;
+            }
+        };
+        let encoded: Vec<u16> = normalized.encode_utf16().collect();
+        if output.is_null() || capacity as usize <= encoded.len() {
+            return (encoded.len() + 1) as u32;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(encoded.as_ptr(), output, encoded.len());
+            output.add(encoded.len()).write(0);
+        }
+        encoded.len() as u32
     }
     extern "win64" fn native_set_file_attributes_w(path: *const u16, attributes: u32) -> i32 {
         let Some(path) = wide(path) else {
@@ -9365,7 +9758,14 @@ mod imp {
             "#111" => Some(native_wsa_get_last_error as *const () as usize as u64),
             "#112" => Some(native_wsa_set_last_error as *const () as usize as u64),
             "GetSystemMetrics" => Some(native_get_system_metrics as *const () as usize as u64),
+            "CompareStringOrdinal" => {
+                Some(native_compare_string_ordinal as *const () as usize as u64)
+            }
             "GetLocaleInfoEx" => Some(native_get_locale_info_ex as *const () as usize as u64),
+            "GetLongPathNameW" => Some(native_get_long_path_name_w as *const () as usize as u64),
+            "ReadDirectoryChangesW" => {
+                Some(native_read_directory_changes_w as *const () as usize as u64)
+            }
             "AreFileApisANSI" => Some(native_are_file_apis_ansi as *const () as usize as u64),
             "LocalFree" => Some(native_local_free as *const () as usize as u64),
             "FreeLibraryAndExitThread" => {
@@ -9668,9 +10068,7 @@ mod imp {
             "CreateProcessW" => Some(native_create_process_w as *const () as usize as u64),
             "CreateFileW" => Some(native_create_file_w as *const () as usize as u64),
             "GetFileAttributesW" => Some(native_get_file_attributes_w as *const () as usize as u64),
-            "SetFileAttributesW" => {
-                Some(native_set_file_attributes_w as *const () as usize as u64)
-            }
+            "SetFileAttributesW" => Some(native_set_file_attributes_w as *const () as usize as u64),
             "GetFileAttributesExW" => {
                 Some(native_get_file_attributes_ex_w as *const () as usize as u64)
             }
