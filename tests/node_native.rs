@@ -60,7 +60,7 @@ fn official_windows_node_reads_guest_file_metadata_and_contents() {
     let host_file = std::env::temp_dir().join(format!("wincli-node-fs-{}.txt", std::process::id()));
     std::fs::write(&host_file, b"npm-probe\n").expect("create host seed file");
     let script = format!(
-        "@seed {} C:\\probe.txt\n\"{}\" -e \"const fs=require('node:fs');const p='C:\\\\probe.txt';console.log(fs.statSync(p).size+':'+fs.readFileSync(p,'utf8').trim())\"\nexit\n",
+        "@seed {} C:\\probe.txt\n\"{}\" -e \"const fs=require('node:fs');const p='C:\\\\probe.txt';console.log(fs.statSync(p).size+':'+fs.readFileSync(p,'utf8').trim()+':'+fs.readdirSync('C:/').includes('probe.txt'))\"\nexit\n",
         host_file.display(),
         node.display(),
     );
@@ -86,7 +86,7 @@ fn official_windows_node_reads_guest_file_metadata_and_contents() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(output.stdout, b"10:npm-probe\n");
+    assert_eq!(output.stdout, b"10:npm-probe:true\n");
 }
 
 #[test]

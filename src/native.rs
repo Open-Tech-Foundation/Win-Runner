@@ -589,6 +589,121 @@ mod imp {
         }
 
         #[test]
+        fn nt_query_directory_file_returns_native_winfs_entries() {
+            let directory = r"C:\nt_query_directory_unit";
+            let context = super::fs_ctx().unwrap();
+            {
+                let mut fs = context.lock().unwrap();
+                fs.fs.mkdir(directory).unwrap();
+                fs.fs.mkdir(&format!(r"{directory}\nested")).unwrap();
+                fs.fs
+                    .write_file(&format!(r"{directory}\alpha.txt"), b"a".to_vec())
+                    .unwrap();
+                fs.fs
+                    .write_file(&format!(r"{directory}\nested\beta.txt"), b"b".to_vec())
+                    .unwrap();
+                let handle = fs.next;
+                fs.next += 1;
+                fs.handles.insert(
+                    handle,
+                    super::NativeFile {
+                        path: directory.to_string(),
+                        offset: 0,
+                        overlapped: false,
+                        completion: None,
+                    },
+                );
+                drop(fs);
+
+                let mut io_status = [0u8; 16];
+                let mut entries = [0u8; 1024];
+                assert_eq!(
+                    super::native_nt_query_directory_file(
+                        handle,
+                        0,
+                        0,
+                        0,
+                        io_status.as_mut_ptr(),
+                        entries.as_mut_ptr(),
+                        entries.len() as u32,
+                        1,
+                        0,
+                        std::ptr::null(),
+                        1,
+                    ),
+                    0
+                );
+                assert_eq!(
+                    u64::from_le_bytes(io_status[8..16].try_into().unwrap()) as usize,
+                    88 + 76
+                );
+                let mut names = Vec::new();
+                let mut offset = 0;
+                loop {
+                    let next = u32::from_le_bytes(entries[offset..offset + 4].try_into().unwrap())
+                        as usize;
+                    let name_len = u32::from_le_bytes(
+                        entries[offset + 60..offset + 64].try_into().unwrap(),
+                    ) as usize;
+                    let name = std::char::decode_utf16(
+                        entries[offset + 64..offset + 64 + name_len]
+                            .chunks_exact(2)
+                            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]])),
+                    )
+                    .map(|character| character.unwrap())
+                    .collect::<String>();
+                    names.push(name);
+                    if next == 0 {
+                        break;
+                    }
+                    offset += next;
+                }
+                names.sort();
+                assert_eq!(names, ["alpha.txt", "nested"]);
+                assert_eq!(
+                    super::native_nt_query_directory_file(
+                        handle,
+                        0,
+                        0,
+                        0,
+                        io_status.as_mut_ptr(),
+                        entries.as_mut_ptr(),
+                        entries.len() as u32,
+                        1,
+                        0,
+                        std::ptr::null(),
+                        0,
+                    ),
+                    0x8000_0006
+                );
+                assert_eq!(
+                    super::native_nt_query_directory_file(
+                        handle,
+                        0,
+                        0,
+                        0,
+                        io_status.as_mut_ptr(),
+                        entries.as_mut_ptr(),
+                        entries.len() as u32,
+                        1,
+                        0,
+                        std::ptr::null(),
+                        1,
+                    ),
+                    0
+                );
+                let mut fs = context.lock().unwrap();
+                fs.handles.remove(&handle);
+                fs.fs.delete_file(&format!(r"{directory}\alpha.txt")).unwrap();
+                fs.fs
+                    .delete_file(&format!(r"{directory}\nested\beta.txt"))
+                    .unwrap();
+                fs.fs.rmdir(&format!(r"{directory}\nested")).unwrap();
+                fs.fs.rmdir(directory).unwrap();
+            }
+        }
+
+        #[test]
         fn get_file_information_by_handle_ex_reports_basic_metadata() {
             let path = r"C:\handle_ex_unit.txt";
             let context = super::fs_ctx().unwrap();
@@ -658,6 +773,170 @@ mod imp {
                 0
             );
             assert_eq!(super::native_get_last_error(), 6);
+        }
+
+        #[test]
+        fn create_file_supports_common_creation_dispositions() {
+            let path = r"C:\create_disposition_unit.txt";
+            let context = super::fs_ctx().unwrap();
+            let wide_path = path
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect::<Vec<_>>();
+            let create = |disposition| {
+                super::native_create_file_w(wide_path.as_ptr(), 0, 0, 0, disposition, 0, 0)
+            };
+
+            let created = create(1); // CREATE_NEW
+            assert_ne!(created, u64::MAX);
+            assert!(context
+                .lock()
+                .unwrap()
+                .fs
+                .read_file(path)
+                .unwrap()
+                .is_empty());
+            assert_eq!(super::native_close_handle(created), 1);
+            assert_eq!(create(1), u64::MAX);
+            assert_eq!(super::native_get_last_error(), 80);
+
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(path, b"keep me".to_vec())
+                .unwrap();
+            let opened = create(4); // OPEN_ALWAYS preserves existing contents
+            assert_ne!(opened, u64::MAX);
+            assert_eq!(super::native_get_last_error(), 183);
+            assert_eq!(
+                context.lock().unwrap().fs.read_file(path).unwrap(),
+                b"keep me"
+            );
+            let mut high = -1i32;
+            assert_eq!(super::native_set_file_pointer(opened, -1, &mut high, 2), 6);
+            assert_eq!(high, 0);
+            assert_eq!(
+                super::native_set_file_pointer(opened, 0, std::ptr::null_mut(), 0),
+                0
+            );
+            assert_eq!(super::native_close_handle(opened), 1);
+
+            let truncated = create(5); // TRUNCATE_EXISTING
+            assert_ne!(truncated, u64::MAX);
+            assert!(context
+                .lock()
+                .unwrap()
+                .fs
+                .read_file(path)
+                .unwrap()
+                .is_empty());
+            assert_eq!(super::native_close_handle(truncated), 1);
+
+            context.lock().unwrap().fs.delete_file(path).unwrap();
+        }
+
+        #[test]
+        fn move_file_ex_honors_replace_existing_and_rejects_bad_flags() {
+            let context = super::fs_ctx().unwrap();
+            let source = r"C:\move_file_ex_source.txt";
+            let destination = r"C:\move_file_ex_destination.txt";
+            {
+                let mut ctx = context.lock().unwrap();
+                ctx.fs.write_file(source, b"new".to_vec()).unwrap();
+                ctx.fs.write_file(destination, b"old".to_vec()).unwrap();
+            }
+            let source_wide = source
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect::<Vec<_>>();
+            let destination_wide = destination
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                super::native_move_file_ex_w(source_wide.as_ptr(), destination_wide.as_ptr(), 0),
+                0
+            );
+            assert_eq!(super::native_get_last_error(), 183);
+            assert_eq!(
+                super::native_move_file_ex_w(source_wide.as_ptr(), destination_wide.as_ptr(), 1),
+                1
+            );
+            assert_eq!(
+                context.lock().unwrap().fs.read_file(destination).unwrap(),
+                b"new"
+            );
+            assert!(!context.lock().unwrap().fs.exists(source));
+            assert_eq!(
+                super::native_move_file_ex_w(source_wide.as_ptr(), destination_wide.as_ptr(), 4),
+                0
+            );
+            assert_eq!(super::native_get_last_error(), 50);
+            context.lock().unwrap().fs.delete_file(destination).unwrap();
+        }
+
+        #[test]
+        fn file_mapping_views_read_and_commit_guest_file_bytes() {
+            let path = r"C:\file_mapping_unit.txt";
+            let context = super::fs_ctx().unwrap();
+            let handle = {
+                let mut fs = context.lock().unwrap();
+                fs.fs.write_file(path, b"abcdef".to_vec()).unwrap();
+                let handle = fs.next;
+                fs.next += 1;
+                fs.handles.insert(
+                    handle,
+                    super::NativeFile {
+                        path: path.into(),
+                        offset: 0,
+                        overlapped: false,
+                        completion: None,
+                    },
+                );
+                handle
+            };
+            let mapping =
+                super::native_create_file_mapping_w(handle, 0, 0x04, 0, 6, std::ptr::null());
+            assert_ne!(mapping, 0);
+            let view = super::native_map_view_of_file(mapping, 0x2, 0, 0, 0);
+            assert!(!view.is_null());
+            unsafe {
+                assert_eq!(std::slice::from_raw_parts(view, 6), b"abcdef");
+                view.add(1).write(b'Z');
+            }
+            assert_eq!(super::native_flush_view_of_file(view.cast(), 0), 1);
+            assert_eq!(
+                context.lock().unwrap().fs.read_file(path).unwrap(),
+                b"aZcdef"
+            );
+            assert_eq!(super::native_unmap_view_of_file(view.cast()), 1);
+            assert_eq!(
+                context.lock().unwrap().fs.read_file(path).unwrap(),
+                b"aZcdef"
+            );
+            assert_eq!(super::native_close_handle(mapping), 1);
+
+            let extended =
+                super::native_create_file_mapping_w(handle, 0, 0x04, 0, 9, std::ptr::null());
+            assert_ne!(extended, 0);
+            assert_eq!(
+                context.lock().unwrap().fs.read_file(path).unwrap(),
+                b"aZcdef\0\0\0"
+            );
+            let view = super::native_map_view_of_file(extended, 0x2, 0, 6, 3);
+            assert!(!view.is_null());
+            unsafe { std::ptr::copy_nonoverlapping(b"xyz".as_ptr(), view, 3) };
+            assert_eq!(super::native_unmap_view_of_file(view.cast()), 1);
+            assert_eq!(
+                context.lock().unwrap().fs.read_file(path).unwrap(),
+                b"aZcdefxyz"
+            );
+            assert_eq!(super::native_close_handle(extended), 1);
+
+            let mut fs = context.lock().unwrap();
+            fs.handles.remove(&handle);
+            fs.fs.delete_file(path).unwrap();
         }
 
         #[test]
@@ -3788,8 +4067,8 @@ mod imp {
         pointer_cookie: u64,
         heap_allocations: Mutex<HashMap<u64, usize>>,
         virtual_allocations: Mutex<HashMap<u64, NativeVirtualAllocation>>,
-        file_mappings: Mutex<HashMap<u64, (usize, u32)>>,
-        mapping_views: Mutex<HashMap<u64, usize>>,
+        file_mappings: Mutex<HashMap<u64, NativeFileMapping>>,
+        mapping_views: Mutex<HashMap<u64, NativeMappingView>>,
         mapping_next: AtomicU64,
         gs_base: AtomicU64,
         tls_template: Mutex<Option<NativeTls>>,
@@ -3868,6 +4147,18 @@ mod imp {
 
     struct NativeVirtualAllocation {
         length: usize,
+    }
+    #[derive(Clone)]
+    struct NativeFileMapping {
+        length: usize,
+        protection: u32,
+        path: Option<String>,
+    }
+    struct NativeMappingView {
+        length: usize,
+        view_length: usize,
+        backing: Option<(String, usize)>,
+        writable: bool,
     }
     struct NativeCompletionPort {
         queue: Mutex<std::collections::VecDeque<NativeCompletion>>,
@@ -6152,6 +6443,9 @@ mod imp {
         ctx.finds.insert(handle, NativeFind { names, index: 0 });
         handle
     }
+    extern "win64" fn native_find_first_file_w(pattern: *const u16, output: *mut u8) -> u64 {
+        native_find_first_file_ex_w(pattern, 0, output, 0, 0, 0)
+    }
     extern "win64" fn native_find_next_file_w(handle: u64, output: *mut u8) -> i32 {
         let context = match fs_ctx() {
             Some(value) => value,
@@ -7383,26 +7677,106 @@ mod imp {
     }
 
     extern "win64" fn native_nt_query_directory_file(
-        _file: u64,
+        file: u64,
         _event: u64,
         _apc_routine: u64,
         _apc_context: u64,
         io_status: *mut u8,
-        _information: *mut u8,
-        _length: u32,
-        _information_class: u32,
-        _return_single_entry: u8,
+        information: *mut u8,
+        length: u32,
+        information_class: u32,
+        return_single_entry: u8,
         _file_name: *const u8,
-        _restart_scan: u8,
+        restart_scan: u8,
     ) -> u32 {
-        const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
-        if !io_status.is_null() {
-            unsafe {
-                (io_status as *mut u32).write_unaligned(STATUS_NOT_IMPLEMENTED);
-                (io_status.add(8) as *mut u64).write_unaligned(0);
+        const STATUS_SUCCESS: u32 = 0;
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        const STATUS_NO_MORE_FILES: u32 = 0x8000_0006;
+        let finish = |status: u32, bytes: usize| {
+            if !io_status.is_null() {
+                unsafe {
+                    (io_status as *mut u32).write_unaligned(status);
+                    (io_status.add(8) as *mut u64).write_unaligned(bytes as u64);
+                }
             }
+            status
+        };
+        if io_status.is_null() || (information.is_null() && length != 0) {
+            return finish(STATUS_INVALID_PARAMETER, 0);
         }
-        STATUS_NOT_IMPLEMENTED
+        if information_class != 1 || return_single_entry > 1 || length < 64 {
+            return finish(STATUS_INVALID_PARAMETER, 0);
+        }
+        let Some(context) = fs_ctx() else {
+            return finish(STATUS_INVALID_HANDLE, 0);
+        };
+        let Ok(mut ctx) = context.lock() else {
+            return finish(STATUS_INVALID_HANDLE, 0);
+        };
+        let Some(file_info) = ctx.handles.get(&file) else {
+            return finish(STATUS_INVALID_HANDLE, 0);
+        };
+        let path = file_info.path.clone();
+        if !ctx.fs.is_dir(&path) {
+            return finish(STATUS_INVALID_PARAMETER, 0);
+        }
+        let Ok(names) = ctx.fs.list_dir(&path) else {
+            return finish(STATUS_INVALID_HANDLE, 0);
+        };
+        let index = if restart_scan != 0 {
+            0
+        } else {
+            file_info.offset
+        };
+        if index >= names.len() {
+            if let Some(file_info) = ctx.handles.get_mut(&file) {
+                file_info.offset = names.len();
+            }
+            return finish(STATUS_NO_MORE_FILES, 0);
+        }
+        let mut written = 0usize;
+        let mut current = index;
+        loop {
+            let encoded: Vec<u16> = names[current].encode_utf16().collect();
+            let entry_size = (64 + encoded.len() * 2 + 7) & !7;
+            if written + entry_size > length as usize {
+                if written == 0 {
+                    return finish(STATUS_INVALID_PARAMETER, 0);
+                }
+                break;
+            }
+            unsafe {
+                let entry = information.add(written);
+                std::ptr::write_bytes(entry, 0, entry_size);
+                (entry.add(60) as *mut u32).write_unaligned((encoded.len() * 2) as u32);
+                entry.add(56).cast::<u32>().write_unaligned(
+                    native_file_attributes(ctx.fs.is_dir(&format!("{path}\\{}", names[current]))),
+                );
+                entry.add(64).cast::<u16>().copy_from_nonoverlapping(encoded.as_ptr(), encoded.len());
+            }
+            let next = current + 1;
+            if return_single_entry != 0 || next == names.len() {
+                written += 64 + encoded.len() * 2;
+                current = next;
+                break;
+            }
+            let next_size = (64 + names[next].encode_utf16().count() * 2 + 7) & !7;
+            if written + entry_size + next_size > length as usize {
+                written += 64 + encoded.len() * 2;
+                current = next;
+                break;
+            }
+            unsafe {
+                (information.add(written) as *mut u32).write_unaligned(entry_size as u32);
+            }
+            written += entry_size;
+            current = next;
+        }
+        if let Some(file_info) = ctx.handles.get_mut(&file) {
+            file_info.offset = current;
+        }
+        finish(STATUS_SUCCESS, written)
     }
 
     extern "win64" fn native_nt_query_system_information(
@@ -7670,19 +8044,36 @@ mod imp {
         };
         let exists = ctx.fs.exists(&path);
         let ok = match creation {
-            2 => ctx.fs.write_file(&path, Vec::new()),
+            1 if !exists => ctx.fs.write_file(&path, Vec::new()), // CREATE_NEW
+            1 => Err("file already exists".into()),
+            2 => ctx.fs.write_file(&path, Vec::new()), // CREATE_ALWAYS
             // OPEN_EXISTING can target either a file or a directory. The
             // caller supplies FILE_FLAG_BACKUP_SEMANTICS for directories;
             // enumeration support consumes the resulting handle next.
-            3 if exists && (ctx.fs.is_file(&path) || ctx.fs.is_dir(&path)) => Ok(()),
+            3 | 4 if exists && (ctx.fs.is_file(&path) || ctx.fs.is_dir(&path)) => Ok(()),
+            4 => ctx.fs.write_file(&path, Vec::new()), // OPEN_ALWAYS
+            5 if ctx.fs.is_file(&path) => ctx.fs.write_file(&path, Vec::new()), // TRUNCATE_EXISTING
             _ => Err("unsupported create".into()),
         };
         if ok.is_err() {
-            native_set_last_error(if creation == 3 && !exists { 2 } else { 87 });
+            native_set_last_error(match (creation, exists) {
+                (1, true) => 80,         // ERROR_FILE_EXISTS
+                (3 | 4 | 5, false) => 2, // ERROR_FILE_NOT_FOUND
+                _ => 87,                 // ERROR_INVALID_PARAMETER
+            });
+            if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+                eprintln!("native CreateFileW failed path={path}");
+            }
             return u64::MAX;
+        }
+        if exists && matches!(creation, 2 | 4) {
+            native_set_last_error(183); // ERROR_ALREADY_EXISTS
         }
         let h = ctx.next;
         ctx.next += 1;
+        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+            eprintln!("native CreateFileW opened path={path} handle={h:#x}");
+        }
         ctx.handles.insert(
             h,
             NativeFile {
@@ -7967,6 +8358,28 @@ mod imp {
         }
         1
     }
+    extern "win64" fn native_set_file_pointer(
+        handle: u64,
+        distance_low: i32,
+        distance_high: *mut i32,
+        method: u32,
+    ) -> u32 {
+        let distance = if distance_high.is_null() {
+            i64::from(distance_low)
+        } else {
+            let high = unsafe { distance_high.read_unaligned() };
+            ((i64::from(high)) << 32) | i64::from(distance_low as u32)
+        };
+        let mut position = 0i64;
+        native_set_last_error(0);
+        if native_set_file_pointer_ex(handle, distance, &mut position, method) == 0 {
+            return u32::MAX;
+        }
+        if !distance_high.is_null() {
+            unsafe { distance_high.write_unaligned((position >> 32) as i32) };
+        }
+        position as u32
+    }
     extern "win64" fn native_read_file(
         h: u64,
         buf: *mut u8,
@@ -8228,6 +8641,44 @@ mod imp {
             })
             .unwrap_or(false) as i32
     }
+    extern "win64" fn native_move_file_ex_w(a: *const u16, b: *const u16, flags: u32) -> i32 {
+        if flags & !0x0b != 0 || flags & 0x04 != 0 {
+            native_set_last_error(if flags & 0x04 != 0 { 50 } else { 87 });
+            return 0;
+        }
+        let (Some(source), Some(destination)) = (wide(a), wide(b)) else {
+            native_set_last_error(87);
+            return 0;
+        };
+        let Some(context) = fs_ctx() else {
+            native_set_last_error(6);
+            return 0;
+        };
+        let Ok(mut ctx) = context.lock() else {
+            native_set_last_error(6);
+            return 0;
+        };
+        if !ctx.fs.exists(&source) {
+            native_set_last_error(2);
+            return 0;
+        }
+        if ctx.fs.exists(&destination) {
+            if flags & 0x01 == 0 {
+                native_set_last_error(183);
+                return 0;
+            }
+            if ctx.fs.delete_file(&destination).is_err() {
+                native_set_last_error(5);
+                return 0;
+            }
+        }
+        if ctx.fs.move_path(&source, &destination).is_ok() {
+            1
+        } else {
+            native_set_last_error(2);
+            0
+        }
+    }
     extern "win64" fn native_copy_file_w(a: *const u16, b: *const u16, fail: i32) -> i32 {
         let (a, b) = match (wide(a), wide(b)) {
             (Some(a), Some(b)) => (a, b),
@@ -8353,6 +8804,7 @@ mod imp {
             "CreateFileMappingW" => Some(native_create_file_mapping_w as *const () as usize as u64),
             "CreateFileMappingA" => Some(native_create_file_mapping_a as *const () as usize as u64),
             "MapViewOfFile" => Some(native_map_view_of_file as *const () as usize as u64),
+            "FlushViewOfFile" => Some(native_flush_view_of_file as *const () as usize as u64),
             "UnmapViewOfFile" => Some(native_unmap_view_of_file as *const () as usize as u64),
             "CryptAcquireContextW" => {
                 Some(native_crypt_acquire_context_w as *const () as usize as u64)
@@ -8621,6 +9073,7 @@ mod imp {
             }
             "SetFileTime" => Some(native_set_file_time as *const () as usize as u64),
             "SetFilePointerEx" => Some(native_set_file_pointer_ex as *const () as usize as u64),
+            "SetFilePointer" => Some(native_set_file_pointer as *const () as usize as u64),
             "WriteFile" => Some(native_write_file as *const () as usize as u64),
             "WriteConsoleW" => Some(native_write_console_w as *const () as usize as u64),
             "ExitProcess" => Some(native_exit_process as *const () as usize as u64),
@@ -8638,6 +9091,7 @@ mod imp {
                 Some(native_get_final_path_name_by_handle_w as *const () as usize as u64)
             }
             "FindFirstFileExW" => Some(native_find_first_file_ex_w as *const () as usize as u64),
+            "FindFirstFileW" => Some(native_find_first_file_w as *const () as usize as u64),
             "FindNextFileW" => Some(native_find_next_file_w as *const () as usize as u64),
             "FindClose" => Some(native_find_close as *const () as usize as u64),
             "CreateThread" => Some(native_create_thread as *const () as usize as u64),
@@ -8666,6 +9120,7 @@ mod imp {
             "RemoveDirectoryW" => Some(native_remove_directory_w as *const () as usize as u64),
             "DeleteFileW" => Some(native_delete_file_w as *const () as usize as u64),
             "MoveFileW" => Some(native_move_file_w as *const () as usize as u64),
+            "MoveFileExW" => Some(native_move_file_ex_w as *const () as usize as u64),
             "CopyFileW" => Some(native_copy_file_w as *const () as usize as u64),
             _ => None,
         }
@@ -8841,21 +9296,73 @@ mod imp {
         size_low: u32,
         _name: *const u16,
     ) -> u64 {
-        let size = ((size_high as u64) << 32) | size_low as u64;
-        if file != u64::MAX
-            || size == 0
-            || size > usize::MAX as u64
-            || linux_protection(protection).is_none()
-        {
+        let requested_size = ((size_high as u64) << 32) | size_low as u64;
+        if !matches!(protection, 0x02 | 0x04) || requested_size > usize::MAX as u64 {
             native_set_last_error(87);
             return 0;
         }
         let Some(process) = process_ctx() else {
             return 0;
         };
+        let (path, size) = if file == u64::MAX {
+            if requested_size == 0 {
+                native_set_last_error(87);
+                return 0;
+            }
+            (None, requested_size as usize)
+        } else {
+            let Some(context) = fs_ctx() else {
+                native_set_last_error(6);
+                return 0;
+            };
+            let Ok(mut ctx) = context.lock() else {
+                native_set_last_error(6);
+                return 0;
+            };
+            let Some(native_file) = ctx.handles.get(&file) else {
+                native_set_last_error(6);
+                return 0;
+            };
+            if ctx.fs.is_dir(&native_file.path) {
+                native_set_last_error(87);
+                return 0;
+            }
+            let path = native_file.path.clone();
+            let mut contents = match ctx.fs.read_file(&path) {
+                Ok(contents) => contents,
+                Err(_) => {
+                    native_set_last_error(6);
+                    return 0;
+                }
+            };
+            let size = if requested_size == 0 {
+                contents.len()
+            } else {
+                requested_size as usize
+            };
+            if size == 0 {
+                native_set_last_error(87);
+                return 0;
+            }
+            if contents.len() < size {
+                contents.resize(size, 0);
+                if ctx.fs.write_file(&path, contents).is_err() {
+                    native_set_last_error(5);
+                    return 0;
+                }
+            }
+            (Some(path), size)
+        };
         let handle = process.mapping_next.fetch_add(1, Ordering::AcqRel);
         let result = if let Ok(mut values) = process.file_mappings.lock() {
-            values.insert(handle, (size as usize, protection));
+            values.insert(
+                handle,
+                NativeFileMapping {
+                    length: size,
+                    protection,
+                    path,
+                },
+            );
             handle
         } else {
             0
@@ -8891,32 +9398,34 @@ mod imp {
         let Some(process) = process_ctx() else {
             return ptr::null_mut();
         };
-        let Some((size, protection)) = process
+        let Some(mapping) = process
             .file_mappings
             .lock()
             .ok()
-            .and_then(|values| values.get(&mapping).copied())
+            .and_then(|values| values.get(&mapping).cloned())
         else {
             native_set_last_error(6);
             return ptr::null_mut();
         };
         let offset = ((offset_high as u64) << 32) | offset_low as u64;
+        let Ok(offset) = usize::try_from(offset) else {
+            native_set_last_error(87);
+            return ptr::null_mut();
+        };
         let length = if bytes == 0 {
-            size.saturating_sub(offset as usize)
+            mapping.length.saturating_sub(offset)
         } else {
             bytes
         };
-        if offset != 0 || length == 0 || length > size {
+        let Some(end) = offset.checked_add(length) else {
+            native_set_last_error(87);
+            return ptr::null_mut();
+        };
+        if length == 0 || end > mapping.length || (access & 0x2 != 0 && mapping.protection != 0x04)
+        {
             native_set_last_error(87);
             return ptr::null_mut();
         }
-        let host_protection = if access & 2 != 0 {
-            PROT_READ | PROT_WRITE
-        } else if access & 4 != 0 {
-            PROT_READ
-        } else {
-            linux_protection(protection).unwrap_or(PROT_READ)
-        };
         let Ok(mapped_length) = page_len(length) else {
             native_set_last_error(8);
             return ptr::null_mut();
@@ -8925,7 +9434,7 @@ mod imp {
             mmap(
                 ptr::null_mut(),
                 mapped_length,
-                host_protection,
+                PROT_READ | PROT_WRITE,
                 MAP_PRIVATE | MAP_ANONYMOUS,
                 -1,
                 0,
@@ -8935,17 +9444,117 @@ mod imp {
             native_set_last_error(8);
             return ptr::null_mut();
         }
+        let view = result.cast::<u8>();
+        if let Some(path) = mapping.path.as_deref() {
+            let Some(context) = fs_ctx() else {
+                unsafe { munmap(result, mapped_length) };
+                native_set_last_error(6);
+                return ptr::null_mut();
+            };
+            let Ok(ctx) = context.lock() else {
+                unsafe { munmap(result, mapped_length) };
+                native_set_last_error(6);
+                return ptr::null_mut();
+            };
+            let Ok(contents) = ctx.fs.read_file(path) else {
+                unsafe { munmap(result, mapped_length) };
+                native_set_last_error(6);
+                return ptr::null_mut();
+            };
+            if offset < contents.len() {
+                let count = length.min(contents.len() - offset);
+                unsafe { ptr::copy_nonoverlapping(contents.as_ptr().add(offset), view, count) };
+            }
+        }
+        let writable = access & 0x2 != 0;
+        let copy_on_write = access & 0x1 != 0;
+        let host_protection = if writable || copy_on_write {
+            PROT_READ | PROT_WRITE
+        } else if access & 0x4 != 0 {
+            PROT_READ
+        } else {
+            linux_protection(mapping.protection).unwrap_or(PROT_READ)
+        };
+        if unsafe { mprotect(result, mapped_length, host_protection) } != 0 {
+            unsafe { munmap(result, mapped_length) };
+            native_set_last_error(87);
+            return ptr::null_mut();
+        }
         if let Ok(mut views) = process.mapping_views.lock() {
-            views.insert(result as u64, mapped_length);
+            views.insert(
+                result as u64,
+                NativeMappingView {
+                    length: mapped_length,
+                    view_length: length,
+                    backing: mapping.path.map(|path| (path, offset)),
+                    writable,
+                },
+            );
         }
         result.cast()
     }
 
-    extern "win64" fn native_unmap_view_of_file(address: *mut c_void) -> i32 {
+    fn native_flush_mapping_view(
+        address: *const u8,
+        view: &NativeMappingView,
+        bytes: usize,
+    ) -> Result<(), u32> {
+        if !view.writable {
+            return Ok(());
+        }
+        let Some((path, offset)) = view.backing.as_ref() else {
+            return Ok(());
+        };
+        let count = if bytes == 0 { view.view_length } else { bytes };
+        if count > view.view_length {
+            return Err(87);
+        }
+        let end = offset.checked_add(count).ok_or(87u32)?;
+        let Some(context) = fs_ctx() else {
+            return Err(6);
+        };
+        let mut ctx = context.lock().map_err(|_| 6u32)?;
+        let mut contents = ctx.fs.read_file(path).map_err(|_| 6u32)?;
+        if contents.len() < end {
+            contents.resize(end, 0);
+        }
+        unsafe {
+            ptr::copy_nonoverlapping(address, contents.as_mut_ptr().add(*offset), count);
+        }
+        ctx.fs.write_file(path, contents).map_err(|_| 5u32)
+    }
+
+    extern "win64" fn native_flush_view_of_file(address: *const c_void, bytes: usize) -> i32 {
         let Some(process) = process_ctx() else {
+            native_set_last_error(6);
             return 0;
         };
-        let Some(length) = process
+        let Some(view) = process.mapping_views.lock().ok().and_then(|values| {
+            values.get(&(address as u64)).map(|view| NativeMappingView {
+                length: view.length,
+                view_length: view.view_length,
+                backing: view.backing.clone(),
+                writable: view.writable,
+            })
+        }) else {
+            native_set_last_error(487);
+            return 0;
+        };
+        match native_flush_mapping_view(address.cast(), &view, bytes) {
+            Ok(()) => 1,
+            Err(error) => {
+                native_set_last_error(error);
+                0
+            }
+        }
+    }
+
+    extern "win64" fn native_unmap_view_of_file(address: *mut c_void) -> i32 {
+        let Some(process) = process_ctx() else {
+            native_set_last_error(6);
+            return 0;
+        };
+        let Some(view) = process
             .mapping_views
             .lock()
             .ok()
@@ -8954,7 +9563,12 @@ mod imp {
             native_set_last_error(487);
             return 0;
         };
-        (unsafe { munmap(address, length) } == 0) as i32
+        if let Err(error) = native_flush_mapping_view(address.cast(), &view, 0) {
+            unsafe { munmap(address, view.length) };
+            native_set_last_error(error);
+            return 0;
+        }
+        (unsafe { munmap(address, view.length) } == 0) as i32
     }
 
     extern "win64" fn native_set_console_ctrl_handler(_handler: u64, _add: i32) -> i32 {

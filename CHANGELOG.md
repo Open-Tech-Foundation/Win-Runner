@@ -27,6 +27,12 @@ All notable changes to this project will be documented in this file.
   files supplied through the guest filesystem.
 - Added `GetFileInformationByHandleEx`, `GetFileSizeEx`, ANSI file mappings, and
   synchronous `NtWriteFile` support for native Windows processes.
+- Added WinFS-backed `NtQueryDirectoryFile` enumeration, including multi-entry
+  directory results and restart/end-of-directory behavior used by Node's
+  `fs.readdir` implementation.
+- Added file-backed `CreateFileMappingW` views with flush/unmap persistence, the
+  common `CreateFileW` creation dispositions, and `MoveFileExW` replacement
+  support used by package managers and other Windows applications.
 - Added `CancelIoEx` and same-thread `CancelIo` for pending native WinFS
   operations, including canceled `OVERLAPPED` status, event signaling, and
   failed IOCP completion packets. Native unit and PE tests cover cancellation
