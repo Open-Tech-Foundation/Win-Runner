@@ -153,12 +153,13 @@ API. Set `WINCLI_NATIVE_DIAGNOSTIC=1` to log dynamic import misses and native
 startup calls.
 Node can load JavaScript modules and read and stat files in WinFS. With the
 staged npm files under `target/nodejs/npm-stage/C/npm`, its CLI `--version`
-command also runs on the native backend. Package installation and network
-operations have not been verified.
+command also runs on the native backend. The offline tarball and live registry
+install paths have both been exercised.
 Set `WINCLI_NODE_EXE=target/nodejs/node-v24.21.0-win-x64.exe` when running
-`cargo test --test node_native` to include the real binary checks. The npm E2E
-uses `WINCLI_NPM_ROOT` if set; otherwise it looks for `npm-stage/C/npm` beside
-the Node executable. The executable
+`cargo test --test node_native` to include the real binary checks. Set
+`WINCLI_TEST_LIVE_NPM=1` as well to install a package from the live npm registry.
+The npm E2E uses `WINCLI_NPM_ROOT` if set; otherwise it looks for
+`npm-stage/C/npm` beside the Node executable. The executable
 comes from `https://nodejs.org/download/release/v24.21.0/win-x64/node.exe`;
 its official SHA-256 is
 `ba4e6d110e8c1592a1ecd390f6b05f3da124b13871a5be62b341a07a853c6c32`.

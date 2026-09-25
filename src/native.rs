@@ -220,8 +220,14 @@ mod imp {
         fn gethostname(name: *mut i8, length: usize) -> i32;
         fn clock_gettime(clock_id: i32, time: *mut NativeTimespec) -> i32;
         fn socket(domain: i32, kind: i32, protocol: i32) -> i32;
+        fn fcntl(fd: i32, command: i32, ...) -> i32;
         fn ioctl(fd: i32, request: usize, argp: *mut c_void) -> i32;
+        fn bind(fd: i32, address: *const u8, length: u32) -> i32;
         fn connect(fd: i32, address: *const u8, length: u32) -> i32;
+        fn send(fd: i32, buffer: *const c_void, length: usize, flags: i32) -> isize;
+        fn recv(fd: i32, buffer: *mut c_void, length: usize, flags: i32) -> isize;
+        fn poll(fds: *mut NativePollFd, count: usize, timeout: i32) -> i32;
+        fn setsockopt(fd: i32, level: i32, option: i32, value: *const c_void, length: u32) -> i32;
         fn getsockopt(
             fd: i32,
             level: i32,
@@ -229,6 +235,9 @@ mod imp {
             value: *mut c_void,
             length: *mut u32,
         ) -> i32;
+        fn getsockname(fd: i32, address: *mut u8, length: *mut u32) -> i32;
+        fn getpeername(fd: i32, address: *mut u8, length: *mut u32) -> i32;
+        fn shutdown(fd: i32, how: i32) -> i32;
         fn getaddrinfo(
             node: *const i8,
             service: *const i8,
@@ -236,6 +245,13 @@ mod imp {
             result: *mut *mut HostAddrInfo,
         ) -> i32;
         fn freeaddrinfo(result: *mut HostAddrInfo);
+    }
+
+    #[repr(C)]
+    struct NativePollFd {
+        fd: i32,
+        events: i16,
+        revents: i16,
     }
 
     // RtlCaptureContext is called directly from guest code. Capture the live
@@ -3165,6 +3181,41 @@ mod imp {
             native_set_last_error(87);
             return 0;
         }
+        if file & 0xffff_ffff_0000_0000 == SOCKET_HANDLE_TAG {
+            let (handle, port) = if existing_port != 0 {
+                let Some(port) = process
+                    .completion_ports
+                    .lock()
+                    .ok()
+                    .and_then(|ports| ports.get(&existing_port).cloned())
+                else {
+                    native_set_last_error(6);
+                    return 0;
+                };
+                (existing_port, port)
+            } else {
+                let handle = process.completion_next.fetch_add(1, Ordering::AcqRel);
+                let port = Arc::new(NativeCompletionPort {
+                    queue: Mutex::new(std::collections::VecDeque::new()),
+                    ready: Condvar::new(),
+                });
+                if let Ok(mut ports) = process.completion_ports.lock() {
+                    ports.insert(handle, port.clone());
+                } else {
+                    return 0;
+                }
+                (handle, port)
+            };
+            let Ok(mut associations) = process.socket_completion_ports.lock() else {
+                return 0;
+            };
+            if associations.contains_key(&file) {
+                native_set_last_error(87);
+                return 0;
+            }
+            associations.insert(file, (port, completion_key));
+            return handle;
+        }
         let mut fs = match process.fs.lock() {
             Ok(fs) => fs,
             Err(_) => return 0,
@@ -3206,6 +3257,59 @@ mod imp {
             fs.handles.get_mut(&file).unwrap().completion = Some((port, completion_key));
         }
         handle
+    }
+    extern "win64" fn native_set_file_completion_notification_modes(
+        handle: u64,
+        flags: u32,
+    ) -> i32 {
+        // The Windows API declares UCHAR flags. Ignore unrelated high bits in
+        // RDX, which are not part of the argument on the x64 ABI.
+        let modes = flags as u8;
+        if handle & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG
+            || modes & !0x3 != 0
+            || unsafe { fcntl(handle as i32, 3) } < 0
+        {
+            native_set_last_error(6);
+            return 0;
+        }
+        if let Some(process) = process_ctx() {
+            if let Ok(mut socket_modes) = process.socket_completion_modes.lock() {
+                socket_modes.insert(handle, modes);
+            }
+        }
+        1
+    }
+    fn native_post_socket_completion(socket: u64, overlapped: u64, bytes: u32) {
+        if overlapped == 0 {
+            return;
+        }
+        let Some(process) = process_ctx() else { return };
+        let skip_port_on_success = process
+            .socket_completion_modes
+            .lock()
+            .ok()
+            .and_then(|modes| modes.get(&socket).copied())
+            .is_some_and(|modes| modes & 0x2 != 0);
+        if skip_port_on_success {
+            return;
+        }
+        let association = process
+            .socket_completion_ports
+            .lock()
+            .ok()
+            .and_then(|associations| associations.get(&socket).cloned());
+        if let Some((port, key)) = association {
+            native_set_overlapped_status(overlapped, 0, bytes);
+            if let Ok(mut queue) = port.queue.lock() {
+                queue.push_back(NativeCompletion {
+                    key,
+                    overlapped,
+                    bytes,
+                    status: 0,
+                });
+                port.ready.notify_one();
+            }
+        }
     }
     fn native_prepare_overlapped_event(overlapped: u64) -> Result<Option<Arc<NativeEvent>>, u32> {
         if overlapped == 0 {
@@ -4081,6 +4185,8 @@ mod imp {
         event_names: Mutex<HashMap<String, std::sync::Weak<NativeEvent>>>,
         event_next: AtomicU64,
         completion_ports: Mutex<HashMap<u64, Arc<NativeCompletionPort>>>,
+        socket_completion_ports: Mutex<HashMap<u64, (Arc<NativeCompletionPort>, u64)>>,
+        socket_completion_modes: Mutex<HashMap<u64, u8>>,
         completion_next: AtomicU64,
         io_wait: Mutex<()>,
         io_ready: Condvar,
@@ -4251,6 +4357,8 @@ mod imp {
             event_names: Mutex::new(HashMap::new()),
             event_next: AtomicU64::new(0x6100_0000),
             completion_ports: Mutex::new(HashMap::new()),
+            socket_completion_ports: Mutex::new(HashMap::new()),
+            socket_completion_modes: Mutex::new(HashMap::new()),
             completion_next: AtomicU64::new(0x9000_0000),
             io_wait: Mutex::new(()),
             io_ready: Condvar::new(),
@@ -4490,10 +4598,30 @@ mod imp {
         1
     }
 
-    extern "win64" fn native_set_handle_information(handle: u64, mask: u32, _flags: u32) -> i32 {
+    extern "win64" fn native_set_handle_information(handle: u64, mask: u32, flags: u32) -> i32 {
         if mask & !0x3 != 0 {
             native_set_last_error(87);
             return 0;
+        }
+        if handle & 0xffff_ffff_0000_0000 == SOCKET_HANDLE_TAG {
+            let fd = handle as i32;
+            let descriptor_flags = unsafe { fcntl(fd, 1) }; // F_GETFD
+            if descriptor_flags < 0 {
+                native_set_last_error(6);
+                return 0;
+            }
+            if mask & 1 != 0 {
+                let next_flags = if flags & 1 != 0 {
+                    descriptor_flags & !1 // inheritable: clear FD_CLOEXEC
+                } else {
+                    descriptor_flags | 1
+                };
+                if unsafe { fcntl(fd, 2, next_flags) } < 0 {
+                    native_set_last_error(6);
+                    return 0;
+                }
+            }
+            return 1;
         }
         if host_standard_fd(handle).is_some()
             || fs_ctx().is_some_and(|context| {
@@ -4506,6 +4634,19 @@ mod imp {
         }
         native_set_last_error(6);
         0
+    }
+    #[cfg(test)]
+    pub(super) fn test_socket_handle_inheritability() -> bool {
+        let socket = native_socket(2, 1, 0);
+        if socket == u64::MAX {
+            return false;
+        }
+        let result = native_set_handle_information(socket, 1, 1) == 1
+            && unsafe { fcntl(socket as i32, 1) } & 1 == 0
+            && native_set_handle_information(socket, 1, 0) == 1
+            && unsafe { fcntl(socket as i32, 1) } & 1 != 0;
+        let _ = native_close_socket(socket);
+        result
     }
     extern "win64" fn native_duplicate_handle(
         source_process: u64,
@@ -5871,6 +6012,116 @@ mod imp {
         }
         1
     }
+    extern "win64" fn native_get_system_time(out: *mut u16) {
+        if out.is_null() {
+            return;
+        }
+        #[repr(C)]
+        struct HostTm {
+            sec: i32,
+            min: i32,
+            hour: i32,
+            mday: i32,
+            mon: i32,
+            year: i32,
+            wday: i32,
+            yday: i32,
+            isdst: i32,
+            gmtoff: i64,
+            zone: *const i8,
+        }
+        unsafe extern "C" {
+            fn gmtime_r(time: *const i64, result: *mut HostTm) -> *mut HostTm;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let seconds = now.as_secs().min(i64::MAX as u64) as i64;
+        let mut tm = std::mem::MaybeUninit::<HostTm>::uninit();
+        if unsafe { gmtime_r(&seconds, tm.as_mut_ptr()) }.is_null() {
+            return;
+        }
+        let tm = unsafe { tm.assume_init() };
+        let fields = [
+            (tm.year + 1900) as u16,
+            (tm.mon + 1) as u16,
+            tm.wday as u16,
+            tm.mday as u16,
+            tm.hour as u16,
+            tm.min as u16,
+            tm.sec as u16,
+            now.subsec_millis() as u16,
+        ];
+        unsafe {
+            std::ptr::copy_nonoverlapping(fields.as_ptr(), out, fields.len());
+        }
+    }
+
+    extern "win64" fn native_system_time_to_file_time(
+        system_time: *const u16,
+        out: *mut u64,
+    ) -> i32 {
+        if system_time.is_null() || out.is_null() {
+            native_set_last_error(87);
+            return 0;
+        }
+        #[repr(C)]
+        struct HostTm {
+            sec: i32,
+            min: i32,
+            hour: i32,
+            mday: i32,
+            mon: i32,
+            year: i32,
+            wday: i32,
+            yday: i32,
+            isdst: i32,
+            gmtoff: i64,
+            zone: *const i8,
+        }
+        unsafe extern "C" {
+            fn timegm(time: *mut HostTm) -> i64;
+        }
+        let f = unsafe { std::slice::from_raw_parts(system_time, 8) };
+        if f[0] < 1601
+            || !(1..=12).contains(&f[1])
+            || !(1..=31).contains(&f[3])
+            || f[4] > 23
+            || f[5] > 59
+            || f[6] > 59
+            || f[7] > 999
+        {
+            native_set_last_error(87);
+            return 0;
+        }
+        let mut tm = HostTm {
+            sec: f[6] as i32,
+            min: f[5] as i32,
+            hour: f[4] as i32,
+            mday: f[3] as i32,
+            mon: f[1] as i32 - 1,
+            year: f[0] as i32 - 1900,
+            wday: 0,
+            yday: 0,
+            isdst: 0,
+            gmtoff: 0,
+            zone: std::ptr::null(),
+        };
+        let seconds = unsafe { timegm(&mut tm) };
+        if seconds < 0 {
+            native_set_last_error(87);
+            return 0;
+        }
+        let ticks = (seconds as u64)
+            .saturating_mul(10_000_000)
+            .saturating_add((f[7] as u64) * 10_000)
+            .saturating_add(116_444_736_000_000_000);
+        unsafe {
+            out.write_unaligned(ticks);
+        }
+        1
+    }
+
     extern "win64" fn native_get_system_time_as_file_time(out: *mut u64) {
         if out.is_null() {
             return;
@@ -7035,6 +7286,8 @@ mod imp {
                 event_names: Mutex::new(HashMap::new()),
                 event_next: AtomicU64::new(0x6100_0000),
                 completion_ports: Mutex::new(HashMap::new()),
+                socket_completion_ports: Mutex::new(HashMap::new()),
+                socket_completion_modes: Mutex::new(HashMap::new()),
                 completion_next: AtomicU64::new(0x9000_0000),
                 io_wait: Mutex::new(()),
                 io_ready: Condvar::new(),
@@ -7796,10 +8049,16 @@ mod imp {
                 let entry = information.add(written);
                 std::ptr::write_bytes(entry, 0, entry_size);
                 (entry.add(60) as *mut u32).write_unaligned((encoded.len() * 2) as u32);
-                entry.add(56).cast::<u32>().write_unaligned(
-                    native_file_attributes(ctx.fs.is_dir(&format!("{path}\\{}", names[current]))),
-                );
-                entry.add(64).cast::<u16>().copy_from_nonoverlapping(encoded.as_ptr(), encoded.len());
+                entry
+                    .add(56)
+                    .cast::<u32>()
+                    .write_unaligned(native_file_attributes(
+                        ctx.fs.is_dir(&format!("{path}\\{}", names[current])),
+                    ));
+                entry
+                    .add(64)
+                    .cast::<u16>()
+                    .copy_from_nonoverlapping(encoded.as_ptr(), encoded.len());
             }
             let next = current + 1;
             if return_single_entry != 0 || next == names.len() {
@@ -8813,7 +9072,11 @@ mod imp {
             ),
             "WS2_32.DLL" => matches!(
                 func,
-                "#3" | "#4"
+                "#2" | "#3"
+                    | "#4"
+                    | "#5"
+                    | "#6"
+                    | "#21"
                     | "#7"
                     | "#11"
                     | "#10"
@@ -8829,6 +9092,9 @@ mod imp {
                     | "#112"
                     | "#115"
                     | "#116"
+                    | "WSAIoctl"
+                    | "WSARecv"
+                    | "WSASend"
             ),
             "USER32.DLL" => func == "GetSystemMetrics",
             "IPHLPAPI.DLL" => func == "GetAdaptersAddresses",
@@ -8869,6 +9135,10 @@ mod imp {
             "#10" => Some(native_ioctlsocket as *const () as usize as u64),
             "#11" => Some(native_wsa_inet_addr as *const () as usize as u64),
             "#4" => Some(native_connect_socket as *const () as usize as u64),
+            "#2" => Some(native_bind_socket as *const () as usize as u64),
+            "#5" => Some(native_getpeername as *const () as usize as u64),
+            "#6" => Some(native_getsockname as *const () as usize as u64),
+            "#21" => Some(native_setsockopt as *const () as usize as u64),
             "#57" => Some(native_wsa_get_host_name as *const () as usize as u64),
             "GetAddrInfoW" => Some(native_get_addr_info_w as *const () as usize as u64),
             "FreeAddrInfoW" => Some(native_free_addr_info_w as *const () as usize as u64),
@@ -8877,6 +9147,9 @@ mod imp {
             "#23" => Some(native_socket as *const () as usize as u64),
             "#3" => Some(native_close_socket as *const () as usize as u64),
             "#7" => Some(native_getsockopt as *const () as usize as u64),
+            "WSAIoctl" => Some(native_wsa_ioctl as *const () as usize as u64),
+            "WSARecv" => Some(native_wsa_recv as *const () as usize as u64),
+            "WSASend" => Some(native_wsa_send as *const () as usize as u64),
             "#111" => Some(native_wsa_get_last_error as *const () as usize as u64),
             "#112" => Some(native_wsa_set_last_error as *const () as usize as u64),
             "GetSystemMetrics" => Some(native_get_system_metrics as *const () as usize as u64),
@@ -8923,6 +9196,9 @@ mod imp {
             "ReleaseSemaphore" => Some(native_release_semaphore as *const () as usize as u64),
             "CreateIoCompletionPort" => {
                 Some(native_create_io_completion_port as *const () as usize as u64)
+            }
+            "SetFileCompletionNotificationModes" => {
+                Some(native_set_file_completion_notification_modes as *const () as usize as u64)
             }
             "PostQueuedCompletionStatus" => {
                 Some(native_post_queued_completion_status as *const () as usize as u64)
@@ -9079,6 +9355,10 @@ mod imp {
             "FlsSetValue" => Some(native_fls_set_value as *const () as usize as u64),
             "GetSystemTimeAsFileTime" => {
                 Some(native_get_system_time_as_file_time as *const () as usize as u64)
+            }
+            "GetSystemTime" => Some(native_get_system_time as *const () as usize as u64),
+            "SystemTimeToFileTime" => {
+                Some(native_system_time_to_file_time as *const () as usize as u64)
             }
             "GetSystemInfo" => Some(native_get_system_info as *const () as usize as u64),
             "GetProcessAffinityMask" => {
@@ -9774,6 +10054,429 @@ mod imp {
         -1
     }
 
+    extern "win64" fn native_bind_socket(socket: u64, address: *const u8, length: i32) -> i32 {
+        if socket & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG
+            || address.is_null()
+            || length < 2
+            || length > 128
+        {
+            native_wsa_set_last_error(10014);
+            return -1;
+        }
+        let mut translated = [0u8; 128];
+        unsafe {
+            ptr::copy_nonoverlapping(address, translated.as_mut_ptr(), length as usize);
+            let family = (translated.as_ptr() as *const u16).read_unaligned();
+            if family == 23 {
+                (translated.as_mut_ptr() as *mut u16).write_unaligned(10);
+            } else if family != 2 {
+                native_wsa_set_last_error(10047);
+                return -1;
+            }
+        }
+        if unsafe { bind(socket as i32, translated.as_ptr(), length as u32) } == 0 {
+            0
+        } else {
+            native_wsa_set_last_error(errno_to_wsa(
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(22),
+            ));
+            -1
+        }
+    }
+
+    extern "win64" fn native_getsockname(socket: u64, address: *mut u8, length: *mut i32) -> i32 {
+        native_socket_name(socket, address, length, false)
+    }
+
+    extern "win64" fn native_getpeername(socket: u64, address: *mut u8, length: *mut i32) -> i32 {
+        native_socket_name(socket, address, length, true)
+    }
+
+    fn native_socket_name(socket: u64, address: *mut u8, length: *mut i32, peer: bool) -> i32 {
+        if socket & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG {
+            native_wsa_set_last_error(10038);
+            return -1;
+        }
+        if address.is_null() || length.is_null() || unsafe { length.read_unaligned() } < 0 {
+            native_wsa_set_last_error(10014);
+            return -1;
+        }
+        let mut host_length = unsafe { length.read_unaligned() } as u32;
+        let result = unsafe {
+            let length_ptr = (&mut host_length) as *mut u32;
+            if peer {
+                getpeername(socket as i32, address, length_ptr)
+            } else {
+                getsockname(socket as i32, address, length_ptr)
+            }
+        };
+        if result != 0 {
+            native_wsa_set_last_error(errno_to_wsa(
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(22),
+            ));
+            return -1;
+        }
+        if host_length >= 2 {
+            unsafe {
+                let family = (address as *const u16).read_unaligned();
+                if family == 10 {
+                    (address as *mut u16).write_unaligned(23);
+                }
+                length.write_unaligned(host_length as i32);
+            }
+        }
+        0
+    }
+
+    extern "win64" fn native_setsockopt(
+        socket: u64,
+        level: i32,
+        option: i32,
+        value: *const u8,
+        length: i32,
+    ) -> i32 {
+        if socket & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG {
+            native_wsa_set_last_error(10038);
+            return -1;
+        }
+        if level == 0xffff && option == 0x7010 {
+            return 0; // SO_UPDATE_CONNECT_CONTEXT
+        }
+        if value.is_null() || length < 0 || length > 1024 {
+            native_wsa_set_last_error(10014);
+            return -1;
+        }
+        let (host_level, host_option) = match (level, option) {
+            (0xffff, 0x0004) => (1, 2), // SO_REUSEADDR
+            (0xffff, 0x0008) => (1, 9), // SO_KEEPALIVE
+            (0xffff, 0x1001) => (1, 7), // SO_SNDBUF
+            (0xffff, 0x1002) => (1, 8), // SO_RCVBUF
+            (6, 1) => (6, 1),           // TCP_NODELAY
+            (41, 27) => (41, 26),       // IPV6_V6ONLY
+            _ => {
+                native_wsa_set_last_error(10042);
+                return -1;
+            }
+        };
+        let result = unsafe {
+            setsockopt(
+                socket as i32,
+                host_level,
+                host_option,
+                value.cast(),
+                length as u32,
+            )
+        };
+        if result == 0 {
+            0
+        } else {
+            native_wsa_set_last_error(errno_to_wsa(
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(22),
+            ));
+            -1
+        }
+    }
+
+    fn errno_to_wsa(errno: i32) -> i32 {
+        match errno {
+            4 => 10004,
+            9 => 10009,
+            11 | 114 | 115 => 10035,
+            98 => 10048,
+            99 => 10049,
+            101 => 10051,
+            110 => 10060,
+            111 => 10061,
+            113 => 10065,
+            _ => 10022,
+        }
+    }
+
+    #[repr(C)]
+    struct NativeWsaBuf {
+        length: u32,
+        _padding: u32,
+        buffer: *mut u8,
+    }
+
+    extern "win64" fn native_wsa_send(
+        socket: u64,
+        buffers: *const NativeWsaBuf,
+        buffer_count: u32,
+        bytes_sent: *mut u32,
+        _flags: u32,
+        overlapped: u64,
+        _completion: u64,
+    ) -> i32 {
+        if socket & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG
+            || (buffers.is_null() && buffer_count != 0)
+        {
+            native_wsa_set_last_error(10014);
+            return -1;
+        }
+        let mut total = 0u32;
+        for i in 0..buffer_count as usize {
+            let buf = unsafe { buffers.add(i).read_unaligned() };
+            if buf.buffer.is_null() && buf.length != 0 {
+                native_wsa_set_last_error(10014);
+                return -1;
+            }
+            let mut offset = 0usize;
+            while offset < buf.length as usize {
+                let count = unsafe {
+                    send(
+                        socket as i32,
+                        buf.buffer.add(offset).cast(),
+                        buf.length as usize - offset,
+                        0x4000,
+                    )
+                };
+                if count <= 0 {
+                    native_wsa_set_last_error(errno_to_wsa(
+                        std::io::Error::last_os_error().raw_os_error().unwrap_or(9),
+                    ));
+                    return -1;
+                }
+                offset += count as usize;
+                total = total.saturating_add(count as u32);
+            }
+        }
+        if !bytes_sent.is_null() {
+            unsafe {
+                bytes_sent.write_unaligned(total);
+            }
+        }
+        native_post_socket_completion(socket, overlapped, total);
+        0
+    }
+
+    extern "win64" fn native_wsa_recv(
+        socket: u64,
+        buffers: *const NativeWsaBuf,
+        buffer_count: u32,
+        bytes_received: *mut u32,
+        flags: *mut u32,
+        overlapped: u64,
+        _completion: u64,
+    ) -> i32 {
+        if socket & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG
+            || (buffers.is_null() && buffer_count != 0)
+        {
+            native_wsa_set_last_error(10014);
+            return -1;
+        }
+        let mut all_zero = true;
+        for i in 0..buffer_count as usize {
+            let buf = unsafe { buffers.add(i).read_unaligned() };
+            if buf.buffer.is_null() && buf.length != 0 {
+                native_wsa_set_last_error(10014);
+                return -1;
+            }
+            all_zero &= buf.length == 0;
+        }
+        if all_zero && overlapped != 0 {
+            let Some(process) = process_ctx() else {
+                native_wsa_set_last_error(10022);
+                return -1;
+            };
+            let Some((port, key)) = process
+                .socket_completion_ports
+                .lock()
+                .ok()
+                .and_then(|map| map.get(&socket).cloned())
+            else {
+                native_wsa_set_last_error(10022);
+                return -1;
+            };
+            let fd = socket as i32;
+            std::thread::spawn(move || {
+                let mut poll_fd = NativePollFd {
+                    fd,
+                    events: 1,
+                    revents: 0,
+                };
+                loop {
+                    poll_fd.revents = 0;
+                    let ready = unsafe { poll(&mut poll_fd, 1, -1) };
+                    if ready > 0 {
+                        break;
+                    }
+                    if ready < 0 && std::io::Error::last_os_error().raw_os_error() != Some(4) {
+                        break;
+                    }
+                }
+                native_set_overlapped_status(overlapped, 0, 0);
+                if let Ok(mut queue) = port.queue.lock() {
+                    queue.push_back(NativeCompletion {
+                        key,
+                        overlapped,
+                        bytes: 0,
+                        status: 0,
+                    });
+                    port.ready.notify_one();
+                }
+            });
+            native_wsa_set_last_error(997); // WSA_IO_PENDING
+            native_set_last_error(997); // libuv checks GetLastError for ERROR_IO_PENDING
+            return -1;
+        }
+        let fd = socket as i32;
+        let mut total = 0u32;
+        for i in 0..buffer_count as usize {
+            let buf = unsafe { buffers.add(i).read_unaligned() };
+            let count = unsafe { recv(fd, buf.buffer.cast(), buf.length as usize, 0) };
+            if count < 0 {
+                let error = std::io::Error::last_os_error().raw_os_error().unwrap_or(9);
+                native_wsa_set_last_error(errno_to_wsa(error));
+                return -1;
+            }
+            total = total.saturating_add(count as u32);
+            if count == 0 || (count as u32) < buf.length {
+                break;
+            }
+        }
+        if !bytes_received.is_null() {
+            unsafe {
+                bytes_received.write_unaligned(total);
+            }
+        }
+        if !flags.is_null() {
+            unsafe {
+                flags.write_unaligned(0);
+            }
+        }
+        native_post_socket_completion(socket, overlapped, total);
+        0
+    }
+
+    extern "win64" fn native_wsa_ioctl(
+        socket: u64,
+        control_code: u32,
+        input: *const u8,
+        input_length: u32,
+        output: *mut u8,
+        output_length: u32,
+        bytes_returned: *mut u32,
+        _overlapped: u64,
+        _completion_routine: u64,
+    ) -> i32 {
+        const SIO_GET_EXTENSION_FUNCTION_POINTER: u32 = 0xC800_0006;
+        const WSAID_CONNECTEX: [u8; 16] = [
+            0xB9, 0x07, 0xA2, 0x25, 0xF3, 0xDD, 0x60, 0x46, 0x8E, 0xE9, 0x76, 0xE5, 0x8C, 0x74,
+            0x06, 0x3E,
+        ];
+        if socket & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG {
+            native_wsa_set_last_error(10038);
+            return -1;
+        }
+        if control_code == SIO_GET_EXTENSION_FUNCTION_POINTER
+            && !input.is_null()
+            && input_length >= 16
+            && !output.is_null()
+            && output_length >= 8
+            && !bytes_returned.is_null()
+            && unsafe { std::slice::from_raw_parts(input, 16) } == WSAID_CONNECTEX
+        {
+            unsafe {
+                output
+                    .cast::<u64>()
+                    .write_unaligned(native_connect_ex as *const () as usize as u64);
+                bytes_returned.write_unaligned(8);
+            }
+            return 0;
+        }
+        native_wsa_set_last_error(10022);
+        -1
+    }
+
+    extern "win64" fn native_connect_ex(
+        socket: u64,
+        address: *const u8,
+        length: i32,
+        send_buffer: *const c_void,
+        send_length: u32,
+        bytes_sent: *mut u32,
+        overlapped: u64,
+    ) -> i32 {
+        if socket & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG
+            || address.is_null()
+            || length < 2
+            || length > 128
+        {
+            native_wsa_set_last_error(10014);
+            return 0;
+        }
+        let fd = socket as i32;
+        let old_flags = unsafe { fcntl(fd, 3) };
+        if old_flags < 0 {
+            native_wsa_set_last_error(errno_to_wsa(9));
+            return 0;
+        }
+        if old_flags & 0x800 != 0 {
+            unsafe {
+                fcntl(fd, 4, old_flags & !0x800);
+            }
+        }
+        let mut translated = [0u8; 128];
+        unsafe {
+            ptr::copy_nonoverlapping(address, translated.as_mut_ptr(), length as usize);
+            let family = (translated.as_ptr() as *const u16).read_unaligned();
+            if family == 23 {
+                (translated.as_mut_ptr() as *mut u16).write_unaligned(10);
+            } else if family != 2 {
+                native_wsa_set_last_error(10047);
+                if old_flags & 0x800 != 0 {
+                    fcntl(fd, 4, old_flags);
+                }
+                return 0;
+            }
+        }
+        let result = unsafe { connect(fd, translated.as_ptr(), length as u32) };
+        let error = if result == 0 {
+            0
+        } else {
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(22)
+        };
+        if old_flags & 0x800 != 0 {
+            unsafe {
+                fcntl(fd, 4, old_flags);
+            }
+        }
+        if result != 0 {
+            native_wsa_set_last_error(errno_to_wsa(error));
+            return 0;
+        }
+        let mut sent_total = 0u32;
+        while sent_total < send_length {
+            if send_buffer.is_null() {
+                native_wsa_set_last_error(10014);
+                return 0;
+            }
+            let sent = unsafe {
+                send(
+                    fd,
+                    send_buffer.cast::<u8>().add(sent_total as usize).cast(),
+                    (send_length - sent_total) as usize,
+                    0x4000,
+                )
+            };
+            if sent <= 0 {
+                native_wsa_set_last_error(errno_to_wsa(
+                    std::io::Error::last_os_error().raw_os_error().unwrap_or(9),
+                ));
+                return 0;
+            }
+            sent_total += sent as u32;
+        }
+        if !bytes_sent.is_null() {
+            unsafe {
+                bytes_sent.write_unaligned(sent_total);
+            }
+        }
+        native_post_socket_completion(socket, overlapped, sent_total);
+        1
+    }
+
     extern "win64" fn native_ioctlsocket(socket: u64, command: i32, argument: *mut u32) -> i32 {
         if socket & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG {
             native_wsa_set_last_error(10038); // WSAENOTSOCK
@@ -10016,6 +10719,17 @@ mod imp {
             native_wsa_set_last_error(10038); // WSAENOTSOCK
             return -1;
         }
+        if let Some(process) = process_ctx() {
+            if let Ok(mut associations) = process.socket_completion_ports.lock() {
+                associations.remove(&handle);
+            }
+            if let Ok(mut modes) = process.socket_completion_modes.lock() {
+                modes.remove(&handle);
+            }
+        }
+        unsafe {
+            shutdown(handle as i32, 2);
+        }
         if unsafe { close(handle as i32) } == 0 {
             0
         } else {
@@ -10040,6 +10754,20 @@ mod imp {
         {
             native_wsa_set_last_error(10014); // WSAEFAULT
             return -1;
+        }
+        if level == 0xffff && option == 0x2005 {
+            // SO_PROTOCOL_INFOW
+            const WSAPROTOCOL_INFO_W_SIZE: u32 = 628;
+            if unsafe { length.read_unaligned() } < WSAPROTOCOL_INFO_W_SIZE {
+                native_wsa_set_last_error(10014);
+                return -1;
+            }
+            unsafe {
+                std::ptr::write_bytes(value.cast::<u8>(), 0, WSAPROTOCOL_INFO_W_SIZE as usize);
+                value.cast::<u32>().write_unaligned(0x0002_0000); // XP1_IFS_HANDLES
+                length.write_unaligned(WSAPROTOCOL_INFO_W_SIZE);
+            }
+            return 0;
         }
         let (host_level, host_option) = match (level, option) {
             (0xffff, 0x1008) => (1, 3),  // SOL_SOCKET, SO_TYPE
@@ -10389,6 +11117,8 @@ mod imp {
             event_names: Mutex::new(HashMap::new()),
             event_next: AtomicU64::new(0x6100_0000),
             completion_ports: Mutex::new(HashMap::new()),
+            socket_completion_ports: Mutex::new(HashMap::new()),
+            socket_completion_modes: Mutex::new(HashMap::new()),
             completion_next: AtomicU64::new(0x9000_0000),
             io_wait: Mutex::new(()),
             io_ready: Condvar::new(),
@@ -10616,6 +11346,11 @@ mod tests {
         load,
     };
     use crate::winfs::WinFs;
+
+    #[test]
+    fn handle_information_accepts_winsock_socket_handles() {
+        assert!(super::imp::test_socket_handle_inheritability());
+    }
 
     #[test]
     fn executes_an_import_free_pe_at_native_speed() {

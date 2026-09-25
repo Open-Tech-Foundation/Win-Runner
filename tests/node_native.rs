@@ -228,6 +228,73 @@ fn official_windows_node_installs_and_runs_a_real_npm_package_natively() {
     assert_eq!(stdout.lines().last(), Some("true false false"));
 }
 
+#[test]
+fn official_windows_node_installs_from_the_live_npm_registry_natively() {
+    if std::env::var("WINCLI_TEST_LIVE_NPM").as_deref() != Ok("1") {
+        return;
+    }
+    let Ok(node) = std::env::var("WINCLI_NODE_EXE") else {
+        return;
+    };
+    let node = Path::new(&node)
+        .canonicalize()
+        .expect("Windows node.exe exists");
+    let npm = std::env::var_os("WINCLI_NPM_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| node.parent().unwrap().join("npm-stage/C/npm"));
+    if !npm.join("bin/npm-cli.js").is_file() {
+        return;
+    }
+    let npm = npm.canonicalize().expect("npm root exists");
+    let probe =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/artifacts/node/is-number-probe.js");
+    let mut files = Vec::new();
+    collect_files(&npm, &mut files);
+    files.sort();
+    let mut script = String::from(
+        "New-Item -ItemType Directory -Force C:\\Users\\wincli\\npm-cache\\_cacache\\tmp | Out-Null\nNew-Item -ItemType Directory -Force C:\\Users\\wincli\\npm-cache\\_logs | Out-Null\nNew-Item -ItemType Directory -Force C:\\project | Out-Null\n",
+    );
+    for file in files {
+        let relative = file.strip_prefix(&npm).unwrap();
+        let guest = format!("C:\\npm\\{}", relative.to_string_lossy().replace('/', "\\"));
+        script.push_str(&format!("@seed \"{}\" {guest}\n", file.display()));
+    }
+    script.push_str(&format!(
+        "@seed \"{}\" C:\\project\\probe.js\n\"{}\" C:\\npm\\bin\\npm-cli.js --prefix C:\\project install is-number@7.0.0 --no-update-notifier --no-audit --no-fund --no-package-lock --ignore-scripts\n\"{}\" C:\\project\\probe.js\nexit\n",
+        probe.display(), node.display(), node.display()
+    ));
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wincli"))
+        .arg("shell")
+        .env("WINCLI_BACKEND", "native")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start native WinCLI shell");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().expect("read npm output");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with("added 1 package")),
+        "npm did not install from the registry: {stdout}"
+    );
+    assert_eq!(stdout.lines().last(), Some("true false false"));
+}
+
 fn collect_files(root: &Path, output: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(root).expect("read npm directory") {
         let path = entry.expect("read npm entry").path();

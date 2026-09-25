@@ -11,6 +11,9 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added native Winsock IOCP association, completion-mode handling, `ConnectEx`,
+  and zero-byte overlapped receive readiness used by Node.js TLS and npm registry
+  installs. Native E2E coverage can verify live registry installs.
 - Added Windows-sized default stacks for native guest threads, recursive
   thread-aware critical sections, per-thread Windows IDs, address wait/wake
   synchronization, native DNS resolution, and initial Winsock socket setup for
