@@ -20,6 +20,8 @@ All notable changes to this project will be documented in this file.
   long-path normalization used by Node.js `fs.watch` and Vite file watching.
 - Added case-insensitive ordinal UTF-16 comparison queried by npm's Windows
   Node.js process.
+- Added WinFS `GetShortPathNameW` compatibility for Vite dependency loading;
+  WinFS returns the normalized path because it does not create 8.3 aliases.
 - Added native Node.js E2E coverage that watches a guest directory and receives
   a file creation event after a WinFS write.
 - Added an optional native Node.js E2E test that verifies a host HTTP request

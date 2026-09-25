@@ -1228,6 +1228,7 @@ mod imp {
         #[test]
         fn import_binding_checks_the_dll_as_well_as_the_function() {
             assert!(super::supports_import("KERNEL32.dll", "ExitProcess"));
+            assert!(super::supports_import("KERNEL32.dll", "GetShortPathNameW"));
             assert!(super::supports_import("WINMM.dll", "timeGetTime"));
             assert!(!super::supports_import("USER32.dll", "ExitProcess"));
             assert!(!super::supports_import("KERNEL32.dll", "timeGetTime"));
@@ -9763,6 +9764,11 @@ mod imp {
             }
             "GetLocaleInfoEx" => Some(native_get_locale_info_ex as *const () as usize as u64),
             "GetLongPathNameW" => Some(native_get_long_path_name_w as *const () as usize as u64),
+            // WinFS has no short-name aliases, so the normalized DOS path is
+            // the shortest spelling available for the path.
+            "GetShortPathNameW" => {
+                Some(native_get_long_path_name_w as *const () as usize as u64)
+            }
             "ReadDirectoryChangesW" => {
                 Some(native_read_directory_changes_w as *const () as usize as u64)
             }
