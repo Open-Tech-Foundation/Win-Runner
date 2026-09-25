@@ -160,6 +160,63 @@ fn official_windows_node_runs_the_staged_npm_cli_natively() {
     );
 }
 
+#[test]
+fn official_windows_node_runs_a_real_npm_package_natively() {
+    let Ok(node) = std::env::var("WINCLI_NODE_EXE") else {
+        return;
+    };
+    let node = Path::new(&node)
+        .canonicalize()
+        .expect("Windows node.exe exists");
+    let package = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/artifacts/node/is-number");
+    let mut files = Vec::new();
+    collect_files(&package, &mut files);
+    files.sort();
+    let mut script = String::from(
+        "New-Item -ItemType Directory -Force C:\\project\\node_modules\\is-number | Out-Null\n",
+    );
+    for file in files {
+        let relative = file.strip_prefix(&package).unwrap();
+        let guest = format!(
+            "C:\\project\\node_modules\\is-number\\{}",
+            relative.to_string_lossy().replace('/', "\\")
+        );
+        script.push_str(&format!("@seed \"{}\" {guest}\n", file.display()));
+    }
+    let probe = package.parent().unwrap().join("is-number-probe.js");
+    script.push_str(&format!(
+        "@seed \"{}\" C:\\project\\probe.js\n\"{}\" C:\\project\\probe.js\nexit\n",
+        probe.display(),
+        node.display()
+    ));
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wincli"))
+        .arg("shell")
+        .env("WINCLI_BACKEND", "native")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start native WinCLI shell");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .expect("seed and run the npm package");
+    let output = child.wait_with_output().expect("read package output");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "true false false"
+    );
+}
+
 fn collect_files(root: &Path, output: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(root).expect("read npm directory") {
         let path = entry.expect("read npm entry").path();

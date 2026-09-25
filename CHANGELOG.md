@@ -11,6 +11,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added Windows-sized default stacks for native guest threads, recursive
+  thread-aware critical sections, per-thread Windows IDs, address wait/wake
+  synchronization, and native DNS address resolution for Node.js.
+- Added optional real-binary E2E coverage that seeds the MIT-licensed
+  `is-number@7.0.0` npm package into guest `node_modules` and executes it with
+  the official Windows Node binary.
 - Added native code-page aliases, file seeking, environment updates, and process,
   console, timezone, CPU, and network information queried by Node.js and npm.
 - Added optional real-binary E2E coverage for the staged npm CLI `--version`
