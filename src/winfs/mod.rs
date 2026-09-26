@@ -1790,6 +1790,74 @@ mod tests {
     }
 
     #[test]
+    fn modern_create_always_style_write_truncates_existing_file() {
+        let mut fs = WinFs::new();
+        let path = r"C:\wine_file_cases\truncate.txt";
+        fs.mkdir(r"C:\wine_file_cases").unwrap();
+        fs.write_file(path, b"old contents with a longer tail".to_vec())
+            .unwrap();
+        fs.write_file(path, b"new".to_vec()).unwrap();
+        assert_eq!(fs.read_file(path).unwrap(), b"new");
+        assert_eq!(fs.file_len(path).unwrap(), 3);
+    }
+
+    #[test]
+    fn modern_copy_and_move_directory_tree_preserve_nested_files() {
+        let mut fs = WinFs::new();
+        let source = r"C:\wine_file_cases\source";
+        let copied = r"C:\wine_file_cases\copied";
+        let moved = r"C:\wine_file_cases\moved";
+        fs.mkdir(&format!(r"{source}\nested")).unwrap();
+        fs.write_file(&format!(r"{source}\root.txt"), b"root".to_vec())
+            .unwrap();
+        fs.write_file(&format!(r"{source}\nested\child.txt"), b"child".to_vec())
+            .unwrap();
+
+        fs.copy_path(source, copied, true).unwrap();
+        assert_eq!(
+            fs.read_file(&format!(r"{copied}\nested\child.txt"))
+                .unwrap(),
+            b"child"
+        );
+        assert!(fs.copy_path(source, copied, true).is_err());
+        fs.move_path(copied, moved).unwrap();
+        assert!(!fs.exists(copied));
+        assert_eq!(
+            fs.read_file(&format!(r"{moved}\root.txt")).unwrap(),
+            b"root"
+        );
+
+        fs.remove(source, true).unwrap();
+        fs.remove(moved, true).unwrap();
+        assert!(!fs.exists(source));
+        assert!(!fs.exists(moved));
+    }
+
+    #[test]
+    fn modern_directory_create_and_remove_report_invalid_states() {
+        let mut fs = WinFs::new();
+        let parent = r"C:\wine_file_cases";
+        let child = r"C:\wine_file_cases\child";
+        assert!(fs.mkdir_one(child).is_err(), "parent must exist first");
+        fs.mkdir_one(parent).unwrap();
+        assert!(
+            fs.mkdir_one(parent).is_err(),
+            "creating an existing dir fails"
+        );
+        fs.mkdir_one(child).unwrap();
+        fs.write_file(&format!(r"{child}\entry.txt"), b"x".to_vec())
+            .unwrap();
+        assert!(
+            fs.rmdir(child).is_err(),
+            "non-empty directories cannot be removed"
+        );
+        fs.delete_file(&format!(r"{child}\entry.txt")).unwrap();
+        fs.rmdir(child).unwrap();
+        fs.rmdir(parent).unwrap();
+        assert!(!fs.exists(parent));
+    }
+
+    #[test]
     fn extended_dos_and_nt_paths_resolve_like_dos_paths() {
         let mut fs = WinFs::new();
         fs.mkdir(r"C:\Users\wincli\npm-cache\_cacache\tmp").unwrap();
