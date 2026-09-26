@@ -1729,6 +1729,67 @@ mod tests {
     }
 
     #[test]
+    fn modern_file_mutations_copy_move_and_delete_like_file_api_cases() {
+        let mut fs = WinFs::new();
+        fs.mkdir(r"C:\wine_file_cases").unwrap();
+        let source = r"C:\wine_file_cases\source.bin";
+        let copy = r"C:\wine_file_cases\copy.bin";
+        let moved = r"C:\wine_file_cases\moved.bin";
+
+        fs.write_file(source, b"first".to_vec()).unwrap();
+        fs.append_file(source, b"-second").unwrap();
+        assert_eq!(fs.read_file(source).unwrap(), b"first-second");
+        assert_eq!(fs.file_len(source).unwrap(), 12);
+
+        fs.copy_path(source, copy, true).unwrap();
+        assert_eq!(fs.read_file(copy).unwrap(), b"first-second");
+        assert!(fs.copy_path(source, copy, true).is_err());
+        fs.copy_path(source, copy, false).unwrap();
+        assert_eq!(fs.read_file(copy).unwrap(), b"first-second");
+
+        fs.move_path(copy, moved).unwrap();
+        assert!(!fs.exists(copy));
+        assert_eq!(fs.read_file(moved).unwrap(), b"first-second");
+        assert!(fs.move_path(source, moved).is_err());
+
+        fs.delete_file(source).unwrap();
+        fs.delete_file(moved).unwrap();
+        assert!(fs.list_dir(r"C:\wine_file_cases").unwrap().is_empty());
+        fs.rmdir(r"C:\wine_file_cases").unwrap();
+        assert!(!fs.exists(r"C:\wine_file_cases"));
+    }
+
+    #[test]
+    fn modern_directory_listing_and_metadata_follow_case_insensitive_paths() {
+        let mut fs = WinFs::new();
+        fs.mkdir(r"C:\wine_file_cases\nested").unwrap();
+        fs.write_file(r"C:\wine_file_cases\Alpha.txt", b"abc".to_vec())
+            .unwrap();
+        fs.write_file(r"C:\wine_file_cases\nested\Beta.txt", b"12345".to_vec())
+            .unwrap();
+
+        let mut entries = fs.list_dir(r"c:\WINE_FILE_CASES").unwrap();
+        entries.sort();
+        assert_eq!(entries, ["Alpha.txt", "nested"]);
+        assert!(fs.is_dir(r"C:\wine_file_cases\NESTED"));
+        assert!(fs.is_file(r"c:\wine_file_cases\alpha.TXT"));
+        assert_eq!(fs.file_len(r"C:\WINE_FILE_CASES\ALPHA.TXT").unwrap(), 3);
+        assert_eq!(
+            fs.read_file_range(r"C:\wine_file_cases\nested\beta.txt", 2, 8)
+                .unwrap(),
+            b"345"
+        );
+        assert_ne!(
+            fs.file_id(r"C:\wine_file_cases\Alpha.txt").unwrap(),
+            fs.file_id(r"C:\wine_file_cases\nested\Beta.txt").unwrap()
+        );
+
+        assert!(fs.rmdir(r"C:\wine_file_cases").is_err());
+        fs.remove(r"C:\wine_file_cases", true).unwrap();
+        assert!(!fs.exists(r"C:\wine_file_cases"));
+    }
+
+    #[test]
     fn extended_dos_and_nt_paths_resolve_like_dos_paths() {
         let mut fs = WinFs::new();
         fs.mkdir(r"C:\Users\wincli\npm-cache\_cacache\tmp").unwrap();

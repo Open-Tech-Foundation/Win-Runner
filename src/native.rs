@@ -903,6 +903,117 @@ mod imp {
         }
 
         #[test]
+        fn win32_file_copy_move_enumerate_and_delete_roundtrip() {
+            let directory = r"C:\wine_file_api_cases";
+            let source = r"C:\wine_file_api_cases\source.txt";
+            let copy = r"C:\wine_file_api_cases\copy.txt";
+            let moved = r"C:\wine_file_api_cases\moved.txt";
+            let wide = |value: &str| value.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let directory_wide = wide(directory);
+            let source_wide = wide(source);
+            let copy_wide = wide(copy);
+            let moved_wide = wide(moved);
+            let context = super::fs_ctx().unwrap();
+            assert_eq!(
+                super::native_create_directory_w(directory_wide.as_ptr(), 0),
+                1
+            );
+            assert_eq!(
+                super::native_create_directory_w(directory_wide.as_ptr(), 0),
+                0
+            );
+            assert_eq!(super::native_get_last_error(), 183);
+
+            let file =
+                super::native_create_file_w(source_wide.as_ptr(), 0xC000_0000, 0, 0, 1, 0, 0);
+            assert_ne!(file, u64::MAX);
+            let payload = b"wine-file-api";
+            let mut written = 0;
+            assert_eq!(
+                super::native_write_file(
+                    file,
+                    payload.as_ptr(),
+                    payload.len() as u32,
+                    &mut written,
+                    0
+                ),
+                1
+            );
+            assert_eq!(written as usize, payload.len());
+            assert_eq!(
+                super::native_set_file_pointer(file, 0, std::ptr::null_mut(), 0),
+                0
+            );
+            let mut read_buffer = [0u8; 32];
+            let mut read = 0;
+            assert_eq!(
+                super::native_read_file(
+                    file,
+                    read_buffer.as_mut_ptr(),
+                    payload.len() as u32,
+                    &mut read,
+                    0
+                ),
+                1
+            );
+            assert_eq!(read as usize, payload.len());
+            assert_eq!(&read_buffer[..read as usize], payload);
+            let mut size = -1;
+            assert_eq!(super::native_get_file_size_ex(file, &mut size), 1);
+            assert_eq!(size, payload.len() as i64);
+            assert_eq!(super::native_close_handle(file), 1);
+
+            assert_eq!(
+                super::native_copy_file_w(source_wide.as_ptr(), copy_wide.as_ptr(), 1),
+                1
+            );
+            assert_eq!(
+                super::native_copy_file_w(source_wide.as_ptr(), copy_wide.as_ptr(), 1),
+                0
+            );
+            assert_eq!(context.lock().unwrap().fs.read_file(copy).unwrap(), payload);
+            assert_eq!(
+                super::native_move_file_w(copy_wide.as_ptr(), moved_wide.as_ptr()),
+                1
+            );
+            assert!(!context.lock().unwrap().fs.exists(copy));
+
+            let pattern = wide(r"C:\wine_file_api_cases\*");
+            let mut find_data = [0u8; 592];
+            let find = super::native_find_first_file_ex_w(
+                pattern.as_ptr(),
+                0,
+                find_data.as_mut_ptr(),
+                0,
+                0,
+                0,
+            );
+            assert_ne!(find, u64::MAX);
+            let mut names = Vec::new();
+            loop {
+                let name = unsafe {
+                    std::slice::from_raw_parts(find_data.as_ptr().add(44).cast::<u16>(), 260)
+                        .iter()
+                        .copied()
+                        .take_while(|unit| *unit != 0)
+                        .collect::<Vec<_>>()
+                };
+                names.push(String::from_utf16(&name).unwrap());
+                if super::native_find_next_file_w(find, find_data.as_mut_ptr()) == 0 {
+                    break;
+                }
+            }
+            names.sort();
+            assert_eq!(names, ["moved.txt", "source.txt"]);
+            assert_eq!(super::native_find_close(find), 1);
+
+            assert_eq!(super::native_delete_file_w(source_wide.as_ptr()), 1);
+            assert_eq!(super::native_delete_file_w(moved_wide.as_ptr()), 1);
+            assert_eq!(super::native_remove_directory_w(directory_wide.as_ptr()), 1);
+            assert!(!context.lock().unwrap().fs.exists(directory));
+        }
+
+        #[test]
         fn file_mapping_views_read_and_commit_guest_file_bytes() {
             let path = r"C:\file_mapping_unit.txt";
             let context = super::fs_ctx().unwrap();
