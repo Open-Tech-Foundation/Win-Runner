@@ -128,7 +128,8 @@ fn main() {
             Some(path) => load_snapshot(path),
             None => WinFs::ephemeral_runner(),
         };
-        let (code, fs) = wincli::shell::run_shell_with_fs(fs);
+        let active_snapshot = save_snapshot_path.as_deref().or(snapshot_path.as_deref());
+        let (code, fs) = wincli::shell::run_shell_with_snapshot(fs, active_snapshot);
         save_snapshot_if_requested(save_snapshot_path.as_deref(), &fs);
         exit(code);
     }
@@ -137,7 +138,8 @@ fn main() {
             Some(path) => load_snapshot(path),
             None => WinFs::ephemeral_runner(),
         };
-        let (code, fs) = wincli::shell::run_runner_with_fs(fs);
+        let active_snapshot = save_snapshot_path.as_deref().or(snapshot_path.as_deref());
+        let (code, fs) = wincli::shell::run_runner_with_snapshot(fs, active_snapshot);
         save_snapshot_if_requested(save_snapshot_path.as_deref(), &fs);
         exit(code);
     }

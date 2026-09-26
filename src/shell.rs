@@ -28,6 +28,7 @@ pub struct Shell {
     sess: ps1::Session,
     last_code: i32,
     backend: Result<&'static dyn backend::ExecutionBackend, String>,
+    snapshot_path: Option<std::path::PathBuf>,
 }
 
 impl Default for Shell {
@@ -45,6 +46,12 @@ impl Shell {
     /// immutable snapshot. The image is owned by this session and discarded
     /// once it exits.
     pub fn with_fs(fs: WinFs) -> Self {
+        Self::with_snapshot_path(fs, None)
+    }
+
+    /// Start a session and remember the file it was loaded from for
+    /// subsequent `snapshot save` commands without a path.
+    pub fn with_snapshot_path(fs: WinFs, snapshot_path: Option<std::path::PathBuf>) -> Self {
         let backend_started = std::time::Instant::now();
         let backend = backend::configured().map_err(|e| format!("failed to select backend: {e}"));
         if std::env::var_os("WINCLI_TIMINGS").is_some() {
@@ -58,6 +65,7 @@ impl Shell {
             sess: ps1::Session::default(),
             last_code: 0,
             backend,
+            snapshot_path,
         }
     }
 
@@ -289,28 +297,34 @@ impl Shell {
         Ok(ShellFlow::Continue)
     }
 
-    /// `snapshot save <host-file>`: persist this session's disk image so
+    /// `snapshot save [host-file]`: persist this session's disk image so
     /// a later `wincli --snapshot=<file> shell` (or `--save-snapshot`)
     /// resumes with every installation and file change intact.
     fn do_snapshot(&mut self, argv: &[String], out: &mut Vec<u8>) -> Result<(), String> {
         match argv.first().map(|s| s.to_lowercase()).as_deref() {
             Some("save") => {
+                if argv.len() > 2 {
+                    return Err("usage: snapshot save [file]".to_string());
+                }
                 let path = argv
                     .get(1)
-                    .ok_or_else(|| "usage: snapshot save <file>".to_string())?;
-                if argv.len() != 2 {
-                    return Err("usage: snapshot save <file>".to_string());
-                }
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| self.snapshot_path.clone())
+                    .ok_or_else(|| {
+                        "no snapshot path is active; use `snapshot save <file>` first".to_string()
+                    })?;
+                let display = path.display().to_string();
                 let bytes = crate::snapshot::encode(&self.fs);
-                std::fs::write(path, &bytes)
-                    .map_err(|e| format!("cannot save snapshot {path}: {e}"))?;
+                std::fs::write(&path, &bytes)
+                    .map_err(|e| format!("cannot save snapshot {display}: {e}"))?;
+                self.snapshot_path = Some(path);
                 self.last_code = 0;
                 out.extend_from_slice(
-                    format!("Saved snapshot {} ({} bytes)\n", path, bytes.len()).as_bytes(),
+                    format!("Saved snapshot {} ({} bytes)\n", display, bytes.len()).as_bytes(),
                 );
                 Ok(())
             }
-            _ => Err("usage: snapshot save <file>".to_string()),
+            _ => Err("usage: snapshot save [file]".to_string()),
         }
     }
     /// `choco install nodejs [--version=X.Y.Z]`: fetch and verify the official
@@ -688,10 +702,14 @@ fn split_line(line: &str) -> Vec<String> {
     out
 }
 
-fn run_session(fs: WinFs, prompt_enabled: bool) -> (i32, WinFs) {
+fn run_session(
+    fs: WinFs,
+    prompt_enabled: bool,
+    snapshot_path: Option<std::path::PathBuf>,
+) -> (i32, WinFs) {
     let stdin = std::io::stdin();
     let tty = prompt_enabled && std::io::IsTerminal::is_terminal(&stdin);
-    let mut shell = Shell::with_fs(fs);
+    let mut shell = Shell::with_snapshot_path(fs, snapshot_path);
     if tty {
         let mut editor = match DefaultEditor::new() {
             Ok(editor) => editor,
@@ -761,12 +779,17 @@ fn execute_input_line(shell: &mut Shell, line: &str) -> Option<i32> {
 /// Interactive loop. Returns the process exit code. EOF ends with the last
 /// code; piped input remains line-oriented and does not activate the editor.
 pub fn run_shell() -> (i32, WinFs) {
-    run_session(WinFs::ephemeral_runner(), true)
+    run_session(WinFs::ephemeral_runner(), true, None)
 }
 
 /// Run an interactive shell from a decoded snapshot image.
 pub fn run_shell_with_fs(fs: WinFs) -> (i32, WinFs) {
-    run_session(fs, true)
+    run_session(fs, true, None)
+}
+
+/// Run an interactive shell and remember the snapshot file to save back to.
+pub fn run_shell_with_snapshot(fs: WinFs, snapshot_path: Option<&str>) -> (i32, WinFs) {
+    run_session(fs, true, snapshot_path.map(std::path::PathBuf::from))
 }
 
 /// Host-controlled runner loop. It consumes job commands from standard input
@@ -774,12 +797,17 @@ pub fn run_shell_with_fs(fs: WinFs) -> (i32, WinFs) {
 /// image when the input closes. This is the local control-plane seam for a
 /// future GitHub Actions protocol adapter.
 pub fn run_runner() -> (i32, WinFs) {
-    run_session(WinFs::ephemeral_runner(), false)
+    run_session(WinFs::ephemeral_runner(), false, None)
 }
 
 /// Run a host-controlled session from a decoded snapshot image.
 pub fn run_runner_with_fs(fs: WinFs) -> (i32, WinFs) {
-    run_session(fs, false)
+    run_session(fs, false, None)
+}
+
+/// Run a host-controlled session and remember the snapshot file to save back to.
+pub fn run_runner_with_snapshot(fs: WinFs, snapshot_path: Option<&str>) -> (i32, WinFs) {
+    run_session(fs, false, snapshot_path.map(std::path::PathBuf::from))
 }
 
 #[cfg(test)]
@@ -899,6 +927,14 @@ mod tests {
         let mut out = Vec::new();
         assert!(shell.exec_line("install", &mut out).is_err());
         assert!(shell.exec_line("inspect", &mut out).is_err());
+    }
+
+    #[test]
+    fn snapshot_save_without_a_default_path_explains_how_to_set_one() {
+        let mut shell = Shell::new();
+        let mut out = Vec::new();
+        let error = shell.exec_line("snapshot save", &mut out).unwrap_err();
+        assert!(error.contains("no snapshot path is active"), "{error}");
     }
 
     #[test]

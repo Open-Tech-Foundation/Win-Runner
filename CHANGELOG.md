@@ -17,6 +17,8 @@ All notable changes to this project will be documented in this file.
 - Streamed native guest output to the terminal as it arrives. Added opt-in
   per-stage PE load, native launch, time-to-first-output, guest-run, and
   filesystem-state timings with `WINCLI_TIMINGS=1`.
+- `snapshot save` now defaults to the snapshot loaded by the shell or runner,
+  and remembers a path given to an earlier save command.
 
 ### Removed
 

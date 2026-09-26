@@ -180,10 +180,13 @@ exit
 wincli --snapshot=wincli.snap shell
 node -v
 7z -h
+snapshot save                # overwrite the snapshot this shell loaded
 ```
 
 `wincli --save-snapshot=wincli.snap shell` also writes the disk when the shell
-exits. Both forms save guest files and installed tools as a snapshot archive.
+exits. A named `snapshot save <file>` establishes the default for later
+`snapshot save` commands; without a loaded or previously saved path, the first
+save needs a filename.
 
 Set `WINCLI_TEST_CHOCO=1` to run the live download-and-verify E2E test
 (`cargo test --test choco_node`).

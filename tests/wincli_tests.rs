@@ -1118,7 +1118,10 @@ fn snapshot_is_the_only_way_to_carry_installed_packages_between_shells() {
     let ignored_cache = tmp_path("ignored-cache");
     let snapshot_arg = format!("--snapshot={}", snapshot.display());
     let (code, stdout, stderr) = run_shell_env(
-        &format!("install demo\nsnapshot save {}\nexit\n", snapshot.display()),
+        &format!(
+            "install demo\nsnapshot save {}\nsnapshot save\nexit\n",
+            snapshot.display()
+        ),
         &[
             ("WINCLI_SOURCE", source.as_str()),
             ("WINCLI_CACHE", ignored_cache.to_str().unwrap()),
@@ -1130,6 +1133,15 @@ fn snapshot_is_the_only_way_to_carry_installed_packages_between_shells() {
         !ignored_cache.exists(),
         "WINCLI_CACHE must not persist staging"
     );
+
+    let (code, stdout, stderr) = run_session_args(
+        &[snapshot_arg.clone(), "shell".to_string()],
+        "demo\nsnapshot save\nexit\n",
+        &[],
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("demo 0.1.0"), "stdout: {stdout}");
+    assert!(stdout.contains("Saved snapshot"), "stdout: {stdout}");
 
     let (code, stdout, stderr) =
         run_session_args(&[snapshot_arg, "shell".to_string()], "demo\nexit\n", &[]);
