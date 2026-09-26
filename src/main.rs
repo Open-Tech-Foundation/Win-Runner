@@ -1,6 +1,6 @@
 use std::io::Write;
 use std::path::Path;
-use wincli::{backend, inspect, instance, install, pe, snapshot, winfs::WinFs};
+use wincli::{backend, inspect, install, instance, pe, snapshot, winfs::WinFs};
 
 fn usage() -> ! {
     eprintln!("usage:");
@@ -10,6 +10,7 @@ fn usage() -> ! {
     eprintln!("  wincli shell                    interactive ephemeral runner shell");
     eprintln!("  wincli runner                   run host-controlled job commands from stdin");
     eprintln!("  wincli --snapshot=os.snap shell|runner  boot a snapshot image");
+    eprintln!("  wincli --save-snapshot=disk.snap shell|runner  persist the disk on exit");
     eprintln!("  wincli snapshot build <dir> <os.snap>   build image from <dir>/C");
     eprintln!("  wincli instance boot <name> [--snapshot=os.snap]");
     eprintln!("  wincli instance status|destroy <name>");
@@ -34,8 +35,20 @@ fn main() {
         .get(1)
         .and_then(|arg| arg.strip_prefix("--snapshot="))
         .map(str::to_string);
+    let save_snapshot_path = args
+        .iter()
+        .find_map(|arg| arg.strip_prefix("--save-snapshot="))
+        .map(str::to_string);
     if snapshot_path.is_some() {
         args.remove(1);
+    }
+    if let Some(path) = save_snapshot_path.as_deref() {
+        if let Some(index) = args
+            .iter()
+            .position(|arg| arg == &format!("--save-snapshot={path}"))
+        {
+            args.remove(index);
+        }
     }
     if args.len() == 3 && args[1] == "inspect" {
         inspect_target(&args[2]);
@@ -57,7 +70,9 @@ fn main() {
     if args.len() >= 4 && args[1] == "instance" {
         match args[2].as_str() {
             "boot" if args.len() == 4 || args.len() == 5 => {
-                let snapshot = args.get(4).and_then(|value| value.strip_prefix("--snapshot="));
+                let snapshot = args
+                    .get(4)
+                    .and_then(|value| value.strip_prefix("--snapshot="));
                 if args.len() == 5 && snapshot.is_none() {
                     usage();
                 }
@@ -108,21 +123,27 @@ fn main() {
         return;
     }
     if args.len() == 2 && args[1] == "shell" {
-        if let Some(path) = snapshot_path.as_deref() {
-            let fs = load_snapshot(path);
-            std::process::exit(wincli::shell::run_shell_with_fs(fs));
-        }
-        std::process::exit(wincli::shell::run_shell());
+        let fs = match snapshot_path.as_deref() {
+            Some(path) => load_snapshot(path),
+            None => WinFs::ephemeral_runner(),
+        };
+        let (code, fs) = wincli::shell::run_shell_with_fs(fs);
+        save_snapshot_if_requested(save_snapshot_path.as_deref(), &fs);
+        std::process::exit(code);
     }
     if args.len() == 2 && args[1] == "runner" {
-        if let Some(path) = snapshot_path.as_deref() {
-            let fs = load_snapshot(path);
-            std::process::exit(wincli::shell::run_runner_with_fs(fs));
-        }
-        std::process::exit(wincli::shell::run_runner());
+        let fs = match snapshot_path.as_deref() {
+            Some(path) => load_snapshot(path),
+            None => WinFs::ephemeral_runner(),
+        };
+        let (code, fs) = wincli::shell::run_runner_with_fs(fs);
+        save_snapshot_if_requested(save_snapshot_path.as_deref(), &fs);
+        std::process::exit(code);
     }
-    if snapshot_path.is_some() {
-        eprintln!("wincli: --snapshot is currently supported with shell or runner");
+    if snapshot_path.is_some() || save_snapshot_path.is_some() {
+        eprintln!(
+            "wincli: --snapshot/--save-snapshot are currently supported with shell or runner"
+        );
         std::process::exit(2);
     }
     if args.len() < 2 {
@@ -154,6 +175,18 @@ fn load_snapshot(path: &str) -> WinFs {
             eprintln!("wincli: cannot boot snapshot {path}: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+/// Write the session disk back when `--save-snapshot=<file>` was given.
+fn save_snapshot_if_requested(path: Option<&str>, fs: &WinFs) {
+    if let Some(path) = path {
+        let bytes = snapshot::encode(fs);
+        if let Err(e) = std::fs::write(path, &bytes) {
+            eprintln!("wincli: cannot save snapshot {path}: {e}");
+            std::process::exit(1);
+        }
+        eprintln!("wincli: saved snapshot {path} ({} bytes)", bytes.len());
     }
 }
 
@@ -219,7 +252,8 @@ fn guest_bin_name(target: &str) -> String {
     }
 }
 
-fn run_exe_file(path: &str, prog: &str, guest_args: &[String]) {    // NOTE: this reads the *Linux host* file as the PE container only.
+fn run_exe_file(path: &str, prog: &str, guest_args: &[String]) {
+    // NOTE: this reads the *Linux host* file as the PE container only.
     // The Windows guest filesystem stays purely in memory (WinFs).
     let data = match std::fs::read(path) {
         Ok(d) => d,

@@ -114,9 +114,16 @@ impl Shell {
                     .ok_or_else(|| "usage: install <pkg>".to_string())?;
                 let inst = do_install(name)?;
                 out.extend_from_slice(
-                    format!("Installed {} {} → {}\n", inst.name, inst.version, inst.guest_path)
-                        .as_bytes(),
+                    format!(
+                        "Installed {} {} → {}\n",
+                        inst.name, inst.version, inst.guest_path
+                    )
+                    .as_bytes(),
                 );
+                Ok(ShellFlow::Continue)
+            }
+            "snapshot" => {
+                self.do_snapshot(&argv[1..], out)?;
                 Ok(ShellFlow::Continue)
             }
             "choco" => {
@@ -132,8 +139,8 @@ impl Shell {
                     .get(1)
                     .ok_or_else(|| "usage: inspect <app.exe|pkg>".to_string())?;
                 let data = read_target_bytes(target)?;
-                let report =
-                    inspect::inspect_pe(&data).map_err(|e| format!("cannot inspect {target}: {e}"))?;
+                let report = inspect::inspect_pe(&data)
+                    .map_err(|e| format!("cannot inspect {target}: {e}"))?;
                 out.extend_from_slice(inspect::render(&report).as_bytes());
                 Ok(ShellFlow::Continue)
             }
@@ -180,6 +187,19 @@ impl Shell {
                 .map_err(|e| format!("cannot read guest executable {target}: {e}"))?;
             return self.run_exe_bytes(&data, target, &argv[1..], out, sink);
         }
+        // Bare names resolve on the machine PATH (`C:\bin`), like a real
+        // terminal: `7z` finds `C:\bin\7z.exe` installed on this disk.
+        if !target.contains(['\\', '/', ':']) {
+            for candidate in [format!(r"C:\bin\{target}"), format!(r"C:\bin\{target}.exe")] {
+                if self.fs.is_file(&candidate) {
+                    let data = self
+                        .fs
+                        .read_file(&candidate)
+                        .map_err(|e| format!("cannot read guest executable {candidate}: {e}"))?;
+                    return self.run_exe_bytes(&data, &candidate, &argv[1..], out, sink);
+                }
+            }
+        }
         let cache = install::cache_dir();
         if let Some(exe_path) = install::find_cached(&cache, &guest_bin_name(target)) {
             return self.run_exe_file(
@@ -219,8 +239,7 @@ impl Shell {
         out: &mut Vec<u8>,
         sink: Option<backend::OutputSink>,
     ) -> Result<ShellFlow, String> {
-        let data =
-            std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+        let data = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
         self.run_exe_bytes(&data, prog, guest_args, out, sink)
     }
 
@@ -237,13 +256,14 @@ impl Shell {
     ) -> Result<ShellFlow, String> {
         let img = pe::load_lenient(data).map_err(|e| format!("failed to load {prog}: {e}"))?;
         let fs = std::mem::replace(&mut self.fs, WinFs::ephemeral_runner());
-        let backend = backend::configured().map_err(|e| format!("failed to select backend: {e}"))?;
+        let backend =
+            backend::configured().map_err(|e| format!("failed to select backend: {e}"))?;
         let streaming = sink.is_some();
         let result = match sink {
             Some(sink) => backend.execute_streaming(&img, fs, prog, guest_args, sink),
             None => backend.execute(&img, fs, prog, guest_args),
         }
-            .map_err(|e| format!("{} execution failed: {e}", backend.id()))?;
+        .map_err(|e| format!("{} execution failed: {e}", backend.id()))?;
         self.fs = result.fs;
         self.last_code = result.code as i32;
         if !streaming {
@@ -252,20 +272,47 @@ impl Shell {
         Ok(ShellFlow::Continue)
     }
 
+    /// `snapshot save <host-file>`: persist this session's disk image so
+    /// a later `wincli --snapshot=<file> shell` (or `--save-snapshot`)
+    /// resumes with every installation and file change intact.
+    fn do_snapshot(&mut self, argv: &[String], out: &mut Vec<u8>) -> Result<(), String> {
+        match argv.first().map(|s| s.to_lowercase()).as_deref() {
+            Some("save") => {
+                let path = argv
+                    .get(1)
+                    .ok_or_else(|| "usage: snapshot save <file>".to_string())?;
+                if argv.len() != 2 {
+                    return Err("usage: snapshot save <file>".to_string());
+                }
+                let bytes = crate::snapshot::encode(&self.fs);
+                std::fs::write(path, &bytes)
+                    .map_err(|e| format!("cannot save snapshot {path}: {e}"))?;
+                self.last_code = 0;
+                out.extend_from_slice(
+                    format!("Saved snapshot {} ({} bytes)\n", path, bytes.len()).as_bytes(),
+                );
+                Ok(())
+            }
+            _ => Err("usage: snapshot save <file>".to_string()),
+        }
+    }
     /// `choco install nodejs [--version=X.Y.Z]`: fetch the official
     /// distribution, verify, and cache node.exe plus the bundled npm tree.
     /// `choco` itself is built into wincli (no bootstrap needed).
     fn do_choco(&mut self, argv: &[String], out: &mut Vec<u8>) -> Result<(), String> {
         match choco::parse_args(argv)? {
             choco::ChocoCmd::Version => {
-                out.extend_from_slice(
-                    format!("wincli-choco {}\n", choco::SHIM_VERSION).as_bytes(),
-                );
+                out.extend_from_slice(format!("wincli-choco {}\n", choco::SHIM_VERSION).as_bytes());
                 Ok(())
             }
             choco::ChocoCmd::InstallNode { version } => {
                 let cache = install::cache_dir();
                 let inst = choco::install_nodejs(&version, &cache)?;
+                self.seed_host_file(
+                    &inst.node_exe_host.display().to_string(),
+                    r"C:\bin\node.exe",
+                )?;
+                self.seed_npm_tree(&inst)?;
                 self.last_code = 0;
                 out.extend_from_slice(
                     format!(
@@ -276,7 +323,64 @@ impl Shell {
                 );
                 Ok(())
             }
+            choco::ChocoCmd::InstallCommunity { id, version } => {
+                let cache = install::cache_dir();
+                let app = choco::install_community(&id, version.as_deref(), &cache)?;
+                self.seed_choco_app(&app)?;
+                self.last_code = 0;
+                out.extend_from_slice(
+                    format!(
+                        "Installed {} {} → C:\\bin\\{}.exe\n",
+                        app.name, app.version, app.name
+                    )
+                    .as_bytes(),
+                );
+                Ok(())
+            }
         }
+    }
+
+    /// Copy a community app onto the guest disk. Keeping the app tree and
+    /// PATH entry in WinFS makes it part of snapshots and removes runtime
+    /// dependence on the host package cache.
+    fn seed_choco_app(&mut self, app: &choco::ChocoApp) -> Result<(), String> {
+        let mut files = Vec::new();
+        collect_host_files(&app.dir_host, &mut files)
+            .map_err(|e| format!("cannot seed {}: {e}", app.name))?;
+        files.sort();
+        for file in files {
+            let rel = file
+                .strip_prefix(&app.dir_host)
+                .map_err(|_| "cannot seed Chocolatey app: bad path".to_string())?;
+            let guest = format!(
+                r"C:\apps\{}\{}",
+                app.name,
+                rel.to_string_lossy().replace('/', "\\")
+            );
+            self.seed_host_file(&file.display().to_string(), &guest)?;
+        }
+        let exe = app.exe_rel.rsplit('/').next().unwrap_or(&app.name);
+        let exe_guest = format!(r"C:\apps\{}\{}", app.name, app.exe_rel.replace('/', "\\"));
+        let bytes = self
+            .fs
+            .read_file(&exe_guest)
+            .map_err(|e| format!("cannot seed {} executable: {e}", app.name))?;
+        self.fs
+            .mkdir(r"C:\bin")
+            .map_err(|e| format!("cannot create command directory: {e}"))?;
+        self.fs
+            .write_file(&format!(r"C:\bin\{}.exe", app.name), bytes.clone())
+            .map_err(|e| format!("cannot seed {} command: {e}", app.name))?;
+        let stem = exe
+            .strip_suffix(".exe")
+            .or_else(|| exe.strip_suffix(".EXE"))
+            .unwrap_or(exe);
+        if !stem.eq_ignore_ascii_case(&app.name) {
+            self.fs
+                .write_file(&format!(r"C:\bin\{stem}.exe"), bytes)
+                .map_err(|e| format!("cannot seed {} command: {e}", app.name))?;
+        }
+        Ok(())
     }
 
     /// Minimal `powershell -c <script>` passthrough so Windows install
@@ -333,16 +437,30 @@ impl Shell {
         out: &mut Vec<u8>,
         sink: Option<backend::OutputSink>,
     ) -> Result<ShellFlow, String> {
-        let cache = install::cache_dir();
-        let inst = choco::current_nodejs(&cache)
-            .ok_or_else(|| "nothing to run: npm (no nodejs; try `choco install nodejs`)".to_string())?;
-        if !inst.node_exe_host.is_file() {
-            return Err("nothing to run: npm (cached node.exe is missing; try `choco install nodejs`)".to_string());
+        let node_guest = r"C:\bin\node.exe";
+        let npm_guest = choco::npm_cli_guest();
+        if let (Ok(node), Ok(_)) = (self.fs.read_file(node_guest), self.fs.read_file(npm_guest)) {
+            let mut args = vec![npm_guest.to_string()];
+            args.extend_from_slice(guest_args);
+            return self.run_exe_bytes(&node, "node", &args, out, sink);
         }
+        let cache = install::cache_dir();
+        let inst = choco::current_nodejs(&cache).ok_or_else(|| {
+            "nothing to run: npm (no nodejs; try `choco install nodejs`)".to_string()
+        })?;
+        if !inst.node_exe_host.is_file() {
+            return Err(
+                "nothing to run: npm (cached node.exe is missing; try `choco install nodejs`)"
+                    .to_string(),
+            );
+        }
+        self.seed_host_file(&inst.node_exe_host.display().to_string(), node_guest)?;
         self.seed_npm_tree(&inst)?;
-        let data = std::fs::read(&inst.node_exe_host)
-            .map_err(|e| format!("cannot read cached node.exe: {e}"))?;
-        let mut args = vec![choco::npm_cli_guest().to_string()];
+        let data = self
+            .fs
+            .read_file(node_guest)
+            .map_err(|e| format!("cannot read guest node.exe: {e}"))?;
+        let mut args = vec![npm_guest.to_string()];
         args.extend_from_slice(guest_args);
         self.run_exe_bytes(&data, "node", &args, out, sink)
     }
@@ -359,17 +477,15 @@ impl Shell {
             return Ok(());
         }
         let mut files = Vec::new();
-        collect_host_files(&inst.npm_root_host, &mut files).map_err(|e| format!("cannot seed npm: {e}"))?;
+        collect_host_files(&inst.npm_root_host, &mut files)
+            .map_err(|e| format!("cannot seed npm: {e}"))?;
         files.sort();
         for file in files {
             let rel = file
                 .strip_prefix(&inst.npm_root_host)
                 .map_err(|_| "cannot seed npm: bad path".to_string())?;
             let guest = format!(r"C:\npm\{}", rel.to_string_lossy().replace('/', "\\"));
-            self.seed_host_file(
-                &file.display().to_string(),
-                &guest,
-            )?;
+            self.seed_host_file(&file.display().to_string(), &guest)?;
         }
         self.fs
             .write_file(MARKER, inst.version.as_bytes().to_vec())
@@ -439,7 +555,10 @@ fn guest_bin_name(target: &str) -> String {
 }
 
 /// Recursively collect host files under `root` (for npm tree seeding).
-fn collect_host_files(root: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {
+fn collect_host_files(
+    root: &std::path::Path,
+    out: &mut Vec<std::path::PathBuf>,
+) -> std::io::Result<()> {
     for entry in std::fs::read_dir(root)? {
         let path = entry?.path();
         if path.is_dir() {
@@ -488,7 +607,7 @@ fn split_line(line: &str) -> Vec<String> {
     out
 }
 
-fn run_session(fs: WinFs, prompt_enabled: bool) -> i32 {
+fn run_session(fs: WinFs, prompt_enabled: bool) -> (i32, WinFs) {
     let stdin = std::io::stdin();
     let tty = prompt_enabled && std::io::IsTerminal::is_terminal(&stdin);
     let mut shell = Shell::with_fs(fs);
@@ -511,7 +630,7 @@ fn run_session(fs: WinFs, prompt_enabled: bool) -> i32 {
             }
             Ok(ShellFlow::Exit(code)) => {
                 let _ = std::io::stdout().write_all(&out);
-                return code;
+                return (code, shell.fs);
             }
             Err(e) => {
                 // Flush partial output first (a real shell streams).
@@ -521,17 +640,17 @@ fn run_session(fs: WinFs, prompt_enabled: bool) -> i32 {
         }
         prompt(&shell);
     }
-    shell.last_code
+    (shell.last_code, shell.fs)
 }
 
 /// Interactive loop. Returns the process exit code. The prompt goes to
 /// stderr (stdout stays clean for pipes); EOF ends with the last code.
-pub fn run_shell() -> i32 {
+pub fn run_shell() -> (i32, WinFs) {
     run_session(WinFs::ephemeral_runner(), true)
 }
 
 /// Run an interactive shell from a decoded snapshot image.
-pub fn run_shell_with_fs(fs: WinFs) -> i32 {
+pub fn run_shell_with_fs(fs: WinFs) -> (i32, WinFs) {
     run_session(fs, true)
 }
 
@@ -539,12 +658,12 @@ pub fn run_shell_with_fs(fs: WinFs) -> i32 {
 /// without a prompt, boots one fresh ephemeral WinFs image, and destroys that
 /// image when the input closes. This is the local control-plane seam for a
 /// future GitHub Actions protocol adapter.
-pub fn run_runner() -> i32 {
+pub fn run_runner() -> (i32, WinFs) {
     run_session(WinFs::ephemeral_runner(), false)
 }
 
 /// Run a host-controlled session from a decoded snapshot image.
-pub fn run_runner_with_fs(fs: WinFs) -> i32 {
+pub fn run_runner_with_fs(fs: WinFs) -> (i32, WinFs) {
     run_session(fs, false)
 }
 
@@ -594,7 +713,10 @@ mod tests {
             .seed_host_file(host.to_str().unwrap(), r"C:\actions-runner\_work\in.txt")
             .unwrap();
         assert_eq!(
-            shell.fs.read_file(r"C:\actions-runner\_work\in.txt").unwrap(),
+            shell
+                .fs
+                .read_file(r"C:\actions-runner\_work\in.txt")
+                .unwrap(),
             b"seeded"
         );
         std::fs::remove_file(host).ok();
@@ -679,7 +801,10 @@ mod tests {
         let mut shell = Shell::new();
         let mut out = Vec::new();
         shell.exec_line("choco --version", &mut out).unwrap();
-        assert_eq!(out, format!("wincli-choco {}\n", choco::SHIM_VERSION).as_bytes());
+        assert_eq!(
+            out,
+            format!("wincli-choco {}\n", choco::SHIM_VERSION).as_bytes()
+        );
     }
 
     #[test]
@@ -688,7 +813,9 @@ mod tests {
         let mut out = Vec::new();
         let err = shell.exec_line("choco", &mut out).unwrap_err();
         assert!(err.contains("usage"), "err: {err}");
-        let err = shell.exec_line("choco install python", &mut out).unwrap_err();
+        let err = shell
+            .exec_line("choco install python", &mut out)
+            .unwrap_err();
         assert!(err.contains("no such package"), "err: {err}");
     }
 

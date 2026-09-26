@@ -145,7 +145,25 @@ node -v   # v24.21.0
 npm -v    # 11.19.0
 ```
 
-Omitting `--version` installs the pinned default (currently 24.21.0).
+Omitting `--version` installs the pinned default (currently 24.21.0). Community
+packages with portable `tools/` payloads can also be installed, for example
+`choco install 7zip.portable -y`; their files are copied into the guest disk.
+
+Save the in-session disk, including Chocolatey-installed commands, and load it
+on a later run:
+
+```bash
+wincli shell
+choco install nodejs
+snapshot save wincli.snap
+exit
+wincli --snapshot=wincli.snap shell
+node -v
+```
+
+`wincli --save-snapshot=wincli.snap shell` also writes the disk when the shell
+exits. Both forms save guest files and installed tools as a snapshot archive.
+
 Set `WINCLI_TEST_CHOCO=1` to run the live download-and-verify E2E test
 (`cargo test --test choco_node`).
 
