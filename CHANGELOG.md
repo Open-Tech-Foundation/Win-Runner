@@ -19,8 +19,17 @@ All notable changes to this project will be documented in this file.
   filesystem-state timings with `WINCLI_TIMINGS=1`.
 - `snapshot save` now defaults to the snapshot loaded by the shell or runner,
   and remembers a path given to an earlier save command.
-- If a guest process fails, a shell booted from a snapshot restores that last
-  saved guest disk instead of replacing it with an empty runner image.
+- Replaced ZIP snapshots with an append-only indexed WinFS disk file. Boot
+  loads the C: path index and reads file extents on demand; native process
+  state now transfers filesystem changes instead of a full disk image.
+- Added seeked range reads for synchronous, NT, and overlapped Win32 file reads.
+  Coverage follows the `SetFilePointer`/`ReadFile` cases in Wine's
+  `dlls/kernel32/tests/file.c`.
+- Failed native launches keep the current C: filesystem in memory and discard
+  only changes from the failed child process.
+- Added live host-folder mounts as guest drives (`mount Z: <host-directory>` or
+  `--mount=Z:<host-directory>`). Mounts read and write through to the host and
+  are kept outside C: snapshots.
 
 ### Removed
 

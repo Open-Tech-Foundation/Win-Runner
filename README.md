@@ -1,14 +1,15 @@
 # Win-CLI
 
 Minimal Linux tool for running Windows console programs and filesystem scripts
-against a fully in-memory Windows-style filesystem. No Wine, VM, Windows DLLs,
-or host filesystem backing.
+against an indexed WinFS disk. Its default C: disk is temporary and discarded
+when the session ends. No Wine, VM, or host Windows installation is required.
 
 ```bash
 wincli app.exe [args...]  # minimal x86_64 PE execution (PE32+, native console apps)
-wincli --snapshot=tools.snap shell # boot a saved guest disk
+wincli --snapshot=tools.winfs shell # boot a saved C: guest disk
+wincli --mount=Z:/host/folder shell # expose a host folder as a live drive
 wincli script.ps1         # minimal PowerShell-like script execution
-wincli shell              # interactive shell: one in-memory WinFS per session
+wincli shell              # interactive shell: one ephemeral WinFS per session
 wincli inspect app.exe    # PE compatibility report: supported vs missing imports
 ```
 
@@ -29,13 +30,15 @@ process.
 The native loader has experimental TLS/TEB/PEB initialization. It is not yet
 sufficient for general Windows CRT startup or exception handling.
 
-PE programs and PS1 scripts share the exact same in-memory `WinFS`: case-insensitive lookup with
-original casing preserved, `C:\` + relative paths, `.`/`..` normalization.
+PE programs and PS1 scripts share the same indexed `WinFS`: case-insensitive
+lookup with original casing preserved, `C:\` and mounted drive paths, relative
+paths, and `.`/`..` normalization. File contents live in a seekable backing
+store; file reads fetch only the requested ranges.
 
 ## Layout
 
 ```text
-src/winfs/   in-memory Windows filesystem (shared by EXE shims and PS1)
+src/winfs/   indexed, seekable Windows filesystem (shared by EXE shims and PS1)
 src/pe/      PE32+ loader and test-EXE builder
 src/native.rs Linux x86-64 PE execution and Windows API shims
 src/choco.rs Chocolatey-compatible `choco install nodejs` (shell builtin)
@@ -100,7 +103,7 @@ cargo test   # unit tests + CLI end-to-end tests against tests/artifacts/
 wincli shell
 ```
 
-One in-memory WinFS for the whole session (files created by one command
+One ephemeral WinFS for the whole session (files created by one command
 are visible to the next). Each line is a PS1 statement, `install`/`inspect`,
 `choco`, `powershell -c`, a host `.exe`/`.ps1` file, or a package installed
 in the session with args — so `install rg` followed by `rg --version` works.
@@ -109,6 +112,16 @@ Errors print as
 with the last guest exit code. Interactive input supports cursor movement,
 insertion, deletion, and history navigation. The prompt goes to stderr,
 keeping stdout clean for pipes.
+
+Mount a host folder on a separate guest drive with the `mount` command or at
+startup. Mounted files read and write through to the host folder. Use
+`mount Z: /path/to/folder ro` or `--mount-ro=Z:/path/to/folder` for a
+read-only mount. Snapshots save only C: and do not preserve mount settings.
+
+New snapshots use an append-only indexed WinFS disk file, not ZIP. Boot reads
+the C: path index and seeks file data on demand; saving to the active snapshot
+appends changed file extents and a new index. Older ZIP snapshots can still be
+loaded and are converted the next time they are saved.
 
 ## Packages
 

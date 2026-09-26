@@ -1,59 +1,474 @@
-//! Immutable boot-image snapshots for ephemeral runner instances.
-//!
-//! A `.snap` file is a normal ZIP archive (stored or raw-deflate entries) with
-//! this layout:
-//!
-//! ```text
-//! wincli-snapshot/v1                 UTF-8: `wincli snapshot v1\n`
-//! files/C/actions-runner/bin/x.exe   guest file at C:\actions-runner\bin\x.exe
-//! files/C/Windows/...                more guest files
-//! ```
-//!
-//! Directories may be explicit. Entry names must use `/`, begin with `files/C/`,
-//! and may not contain `.` or `..` components. Loading always starts with the
-//! built-in empty runner image; the archive only adds or replaces files.
+//! Seekable C-drive images for ephemeral runner instances. New `.snap` files
+//! use a small path index plus file extents in one appendable disk file. Boot
+//! reads the index only; guest file contents are fetched from their extents
+//! when the program opens them. Legacy ZIP snapshots remain loadable.
 
-use crate::{install, winfs::WinFs};
-use std::path::{Path, PathBuf};
+use crate::{
+    install,
+    winfs::{DiskStore, WinFs},
+};
+use std::{
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 const MARKER: &str = "wincli-snapshot/v1";
 const MARKER_CONTENTS: &[u8] = b"wincli snapshot v1\n";
 const FILE_PREFIX: &str = "files/C/";
+const DISK_MAGIC: &[u8; 8] = b"WFSDSK01";
+const DISK_VERSION: u32 = 1;
+const DISK_HEADER_LEN: u64 = 36;
+const MAX_INDEX_SIZE: u64 = 256 * 1024 * 1024;
+const CHANGE_MAGIC: &[u8; 8] = b"WFSCHG01";
 
 /// Load a snapshot file into a newly booted ephemeral runner image.
 pub fn load_file(path: &str) -> Result<WinFs, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("cannot read snapshot {path}: {e}"))?;
+    let path = Path::new(path);
+    let mut file =
+        File::open(path).map_err(|e| format!("cannot read snapshot {}: {e}", path.display()))?;
+    let mut magic = [0u8; 8];
+    let read = file
+        .read(&mut magic)
+        .map_err(|e| format!("cannot read snapshot {}: {e}", path.display()))?;
+    if read == magic.len() && &magic == DISK_MAGIC {
+        return load_disk_file(path);
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("cannot read legacy snapshot {}: {e}", path.display()))?;
     load(&bytes)
 }
 
-/// Build a deterministic v1 snapshot from a host staging directory.
+/// Save only changed file extents when updating an existing WinFS disk. The
+/// index is appended and its pointer is committed last, so the previous index
+/// remains active if writing new data fails.
+pub fn save_file(fs: &mut WinFs, output: &str) -> Result<usize, String> {
+    let output_path = Path::new(output);
+    let is_existing_disk = output_path.exists() && is_disk_file(output_path)?;
+    let use_temporary = !is_existing_disk;
+    let write_path = if use_temporary {
+        temporary_output_path(output_path)
+    } else {
+        output_path.to_path_buf()
+    };
+    let disk = if use_temporary {
+        DiskStore::create_temporary(&write_path)?
+    } else {
+        DiskStore::open(&write_path)?
+    };
+    if disk.len()? == 0 {
+        let mut header = vec![0u8; DISK_HEADER_LEN as usize];
+        header[..8].copy_from_slice(DISK_MAGIC);
+        header[8..12].copy_from_slice(&DISK_VERSION.to_le_bytes());
+        disk.append(&header)?;
+    }
+
+    let files = fs.snapshot_files();
+    let mut file_records = Vec::with_capacity(files.len());
+    for file in &files {
+        let (offset, length) = if file.is_stored_in(output_path) && is_existing_disk {
+            file.disk_location()
+                .map(|(_, offset, length)| (offset, length))
+                .ok_or_else(|| format!("missing disk location for {}", file.path))?
+        } else {
+            file.append_to(&disk)?
+        };
+        file_records.push((file.path.clone(), offset, length));
+    }
+
+    let directories = fs.snapshot_directories();
+    let entry_count = directories
+        .len()
+        .checked_add(file_records.len())
+        .ok_or("too many snapshot entries")?;
+    let index = encode_index(&directories, &file_records)?;
+    let index_offset = disk.append(&index)?;
+    let mut header = vec![0u8; DISK_HEADER_LEN as usize];
+    header[..8].copy_from_slice(DISK_MAGIC);
+    header[8..12].copy_from_slice(&DISK_VERSION.to_le_bytes());
+    header[12..20].copy_from_slice(&index_offset.to_le_bytes());
+    header[20..28].copy_from_slice(&(index.len() as u64).to_le_bytes());
+    header[28..36].copy_from_slice(&(entry_count as u64).to_le_bytes());
+    disk.write_at(0, &header)?;
+
+    let final_disk = if use_temporary {
+        std::fs::rename(&write_path, output_path)
+            .map_err(|e| format!("cannot commit snapshot {}: {e}", output_path.display()))?;
+        DiskStore::open(output_path)?
+    } else {
+        disk
+    };
+    for (path, offset, length) in &file_records {
+        fs.mark_snapshot_file(path, Arc::clone(&final_disk), *offset, *length)?;
+    }
+    Ok(file_records.len())
+}
+
+fn temporary_output_path(output: &Path) -> PathBuf {
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    let name = output.file_name().unwrap_or_default().to_string_lossy();
+    parent.join(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ))
+}
+
+fn is_disk_file(path: &Path) -> Result<bool, String> {
+    let mut file =
+        File::open(path).map_err(|e| format!("cannot inspect snapshot {}: {e}", path.display()))?;
+    let mut magic = [0u8; 8];
+    let read = file
+        .read(&mut magic)
+        .map_err(|e| format!("cannot inspect snapshot {}: {e}", path.display()))?;
+    Ok(read == magic.len() && &magic == DISK_MAGIC)
+}
+
+fn encode_index(directories: &[String], files: &[(String, u64, u64)]) -> Result<Vec<u8>, String> {
+    let count = directories
+        .len()
+        .checked_add(files.len())
+        .ok_or("too many snapshot entries")?;
+    let count = u32::try_from(count).map_err(|_| "too many snapshot entries")?;
+    let mut out = Vec::new();
+    out.extend_from_slice(&count.to_le_bytes());
+    for directory in directories {
+        encode_index_path(&mut out, 0, directory)?;
+    }
+    for (path, offset, length) in files {
+        encode_index_path(&mut out, 1, path)?;
+        out.extend_from_slice(&offset.to_le_bytes());
+        out.extend_from_slice(&length.to_le_bytes());
+    }
+    Ok(out)
+}
+
+fn encode_index_path(out: &mut Vec<u8>, kind: u8, path: &str) -> Result<(), String> {
+    let path = path.as_bytes();
+    let len = u32::try_from(path.len()).map_err(|_| "snapshot path is too long")?;
+    out.push(kind);
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(path);
+    Ok(())
+}
+
+fn load_disk_file(path: &Path) -> Result<WinFs, String> {
+    let store = DiskStore::open(path)?;
+    let header = store.read_at(0, DISK_HEADER_LEN as usize)?;
+    if &header[..8] != DISK_MAGIC {
+        return Err("invalid WinFS disk signature".to_string());
+    }
+    let version = u32::from_le_bytes(header[8..12].try_into().unwrap());
+    if version != DISK_VERSION {
+        return Err(format!("unsupported WinFS disk version {version}"));
+    }
+    let offset = u64::from_le_bytes(header[12..20].try_into().unwrap());
+    let length = u64::from_le_bytes(header[20..28].try_into().unwrap());
+    let declared_count = u64::from_le_bytes(header[28..36].try_into().unwrap());
+    let disk_len = store.len()?;
+    if length > MAX_INDEX_SIZE
+        || offset < DISK_HEADER_LEN
+        || offset
+            .checked_add(length)
+            .map(|end| end > disk_len)
+            .unwrap_or(true)
+    {
+        return Err("invalid WinFS disk index bounds".to_string());
+    }
+    let length = usize::try_from(length).map_err(|_| "WinFS disk index is too large")?;
+    let index = store.read_at(offset, length)?;
+    let mut cursor = 0usize;
+    let count = take_u32(&index, &mut cursor)? as u64;
+    if count != declared_count {
+        return Err("WinFS disk index entry count mismatch".to_string());
+    }
+    if count > 10_000_000 {
+        return Err("WinFS disk has too many indexed entries".to_string());
+    }
+    let mut fs = WinFs::ephemeral_runner();
+    for _ in 0..count {
+        let kind = take_u8(&index, &mut cursor)?;
+        let guest = take_index_path(&index, &mut cursor)?;
+        validate_guest_absolute(&guest)?;
+        match kind {
+            0 => fs
+                .mkdir(&guest)
+                .map_err(|e| format!("invalid indexed directory {guest}: {e}"))?,
+            1 => {
+                let file_offset = take_u64(&index, &mut cursor)?;
+                let file_length = take_u64(&index, &mut cursor)?;
+                let end = file_offset
+                    .checked_add(file_length)
+                    .ok_or("indexed file extent overflow")?;
+                if file_offset < DISK_HEADER_LEN || end > offset {
+                    return Err(format!(
+                        "indexed file extent is outside data section: {guest}"
+                    ));
+                }
+                fs.open_snapshot_file(&guest, Arc::clone(&store), file_offset, file_length)?;
+            }
+            _ => return Err(format!("unknown WinFS disk index record {kind}")),
+        }
+    }
+    if cursor != index.len() {
+        return Err("trailing bytes in WinFS disk index".to_string());
+    }
+    fs.clear_changes();
+    Ok(fs)
+}
+
+fn validate_guest_absolute(path: &str) -> Result<(), String> {
+    if !path.starts_with("C:\\")
+        || path[3..]
+            .split('\\')
+            .any(|part| part.is_empty() || matches!(part, "." | ".."))
+    {
+        return Err(format!("unsafe WinFS disk path: {path}"));
+    }
+    Ok(())
+}
+
+fn take_u8(bytes: &[u8], cursor: &mut usize) -> Result<u8, String> {
+    let value = *bytes.get(*cursor).ok_or("truncated WinFS disk index")?;
+    *cursor += 1;
+    Ok(value)
+}
+
+fn take_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32, String> {
+    let end = cursor.checked_add(4).ok_or("WinFS index offset overflow")?;
+    let value = u32::from_le_bytes(
+        bytes
+            .get(*cursor..end)
+            .ok_or("truncated WinFS disk index")?
+            .try_into()
+            .unwrap(),
+    );
+    *cursor = end;
+    Ok(value)
+}
+
+fn take_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64, String> {
+    let end = cursor.checked_add(8).ok_or("WinFS index offset overflow")?;
+    let value = u64::from_le_bytes(
+        bytes
+            .get(*cursor..end)
+            .ok_or("truncated WinFS disk index")?
+            .try_into()
+            .unwrap(),
+    );
+    *cursor = end;
+    Ok(value)
+}
+
+fn take_index_path(bytes: &[u8], cursor: &mut usize) -> Result<String, String> {
+    let len = take_u32(bytes, cursor)? as usize;
+    let end = cursor
+        .checked_add(len)
+        .ok_or("WinFS path offset overflow")?;
+    let value = std::str::from_utf8(bytes.get(*cursor..end).ok_or("truncated WinFS disk path")?)
+        .map_err(|_| "WinFS disk path is not UTF-8")?
+        .to_string();
+    *cursor = end;
+    Ok(value)
+}
+
+/// Encode only the guest filesystem operations performed by one process.
+/// File writes point at extents in the shared temporary disk; bytes are not
+/// copied through the parent/child state pipe.
+pub(crate) fn encode_changes(fs: &WinFs) -> Result<Vec<u8>, String> {
+    use crate::winfs::FsChange;
+    let changes = fs.changes();
+    let count = u32::try_from(changes.len()).map_err(|_| "too many WinFS changes")?;
+    let mut out = Vec::new();
+    out.extend_from_slice(CHANGE_MAGIC);
+    out.extend_from_slice(&count.to_le_bytes());
+    for change in changes {
+        match change {
+            FsChange::Mkdir(path) => {
+                out.push(0);
+                push_string(&mut out, path)?;
+            }
+            FsChange::Write {
+                path,
+                offset: Some((offset, length)),
+                ..
+            } => {
+                out.push(1);
+                push_string(&mut out, path)?;
+                out.push(1);
+                out.extend_from_slice(&offset.to_le_bytes());
+                out.extend_from_slice(&length.to_le_bytes());
+            }
+            FsChange::Write {
+                path,
+                offset: None,
+                bytes,
+            } => {
+                out.push(1);
+                push_string(&mut out, path)?;
+                out.push(0);
+                let len =
+                    u64::try_from(bytes.len()).map_err(|_| "WinFS file write is too large")?;
+                out.extend_from_slice(&len.to_le_bytes());
+                out.extend_from_slice(bytes);
+            }
+            FsChange::Remove { path, recursive } => {
+                out.push(2);
+                push_string(&mut out, path)?;
+                out.push(u8::from(*recursive));
+            }
+            FsChange::Move { source, target } => {
+                out.push(3);
+                push_string(&mut out, source)?;
+                push_string(&mut out, target)?;
+            }
+            FsChange::Copy {
+                source,
+                target,
+                overwrite,
+            } => {
+                out.push(4);
+                push_string(&mut out, source)?;
+                push_string(&mut out, target)?;
+                out.push(u8::from(*overwrite));
+            }
+            FsChange::SetCwd(path) => {
+                out.push(5);
+                push_string(&mut out, path)?;
+            }
+        }
+    }
+    Ok(out)
+}
+
+pub(crate) fn apply_changes(bytes: &[u8], fs: &mut WinFs) -> Result<(), String> {
+    use crate::winfs::FsChange;
+    if bytes.len() < 12 || &bytes[..8] != CHANGE_MAGIC {
+        return Err("invalid WinFS change stream".to_string());
+    }
+    let mut cursor = 8usize;
+    let count = take_u32(bytes, &mut cursor)? as usize;
+    if count > 10_000_000 {
+        return Err("too many WinFS change records".to_string());
+    }
+    let mut changes = Vec::with_capacity(count);
+    for _ in 0..count {
+        match take_u8(bytes, &mut cursor)? {
+            0 => changes.push(FsChange::Mkdir(take_string(bytes, &mut cursor)?)),
+            1 => {
+                let path = take_string(bytes, &mut cursor)?;
+                if take_u8(bytes, &mut cursor)? != 0 {
+                    changes.push(FsChange::Write {
+                        path,
+                        offset: Some((
+                            take_u64(bytes, &mut cursor)?,
+                            take_u64(bytes, &mut cursor)?,
+                        )),
+                        bytes: Vec::new(),
+                    });
+                } else {
+                    let length = take_u64(bytes, &mut cursor)?;
+                    let length =
+                        usize::try_from(length).map_err(|_| "WinFS change payload is too large")?;
+                    let end = cursor
+                        .checked_add(length)
+                        .ok_or("WinFS change payload overflow")?;
+                    let payload = bytes
+                        .get(cursor..end)
+                        .ok_or("truncated WinFS change payload")?
+                        .to_vec();
+                    cursor = end;
+                    changes.push(FsChange::Write {
+                        path,
+                        offset: None,
+                        bytes: payload,
+                    });
+                }
+            }
+            2 => changes.push(FsChange::Remove {
+                path: take_string(bytes, &mut cursor)?,
+                recursive: take_u8(bytes, &mut cursor)? != 0,
+            }),
+            3 => changes.push(FsChange::Move {
+                source: take_string(bytes, &mut cursor)?,
+                target: take_string(bytes, &mut cursor)?,
+            }),
+            4 => changes.push(FsChange::Copy {
+                source: take_string(bytes, &mut cursor)?,
+                target: take_string(bytes, &mut cursor)?,
+                overwrite: take_u8(bytes, &mut cursor)? != 0,
+            }),
+            5 => changes.push(FsChange::SetCwd(take_string(bytes, &mut cursor)?)),
+            tag => return Err(format!("unknown WinFS change operation {tag}")),
+        }
+    }
+    if cursor != bytes.len() {
+        return Err("trailing bytes in WinFS change stream".to_string());
+    }
+    fs.apply_changes(&changes)
+}
+
+fn push_string(out: &mut Vec<u8>, value: &str) -> Result<(), String> {
+    let len = u32::try_from(value.len()).map_err(|_| "WinFS path is too long")?;
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn take_string(bytes: &[u8], cursor: &mut usize) -> Result<String, String> {
+    let len = take_u32(bytes, cursor)? as usize;
+    let end = cursor
+        .checked_add(len)
+        .ok_or("WinFS string offset overflow")?;
+    let value = std::str::from_utf8(bytes.get(*cursor..end).ok_or("truncated WinFS string")?)
+        .map_err(|_| "WinFS string is not UTF-8")?
+        .to_string();
+    *cursor = end;
+    Ok(value)
+}
+
+/// Build an indexed C: disk from a host staging directory.
 ///
-/// `input` must contain a `C/` directory. Regular files below it become
-/// `files/C/...` ZIP entries; directories are implicit. Symlinks and special
-/// files are rejected so the archive cannot accidentally capture host links.
+/// `input` must contain a `C/` directory. Regular files below it are copied
+/// into seekable extents and indexed by guest path. Symlinks and special files
+/// are rejected so the disk cannot accidentally capture host links.
 pub fn build_file(input: &str, output: &str) -> Result<usize, String> {
     let root = Path::new(input).join("C");
     if !root.is_dir() {
-        return Err(format!("snapshot input must contain a C directory: {}", root.display()));
+        return Err(format!(
+            "snapshot input must contain a C directory: {}",
+            root.display()
+        ));
     }
     let mut files = Vec::new();
     collect_files(&root, &root, &mut files)?;
     files.sort_by(|left, right| left.0.cmp(&right.0));
 
-    let mut entries = vec![(MARKER.to_string(), MARKER_CONTENTS.to_vec())];
-    for (relative, source) in files {
+    let mut fs = WinFs::ephemeral_runner();
+    for (relative, source) in &files {
+        let guest = format!("C:\\{}", relative.replace('/', "\\"));
+        if let Some((parent, _)) = guest.rsplit_once('\\') {
+            fs.mkdir(parent)
+                .map_err(|e| format!("cannot create guest directory {parent}: {e}"))?;
+        }
         let data = std::fs::read(&source)
             .map_err(|e| format!("cannot read snapshot input {}: {e}", source.display()))?;
-        entries.push((format!("files/C/{relative}"), data));
+        fs.write_file(&guest, data)
+            .map_err(|e| format!("cannot write guest file {guest}: {e}"))?;
     }
-    std::fs::write(output, zip_stored(&entries))
-        .map_err(|e| format!("cannot write snapshot {output}: {e}"))?;
-    Ok(entries.len() - 1)
+    save_file(&mut fs, output)?;
+    Ok(files.len())
 }
 
-/// Decode an archive and overlay it on a clean runner image.
+/// Decode a legacy ZIP snapshot and overlay it on a clean runner image.
+/// New snapshots are loaded from disk with `load_file`.
 pub fn load(bytes: &[u8]) -> Result<WinFs, String> {
-    let entries = install::zip_entries(bytes).map_err(|e| format!("invalid snapshot archive: {e}"))?;
+    let entries =
+        install::zip_entries(bytes).map_err(|e| format!("invalid snapshot archive: {e}"))?;
     let marker = entries
         .iter()
         .find(|entry| entry.name == MARKER && !entry.is_dir)
@@ -65,7 +480,10 @@ pub fn load(bytes: &[u8]) -> Result<WinFs, String> {
     }
 
     let mut fs = WinFs::ephemeral_runner();
-    for entry in entries.iter().filter(|entry| entry.name.starts_with(FILE_PREFIX)) {
+    for entry in entries
+        .iter()
+        .filter(|entry| entry.name.starts_with(FILE_PREFIX))
+    {
         if entry.is_dir {
             let name = entry.name.trim_end_matches('/');
             let guest = guest_path(name)?;
@@ -74,7 +492,10 @@ pub fn load(bytes: &[u8]) -> Result<WinFs, String> {
             continue;
         }
         let guest = guest_path(&entry.name)?;
-        let parent = guest.rsplit_once('\\').map(|(parent, _)| parent).unwrap_or("C:");
+        let parent = guest
+            .rsplit_once('\\')
+            .map(|(parent, _)| parent)
+            .unwrap_or("C:");
         fs.mkdir(parent)
             .map_err(|e| format!("snapshot cannot create {parent}: {e}"))?;
         let contents = install::extract_bytes(bytes, entry)
@@ -82,23 +503,8 @@ pub fn load(bytes: &[u8]) -> Result<WinFs, String> {
         fs.write_file(&guest, contents)
             .map_err(|e| format!("snapshot cannot write {guest}: {e}"))?;
     }
+    fs.clear_changes();
     Ok(fs)
-}
-
-/// Encode an in-memory instance as a bootable v1 archive. This is used by
-/// the native child boundary to return its guest-side filesystem changes to
-/// the host controller without mounting the host filesystem.
-pub fn encode(fs: &WinFs) -> Vec<u8> {
-    let mut entries = vec![(MARKER.to_string(), MARKER_CONTENTS.to_vec())];
-    for path in fs.directories() {
-        let path = path.strip_prefix("C:\\").unwrap_or(&path).replace('\\', "/");
-        entries.push((format!("files/C/{path}/"), Vec::new()));
-    }
-    for (path, data) in fs.files() {
-        let path = path.strip_prefix("C:\\").unwrap_or(&path).replace('\\', "/");
-        entries.push((format!("files/C/{path}"), data));
-    }
-    zip_stored(&entries)
 }
 
 fn guest_path(name: &str) -> Result<String, String> {
@@ -113,7 +519,11 @@ fn validate_name(name: &str) -> Result<(), String> {
     if !name.starts_with(FILE_PREFIX) {
         return Err(format!("snapshot entry outside guest image: {name}"));
     }
-    if name.contains('\\') || name.split('/').any(|part| part.is_empty() || matches!(part, "." | "..")) {
+    if name.contains('\\')
+        || name
+            .split('/')
+            .any(|part| part.is_empty() || matches!(part, "." | ".."))
+    {
         return Err(format!("unsafe snapshot entry: {name}"));
     }
     Ok(())
@@ -128,7 +538,10 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> R
         let metadata = std::fs::symlink_metadata(&path)
             .map_err(|e| format!("cannot stat snapshot input {}: {e}", path.display()))?;
         if metadata.file_type().is_symlink() {
-            return Err(format!("snapshot input may not contain symlinks: {}", path.display()));
+            return Err(format!(
+                "snapshot input may not contain symlinks: {}",
+                path.display()
+            ));
         }
         if metadata.is_dir() {
             collect_files(root, &path, out)?;
@@ -140,76 +553,13 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> R
                 .replace(std::path::MAIN_SEPARATOR, "/");
             out.push((relative, path));
         } else {
-            return Err(format!("snapshot input is not a regular file: {}", path.display()));
+            return Err(format!(
+                "snapshot input is not a regular file: {}",
+                path.display()
+            ));
         }
     }
     Ok(())
-}
-
-/// Standard, stored-only ZIP writer. The loader also accepts deflated ZIPs,
-/// but stored output keeps boot images deterministic without a compressor.
-fn zip_stored(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut central = Vec::new();
-    for (name, data) in entries {
-        let offset = out.len() as u32;
-        let crc = crc32(data);
-        let name = name.as_bytes();
-        out.extend_from_slice(b"PK\x03\x04");
-        out.extend_from_slice(&20u16.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&crc.to_le_bytes());
-        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(name);
-        out.extend_from_slice(data);
-
-        central.extend_from_slice(b"PK\x01\x02");
-        central.extend_from_slice(&20u16.to_le_bytes());
-        central.extend_from_slice(&20u16.to_le_bytes());
-        central.extend_from_slice(&0u16.to_le_bytes());
-        central.extend_from_slice(&0u16.to_le_bytes());
-        central.extend_from_slice(&0u16.to_le_bytes());
-        central.extend_from_slice(&0u16.to_le_bytes());
-        central.extend_from_slice(&crc.to_le_bytes());
-        central.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        central.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        central.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        central.extend_from_slice(&0u16.to_le_bytes());
-        central.extend_from_slice(&0u16.to_le_bytes());
-        central.extend_from_slice(&0u16.to_le_bytes());
-        central.extend_from_slice(&0u16.to_le_bytes());
-        central.extend_from_slice(&0u32.to_le_bytes());
-        central.extend_from_slice(&offset.to_le_bytes());
-        central.extend_from_slice(name);
-    }
-    let central_offset = out.len() as u32;
-    out.extend_from_slice(&central);
-    out.extend_from_slice(b"PK\x05\x06");
-    out.extend_from_slice(&0u16.to_le_bytes());
-    out.extend_from_slice(&0u16.to_le_bytes());
-    out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
-    out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
-    out.extend_from_slice(&(central.len() as u32).to_le_bytes());
-    out.extend_from_slice(&central_offset.to_le_bytes());
-    out.extend_from_slice(&0u16.to_le_bytes());
-    out
-}
-
-fn crc32(data: &[u8]) -> u32 {
-    let mut crc = 0xffff_ffffu32;
-    for byte in data {
-        crc ^= *byte as u32;
-        for _ in 0..8 {
-            crc = if crc & 1 == 1 { (crc >> 1) ^ 0xedb8_8320 } else { crc >> 1 };
-        }
-    }
-    !crc
 }
 
 #[cfg(test)]
@@ -250,42 +600,143 @@ mod tests {
     #[test]
     fn rejects_path_escape_and_missing_marker() {
         let unsafe_snap = zip_stored(&[(MARKER, MARKER_CONTENTS), ("files/C/../bad", b"")]);
-        assert!(load(&unsafe_snap).unwrap_err().contains("unsafe snapshot entry"));
+        assert!(load(&unsafe_snap)
+            .unwrap_err()
+            .contains("unsafe snapshot entry"));
         assert!(load(&zip_stored(&[("files/C/a", b"")])).is_err());
     }
 
     #[test]
-    fn builds_deterministic_bootable_archive() {
+    fn builds_indexed_seekable_boot_disk() {
         let root = std::env::temp_dir().join(format!("wincli-snapshot-{}", std::process::id()));
         let input = root.join("input");
         let output = root.join("os.snap");
         std::fs::create_dir_all(input.join("C/tools")).unwrap();
         std::fs::write(input.join("C/tools/tool.txt"), b"tool").unwrap();
-        assert_eq!(build_file(input.to_str().unwrap(), output.to_str().unwrap()).unwrap(), 1);
-        let fs = load(&std::fs::read(&output).unwrap()).unwrap();
+        assert_eq!(
+            build_file(input.to_str().unwrap(), output.to_str().unwrap()).unwrap(),
+            1
+        );
+        let bytes = std::fs::read(&output).unwrap();
+        assert_eq!(&bytes[..8], DISK_MAGIC);
+        let fs = load_file(output.to_str().unwrap()).unwrap();
         assert_eq!(fs.read_file(r"C:\tools\tool.txt").unwrap(), b"tool");
         std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
-    fn encodes_a_live_instance() {
+    fn saving_updates_the_index_without_rewriting_existing_extents() {
+        let output =
+            std::env::temp_dir().join(format!("wincli-indexed-update-{}.disk", std::process::id()));
+        let mut fs = WinFs::ephemeral_runner();
+        fs.mkdir(r"C:\tools").unwrap();
+        fs.write_file(r"C:\tools\node.exe", b"node-data".to_vec())
+            .unwrap();
+        save_file(&mut fs, output.to_str().unwrap()).unwrap();
+        let first_size = std::fs::metadata(&output).unwrap().len();
+
+        fs.write_file(r"C:\tools\curl.exe", b"curl-data".to_vec())
+            .unwrap();
+        save_file(&mut fs, output.to_str().unwrap()).unwrap();
+        let second_size = std::fs::metadata(&output).unwrap().len();
+        assert!(second_size > first_size);
+        let loaded = load_file(output.to_str().unwrap()).unwrap();
+        assert_eq!(
+            loaded.read_file(r"C:\tools\node.exe").unwrap(),
+            b"node-data"
+        );
+        assert_eq!(
+            loaded.read_file(r"C:\tools\curl.exe").unwrap(),
+            b"curl-data"
+        );
+        std::fs::remove_file(output).ok();
+    }
+
+    #[test]
+    fn c_drive_snapshot_does_not_capture_a_live_mounted_drive() {
+        let root =
+            std::env::temp_dir().join(format!("wincli-snapshot-mount-{}", std::process::id()));
+        let output = root.with_extension("snap");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("host.txt"), b"external").unwrap();
+        let mut fs = WinFs::ephemeral_runner();
+        fs.mount_host_dir('Z', &root, false).unwrap();
+        fs.write_file(r"C:\guest.txt", b"guest".to_vec()).unwrap();
+        save_file(&mut fs, output.to_str().unwrap()).unwrap();
+        let loaded = load_file(output.to_str().unwrap()).unwrap();
+        assert_eq!(loaded.read_file(r"C:\guest.txt").unwrap(), b"guest");
+        assert!(!loaded.exists(r"Z:\host.txt"));
+        std::fs::remove_file(output).ok();
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn child_filesystem_transport_contains_only_the_change_index() {
+        let mut parent = WinFs::ephemeral_runner();
+        parent.mkdir(r"C:\tools").unwrap();
+        parent
+            .write_file(r"C:\tools\node.exe", vec![b'n'; 2 * 1024 * 1024])
+            .unwrap();
+        parent.clear_changes();
+        let mut child = parent.clone();
+        child
+            .write_file(r"C:\tools\curl.exe", vec![b'c'; 2 * 1024 * 1024])
+            .unwrap();
+        let changes = encode_changes(&child).unwrap();
+        assert!(
+            changes.len() < 128,
+            "change pipe carried file data: {} bytes",
+            changes.len()
+        );
+        apply_changes(&changes, &mut parent).unwrap();
+        assert_eq!(
+            parent.file_len(r"C:\tools\node.exe").unwrap(),
+            2 * 1024 * 1024
+        );
+        assert_eq!(
+            parent.file_len(r"C:\tools\curl.exe").unwrap(),
+            2 * 1024 * 1024
+        );
+        assert_eq!(
+            parent.read_file_range(r"C:\tools\curl.exe", 0, 1).unwrap(),
+            b"c"
+        );
+    }
+
+    #[test]
+    fn saves_a_live_instance_as_an_indexed_disk() {
         let mut fs = WinFs::ephemeral_runner();
         fs.mkdir(r"C:\actions-runner\_work").unwrap();
         fs.write_file(r"C:\actions-runner\_work\result.txt", b"done".to_vec())
             .unwrap();
-        let restored = load(&encode(&fs)).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("wincli-live-disk-{}.snap", std::process::id()));
+        save_file(&mut fs, path.to_str().unwrap()).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..8], DISK_MAGIC);
+        let restored = load_file(path.to_str().unwrap()).unwrap();
         assert_eq!(
-            restored.read_file(r"C:\actions-runner\_work\result.txt").unwrap(),
+            restored
+                .read_file(r"C:\actions-runner\_work\result.txt")
+                .unwrap(),
             b"done"
         );
+        std::fs::remove_file(path).ok();
     }
 
     #[test]
     fn preserves_empty_directories_across_native_child_snapshot() {
         let mut fs = WinFs::new();
         fs.mkdir(r"C:\Empty\Nested").unwrap();
-        let restored = load(&encode(&fs)).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("wincli-empty-disk-{}.snap", std::process::id()));
+        save_file(&mut fs, path.to_str().unwrap()).unwrap();
+        let restored = load_file(path.to_str().unwrap()).unwrap();
         assert!(restored.is_dir(r"C:\Empty\Nested"));
-        assert_eq!(restored.list_dir(r"C:\Empty\Nested").unwrap(), Vec::<String>::new());
+        assert_eq!(
+            restored.list_dir(r"C:\Empty\Nested").unwrap(),
+            Vec::<String>::new()
+        );
+        std::fs::remove_file(path).ok();
     }
 }

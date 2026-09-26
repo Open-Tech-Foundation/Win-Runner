@@ -41,15 +41,23 @@ fn socket_path(dir: &Path, name: &str) -> PathBuf {
 pub fn boot(name: &str, snapshot_path: Option<&str>) -> Result<(), String> {
     validate_name(name)?;
     let dir = state_dir();
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("cannot create instance state directory {}: {e}", dir.display()))?;
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        format!(
+            "cannot create instance state directory {}: {e}",
+            dir.display()
+        )
+    })?;
     let socket = socket_path(&dir, name);
     if socket.exists() {
         if ping(name).is_ok() {
             return Err(format!("instance already running: {name}"));
         }
-        std::fs::remove_file(&socket)
-            .map_err(|e| format!("cannot remove stale instance socket {}: {e}", socket.display()))?;
+        std::fs::remove_file(&socket).map_err(|e| {
+            format!(
+                "cannot remove stale instance socket {}: {e}",
+                socket.display()
+            )
+        })?;
     }
     let exe = std::env::current_exe().map_err(|e| format!("cannot find wincli executable: {e}"))?;
     let mut command = std::process::Command::new(exe);
@@ -133,9 +141,16 @@ fn framed_exec(name: &str, command: &str) -> Result<ExecResult, String> {
         .map_err(|e| format!("instance is not running ({name}): {e}"))?;
     write_frame(
         &mut stream,
-        &Frame { stream: 1, kind: Kind::Request, flags: 1, payload: command.as_bytes().to_vec() },
+        &Frame {
+            stream: 1,
+            kind: Kind::Request,
+            flags: 1,
+            payload: command.as_bytes().to_vec(),
+        },
     )?;
-    stream.shutdown(Shutdown::Write).map_err(|e| format!("cannot finish execution request: {e}"))?;
+    stream
+        .shutdown(Shutdown::Write)
+        .map_err(|e| format!("cannot finish execution request: {e}"))?;
     let mut stdout = Vec::new();
     loop {
         let frame = read_frame(&mut stream)?;
@@ -205,8 +220,12 @@ pub fn run_daemon(name: &str, dir: &str, snapshot_path: Option<&str>) -> Result<
 
         validate_name(name)?;
         let dir = PathBuf::from(dir);
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| format!("cannot create daemon state directory {}: {e}", dir.display()))?;
+        std::fs::create_dir_all(&dir).map_err(|e| {
+            format!(
+                "cannot create daemon state directory {}: {e}",
+                dir.display()
+            )
+        })?;
         let socket = socket_path(&dir, name);
         if socket.exists() {
             std::fs::remove_file(&socket)
@@ -241,14 +260,24 @@ pub fn run_daemon(name: &str, dir: &str, snapshot_path: Option<&str>) -> Result<
                     Ok(_) => {
                         let _ = write_frame(
                             &mut stream,
-                            &Frame { stream: 1, kind: Kind::Failure, flags: 1, payload: b"invalid execution request".to_vec() },
+                            &Frame {
+                                stream: 1,
+                                kind: Kind::Failure,
+                                flags: 1,
+                                payload: b"invalid execution request".to_vec(),
+                            },
                         );
                         continue;
                     }
                     Err(error) => {
                         let _ = write_frame(
                             &mut stream,
-                            &Frame { stream: 1, kind: Kind::Failure, flags: 1, payload: error.into_bytes() },
+                            &Frame {
+                                stream: 1,
+                                kind: Kind::Failure,
+                                flags: 1,
+                                payload: error.into_bytes(),
+                            },
                         );
                         continue;
                     }
@@ -258,7 +287,12 @@ pub fn run_daemon(name: &str, dir: &str, snapshot_path: Option<&str>) -> Result<
                     _ => {
                         let _ = write_frame(
                             &mut stream,
-                            &Frame { stream: 1, kind: Kind::Failure, flags: 1, payload: b"invalid command".to_vec() },
+                            &Frame {
+                                stream: 1,
+                                kind: Kind::Failure,
+                                flags: 1,
+                                payload: b"invalid command".to_vec(),
+                            },
                         );
                         continue;
                     }
@@ -269,47 +303,78 @@ pub fn run_daemon(name: &str, dir: &str, snapshot_path: Option<&str>) -> Result<
                     Err(error) => {
                         let _ = write_frame(
                             &mut stream,
-                            &Frame { stream: 1, kind: Kind::Failure, flags: 1, payload: error.to_string().into_bytes() },
+                            &Frame {
+                                stream: 1,
+                                kind: Kind::Failure,
+                                flags: 1,
+                                payload: error.to_string().into_bytes(),
+                            },
                         );
                         continue;
                     }
                 };
-                let sink: crate::backend::OutputSink = std::sync::Arc::new(move |channel, chunk| {
-                    let kind = match channel {
-                        crate::backend::OutputChannel::Stdout => Kind::Stdout,
-                        crate::backend::OutputChannel::Stderr => Kind::Stderr,
-                    };
-                    if let Ok(mut writer) = output_stream.lock() {
-                        let _ = write_frame(
-                            &mut *writer,
-                            &Frame { stream: 1, kind, flags: 0, payload: chunk.to_vec() },
-                        );
-                    }
-                });
+                let sink: crate::backend::OutputSink =
+                    std::sync::Arc::new(move |channel, chunk| {
+                        let kind = match channel {
+                            crate::backend::OutputChannel::Stdout => Kind::Stdout,
+                            crate::backend::OutputChannel::Stderr => Kind::Stderr,
+                        };
+                        if let Ok(mut writer) = output_stream.lock() {
+                            let _ = write_frame(
+                                &mut *writer,
+                                &Frame {
+                                    stream: 1,
+                                    kind,
+                                    flags: 0,
+                                    payload: chunk.to_vec(),
+                                },
+                            );
+                        }
+                    });
                 let code = match shell.exec_line_streaming(command, &mut output, sink) {
                     Ok(ShellFlow::Continue) => shell.last_code(),
                     Ok(ShellFlow::Exit(code)) => code,
                     Err(error) => {
                         let _ = write_frame(
                             &mut stream,
-                            &Frame { stream: 1, kind: Kind::Failure, flags: 1, payload: error.into_bytes() },
+                            &Frame {
+                                stream: 1,
+                                kind: Kind::Failure,
+                                flags: 1,
+                                payload: error.into_bytes(),
+                            },
                         );
                         continue;
                     }
                 };
                 let _ = write_frame(
                     &mut stream,
-                    &Frame { stream: 1, kind: Kind::Response, flags: 0, payload: Vec::new() },
+                    &Frame {
+                        stream: 1,
+                        kind: Kind::Response,
+                        flags: 0,
+                        payload: Vec::new(),
+                    },
                 );
                 for chunk in output.chunks(crate::protocol::MAX_PAYLOAD) {
                     let _ = write_frame(
                         &mut stream,
-                        &Frame { stream: 1, kind: Kind::Stdout, flags: 0, payload: chunk.to_vec() },
+                        &Frame {
+                            stream: 1,
+                            kind: Kind::Stdout,
+                            flags: 0,
+                            payload: chunk.to_vec(),
+                        },
                     );
                 }
                 let _ = write_frame(
                     &mut stream,
-                    &Frame { stream: 1, kind: Kind::Exit, flags: 1, payload: code.to_be_bytes().to_vec() },
+                    &Frame {
+                        stream: 1,
+                        kind: Kind::Exit,
+                        flags: 1,
+                        payload: code.to_be_bytes().to_vec(),
+                    },
                 );
                 continue;
             }

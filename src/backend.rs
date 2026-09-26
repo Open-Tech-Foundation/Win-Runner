@@ -21,6 +21,14 @@ pub struct Execution {
     pub fs: WinFs,
 }
 
+#[derive(Debug)]
+pub struct ExecutionFailure {
+    pub message: String,
+    /// Current guest filesystem at the failure boundary. Native child writes
+    /// are committed through its filesystem journal only after clean exit.
+    pub fs: WinFs,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputChannel {
     Stdout,
@@ -41,7 +49,7 @@ pub trait ExecutionBackend: Sync {
         fs: WinFs,
         prog: &str,
         args: &[String],
-    ) -> Result<Execution, String>;
+    ) -> Result<Execution, ExecutionFailure>;
 
     /// Execute while forwarding console output. Backends without a native
     /// incremental console bridge retain the safe default and emit once on
@@ -54,7 +62,7 @@ pub trait ExecutionBackend: Sync {
         prog: &str,
         args: &[String],
         sink: OutputSink,
-    ) -> Result<Execution, String> {
+    ) -> Result<Execution, ExecutionFailure> {
         let result = self.execute(image, fs, prog, args)?;
         if !result.stdout.is_empty() {
             sink(OutputChannel::Stdout, &result.stdout);
@@ -87,8 +95,14 @@ impl ExecutionBackend for NativeLinuxX64 {
         fs: WinFs,
         prog: &str,
         args: &[String],
-    ) -> Result<Execution, String> {
-        let (code, stdout, fs) = native::run_rust_baseline_argv_with_fs(image, fs, prog, args)?;
+    ) -> Result<Execution, ExecutionFailure> {
+        let (code, stdout, fs) = native::run_rust_baseline_argv_with_fs_recoverable(
+            image, fs, prog, args,
+        )
+        .map_err(|failure| ExecutionFailure {
+            message: failure.message,
+            fs: failure.fs,
+        })?;
         Ok(Execution { code, stdout, fs })
     }
 
@@ -99,15 +113,19 @@ impl ExecutionBackend for NativeLinuxX64 {
         prog: &str,
         args: &[String],
         sink: OutputSink,
-    ) -> Result<Execution, String> {
+    ) -> Result<Execution, ExecutionFailure> {
         let forward = Arc::clone(&sink);
-        let (code, stdout, fs) = native::run_rust_baseline_argv_with_fs_streaming(
+        let (code, stdout, fs) = native::run_rust_baseline_argv_with_fs_streaming_recoverable(
             image,
             fs,
             prog,
             args,
             &move |chunk| forward(OutputChannel::Stdout, chunk),
-        )?;
+        )
+        .map_err(|failure| ExecutionFailure {
+            message: failure.message,
+            fs: failure.fs,
+        })?;
         Ok(Execution { code, stdout, fs })
     }
 }

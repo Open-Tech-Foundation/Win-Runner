@@ -121,7 +121,9 @@ mod tests {
         invalid.extend_from_slice(&[2, Kind::Request as u8, 0, 0]);
         invalid.extend_from_slice(&0u32.to_be_bytes());
         invalid.extend_from_slice(&0u32.to_be_bytes());
-        assert!(read_frame(invalid.as_slice()).unwrap_err().contains("version"));
+        assert!(read_frame(invalid.as_slice())
+            .unwrap_err()
+            .contains("version"));
         let oversized = Frame {
             stream: 1,
             kind: Kind::Request,

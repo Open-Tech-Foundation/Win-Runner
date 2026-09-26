@@ -417,10 +417,14 @@ fn load_inner(data: &[u8], strict: bool) -> Result<PeImage, String> {
                     break;
                 }
                 let callback_rva = to_rva(f)?;
-                if !secs.iter().any(|s| s.chars & 0x2000_0000 != 0
-                    && callback_rva >= s.vaddr
-                    && callback_rva < s.vaddr.saturating_add(s.vsize.max(s.fsize))) {
-                    return Err(format!("TLS callback 0x{callback_rva:08x} is not executable"));
+                if !secs.iter().any(|s| {
+                    s.chars & 0x2000_0000 != 0
+                        && callback_rva >= s.vaddr
+                        && callback_rva < s.vaddr.saturating_add(s.vsize.max(s.fsize))
+                }) {
+                    return Err(format!(
+                        "TLS callback 0x{callback_rva:08x} is not executable"
+                    ));
                 }
                 callbacks.push(callback_rva);
             }
@@ -606,7 +610,10 @@ mod large_image_tests {
             load_lenient(&exe).unwrap().tls.unwrap().callbacks,
             vec![SECTION_RVA]
         );
-        assert_eq!(load(&exe).unwrap().tls.unwrap().callbacks, vec![SECTION_RVA]);
+        assert_eq!(
+            load(&exe).unwrap().tls.unwrap().callbacks,
+            vec![SECTION_RVA]
+        );
         let report = crate::inspect::inspect_pe(&exe).unwrap();
         assert!(report.runnable());
         assert!(report.limitations.is_empty());
@@ -614,8 +621,9 @@ mod large_image_tests {
         invalid[raw as usize + 0x50..raw as usize + 0x58]
             .copy_from_slice(&(base + u64::from(tls_rva) + 0x40).to_le_bytes());
         assert!(load(&invalid).unwrap_err().contains("not executable"));
-        invalid[raw as usize + 0x50..raw as usize + 0x58]
-            .copy_from_slice(&u64::MAX.to_le_bytes());
-        assert!(load(&invalid).unwrap_err().contains("TLS address out of image"));
+        invalid[raw as usize + 0x50..raw as usize + 0x58].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(load(&invalid)
+            .unwrap_err()
+            .contains("TLS address out of image"));
     }
 }

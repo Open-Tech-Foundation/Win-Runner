@@ -8,8 +8,7 @@
 //! A tiny alias table maps short names (`rg`) to full package IDs. Full IDs
 //! always work directly.
 
-pub const RAW_BASE: &str =
-    "https://raw.githubusercontent.com/microsoft/winget-pkgs/master";
+pub const RAW_BASE: &str = "https://raw.githubusercontent.com/microsoft/winget-pkgs/master";
 pub const API_BASE: &str = "https://api.github.com/repos/microsoft/winget-pkgs/contents";
 
 /// Short-name bootstrap aliases (not a package database).
@@ -63,9 +62,10 @@ pub fn resolve(name: &str) -> Result<RemotePkg, String> {
         .ok_or_else(|| format!("{id}: no InstallerSha256, refusing unverified download"))?
         .to_lowercase();
     let kind = if item.url.to_lowercase().ends_with(".zip") {
-        let nested = item.nested.clone().ok_or_else(|| {
-            format!("{id}: zip installer without NestedInstallerFiles entry")
-        })?;
+        let nested = item
+            .nested
+            .clone()
+            .ok_or_else(|| format!("{id}: zip installer without NestedInstallerFiles entry"))?;
         Kind::Zip { nested }
     } else {
         Kind::Exe
@@ -92,11 +92,7 @@ pub fn resolve(name: &str) -> Result<RemotePkg, String> {
 fn manifest_url(id: &str, version: &str, kind: &str) -> String {
     let mut parts: Vec<&str> = id.split('.').collect();
     let publisher = parts.remove(0);
-    let first = publisher
-        .chars()
-        .next()
-        .unwrap_or('x')
-        .to_ascii_lowercase();
+    let first = publisher.chars().next().unwrap_or('x').to_ascii_lowercase();
     let mut p = format!("{RAW_BASE}/manifests/{first}/{publisher}");
     for rest in parts {
         p.push('/');
@@ -108,11 +104,7 @@ fn manifest_url(id: &str, version: &str, kind: &str) -> String {
 fn api_dir_url(id: &str) -> String {
     let mut parts: Vec<&str> = id.split('.').collect();
     let publisher = parts.remove(0);
-    let first = publisher
-        .chars()
-        .next()
-        .unwrap_or('x')
-        .to_ascii_lowercase();
+    let first = publisher.chars().next().unwrap_or('x').to_ascii_lowercase();
     let mut p = format!("{API_BASE}/manifests/{first}/{publisher}");
     for rest in parts {
         p.push('/');
@@ -140,7 +132,11 @@ fn latest_version(id: &str) -> Result<String, String> {
 fn version_key(v: &str) -> (Vec<u64>, String) {
     let nums = v
         .split('.')
-        .map(|p| p.chars().take_while(|c| c.is_ascii_digit()).collect::<String>())
+        .map(|p| {
+            p.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+        })
         .map(|p| p.parse::<u64>().unwrap_or(0))
         .collect();
     (nums, v.to_string())
@@ -252,8 +248,7 @@ fn split_kv(s: &str) -> Option<(String, String)> {
 fn unquote(s: String) -> String {
     let t = s.trim();
     if t.len() >= 2
-        && ((t.starts_with('"') && t.ends_with('"'))
-            || (t.starts_with('\'') && t.ends_with('\'')))
+        && ((t.starts_with('"') && t.ends_with('"')) || (t.starts_with('\'') && t.ends_with('\'')))
     {
         t[1..t.len() - 1].to_string()
     } else {
@@ -324,7 +319,10 @@ fn select_installer(man: &Manifest) -> Result<(Installer, String), String> {
                 format!(
                     "{}:{}",
                     i.arch,
-                    i.itype.clone().or_else(|| man.top_type.clone()).unwrap_or_default()
+                    i.itype
+                        .clone()
+                        .or_else(|| man.top_type.clone())
+                        .unwrap_or_default()
                 )
             })
             .collect();
@@ -403,7 +401,11 @@ mod tests {
 
     #[test]
     fn version_ordering() {
-        let mut v = vec!["14.1.1".to_string(), "15.2.0".to_string(), "14.0.3".to_string()];
+        let mut v = vec![
+            "14.1.1".to_string(),
+            "15.2.0".to_string(),
+            "14.0.3".to_string(),
+        ];
         v.sort_by(|a, b| version_key(a).cmp(&version_key(b)));
         assert_eq!(v.last().unwrap(), "15.2.0");
     }

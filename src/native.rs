@@ -15,6 +15,11 @@ use crate::pe::PeImage;
 
 const COMMAND_LINE_BYTES: usize = 0x10000;
 
+pub struct NativeExecutionFailure {
+    pub message: String,
+    pub fs: crate::winfs::WinFs,
+}
+
 fn quote_arg(arg: &str) -> String {
     if arg.is_empty() {
         return "\"\"".to_string();
@@ -87,7 +92,19 @@ pub fn run_rust_baseline_argv_with_fs(
     prog: &str,
     args: &[String],
 ) -> Result<(u32, Vec<u8>, crate::winfs::WinFs), String> {
-    imp::run_rust_baseline_argv_with_fs(img, fs, prog, args)
+    run_rust_baseline_argv_with_fs_recoverable(img, fs, prog, args)
+        .map_err(|failure| failure.message)
+}
+
+/// Like [`run_rust_baseline_argv_with_fs`], preserving the starting disk when
+/// the child cannot commit its filesystem journal.
+pub fn run_rust_baseline_argv_with_fs_recoverable(
+    img: &PeImage,
+    fs: crate::winfs::WinFs,
+    prog: &str,
+    args: &[String],
+) -> Result<(u32, Vec<u8>, crate::winfs::WinFs), NativeExecutionFailure> {
+    imp::run_rust_baseline_argv_with_fs_recoverable(img, fs, prog, args)
 }
 
 /// As [`run_rust_baseline_argv_with_fs`], forwarding stdout chunks while the
@@ -100,6 +117,16 @@ pub fn run_rust_baseline_argv_with_fs_streaming(
     output: &dyn Fn(&[u8]),
 ) -> Result<(u32, Vec<u8>, crate::winfs::WinFs), String> {
     imp::run_rust_baseline_argv_with_fs_streaming(img, fs, prog, args, output)
+}
+
+pub fn run_rust_baseline_argv_with_fs_streaming_recoverable(
+    img: &PeImage,
+    fs: crate::winfs::WinFs,
+    prog: &str,
+    args: &[String],
+    output: &dyn Fn(&[u8]),
+) -> Result<(u32, Vec<u8>, crate::winfs::WinFs), NativeExecutionFailure> {
+    imp::run_rust_baseline_argv_with_fs_streaming_recoverable(img, fs, prog, args, output)
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -3866,19 +3893,21 @@ mod imp {
                     format!("{prefix}\\{name}")
                 };
                 let is_directory = fs.is_dir(&full_path);
-                let bytes = if is_directory {
-                    Vec::new()
+                let size = if is_directory {
+                    0
                 } else {
-                    fs.read_file(&full_path).unwrap_or_default()
+                    fs.file_len(&full_path).unwrap_or(0) as usize
                 };
-                let content_hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
-                    (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3)
-                });
+                let content_hash = if is_directory {
+                    0
+                } else {
+                    fs.file_version(&full_path).unwrap_or_default()
+                };
                 output.insert(
                     relative.clone(),
                     NativeDirectoryEntry {
                         is_directory,
-                        size: bytes.len(),
+                        size,
                         content_hash,
                     },
                 );
@@ -4333,21 +4362,48 @@ mod imp {
             } else {
                 match job.operation {
                     NativeFileIoOperation::Read { output, length } => match job.process.fs.lock() {
-                        Ok(fs) => match fs.fs.read_file(&job.file.path) {
-                            Ok(data) if job.offset >= data.len() => Err(STATUS_END_OF_FILE),
-                            Ok(data) => {
-                                if job.request.cancelled.load(Ordering::Acquire) {
-                                    Err(STATUS_CANCELLED)
-                                } else {
-                                    let count = (data.len() - job.offset).min(length as usize);
+                        Ok(fs) => match fs.fs.file_len(&job.file.path) {
+                            Ok(file_len) if job.offset as u64 >= file_len => {
+                                Err(STATUS_END_OF_FILE)
+                            }
+                            Ok(_) => {
+                                let mut copied = 0usize;
+                                let mut failure = None;
+                                while copied < length as usize {
+                                    let amount = (length as usize - copied).min(64 * 1024);
+                                    let data = match fs.fs.read_file_range(
+                                        &job.file.path,
+                                        (job.offset + copied) as u64,
+                                        amount,
+                                    ) {
+                                        Ok(data) => data,
+                                        Err(_) => {
+                                            failure = Some(STATUS_UNSUCCESSFUL);
+                                            break;
+                                        }
+                                    };
+                                    if data.is_empty() {
+                                        break;
+                                    }
+                                    if job.request.cancelled.load(Ordering::Acquire) {
+                                        failure = Some(STATUS_CANCELLED);
+                                        break;
+                                    }
                                     unsafe {
                                         std::ptr::copy_nonoverlapping(
-                                            data.as_ptr().add(job.offset),
-                                            output as *mut u8,
-                                            count,
+                                            data.as_ptr(),
+                                            (output as *mut u8).add(copied),
+                                            data.len(),
                                         )
                                     };
-                                    Ok(count as u32)
+                                    copied += data.len();
+                                    if data.len() < amount {
+                                        break;
+                                    }
+                                }
+                                match failure {
+                                    Some(error) => Err(error),
+                                    None => Ok(copied as u32),
                                 }
                             }
                             Err(_) => Err(STATUS_UNSUCCESSFUL),
@@ -4923,15 +4979,17 @@ mod imp {
         let mut status = 0;
         let reaped = unsafe { waitpid(pid, &mut status, 0) } == pid;
         if reaped && !encoded.is_empty() {
-            if let Ok(snapshot) = crate::snapshot::load(&encoded) {
-                if let Ok(mut native_fs) = fs.lock() {
-                    // A child process owns its working directory. Preserve
-                    // the parent's directory while accepting its WinFs file
-                    // changes from the snapshot transport.
-                    let parent_cwd = native_fs.fs.cwd();
-                    let mut snapshot = snapshot;
-                    let _ = snapshot.set_cwd(&parent_cwd);
-                    native_fs.fs = snapshot;
+            if let Ok(mut native_fs) = fs.lock() {
+                // A child process owns its working directory. Preserve the
+                // parent's directory while applying the child's file journal.
+                let parent_cwd = native_fs.fs.cwd();
+                match crate::snapshot::apply_changes(&encoded, &mut native_fs.fs) {
+                    Ok(()) => {
+                        let _ = native_fs.fs.set_cwd(&parent_cwd);
+                    }
+                    Err(error) => {
+                        eprintln!("wincli: cannot apply child filesystem changes: {error}")
+                    }
                 }
             }
         }
@@ -8651,7 +8709,9 @@ mod imp {
         let Ok(ctx) = context.lock() else {
             return;
         };
-        let encoded = crate::snapshot::encode(&ctx.fs);
+        let Ok(encoded) = crate::snapshot::encode_changes(&ctx.fs) else {
+            return;
+        };
         let mut written = 0;
         while written < encoded.len() {
             let n = unsafe {
@@ -9189,14 +9249,32 @@ mod imp {
         let Ok(offset) = usize::try_from(offset) else {
             return finish(STATUS_INVALID_PARAMETER, 0);
         };
-        let Ok(contents) = fs.fs.read_file(&path) else {
+        let Ok(file_length) = fs.fs.file_len(&path) else {
             return finish(STATUS_INVALID_HANDLE, 0);
         };
-        if offset >= contents.len() {
+        if offset as u64 >= file_length {
             return finish(STATUS_END_OF_FILE, 0);
         }
-        let count = (contents.len() - offset).min(length as usize);
-        unsafe { ptr::copy_nonoverlapping(contents.as_ptr().add(offset), buffer, count) };
+        let mut count = 0usize;
+        while count < length as usize {
+            let amount = (length as usize - count).min(64 * 1024);
+            let Ok(contents) = fs
+                .fs
+                .read_file_range(&path, (offset + count) as u64, amount)
+            else {
+                return finish(STATUS_INVALID_HANDLE, 0);
+            };
+            if contents.is_empty() {
+                break;
+            }
+            unsafe {
+                ptr::copy_nonoverlapping(contents.as_ptr(), buffer.add(count), contents.len())
+            };
+            count += contents.len();
+            if contents.len() < amount {
+                break;
+            }
+        }
         if let Some(item) = fs.handles.get_mut(&file) {
             item.offset = offset + count;
         }
@@ -10514,8 +10592,8 @@ mod imp {
         let size = if is_directory {
             0
         } else {
-            match ctx.fs.read_file(path) {
-                Ok(data) => data.len() as u64,
+            match ctx.fs.file_len(path) {
+                Ok(length) => length,
                 Err(_) => {
                     native_set_last_error(2); // ERROR_FILE_NOT_FOUND
                     return 0;
@@ -10591,10 +10669,7 @@ mod imp {
         let size = if is_directory {
             0
         } else {
-            ctx.fs
-                .read_file(path)
-                .map(|data| data.len() as u64)
-                .unwrap_or(0)
+            ctx.fs.file_len(path).unwrap_or(0)
         };
         let file_id = match ctx.fs.file_id(path) {
             Ok(value) => value,
@@ -10637,8 +10712,8 @@ mod imp {
         let size = if is_directory {
             0
         } else {
-            match ctx.fs.read_file(&file.path) {
-                Ok(data) => data.len() as u64,
+            match ctx.fs.file_len(&file.path) {
+                Ok(length) => length,
                 Err(_) => {
                     native_set_last_error(2);
                     return 0;
@@ -10706,8 +10781,8 @@ mod imp {
         let size = if ctx.fs.is_dir(&file.path) {
             0
         } else {
-            match ctx.fs.read_file(&file.path) {
-                Ok(data) => data.len() as i64,
+            match ctx.fs.file_len(&file.path) {
+                Ok(length) => length as i64,
                 Err(_) => {
                     native_set_last_error(2);
                     return 0;
@@ -10748,8 +10823,8 @@ mod imp {
                     return 0;
                 }
             },
-            2 => match ctx.fs.read_file(&file.path) {
-                Ok(data) => match i64::try_from(data.len()) {
+            2 => match ctx.fs.file_len(&file.path) {
+                Ok(length) => match i64::try_from(length) {
                     Ok(length) => length,
                     Err(_) => {
                         native_set_last_error(87);
@@ -10972,24 +11047,35 @@ mod imp {
                 return 0;
             }
         };
-        let data = match ctx.fs.read_file(&path) {
-            Ok(v) => v,
+        let file_length = match ctx.fs.file_len(&path) {
+            Ok(length) => length,
             Err(_) => return 0,
         };
         if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
             eprintln!(
-                "native ReadFile path={path} offset={offset} available={} image_base={:#x}",
-                data.len(),
+                "native ReadFile path={path} offset={offset} length={file_length} image_base={:#x}",
                 process_ctx().map_or(0, |p| p.image_base)
             );
         }
-        if ov != 0 && n != 0 && offset >= data.len() {
+        if ov != 0 && n != 0 && offset as u64 >= file_length {
             native_set_last_error(38); // ERROR_HANDLE_EOF
             return 0;
         }
-        let k = (data.len().saturating_sub(offset)).min(n as usize);
-        if k != 0 {
-            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr().add(offset), buf, k) };
+        let mut k = 0usize;
+        while k < n as usize {
+            let amount = (n as usize - k).min(64 * 1024);
+            let data = match ctx.fs.read_file_range(&path, (offset + k) as u64, amount) {
+                Ok(data) => data,
+                Err(_) => return 0,
+            };
+            if data.is_empty() {
+                break;
+            }
+            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), buf.add(k), data.len()) };
+            k += data.len();
+            if data.len() < amount {
+                break;
+            }
         }
         if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
             eprintln!("native ReadFile copied={k}");
@@ -14004,6 +14090,16 @@ mod imp {
         args: &[String],
     ) -> Result<(u32, Vec<u8>, WinFs), String> {
         run_rust_baseline_argv_with_fs_impl(img, instance_fs, prog, args, None)
+            .map_err(|failure| failure.message)
+    }
+
+    pub(super) fn run_rust_baseline_argv_with_fs_recoverable(
+        img: &PeImage,
+        instance_fs: WinFs,
+        prog: &str,
+        args: &[String],
+    ) -> Result<(u32, Vec<u8>, WinFs), super::NativeExecutionFailure> {
+        run_rust_baseline_argv_with_fs_impl(img, instance_fs, prog, args, None)
     }
 
     pub(super) fn run_rust_baseline_argv_with_fs_streaming(
@@ -14014,6 +14110,17 @@ mod imp {
         output: &dyn Fn(&[u8]),
     ) -> Result<(u32, Vec<u8>, WinFs), String> {
         run_rust_baseline_argv_with_fs_impl(img, instance_fs, prog, args, Some(output))
+            .map_err(|failure| failure.message)
+    }
+
+    pub(super) fn run_rust_baseline_argv_with_fs_streaming_recoverable(
+        img: &PeImage,
+        instance_fs: WinFs,
+        prog: &str,
+        args: &[String],
+        output: &dyn Fn(&[u8]),
+    ) -> Result<(u32, Vec<u8>, WinFs), super::NativeExecutionFailure> {
+        run_rust_baseline_argv_with_fs_impl(img, instance_fs, prog, args, Some(output))
     }
 
     fn run_rust_baseline_argv_with_fs_impl(
@@ -14022,282 +14129,308 @@ mod imp {
         prog: &str,
         args: &[String],
         output: Option<&dyn Fn(&[u8])>,
-    ) -> Result<(u32, Vec<u8>, WinFs), String> {
-        let total_started = std::time::Instant::now();
-        let timing = std::env::var_os("WINCLI_TIMINGS").is_some();
-        let lock_started = std::time::Instant::now();
-        let _run = NATIVE_RUN_LOCK
-            .lock()
-            .map_err(|_| "native backend execution lock is poisoned".to_string())?;
-        let lock_wait_ms = lock_started.elapsed().as_secs_f64() * 1000.0;
-        let entry_started = std::time::Instant::now();
-        let entry = entry(img)?;
-        let entry_ms = entry_started.elapsed().as_secs_f64() * 1000.0;
-        let map_started = std::time::Instant::now();
-        let mapping = map(img)?;
-        let map_ms = map_started.elapsed().as_secs_f64() * 1000.0;
-        let import_started = std::time::Instant::now();
-        let strict_imports = std::env::var("WINCLI_NATIVE_STRICT_IMPORTS").as_deref() == Ok("1");
-        let _import_stubs = patch_baseline_imports(&mapping, img, strict_imports)?;
-        let import_ms = import_started.elapsed().as_secs_f64() * 1000.0;
-        let tls_started = std::time::Instant::now();
-        let tls = setup_tls(&mapping, img)?;
-        let tls_ms = tls_started.elapsed().as_secs_f64() * 1000.0;
-        let context_started = std::time::Instant::now();
-        let fs = Arc::new(Mutex::new(NativeFs {
-            fs: instance_fs,
-            handles: HashMap::new(),
-            finds: HashMap::new(),
-            file_attributes: HashMap::new(),
-            next: 0x100,
-        }));
-        let command_line_w = command_line_w(prog, args)?;
-        let command_line_a = command_line_a(&command_line_w);
-        let process = Arc::new(NativeProcessContext {
-            image_base: img.image_base,
-            module_path: prog.to_string(),
-            process_id: 1,
-            process_handle: u64::MAX,
-            parent_process_id: 0,
-            command_line_w,
-            command_line_a,
-            environment: Mutex::new(Vec::new()),
-            environment_block: Mutex::new(vec![0, 0]),
-            std_handles: [
-                AtomicU64::new(STD_HANDLE_BASE),
-                AtomicU64::new(STD_HANDLE_BASE + 1),
-                AtomicU64::new(STD_HANDLE_BASE + 2),
-            ],
-            crt_fds: Mutex::new(HashMap::new()),
-            crt_fd_next: AtomicI32::new(3),
-            fs,
-            named_pipes: Mutex::new(NativeNamedPipeTable::new()),
-            error_mode: AtomicU32::new(0),
-            pointer_cookie: random_pointer_cookie(),
-            heap_allocations: Mutex::new(HashMap::new()),
-            virtual_allocations: Mutex::new(HashMap::new()),
-            file_mappings: Mutex::new(HashMap::new()),
-            mapping_views: Mutex::new(HashMap::new()),
-            mapping_next: AtomicU64::new(0x9800_0000),
-            gs_base: AtomicU64::new(0),
-            tls_template: Mutex::new(tls.as_ref().map(NativeTls::clone_for_thread)),
-            dynamic_tls: Mutex::new(DynamicTlsSlots::new(tls.is_some())),
-            threads: Mutex::new(HashMap::new()),
-            thread_next: AtomicU64::new(0x8000_0000),
-            semaphores: Mutex::new(HashMap::new()),
-            semaphore_next: AtomicU64::new(0x6000_0000),
-            events: Mutex::new(HashMap::new()),
-            event_names: Mutex::new(HashMap::new()),
-            event_next: AtomicU64::new(0x6100_0000),
-            job_objects: Mutex::new(HashMap::new()),
-            wait_registrations: Mutex::new(HashMap::new()),
-            completion_ports: Mutex::new(HashMap::new()),
-            socket_completion_ports: Mutex::new(HashMap::new()),
-            socket_completion_modes: Mutex::new(HashMap::new()),
-            completion_next: AtomicU64::new(0x9000_0000),
-            io_wait: Mutex::new(()),
-            io_ready: Condvar::new(),
-            pending_file_io: AtomicU64::new(0),
-            pending_requests: Mutex::new(HashMap::new()),
-            file_io_queue: Mutex::new(None),
-            duplicate_handles: Mutex::new(HashMap::new()),
-            duplicate_next: AtomicU64::new(0xa000_0000),
-            timer_next: AtomicU64::new(0x7000_0000),
-            state_fd: AtomicU32::new(u32::MAX),
-            fls_value: AtomicU64::new(0),
-            unhandled_exception_filter: AtomicU64::new(0),
-            vectored_exception_handler: AtomicU64::new(0),
-            exit_status: AtomicU32::new(259), // STILL_ACTIVE
-            exited: AtomicBool::new(false),
-            children: Mutex::new(NativeProcessTable::new()),
-        });
-        if let Ok(mut context) = NATIVE_PROCESS.lock() {
-            *context = Some(Arc::clone(&process));
-        }
-        let mut fds = [-1, -1];
-        if unsafe { pipe(fds.as_mut_ptr()) } != 0 {
-            return Err(format!(
-                "native backend could not create stdout pipe: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        let mut state_fds = [-1, -1];
-        if unsafe { pipe(state_fds.as_mut_ptr()) } != 0 {
-            unsafe {
-                close(fds[0]);
-                close(fds[1]);
+    ) -> Result<(u32, Vec<u8>, WinFs), super::NativeExecutionFailure> {
+        let mut recovery_fs = Some(instance_fs);
+        let mut recovery_process: Option<Arc<NativeProcessContext>> = None;
+        let result = (|| -> Result<(u32, Vec<u8>, WinFs), String> {
+            let total_started = std::time::Instant::now();
+            let timing = std::env::var_os("WINCLI_TIMINGS").is_some();
+            let lock_started = std::time::Instant::now();
+            let _run = NATIVE_RUN_LOCK
+                .lock()
+                .map_err(|_| "native backend execution lock is poisoned".to_string())?;
+            let lock_wait_ms = lock_started.elapsed().as_secs_f64() * 1000.0;
+            let entry_started = std::time::Instant::now();
+            let entry = entry(img)?;
+            let entry_ms = entry_started.elapsed().as_secs_f64() * 1000.0;
+            let map_started = std::time::Instant::now();
+            let mapping = map(img)?;
+            let map_ms = map_started.elapsed().as_secs_f64() * 1000.0;
+            let import_started = std::time::Instant::now();
+            let strict_imports =
+                std::env::var("WINCLI_NATIVE_STRICT_IMPORTS").as_deref() == Ok("1");
+            let _import_stubs = patch_baseline_imports(&mapping, img, strict_imports)?;
+            let import_ms = import_started.elapsed().as_secs_f64() * 1000.0;
+            let tls_started = std::time::Instant::now();
+            let tls = setup_tls(&mapping, img)?;
+            let tls_ms = tls_started.elapsed().as_secs_f64() * 1000.0;
+            let context_started = std::time::Instant::now();
+            let mut instance_fs = recovery_fs
+                .take()
+                .expect("filesystem is available before launch");
+            instance_fs.clear_changes();
+            let fs = Arc::new(Mutex::new(NativeFs {
+                fs: instance_fs,
+                handles: HashMap::new(),
+                finds: HashMap::new(),
+                file_attributes: HashMap::new(),
+                next: 0x100,
+            }));
+            let command_line_w = command_line_w(prog, args)?;
+            let command_line_a = command_line_a(&command_line_w);
+            let process = Arc::new(NativeProcessContext {
+                image_base: img.image_base,
+                module_path: prog.to_string(),
+                process_id: 1,
+                process_handle: u64::MAX,
+                parent_process_id: 0,
+                command_line_w,
+                command_line_a,
+                environment: Mutex::new(Vec::new()),
+                environment_block: Mutex::new(vec![0, 0]),
+                std_handles: [
+                    AtomicU64::new(STD_HANDLE_BASE),
+                    AtomicU64::new(STD_HANDLE_BASE + 1),
+                    AtomicU64::new(STD_HANDLE_BASE + 2),
+                ],
+                crt_fds: Mutex::new(HashMap::new()),
+                crt_fd_next: AtomicI32::new(3),
+                fs,
+                named_pipes: Mutex::new(NativeNamedPipeTable::new()),
+                error_mode: AtomicU32::new(0),
+                pointer_cookie: random_pointer_cookie(),
+                heap_allocations: Mutex::new(HashMap::new()),
+                virtual_allocations: Mutex::new(HashMap::new()),
+                file_mappings: Mutex::new(HashMap::new()),
+                mapping_views: Mutex::new(HashMap::new()),
+                mapping_next: AtomicU64::new(0x9800_0000),
+                gs_base: AtomicU64::new(0),
+                tls_template: Mutex::new(tls.as_ref().map(NativeTls::clone_for_thread)),
+                dynamic_tls: Mutex::new(DynamicTlsSlots::new(tls.is_some())),
+                threads: Mutex::new(HashMap::new()),
+                thread_next: AtomicU64::new(0x8000_0000),
+                semaphores: Mutex::new(HashMap::new()),
+                semaphore_next: AtomicU64::new(0x6000_0000),
+                events: Mutex::new(HashMap::new()),
+                event_names: Mutex::new(HashMap::new()),
+                event_next: AtomicU64::new(0x6100_0000),
+                job_objects: Mutex::new(HashMap::new()),
+                wait_registrations: Mutex::new(HashMap::new()),
+                completion_ports: Mutex::new(HashMap::new()),
+                socket_completion_ports: Mutex::new(HashMap::new()),
+                socket_completion_modes: Mutex::new(HashMap::new()),
+                completion_next: AtomicU64::new(0x9000_0000),
+                io_wait: Mutex::new(()),
+                io_ready: Condvar::new(),
+                pending_file_io: AtomicU64::new(0),
+                pending_requests: Mutex::new(HashMap::new()),
+                file_io_queue: Mutex::new(None),
+                duplicate_handles: Mutex::new(HashMap::new()),
+                duplicate_next: AtomicU64::new(0xa000_0000),
+                timer_next: AtomicU64::new(0x7000_0000),
+                state_fd: AtomicU32::new(u32::MAX),
+                fls_value: AtomicU64::new(0),
+                unhandled_exception_filter: AtomicU64::new(0),
+                vectored_exception_handler: AtomicU64::new(0),
+                exit_status: AtomicU32::new(259), // STILL_ACTIVE
+                exited: AtomicBool::new(false),
+                children: Mutex::new(NativeProcessTable::new()),
+            });
+            recovery_process = Some(Arc::clone(&process));
+            if let Ok(mut context) = NATIVE_PROCESS.lock() {
+                *context = Some(Arc::clone(&process));
             }
-            return Err(format!(
-                "native backend could not create state pipe: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        let context_ms = context_started.elapsed().as_secs_f64() * 1000.0;
-        let fork_started = std::time::Instant::now();
-        let pid = unsafe { fork() };
-        let fork_ms = fork_started.elapsed().as_secs_f64() * 1000.0;
-        if pid < 0 {
-            unsafe {
-                close(fds[0]);
-                close(fds[1]);
-                close(state_fds[0]);
-                close(state_fds[1]);
+            let mut fds = [-1, -1];
+            if unsafe { pipe(fds.as_mut_ptr()) } != 0 {
+                return Err(format!(
+                    "native backend could not create stdout pipe: {}",
+                    std::io::Error::last_os_error()
+                ));
             }
-            return Err(format!(
-                "native backend could not fork guest: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        if pid == 0 {
-            #[cfg(test)]
-            NATIVE_GUEST_ACTIVE.store(true, Ordering::Release);
-            unsafe {
-                close(fds[0]);
-                close(state_fds[0]);
-                if dup2(fds[1], 1) < 0 {
-                    _exit(127);
-                }
-                close(fds[1]);
-            }
-            process
-                .state_fd
-                .store(state_fds[1] as u32, Ordering::Release);
-            if protect_exec(&mapping).is_err() {
-                unsafe { _exit(127) };
-            }
-            // Launcher threads can have 64 KiB stacks. V8 needs a larger
-            // Windows thread stack, with bounds reflected in the guest TEB.
-            let guest_process = Arc::clone(&process);
-            let guest_thread = std::thread::Builder::new()
-                .stack_size(16 * 1024 * 1024)
-                .spawn(move || {
-                    let mut tls = tls;
-                    let mut fallback_teb = Box::new([0u8; 0x1000]);
-                    let teb = tls
-                        .as_mut()
-                        .map(|tls| &mut tls.teb)
-                        .unwrap_or(&mut fallback_teb);
-                    if !install_thread_teb(teb) {
-                        return 127;
-                    }
-                    guest_process
-                        .gs_base
-                        .store(teb.as_ptr() as u64, Ordering::Release);
-                    // SAFETY: entry is in the child-owned RX PE mapping.
-                    let guest: unsafe extern "win64" fn() -> u32 =
-                        unsafe { std::mem::transmute(entry) };
-                    let code = unsafe { guest() as i32 };
-                    native_wait_file_io(&guest_process);
-                    code
-                });
-            let code = guest_thread
-                .ok()
-                .and_then(|thread| thread.join().ok())
-                .unwrap_or(127);
-            unsafe { close(1) };
-            native_flush_instance_state();
-            unsafe { _exit(code) };
-        }
-        unsafe {
-            close(fds[1]);
-            close(state_fds[1]);
-        }
-        let mut out = Vec::new();
-        let mut buf = [0u8; 4096];
-        let guest_started = std::time::Instant::now();
-        let mut first_output_ms = None;
-        loop {
-            let n = unsafe { read(fds[0], buf.as_mut_ptr().cast(), buf.len()) };
-            if n == 0 {
-                break;
-            }
-            if n < 0 {
+            let mut state_fds = [-1, -1];
+            if unsafe { pipe(state_fds.as_mut_ptr()) } != 0 {
                 unsafe {
                     close(fds[0]);
+                    close(fds[1]);
                 }
                 return Err(format!(
-                    "native backend could not read guest stdout: {}",
+                    "native backend could not create state pipe: {}",
                     std::io::Error::last_os_error()
                 ));
             }
-            if first_output_ms.is_none() {
-                first_output_ms = Some(guest_started.elapsed().as_secs_f64() * 1000.0);
-            }
-            out.extend_from_slice(&buf[..n as usize]);
-            if let Some(output) = output {
-                output(&buf[..n as usize]);
-            }
-        }
-        unsafe {
-            close(fds[0]);
-        }
-        let guest_ms = guest_started.elapsed().as_secs_f64() * 1000.0;
-        let state_started = std::time::Instant::now();
-        let mut state = Vec::new();
-        loop {
-            let n = unsafe { read(state_fds[0], buf.as_mut_ptr().cast(), buf.len()) };
-            if n == 0 {
-                break;
-            }
-            if n < 0 {
-                unsafe { close(state_fds[0]) };
+            let context_ms = context_started.elapsed().as_secs_f64() * 1000.0;
+            let fork_started = std::time::Instant::now();
+            let pid = unsafe { fork() };
+            let fork_ms = fork_started.elapsed().as_secs_f64() * 1000.0;
+            if pid < 0 {
+                unsafe {
+                    close(fds[0]);
+                    close(fds[1]);
+                    close(state_fds[0]);
+                    close(state_fds[1]);
+                }
                 return Err(format!(
-                    "native backend could not read guest filesystem state: {}",
+                    "native backend could not fork guest: {}",
                     std::io::Error::last_os_error()
                 ));
             }
-            state.extend_from_slice(&buf[..n as usize]);
-        }
-        unsafe { close(state_fds[0]) };
-        let mut status = 0;
-        if unsafe { waitpid(pid, &mut status, 0) } != pid {
-            return Err(format!(
-                "native backend could not reap guest: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        let state_transfer_ms = state_started.elapsed().as_secs_f64() * 1000.0;
-        process
-            .exit_status
-            .store((status >> 8) as u32, Ordering::Release);
-        process.exited.store(true, Ordering::Release);
-        if let Ok(mut context) = NATIVE_PROCESS.lock() {
-            *context = None;
-        }
-        let decode_started = std::time::Instant::now();
-        let final_fs = if state.is_empty() {
-            process
-                .fs
-                .lock()
-                .map_err(|_| "native backend filesystem lock is poisoned".to_string())?
-                .fs
-                .clone()
-        } else {
-            crate::snapshot::load(&state)
-                .map_err(|e| format!("native backend returned invalid filesystem state: {e}"))?
-        };
-        let state_decode_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
-        if status & 0x7f != 0 {
-            return Err(format!(
-                "native guest terminated by signal {}",
-                status & 0x7f
-            ));
-        }
-        if timing {
-            if !out.is_empty() && !out.ends_with(b"\n") {
-                eprintln!();
+            if pid == 0 {
+                #[cfg(test)]
+                NATIVE_GUEST_ACTIVE.store(true, Ordering::Release);
+                unsafe {
+                    close(fds[0]);
+                    close(state_fds[0]);
+                    if dup2(fds[1], 1) < 0 {
+                        _exit(127);
+                    }
+                    close(fds[1]);
+                }
+                process
+                    .state_fd
+                    .store(state_fds[1] as u32, Ordering::Release);
+                if protect_exec(&mapping).is_err() {
+                    unsafe { _exit(127) };
+                }
+                // Launcher threads can have 64 KiB stacks. V8 needs a larger
+                // Windows thread stack, with bounds reflected in the guest TEB.
+                let guest_process = Arc::clone(&process);
+                let guest_thread = std::thread::Builder::new()
+                    .stack_size(16 * 1024 * 1024)
+                    .spawn(move || {
+                        let mut tls = tls;
+                        let mut fallback_teb = Box::new([0u8; 0x1000]);
+                        let teb = tls
+                            .as_mut()
+                            .map(|tls| &mut tls.teb)
+                            .unwrap_or(&mut fallback_teb);
+                        if !install_thread_teb(teb) {
+                            return 127;
+                        }
+                        guest_process
+                            .gs_base
+                            .store(teb.as_ptr() as u64, Ordering::Release);
+                        // SAFETY: entry is in the child-owned RX PE mapping.
+                        let guest: unsafe extern "win64" fn() -> u32 =
+                            unsafe { std::mem::transmute(entry) };
+                        let code = unsafe { guest() as i32 };
+                        native_wait_file_io(&guest_process);
+                        code
+                    });
+                let code = guest_thread
+                    .ok()
+                    .and_then(|thread| thread.join().ok())
+                    .unwrap_or(127);
+                unsafe { close(1) };
+                native_flush_instance_state();
+                unsafe { _exit(code) };
             }
-            let first_output = first_output_ms
-                .map(|milliseconds| format!("{milliseconds:.3}ms"))
-                .unwrap_or_else(|| "none".to_string());
-            eprintln!(
+            unsafe {
+                close(fds[1]);
+                close(state_fds[1]);
+            }
+            let mut out = Vec::new();
+            let mut buf = [0u8; 4096];
+            let guest_started = std::time::Instant::now();
+            let mut first_output_ms = None;
+            loop {
+                let n = unsafe { read(fds[0], buf.as_mut_ptr().cast(), buf.len()) };
+                if n == 0 {
+                    break;
+                }
+                if n < 0 {
+                    unsafe {
+                        close(fds[0]);
+                    }
+                    return Err(format!(
+                        "native backend could not read guest stdout: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                if first_output_ms.is_none() {
+                    first_output_ms = Some(guest_started.elapsed().as_secs_f64() * 1000.0);
+                }
+                out.extend_from_slice(&buf[..n as usize]);
+                if let Some(output) = output {
+                    output(&buf[..n as usize]);
+                }
+            }
+            unsafe {
+                close(fds[0]);
+            }
+            let guest_ms = guest_started.elapsed().as_secs_f64() * 1000.0;
+            let state_started = std::time::Instant::now();
+            let mut state = Vec::new();
+            loop {
+                let n = unsafe { read(state_fds[0], buf.as_mut_ptr().cast(), buf.len()) };
+                if n == 0 {
+                    break;
+                }
+                if n < 0 {
+                    unsafe { close(state_fds[0]) };
+                    return Err(format!(
+                        "native backend could not read guest filesystem state: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                state.extend_from_slice(&buf[..n as usize]);
+            }
+            unsafe { close(state_fds[0]) };
+            let mut status = 0;
+            if unsafe { waitpid(pid, &mut status, 0) } != pid {
+                return Err(format!(
+                    "native backend could not reap guest: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let state_transfer_ms = state_started.elapsed().as_secs_f64() * 1000.0;
+            process
+                .exit_status
+                .store((status >> 8) as u32, Ordering::Release);
+            process.exited.store(true, Ordering::Release);
+            if let Ok(mut context) = NATIVE_PROCESS.lock() {
+                *context = None;
+            }
+            let decode_started = std::time::Instant::now();
+            if status & 0x7f != 0 {
+                return Err(format!(
+                    "native guest terminated by signal {}",
+                    status & 0x7f
+                ));
+            }
+            let final_fs = {
+                let mut native_fs = process
+                    .fs
+                    .lock()
+                    .map_err(|_| "native backend filesystem lock is poisoned".to_string())?;
+                if !state.is_empty() {
+                    crate::snapshot::apply_changes(&state, &mut native_fs.fs).map_err(|e| {
+                        format!("native backend returned invalid filesystem changes: {e}")
+                    })?;
+                }
+                std::mem::replace(&mut native_fs.fs, WinFs::new())
+            };
+            let state_decode_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
+            if timing {
+                if !out.is_empty() && !out.ends_with(b"\n") {
+                    eprintln!();
+                }
+                let first_output = first_output_ms
+                    .map(|milliseconds| format!("{milliseconds:.3}ms"))
+                    .unwrap_or_else(|| "none".to_string());
+                eprintln!(
                 "wincli timing: {prog}: lock={lock_wait_ms:.3}ms entry={entry_ms:.3}ms map={map_ms:.3}ms imports={import_ms:.3}ms tls={tls_ms:.3}ms context={context_ms:.3}ms fork={fork_ms:.3}ms first_output={first_output} guest_until_stdout_eof={guest_ms:.3}ms state_transfer={state_transfer_ms:.3}ms state_decode={state_decode_ms:.3}ms stdout_bytes={} state_bytes={} total={:.3}ms",
                 out.len(),
                 state.len(),
                 total_started.elapsed().as_secs_f64() * 1000.0
             );
+            }
+            Ok(((status >> 8) as u32, out, final_fs))
+        })();
+        match result {
+            Ok(result) => Ok(result),
+            Err(message) => {
+                let fs = if let Some(process) = recovery_process {
+                    process
+                        .fs
+                        .lock()
+                        .map(|native_fs| native_fs.fs.clone())
+                        .unwrap_or_else(|_| WinFs::new())
+                } else {
+                    recovery_fs.take().unwrap_or_else(WinFs::new)
+                };
+                Err(super::NativeExecutionFailure { message, fs })
+            }
         }
-        Ok(((status >> 8) as u32, out, final_fs))
     }
 }
 
@@ -14311,6 +14444,18 @@ mod imp {
 
     pub(super) fn run_import_free(_: &PeImage) -> Result<u32, String> {
         Err("native backend is available only on Linux x86_64".to_string())
+    }
+
+    pub(super) fn run_rust_baseline_argv_with_fs_recoverable(
+        _: &PeImage,
+        fs: crate::winfs::WinFs,
+        _: &str,
+        _: &[String],
+    ) -> Result<(u32, Vec<u8>, crate::winfs::WinFs), super::NativeExecutionFailure> {
+        Err(super::NativeExecutionFailure {
+            message: "native backend is available only on Linux x86_64".to_string(),
+            fs,
+        })
     }
 
     pub(super) fn run_rust_baseline_argv(
@@ -14338,6 +14483,19 @@ mod imp {
         _: &dyn Fn(&[u8]),
     ) -> Result<(u32, Vec<u8>, crate::winfs::WinFs), String> {
         Err("native backend is available only on Linux x86_64".to_string())
+    }
+
+    pub(super) fn run_rust_baseline_argv_with_fs_streaming_recoverable(
+        _: &PeImage,
+        fs: crate::winfs::WinFs,
+        _: &str,
+        _: &[String],
+        _: &dyn Fn(&[u8]),
+    ) -> Result<(u32, Vec<u8>, crate::winfs::WinFs), super::NativeExecutionFailure> {
+        Err(super::NativeExecutionFailure {
+            message: "native backend is available only on Linux x86_64".to_string(),
+            fs,
+        })
     }
 }
 
@@ -14452,6 +14610,34 @@ mod tests {
             .expect("native reader runs");
         assert_eq!(code, 0);
         assert_eq!(out, b"native");
+    }
+
+    #[test]
+    fn native_guest_reads_only_a_seeked_file_range() {
+        // Wine's dlls/kernel32/tests/file.c exercises repeated seeks followed
+        // by reads, including requests that reach or pass EOF.
+        for (offset, length, expected) in [
+            (0, 10, &b"0123456789"[..]),
+            (4, 3, &b"456"[..]),
+            (8, 5, &b"89"[..]),
+            (10, 1, &b""[..]),
+        ] {
+            let reader = load(&crate::pe::builder::read_file_range_to_stdout(
+                r"C:\work\range.txt",
+                offset,
+                length,
+            ))
+            .expect("seek reader loads");
+            let mut fs = WinFs::ephemeral_runner();
+            fs.mkdir(r"C:\work").unwrap();
+            fs.write_file(r"C:\work\range.txt", b"0123456789".to_vec())
+                .unwrap();
+            let (code, output, _) =
+                run_rust_baseline_argv_with_fs(&reader, fs, "seek-reader.exe", &[])
+                    .expect("seek reader runs");
+            assert_eq!(code, 0, "offset={offset}, length={length}");
+            assert_eq!(output, expected, "offset={offset}, length={length}");
+        }
     }
 
     #[test]

@@ -777,6 +777,92 @@ pub fn read_file_to_stdout(path: &str) -> Vec<u8> {
     )
 }
 
+/// Seek to `offset`, read at most `length` bytes, and print them. This mirrors
+/// the seek/read sequence covered by Wine's kernel32 file tests.
+pub fn read_file_range_to_stdout(path: &str, offset: u32, length: u32) -> Vec<u8> {
+    let mut a = Asm::new();
+    let d_path = a.add_utf16(path);
+    let d_buf = a.add_zeroed(length.max(1) as usize);
+    let d_read = a.add_zeroed(8);
+    let d_written = a.add_zeroed(8);
+    let fail = a.fresh_label();
+    a.sub_rsp(0x48);
+    // CreateFileW(path, GENERIC_READ, 0, 0, OPEN_EXISTING, 0, NULL)
+    a.lea_reg_rip(1, d_path);
+    a.emit(&[0x48, 0xB8]);
+    a.emit(&0x8000_0000u64.to_le_bytes());
+    a.emit(&[0x48, 0x89, 0xC2]);
+    a.mov_r8d_imm(0);
+    a.mov_r9d_imm(0);
+    a.xor_eax();
+    a.emit(&[0xC7, 0x44, 0x24, 0x20]);
+    a.emit(&3u32.to_le_bytes());
+    a.emit(&[0xC7, 0x44, 0x24, 0x28]);
+    a.emit(&0u32.to_le_bytes());
+    a.mov_rspoff_rax(0x30);
+    a.call_import(0);
+    a.cmp_rax_m1();
+    a.jz(fail);
+    a.emit(&[0x48, 0x89, 0x44, 0x24, 0x40]);
+    // SetFilePointer(handle, offset, NULL, FILE_BEGIN)
+    a.emit(&[0x48, 0x8B, 0x4C, 0x24, 0x40]);
+    a.mov_r32_imm(2, offset);
+    a.xor_eax();
+    a.mov_r8d_imm(0);
+    a.mov_r9d_imm(0);
+    a.call_import(1);
+    a.cmp_eax_imm(u32::MAX);
+    a.jz(fail);
+    // ReadFile(handle, buffer, length, &read, NULL)
+    a.emit(&[0x48, 0x8B, 0x4C, 0x24, 0x40]);
+    a.lea_reg_rip(2, d_buf);
+    a.mov_r8d_imm(length);
+    a.lea_reg_rip(9, d_read);
+    a.xor_eax();
+    a.mov_rspoff_rax(0x20);
+    a.call_import(2);
+    a.test_eax_eax();
+    a.jz(fail);
+    {
+        let pos = a.code.len() + 3;
+        a.emit(&[0x44, 0x8B, 0x05, 0, 0, 0, 0]);
+        a.fix_dat.push((pos, d_read));
+    }
+    a.emit(&[0x4C, 0x89, 0x44, 0x24, 0x38]);
+    a.mov_ecx_imm(0xFFFF_FFF5);
+    a.call_import(3);
+    a.mov_rcx_rax();
+    a.emit(&[0x4C, 0x8B, 0x44, 0x24, 0x38]);
+    a.lea_reg_rip(2, d_buf);
+    a.lea_reg_rip(9, d_written);
+    a.xor_eax();
+    a.mov_rspoff_rax(0x20);
+    a.call_import(4);
+    a.emit(&[0x48, 0x8B, 0x4C, 0x24, 0x40]);
+    a.call_import(5);
+    a.mov_ecx_imm(0);
+    a.call_import(6);
+    a.add_rsp(0x48);
+    a.ret();
+    a.mark(fail);
+    a.mov_ecx_imm(1);
+    a.call_import(6);
+    a.add_rsp(0x48);
+    a.ret();
+    build(
+        a,
+        &[
+            ("KERNEL32.dll", "CreateFileW"),
+            ("KERNEL32.dll", "SetFilePointer"),
+            ("KERNEL32.dll", "ReadFile"),
+            ("KERNEL32.dll", "GetStdHandle"),
+            ("KERNEL32.dll", "WriteFile"),
+            ("KERNEL32.dll", "CloseHandle"),
+            ("KERNEL32.dll", "ExitProcess"),
+        ],
+    )
+}
+
 /// delete file + exit by BOOL.
 pub fn delete_file(path: &str) -> Vec<u8> {
     let mut a = Asm::new();

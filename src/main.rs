@@ -14,9 +14,11 @@ fn usage() -> ! {
     eprintln!("  wincli <script.ps1>             run a script (no args yet)");
     eprintln!("  wincli shell                    interactive ephemeral runner shell");
     eprintln!("  wincli runner                   run host-controlled job commands from stdin");
-    eprintln!("  wincli --snapshot=os.snap shell|runner  boot a snapshot image");
-    eprintln!("  wincli --save-snapshot=disk.snap shell|runner  persist the disk on exit");
-    eprintln!("  wincli snapshot build <dir> <os.snap>   build image from <dir>/C");
+    eprintln!("  wincli --snapshot=os.disk shell|runner  boot an indexed C: disk image");
+    eprintln!("  wincli --save-snapshot=disk.winfs shell|runner  persist C: on exit");
+    eprintln!("  wincli --mount=Z:/host/folder shell  mount a writable host folder");
+    eprintln!("  wincli --mount-ro=Z:/host/folder shell  mount a read-only host folder");
+    eprintln!("  wincli snapshot build <dir> <os.winfs>  build image from <dir>/C");
     eprintln!("  wincli instance boot <name> [--snapshot=os.snap]");
     eprintln!("  wincli instance status|destroy <name>");
     eprintln!("  wincli instance exec <name> -- <command> [args...]");
@@ -44,6 +46,14 @@ fn main() {
         .iter()
         .find_map(|arg| arg.strip_prefix("--save-snapshot="))
         .map(str::to_string);
+    let mount_specs: Vec<String> = args
+        .iter()
+        .filter_map(|arg| arg.strip_prefix("--mount=").map(str::to_string))
+        .collect();
+    let read_only_mount_specs: Vec<String> = args
+        .iter()
+        .filter_map(|arg| arg.strip_prefix("--mount-ro=").map(str::to_string))
+        .collect();
     if snapshot_path.is_some() {
         args.remove(1);
     }
@@ -55,6 +65,7 @@ fn main() {
             args.remove(index);
         }
     }
+    args.retain(|arg| !arg.starts_with("--mount=") && !arg.starts_with("--mount-ro="));
     if args.len() == 3 && args[1] == "inspect" {
         inspect_target(&args[2]);
     }
@@ -128,9 +139,10 @@ fn main() {
             Some(path) => load_snapshot(path),
             None => WinFs::ephemeral_runner(),
         };
+        let fs = mount_host_dirs(fs, &mount_specs, &read_only_mount_specs);
         let active_snapshot = save_snapshot_path.as_deref().or(snapshot_path.as_deref());
-        let (code, fs) = wincli::shell::run_shell_with_snapshot(fs, active_snapshot);
-        save_snapshot_if_requested(save_snapshot_path.as_deref(), &fs);
+        let (code, mut fs) = wincli::shell::run_shell_with_snapshot(fs, active_snapshot);
+        save_snapshot_if_requested(save_snapshot_path.as_deref(), &mut fs);
         exit(code);
     }
     if args.len() == 2 && args[1] == "runner" {
@@ -138,15 +150,18 @@ fn main() {
             Some(path) => load_snapshot(path),
             None => WinFs::ephemeral_runner(),
         };
+        let fs = mount_host_dirs(fs, &mount_specs, &read_only_mount_specs);
         let active_snapshot = save_snapshot_path.as_deref().or(snapshot_path.as_deref());
-        let (code, fs) = wincli::shell::run_runner_with_snapshot(fs, active_snapshot);
-        save_snapshot_if_requested(save_snapshot_path.as_deref(), &fs);
+        let (code, mut fs) = wincli::shell::run_runner_with_snapshot(fs, active_snapshot);
+        save_snapshot_if_requested(save_snapshot_path.as_deref(), &mut fs);
         exit(code);
     }
-    if snapshot_path.is_some() || save_snapshot_path.is_some() {
-        eprintln!(
-            "wincli: --snapshot/--save-snapshot are currently supported with shell or runner"
-        );
+    if snapshot_path.is_some()
+        || save_snapshot_path.is_some()
+        || !mount_specs.is_empty()
+        || !read_only_mount_specs.is_empty()
+    {
+        eprintln!("wincli: --snapshot/--save-snapshot/--mount are supported with shell or runner");
         exit(2);
     }
     if args.len() < 2 {
@@ -181,15 +196,37 @@ fn load_snapshot(path: &str) -> WinFs {
     }
 }
 
+fn mount_host_dirs(mut fs: WinFs, writable: &[String], read_only: &[String]) -> WinFs {
+    for (spec, ro) in writable
+        .iter()
+        .map(|value| (value, false))
+        .chain(read_only.iter().map(|value| (value, true)))
+    {
+        let Some((drive, path)) = spec.split_once(':') else {
+            eprintln!("wincli: invalid mount {spec:?}; use --mount=Z:/host/folder");
+            exit(2);
+        };
+        let mut chars = drive.chars();
+        let Some(drive) = chars.next().filter(|_| chars.next().is_none()) else {
+            eprintln!("wincli: invalid mount drive in {spec:?}");
+            exit(2);
+        };
+        if let Err(error) = fs.mount_host_dir(drive, std::path::Path::new(path), ro) {
+            eprintln!("wincli: cannot mount {spec:?}: {error}");
+            exit(2);
+        }
+    }
+    fs
+}
+
 /// Write the session disk back when `--save-snapshot=<file>` was given.
-fn save_snapshot_if_requested(path: Option<&str>, fs: &WinFs) {
+fn save_snapshot_if_requested(path: Option<&str>, fs: &mut WinFs) {
     if let Some(path) = path {
-        let bytes = snapshot::encode(fs);
-        if let Err(e) = std::fs::write(path, &bytes) {
+        if let Err(e) = snapshot::save_file(fs, path) {
             eprintln!("wincli: cannot save snapshot {path}: {e}");
             exit(1);
         }
-        eprintln!("wincli: saved snapshot {path} ({} bytes)", bytes.len());
+        eprintln!("wincli: saved C: disk snapshot {path}");
     }
 }
 
@@ -282,7 +319,11 @@ fn run_with_runner(img: &pe::PeImage, path: &str, prog: &str, guest_args: &[Stri
             exit(result.code as i32);
         }
         Err(e) => {
-            eprintln!("wincli: {} execution failed for {path}: {e}", backend.id());
+            eprintln!(
+                "wincli: {} execution failed for {path}: {}",
+                backend.id(),
+                e.message
+            );
             exit(1);
         }
     }

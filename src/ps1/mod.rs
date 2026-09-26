@@ -439,8 +439,7 @@ impl<'a> Interpreter<'a> {
         // sides of `-match`/`-notmatch` are regex engine data, exempt too.
         let match_operands = if toks.len() == 3 {
             let op = toks[1].text().to_lowercase();
-            (op == "-match" || op == "-notmatch")
-                .then_some((0usize, 2usize))
+            (op == "-match" || op == "-notmatch").then_some((0usize, 2usize))
         } else {
             None
         };
@@ -454,9 +453,7 @@ impl<'a> Interpreter<'a> {
             }
             // Whole `(...)` groups (with any `.Member`/`[i]` tail) expand
             // through the subexpression evaluator below.
-            if t.trim_start().starts_with('(')
-                && take_wrapped(t.trim_start(), '(', ')').is_ok()
-            {
+            if t.trim_start().starts_with('(') && take_wrapped(t.trim_start(), '(', ')').is_ok() {
                 continue;
             }
             if t.contains(['.', '(', ')', '{', '}', '[', ']', '@']) {
@@ -519,13 +516,13 @@ impl<'a> Interpreter<'a> {
         } else {
             let joined: String = coll.iter().map(Token::text).collect::<Vec<_>>().join(" ");
             if !joined.trim_start().starts_with("@(") {
-                return Err(format!("cannot evaluate condition: {op} needs a collection"));
+                return Err(format!(
+                    "cannot evaluate condition: {op} needs a collection"
+                ));
             }
             self.eval_array(&joined)?
         };
-        let hit = coll_vals
-            .iter()
-            .any(|v| v.eq_ignore_ascii_case(&item_val));
+        let hit = coll_vals.iter().any(|v| v.eq_ignore_ascii_case(&item_val));
         Ok(if op == "-in" || op == "-contains" {
             hit
         } else {
@@ -682,7 +679,9 @@ impl<'a> Interpreter<'a> {
         // (what switch bodies and subexpressions produce). Bare array/map
         // variables enumerate (one element per line, like real output);
         // strings display raw.
-        if toks.len() == 1 && (toks[0].quoted || toks[0].text().len() > 1 && toks[0].text().starts_with('$')) {
+        if toks.len() == 1
+            && (toks[0].quoted || toks[0].text().len() > 1 && toks[0].text().starts_with('$'))
+        {
             let t = toks[0].text();
             if !toks[0].quoted {
                 if let Some(v) = self.var_value(&t).cloned() {
@@ -791,7 +790,8 @@ impl<'a> Interpreter<'a> {
             "push-location" | "pushd" => self.cmd_set_location(rest, true),
             "pop-location" | "popd" => self.cmd_pop_location(rest),
             "start-sleep" | "sleep" => self.cmd_start_sleep(rest),
-            "join-path" => self.cmd_join_path(rest),            "invoke-webrequest" | "iwr" | "wget" => self.cmd_invoke_webrequest(rest),
+            "join-path" => self.cmd_join_path(rest),
+            "invoke-webrequest" | "iwr" | "wget" => self.cmd_invoke_webrequest(rest),
             "expand-archive" => self.cmd_expand_archive(rest),
             "get-filehash" => self.cmd_get_filehash(rest),
             "write-host" | "write-output" | "echo" => {
@@ -822,8 +822,7 @@ impl<'a> Interpreter<'a> {
             .cloned()
             .or_else(|| positional.first().cloned())
             .ok_or_else(|| "usage: irm <url>".to_string())?;
-        let text = crate::install::fetch_url(&url, 120)
-            .map_err(|e| format!("irm: {e}"))?;
+        let text = crate::install::fetch_url(&url, 120).map_err(|e| format!("irm: {e}"))?;
         // Like the real cmdlet, JSON bodies arrive parsed: arrays flow
         // one element per line (JSON Lines), anything else one line.
         // Anything unparseable flows as raw text (scripts depend on it).
@@ -917,7 +916,9 @@ impl<'a> Interpreter<'a> {
                         .map_err(|_| "Select-Object -First needs a number".to_string())?,
                 );
             } else {
-                return Err(format!("Select-Object {tok} is not supported (only -First)"));
+                return Err(format!(
+                    "Select-Object {tok} is not supported (only -First)"
+                ));
             }
         }
         let n = first.ok_or_else(|| "Select-Object needs -First N".to_string())?;
@@ -1047,14 +1048,18 @@ impl<'a> Interpreter<'a> {
     /// defined-function call capture, builtin capture, or scalar. Returns
     /// the value plus any loop signal from a captured call (abandon on it).
     fn eval_value(&mut self, vals: &[Token]) -> Result<(Value, Flow), String> {
-        let joined: String = vals
-            .iter()
-            .map(Token::text)
-            .collect::<Vec<_>>()
-            .join(" ");
+        let joined: String = vals.iter().map(Token::text).collect::<Vec<_>>().join(" ");
         let t = joined.trim_start();
         if t.starts_with("@(") {
-            return Ok((Value::Arr(self.eval_array(&joined)?.into_iter().map(Value::Str).collect()), Flow::Next));
+            return Ok((
+                Value::Arr(
+                    self.eval_array(&joined)?
+                        .into_iter()
+                        .map(Value::Str)
+                        .collect(),
+                ),
+                Flow::Next,
+            ));
         }
         let nospace: String = t.chars().filter(|c| !c.is_whitespace()).collect();
         if nospace == "@{}" {
@@ -1084,8 +1089,10 @@ impl<'a> Interpreter<'a> {
         // capturing output (0 lines → `""`, 1 → string, N → array).
         if !vals.is_empty() && !vals[0].verbatim() {
             let fname = vals[0].text().to_lowercase();
-            if let Some((params, body)) =
-                self.funcs.get(&fname).map(|f| (f.params.clone(), f.body.clone()))
+            if let Some((params, body)) = self
+                .funcs
+                .get(&fname)
+                .map(|f| (f.params.clone(), f.body.clone()))
             {
                 let mut argvals = Vec::with_capacity(vals.len().saturating_sub(1));
                 for tok in vals.iter().skip(1) {
@@ -1366,7 +1373,8 @@ impl<'a> Interpreter<'a> {
         if !rest.starts_with('(') {
             return Err("foreach needs ($var in ...)".to_string());
         }
-        let (header, rest2) = take_wrapped(rest, '(', ')').map_err(|_| "foreach needs ($var in ...)".to_string())?;
+        let (header, rest2) =
+            take_wrapped(rest, '(', ')').map_err(|_| "foreach needs ($var in ...)".to_string())?;
         let rest2 = rest2.trim_start();
         if !rest2.starts_with('{') {
             return Err("foreach needs {body}".to_string());
@@ -1433,7 +1441,9 @@ impl<'a> Interpreter<'a> {
                 .chars()
                 .next()
                 .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-            || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
         {
             return Err("invalid function name".to_string());
         }
@@ -1457,13 +1467,8 @@ impl<'a> Interpreter<'a> {
         if !rest2.trim().is_empty() {
             return Err("unexpected text after function".to_string());
         }
-        self.funcs.insert(
-            name.to_lowercase(),
-            FuncDef {
-                params,
-                body,
-            },
-        );
+        self.funcs
+            .insert(name.to_lowercase(), FuncDef { params, body });
         Ok(Flow::Next)
     }
 
@@ -1600,8 +1605,7 @@ impl<'a> Interpreter<'a> {
                     // Optional `[index]` chain on the method result.
                     let mut k = cs.len() - rest2.chars().count();
                     if k < cs.len() && cs[k].0 == '[' {
-                        let tail2: String =
-                            cs[k..].iter().map(|(c, _)| *c).collect();
+                        let tail2: String = cs[k..].iter().map(|(c, _)| *c).collect();
                         let (inner2, rest3) = take_wrapped(&tail2, '[', ']')?;
                         let itoks = tokenize(inner2.trim())?;
                         if itoks.len() != 1 {
@@ -1620,8 +1624,7 @@ impl<'a> Interpreter<'a> {
                 // strings, or unset/null). Other bases keep the legacy
                 // value-plus-literal behavior.
                 if j < cs.len() && cs[j].0 == '[' && is_var_name(&name) {
-                    let tail: String =
-                        cs[j..].iter().map(|(c, _)| *c).collect();
+                    let tail: String = cs[j..].iter().map(|(c, _)| *c).collect();
                     let (inner, rest2) = take_wrapped(&tail, '[', ']')?;
                     let itoks = tokenize(inner.trim())?;
                     if itoks.len() != 1 {
@@ -1752,8 +1755,7 @@ impl<'a> Interpreter<'a> {
                     .map(|(_, v)| v)?,
                 Value::Arr(a) => {
                     if rest.is_empty()
-                        && (seg.eq_ignore_ascii_case("count")
-                            || seg.eq_ignore_ascii_case("length"))
+                        && (seg.eq_ignore_ascii_case("count") || seg.eq_ignore_ascii_case("length"))
                     {
                         return Some(a.len().to_string());
                     }
@@ -1798,7 +1800,8 @@ impl<'a> Interpreter<'a> {
 
     /// Method call on an already-resolved value (member chains on
     /// parenthesized expressions share this with `$var.Method()`).
-    fn eval_method_value(        &self,
+    fn eval_method_value(
+        &self,
         receiver: Value,
         method: &str,
         args: &[String],
@@ -1812,13 +1815,11 @@ impl<'a> Interpreter<'a> {
                 if args.len() != 1 {
                     return Err("ContainsKey takes one argument".to_string());
                 }
-                Ok(Value::Str(
-                    if map.contains_key(&args[0].to_lowercase()) {
-                        "True".to_string()
-                    } else {
-                        "False".to_string()
-                    },
-                ))
+                Ok(Value::Str(if map.contains_key(&args[0].to_lowercase()) {
+                    "True".to_string()
+                } else {
+                    "False".to_string()
+                }))
             }
             Value::Arr(items) => {
                 if m != "contains" {
@@ -1997,10 +1998,7 @@ impl<'a> Interpreter<'a> {
     }
 
     fn cmd_new_item(&mut self, args: &[String]) -> Result<(), String> {
-        let (named, pos) = parse_params(
-            args,
-            &["path", "itemtype", "value", "force", "name"],
-        )?;
+        let (named, pos) = parse_params(args, &["path", "itemtype", "value", "force", "name"])?;
         let path = named
             .get("path")
             .cloned()
@@ -2019,8 +2017,7 @@ impl<'a> Interpreter<'a> {
         let value = named.get("value").cloned().or_else(|| {
             // value = last positional that isn't the type
             if pos.len() >= 2
-                && (pos[1].eq_ignore_ascii_case("file")
-                    || pos[1].eq_ignore_ascii_case("directory"))
+                && (pos[1].eq_ignore_ascii_case("file") || pos[1].eq_ignore_ascii_case("directory"))
             {
                 pos.get(2).cloned()
             } else {
@@ -2050,7 +2047,9 @@ impl<'a> Interpreter<'a> {
                 // create parents
                 if let Some(parent) = parent_of(&path) {
                     if !parent.is_empty() {
-                        self.fs.mkdir(&parent).map_err(|e| format!("New-Item: {e}"))?;
+                        self.fs
+                            .mkdir(&parent)
+                            .map_err(|e| format!("New-Item: {e}"))?;
                     }
                 }
                 self.fs
@@ -2082,7 +2081,9 @@ impl<'a> Interpreter<'a> {
         if let Some(parent) = parent_of(&path) {
             if !parent.is_empty() && !self.fs.is_dir(&parent) && !self.fs.exists(&parent) {
                 // auto-create parents to keep scripts simple
-                self.fs.mkdir(&parent).map_err(|e| format!("Set-Content: {e}"))?;
+                self.fs
+                    .mkdir(&parent)
+                    .map_err(|e| format!("Set-Content: {e}"))?;
             }
         }
         let mut data = value.into_bytes();
@@ -2120,7 +2121,10 @@ impl<'a> Interpreter<'a> {
             .cloned()
             .or_else(|| pos.first().cloned())
             .ok_or_else(|| "Get-Content: missing -Path".to_string())?;
-        let data = self.fs.read_file(&path).map_err(|e| format!("Get-Content: {e}"))?;
+        let data = self
+            .fs
+            .read_file(&path)
+            .map_err(|e| format!("Get-Content: {e}"))?;
         let text = String::from_utf8_lossy(&data);
         // print without adding extra newline if content already ends with one
         let s = text.strip_suffix('\n').unwrap_or(&text);
@@ -2157,7 +2161,10 @@ impl<'a> Interpreter<'a> {
         let recurse = named.contains_key("recurse");
         // -Force also implies recursive-ish leniency? keep: recurse only via -Recurse.
         self.fs
-            .remove(&path, recurse || named.contains_key("force") && self.fs.is_dir(&path) && recurse)
+            .remove(
+                &path,
+                recurse || named.contains_key("force") && self.fs.is_dir(&path) && recurse,
+            )
             .map_err(|e| format!("Remove-Item: {e}"))?;
         Ok(())
     }
@@ -2178,7 +2185,9 @@ impl<'a> Interpreter<'a> {
         // auto-create dst parents for convenience
         if let Some(parent) = parent_of(&dst) {
             if !parent.is_empty() && !self.fs.exists(&parent) {
-                self.fs.mkdir(&parent).map_err(|e| format!("Copy-Item: {e}"))?;
+                self.fs
+                    .mkdir(&parent)
+                    .map_err(|e| format!("Copy-Item: {e}"))?;
             }
         }
         self.fs
@@ -2201,7 +2210,9 @@ impl<'a> Interpreter<'a> {
             .ok_or_else(|| "Move-Item: missing -Destination".to_string())?;
         if let Some(parent) = parent_of(&dst) {
             if !parent.is_empty() && !self.fs.exists(&parent) {
-                self.fs.mkdir(&parent).map_err(|e| format!("Move-Item: {e}"))?;
+                self.fs
+                    .mkdir(&parent)
+                    .map_err(|e| format!("Move-Item: {e}"))?;
             }
         }
         self.fs
@@ -2217,7 +2228,11 @@ impl<'a> Interpreter<'a> {
             .cloned()
             .or_else(|| pos.first().cloned())
             .ok_or_else(|| "Test-Path: missing -Path".to_string())?;
-        self.emit(if self.fs.test_path(&path) { "True" } else { "False" });
+        self.emit(if self.fs.test_path(&path) {
+            "True"
+        } else {
+            "False"
+        });
         Ok(())
     }
 
@@ -2259,20 +2274,24 @@ impl<'a> Interpreter<'a> {
                 }
             })?;
         // Validate (and resolve) before touching the location stack.
-        let display = self
-            .fs
-            .normalize(&path)
-            .map(|p| p.display())
-            .map_err(|e| {
-                format!(
-                    "{}: {e}",
-                    if push { "Push-Location" } else { "Set-Location" }
-                )
-            })?;
+        let display = self.fs.normalize(&path).map(|p| p.display()).map_err(|e| {
+            format!(
+                "{}: {e}",
+                if push {
+                    "Push-Location"
+                } else {
+                    "Set-Location"
+                }
+            )
+        })?;
         if !self.fs.is_dir(&display) {
             return Err(format!(
                 "{}: path not found: {path}",
-                if push { "Push-Location" } else { "Set-Location" }
+                if push {
+                    "Push-Location"
+                } else {
+                    "Set-Location"
+                }
             ));
         }
         if push {
@@ -2365,7 +2384,9 @@ impl<'a> Interpreter<'a> {
             }
         }
         for dir in chain.iter().rev() {
-            self.fs.mkdir(dir).map_err(|e| format!("mkdir {dir}: {e}"))?;
+            self.fs
+                .mkdir(dir)
+                .map_err(|e| format!("mkdir {dir}: {e}"))?;
         }
         Ok(())
     }
@@ -2382,8 +2403,8 @@ impl<'a> Interpreter<'a> {
             .cloned()
             .or_else(|| pos.get(1).cloned())
             .ok_or_else(|| "usage: Invoke-WebRequest -Uri <url> -OutFile <path>".to_string())?;
-        let bytes = crate::install::fetch_url(&url, 300)
-            .map_err(|e| format!("Invoke-WebRequest: {e}"))?;
+        let bytes =
+            crate::install::fetch_url(&url, 300).map_err(|e| format!("Invoke-WebRequest: {e}"))?;
         if let Some(parent) = parent_of(&dest) {
             if !parent.is_empty() && !self.fs.exists(&parent) {
                 self.ensure_dir(&parent)?;
@@ -2401,21 +2422,29 @@ impl<'a> Interpreter<'a> {
             .get("path")
             .cloned()
             .or_else(|| pos.first().cloned())
-            .ok_or_else(|| "usage: Expand-Archive -Path <zip> -DestinationPath <dir>".to_string())?;
+            .ok_or_else(|| {
+                "usage: Expand-Archive -Path <zip> -DestinationPath <dir>".to_string()
+            })?;
         let dest = named
             .get("destinationpath")
             .cloned()
             .or_else(|| pos.get(1).cloned())
-            .ok_or_else(|| "usage: Expand-Archive -Path <zip> -DestinationPath <dir>".to_string())?;
+            .ok_or_else(|| {
+                "usage: Expand-Archive -Path <zip> -DestinationPath <dir>".to_string()
+            })?;
         let blob = self
             .fs
             .read_file(&zip_path)
             .map_err(|e| format!("Expand-Archive: {e}"))?;
-        let entries = crate::install::zip_entries(&blob)
-            .map_err(|e| format!("Expand-Archive: {e}"))?;
+        let entries =
+            crate::install::zip_entries(&blob).map_err(|e| format!("Expand-Archive: {e}"))?;
         self.ensure_dir(&dest)?;
         for entry in entries {
-            let target = format!("{}\\{}", dest.trim_end_matches('\\'), entry.name.replace('/', "\\"));
+            let target = format!(
+                "{}\\{}",
+                dest.trim_end_matches('\\'),
+                entry.name.replace('/', "\\")
+            );
             if entry.is_dir {
                 self.ensure_dir(&target)?;
                 continue;
@@ -2460,15 +2489,13 @@ impl<'a> Interpreter<'a> {
 
     /// Value form of Get-FileHash for member chains:
     /// `{Algorithm, Hash, Path}` (hash uppercase, like .NET).
-    fn filehash_value(&self, path: &str) -> Result<Value, String> {        let bytes = self
+    fn filehash_value(&self, path: &str) -> Result<Value, String> {
+        let bytes = self
             .fs
             .read_file(path)
             .map_err(|e| format!("Get-FileHash: {e}"))?;
         let mut map = HashMap::new();
-        map.insert(
-            "algorithm".to_string(),
-            Value::Str("SHA256".to_string()),
-        );
+        map.insert("algorithm".to_string(), Value::Str("SHA256".to_string()));
         map.insert(
             "hash".to_string(),
             Value::Str(crate::install::sha256_hex(&bytes).to_uppercase()),
@@ -2545,17 +2572,11 @@ impl<'a> Interpreter<'a> {
             }
         }
         let toks = tokenize(t)?;
-        if toks.len() == 3
-            && !toks[1].verbatim()
-            && toks[1].text() == "+"
-        {
+        if toks.len() == 3 && !toks[1].verbatim() && toks[1].text() == "+" {
             let v = self.eval_plus(&toks)?;
             return Ok((v, Flow::Next));
         }
-        if toks.len() == 3
-            && !toks[1].verbatim()
-            && toks[1].text().eq_ignore_ascii_case("-split")
-        {
+        if toks.len() == 3 && !toks[1].verbatim() && toks[1].text().eq_ignore_ascii_case("-split") {
             let lhs = self.expand_token(&toks[0])?;
             let pat = self.expand_token(&toks[2])?;
             let parts = regex_split(&pat, &lhs)?;
@@ -3049,7 +3070,11 @@ fn regex_split(pattern: &str, text: &str) -> Result<Vec<String>, String> {
 enum RxNode {
     Lit(char),
     Dot,
-    Class { neg: bool, singles: Vec<char>, ranges: Vec<(char, char)> },
+    Class {
+        neg: bool,
+        singles: Vec<char>,
+        ranges: Vec<(char, char)>,
+    },
     AnchorStart,
     AnchorEnd,
     Boundary(bool),
@@ -3190,7 +3215,9 @@ impl RxParser {
             }
             Some('\\') => {
                 self.pos += 1;
-                let e = self.peek().ok_or_else(|| "trailing backslash".to_string())?;
+                let e = self
+                    .peek()
+                    .ok_or_else(|| "trailing backslash".to_string())?;
                 self.pos += 1;
                 match e {
                     'd' => Ok(self.push(RxNode::Class {
@@ -3225,9 +3252,7 @@ impl RxParser {
                     })),
                     'b' => Ok(self.push(RxNode::Boundary(false))),
                     'B' => Ok(self.push(RxNode::Boundary(true))),
-                    c if c.is_ascii_alphanumeric() => {
-                        Err(format!("unsupported escape: \\{c}"))
-                    }
+                    c if c.is_ascii_alphanumeric() => Err(format!("unsupported escape: \\{c}")),
                     c => Ok(self.push(RxNode::Lit(c))),
                 }
             }
@@ -3285,7 +3310,9 @@ impl RxParser {
                 }
                 Some('\\') => {
                     self.pos += 1;
-                    let e = self.peek().ok_or_else(|| "trailing backslash".to_string())?;
+                    let e = self
+                        .peek()
+                        .ok_or_else(|| "trailing backslash".to_string())?;
                     self.pos += 1;
                     // Inside classes only simple escaped literals fold in;
                     // class shorthands stay loud errors (documented subset).
@@ -3301,9 +3328,7 @@ impl RxParser {
                             ranges.push(('A', 'Z'));
                             ranges.push(('0', '9'));
                         }
-                        'W' | 's' | 'S' => {
-                            return Err("unsupported class inside class".to_string())
-                        }
+                        'W' | 's' | 'S' => return Err("unsupported class inside class".to_string()),
                         c => singles.push(c),
                     }
                 }
@@ -3337,7 +3362,11 @@ impl RxParser {
         if singles.is_empty() && ranges.is_empty() {
             return Err("empty character class".to_string());
         }
-        Ok(self.push(RxNode::Class { neg, singles, ranges }))
+        Ok(self.push(RxNode::Class {
+            neg,
+            singles,
+            ranges,
+        }))
     }
 }
 
@@ -3359,7 +3388,11 @@ impl RxMatcher {
     /// End positions after matching node `n` starting at `ti`.
     fn run(&mut self, n: usize, ti: usize) -> Result<Vec<usize>, String> {
         self.burn()?;
-        let node = self.nodes.get(n).cloned().ok_or_else(|| "bad node".to_string())?;
+        let node = self
+            .nodes
+            .get(n)
+            .cloned()
+            .ok_or_else(|| "bad node".to_string())?;
         match node {
             RxNode::Lit(c) => {
                 if self.t.get(ti) == Some(&c) {
@@ -3372,7 +3405,11 @@ impl RxMatcher {
                 Some(&'\n') | None => Ok(Vec::new()),
                 _ => Ok(vec![ti + 1]),
             },
-            RxNode::Class { neg, singles, ranges } => match self.t.get(ti) {
+            RxNode::Class {
+                neg,
+                singles,
+                ranges,
+            } => match self.t.get(ti) {
                 None => Ok(Vec::new()),
                 Some(&c) => {
                     let mut hit =
@@ -3384,7 +3421,11 @@ impl RxMatcher {
                 }
             },
             RxNode::AnchorStart => Ok(if ti == 0 { vec![ti] } else { Vec::new() }),
-            RxNode::AnchorEnd => Ok(if ti == self.t.len() { vec![ti] } else { Vec::new() }),
+            RxNode::AnchorEnd => Ok(if ti == self.t.len() {
+                vec![ti]
+            } else {
+                Vec::new()
+            }),
             RxNode::Boundary(neg) => {
                 let word = |i: usize| {
                     self.t
@@ -3581,12 +3622,16 @@ impl JsonParser {
         self.pos += 1; // opening "
         let mut out = String::new();
         loop {
-            let c = self.peek().ok_or_else(|| "unterminated JSON string".to_string())?;
+            let c = self
+                .peek()
+                .ok_or_else(|| "unterminated JSON string".to_string())?;
             self.pos += 1;
             match c {
                 '"' => return Ok(out),
                 '\\' => {
-                    let e = self.peek().ok_or_else(|| "unterminated JSON escape".to_string())?;
+                    let e = self
+                        .peek()
+                        .ok_or_else(|| "unterminated JSON escape".to_string())?;
                     self.pos += 1;
                     match e {
                         '"' => out.push('"'),
@@ -3614,7 +3659,9 @@ impl JsonParser {
     fn parse_hex4(&mut self) -> Result<char, String> {
         let mut n: u32 = 0;
         for _ in 0..4 {
-            let c = self.peek().ok_or_else(|| "truncated \\u escape".to_string())?;
+            let c = self
+                .peek()
+                .ok_or_else(|| "truncated \\u escape".to_string())?;
             let d = c.to_digit(16).ok_or_else(|| "bad \\u escape".to_string())?;
             n = n * 16 + d;
             self.pos += 1;
@@ -3875,11 +3922,7 @@ fn split_static_call(s: &str) -> Result<Option<(String, String, String, String)>
 fn value_string(v: &Value) -> String {
     match v {
         Value::Str(s) => s.clone(),
-        Value::Arr(a) => a
-            .iter()
-            .map(value_string)
-            .collect::<Vec<_>>()
-            .join(" "),
+        Value::Arr(a) => a.iter().map(value_string).collect::<Vec<_>>().join(" "),
         Value::Map(_) => String::new(),
     }
 }
@@ -3965,7 +4008,8 @@ fn split_top_commas(s: &str) -> Vec<String> {
 /// First unquoted `op` token (`-and` / `-or`); whole `(...)` groups
 /// are single tokens so anything inside them never matches.
 fn find_logic_op(toks: &[Token], op: &str) -> Option<usize> {
-    toks.iter().position(|t| !t.verbatim() && t.text().eq_ignore_ascii_case(op))
+    toks.iter()
+        .position(|t| !t.verbatim() && t.text().eq_ignore_ascii_case(op))
 }
 
 /// Does a parenthesized inner read as a condition (comparison / logic /
@@ -3975,10 +4019,7 @@ fn is_condition_shape(inner: &str) -> Result<bool, String> {
     if toks.len() == 1 {
         return Ok(true);
     }
-    if toks.len() == 2
-        && !toks[0].verbatim()
-        && toks[0].text().eq_ignore_ascii_case("-not")
-    {
+    if toks.len() == 2 && !toks[0].verbatim() && toks[0].text().eq_ignore_ascii_case("-not") {
         return Ok(true);
     }
     if toks.len() == 3
@@ -3997,10 +4038,10 @@ fn is_condition_shape(inner: &str) -> Result<bool, String> {
     {
         return Ok(true);
     }
-    if toks
-        .iter()
-        .any(|t| !t.verbatim() && (t.text().eq_ignore_ascii_case("-and") || t.text().eq_ignore_ascii_case("-or")))
-    {
+    if toks.iter().any(|t| {
+        !t.verbatim()
+            && (t.text().eq_ignore_ascii_case("-and") || t.text().eq_ignore_ascii_case("-or"))
+    }) {
         return Ok(true);
     }
     Ok(false)
@@ -4695,7 +4736,10 @@ mod tests {
     }
 
     /// Pre-seeded WinFS run (script's `C:\...` files must already exist).
-    fn run_seed(seed: &[(&str, &[u8])], script: &str) -> (i32, Vec<u8>, Result<i32, String>, WinFs) {
+    fn run_seed(
+        seed: &[(&str, &[u8])],
+        script: &str,
+    ) -> (i32, Vec<u8>, Result<i32, String>, WinFs) {
         let mut fs = WinFs::new();
         for (path, data) in seed {
             fs.write_file(path, data.to_vec()).unwrap();
@@ -4733,10 +4777,7 @@ mod tests {
     #[test]
     fn get_filehash_emits_uppercase_sha256() {
         // SHA-256("abc") — FIPS 180-4 test vector.
-        let (_, out, r, _) = run_seed(
-            &[("C:\\data.txt", b"abc")],
-            "Get-FileHash C:\\data.txt",
-        );
+        let (_, out, r, _) = run_seed(&[("C:\\data.txt", b"abc")], "Get-FileHash C:\\data.txt");
         assert!(r.is_ok());
         assert_eq!(
             out,
@@ -4768,7 +4809,11 @@ mod tests {
             &[("C:\\pkg.zip", &zip)],
             "Expand-Archive C:\\pkg.zip C:\\out\nGet-Content C:\\out\\pkg\\a.txt\nGet-Content C:\\out\\pkg\\sub\\b.txt",
         );
-        assert!(r.is_ok(), "code={code} out={}", String::from_utf8_lossy(&out));
+        assert!(
+            r.is_ok(),
+            "code={code} out={}",
+            String::from_utf8_lossy(&out)
+        );
         assert_eq!(out, b"alpha\nbeta\n");
         assert!(fs.test_path("C:\\out\\pkg\\a.txt"));
     }
@@ -4821,7 +4866,8 @@ mod tests {
     }
 
     #[test]
-    fn assignment_runs_full_pipeline() {        // `$line = Get-Content ... | Where ... | Select -First 1`
+    fn assignment_runs_full_pipeline() {
+        // `$line = Get-Content ... | Where ... | Select -First 1`
         // (installer checksum prober): stages past the first must run.
         let (_, out, r, _) = run_seed(
             &[("C:\\s.txt", b"nope\nwant-me\n")],
@@ -4843,7 +4889,8 @@ mod tests {
     #[test]
     fn plus_concatenates_in_paren_and_bare() {
         // `$tmp = Join-Path ... ("es-runtime-" + guid)` shape.
-        let (_, out, r) = run("$g = 'AB12'\nWrite-Host ('es-runtime-' + $g)\nWrite-Host ('x' + 'y')");
+        let (_, out, r) =
+            run("$g = 'AB12'\nWrite-Host ('es-runtime-' + $g)\nWrite-Host ('x' + 'y')");
         assert!(r.is_ok());
         assert_eq!(out, b"es-runtime-AB12\nxy\n");
     }
@@ -4870,7 +4917,10 @@ mod tests {
         assert!(r.is_ok());
         assert_eq!(out, b"a b\n");
         // Trailing junk and unbalanced groups fail clearly.
-        assert!(run_session("(echo hi) extra").1.unwrap_err().contains("unexpected text"));
+        assert!(run_session("(echo hi) extra")
+            .1
+            .unwrap_err()
+            .contains("unexpected text"));
         assert!(run_session("(echo hi").1.is_err());
     }
 
@@ -4890,7 +4940,10 @@ mod tests {
         let (out, r) = run_session("New-Item C:\\ea.txt -Value x -ErrorAction SilentlyContinue\nGet-Content C:\\ea.txt -ErrorAction Stop");
         assert!(r.is_ok());
         assert_eq!(out, b"x\n");
-        assert!(run_session("echo hi -ErrorAction").1.unwrap_err().contains("missing value"));
+        assert!(run_session("echo hi -ErrorAction")
+            .1
+            .unwrap_err()
+            .contains("missing value"));
     }
 
     #[test]
@@ -4912,7 +4965,8 @@ mod tests {
     #[test]
     fn foreach_object_text_and_scoping() {
         // Plain lines bind as text; `$_` restores afterwards.
-        let (out, r) = run_session("echo hi | ForEach-Object { echo \"got-$_\" }\necho \"after-$_\"");
+        let (out, r) =
+            run_session("echo hi | ForEach-Object { echo \"got-$_\" }\necho \"after-$_\"");
         assert!(r.is_ok());
         assert_eq!(out, b"got-hi\nafter-\n");
         // Aliases `%` and named `-Process` work.
@@ -4923,12 +4977,17 @@ mod tests {
         assert!(r.is_ok());
         assert_eq!(out, b"a\n");
         // Missing scriptblock fails clearly.
-        assert!(run_session("echo a | ForEach-Object").1.unwrap_err().contains("scriptblock"));
+        assert!(run_session("echo a | ForEach-Object")
+            .1
+            .unwrap_err()
+            .contains("scriptblock"));
     }
 
     #[test]
     fn where_object_filters() {
-        let (out, r) = run_session("echo '[\"a1\", \"b2\"]' | ForEach-Object { $_ } | Where-Object { $_ -match '2' }");
+        let (out, r) = run_session(
+            "echo '[\"a1\", \"b2\"]' | ForEach-Object { $_ } | Where-Object { $_ -match '2' }",
+        );
         assert!(r.is_ok());
         assert_eq!(out, b"b2\n");
         // Directly over array lines too.
@@ -4939,11 +4998,19 @@ mod tests {
 
     #[test]
     fn select_object_first() {
-        let (out, r) = run_session("echo '[\"a\", \"b\", \"c\"]' | ForEach-Object { $_ } | Select-Object -First 2");
+        let (out, r) = run_session(
+            "echo '[\"a\", \"b\", \"c\"]' | ForEach-Object { $_ } | Select-Object -First 2",
+        );
         assert!(r.is_ok());
         assert_eq!(out, b"a\nb\n");
-        assert!(run_session("echo hi | Select-Object").1.unwrap_err().contains("-First"));
-        assert!(run_session("echo hi | Select-Object -Last 1").1.unwrap_err().contains("only -First"));
+        assert!(run_session("echo hi | Select-Object")
+            .1
+            .unwrap_err()
+            .contains("-First"));
+        assert!(run_session("echo hi | Select-Object -Last 1")
+            .1
+            .unwrap_err()
+            .contains("only -First"));
     }
 
     #[test]
@@ -4953,7 +5020,10 @@ mod tests {
             ("^(esrun@|v[0-9])", "esrun@0.24.0"),
             ("^(esrun@|v[0-9])", "v1.2.3"),
             ("^esdev@", "esdev@0.1.0"),
-            ("  esrun\\-windows\\-x86\\-64\\.zip$", "  esrun-windows-x86-64.zip"),
+            (
+                "  esrun\\-windows\\-x86\\-64\\.zip$",
+                "  esrun-windows-x86-64.zip",
+            ),
             ("@", "a@b"),
             ("^v", "v1"),
             ("a*b", "aaab"),
@@ -4971,7 +5041,10 @@ mod tests {
         let no = [
             ("^(esrun@|v[0-9])", "esdev@0.1.0"),
             ("^esdev@", "esrun@0.1.0"),
-            ("  esrun\\-windows\\-x86\\-64\\.zip$", "  esrun-linux-x86-64.zip"),
+            (
+                "  esrun\\-windows\\-x86\\-64\\.zip$",
+                "  esrun-linux-x86-64.zip",
+            ),
             ("@", "ab"),
             ("a+b", "b"),
             (".", "\n"),
@@ -4993,8 +5066,12 @@ mod tests {
     fn json_values_and_canonical_form() {
         // Scalars canonicalize quoted (numbers/bools arrive as strings);
         // the form round-trips structurally.
-        let v = parse_json("{\"tag_name\": \"esrun@0.24.0\", \"n\": 12, \"t\": true, \"z\": null}").unwrap();
-        assert_eq!(render_json(&v), "{\"n\":\"12\",\"t\":\"True\",\"tag_name\":\"esrun@0.24.0\",\"z\":\"\"}");
+        let v = parse_json("{\"tag_name\": \"esrun@0.24.0\", \"n\": 12, \"t\": true, \"z\": null}")
+            .unwrap();
+        assert_eq!(
+            render_json(&v),
+            "{\"n\":\"12\",\"t\":\"True\",\"tag_name\":\"esrun@0.24.0\",\"z\":\"\"}"
+        );
         assert_eq!(parse_json(&render_json(&v)).unwrap(), v);
         let v = parse_json("[{\"a\": 1}, {\"a\": 2}]").unwrap();
         let Value::Arr(items) = v else {
@@ -5007,7 +5084,15 @@ mod tests {
         assert!(matches!(parse_json("{}"), Ok(Value::Map(_))));
         assert!(matches!(parse_json("[]"), Ok(Value::Arr(_))));
         // Malformed documents fail clearly.
-        for bad in ["{", "[1,]", "{\"a\": }", "nul", "--1", "01", "{\"a\" \"b\"}"] {
+        for bad in [
+            "{",
+            "[1,]",
+            "{\"a\": }",
+            "nul",
+            "--1",
+            "01",
+            "{\"a\" \"b\"}",
+        ] {
             assert!(parse_json(bad).is_err(), "{bad}");
         }
     }
@@ -5022,9 +5107,13 @@ mod tests {
 
     #[test]
     fn variables_assign_read_case_insensitive() {
-        let (out, r) = run_session("$Repo = Open-Tech-Foundation/ES-Runtime\necho $Repo\necho $repo");
+        let (out, r) =
+            run_session("$Repo = Open-Tech-Foundation/ES-Runtime\necho $Repo\necho $repo");
         assert!(r.is_ok());
-        assert_eq!(out, b"Open-Tech-Foundation/ES-Runtime\nOpen-Tech-Foundation/ES-Runtime\n");
+        assert_eq!(
+            out,
+            b"Open-Tech-Foundation/ES-Runtime\nOpen-Tech-Foundation/ES-Runtime\n"
+        );
     }
 
     #[test]
@@ -5144,12 +5233,14 @@ mod tests {
 
     #[test]
     fn if_elseif_else_chain_and_nesting() {
-        let script = "$x = 2\nif ($x -eq 1) { echo one } elseif ($x -eq 2) { echo two } else { echo other }";
+        let script =
+            "$x = 2\nif ($x -eq 1) { echo one } elseif ($x -eq 2) { echo two } else { echo other }";
         let (out, r) = run_session(script);
         assert!(r.is_ok());
         assert_eq!(out, b"two\n");
         // Multi-line shape with next-line elseif.
-        let script = "if ($Nope_X) {\n echo bad\n}\nelseif ($Nope_Y) {\n echo bad2\n}\nelse {\n echo els\n}";
+        let script =
+            "if ($Nope_X) {\n echo bad\n}\nelseif ($Nope_Y) {\n echo bad2\n}\nelse {\n echo els\n}";
         let (out, r) = run_session(script);
         assert!(r.is_ok());
         assert_eq!(out, b"els\n");
@@ -5161,9 +5252,18 @@ mod tests {
 
     #[test]
     fn if_unsupported_conditions_fail_clearly() {
-        assert!(run_session("if ('abc' -match 'a{2}') { echo bad }").1.unwrap_err().contains("counted"));
-        assert!(run_session("if ($x.Split('y') -eq 'a') { echo bad }").1.unwrap_err().contains("not supported"));
-        assert!(run_session("if ($x) { echo bad } else ($y) { echo bad }").1.unwrap_err().contains("no condition"));
+        assert!(run_session("if ('abc' -match 'a{2}') { echo bad }")
+            .1
+            .unwrap_err()
+            .contains("counted"));
+        assert!(run_session("if ($x.Split('y') -eq 'a') { echo bad }")
+            .1
+            .unwrap_err()
+            .contains("not supported"));
+        assert!(run_session("if ($x) { echo bad } else ($y) { echo bad }")
+            .1
+            .unwrap_err()
+            .contains("no condition"));
     }
 
     #[test]
@@ -5178,7 +5278,8 @@ mod tests {
         let (out, r) = run_session("$a = 1\nif (($a -eq 9) -or ($a -eq 1)) { echo or }");
         assert!(r.is_ok());
         assert_eq!(out, b"or\n");
-        let (out, r) = run_session("$a = 1\nif (($a -eq 9) -and ($a -eq 1)) { echo bad } else { echo good }");
+        let (out, r) =
+            run_session("$a = 1\nif (($a -eq 9) -and ($a -eq 1)) { echo bad } else { echo good }");
         assert!(r.is_ok());
         assert_eq!(out, b"good\n");
         // Command-shaped group: `(Test-Path $p)` runs and tests truthy.
@@ -5201,18 +5302,27 @@ mod tests {
 
     #[test]
     fn static_environment_roundtrip() {
-        let (out, r) = run_session("[Environment]::SetEnvironmentVariable('WINCLI_DOTNET_XYZ', 'dotnet-ok', 'User')");
+        let (out, r) = run_session(
+            "[Environment]::SetEnvironmentVariable('WINCLI_DOTNET_XYZ', 'dotnet-ok', 'User')",
+        );
         assert!(r.is_ok());
         assert!(out.is_empty());
         let (out, r) = run_session("[Environment]::SetEnvironmentVariable('WINCLI_DOTNET_XYZ', 'dotnet-ok', 'User')\n[Environment]::GetEnvironmentVariable('WINCLI_DOTNET_XYZ')");
         assert!(r.is_ok());
         assert_eq!(out, b"dotnet-ok\n");
         // Process target and missing names behave the same way.
-        let (out, r) = run_session("[Environment]::GetEnvironmentVariable('WINCLI_DEFINITELY_NOT_SET_XYZ')");
+        let (out, r) =
+            run_session("[Environment]::GetEnvironmentVariable('WINCLI_DEFINITELY_NOT_SET_XYZ')");
         assert!(r.is_ok());
         assert_eq!(out, b"\n");
-        assert!(run_session("[Environment]::Nope('x')").1.unwrap_err().contains("not supported"));
-        assert!(run_session("[Nope]::Nope('x')").1.unwrap_err().contains("not supported"));
+        assert!(run_session("[Environment]::Nope('x')")
+            .1
+            .unwrap_err()
+            .contains("not supported"));
+        assert!(run_session("[Nope]::Nope('x')")
+            .1
+            .unwrap_err()
+            .contains("not supported"));
     }
 
     #[test]
@@ -5249,8 +5359,14 @@ mod tests {
         let (out, r) = run_session("$s = 'abc'\necho $s.Replace('b', 'B')");
         assert!(r.is_ok());
         assert_eq!(out, b"aBc\n");
-        assert!(run_session("$s = 'a'\necho $s.ToUpper('x')").1.unwrap_err().contains("no arguments"));
-        assert!(run_session("echo $s.Foo()").1.unwrap_err().contains("method"));
+        assert!(run_session("$s = 'a'\necho $s.ToUpper('x')")
+            .1
+            .unwrap_err()
+            .contains("no arguments"));
+        assert!(run_session("echo $s.Foo()")
+            .1
+            .unwrap_err()
+            .contains("method"));
     }
 
     #[test]
@@ -5332,10 +5448,24 @@ mod tests {
 
     #[test]
     fn try_shape_errors() {
-        assert!(run_session("try echo hi").1.unwrap_err().contains("needs {body}"));
-        assert!(run_session("try { echo hi } catch echo").1.unwrap_err().contains("needs {body}"));
-        assert!(run_session("try { echo hi } finally").1.unwrap_err().contains("needs {body}"));
-        assert!(run_session("try { echo hi } finally { echo f } finally { echo g }").1.unwrap_err().contains("duplicate"));
+        assert!(run_session("try echo hi")
+            .1
+            .unwrap_err()
+            .contains("needs {body}"));
+        assert!(run_session("try { echo hi } catch echo")
+            .1
+            .unwrap_err()
+            .contains("needs {body}"));
+        assert!(run_session("try { echo hi } finally")
+            .1
+            .unwrap_err()
+            .contains("needs {body}"));
+        assert!(
+            run_session("try { echo hi } finally { echo f } finally { echo g }")
+                .1
+                .unwrap_err()
+                .contains("duplicate")
+        );
     }
 
     #[test]
@@ -5348,9 +5478,18 @@ mod tests {
         let (out, r) = run_session("$u = @{}\necho \"x$u['nope']y\"");
         assert!(r.is_ok());
         assert_eq!(out, b"xy\n");
-        assert!(run_session("$u = @{a=1}").1.unwrap_err().contains("entries"));
-        assert!(run_session("echo $u.Length('x')").1.unwrap_err().contains("method"));
-        assert!(run_session("$s = 'ab'\necho $s.Foo()").1.unwrap_err().contains("method"));
+        assert!(run_session("$u = @{a=1}")
+            .1
+            .unwrap_err()
+            .contains("entries"));
+        assert!(run_session("echo $u.Length('x')")
+            .1
+            .unwrap_err()
+            .contains("method"));
+        assert!(run_session("$s = 'ab'\necho $s.Foo()")
+            .1
+            .unwrap_err()
+            .contains("method"));
     }
 
     #[test]
@@ -5364,8 +5503,14 @@ mod tests {
         let (out, r) = run_session("$a = @('x')\necho \"a$b[5]c\"");
         assert!(r.is_ok());
         assert_eq!(out, b"ac\n");
-        assert!(run_session("$a = @('x')\necho $a[nope]").1.unwrap_err().contains("integer"));
-        assert!(run_session("$nosuch[0] = 1").1.unwrap_err().contains("hashtable"));
+        assert!(run_session("$a = @('x')\necho $a[nope]")
+            .1
+            .unwrap_err()
+            .contains("integer"));
+        assert!(run_session("$nosuch[0] = 1")
+            .1
+            .unwrap_err()
+            .contains("hashtable"));
     }
 
     #[test]
@@ -5399,10 +5544,22 @@ mod tests {
 
     #[test]
     fn foreach_shape_errors() {
-        assert!(run_session("foreach $x in $y { echo $x }").1.unwrap_err().contains("($var"));
-        assert!(run_session("foreach ($x in $y)").1.unwrap_err().contains("{body}"));
-        assert!(run_session("foreach ($1 in $y) { echo $1 }").1.unwrap_err().contains("loop variable"));
-        assert!(run_session("foreach ($x in $y) { echo $x } extra").1.unwrap_err().contains("unexpected text"));
+        assert!(run_session("foreach $x in $y { echo $x }")
+            .1
+            .unwrap_err()
+            .contains("($var"));
+        assert!(run_session("foreach ($x in $y)")
+            .1
+            .unwrap_err()
+            .contains("{body}"));
+        assert!(run_session("foreach ($1 in $y) { echo $1 }")
+            .1
+            .unwrap_err()
+            .contains("loop variable"));
+        assert!(run_session("foreach ($x in $y) { echo $x } extra")
+            .1
+            .unwrap_err()
+            .contains("unexpected text"));
     }
 
     #[test]
@@ -5414,9 +5571,15 @@ mod tests {
         let (out, r) = run_session("function F($a, $b) { echo \"$a-$b\" }\nF only");
         assert!(r.is_ok());
         assert_eq!(out, b"only-\n");
-        assert!(run_session("function F($a) { echo $a }\nF 1 2").1.unwrap_err().contains("too many"));
+        assert!(run_session("function F($a) { echo $a }\nF 1 2")
+            .1
+            .unwrap_err()
+            .contains("too many"));
         // Unknown commands still fail.
-        assert!(run_session("NoSuchFn 1").1.unwrap_err().contains("unknown command"));
+        assert!(run_session("NoSuchFn 1")
+            .1
+            .unwrap_err()
+            .contains("unknown command"));
         // Param-less form and redefinition.
         let (out, r) = run_session("function P { echo one }\nP\nfunction P { echo two }\nP");
         assert!(r.is_ok());
@@ -5425,17 +5588,22 @@ mod tests {
         let (out, r) = run_session("function Install-One($b) { echo \"got-$b\" }\ninstall-one X");
         assert!(r.is_ok());
         assert_eq!(out, b"got-X\n");
-        assert!(run_session("function 1bad { echo x }").1.unwrap_err().contains("function name"));
+        assert!(run_session("function 1bad { echo x }")
+            .1
+            .unwrap_err()
+            .contains("function name"));
     }
 
     #[test]
     fn function_output_captures_and_scopes() {
         // Call output captured by assignment (1 line → string).
-        let (out, r) = run_session("function GetIt($x) { echo \"got-$x\" }\n$t = GetIt world\necho $t");
+        let (out, r) =
+            run_session("function GetIt($x) { echo \"got-$x\" }\n$t = GetIt world\necho $t");
         assert!(r.is_ok());
         assert_eq!(out, b"got-world\n");
         // Writes are local to the call (child scope).
-        let (out, r) = run_session("$v = outer\nfunction Sc($v) { echo \"in-$v\" }\nSc inner\necho $v");
+        let (out, r) =
+            run_session("$v = outer\nfunction Sc($v) { echo \"in-$v\" }\nSc inner\necho $v");
         assert!(r.is_ok());
         assert_eq!(out, b"in-inner\nouter\n");
     }
@@ -5481,9 +5649,18 @@ mod tests {
 
     #[test]
     fn switch_shape_errors() {
-        assert!(run_session("switch -regex ('a') { 'a' { echo y } }").1.unwrap_err().contains("flags"));
-        assert!(run_session("switch $x { 'a' { echo y } }").1.unwrap_err().contains("needs (value)"));
-        assert!(run_session("switch ('a') { { $_ } { echo y } }").1.unwrap_err().contains("scriptblock"));
+        assert!(run_session("switch -regex ('a') { 'a' { echo y } }")
+            .1
+            .unwrap_err()
+            .contains("flags"));
+        assert!(run_session("switch $x { 'a' { echo y } }")
+            .1
+            .unwrap_err()
+            .contains("needs (value)"));
+        assert!(run_session("switch ('a') { { $_ } { echo y } }")
+            .1
+            .unwrap_err()
+            .contains("scriptblock"));
         assert!(run_session("switch ('a') { 'a' 'b' }").1.is_err());
     }
 
@@ -5502,7 +5679,8 @@ mod tests {
         let (out, r) = run_session("$Bins = @('esrun', 'esdev')\necho $Bins");
         assert!(r.is_ok());
         assert_eq!(out, b"esrun esdev\n");
-        let (out, r) = run_session("$Bins = @('esrun', 'esdev')\nif ($Bins.Count -eq 2) { echo c }");
+        let (out, r) =
+            run_session("$Bins = @('esrun', 'esdev')\nif ($Bins.Count -eq 2) { echo c }");
         assert!(r.is_ok());
         assert_eq!(out, b"c\n");
         let (out, r) = run_session("$Bins = @('esrun')\nif ($Bins.Length -eq 1) { echo len }");
@@ -5556,16 +5734,28 @@ mod tests {
     fn array_and_membership_shape_errors() {
         assert!(run_session("$a = @('x',,'y')").1.is_err());
         assert!(run_session("$a = @('x'").1.is_err());
-        assert!(run_session("$a = @('x') extra").1.unwrap_err().contains("after array"));
+        assert!(run_session("$a = @('x') extra")
+            .1
+            .unwrap_err()
+            .contains("after array"));
         // No-space `@(...)` on the collection side works.
         let (out, r) = run_session("if (@('a') -contains 'a') { echo y }");
         assert!(r.is_ok());
         assert_eq!(out, b"y\n");
         // Arrays as items and method calls fail clearly (`-match` itself
         // works now; unsupported patterns do not).
-        assert!(run_session("if (@('a') -in $Bins) { echo y }").1.unwrap_err().contains("items"));
-        assert!(run_session("if ('abc' -match 'a{2}') { echo y }").1.unwrap_err().contains("counted"));
-        assert!(run_session("if ($x.Split('@') -eq 'a') { echo y }").1.unwrap_err().contains("not supported"));
+        assert!(run_session("if (@('a') -in $Bins) { echo y }")
+            .1
+            .unwrap_err()
+            .contains("items"));
+        assert!(run_session("if ('abc' -match 'a{2}') { echo y }")
+            .1
+            .unwrap_err()
+            .contains("counted"));
+        assert!(run_session("if ($x.Split('@') -eq 'a') { echo y }")
+            .1
+            .unwrap_err()
+            .contains("not supported"));
     }
 
     #[test]

@@ -58,8 +58,11 @@ fn main() {
     let pkgs = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/artifacts/packages");
     std::fs::create_dir_all(&pkgs).unwrap();
     let demo_exe = builder::hello("demo 0.1.0");
-    std::fs::write(pkgs.join("demo.zip"), zip_stored(&[("demo.exe", &demo_exe)]))
-        .unwrap();
+    std::fs::write(
+        pkgs.join("demo.zip"),
+        zip_stored(&[("demo.exe", &demo_exe)]),
+    )
+    .unwrap();
     std::fs::write(
         pkgs.join("demo.json"),
         "{\"name\":\"demo\",\"version\":\"0.1.0\",\"exe\":\"demo.exe\"}\n",
@@ -129,7 +132,11 @@ fn crc32(data: &[u8]) -> u32 {
     for &b in data {
         crc ^= b as u32;
         for _ in 0..8 {
-            crc = if crc & 1 == 1 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
         }
     }
     !crc

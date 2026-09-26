@@ -50,7 +50,9 @@ fn unused_missing_import_runs_by_default_but_strict_mode_rejects_it() {
     assert_eq!(normal.status.code(), Some(0));
     let diagnostic = run_guest(&exe, true, false);
     assert_eq!(diagnostic.status.code(), Some(0));
-    assert!(!String::from_utf8_lossy(&diagnostic.stderr).contains("unsupported native import called"));
+    assert!(
+        !String::from_utf8_lossy(&diagnostic.stderr).contains("unsupported native import called")
+    );
 }
 
 #[test]

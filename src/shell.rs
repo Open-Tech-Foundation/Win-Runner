@@ -147,6 +147,49 @@ impl Shell {
                 self.do_snapshot(&argv[1..], out)?;
                 Ok(ShellFlow::Continue)
             }
+            "mount" => {
+                match argv.len() {
+                    1 => {
+                        for (drive, path, read_only) in self.fs.host_mounts() {
+                            out.extend_from_slice(
+                                format!(
+                                    "{drive}:\\ -> {} ({})\n",
+                                    path.display(),
+                                    if read_only { "read-only" } else { "read/write" }
+                                )
+                                .as_bytes(),
+                            );
+                        }
+                    }
+                    3 | 4 => {
+                        let drive = argv[1]
+                            .strip_suffix(':')
+                            .and_then(|s| s.chars().next())
+                            .ok_or_else(|| {
+                                "usage: mount <drive>: <host-directory> [ro]".to_string()
+                            })?;
+                        let read_only = argv
+                            .get(3)
+                            .map(|option| option.eq_ignore_ascii_case("ro"))
+                            .unwrap_or(false);
+                        if argv.len() == 4 && !read_only {
+                            return Err("mount: expected optional `ro`".to_string());
+                        }
+                        self.fs
+                            .mount_host_dir(drive, std::path::Path::new(&argv[2]), read_only)?;
+                        out.extend_from_slice(
+                            format!(
+                                "Mounted {} as {drive}:\\ ({})\n",
+                                argv[2],
+                                if read_only { "read-only" } else { "read/write" }
+                            )
+                            .as_bytes(),
+                        );
+                    }
+                    _ => return Err("usage: mount [<drive>: <host-directory> [ro]]".to_string()),
+                }
+                Ok(ShellFlow::Continue)
+            }
             "choco" => {
                 self.do_choco(&argv[1..], out)?;
                 Ok(ShellFlow::Continue)
@@ -290,28 +333,13 @@ impl Shell {
         };
         let result = match result {
             Ok(result) => result,
-            Err(error) => {
-                let message = format!("{} execution failed: {error}", backend.id());
-                if let Some(path) = self.snapshot_path.as_deref() {
-                    match crate::snapshot::load_file(&path.to_string_lossy()) {
-                        Ok(fs) => {
-                            self.fs = fs;
-                            return Err(format!(
-                                "{message}; guest disk restored from snapshot {}",
-                                path.display()
-                            ));
-                        }
-                        Err(restore_error) => {
-                            self.fs = WinFs::ephemeral_runner();
-                            return Err(format!(
-                                "{message}; could not restore snapshot {}: {restore_error}",
-                                path.display()
-                            ));
-                        }
-                    }
-                }
-                self.fs = WinFs::ephemeral_runner();
-                return Err(message);
+            Err(failure) => {
+                self.fs = failure.fs;
+                return Err(format!(
+                    "{} execution failed: {}",
+                    backend.id(),
+                    failure.message
+                ));
             }
         };
         self.fs = result.fs;
@@ -339,14 +367,11 @@ impl Shell {
                         "no snapshot path is active; use `snapshot save <file>` first".to_string()
                     })?;
                 let display = path.display().to_string();
-                let bytes = crate::snapshot::encode(&self.fs);
-                std::fs::write(&path, &bytes)
+                crate::snapshot::save_file(&mut self.fs, &display)
                     .map_err(|e| format!("cannot save snapshot {display}: {e}"))?;
                 self.snapshot_path = Some(path);
                 self.last_code = 0;
-                out.extend_from_slice(
-                    format!("Saved snapshot {} ({} bytes)\n", display, bytes.len()).as_bytes(),
-                );
+                out.extend_from_slice(format!("Saved C: disk snapshot {}\n", display).as_bytes());
                 Ok(())
             }
             _ => Err("usage: snapshot save [file]".to_string()),
@@ -436,14 +461,16 @@ impl Shell {
             ));
         }
 
-        let (installed_path, installed) = self
+        let installed_path = self
             .fs
-            .files()
-            .into_iter()
-            .find(|(path, _)| path.to_lowercase().ends_with(r"\7-zip\7z.exe"))
+            .find_file_path_suffix(r"\7-zip\7z.exe")
             .ok_or_else(|| {
                 "choco: 7-Zip installer completed but did not create 7-Zip\\7z.exe".to_string()
             })?;
+        let installed = self
+            .fs
+            .read_file(&installed_path)
+            .map_err(|e| format!("choco: cannot read installed 7z.exe: {e}"))?;
         let install_dir = installed_path
             .strip_suffix(r"\7z.exe")
             .unwrap_or(&installed_path);
