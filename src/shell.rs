@@ -324,6 +324,9 @@ impl Shell {
                 Ok(())
             }
             choco::ChocoCmd::InstallCommunity { id, version } => {
+                if id == "7zip.install" {
+                    return self.install_7zip_guest(version.as_deref(), out);
+                }
                 let cache = install::cache_dir();
                 let app = choco::install_community(&id, version.as_deref(), &cache)?;
                 self.seed_choco_app(&app)?;
@@ -338,6 +341,67 @@ impl Shell {
                 Ok(())
             }
         }
+    }
+
+    /// Install Chocolatey's `7zip.install` package by running its silent
+    /// Windows installer against WinFS. The installer and resulting program
+    /// files stay on the guest disk and therefore travel with snapshots.
+    fn install_7zip_guest(
+        &mut self,
+        version: Option<&str>,
+        out: &mut Vec<u8>,
+    ) -> Result<(), String> {
+        let (pkg, blob) = choco::download_community_nupkg("7zip.install", version)?;
+        let tools = r"C:\ProgramData\chocolatey\lib\7zip.install\tools";
+        let files = choco::extract_nupkg_tools_to_guest(&blob, &mut self.fs, tools)?;
+        let installer = files
+            .iter()
+            .find(|path| {
+                path.rsplit('\\')
+                    .next()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("7zip_x64.exe"))
+            })
+            .ok_or_else(|| format!("choco: {} has no 64-bit 7-Zip installer", pkg.id))?;
+        let bytes = self
+            .fs
+            .read_file(installer)
+            .map_err(|e| format!("choco: cannot read guest installer: {e}"))?;
+        let staged_disk = self.fs.clone();
+        if let Err(error) = self.run_exe_bytes(&bytes, installer, &["/S".to_string()], out, None) {
+            // A native guest crash consumes its moved WinFS. Keep the package
+            // tools available so the caller can inspect or retry the install.
+            self.fs = staged_disk;
+            return Err(error);
+        }
+        if self.last_code != 0 {
+            return Err(format!(
+                "choco: 7-Zip guest installer exited with code {}",
+                self.last_code
+            ));
+        }
+
+        let (installed_path, installed) = self
+            .fs
+            .files()
+            .into_iter()
+            .find(|(path, _)| path.to_lowercase().ends_with(r"\7-zip\7z.exe"))
+            .ok_or_else(|| {
+                "choco: 7-Zip installer completed but did not create 7-Zip\\7z.exe".to_string()
+            })?;
+        let install_dir = installed_path
+            .strip_suffix(r"\7z.exe")
+            .unwrap_or(&installed_path);
+        self.fs
+            .mkdir(r"C:\bin")
+            .map_err(|e| format!("choco: cannot create C:\\bin: {e}"))?;
+        self.fs
+            .write_file(r"C:\bin\7z.exe", installed)
+            .map_err(|e| format!("choco: cannot install C:\\bin\\7z.exe: {e}"))?;
+        self.last_code = 0;
+        out.extend_from_slice(
+            format!("Installed 7zip.install {} → {install_dir}\n", pkg.version).as_bytes(),
+        );
+        Ok(())
     }
 
     /// Copy a community app onto the guest disk. Keeping the app tree and

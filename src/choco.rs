@@ -298,6 +298,85 @@ pub struct CommunityPkg {
     pub sha512: [u8; 64],
 }
 
+/// Download a feed package and verify its nupkg against the feed SHA-512.
+/// The returned bytes can be installed directly into WinFS without staging
+/// the package contents in the host cache.
+pub fn download_community_nupkg(
+    id: &str,
+    version: Option<&str>,
+) -> Result<(CommunityPkg, Vec<u8>), String> {
+    let pkg = resolve_community(id, version)?;
+    let blob = crate::install::fetch_url(
+        &format!(
+            "{}/package/{}/{}",
+            community_feed_base(),
+            pkg.id,
+            pkg.version
+        ),
+        300,
+    )
+    .map_err(|e| format!("choco: download failed: {e}"))?;
+    if crate::install::sha512(&blob) != pkg.sha512 {
+        return Err(format!(
+            "choco: SHA-512 mismatch for {} {}",
+            pkg.id, pkg.version
+        ));
+    }
+    Ok((pkg, blob))
+}
+
+/// Extract package `tools/` files directly into a guest tools directory.
+/// Reject traversal and absolute paths before writing any entry.
+pub fn extract_nupkg_tools_to_guest(
+    blob: &[u8],
+    fs: &mut crate::winfs::WinFs,
+    guest_tools: &str,
+) -> Result<Vec<String>, String> {
+    let entries = crate::install::zip_entries(blob)?;
+    let mut files = Vec::new();
+    for entry in &entries {
+        if !entry.name.to_lowercase().starts_with("tools/") {
+            continue;
+        }
+        let rel = entry.name["tools/".len()..].trim_end_matches('/');
+        if rel.is_empty() {
+            continue;
+        }
+        if rel.contains('\\')
+            || rel.starts_with('/')
+            || rel
+                .split('/')
+                .any(|part| matches!(part, "" | "." | "..") || part.contains(':'))
+        {
+            return Err(format!("choco: unsafe package path '{}'", entry.name));
+        }
+        let guest = format!(
+            r"{}\{}",
+            guest_tools.trim_end_matches('\\'),
+            rel.replace('/', "\\")
+        );
+        if entry.is_dir {
+            fs.mkdir(&guest)
+                .map_err(|e| format!("choco: cannot create {guest}: {e}"))?;
+        } else {
+            let parent = guest
+                .rsplit_once('\\')
+                .map(|(parent, _)| parent)
+                .unwrap_or(guest_tools);
+            fs.mkdir(parent)
+                .map_err(|e| format!("choco: cannot create {parent}: {e}"))?;
+            let bytes = crate::install::extract_bytes(blob, entry)?;
+            fs.write_file(&guest, bytes)
+                .map_err(|e| format!("choco: cannot write {guest}: {e}"))?;
+            files.push(guest);
+        }
+    }
+    if files.is_empty() {
+        return Err("choco: package has no tools/ payload".to_string());
+    }
+    Ok(files)
+}
+
 /// Resolve `<id>` (+ optional version) through the Chocolatey feed
 /// (the OData entry carries the SHA-512 `PackageHash`).
 pub fn resolve_community(id: &str, version: Option<&str>) -> Result<CommunityPkg, String> {

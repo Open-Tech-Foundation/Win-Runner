@@ -11,10 +11,13 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
-- Chocolatey Node.js and community package installs are copied into the guest
-  disk, so snapshot save/load preserves installed commands and npm files.
+- Added guest-disk installation for Chocolatey's `7zip.install`: the verified
+  package is extracted into WinFS, its silent installer runs through the
+  native backend, and `7z` remains available after snapshot reload.
 - Added `snapshot save <file>` and `--save-snapshot=<file>` to persist a shell
   or runner disk for later boot with `--snapshot=<file>`.
+- Node.js, npm, and portable Chocolatey package contents are kept on the guest
+  disk so snapshots preserve installed commands and npm files.
 - Added a Chocolatey-compatible `choco install nodejs` shell builtin: it
   downloads the official `node-v<version>-win-x64.zip` from nodejs.org,
   verifies its SHA-256 against the release `SHASUMS256.txt`, caches

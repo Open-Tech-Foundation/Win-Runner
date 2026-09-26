@@ -147,7 +147,14 @@ npm -v    # 11.19.0
 
 Omitting `--version` installs the pinned default (currently 24.21.0). Community
 packages with portable `tools/` payloads can also be installed, for example
-`choco install 7zip.portable -y`; their files are copied into the guest disk.
+`choco install 7zip.portable -y`. `choco install 7zip.install -y` runs the
+package's silent 64-bit installer against the guest disk and exposes `7z` in
+`C:\bin`:
+
+```bash
+choco install 7zip.install -y
+7z -h
+```
 
 Save the in-session disk, including Chocolatey-installed commands, and load it
 on a later run:
@@ -155,10 +162,12 @@ on a later run:
 ```bash
 wincli shell
 choco install nodejs
+choco install 7zip.install -y
 snapshot save wincli.snap
 exit
 wincli --snapshot=wincli.snap shell
 node -v
+7z -h
 ```
 
 `wincli --save-snapshot=wincli.snap shell` also writes the disk when the shell

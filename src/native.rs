@@ -128,28 +128,6 @@ mod imp {
     // A child-local stand-in for the API-set modules dynamically requested by
     // the Universal CRT. It is deliberately not a host `dlopen` handle.
     const API_SET_MODULE: u64 = 0x5749_4e43_4c49_0001;
-    const MODULE_FILE_NAME: &[u16] = &[
-        b'C' as u16,
-        b':' as u16,
-        b'\\' as u16,
-        b'w' as u16,
-        b'i' as u16,
-        b'n' as u16,
-        b'c' as u16,
-        b'l' as u16,
-        b'i' as u16,
-        b'\\' as u16,
-        b'w' as u16,
-        b'i' as u16,
-        b'n' as u16,
-        b'c' as u16,
-        b'l' as u16,
-        b'i' as u16,
-        b'.' as u16,
-        b'e' as u16,
-        b'x' as u16,
-        b'e' as u16,
-    ];
     static EMPTY_ENVIRONMENT_BLOCK: [u16; 2] = [0, 0];
 
     // Preferred-base PE mappings collide by design. Serialize native runs in
@@ -2803,6 +2781,15 @@ mod imp {
             }
         }
     }
+    fn install_thread_teb(teb: &mut [u8; 0x1000]) -> bool {
+        set_teb_stack_bounds(teb);
+        let base = teb.as_ptr() as u64;
+        if !unsafe { set_gs(base) } {
+            return false;
+        }
+        THREAD_TEB_BASE.set(base);
+        true
+    }
     fn setup_tls(mapping: &Mapping, img: &PeImage) -> Result<Option<NativeTls>, String> {
         let Some(tls) = &img.tls else { return Ok(None) };
         let mut data = tls.raw_data.clone();
@@ -4955,6 +4942,7 @@ mod imp {
     /// the ownership explicit is the migration seam for native CreateProcessW.
     struct NativeProcessContext {
         image_base: u64,
+        module_path: String,
         process_id: u32,
         process_handle: u64,
         parent_process_id: u32,
@@ -5123,6 +5111,13 @@ mod imp {
         static THREAD_LAST_ERROR: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
         static THREAD_TEB_BASE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
+    static NATIVE_CRT_FMODE: AtomicI32 = AtomicI32::new(0);
+    static NATIVE_CRT_COMMODE: AtomicI32 = AtomicI32::new(0);
+    static NATIVE_CRT_ACMDLN: AtomicU64 = AtomicU64::new(0);
+    static NATIVE_CRT_EMPTY_COMMAND_LINE: [u8; 1] = [0];
+    static NATIVE_CRT_INITENV: AtomicU64 = AtomicU64::new(0);
+    static NATIVE_CRT_IOB: [AtomicU64; 24] = [const { AtomicU64::new(0) }; 24];
+    static NATIVE_REGISTRY_HANDLE_NEXT: AtomicU64 = AtomicU64::new(0x5500_0000);
 
     // Import trampolines have no guest-context argument. This is therefore a
     // narrow dispatcher slot, while every mutable Windows-process datum lives
@@ -5136,6 +5131,7 @@ mod imp {
     static TEST_PROCESS: LazyLock<Arc<NativeProcessContext>> = LazyLock::new(|| {
         Arc::new(NativeProcessContext {
             image_base: 0x1400_0000_0,
+            module_path: r"C:\wincli\wincli.exe".to_string(),
             process_id: 1,
             process_handle: u64::MAX,
             parent_process_id: 0,
@@ -5727,9 +5723,13 @@ mod imp {
         if output.is_null() || output_len == 0 {
             return 0;
         }
+        let module_path = process_ctx()
+            .map(|process| process.module_path.clone())
+            .unwrap_or_else(|| r"C:\wincli\wincli.exe".to_string());
+        let encoded: Vec<u16> = module_path.encode_utf16().collect();
         let capacity = output_len as usize;
-        let copied = MODULE_FILE_NAME.len().min(capacity);
-        unsafe { std::ptr::copy_nonoverlapping(MODULE_FILE_NAME.as_ptr(), output, copied) };
+        let copied = encoded.len().min(capacity);
+        unsafe { std::ptr::copy_nonoverlapping(encoded.as_ptr(), output, copied) };
         if copied < capacity {
             unsafe { output.add(copied).write(0) };
         }
@@ -7507,6 +7507,114 @@ mod imp {
         unsafe { output.copy_from_nonoverlapping(encoded.as_ptr(), encoded.len()) };
         (encoded.len() - 1) as u32
     }
+    extern "win64" fn native_get_system_directory_w(output: *mut u16, capacity: u32) -> u32 {
+        const SYSTEM_DIR: &str = r"C:\Windows\System32";
+        let encoded: Vec<u16> = SYSTEM_DIR
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        if output.is_null() || capacity < encoded.len() as u32 {
+            return encoded.len() as u32 - 1;
+        }
+        unsafe { output.copy_from_nonoverlapping(encoded.as_ptr(), encoded.len()) };
+        encoded.len() as u32 - 1
+    }
+    extern "win64" fn native_sh_get_folder_path_w(
+        _window: u64,
+        csidl: i32,
+        _token: u64,
+        _flags: u32,
+        output: *mut u16,
+    ) -> i32 {
+        let path = match csidl & 0x7fff {
+            0x1a => r"C:\Users\runneradmin\AppData\Roaming",
+            0x1c => r"C:\Users\runneradmin\AppData\Local",
+            0x23 => r"C:\ProgramData",
+            0x24 => r"C:\Windows",
+            0x25 => r"C:\Windows\System32",
+            0x26 => r"C:\Program Files",
+            0x2b => r"C:\Program Files\Common Files",
+            0x28 => r"C:\Users\runneradmin",
+            _ => return 0x8007_0049u32 as i32, // E_FAIL
+        };
+        if output.is_null() {
+            return 0x8007_0057u32 as i32; // E_INVALIDARG
+        }
+        let encoded: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe { output.copy_from_nonoverlapping(encoded.as_ptr(), encoded.len()) };
+        0 // S_OK
+    }
+    extern "win64" fn native_get_version() -> u32 {
+        // Windows 10.0, build 19045, encoded using the legacy GetVersion layout.
+        (19045u32 << 16) | 0x0a00
+    }
+    extern "win64" fn native_set_default_dll_directories(_flags: u32) -> i32 {
+        1
+    }
+    extern "win64" fn native_set_file_apis_to_oem() {}
+    extern "win64" fn native_co_initialize(_reserved: *mut u8) -> i32 {
+        0 // S_OK
+    }
+    extern "win64" fn native_lookup_privilege_value_w(
+        _system: *const u16,
+        name: *const u16,
+        luid: *mut u8,
+    ) -> i32 {
+        if name.is_null() || luid.is_null() {
+            native_set_last_error(87);
+            return 0;
+        }
+        let value = wide(name).unwrap_or_default();
+        let low = value.bytes().fold(0u32, |hash, byte| {
+            hash.wrapping_mul(33).wrapping_add(byte as u32)
+        });
+        unsafe {
+            luid.cast::<u32>().write_unaligned(low);
+            luid.add(4).cast::<i32>().write_unaligned(0);
+        }
+        1
+    }
+    extern "win64" fn native_adjust_token_privileges(
+        _token: u64,
+        _disable_all: i32,
+        _new_state: *const u8,
+        _buffer_len: u32,
+        _previous_state: *mut u8,
+        _return_len: *mut u32,
+    ) -> i32 {
+        1
+    }
+    extern "win64" fn native_lstrlen_w(input: *const u16) -> i32 {
+        wide(input)
+            .map(|value| value.encode_utf16().count() as i32)
+            .unwrap_or(0)
+    }
+    extern "win64" fn native_lstrcpy_w(output: *mut u16, input: *const u16) -> u64 {
+        if output.is_null() {
+            return 0;
+        }
+        let Some(value) = wide(input) else {
+            return 0;
+        };
+        let encoded: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe { output.copy_from_nonoverlapping(encoded.as_ptr(), encoded.len()) };
+        output as u64
+    }
+    extern "win64" fn native_lstrcat_w(output: *mut u16, input: *const u16) -> u64 {
+        if output.is_null() {
+            return 0;
+        }
+        let Some(left) = wide(output) else {
+            return 0;
+        };
+        let Some(right) = wide(input) else {
+            return 0;
+        };
+        let end = output.wrapping_add(left.encode_utf16().count());
+        let encoded: Vec<u16> = right.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe { end.copy_from_nonoverlapping(encoded.as_ptr(), encoded.len()) };
+        output as u64
+    }
     extern "win64" fn native_get_computer_name_ex_w(
         _name_type: u32,
         output: *mut u16,
@@ -8396,6 +8504,7 @@ mod imp {
             .unwrap_or_else(|_| vec![0]);
             let child_context = Arc::new(NativeProcessContext {
                 image_base: image.image_base,
+                module_path: launch.application.clone(),
                 process_id: child.process_id,
                 process_handle,
                 parent_process_id: parent.process_id,
@@ -8464,14 +8573,13 @@ mod imp {
                 unsafe { _exit(127) };
             }
             let mut tls = tls;
-            if let Some(tls) = tls.as_mut() {
-                set_teb_stack_bounds(&mut tls.teb);
-                if !unsafe { set_gs(tls.teb.as_ptr() as u64) } {
-                    unsafe { _exit(127) };
-                }
-                THREAD_TEB_BASE.set(tls.teb.as_ptr() as u64);
-            } else {
-                THREAD_TEB_BASE.set(0);
+            let mut fallback_teb = Box::new([0u8; 0x1000]);
+            let teb = tls
+                .as_mut()
+                .map(|tls| &mut tls.teb)
+                .unwrap_or(&mut fallback_teb);
+            if !install_thread_teb(teb) {
+                unsafe { _exit(127) };
             }
             let guest: unsafe extern "win64" fn() -> u32 = unsafe { std::mem::transmute(entry) };
             let code = unsafe { guest() };
@@ -8558,6 +8666,197 @@ mod imp {
             .map(|process| process.error_mode.swap(mode, Ordering::AcqRel))
             .unwrap_or(0)
     }
+    extern "win64" fn native_crt_set_app_type(_app_type: i32) {}
+    extern "win64" fn native_crt_cexit() {}
+    extern "win64" fn native_crt_onexit(callback: u64) -> u64 {
+        callback
+    }
+    extern "win64" fn native_crt_strlen(input: *const u8) -> usize {
+        if input.is_null() {
+            return 0;
+        }
+        for len in 0..1_048_576usize {
+            if unsafe { input.add(len).read() } == 0 {
+                return len;
+            }
+        }
+        0
+    }
+    extern "win64" fn native_crt_strcmp(left: *const u8, right: *const u8) -> i32 {
+        for index in 0..1_048_576usize {
+            let (a, b) = unsafe { (left.add(index).read(), right.add(index).read()) };
+            if a != b || a == 0 {
+                return i32::from(a) - i32::from(b);
+            }
+        }
+        0
+    }
+    extern "win64" fn native_crt_wcscmp(left: *const u16, right: *const u16) -> i32 {
+        for index in 0..1_048_576usize {
+            let (a, b) = unsafe { (left.add(index).read(), right.add(index).read()) };
+            if a != b || a == 0 {
+                return i32::from(a) - i32::from(b);
+            }
+        }
+        0
+    }
+    extern "win64" fn native_crt_wcsstr(haystack: *const u16, needle: *const u16) -> *mut u16 {
+        if haystack.is_null() || needle.is_null() {
+            return std::ptr::null_mut();
+        }
+        let mut needle_len = 0usize;
+        while needle_len < 32768 && unsafe { needle.add(needle_len).read() } != 0 {
+            needle_len += 1;
+        }
+        let mut offset = 0usize;
+        while offset < 1_048_576 {
+            if unsafe { haystack.add(offset).read() } == 0 {
+                return std::ptr::null_mut();
+            }
+            let mut matched = true;
+            for index in 0..needle_len {
+                if unsafe { haystack.add(offset + index).read() != needle.add(index).read() } {
+                    matched = false;
+                    break;
+                }
+            }
+            if matched {
+                return haystack.wrapping_add(offset) as *mut u16;
+            }
+            offset += 1;
+        }
+        std::ptr::null_mut()
+    }
+    extern "win64" fn native_crt_fflush(_file: *mut u8) -> i32 {
+        0
+    }
+    extern "win64" fn native_crt_fputs(input: *const u8, _file: *mut u8) -> i32 {
+        let len = native_crt_strlen(input);
+        if len == 0 {
+            return 0;
+        }
+        let written = unsafe { write(1, input.cast(), len) };
+        if written < 0 {
+            -1
+        } else {
+            0
+        }
+    }
+    extern "win64" fn native_crt_fputc(byte: i32, _file: *mut u8) -> i32 {
+        let value = [byte as u8];
+        if unsafe { write(1, value.as_ptr().cast(), 1) } == 1 {
+            byte & 0xff
+        } else {
+            -1
+        }
+    }
+    extern "win64" fn native_crt_malloc(size: usize) -> *mut c_void {
+        unsafe { malloc(size.max(1)) }
+    }
+    extern "win64" fn native_crt_free(ptr: *mut c_void) {
+        if !ptr.is_null() {
+            unsafe { free(ptr) };
+        }
+    }
+    extern "win64" fn native_crt_memcmp(left: *const u8, right: *const u8, len: usize) -> i32 {
+        for index in 0..len {
+            let (a, b) = unsafe { (left.add(index).read(), right.add(index).read()) };
+            if a != b {
+                return i32::from(a) - i32::from(b);
+            }
+        }
+        0
+    }
+    extern "win64" fn native_crt_memcpy(
+        output: *mut c_void,
+        input: *const c_void,
+        len: usize,
+    ) -> *mut c_void {
+        if len != 0 {
+            unsafe { std::ptr::copy_nonoverlapping(input.cast::<u8>(), output.cast(), len) };
+        }
+        output
+    }
+    extern "win64" fn native_crt_memmove(
+        output: *mut c_void,
+        input: *const c_void,
+        len: usize,
+    ) -> *mut c_void {
+        if len != 0 {
+            unsafe { std::ptr::copy(input.cast::<u8>(), output.cast(), len) };
+        }
+        output
+    }
+    extern "win64" fn native_crt_memset(
+        output: *mut c_void,
+        value: i32,
+        len: usize,
+    ) -> *mut c_void {
+        if len != 0 {
+            unsafe { std::ptr::write_bytes(output.cast::<u8>(), value as u8, len) };
+        }
+        output
+    }
+    extern "win64" fn native_crt_initterm(first: *const u64, last: *const u64) {
+        if first.is_null() || last.is_null() {
+            return;
+        }
+        let start = first as usize;
+        let end = last as usize;
+        if end < start || (end - start) % std::mem::size_of::<u64>() != 0 {
+            return;
+        }
+        let count = ((end - start) / std::mem::size_of::<u64>()).min(4096);
+        for index in 0..count {
+            let address = unsafe { first.add(index).read_unaligned() };
+            if address != 0 {
+                let init: extern "win64" fn() = unsafe { std::mem::transmute(address as usize) };
+                init();
+            }
+        }
+    }
+    extern "win64" fn native_crt_getmainargs(
+        argc_out: *mut i32,
+        argv_out: *mut *mut *mut i8,
+        env_out: *mut *mut *mut i8,
+        _wildcard: i32,
+        _startup: *mut u8,
+    ) -> i32 {
+        let line = process_ctx()
+            .map(|process| String::from_utf8_lossy(&process.command_line_a).into_owned())
+            .unwrap_or_default();
+        let args = parse_windows_command_line(line.trim_end_matches('\0')).unwrap_or_default();
+        let argv =
+            unsafe { malloc((args.len() + 1) * std::mem::size_of::<*mut i8>()) } as *mut *mut i8;
+        if argv.is_null() {
+            return 12;
+        }
+        for (index, arg) in args.iter().enumerate() {
+            let bytes = arg.as_bytes();
+            let buffer = unsafe { malloc(bytes.len() + 1) } as *mut i8;
+            if buffer.is_null() {
+                return 12;
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.cast(), bytes.len());
+                buffer.add(bytes.len()).write(0);
+                argv.add(index).write(buffer);
+            }
+        }
+        unsafe {
+            argv.add(args.len()).write(std::ptr::null_mut());
+            if !argc_out.is_null() {
+                argc_out.write_unaligned(args.len() as i32);
+            }
+            if !argv_out.is_null() {
+                argv_out.write_unaligned(argv);
+            }
+            if !env_out.is_null() {
+                env_out.write_unaligned(std::ptr::null_mut());
+            }
+        }
+        0
+    }
 
     extern "win64" fn native_get_startup_info_w(startup_info: *mut u8) {
         if startup_info.is_null() {
@@ -8570,6 +8869,12 @@ mod imp {
             std::ptr::write_bytes(startup_info, 0, 104);
             (startup_info as *mut u32).write_unaligned(104);
         }
+    }
+
+    extern "win64" fn native_get_startup_info_a(startup_info: *mut u8) {
+        // STARTUPINFOA and STARTUPINFOW have the same 64-bit layout; the
+        // zeroed console-process baseline contains no character fields.
+        native_get_startup_info_w(startup_info);
     }
 
     unsafe fn ascii_z(ptr: *const u8) -> Option<&'static str> {
@@ -10955,9 +11260,44 @@ mod imp {
     pub(super) fn supports_import(dll: &str, func: &str) -> bool {
         let module = dll.to_ascii_uppercase();
         let allowed = match module.as_str() {
+            "MSVCRT.DLL" | "UCRTBASE.DLL" => {
+                matches!(
+                    func,
+                    "__set_app_type"
+                        | "_fmode"
+                        | "_commode"
+                        | "_acmdln"
+                        | "_initterm"
+                        | "__getmainargs"
+                        | "exit"
+                        | "_exit"
+                        | "_cexit"
+                        | "_c_exit"
+                        | "_onexit"
+                        | "malloc"
+                        | "free"
+                        | "memcmp"
+                        | "memcpy"
+                        | "memmove"
+                        | "memset"
+                        | "strlen"
+                        | "strcmp"
+                        | "wcscmp"
+                        | "wcsstr"
+                        | "fflush"
+                        | "fputs"
+                        | "fputc"
+                        | "_iob"
+                        | "__initenv"
+                        | "_isatty"
+                        | "_get_osfhandle"
+                )
+            }
             "WINMM.DLL" => func == "timeGetTime",
             "USERENV.DLL" => func == "GetUserProfileDirectoryW",
             "BCRYPTPRIMITIVES.DLL" => func == "ProcessPrng",
+            "OLE32.DLL" => func == "CoInitialize",
+            "SHELL32.DLL" => func == "SHGetFolderPathW",
             "ADVAPI32.DLL" => matches!(
                 func,
                 "CryptAcquireContextW"
@@ -10970,6 +11310,12 @@ mod imp {
                     | "EventWriteTransfer"
                     | "RegOpenKeyExA"
                     | "RegOpenKeyExW"
+                    | "RegCreateKeyExW"
+                    | "RegSetValueExW"
+                    | "RegQueryValueExW"
+                    | "RegCloseKey"
+                    | "LookupPrivilegeValueW"
+                    | "AdjustTokenPrivileges"
                     | "OpenProcessToken"
                     | "GetUserNameW"
             ),
@@ -11033,6 +11379,37 @@ mod imp {
 
     fn baseline_trampoline(name: &str) -> Option<u64> {
         match name {
+            "__set_app_type" => Some(native_crt_set_app_type as *const () as usize as u64),
+            "_initterm" => Some(native_crt_initterm as *const () as usize as u64),
+            "__getmainargs" => Some(native_crt_getmainargs as *const () as usize as u64),
+            "exit" | "_exit" => Some(native_exit_process as *const () as usize as u64),
+            "_cexit" | "_c_exit" => Some(native_crt_cexit as *const () as usize as u64),
+            "_onexit" => Some(native_crt_onexit as *const () as usize as u64),
+            "strlen" => Some(native_crt_strlen as *const () as usize as u64),
+            "strcmp" => Some(native_crt_strcmp as *const () as usize as u64),
+            "wcscmp" => Some(native_crt_wcscmp as *const () as usize as u64),
+            "wcsstr" => Some(native_crt_wcsstr as *const () as usize as u64),
+            "fflush" => Some(native_crt_fflush as *const () as usize as u64),
+            "fputs" => Some(native_crt_fputs as *const () as usize as u64),
+            "fputc" => Some(native_crt_fputc as *const () as usize as u64),
+            "_iob" => Some(NATIVE_CRT_IOB.as_ptr() as u64),
+            "__initenv" => Some(NATIVE_CRT_INITENV.as_ptr() as u64),
+            "malloc" => Some(native_crt_malloc as *const () as usize as u64),
+            "free" => Some(native_crt_free as *const () as usize as u64),
+            "memcmp" => Some(native_crt_memcmp as *const () as usize as u64),
+            "memcpy" => Some(native_crt_memcpy as *const () as usize as u64),
+            "memmove" => Some(native_crt_memmove as *const () as usize as u64),
+            "memset" => Some(native_crt_memset as *const () as usize as u64),
+            // These MSVCRT exports are data, not callable functions. Their
+            // IAT entries must point at writable storage because CRT startup
+            // initializes them before invoking the executable entry point.
+            "_fmode" => Some(NATIVE_CRT_FMODE.as_ptr() as u64),
+            "_commode" => Some(NATIVE_CRT_COMMODE.as_ptr() as u64),
+            "_acmdln" => {
+                let empty = std::ptr::addr_of!(NATIVE_CRT_EMPTY_COMMAND_LINE) as u64;
+                NATIVE_CRT_ACMDLN.store(empty, Ordering::Release);
+                Some(NATIVE_CRT_ACMDLN.as_ptr() as u64)
+            }
             "RtlCaptureContext" => {
                 Some(wincli_native_rtl_capture_context as *const () as usize as u64)
             }
@@ -11099,6 +11476,10 @@ mod imp {
             }
             "RegOpenKeyExW" => Some(native_reg_open_key_ex_w as *const () as usize as u64),
             "RegOpenKeyExA" => Some(native_reg_open_key_ex_a as *const () as usize as u64),
+            "RegCreateKeyExW" => Some(native_reg_create_key_ex_w as *const () as usize as u64),
+            "RegSetValueExW" => Some(native_reg_set_value_ex_w as *const () as usize as u64),
+            "RegQueryValueExW" => Some(native_reg_query_value_ex_w as *const () as usize as u64),
+            "RegCloseKey" => Some(native_reg_close_key as *const () as usize as u64),
             "CreateFileMappingW" => Some(native_create_file_mapping_w as *const () as usize as u64),
             "CreateFileMappingA" => Some(native_create_file_mapping_a as *const () as usize as u64),
             "MapViewOfFile" => Some(native_map_view_of_file as *const () as usize as u64),
@@ -11173,6 +11554,26 @@ mod imp {
             "SetLastError" => Some(native_set_last_error as *const () as usize as u64),
             "SetErrorMode" => Some(native_set_error_mode as *const () as usize as u64),
             "GetStartupInfoW" => Some(native_get_startup_info_w as *const () as usize as u64),
+            "GetStartupInfoA" => Some(native_get_startup_info_a as *const () as usize as u64),
+            "GetVersion" => Some(native_get_version as *const () as usize as u64),
+            "GetSystemDirectoryW" => {
+                Some(native_get_system_directory_w as *const () as usize as u64)
+            }
+            "lstrlenW" => Some(native_lstrlen_w as *const () as usize as u64),
+            "lstrcpyW" => Some(native_lstrcpy_w as *const () as usize as u64),
+            "lstrcatW" => Some(native_lstrcat_w as *const () as usize as u64),
+            "SetDefaultDllDirectories" => {
+                Some(native_set_default_dll_directories as *const () as usize as u64)
+            }
+            "SetFileApisToOEM" => Some(native_set_file_apis_to_oem as *const () as usize as u64),
+            "CoInitialize" => Some(native_co_initialize as *const () as usize as u64),
+            "LookupPrivilegeValueW" => {
+                Some(native_lookup_privilege_value_w as *const () as usize as u64)
+            }
+            "AdjustTokenPrivileges" => {
+                Some(native_adjust_token_privileges as *const () as usize as u64)
+            }
+            "SHGetFolderPathW" => Some(native_sh_get_folder_path_w as *const () as usize as u64),
             "GetProcessHeap" => Some(native_get_process_heap as *const () as usize as u64),
             "GetCurrentThreadId" => Some(native_get_current_thread_id as *const () as usize as u64),
             "GetCurrentProcessId" => {
@@ -11857,6 +12258,55 @@ mod imp {
         }
         native_set_last_error(87);
         87
+    }
+    extern "win64" fn native_reg_create_key_ex_w(
+        _key: u64,
+        subkey: *const u16,
+        _reserved: u32,
+        _class: *mut u16,
+        _options: u32,
+        _access: u32,
+        _security: u64,
+        out: *mut u64,
+        disposition: *mut u32,
+    ) -> u32 {
+        if subkey.is_null() || out.is_null() {
+            return 87;
+        }
+        let handle = NATIVE_REGISTRY_HANDLE_NEXT.fetch_add(1, Ordering::Relaxed);
+        unsafe {
+            out.write_unaligned(handle);
+            if !disposition.is_null() {
+                disposition.write_unaligned(1); // REG_CREATED_NEW_KEY
+            }
+        }
+        0
+    }
+    extern "win64" fn native_reg_set_value_ex_w(
+        key: u64,
+        _value_name: *const u16,
+        _reserved: u32,
+        _value_type: u32,
+        data: *const u8,
+        data_len: u32,
+    ) -> u32 {
+        if key == 0 || (data.is_null() && data_len != 0) {
+            return 87;
+        }
+        0
+    }
+    extern "win64" fn native_reg_query_value_ex_w(
+        _key: u64,
+        _value_name: *const u16,
+        _reserved: *mut u32,
+        _value_type: *mut u32,
+        _data: *mut u8,
+        _data_len: *mut u32,
+    ) -> u32 {
+        2 // ERROR_FILE_NOT_FOUND
+    }
+    extern "win64" fn native_reg_close_key(_key: u64) -> u32 {
+        0
     }
 
     extern "win64" fn native_local_free(value: u64) -> u64 {
@@ -13565,6 +14015,7 @@ mod imp {
         let command_line_a = command_line_a(&command_line_w);
         let process = Arc::new(NativeProcessContext {
             image_base: img.image_base,
+            module_path: prog.to_string(),
             process_id: 1,
             process_handle: u64::MAX,
             parent_process_id: 0,
@@ -13678,16 +14129,17 @@ mod imp {
                 .stack_size(16 * 1024 * 1024)
                 .spawn(move || {
                     let mut tls = tls;
-                    if let Some(tls) = tls.as_mut() {
-                        set_teb_stack_bounds(&mut tls.teb);
-                        guest_process
-                            .gs_base
-                            .store(tls.teb.as_ptr() as u64, Ordering::Release);
-                        if !unsafe { set_gs(tls.teb.as_ptr() as u64) } {
-                            return 127;
-                        }
-                        THREAD_TEB_BASE.set(tls.teb.as_ptr() as u64);
+                    let mut fallback_teb = Box::new([0u8; 0x1000]);
+                    let teb = tls
+                        .as_mut()
+                        .map(|tls| &mut tls.teb)
+                        .unwrap_or(&mut fallback_teb);
+                    if !install_thread_teb(teb) {
+                        return 127;
                     }
+                    guest_process
+                        .gs_base
+                        .store(teb.as_ptr() as u64, Ordering::Release);
                     // SAFETY: entry is in the child-owned RX PE mapping.
                     let guest: unsafe extern "win64" fn() -> u32 =
                         unsafe { std::mem::transmute(entry) };
