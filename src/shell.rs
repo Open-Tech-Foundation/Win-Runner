@@ -13,6 +13,7 @@
 use crate::{backend, choco, inspect, install, pe, ps1, winfs::WinFs};
 use rustyline::{error::ReadlineError, DefaultEditor};
 use std::io::{BufRead, Write};
+use std::sync::Arc;
 
 /// What the REPL does after a line.
 #[derive(Debug)]
@@ -26,6 +27,7 @@ pub struct Shell {
     fs: WinFs,
     sess: ps1::Session,
     last_code: i32,
+    backend: Result<&'static dyn backend::ExecutionBackend, String>,
 }
 
 impl Default for Shell {
@@ -43,10 +45,19 @@ impl Shell {
     /// immutable snapshot. The image is owned by this session and discarded
     /// once it exits.
     pub fn with_fs(fs: WinFs) -> Self {
+        let backend_started = std::time::Instant::now();
+        let backend = backend::configured().map_err(|e| format!("failed to select backend: {e}"));
+        if std::env::var_os("WINCLI_TIMINGS").is_some() {
+            eprintln!(
+                "wincli timing: shell backend_init={:.3}ms",
+                backend_started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         Shell {
             fs,
             sess: ps1::Session::default(),
             last_code: 0,
+            backend,
         }
     }
 
@@ -168,8 +179,10 @@ impl Shell {
             match ext.as_str() {
                 "exe" => return self.run_exe_file(target, target, &argv[1..], out, sink),
                 "ps1" => {
+                    let file_read_started = std::time::Instant::now();
                     let script = std::fs::read_to_string(target)
                         .map_err(|e| format!("cannot read {target}: {e}"))?;
+                    report_timing(target, "host_file_read", file_read_started);
                     let code = ps1::run_ps1_session(&mut self.sess, &mut self.fs, &script, out)
                         .map_err(|e| format!("script error: {e}"))?;
                     self.last_code = code;
@@ -183,10 +196,12 @@ impl Shell {
             }
         }
         if self.fs.is_file(target) {
+            let file_read_started = std::time::Instant::now();
             let data = self
                 .fs
                 .read_file(target)
                 .map_err(|e| format!("cannot read guest executable {target}: {e}"))?;
+            report_timing(target, "guest_file_read", file_read_started);
             return self.run_exe_bytes(&data, target, &argv[1..], out, sink);
         }
         // Bare names resolve on the machine PATH (`C:\bin`), like a real
@@ -194,10 +209,12 @@ impl Shell {
         if !target.contains(['\\', '/', ':']) {
             for candidate in [format!(r"C:\bin\{target}"), format!(r"C:\bin\{target}.exe")] {
                 if self.fs.is_file(&candidate) {
+                    let file_read_started = std::time::Instant::now();
                     let data = self
                         .fs
                         .read_file(&candidate)
                         .map_err(|e| format!("cannot read guest executable {candidate}: {e}"))?;
+                    report_timing(&candidate, "guest_file_read", file_read_started);
                     return self.run_exe_bytes(&data, &candidate, &argv[1..], out, sink);
                 }
             }
@@ -231,7 +248,9 @@ impl Shell {
         out: &mut Vec<u8>,
         sink: Option<backend::OutputSink>,
     ) -> Result<ShellFlow, String> {
+        let file_read_started = std::time::Instant::now();
         let data = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+        report_timing(prog, "host_file_read", file_read_started);
         self.run_exe_bytes(&data, prog, guest_args, out, sink)
     }
 
@@ -246,10 +265,16 @@ impl Shell {
         out: &mut Vec<u8>,
         sink: Option<backend::OutputSink>,
     ) -> Result<ShellFlow, String> {
+        let pe_load_started = std::time::Instant::now();
         let img = pe::load_lenient(data).map_err(|e| format!("failed to load {prog}: {e}"))?;
+        if std::env::var_os("WINCLI_TIMINGS").is_some() {
+            eprintln!(
+                "wincli timing: {prog}: pe_load={:.3}ms",
+                pe_load_started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         let fs = std::mem::replace(&mut self.fs, WinFs::ephemeral_runner());
-        let backend =
-            backend::configured().map_err(|e| format!("failed to select backend: {e}"))?;
+        let backend = self.backend.as_ref().map_err(Clone::clone)?;
         let streaming = sink.is_some();
         let result = match sink {
             Some(sink) => backend.execute_streaming(&img, fs, prog, guest_args, sink),
@@ -601,6 +626,15 @@ fn read_target_bytes(fs: &WinFs, target: &str) -> Result<Vec<u8>, String> {
     ))
 }
 
+fn report_timing(program: &str, stage: &str, started: std::time::Instant) {
+    if std::env::var_os("WINCLI_TIMINGS").is_some() {
+        eprintln!(
+            "wincli timing: {program}: {stage}={:.3}ms",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+}
+
 /// Recursively collect host files under `root` (for npm tree seeding).
 fn collect_host_files(
     root: &std::path::Path,
@@ -696,7 +730,19 @@ fn run_session(fs: WinFs, prompt_enabled: bool) -> (i32, WinFs) {
 
 fn execute_input_line(shell: &mut Shell, line: &str) -> Option<i32> {
     let mut out = Vec::new();
-    match shell.exec_line(line, &mut out) {
+    let sink: backend::OutputSink = Arc::new(|channel, chunk| match channel {
+        backend::OutputChannel::Stdout => {
+            let mut stdout = std::io::stdout().lock();
+            let _ = stdout.write_all(chunk);
+            let _ = stdout.flush();
+        }
+        backend::OutputChannel::Stderr => {
+            let mut stderr = std::io::stderr().lock();
+            let _ = stderr.write_all(chunk);
+            let _ = stderr.flush();
+        }
+    });
+    match shell.exec_line_streaming(line, &mut out, sink) {
         Ok(ShellFlow::Continue) => {
             let _ = std::io::stdout().write_all(&out);
         }
@@ -796,6 +842,25 @@ mod tests {
             &["New-Item C:\\t.txt -Value hi", "Get-Content C:\\t.txt"],
         );
         assert_eq!(out, b"hi\n");
+    }
+
+    #[test]
+    fn streaming_shell_execution_forwards_guest_output_to_sink() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/artifacts/exe/hello.exe");
+        let mut shell = Shell::new();
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_received = Arc::clone(&received);
+        let sink: backend::OutputSink = Arc::new(move |channel, chunk| {
+            assert_eq!(channel, backend::OutputChannel::Stdout);
+            sink_received.lock().unwrap().extend_from_slice(chunk);
+        });
+        let mut buffered = Vec::new();
+        shell
+            .exec_line_streaming(path.to_str().unwrap(), &mut buffered, sink)
+            .unwrap();
+        assert!(buffered.is_empty());
+        assert_eq!(*received.lock().unwrap(), b"Hello from Windows");
     }
 
     #[test]

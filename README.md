@@ -21,6 +21,11 @@ guest calls it. Set `WINCLI_NATIVE_STRICT_IMPORTS=1` to reject unsupported
 imports before entry. `wincli inspect` lists static shim coverage. Other host platforms currently have no PE
 execution backend.
 
+The shim code is part of the Rust executable, and an interactive shell selects
+its native backend once when the shell starts. Each PE still gets its own
+image mapping and import resolution, as it would when the OS loads a new
+process.
+
 The native loader has experimental TLS/TEB/PEB initialization. It is not yet
 sufficient for general Windows CRT startup or exception handling.
 
@@ -192,6 +197,12 @@ at portable Windows CLI tools to drive expansion one program at a time:
 ```bash
 wincli inspect rg.exe
 ```
+
+Native program output streams to the terminal while the program runs. To see
+where time is spent, start the shell with `WINCLI_TIMINGS=1 wincli shell`;
+WinCLI prints PE loading, native setup, time to first output, guest execution,
+and filesystem-state timing details to stderr for each PE program, including
+the guest-disk read when a program is launched from the shell.
 
 The official Node.js 24.21.0 Windows x64 `node.exe` runs on the Linux native
 backend for version reporting and simple JavaScript evaluation:

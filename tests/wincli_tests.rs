@@ -863,7 +863,7 @@ fn test_inspect_invalid_file() {
     assert!(stderr.contains("cannot inspect"), "stderr: {stderr}");
 }
 
-// ---------- P1: offline install loop (no network) ----------
+// ---------- command-line helpers ----------
 
 fn run_wincli_env(args: &[&str], envs: &[(&str, &str)]) -> (i32, String, String) {
     let bin = env!("CARGO_BIN_EXE_wincli");
@@ -872,13 +872,52 @@ fn run_wincli_env(args: &[&str], envs: &[(&str, &str)]) -> (i32, String, String)
     for (k, v) in envs {
         cmd.env(k, v);
     }
-    // never inherit a real source/cache from the developer machine
+    // Never inherit package-source configuration from the developer machine.
     let output = cmd.output().expect("spawn wincli");
     (
         output.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&output.stdout).to_string(),
         String::from_utf8_lossy(&output.stderr).to_string(),
     )
+}
+
+#[test]
+fn native_timing_reports_load_execution_and_state_stages() {
+    let path = artifact("exe/hello.exe");
+    let path = path.to_string_lossy().to_string();
+    let (code, stdout, stderr) = run_wincli_env(&[&path], &[("WINCLI_TIMINGS", "1")]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "Hello from Windows");
+    for stage in [
+        "host_read=",
+        "pe_load=",
+        "lock=",
+        "entry=",
+        "map=",
+        "imports=",
+        "tls=",
+        "context=",
+        "fork=",
+        "first_output=",
+        "guest_until_stdout_eof=",
+        "state_transfer=",
+        "state_decode=",
+        "total=",
+    ] {
+        assert!(stderr.contains(stage), "missing {stage} in {stderr}");
+    }
+
+    let (code, stdout, stderr) =
+        run_shell_env(&format!("{path}\nexit\n"), &[("WINCLI_TIMINGS", "1")]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "Hello from Windows");
+    assert!(stderr.contains("shell backend_init="), "stderr: {stderr}");
+    assert!(stderr.contains("host_file_read="), "stderr: {stderr}");
+    assert!(stderr.contains("pe_load="), "stderr: {stderr}");
+    assert!(
+        stderr.contains("guest_until_stdout_eof="),
+        "stderr: {stderr}"
+    );
 }
 
 // ---------- P3: argv + name resolution ----------

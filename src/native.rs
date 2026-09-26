@@ -14023,14 +14023,27 @@ mod imp {
         args: &[String],
         output: Option<&dyn Fn(&[u8])>,
     ) -> Result<(u32, Vec<u8>, WinFs), String> {
+        let total_started = std::time::Instant::now();
+        let timing = std::env::var_os("WINCLI_TIMINGS").is_some();
+        let lock_started = std::time::Instant::now();
         let _run = NATIVE_RUN_LOCK
             .lock()
             .map_err(|_| "native backend execution lock is poisoned".to_string())?;
+        let lock_wait_ms = lock_started.elapsed().as_secs_f64() * 1000.0;
+        let entry_started = std::time::Instant::now();
         let entry = entry(img)?;
+        let entry_ms = entry_started.elapsed().as_secs_f64() * 1000.0;
+        let map_started = std::time::Instant::now();
         let mapping = map(img)?;
+        let map_ms = map_started.elapsed().as_secs_f64() * 1000.0;
+        let import_started = std::time::Instant::now();
         let strict_imports = std::env::var("WINCLI_NATIVE_STRICT_IMPORTS").as_deref() == Ok("1");
         let _import_stubs = patch_baseline_imports(&mapping, img, strict_imports)?;
+        let import_ms = import_started.elapsed().as_secs_f64() * 1000.0;
+        let tls_started = std::time::Instant::now();
         let tls = setup_tls(&mapping, img)?;
+        let tls_ms = tls_started.elapsed().as_secs_f64() * 1000.0;
+        let context_started = std::time::Instant::now();
         let fs = Arc::new(Mutex::new(NativeFs {
             fs: instance_fs,
             handles: HashMap::new(),
@@ -14119,7 +14132,10 @@ mod imp {
                 std::io::Error::last_os_error()
             ));
         }
+        let context_ms = context_started.elapsed().as_secs_f64() * 1000.0;
+        let fork_started = std::time::Instant::now();
         let pid = unsafe { fork() };
+        let fork_ms = fork_started.elapsed().as_secs_f64() * 1000.0;
         if pid < 0 {
             unsafe {
                 close(fds[0]);
@@ -14188,6 +14204,8 @@ mod imp {
         }
         let mut out = Vec::new();
         let mut buf = [0u8; 4096];
+        let guest_started = std::time::Instant::now();
+        let mut first_output_ms = None;
         loop {
             let n = unsafe { read(fds[0], buf.as_mut_ptr().cast(), buf.len()) };
             if n == 0 {
@@ -14202,6 +14220,9 @@ mod imp {
                     std::io::Error::last_os_error()
                 ));
             }
+            if first_output_ms.is_none() {
+                first_output_ms = Some(guest_started.elapsed().as_secs_f64() * 1000.0);
+            }
             out.extend_from_slice(&buf[..n as usize]);
             if let Some(output) = output {
                 output(&buf[..n as usize]);
@@ -14210,6 +14231,8 @@ mod imp {
         unsafe {
             close(fds[0]);
         }
+        let guest_ms = guest_started.elapsed().as_secs_f64() * 1000.0;
+        let state_started = std::time::Instant::now();
         let mut state = Vec::new();
         loop {
             let n = unsafe { read(state_fds[0], buf.as_mut_ptr().cast(), buf.len()) };
@@ -14233,6 +14256,7 @@ mod imp {
                 std::io::Error::last_os_error()
             ));
         }
+        let state_transfer_ms = state_started.elapsed().as_secs_f64() * 1000.0;
         process
             .exit_status
             .store((status >> 8) as u32, Ordering::Release);
@@ -14240,6 +14264,7 @@ mod imp {
         if let Ok(mut context) = NATIVE_PROCESS.lock() {
             *context = None;
         }
+        let decode_started = std::time::Instant::now();
         let final_fs = if state.is_empty() {
             process
                 .fs
@@ -14251,11 +14276,26 @@ mod imp {
             crate::snapshot::load(&state)
                 .map_err(|e| format!("native backend returned invalid filesystem state: {e}"))?
         };
+        let state_decode_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
         if status & 0x7f != 0 {
             return Err(format!(
                 "native guest terminated by signal {}",
                 status & 0x7f
             ));
+        }
+        if timing {
+            if !out.is_empty() && !out.ends_with(b"\n") {
+                eprintln!();
+            }
+            let first_output = first_output_ms
+                .map(|milliseconds| format!("{milliseconds:.3}ms"))
+                .unwrap_or_else(|| "none".to_string());
+            eprintln!(
+                "wincli timing: {prog}: lock={lock_wait_ms:.3}ms entry={entry_ms:.3}ms map={map_ms:.3}ms imports={import_ms:.3}ms tls={tls_ms:.3}ms context={context_ms:.3}ms fork={fork_ms:.3}ms first_output={first_output} guest_until_stdout_eof={guest_ms:.3}ms state_transfer={state_transfer_ms:.3}ms state_decode={state_decode_ms:.3}ms stdout_bytes={} state_bytes={} total={:.3}ms",
+                out.len(),
+                state.len(),
+                total_started.elapsed().as_secs_f64() * 1000.0
+            );
         }
         Ok(((status >> 8) as u32, out, final_fs))
     }

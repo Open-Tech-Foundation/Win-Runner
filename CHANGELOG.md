@@ -14,6 +14,9 @@ All notable changes to this project will be documented in this file.
 - Removed the persistent host package cache and one-shot `wincli install`
   command. Package staging and shell guest disks are disposable; snapshots are
   the only way to carry installed programs or other guest files between runs.
+- Streamed native guest output to the terminal as it arrives. Added opt-in
+  per-stage PE load, native launch, time-to-first-output, guest-run, and
+  filesystem-state timings with `WINCLI_TIMINGS=1`.
 
 ### Removed
 
