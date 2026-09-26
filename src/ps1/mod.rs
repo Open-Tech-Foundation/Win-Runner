@@ -1,7 +1,9 @@
 //! Minimal PowerShell-like interpreter for filesystem tests.
 //!
 //! Implements only: New-Item, Set-Content, Add-Content, Get-Content,
-//! Get-ChildItem, Remove-Item, Copy-Item, Move-Item, Test-Path
+//! Get-ChildItem, Remove-Item, Copy-Item, Move-Item, Test-Path, Get-Item,
+//! Get-Location/Set-Location/Push-Location/Pop-Location (`pwd`/`cd`/
+//! `pushd`/`popd`), Start-Sleep, Join-Path, Expand-Archive, Get-FileHash
 //! (+ Write-Host/Write-Output/echo as pass-through for scripts),
 //! text pipelines (`a | b`, fed as text), Invoke-RestMethod (`irm`,
 //! HTTPS GET via host curl), Invoke-Expression (`iex`, runs text
@@ -49,6 +51,8 @@ const MAX_IEX_DEPTH: usize = 32;
 pub struct Session {
     pub vars: HashMap<String, Value>,
     pub funcs: HashMap<String, FuncDef>,
+    /// `Push-Location`/`Pop-Location` stack (guest-absolute directories).
+    pub dir_stack: Vec<String>,
 }
 
 /// A defined function: parameter names (lowercased, no `$`) and body text.
@@ -96,6 +100,7 @@ pub fn run_ps1_session(
         depth: 0,
         vars: &mut sess.vars,
         funcs: &mut sess.funcs,
+        dir_stack: &mut sess.dir_stack,
     };
     interp.run(script)
 }
@@ -106,6 +111,7 @@ struct Interpreter<'a> {
     depth: usize,
     vars: &'a mut HashMap<String, Value>,
     funcs: &'a mut HashMap<String, FuncDef>,
+    dir_stack: &'a mut Vec<String>,
 }
 
 impl<'a> Interpreter<'a> {
@@ -774,6 +780,16 @@ impl<'a> Interpreter<'a> {
             "copy-item" | "copy" | "cp" | "ci" => self.cmd_copy_item(rest),
             "move-item" | "move" | "mv" | "mi" => self.cmd_move_item(rest),
             "test-path" => self.cmd_test_path(rest),
+            "get-item" => self.cmd_get_item(rest),
+            "get-location" | "pwd" | "gl" => {
+                let path = self.fs.cwd();
+                self.emit(&path);
+                Ok(())
+            }
+            "set-location" | "cd" | "chdir" | "sl" => self.cmd_set_location(rest, false),
+            "push-location" | "pushd" => self.cmd_set_location(rest, true),
+            "pop-location" | "popd" => self.cmd_pop_location(rest),
+            "start-sleep" | "sleep" => self.cmd_start_sleep(rest),
             "join-path" => self.cmd_join_path(rest),            "invoke-webrequest" | "iwr" | "wget" => self.cmd_invoke_webrequest(rest),
             "expand-archive" => self.cmd_expand_archive(rest),
             "get-filehash" => self.cmd_get_filehash(rest),
@@ -805,6 +821,16 @@ impl<'a> Interpreter<'a> {
             .cloned()
             .or_else(|| positional.first().cloned())
             .ok_or_else(|| "usage: irm <url>".to_string())?;
+        // Chocolatey is built into wincli as the `choco` command, so its
+        // Windows bootstrap script has nothing to install. Answer the
+        // well-known URL with an informational stub instead of failing on
+        // the script's .NET/PS features.
+        if url.contains("community.chocolatey.org/install.ps1") {
+            self.out.extend_from_slice(
+                b"Write-Host \"wincli: Chocolatey is built in; 'choco' is ready to use.\"\n",
+            );
+            return Ok(());
+        }
         let text = crate::install::fetch_url(&url, 120)
             .map_err(|e| format!("irm: {e}"))?;
         // Like the real cmdlet, JSON bodies arrive parsed: arrays flow
@@ -1651,6 +1677,7 @@ impl<'a> Interpreter<'a> {
             depth: self.depth,
             vars: &mut *self.vars,
             funcs: &mut *self.funcs,
+            dir_stack: &mut *self.dir_stack,
         }
     }
 
@@ -2200,6 +2227,103 @@ impl<'a> Interpreter<'a> {
             .or_else(|| pos.first().cloned())
             .ok_or_else(|| "Test-Path: missing -Path".to_string())?;
         self.emit(if self.fs.test_path(&path) { "True" } else { "False" });
+        Ok(())
+    }
+
+    /// Get-Item: emit the normalized path when it names a file or
+    /// directory, else fail like the real cmdlet.
+    fn cmd_get_item(&mut self, args: &[String]) -> Result<(), String> {
+        let (named, pos) = parse_params(args, &["path"])?;
+        let path = named
+            .get("path")
+            .cloned()
+            .or_else(|| pos.first().cloned())
+            .ok_or_else(|| "Get-Item: missing -Path".to_string())?;
+        let display = self
+            .fs
+            .normalize(&path)
+            .map(|p| p.display())
+            .map_err(|e| format!("Get-Item: {e}"))?;
+        if self.fs.is_file(&display) || self.fs.is_dir(&display) {
+            self.emit(&display);
+            Ok(())
+        } else {
+            Err(format!("Get-Item: path not found: {path}"))
+        }
+    }
+
+    /// Set-Location / Push-Location: change the session working directory
+    /// (relative paths resolve against it, like a real shell).
+    fn cmd_set_location(&mut self, args: &[String], push: bool) -> Result<(), String> {
+        let (named, pos) = parse_params(args, &["path"])?;
+        let path = named
+            .get("path")
+            .cloned()
+            .or_else(|| pos.first().cloned())
+            .ok_or_else(|| {
+                if push {
+                    "Push-Location: missing -Path".to_string()
+                } else {
+                    "Set-Location: missing -Path".to_string()
+                }
+            })?;
+        // Validate (and resolve) before touching the location stack.
+        let display = self
+            .fs
+            .normalize(&path)
+            .map(|p| p.display())
+            .map_err(|e| {
+                format!(
+                    "{}: {e}",
+                    if push { "Push-Location" } else { "Set-Location" }
+                )
+            })?;
+        if !self.fs.is_dir(&display) {
+            return Err(format!(
+                "{}: path not found: {path}",
+                if push { "Push-Location" } else { "Set-Location" }
+            ));
+        }
+        if push {
+            self.dir_stack.push(self.fs.cwd());
+        }
+        self.fs
+            .set_cwd(&display)
+            .map_err(|e| format!("Set-Location: {e}"))?;
+        Ok(())
+    }
+
+    /// Pop-Location: return to the directory saved by Push-Location.
+    fn cmd_pop_location(&mut self, args: &[String]) -> Result<(), String> {
+        let (named, pos) = parse_params(args, &[])?;
+        if named.contains_key("path") || !pos.is_empty() {
+            return Err("usage: Pop-Location".to_string());
+        }
+        let back = self
+            .dir_stack
+            .pop()
+            .ok_or_else(|| "Pop-Location: location stack empty".to_string())?;
+        self.fs
+            .set_cwd(&back)
+            .map_err(|e| format!("Pop-Location: {e}"))?;
+        Ok(())
+    }
+
+    /// Start-Sleep: pause the session (`-Seconds`, or `-Milliseconds`).
+    fn cmd_start_sleep(&mut self, args: &[String]) -> Result<(), String> {
+        let (named, pos) = parse_params(args, &["seconds", "milliseconds"])?;
+        let millis: u64 = if let Some(s) = named.get("seconds").or_else(|| pos.first()) {
+            s.parse::<u64>()
+                .map_err(|_| "Start-Sleep: -Seconds needs a number".to_string())?
+                .checked_mul(1000)
+                .ok_or_else(|| "Start-Sleep: -Seconds too large".to_string())?
+        } else if let Some(m) = named.get("milliseconds") {
+            m.parse::<u64>()
+                .map_err(|_| "Start-Sleep: -Milliseconds needs a number".to_string())?
+        } else {
+            return Err("usage: Start-Sleep -Seconds <n>".to_string());
+        };
+        std::thread::sleep(std::time::Duration::from_millis(millis));
         Ok(())
     }
 
@@ -4055,6 +4179,20 @@ fn is_builtin_command(cmd: &str) -> bool {
             | "mv"
             | "mi"
             | "test-path"
+            | "get-item"
+            | "get-location"
+            | "pwd"
+            | "gl"
+            | "set-location"
+            | "cd"
+            | "chdir"
+            | "sl"
+            | "push-location"
+            | "pushd"
+            | "pop-location"
+            | "popd"
+            | "start-sleep"
+            | "sleep"
             | "join-path"
             | "write-host"
             | "write-output"
@@ -4443,12 +4581,14 @@ mod tests {
             let mut out = Vec::new();
             let mut vars = HashMap::new();
             let mut funcs = HashMap::new();
+            let mut stack = Vec::new();
             let mut interp = Interpreter {
                 fs: &mut fs,
                 out: &mut out,
                 depth,
                 vars: &mut vars,
                 funcs: &mut funcs,
+                dir_stack: &mut stack,
             };
             interp.cmd_iex(&["echo hi".to_string()], None).map(|_| ())
         }
@@ -4467,6 +4607,57 @@ mod tests {
         // Discard port on loopback: refused fast, no DNS, no network.
         let (_, _, r) = run("irm http://127.0.0.1:9/nope");
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn irm_chocolatey_bootstrap_answers_builtin_stub() {
+        let (out, r) = run_session(
+            "irm https://community.chocolatey.org/install.ps1 | iex",
+        );
+        assert!(r.is_ok());
+        assert!(
+            out.windows(b"built in".len())
+                .any(|w| w == b"built in"),
+            "out: {}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    #[test]
+    fn location_stack_roundtrip() {
+        let (out, r) = run_session(
+            "New-Item -Path C:\\loc -ItemType Directory | Out-Null\ncd C:\\loc\npwd\npush-location C:\\ | Out-Null\npwd\npop-location\npwd",
+        );
+        assert!(r.is_ok());
+        assert_eq!(out, b"C:\\loc\nC:\\\nC:\\loc\n");
+    }
+
+    #[test]
+    fn location_errors_are_clear() {
+        let (_, r) = run_session("cd C:\\loc-missing-xyz");
+        assert!(r.unwrap_err().contains("path not found"));
+        let (_, r) = run_session("pop-location");
+        assert!(r.unwrap_err().contains("stack empty"));
+        let (_, r) = run_session("cd");
+        assert!(r.unwrap_err().contains("missing -Path"));
+    }
+
+    #[test]
+    fn get_item_reports_files_and_missing() {
+        let (out, r) = run_session("New-Item C:\\gi.txt -Value x | Out-Null\nGet-Item C:\\gi.txt");
+        assert!(r.is_ok());
+        assert_eq!(out, b"C:\\gi.txt\n");
+        let (_, r) = run_session("Get-Item C:\\gi-missing-xyz");
+        assert!(r.unwrap_err().contains("path not found"));
+    }
+
+    #[test]
+    fn start_sleep_zero_is_a_noop() {
+        let (out, r) = run_session("Start-Sleep -Seconds 0\necho awake");
+        assert!(r.is_ok());
+        assert_eq!(out, b"awake\n");
+        let (_, r) = run_session("Start-Sleep");
+        assert!(r.unwrap_err().contains("usage"));
     }
 
     /// Pre-seeded WinFS run (script's `C:\...` files must already exist).

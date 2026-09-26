@@ -1,4 +1,5 @@
 pub mod backend;
+pub mod choco;
 pub mod deflate;
 pub mod inspect;
 pub mod instance;

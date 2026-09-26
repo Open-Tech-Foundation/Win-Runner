@@ -34,9 +34,11 @@ original casing preserved, `C:\` + relative paths, `.`/`..` normalization.
 src/winfs/   in-memory Windows filesystem (shared by EXE shims and PS1)
 src/pe/      PE32+ loader and test-EXE builder
 src/native.rs Linux x86-64 PE execution and Windows API shims
+src/choco.rs Chocolatey-compatible `choco install nodejs` (shell builtin)
 src/ps1/     minimal interpreter: New-Item, Set-Content, Add-Content,
-             Get-Content, Get-ChildItem, Remove-Item, Copy-Item,
-             Move-Item, Test-Path, text pipelines (|), irm, iex
+              Get-Content, Get-ChildItem, Remove-Item, Copy-Item,
+              Move-Item, Test-Path, Get-Item, Get/Set/Push/Pop-Location,
+              Start-Sleep, Join-Path, text pipelines (|), irm, iex
 tests/artifacts/  committed test artifacts (see below)
 ```
 
@@ -96,8 +98,8 @@ wincli shell
 
 One in-memory WinFS for the whole session (files created by one command
 are visible to the next). Each line is a PS1 statement, `install`/`inspect`,
-a host `.exe`/`.ps1` file, or a cached package with args — so `install rg`
-followed by `rg --version` works in one session. Errors print as
+`choco`, `powershell -c`, a host `.exe`/`.ps1` file, or a cached package
+with args — so `install rg` followed by `rg --version` works in one session. Errors print as
 `wincli: ...` without ending the session; `exit`/`quit` (or Ctrl-D) ends it
 with the last guest exit code. The prompt goes to stderr, keeping stdout
 clean for pipes.
@@ -127,6 +129,27 @@ WinGet IDs (`BurntSushi.ripgrep.MSVC`). Manifests come from winget-pkgs
 (version discovery via GitHub API, YAML via raw); only portable/zip x64
 installers are accepted, downloads are SHA-256-verified against the
 manifest, and re-installs never re-download (content-addressed cache).
+
+## Node.js via `choco`
+
+`choco` is built into the shell (no bootstrap needed — the upstream
+Chocolatey installer requires .NET/PowerShell, so `irm
+https://community.chocolatey.org/install.ps1 | iex` answers with a
+built-in notice instead). Installing Node.js fetches the official
+distribution zip from nodejs.org, verifies it against the release
+`SHASUMS256.txt`, caches `node.exe` as `C:\bin\node.exe`, and extracts
+the bundled npm tree so bare `npm` runs through the cached node:
+
+```bash
+wincli shell
+choco install nodejs --version="24.21.0"
+node -v   # v24.21.0
+npm -v    # 11.19.0
+```
+
+Omitting `--version` installs the pinned default (currently 24.21.0).
+Set `WINCLI_TEST_CHOCO=1` to run the live download-and-verify E2E test
+(`cargo test --test choco_node`).
 
 ## Compatibility harness
 

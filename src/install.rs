@@ -187,7 +187,7 @@ fn check_name(name: &str) -> Result<(), String> {
 }
 
 /// Shared cache-write tail for local + remote installs.
-fn finalize(
+pub(crate) fn finalize(
     name: &str,
     version: &str,
     exe_rel: &str,

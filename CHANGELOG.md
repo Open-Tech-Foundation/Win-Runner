@@ -11,6 +11,20 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added a Chocolatey-compatible `choco install nodejs` shell builtin: it
+  downloads the official `node-v<version>-win-x64.zip` from nodejs.org,
+  verifies its SHA-256 against the release `SHASUMS256.txt`, caches
+  `node.exe` as `C:\bin\node.exe`, and extracts the bundled npm tree so
+  bare `node -v` and `npm -v` work in `wincli shell`. `choco` needs no
+  bootstrap (the upstream installer requires .NET); the well-known
+  `install.ps1` URL answers with a built-in notice through `irm|iex`.
+- Added a `powershell -c <script>` shell passthrough so Windows install
+  one-liners run as in-session PS1.
+- Added PS1 location cmdlets (`Get/Set/Push/Pop-Location` with
+  `pwd`/`cd`/`pushd`/`popd`), `Get-Item`, and `Start-Sleep`.
+- Added a live `choco install nodejs` E2E test (`WINCLI_TEST_CHOCO=1`)
+  asserting `node -v` prints `v24.21.0` and `npm -v` prints `11.19.0`.
+
 - Added a native byte-mode named-pipe handle model for libuv, with `CreateNamedPipe`,
   `CreateFile`, `ConnectNamedPipe`, synchronous and overlapped transfers, IOCP
   completion, cancellation, pipe state/type queries, and inheritable child

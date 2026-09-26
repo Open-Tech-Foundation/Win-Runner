@@ -10,7 +10,7 @@
 //! shell continues. `exit [n]`/`quit`, Ctrl-D (EOF), or a closed pipe ends
 //! the session (code = argument, else the last guest code).
 
-use crate::{backend, inspect, install, pe, ps1, winfs::WinFs};
+use crate::{backend, choco, inspect, install, pe, ps1, winfs::WinFs};
 use std::io::{BufRead, Write};
 
 /// What the REPL does after a line.
@@ -119,6 +119,14 @@ impl Shell {
                 );
                 Ok(ShellFlow::Continue)
             }
+            "choco" => {
+                self.do_choco(&argv[1..], out)?;
+                Ok(ShellFlow::Continue)
+            }
+            "powershell" => {
+                self.do_powershell(&argv[1..], out)?;
+                Ok(ShellFlow::Continue)
+            }
             "inspect" => {
                 let target = argv
                     .get(1)
@@ -182,6 +190,11 @@ impl Shell {
                 sink,
             );
         }
+        // Bare `npm` runs the cached Node.js distribution's npm-cli.js
+        // through the cached node.exe (npm ships as JS, not a PE).
+        if target.eq_ignore_ascii_case("npm") || target.eq_ignore_ascii_case("npm.cmd") {
+            return self.run_npm(&argv[1..], out, sink);
+        }
         // Otherwise a PS1 statement; an unknown first word that is not
         // installed reads as the familiar install hint.
         match ps1::run_ps1_session(&mut self.sess, &mut self.fs, line, out) {
@@ -239,6 +252,130 @@ impl Shell {
         Ok(ShellFlow::Continue)
     }
 
+    /// `choco install nodejs [--version=X.Y.Z]`: fetch the official
+    /// distribution, verify, and cache node.exe plus the bundled npm tree.
+    /// `choco` itself is built into wincli (no bootstrap needed).
+    fn do_choco(&mut self, argv: &[String], out: &mut Vec<u8>) -> Result<(), String> {
+        match choco::parse_args(argv)? {
+            choco::ChocoCmd::Version => {
+                out.extend_from_slice(
+                    format!("wincli-choco {}\n", choco::SHIM_VERSION).as_bytes(),
+                );
+                Ok(())
+            }
+            choco::ChocoCmd::InstallNode { version } => {
+                let cache = install::cache_dir();
+                let inst = choco::install_nodejs(&version, &cache)?;
+                self.last_code = 0;
+                out.extend_from_slice(
+                    format!(
+                        "Installed nodejs {} → C:\\bin\\node.exe\nnpm {} ready as 'npm'\n",
+                        inst.version, inst.npm_version
+                    )
+                    .as_bytes(),
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Minimal `powershell -c <script>` passthrough so Windows install
+    /// one-liners (`powershell -c "irm ...|iex"`) run as PS1 in-session.
+    fn do_powershell(&mut self, argv: &[String], out: &mut Vec<u8>) -> Result<(), String> {
+        let mut args = argv;
+        // Swallow `-NoProfile`, `-NonInteractive`, `-NoLogo`,
+        // `-ExecutionPolicy <policy>`.
+        while let Some(first) = args.first() {
+            let flag = first.to_lowercase();
+            if flag == "-noprofile" || flag == "-noninteractive" || flag == "-nologo" {
+                args = &args[1..];
+            } else if flag == "-executionpolicy" {
+                if args.len() < 2 {
+                    return Err(
+                        "usage: powershell [-NoProfile] -c <script> | powershell <script.ps1>"
+                            .to_string(),
+                    );
+                }
+                args = &args[2..];
+            } else {
+                break;
+            }
+        }
+        let script = match args.first().map(|s| s.to_lowercase()) {
+            Some(flag) if flag == "-command" || flag == "-c" || flag == "/c" => {
+                if args.len() < 2 {
+                    return Err("usage: powershell -c <script>".to_string());
+                }
+                args[1..].join(" ")
+            }
+            Some(_) if args.len() == 1 && args[0].to_lowercase().ends_with(".ps1") => {
+                std::fs::read_to_string(&args[0])
+                    .map_err(|e| format!("cannot read {}: {e}", args[0]))?
+            }
+            _ => {
+                return Err(
+                    "usage: powershell [-NoProfile] -c <script> | powershell <script.ps1>"
+                        .to_string(),
+                );
+            }
+        };
+        let code = ps1::run_ps1_session(&mut self.sess, &mut self.fs, &script, out)
+            .map_err(|e| format!("script error: {e}"))?;
+        self.last_code = code;
+        Ok(())
+    }
+
+    /// Run the cached npm CLI: seed the bundled npm tree into the session
+    /// once, then execute it with the cached node.exe.
+    fn run_npm(
+        &mut self,
+        guest_args: &[String],
+        out: &mut Vec<u8>,
+        sink: Option<backend::OutputSink>,
+    ) -> Result<ShellFlow, String> {
+        let cache = install::cache_dir();
+        let inst = choco::current_nodejs(&cache)
+            .ok_or_else(|| "nothing to run: npm (no nodejs; try `choco install nodejs`)".to_string())?;
+        if !inst.node_exe_host.is_file() {
+            return Err("nothing to run: npm (cached node.exe is missing; try `choco install nodejs`)".to_string());
+        }
+        self.seed_npm_tree(&inst)?;
+        let data = std::fs::read(&inst.node_exe_host)
+            .map_err(|e| format!("cannot read cached node.exe: {e}"))?;
+        let mut args = vec![choco::npm_cli_guest().to_string()];
+        args.extend_from_slice(guest_args);
+        self.run_exe_bytes(&data, "node", &args, out, sink)
+    }
+
+    /// One-way host-to-guest copy of the cached npm tree (`C:\npm`),
+    /// skipped when this session already seeded the same version.
+    fn seed_npm_tree(&mut self, inst: &choco::NodeInstalled) -> Result<(), String> {
+        const MARKER: &str = r"C:\npm\.wincli-seeded";
+        if self
+            .fs
+            .read_file(MARKER)
+            .is_ok_and(|have| have == inst.version.as_bytes())
+        {
+            return Ok(());
+        }
+        let mut files = Vec::new();
+        collect_host_files(&inst.npm_root_host, &mut files).map_err(|e| format!("cannot seed npm: {e}"))?;
+        files.sort();
+        for file in files {
+            let rel = file
+                .strip_prefix(&inst.npm_root_host)
+                .map_err(|_| "cannot seed npm: bad path".to_string())?;
+            let guest = format!(r"C:\npm\{}", rel.to_string_lossy().replace('/', "\\"));
+            self.seed_host_file(
+                &file.display().to_string(),
+                &guest,
+            )?;
+        }
+        self.fs
+            .write_file(MARKER, inst.version.as_bytes().to_vec())
+            .map_err(|e| format!("cannot seed npm: {e}"))?;
+        Ok(())
+    }
     /// One-way host-to-guest copy used while booting a local runner image.
     /// The guest path is validated and written through WinFs; no guest call
     /// can recover the corresponding host path.
@@ -299,6 +436,19 @@ fn guest_bin_name(target: &str) -> String {
     } else {
         target.to_string()
     }
+}
+
+/// Recursively collect host files under `root` (for npm tree seeding).
+fn collect_host_files(root: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(root)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_host_files(&path, out)?;
+        } else if path.is_file() {
+            out.push(path);
+        }
+    }
+    Ok(())
 }
 
 /// Split a shell line on whitespace, honoring single/double quotes.
@@ -401,6 +551,10 @@ pub fn run_runner_with_fs(fs: WinFs) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Tests below mutate `WINCLI_CACHE`; serialize them.
+    static CACHE_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn run_lines(shell: &mut Shell, lines: &[&str]) -> (Vec<u8>, Result<ShellFlow, String>) {
         let mut out = Vec::new();
@@ -518,5 +672,55 @@ mod tests {
         assert_eq!(split_line("rg \"foo bar\" -i"), vec!["rg", "foo bar", "-i"]);
         assert_eq!(split_line("echo 'a b'"), vec!["echo", "a b"]);
         assert_eq!(split_line("  "), Vec::<String>::new());
+    }
+
+    #[test]
+    fn choco_reports_builtin_version() {
+        let mut shell = Shell::new();
+        let mut out = Vec::new();
+        shell.exec_line("choco --version", &mut out).unwrap();
+        assert_eq!(out, format!("wincli-choco {}\n", choco::SHIM_VERSION).as_bytes());
+    }
+
+    #[test]
+    fn choco_rejects_unknown_packages_and_options() {
+        let mut shell = Shell::new();
+        let mut out = Vec::new();
+        let err = shell.exec_line("choco", &mut out).unwrap_err();
+        assert!(err.contains("usage"), "err: {err}");
+        let err = shell.exec_line("choco install python", &mut out).unwrap_err();
+        assert!(err.contains("no such package"), "err: {err}");
+    }
+
+    #[test]
+    fn npm_without_nodejs_hints_choco() {
+        let _guard = CACHE_ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("wincli-npm-hint-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("WINCLI_CACHE", &dir);
+        let mut shell = Shell::new();
+        let mut out = Vec::new();
+        let err = shell.exec_line("npm -v", &mut out).unwrap_err();
+        assert!(err.contains("choco install nodejs"), "err: {err}");
+        std::env::remove_var("WINCLI_CACHE");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn powershell_command_passthrough_runs_ps1() {
+        let mut shell = Shell::new();
+        let mut out = Vec::new();
+        shell
+            .exec_line("powershell -NoProfile -c \"echo ps-ok\"", &mut out)
+            .unwrap();
+        assert_eq!(out, b"ps-ok\n");
+    }
+
+    #[test]
+    fn powershell_needs_a_script() {
+        let mut shell = Shell::new();
+        let mut out = Vec::new();
+        let err = shell.exec_line("powershell", &mut out).unwrap_err();
+        assert!(err.contains("usage"), "err: {err}");
     }
 }
