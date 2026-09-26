@@ -1014,6 +1014,185 @@ mod imp {
         }
 
         #[test]
+        fn win32_read_only_handle_rejects_write() {
+            let path = r"C:\wine_readonly_access.txt";
+            let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(path, b"read-only".to_vec())
+                .unwrap();
+
+            let handle = super::native_create_file_w(wide.as_ptr(), 0x8000_0000, 0, 0, 3, 0, 0);
+            assert_ne!(handle, u64::MAX);
+            let mut written = 0;
+            let write = super::native_write_file(handle, b"x".as_ptr(), 1, &mut written, 0);
+            assert_eq!(write, 0, "a GENERIC_READ handle must not allow writes");
+            assert_eq!(super::native_get_last_error(), 5);
+            assert_eq!(super::native_close_handle(handle), 1);
+            context.lock().unwrap().fs.delete_file(path).unwrap();
+        }
+
+        #[test]
+        fn win32_share_mode_rejects_conflicting_open() {
+            let path = r"C:\wine_sharing.txt";
+            let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(path, b"shared".to_vec())
+                .unwrap();
+
+            let first = super::native_create_file_w(wide.as_ptr(), 0x8000_0000, 0, 0, 3, 0, 0);
+            assert_ne!(first, u64::MAX);
+            let conflicting =
+                super::native_create_file_w(wide.as_ptr(), 0x8000_0000, 0, 0, 3, 0, 0);
+            assert_eq!(conflicting, u64::MAX);
+            assert_eq!(super::native_get_last_error(), 32);
+            assert_eq!(super::native_close_handle(first), 1);
+            context.lock().unwrap().fs.delete_file(path).unwrap();
+        }
+
+        #[test]
+        fn win32_find_first_file_filters_the_requested_name_pattern() {
+            let directory = r"C:\wine_find_pattern";
+            let directory_wide = directory.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let pattern = r"C:\wine_find_pattern\*.txt"
+                .encode_utf16()
+                .chain([0])
+                .collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            {
+                let mut ctx = context.lock().unwrap();
+                ctx.fs.mkdir(directory).unwrap();
+                ctx.fs
+                    .write_file(r"C:\wine_find_pattern\match.txt", b"x".to_vec())
+                    .unwrap();
+                ctx.fs
+                    .write_file(r"C:\wine_find_pattern\ignore.bin", b"y".to_vec())
+                    .unwrap();
+            }
+
+            let mut data = [0u8; 592];
+            let find =
+                super::native_find_first_file_ex_w(pattern.as_ptr(), 0, data.as_mut_ptr(), 0, 0, 0);
+            assert_ne!(find, u64::MAX);
+            let name = unsafe {
+                std::slice::from_raw_parts(data.as_ptr().add(44).cast::<u16>(), 260)
+                    .iter()
+                    .copied()
+                    .take_while(|unit| *unit != 0)
+                    .collect::<Vec<_>>()
+            };
+            let mut names = vec![String::from_utf16(&name).unwrap()];
+            while super::native_find_next_file_w(find, data.as_mut_ptr()) != 0 {
+                let name = unsafe {
+                    std::slice::from_raw_parts(data.as_ptr().add(44).cast::<u16>(), 260)
+                        .iter()
+                        .copied()
+                        .take_while(|unit| *unit != 0)
+                        .collect::<Vec<_>>()
+                };
+                names.push(String::from_utf16(&name).unwrap());
+            }
+            assert_eq!(super::native_find_close(find), 1);
+            assert_eq!(names, ["match.txt"]);
+
+            let mut ctx = context.lock().unwrap();
+            ctx.fs
+                .delete_file(r"C:\wine_find_patternmatch.txt")
+                .unwrap();
+            ctx.fs
+                .delete_file(r"C:\wine_find_patternignore.bin")
+                .unwrap();
+            drop(ctx);
+            assert_eq!(super::native_remove_directory_w(directory_wide.as_ptr()), 1);
+        }
+
+        #[test]
+        fn win32_set_file_time_accepts_a_guest_file_handle() {
+            let path = r"C:\wine_set_time.txt";
+            let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(path, b"time".to_vec())
+                .unwrap();
+            let handle = super::native_create_file_w(wide.as_ptr(), 0, 0, 0, 3, 0, 0);
+            assert_ne!(handle, u64::MAX);
+            let timestamp = 132_537_600_000_000_000u64;
+            assert_eq!(
+                super::native_set_file_time(handle, &timestamp, &timestamp, &timestamp),
+                1
+            );
+            assert_eq!(super::native_close_handle(handle), 1);
+            context.lock().unwrap().fs.delete_file(path).unwrap();
+        }
+
+        #[test]
+        fn win32_readonly_attribute_blocks_delete_file() {
+            let path = r"C:\wine_readonly_delete.txt";
+            let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(path, b"keep".to_vec())
+                .unwrap();
+
+            assert_eq!(super::native_set_file_attributes_w(wide.as_ptr(), 1), 1);
+            assert_eq!(super::native_delete_file_w(wide.as_ptr()), 0);
+            assert_eq!(super::native_get_last_error(), 5);
+            assert!(context.lock().unwrap().fs.exists(path));
+            assert_eq!(super::native_set_file_attributes_w(wide.as_ptr(), 0x80), 1);
+            assert_eq!(super::native_delete_file_w(wide.as_ptr()), 1);
+        }
+
+        #[test]
+        fn win32_get_final_path_supports_size_query_and_extended_path() {
+            let path = r"C:\wine_final_path.txt";
+            let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(path, b"path".to_vec())
+                .unwrap();
+            let handle = super::native_create_file_w(wide.as_ptr(), 0, 0, 0, 3, 0, 0);
+            assert_ne!(handle, u64::MAX);
+
+            let required =
+                super::native_get_final_path_name_by_handle_w(handle, std::ptr::null_mut(), 0, 0);
+            assert_eq!(
+                required as usize,
+                r"\\?\C:\wine_final_path.txt".encode_utf16().count() + 1
+            );
+            let mut output = vec![0u16; required as usize];
+            let written = super::native_get_final_path_name_by_handle_w(
+                handle,
+                output.as_mut_ptr(),
+                output.len() as u32,
+                0,
+            );
+            assert_eq!(written + 1, required);
+            assert_eq!(
+                String::from_utf16(&output[..written as usize]).unwrap(),
+                r"\\?\C:\wine_final_path.txt"
+            );
+
+            assert_eq!(super::native_close_handle(handle), 1);
+            context.lock().unwrap().fs.delete_file(path).unwrap();
+        }
+
+        #[test]
         fn file_mapping_views_read_and_commit_guest_file_bytes() {
             let path = r"C:\file_mapping_unit.txt";
             let context = super::fs_ctx().unwrap();

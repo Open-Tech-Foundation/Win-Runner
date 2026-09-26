@@ -28,6 +28,8 @@ All notable changes to this project will be documented in this file.
 - Added Rust tests modeled on modern file-operation cases from Wine's
   `file.c`, covering copy, move, delete, enumeration, metadata, and directory
   cleanup through WinFS and the native Win32 shims.
+- Expanded the Wine-inspired native tests to cover read-only access, sharing
+  conflicts, wildcard enumeration, read-only deletion, and guest file times.
 - Failed native launches keep the current C: filesystem in memory and discard
   only changes from the failed child process.
 - Added live host-folder mounts as guest drives (`mount Z: <host-directory>` or
