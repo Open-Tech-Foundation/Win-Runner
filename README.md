@@ -132,10 +132,8 @@ manifest, and re-installs never re-download (content-addressed cache).
 
 ## Node.js via `choco`
 
-`choco` is built into the shell (no bootstrap needed — the upstream
-Chocolatey installer requires .NET/PowerShell, so `irm
-https://community.chocolatey.org/install.ps1 | iex` answers with a
-built-in notice instead). Installing Node.js fetches the official
+`choco` is built into the shell (no bootstrap needed). Installing
+Node.js fetches the official
 distribution zip from nodejs.org, verifies it against the release
 `SHASUMS256.txt`, caches `node.exe` as `C:\bin\node.exe`, and extracts
 the bundled npm tree so bare `npm` runs through the cached node:

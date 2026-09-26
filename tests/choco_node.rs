@@ -37,10 +37,9 @@ fn choco_install_nodejs_then_node_and_npm_report_pinned_versions() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("wincli: Chocolatey is built in"),
-        "bootstrap stub missing: {stdout}"
-    );
+    // The upstream bootstrap script needs full PowerShell/.NET, so it
+    // fails clearly on stderr; the session must survive it and the
+    // built-in choco flow below still runs.
     assert!(
         stdout.contains("Installed nodejs 24.21.0"),
         "install report missing: {stdout}"

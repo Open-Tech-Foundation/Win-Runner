@@ -125,6 +125,7 @@ impl<'a> Interpreter<'a> {
     fn run_code(&mut self, script: &str) -> Result<Flow, String> {
         // Split into statements on newlines and top-level ';'. A line
         // ending in `=`, `|`, `,`, or backtick continues on the next line.
+        let script = strip_block_comments(script)?;
         let mut code = String::new();
         for line in script.lines() {
             let stripped = strip_comment(line);
@@ -821,16 +822,6 @@ impl<'a> Interpreter<'a> {
             .cloned()
             .or_else(|| positional.first().cloned())
             .ok_or_else(|| "usage: irm <url>".to_string())?;
-        // Chocolatey is built into wincli as the `choco` command, so its
-        // Windows bootstrap script has nothing to install. Answer the
-        // well-known URL with an informational stub instead of failing on
-        // the script's .NET/PS features.
-        if url.contains("community.chocolatey.org/install.ps1") {
-            self.out.extend_from_slice(
-                b"Write-Host \"wincli: Chocolatey is built in; 'choco' is ready to use.\"\n",
-            );
-            return Ok(());
-        }
         let text = crate::install::fetch_url(&url, 120)
             .map_err(|e| format!("irm: {e}"))?;
         // Like the real cmdlet, JSON bodies arrive parsed: arrays flow
@@ -2648,6 +2639,47 @@ impl<'a> Interpreter<'a> {
 }
 
 /// Strip `#` comments (outside quotes).
+/// Strip `<# ... #>` block comments from a whole script (quote-aware).
+/// An unterminated block is an error, like the real parser.
+fn strip_block_comments(script: &str) -> Result<String, String> {
+    let chars: Vec<char> = script.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    let mut sq = false;
+    let mut dq = false;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\'' && !dq {
+            sq = !sq;
+            out.push(c);
+            i += 1;
+        } else if c == '"' && !sq {
+            dq = !dq;
+            out.push(c);
+            i += 1;
+        } else if c == '<' && !sq && !dq && chars.get(i + 1) == Some(&'#') {
+            i += 2;
+            let mut closed = false;
+            while i < chars.len() {
+                if chars[i] == '#' && chars.get(i + 1) == Some(&'>') {
+                    i += 2;
+                    closed = true;
+                    break;
+                }
+                i += 1;
+            }
+            if !closed {
+                return Err("missing block comment terminator '#>'".to_string());
+            }
+            out.push(' ');
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    Ok(out)
+}
+
 fn strip_comment(line: &str) -> String {
     let mut out = String::new();
     let mut sq = false;
@@ -4610,20 +4642,6 @@ mod tests {
     }
 
     #[test]
-    fn irm_chocolatey_bootstrap_answers_builtin_stub() {
-        let (out, r) = run_session(
-            "irm https://community.chocolatey.org/install.ps1 | iex",
-        );
-        assert!(r.is_ok());
-        assert!(
-            out.windows(b"built in".len())
-                .any(|w| w == b"built in"),
-            "out: {}",
-            String::from_utf8_lossy(&out)
-        );
-    }
-
-    #[test]
     fn location_stack_roundtrip() {
         let (out, r) = run_session(
             "New-Item -Path C:\\loc -ItemType Directory | Out-Null\ncd C:\\loc\npwd\npush-location C:\\ | Out-Null\npwd\npop-location\npwd",
@@ -4658,6 +4676,22 @@ mod tests {
         assert_eq!(out, b"awake\n");
         let (_, r) = run_session("Start-Sleep");
         assert!(r.unwrap_err().contains("usage"));
+    }
+
+    #[test]
+    fn block_comments_are_stripped() {
+        let (out, r) = run_session("<# leading block #>echo hi");
+        assert!(r.is_ok());
+        assert_eq!(out, b"hi\n");
+        let (out, r) = run_session("<#\n multi-line\n block\n#>\necho ok");
+        assert!(r.is_ok());
+        assert_eq!(out, b"ok\n");
+        // `<#` inside strings is literal text, not a comment.
+        let (out, r) = run_session("echo '<# not a comment'");
+        assert!(r.is_ok());
+        assert_eq!(out, b"<# not a comment\n");
+        let (_, r) = run_session("<# unterminated");
+        assert!(r.unwrap_err().contains("terminator"));
     }
 
     /// Pre-seeded WinFS run (script's `C:\...` files must already exist).

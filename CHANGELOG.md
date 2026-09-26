@@ -16,12 +16,14 @@ All notable changes to this project will be documented in this file.
   verifies its SHA-256 against the release `SHASUMS256.txt`, caches
   `node.exe` as `C:\bin\node.exe`, and extracts the bundled npm tree so
   bare `node -v` and `npm -v` work in `wincli shell`. `choco` needs no
-  bootstrap (the upstream installer requires .NET); the well-known
-  `install.ps1` URL answers with a built-in notice through `irm|iex`.
+  bootstrap. Remote scripts fetched with `irm|iex` always execute
+  genuinely (no URL is stubbed); scripts needing full PowerShell/.NET
+  fail with a clear error.
 - Added a `powershell -c <script>` shell passthrough so Windows install
   one-liners run as in-session PS1.
 - Added PS1 location cmdlets (`Get/Set/Push/Pop-Location` with
   `pwd`/`cd`/`pushd`/`popd`), `Get-Item`, and `Start-Sleep`.
+- Added PS1 `<# ... #>` block-comment support (multi-line, quote-aware).
 - Added a live `choco install nodejs` E2E test (`WINCLI_TEST_CHOCO=1`)
   asserting `node -v` prints `v24.21.0` and `npm -v` prints `11.19.0`.
 
