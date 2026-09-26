@@ -19,6 +19,8 @@ All notable changes to this project will be documented in this file.
   filesystem-state timings with `WINCLI_TIMINGS=1`.
 - `snapshot save` now defaults to the snapshot loaded by the shell or runner,
   and remembers a path given to an earlier save command.
+- If a guest process fails, a shell booted from a snapshot restores that last
+  saved guest disk instead of replacing it with an empty runner image.
 
 ### Removed
 

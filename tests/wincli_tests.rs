@@ -1151,6 +1151,37 @@ fn snapshot_is_the_only_way_to_carry_installed_packages_between_shells() {
     std::fs::remove_file(snapshot).ok();
 }
 
+#[test]
+fn failed_guest_execution_restores_the_loaded_snapshot_before_save() {
+    let source = artifact("packages").to_string_lossy().to_string();
+    let snapshot = tmp_path("failed-run.snap");
+    let snapshot_arg = format!("--snapshot={}", snapshot.display());
+    let (code, _, stderr) = run_shell_env(
+        &format!("install demo\nsnapshot save {}\nexit\n", snapshot.display()),
+        &[("WINCLI_SOURCE", source.as_str())],
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+
+    let bad_exe = artifact("exe/bad_import.exe").to_string_lossy().to_string();
+    let (code, _, stderr) = run_session_args(
+        &[snapshot_arg.clone(), "shell".to_string()],
+        &format!("{bad_exe}\nsnapshot save\nexit\n"),
+        &[("WINCLI_NATIVE_STRICT_IMPORTS", "1")],
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stderr.contains("guest disk restored from snapshot"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("unsupported native import"), "{stderr}");
+
+    let (code, stdout, stderr) =
+        run_session_args(&[snapshot_arg, "shell".to_string()], "demo\nexit\n", &[]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("demo 0.1.0"), "stdout: {stdout}");
+    std::fs::remove_file(snapshot).ok();
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn interactive_shell_inserts_text_at_the_cursor() {

@@ -246,8 +246,8 @@ impl Shell {
     }
 
     /// Run an EXE with the session filesystem; the FS comes back with the
-    /// exit code. A failed run resets the session to a clean runner image
-    /// (the native runner has consumed its filesystem state).
+    /// exit code. When native execution fails, restore the last saved snapshot
+    /// when one is active; otherwise start a clean runner image.
     fn run_exe_file(
         &mut self,
         path: &str,
@@ -281,14 +281,39 @@ impl Shell {
                 pe_load_started.elapsed().as_secs_f64() * 1000.0
             );
         }
-        let fs = std::mem::replace(&mut self.fs, WinFs::ephemeral_runner());
         let backend = self.backend.as_ref().map_err(Clone::clone)?;
+        let fs = std::mem::replace(&mut self.fs, WinFs::ephemeral_runner());
         let streaming = sink.is_some();
         let result = match sink {
             Some(sink) => backend.execute_streaming(&img, fs, prog, guest_args, sink),
             None => backend.execute(&img, fs, prog, guest_args),
-        }
-        .map_err(|e| format!("{} execution failed: {e}", backend.id()))?;
+        };
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                let message = format!("{} execution failed: {error}", backend.id());
+                if let Some(path) = self.snapshot_path.as_deref() {
+                    match crate::snapshot::load_file(&path.to_string_lossy()) {
+                        Ok(fs) => {
+                            self.fs = fs;
+                            return Err(format!(
+                                "{message}; guest disk restored from snapshot {}",
+                                path.display()
+                            ));
+                        }
+                        Err(restore_error) => {
+                            self.fs = WinFs::ephemeral_runner();
+                            return Err(format!(
+                                "{message}; could not restore snapshot {}: {restore_error}",
+                                path.display()
+                            ));
+                        }
+                    }
+                }
+                self.fs = WinFs::ephemeral_runner();
+                return Err(message);
+            }
+        };
         self.fs = result.fs;
         self.last_code = result.code as i32;
         if !streaming {
