@@ -202,6 +202,7 @@ mod imp {
         fn munmap(addr: *mut c_void, len: usize) -> i32;
         fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
         fn pipe(fds: *mut i32) -> i32;
+        fn socketpair(domain: i32, kind: i32, protocol: i32, fds: *mut i32) -> i32;
         fn fork() -> i32;
         #[cfg(test)]
         fn pause() -> i32;
@@ -381,8 +382,7 @@ mod imp {
         use super::{
             _exit, command_line_a, environment_block, linux_protection, load_native_child_image,
             native_acquire_srw_lock_exclusive, native_add_vectored_exception_handler,
-            native_close_handle, native_connect_socket, native_listen_socket,
-            native_create_process_w,
+            native_close_handle, native_connect_socket, native_create_process_w,
             native_create_waitable_timer_ex_w, native_decode_pointer,
             native_delete_critical_section, native_encode_pointer, native_enter_critical_section,
             native_extended_path, native_file_attributes, native_format_message_a,
@@ -406,17 +406,16 @@ mod imp {
             native_interlocked_pop_entry_slist, native_interlocked_push_entry_slist,
             native_ioctlsocket, native_is_processor_feature_present, native_is_valid_code_page,
             native_launch_spec, native_lc_map_string_w, native_leave_critical_section,
-            native_multi_byte_to_wide_char, native_process_prng, native_query_depth_slist,
-            native_query_performance_frequency, native_release_srw_lock_exclusive,
-            native_release_srw_lock_shared, native_resolve_code_page, native_rtl_get_version,
-            native_rtl_nt_status_to_dos_error, native_set_console_mode,
-            native_set_environment_variable_w, native_set_file_time, native_set_last_error,
-            native_shutdown_socket,
-            native_set_thread_stack_guarantee, native_set_unhandled_exception_filter,
-            native_set_waitable_timer, native_sleep_condition_variable_srw,
-            native_terminate_process, native_try_acquire_srw_lock_shared,
-            native_wait_for_single_object, native_wait_on_address,
-            native_wake_all_condition_variable, native_wake_by_address_all,
+            native_listen_socket, native_multi_byte_to_wide_char, native_process_prng,
+            native_query_depth_slist, native_query_performance_frequency,
+            native_release_srw_lock_exclusive, native_release_srw_lock_shared,
+            native_resolve_code_page, native_rtl_get_version, native_rtl_nt_status_to_dos_error,
+            native_set_console_mode, native_set_environment_variable_w, native_set_file_time,
+            native_set_last_error, native_set_thread_stack_guarantee,
+            native_set_unhandled_exception_filter, native_set_waitable_timer,
+            native_shutdown_socket, native_sleep_condition_variable_srw, native_terminate_process,
+            native_try_acquire_srw_lock_shared, native_wait_for_single_object,
+            native_wait_on_address, native_wake_all_condition_variable, native_wake_by_address_all,
             native_wide_char_to_multi_byte, native_write_console_w, native_wsa_get_last_error,
             native_wsa_inet_addr, parse_windows_command_line, process_ctx, uppercase_ascii_utf16,
             waitpid, write_process_information, NativeLaunchSpec, NativeMemoryStatus,
@@ -2680,6 +2679,66 @@ mod imp {
         overlapped: bool,
         completion: Option<(Arc<NativeCompletionPort>, u64)>,
     }
+
+    struct NativePipeEndpoint {
+        fd: i32,
+        name: String,
+        server: bool,
+        access: u32,
+    }
+
+    impl Drop for NativePipeEndpoint {
+        fn drop(&mut self) {
+            unsafe { close(self.fd) };
+        }
+    }
+
+    #[derive(Clone)]
+    struct NativePipeHandle {
+        endpoint: Arc<NativePipeEndpoint>,
+        pending_client: Option<Arc<NativePipeEndpoint>>,
+        overlapped: bool,
+        inheritable: bool,
+        access: u32,
+        mode: u32,
+        completion: Option<(Arc<NativeCompletionPort>, u64)>,
+        completion_modes: u8,
+    }
+
+    struct NativeNamedPipeTable {
+        handles: HashMap<u64, NativePipeHandle>,
+        pending_clients: HashMap<String, std::collections::VecDeque<Arc<NativePipeEndpoint>>>,
+        pending_io: HashMap<(u64, u64), Arc<AtomicBool>>,
+        next: u64,
+    }
+
+    impl NativeNamedPipeTable {
+        fn new() -> Self {
+            Self {
+                handles: HashMap::new(),
+                pending_clients: HashMap::new(),
+                pending_io: HashMap::new(),
+                next: 0xb000_0000,
+            }
+        }
+
+        fn clone_for_child(&self, inherit_handles: bool) -> Self {
+            Self {
+                handles: if inherit_handles {
+                    self.handles
+                        .iter()
+                        .filter(|(_, handle)| handle.inheritable)
+                        .map(|(handle, value)| (*handle, value.clone()))
+                        .collect()
+                } else {
+                    HashMap::new()
+                },
+                pending_clients: HashMap::new(),
+                pending_io: HashMap::new(),
+                next: self.next,
+            }
+        }
+    }
     struct NativeFind {
         names: Vec<String>,
         index: usize,
@@ -3253,6 +3312,227 @@ mod imp {
         semaphore.changed.notify_all();
         1
     }
+    extern "win64" fn native_create_job_object_w(_attributes: u64, name: *const u16) -> u64 {
+        if !name.is_null() {
+            native_set_last_error(50); // Named kernel objects are not mounted in this process.
+            return 0;
+        }
+        let Some(process) = process_ctx() else {
+            return 0;
+        };
+        let handle = process.completion_next.fetch_add(1, Ordering::AcqRel);
+        if process.job_objects.lock().is_ok_and(|mut jobs| {
+            jobs.insert(
+                handle,
+                NativeJobObject {
+                    limit_flags: 0,
+                    members: std::collections::HashSet::new(),
+                },
+            );
+            true
+        }) {
+            handle
+        } else {
+            0
+        }
+    }
+    extern "win64" fn native_create_job_object_a(attributes: u64, name: *const u8) -> u64 {
+        if !name.is_null() {
+            native_set_last_error(50);
+            return 0;
+        }
+        native_create_job_object_w(attributes, std::ptr::null())
+    }
+    extern "win64" fn native_set_information_job_object(
+        job: u64,
+        information_class: i32,
+        information: *const u8,
+        length: u32,
+    ) -> i32 {
+        if information.is_null() || information_class != 9 || length < 144 {
+            native_set_last_error(87);
+            return 0;
+        }
+        let flags = unsafe { ((information as usize + 24) as *const u32).read_unaligned() };
+        let Some(process) = process_ctx() else {
+            return 0;
+        };
+        let Some(_) = process.job_objects.lock().ok().and_then(|mut jobs| {
+            jobs.get_mut(&job).map(|job| {
+                job.limit_flags = flags;
+            })
+        }) else {
+            native_set_last_error(6);
+            return 0;
+        };
+        1
+    }
+    extern "win64" fn native_assign_process_to_job_object(job: u64, process_handle: u64) -> i32 {
+        let Some(process) = process_ctx() else {
+            return 0;
+        };
+        let is_child = process
+            .children
+            .lock()
+            .is_ok_and(|children| children.children.contains_key(&process_handle));
+        let is_current_process =
+            process_handle == PROCESS_TOKEN_HANDLE || process_handle == process.process_handle;
+        if !is_child && !is_current_process {
+            native_set_last_error(6);
+            return 0;
+        }
+        if process.job_objects.lock().is_ok_and(|mut jobs| {
+            jobs.get_mut(&job)
+                .is_some_and(|job| job.members.insert(process_handle))
+        }) {
+            1
+        } else {
+            native_set_last_error(6);
+            0
+        }
+    }
+    extern "win64" fn native_terminate_job_object(job: u64, exit_code: u32) -> i32 {
+        let Some(process) = process_ctx() else {
+            return 0;
+        };
+        let members = process.job_objects.lock().ok().and_then(|jobs| {
+            jobs.get(&job)
+                .map(|job| job.members.iter().copied().collect::<Vec<_>>())
+        });
+        let Some(members) = members else {
+            native_set_last_error(6);
+            return 0;
+        };
+        for member in members {
+            native_terminate_process(member, exit_code);
+        }
+        1
+    }
+    struct NativeWaitCallbackInvocation {
+        callback: u64,
+        context: u64,
+    }
+    extern "win64" fn native_wait_callback_entry(parameter: u64) -> u32 {
+        if parameter == 0 {
+            return 0;
+        }
+        let invocation = unsafe { Box::from_raw(parameter as *mut NativeWaitCallbackInvocation) };
+        let callback: unsafe extern "win64" fn(u64, i32) =
+            unsafe { std::mem::transmute(invocation.callback) };
+        unsafe { callback(invocation.context, 0) };
+        0
+    }
+    extern "win64" fn native_register_wait_for_single_object(
+        output: *mut u64,
+        object: u64,
+        callback: u64,
+        context: u64,
+        milliseconds: u32,
+        flags: u32,
+    ) -> i32 {
+        if output.is_null() || callback == 0 || milliseconds != u32::MAX || flags & !0x3f != 0 {
+            native_set_last_error(87);
+            return 0;
+        }
+        let Some(process) = process_ctx() else {
+            return 0;
+        };
+        let Some(child) = child_process(&process, object) else {
+            native_set_last_error(6);
+            return 0;
+        };
+        let handle = process.completion_next.fetch_add(1, Ordering::AcqRel);
+        let registration = Arc::new(NativeWaitRegistration {
+            callback,
+            context,
+            child,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            execute_once: flags & 0x8 != 0,
+        });
+        if !process.wait_registrations.lock().is_ok_and(|mut waits| {
+            waits.insert(handle, Arc::clone(&registration));
+            true
+        }) {
+            native_set_last_error(6);
+            return 0;
+        }
+        let worker_process = Arc::clone(&process);
+        if std::thread::Builder::new()
+            .name("wincli-process-wait".into())
+            .spawn(move || {
+                loop {
+                    if registration.cancelled.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let signaled = registration
+                        .child
+                        .state
+                        .lock()
+                        .is_ok_and(|state| state.is_some());
+                    if signaled {
+                        let invocation = Box::new(NativeWaitCallbackInvocation {
+                            callback: registration.callback,
+                            context: registration.context,
+                        });
+                        let parameter = Box::into_raw(invocation) as u64;
+                        if native_create_thread(
+                            0,
+                            0,
+                            native_wait_callback_entry as *const () as usize as u64,
+                            parameter,
+                            0,
+                            std::ptr::null_mut(),
+                        ) == 0
+                        {
+                            unsafe {
+                                drop(Box::from_raw(
+                                    parameter as *mut NativeWaitCallbackInvocation,
+                                ));
+                            }
+                        }
+                        if registration.execute_once {
+                            break;
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                if registration.execute_once {
+                    if let Ok(mut waits) = worker_process.wait_registrations.lock() {
+                        waits.remove(&handle);
+                    }
+                }
+            })
+            .is_err()
+        {
+            process
+                .wait_registrations
+                .lock()
+                .ok()
+                .map(|mut waits| waits.remove(&handle));
+            native_set_last_error(8);
+            return 0;
+        }
+        unsafe { output.write(handle) };
+        1
+    }
+    extern "win64" fn native_unregister_wait_ex(wait: u64, completion_event: u64) -> i32 {
+        let registration = process_ctx().and_then(|process| {
+            process
+                .wait_registrations
+                .lock()
+                .ok()
+                .and_then(|mut waits| waits.remove(&wait))
+        });
+        let Some(registration) = registration else {
+            native_set_last_error(6);
+            return 0;
+        };
+        registration.cancelled.store(true, Ordering::Release);
+        if completion_event != 0 && completion_event != u64::MAX {
+            let _ = native_set_event(completion_event);
+        }
+        1
+    }
     extern "win64" fn native_create_io_completion_port(
         file: u64,
         existing_port: u64,
@@ -3265,6 +3545,51 @@ mod imp {
         let Some(process) = process_ctx() else {
             return 0;
         };
+        if file != u64::MAX
+            && process
+                .named_pipes
+                .lock()
+                .is_ok_and(|pipes| pipes.handles.contains_key(&file))
+        {
+            let mut pipes = match process.named_pipes.lock() {
+                Ok(pipes) => pipes,
+                Err(_) => return 0,
+            };
+            let Some(pipe) = pipes.handles.get(&file) else {
+                native_set_last_error(6);
+                return 0;
+            };
+            if !pipe.overlapped || pipe.completion.is_some() {
+                native_set_last_error(87);
+                return 0;
+            }
+            let (handle, port) = if existing_port != 0 {
+                let Some(port) = process
+                    .completion_ports
+                    .lock()
+                    .ok()
+                    .and_then(|ports| ports.get(&existing_port).cloned())
+                else {
+                    native_set_last_error(6);
+                    return 0;
+                };
+                (existing_port, port)
+            } else {
+                let handle = process.completion_next.fetch_add(1, Ordering::AcqRel);
+                let port = Arc::new(NativeCompletionPort {
+                    queue: Mutex::new(std::collections::VecDeque::new()),
+                    ready: Condvar::new(),
+                });
+                if let Ok(mut ports) = process.completion_ports.lock() {
+                    ports.insert(handle, port.clone());
+                } else {
+                    return 0;
+                }
+                (handle, port)
+            };
+            pipes.handles.get_mut(&file).unwrap().completion = Some((port, completion_key));
+            return handle;
+        }
         if file == u64::MAX && existing_port != 0 {
             native_set_last_error(87);
             return 0;
@@ -3353,6 +3678,18 @@ mod imp {
         // The Windows API declares UCHAR flags. Ignore unrelated high bits in
         // RDX, which are not part of the argument on the x64 ABI.
         let modes = flags as u8;
+        if let Some(process) = process_ctx() {
+            if let Ok(mut pipes) = process.named_pipes.lock() {
+                if let Some(pipe) = pipes.handles.get_mut(&handle) {
+                    if modes & !0x3 != 0 {
+                        native_set_last_error(87);
+                        return 0;
+                    }
+                    pipe.completion_modes = modes;
+                    return 1;
+                }
+            }
+        }
         if handle & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG
             || modes & !0x3 != 0
             || unsafe { fcntl(handle as i32, 3) } < 0
@@ -3456,6 +3793,42 @@ mod imp {
                         overlapped,
                         bytes,
                         status: 0,
+                    });
+                    port.ready.notify_one();
+                }
+            }
+        }
+    }
+
+    fn native_complete_pipe_io(
+        pipe: &NativePipeHandle,
+        overlapped: u64,
+        bytes: u32,
+        status: u32,
+        event: Option<&Arc<NativeEvent>>,
+    ) {
+        if overlapped == 0 {
+            return;
+        }
+        unsafe {
+            (overlapped as *mut u64).write_unaligned(status as u64);
+            ((overlapped + 8) as *mut u64).write_unaligned(bytes as u64);
+        }
+        if let Some(event) = event {
+            native_signal_event(event);
+        }
+        if let Some((port, key)) = &pipe.completion {
+            let event_handle = unsafe { ((overlapped + 24) as *const u64).read_unaligned() };
+            // FILE_SKIP_COMPLETION_PORT_ON_SUCCESS only applies to I/O that
+            // completes before returning from the API. This helper is used
+            // only after an operation was queued as pending.
+            if event_handle & 1 == 0 {
+                if let Ok(mut queue) = port.queue.lock() {
+                    queue.push_back(NativeCompletion {
+                        key: *key,
+                        overlapped,
+                        bytes,
+                        status: status as u64,
                     });
                     port.ready.notify_one();
                 }
@@ -4081,6 +4454,27 @@ mod imp {
         let Some(process) = process_ctx() else {
             return 0;
         };
+        if let Ok(pipes) = process.named_pipes.lock() {
+            if pipes.handles.contains_key(&handle) {
+                let matching: Vec<_> = pipes
+                    .pending_io
+                    .iter()
+                    .filter(|((pipe_handle, ov), _)| {
+                        *pipe_handle == handle && (overlapped == 0 || *ov == overlapped)
+                    })
+                    .map(|(_, cancelled)| Arc::clone(cancelled))
+                    .collect();
+                drop(pipes);
+                if matching.is_empty() {
+                    native_set_last_error(1168);
+                    return 0;
+                }
+                for cancelled in matching {
+                    cancelled.store(true, Ordering::Release);
+                }
+                return 1;
+            }
+        }
         if !process
             .fs
             .lock()
@@ -4569,7 +4963,10 @@ mod imp {
         environment: Mutex<Vec<(String, String)>>,
         environment_block: Mutex<Vec<u16>>,
         std_handles: [AtomicU64; 3],
+        crt_fds: Mutex<HashMap<i32, u64>>,
+        crt_fd_next: AtomicI32,
         fs: Arc<Mutex<NativeFs>>,
+        named_pipes: Mutex<NativeNamedPipeTable>,
         error_mode: AtomicU32,
         pointer_cookie: u64,
         heap_allocations: Mutex<HashMap<u64, usize>>,
@@ -4587,6 +4984,8 @@ mod imp {
         events: Mutex<HashMap<u64, Arc<NativeEvent>>>,
         event_names: Mutex<HashMap<String, std::sync::Weak<NativeEvent>>>,
         event_next: AtomicU64,
+        job_objects: Mutex<HashMap<u64, NativeJobObject>>,
+        wait_registrations: Mutex<HashMap<u64, Arc<NativeWaitRegistration>>>,
         completion_ports: Mutex<HashMap<u64, Arc<NativeCompletionPort>>>,
         socket_completion_ports: Mutex<HashMap<u64, (Arc<NativeCompletionPort>, u64)>>,
         socket_completion_modes: Mutex<HashMap<u64, u8>>,
@@ -4618,6 +5017,19 @@ mod imp {
         count: Mutex<i32>,
         changed: Condvar,
         maximum: i32,
+    }
+
+    struct NativeJobObject {
+        limit_flags: u32,
+        members: std::collections::HashSet<u64>,
+    }
+
+    struct NativeWaitRegistration {
+        callback: u64,
+        context: u64,
+        child: Arc<NativeChildProcess>,
+        cancelled: Arc<AtomicBool>,
+        execute_once: bool,
     }
 
     struct NativeEvent {
@@ -4736,6 +5148,8 @@ mod imp {
                 AtomicU64::new(STD_HANDLE_BASE + 1),
                 AtomicU64::new(STD_HANDLE_BASE + 2),
             ],
+            crt_fds: Mutex::new(HashMap::new()),
+            crt_fd_next: AtomicI32::new(3),
             fs: Arc::new(Mutex::new(NativeFs {
                 fs: WinFs::new(),
                 handles: HashMap::new(),
@@ -4743,6 +5157,7 @@ mod imp {
                 file_attributes: HashMap::new(),
                 next: 0x100,
             })),
+            named_pipes: Mutex::new(NativeNamedPipeTable::new()),
             error_mode: AtomicU32::new(0),
             pointer_cookie: random_pointer_cookie(),
             heap_allocations: Mutex::new(HashMap::new()),
@@ -4760,6 +5175,8 @@ mod imp {
             events: Mutex::new(HashMap::new()),
             event_names: Mutex::new(HashMap::new()),
             event_next: AtomicU64::new(0x6100_0000),
+            job_objects: Mutex::new(HashMap::new()),
+            wait_registrations: Mutex::new(HashMap::new()),
             completion_ports: Mutex::new(HashMap::new()),
             socket_completion_ports: Mutex::new(HashMap::new()),
             socket_completion_modes: Mutex::new(HashMap::new()),
@@ -4945,9 +5362,36 @@ mod imp {
         })
     }
 
+    fn native_startup_std_handles(startup_info: u64, fallback: [u64; 3]) -> [u64; 3] {
+        if startup_info == 0 {
+            return fallback;
+        }
+        let flags = unsafe { ((startup_info + 60) as *const u32).read_unaligned() };
+        if flags & 0x100 == 0 {
+            return fallback;
+        }
+        unsafe {
+            [
+                (startup_info + 80) as *const u64,
+                (startup_info + 88) as *const u64,
+                (startup_info + 96) as *const u64,
+            ]
+            .map(|address| address.read_unaligned())
+        }
+    }
+
     fn load_native_child_image(fs: &WinFs, launch: &NativeLaunchSpec) -> Result<PeImage, u32> {
         let bytes = fs.read_file(&launch.application).map_err(|_| 2u32)?; // ERROR_FILE_NOT_FOUND
-        crate::pe::load(&bytes).map_err(|_| 193u32) // ERROR_BAD_EXE_FORMAT
+        crate::pe::load_lenient(&bytes).map_err(|error| {
+            if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+                eprintln!(
+                    "native child PE parse failed path={} len={} error={error}",
+                    launch.application,
+                    bytes.len()
+                );
+            }
+            193u32
+        }) // ERROR_BAD_EXE_FORMAT
     }
     fn fs_ctx() -> Option<Arc<Mutex<NativeFs>>> {
         process_ctx().map(|process| Arc::clone(&process.fs))
@@ -4965,18 +5409,130 @@ mod imp {
     }
 
     extern "win64" fn native_get_std_handle(which: u32) -> u64 {
-        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
-            eprintln!("native GetStdHandle which={which:#x}");
-        }
         let index = match which as i32 {
             -10 => 0,
             -11 => 1,
             -12 => 2,
             _ => return u64::MAX,
         };
-        process_ctx()
+        let handle = process_ctx()
             .map(|process| process.std_handles[index].load(Ordering::Acquire))
-            .unwrap_or(u64::MAX)
+            .unwrap_or(u64::MAX);
+        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+            eprintln!("native GetStdHandle which={which:#x} handle={handle:#x}");
+        }
+        handle
+    }
+    extern "win64" fn native_crt_get_osfhandle(fd: i32) -> u64 {
+        let Some(process) = process_ctx() else {
+            return u64::MAX;
+        };
+        let handle = if (0..3).contains(&fd) {
+            process.std_handles[fd as usize].load(Ordering::Acquire)
+        } else {
+            process
+                .crt_fds
+                .lock()
+                .ok()
+                .and_then(|fds| fds.get(&fd).copied())
+                .unwrap_or(u64::MAX)
+        };
+        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+            eprintln!("native CRT _get_osfhandle fd={fd} handle={handle:#x}");
+        }
+        handle
+    }
+    extern "win64" fn native_crt_open_osfhandle(handle: u64, _flags: i32) -> i32 {
+        let Some(process) = process_ctx() else {
+            return -1;
+        };
+        let valid = host_standard_fd(handle).is_some()
+            || process
+                .named_pipes
+                .lock()
+                .is_ok_and(|pipes| pipes.handles.contains_key(&handle))
+            || process
+                .fs
+                .lock()
+                .is_ok_and(|fs| fs.handles.contains_key(&handle))
+            || handle & 0xffff_ffff_0000_0000 == SOCKET_HANDLE_TAG;
+        if !valid {
+            native_set_last_error(6);
+            return -1;
+        }
+        let fd = process.crt_fd_next.fetch_add(1, Ordering::AcqRel);
+        if process.crt_fds.lock().is_ok_and(|mut fds| {
+            fds.insert(fd, handle);
+            true
+        }) {
+            if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+                eprintln!("native CRT _open_osfhandle handle={handle:#x} fd={fd}");
+            }
+            fd
+        } else {
+            -1
+        }
+    }
+    extern "win64" fn native_crt_close(fd: i32) -> i32 {
+        if fd < 0 {
+            native_set_last_error(9); // EBADF
+            return -1;
+        }
+        if (0..3).contains(&fd) {
+            return native_close_handle(native_crt_get_osfhandle(fd)) - 1;
+        }
+        let handle = process_ctx().and_then(|process| {
+            process
+                .crt_fds
+                .lock()
+                .ok()
+                .and_then(|mut fds| fds.remove(&fd))
+        });
+        match handle {
+            Some(handle) => native_close_handle(handle) - 1,
+            None => {
+                native_set_last_error(9);
+                -1
+            }
+        }
+    }
+    extern "win64" fn native_crt_read(fd: i32, buffer: *mut u8, length: u32) -> i32 {
+        if fd < 0 {
+            native_set_last_error(9);
+            return -1;
+        }
+        let handle = native_crt_get_osfhandle(fd);
+        if handle == u64::MAX {
+            native_set_last_error(9);
+            return -1;
+        }
+        let mut count = 0;
+        if native_read_file(handle, buffer, length, &mut count, 0) == 0 {
+            -1
+        } else {
+            count.min(i32::MAX as u32) as i32
+        }
+    }
+    extern "win64" fn native_crt_write(fd: i32, buffer: *const u8, length: u32) -> i32 {
+        if fd < 0 {
+            native_set_last_error(9);
+            return -1;
+        }
+        let handle = native_crt_get_osfhandle(fd);
+        if handle == u64::MAX {
+            native_set_last_error(9);
+            return -1;
+        }
+        let mut count = 0;
+        if native_write_file(handle, buffer, length, &mut count, 0) == 0 {
+            -1
+        } else {
+            count.min(i32::MAX as u32) as i32
+        }
+    }
+    extern "win64" fn native_crt_isatty(fd: i32) -> i32 {
+        let handle = native_crt_get_osfhandle(fd);
+        (handle != u64::MAX && native_get_file_type(handle) == 2) as i32
     }
 
     extern "win64" fn native_set_std_handle(which: u32, handle: u64) -> i32 {
@@ -5137,11 +5693,18 @@ mod imp {
     }
 
     extern "win64" fn native_get_file_type(handle: u64) -> u32 {
-        match host_standard_fd(handle) {
+        let kind = match host_standard_fd(handle) {
             Some(fd) if unsafe { isatty(fd) } != 0 => 0x0002,
             Some(_) => 0x0003, // anonymous launcher pipes
             None => {
-                if fs_ctx().is_some_and(|context| {
+                if process_ctx().is_some_and(|process| {
+                    process
+                        .named_pipes
+                        .lock()
+                        .is_ok_and(|pipes| pipes.handles.contains_key(&handle))
+                }) {
+                    0x0003 // FILE_TYPE_PIPE
+                } else if fs_ctx().is_some_and(|context| {
                     context
                         .lock()
                         .is_ok_and(|fs| fs.handles.contains_key(&handle))
@@ -5152,7 +5715,8 @@ mod imp {
                     0
                 }
             }
-        }
+        };
+        kind
     }
 
     extern "win64" fn native_get_module_file_name_w(
@@ -7347,6 +7911,87 @@ mod imp {
         unsafe { head.add(8).cast::<u16>().read() }
     }
 
+    fn native_submit_pipe_io(
+        process: &Arc<NativeProcessContext>,
+        handle: u64,
+        pipe: NativePipeHandle,
+        overlapped: u64,
+        event: Option<Arc<NativeEvent>>,
+        buffer: usize,
+        data: Option<Vec<u8>>,
+        length: usize,
+    ) -> Result<(), u32> {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        {
+            let mut pipes = process.named_pipes.lock().map_err(|_| 6u32)?;
+            if !pipe.overlapped || pipes.pending_io.contains_key(&(handle, overlapped)) {
+                return Err(87);
+            }
+            pipes
+                .pending_io
+                .insert((handle, overlapped), cancelled.clone());
+        }
+        native_set_overlapped_status(overlapped, STATUS_PENDING, 0);
+        let worker_pipe = pipe.clone();
+        let worker_process = Arc::clone(process);
+        let spawn = std::thread::Builder::new()
+            .name("wincli-named-pipe-io".into())
+            .spawn(move || {
+                let is_write = data.is_some();
+                let events = if is_write { 0x4 } else { 0x1 };
+                let (status, bytes) = loop {
+                    if cancelled.load(Ordering::Acquire) {
+                        break (0xc000_0120, 0); // STATUS_CANCELLED
+                    }
+                    let mut descriptor = NativePollFd {
+                        fd: worker_pipe.endpoint.fd,
+                        events,
+                        revents: 0,
+                    };
+                    let ready = unsafe { poll(&mut descriptor, 1, 25) };
+                    if ready < 0 {
+                        break (0xc000_0001, 0); // STATUS_UNSUCCESSFUL
+                    }
+                    if ready == 0 {
+                        continue;
+                    }
+                    let count = if let Some(ref payload) = data {
+                        unsafe {
+                            send(
+                                worker_pipe.endpoint.fd,
+                                payload.as_ptr().cast(),
+                                payload.len(),
+                                0x4000,
+                            )
+                        }
+                    } else {
+                        unsafe { recv(worker_pipe.endpoint.fd, buffer as *mut c_void, length, 0) }
+                    };
+                    if count < 0 {
+                        continue;
+                    }
+                    if count == 0 && !is_write && length != 0 {
+                        break (0xc000_014b, 0); // STATUS_PIPE_BROKEN
+                    }
+                    break (0, count as u32);
+                };
+                if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+                    eprintln!("native named-pipe completion handle={handle:#x} overlap={overlapped:#x} status={status:#x} bytes={bytes}");
+                }
+                native_complete_pipe_io(&worker_pipe, overlapped, bytes, status, event.as_ref());
+                if let Ok(mut pipes) = worker_process.named_pipes.lock() {
+                    pipes.pending_io.remove(&(handle, overlapped));
+                }
+            });
+        if spawn.is_err() {
+            if let Ok(mut pipes) = process.named_pipes.lock() {
+                pipes.pending_io.remove(&(handle, overlapped));
+            }
+            return Err(8);
+        }
+        Ok(())
+    }
+
     extern "win64" fn native_write_file(
         handle: u64,
         buf: *const u8,
@@ -7355,11 +8000,93 @@ mod imp {
         overlapped: u64,
     ) -> i32 {
         if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
-            eprintln!("native WriteFile handle={handle:#x} len={len}");
+            eprintln!("native WriteFile handle={handle:#x} len={len} overlap={overlapped:#x}");
         }
         if (buf.is_null() && len != 0) || len > 16 * 1024 * 1024 {
             native_set_last_error(87);
             return 0;
+        }
+        let pipe = process_ctx().and_then(|process| {
+            process
+                .named_pipes
+                .lock()
+                .ok()
+                .and_then(|pipes| pipes.handles.get(&handle).cloned())
+        });
+        if let Some(pipe) = pipe {
+            let can_write = if pipe.endpoint.server {
+                pipe.access & 0x3 & 0x2 != 0
+            } else {
+                pipe.access & 0x4000_0000 != 0
+            };
+            if !can_write {
+                native_set_last_error(5);
+                return 0;
+            }
+            if len == 0 {
+                if !written.is_null() {
+                    unsafe { written.write(0) };
+                }
+                return 1;
+            }
+            if pipe.overlapped && overlapped == 0 {
+                native_set_last_error(87);
+                return 0;
+            }
+            if overlapped != 0
+                && (overlapped & 7 != 0 || native_overlapped_status(overlapped) == STATUS_PENDING)
+            {
+                native_set_last_error(87);
+                return 0;
+            }
+            let event = match native_prepare_overlapped_event(overlapped) {
+                Ok(event) => event,
+                Err(error) => {
+                    native_set_last_error(error);
+                    return 0;
+                }
+            };
+            let payload = if len == 0 {
+                Vec::new()
+            } else {
+                unsafe { std::slice::from_raw_parts(buf, len as usize).to_vec() }
+            };
+            if overlapped != 0 {
+                let Some(process) = process_ctx() else {
+                    return 0;
+                };
+                if let Err(error) = native_submit_pipe_io(
+                    &process,
+                    handle,
+                    pipe,
+                    overlapped,
+                    event,
+                    0,
+                    Some(payload),
+                    len as usize,
+                ) {
+                    native_set_last_error(error);
+                    return 0;
+                }
+                native_set_last_error(997); // ERROR_IO_PENDING
+                return 0;
+            }
+            let count = unsafe {
+                send(
+                    pipe.endpoint.fd,
+                    payload.as_ptr().cast(),
+                    payload.len(),
+                    0x4000,
+                )
+            };
+            if count < 0 {
+                native_set_last_error(109);
+                return 0;
+            }
+            if !written.is_null() {
+                unsafe { written.write(count as u32) };
+            }
+            return 1;
         }
         if !matches!(host_standard_fd(handle), Some(1 | 2)) {
             let context = match fs_ctx() {
@@ -7525,11 +8252,11 @@ mod imp {
         command_line: *mut u16,
         _process_attributes: u64,
         _thread_attributes: u64,
-        _inherit_handles: i32,
+        inherit_handles: i32,
         _creation_flags: u32,
         environment: u64,
         current_directory: *const u16,
-        _startup_info: u64,
+        startup_info: u64,
         process_information: u64,
     ) -> i32 {
         if process_information == 0 {
@@ -7583,6 +8310,13 @@ mod imp {
         let image = match load_native_child_image(&fs.fs, &launch) {
             Ok(image) => image,
             Err(error) => {
+                if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+                    eprintln!(
+                        "native CreateProcessW could not load {} (exists={}): error={error}",
+                        launch.application,
+                        fs.fs.exists(&launch.application)
+                    );
+                }
                 native_set_last_error(error);
                 return 0;
             }
@@ -7617,6 +8351,9 @@ mod imp {
             native_set_last_error(6);
             return 0;
         };
+        let parent_std_handles =
+            std::array::from_fn(|index| parent.std_handles[index].load(Ordering::Acquire));
+        let child_std_handles = native_startup_std_handles(startup_info, parent_std_handles);
         let environment = explicit_environment.unwrap_or_else(|| {
             parent
                 .environment
@@ -7667,11 +8404,20 @@ mod imp {
                 environment_block: Mutex::new(environment_strings(&environment)),
                 environment: Mutex::new(environment),
                 std_handles: [
-                    AtomicU64::new(STD_HANDLE_BASE),
-                    AtomicU64::new(STD_HANDLE_BASE + 1),
-                    AtomicU64::new(STD_HANDLE_BASE + 2),
+                    AtomicU64::new(child_std_handles[0]),
+                    AtomicU64::new(child_std_handles[1]),
+                    AtomicU64::new(child_std_handles[2]),
                 ],
+                crt_fds: Mutex::new(HashMap::new()),
+                crt_fd_next: AtomicI32::new(3),
                 fs: Arc::clone(&context),
+                named_pipes: Mutex::new(
+                    parent
+                        .named_pipes
+                        .lock()
+                        .map(|pipes| pipes.clone_for_child(inherit_handles != 0))
+                        .unwrap_or_else(|_| NativeNamedPipeTable::new()),
+                ),
                 error_mode: AtomicU32::new(0),
                 pointer_cookie: random_pointer_cookie(),
                 heap_allocations: Mutex::new(HashMap::new()),
@@ -7689,6 +8435,8 @@ mod imp {
                 events: Mutex::new(HashMap::new()),
                 event_names: Mutex::new(HashMap::new()),
                 event_next: AtomicU64::new(0x6100_0000),
+                job_objects: Mutex::new(HashMap::new()),
+                wait_registrations: Mutex::new(HashMap::new()),
                 completion_ports: Mutex::new(HashMap::new()),
                 socket_completion_ports: Mutex::new(HashMap::new()),
                 socket_completion_modes: Mutex::new(HashMap::new()),
@@ -8256,6 +9004,25 @@ mod imp {
                 return 0;
             }
         }
+        if information_class == 16 && !information.is_null() && length >= 4 {
+            if let Some(pipe) = process_ctx().and_then(|process| {
+                process
+                    .named_pipes
+                    .lock()
+                    .ok()
+                    .and_then(|pipes| pipes.handles.get(&original).cloned())
+            }) {
+                let mode = if pipe.overlapped { 0 } else { 0x20 }; // FILE_SYNCHRONOUS_IO_NONALERT
+                unsafe { (information as *mut u32).write_unaligned(mode) };
+                if !io_status.is_null() {
+                    unsafe {
+                        (io_status as *mut u32).write_unaligned(0);
+                        (io_status.add(8) as *mut u64).write_unaligned(4);
+                    }
+                }
+                return 0; // STATUS_SUCCESS
+            }
+        }
         if information_class == 18 && !information.is_null() && length >= 96 {
             if let Some(context) = fs_ctx() {
                 if let Ok(ctx) = context.lock() {
@@ -8778,20 +9545,24 @@ mod imp {
 
     extern "win64" fn native_create_file_w(
         path: *const u16,
-        _access: u32,
-        _share: u32,
-        _sec: u64,
+        access: u32,
+        share: u32,
+        security: u64,
         creation: u32,
         flags: u32,
         _tmpl: u64,
     ) -> u64 {
         let path = match wide(path) {
-            Some(v) => v.strip_prefix(r"\\?\").unwrap_or(&v).to_string(),
+            Some(v) => v,
             None => {
                 native_set_last_error(87);
                 return u64::MAX;
             }
         };
+        if native_named_pipe_key(&path).is_some() {
+            return native_open_named_pipe(&path, access, share, flags, security);
+        }
+        let path = path.strip_prefix(r"\\?\").unwrap_or(&path).to_string();
         let context = match fs_ctx() {
             Some(v) => v,
             None => return u64::MAX,
@@ -8830,7 +9601,7 @@ mod imp {
         let h = ctx.next;
         ctx.next += 1;
         if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
-            eprintln!("native CreateFileW opened path={path} handle={h:#x} flags={flags:#x} access={_access:#x}");
+            eprintln!("native CreateFileW opened path={path} handle={h:#x} flags={flags:#x} access={access:#x}");
         }
         ctx.handles.insert(
             h,
@@ -8842,6 +9613,425 @@ mod imp {
             },
         );
         h
+    }
+
+    fn native_named_pipe_key(path: &str) -> Option<String> {
+        let path = path.replace('/', "\\").to_lowercase();
+        let name = path
+            .strip_prefix(r"\\.\pipe\")
+            .or_else(|| path.strip_prefix(r"\\?\pipe\"))?;
+        if name.is_empty()
+            || name.len() > 250
+            || name.contains(':')
+            || name
+                .split('\\')
+                .any(|component| component.is_empty() || matches!(component, "." | ".."))
+        {
+            return None;
+        }
+        Some(name.to_lowercase())
+    }
+
+    fn native_open_named_pipe(
+        path: &str,
+        access: u32,
+        share: u32,
+        flags: u32,
+        security: u64,
+    ) -> u64 {
+        let Some(name) = native_named_pipe_key(path) else {
+            native_set_last_error(2); // ERROR_FILE_NOT_FOUND
+            return u64::MAX;
+        };
+        if share != 0 {
+            native_set_last_error(87); // ERROR_INVALID_PARAMETER
+            return u64::MAX;
+        }
+        let Some(process) = process_ctx() else {
+            native_set_last_error(6);
+            return u64::MAX;
+        };
+        let Ok(mut pipes) = process.named_pipes.lock() else {
+            native_set_last_error(6);
+            return u64::MAX;
+        };
+        let Some(queue) = pipes.pending_clients.get_mut(&name) else {
+            native_set_last_error(2); // ERROR_FILE_NOT_FOUND
+            return u64::MAX;
+        };
+        let Some(pending) = queue.front() else {
+            native_set_last_error(231); // ERROR_PIPE_BUSY
+            return u64::MAX;
+        };
+        let server_access = pending.access;
+        let needs_read = access & 0x8000_0000 != 0;
+        let needs_write = access & 0x4000_0000 != 0;
+        let compatible = match server_access {
+            1 => needs_write, // PIPE_ACCESS_INBOUND
+            2 => needs_read,  // PIPE_ACCESS_OUTBOUND
+            3 => needs_read || needs_write,
+            _ => false,
+        };
+        if !compatible {
+            native_set_last_error(5); // ERROR_ACCESS_DENIED
+            return u64::MAX;
+        }
+        let endpoint = queue.pop_front().unwrap();
+        let connected = [0xffu8];
+        if unsafe {
+            send(
+                endpoint.fd,
+                connected.as_ptr().cast(),
+                connected.len(),
+                0x4000, // MSG_NOSIGNAL
+            )
+        } != 1
+        {
+            native_set_last_error(109); // ERROR_BROKEN_PIPE
+            return u64::MAX;
+        }
+        let handle = pipes.next;
+        pipes.next = pipes.next.saturating_add(1);
+        pipes.handles.insert(
+            handle,
+            NativePipeHandle {
+                overlapped: flags & 0x4000_0000 != 0,
+                endpoint,
+                pending_client: None,
+                inheritable: security != 0
+                    && unsafe { ((security + 16) as *const i32).read_unaligned() } != 0,
+                access,
+                mode: 0, // PIPE_READMODE_BYTE | PIPE_WAIT
+                completion: None,
+                completion_modes: 0,
+            },
+        );
+        handle
+    }
+
+    extern "win64" fn native_create_file_a(
+        path: *const u8,
+        access: u32,
+        share: u32,
+        security: u64,
+        creation: u32,
+        flags: u32,
+        template: u64,
+    ) -> u64 {
+        let Some(path) = (unsafe { ascii_z(path) }) else {
+            native_set_last_error(87);
+            return u64::MAX;
+        };
+        let wide_path: Vec<u16> = path.bytes().map(u16::from).chain([0]).collect();
+        native_create_file_w(
+            wide_path.as_ptr(),
+            access,
+            share,
+            security,
+            creation,
+            flags,
+            template,
+        )
+    }
+
+    extern "win64" fn native_create_named_pipe_w(
+        path: *const u16,
+        open_mode: u32,
+        pipe_mode: u32,
+        max_instances: u32,
+        _out_buffer_size: u32,
+        _in_buffer_size: u32,
+        _default_timeout: u32,
+        security: u64,
+    ) -> u64 {
+        let Some(path) = wide(path) else {
+            native_set_last_error(87);
+            return u64::MAX;
+        };
+        let Some(name) = native_named_pipe_key(&path) else {
+            native_set_last_error(123); // ERROR_INVALID_NAME
+            return u64::MAX;
+        };
+        let access = open_mode & 0x3;
+        // libuv adds WRITE_DAC so the pipe ACL can be adjusted for the
+        // inheritable client endpoint it passes to CreateProcessW.
+        let valid_open_flags = 0x4000_0000 | 0x0008_0000 | 0x0004_0000 | 0x8000_0000;
+        if !(1..=3).contains(&access)
+            || open_mode & !(0x3 | valid_open_flags) != 0
+            || pipe_mode & !0x1 != 0
+            || max_instances == 0
+            || max_instances > 255
+        {
+            native_set_last_error(87); // ERROR_INVALID_PARAMETER
+            return u64::MAX;
+        }
+        let Some(process) = process_ctx() else {
+            native_set_last_error(6);
+            return u64::MAX;
+        };
+        let Ok(mut pipes) = process.named_pipes.lock() else {
+            native_set_last_error(6);
+            return u64::MAX;
+        };
+        let existing = pipes
+            .handles
+            .values()
+            .filter(|handle| handle.endpoint.server && handle.endpoint.name == name)
+            .count();
+        let first_instance = open_mode & 0x0008_0000 != 0;
+        if first_instance && existing != 0 {
+            native_set_last_error(5); // ERROR_ACCESS_DENIED
+            return u64::MAX;
+        }
+        if existing >= max_instances as usize {
+            native_set_last_error(231); // ERROR_PIPE_BUSY
+            return u64::MAX;
+        }
+        let mut fds = [-1; 2];
+        if unsafe { socketpair(1, 1, 0, fds.as_mut_ptr()) } != 0 {
+            native_set_last_error(8); // ERROR_NOT_ENOUGH_MEMORY
+            return u64::MAX;
+        }
+        let overlapped = open_mode & 0x4000_0000 != 0;
+        let server_endpoint = Arc::new(NativePipeEndpoint {
+            fd: fds[0],
+            name: name.clone(),
+            server: true,
+            access,
+        });
+        let client_endpoint = Arc::new(NativePipeEndpoint {
+            fd: fds[1],
+            name: name.clone(),
+            server: false,
+            access,
+        });
+        let handle = pipes.next;
+        pipes.next = pipes.next.saturating_add(1);
+        pipes.handles.insert(
+            handle,
+            NativePipeHandle {
+                endpoint: server_endpoint,
+                pending_client: Some(client_endpoint.clone()),
+                overlapped,
+                inheritable: security != 0
+                    && unsafe { ((security + 16) as *const i32).read_unaligned() } != 0,
+                access,
+                mode: pipe_mode & 0x1,
+                completion: None,
+                completion_modes: 0,
+            },
+        );
+        pipes
+            .pending_clients
+            .entry(name)
+            .or_default()
+            .push_back(client_endpoint);
+        handle
+    }
+
+    extern "win64" fn native_create_named_pipe_a(
+        path: *const u8,
+        open_mode: u32,
+        pipe_mode: u32,
+        max_instances: u32,
+        out_buffer_size: u32,
+        in_buffer_size: u32,
+        default_timeout: u32,
+        security: u64,
+    ) -> u64 {
+        let Some(path) = (unsafe { ascii_z(path) }) else {
+            native_set_last_error(87);
+            return u64::MAX;
+        };
+        let wide_path: Vec<u16> = path.bytes().map(u16::from).chain([0]).collect();
+        native_create_named_pipe_w(
+            wide_path.as_ptr(),
+            open_mode,
+            pipe_mode,
+            max_instances,
+            out_buffer_size,
+            in_buffer_size,
+            default_timeout,
+            security,
+        )
+    }
+    extern "win64" fn native_connect_named_pipe(handle: u64, overlapped: u64) -> i32 {
+        let Some(process) = process_ctx() else {
+            return 0;
+        };
+        let pipe = process
+            .named_pipes
+            .lock()
+            .ok()
+            .and_then(|pipes| pipes.handles.get(&handle).cloned());
+        let Some(pipe) = pipe.filter(|pipe| pipe.endpoint.server) else {
+            native_set_last_error(6);
+            return 0;
+        };
+        if overlapped != 0 {
+            if overlapped & 7 != 0 || native_overlapped_status(overlapped) == STATUS_PENDING {
+                native_set_last_error(87);
+                return 0;
+            }
+        }
+        let event = if overlapped != 0 {
+            match native_prepare_overlapped_event(overlapped) {
+                Ok(event) => event,
+                Err(error) => {
+                    native_set_last_error(error);
+                    return 0;
+                }
+            }
+        } else {
+            None
+        };
+        let mut marker = [0u8; 1];
+        loop {
+            let count = unsafe {
+                recv(
+                    pipe.endpoint.fd,
+                    marker.as_mut_ptr().cast(),
+                    1,
+                    0x42, // MSG_PEEK | MSG_DONTWAIT
+                )
+            };
+            if count == 1 {
+                if marker[0] != 0xff {
+                    native_set_last_error(87);
+                    return 0;
+                }
+                unsafe { recv(pipe.endpoint.fd, marker.as_mut_ptr().cast(), 1, 0x40) };
+                if overlapped != 0 {
+                    native_complete_pipe_io(&pipe, overlapped, 0, 0, event.as_ref());
+                }
+                native_set_last_error(535); // ERROR_PIPE_CONNECTED
+                return 0;
+            }
+            if count == 0 {
+                native_set_last_error(109);
+                return 0;
+            }
+            if overlapped != 0 {
+                if let Err(error) =
+                    native_submit_pipe_connect(&process, handle, pipe, overlapped, event)
+                {
+                    native_set_last_error(error);
+                    return 0;
+                }
+                native_set_last_error(997); // ERROR_IO_PENDING
+                return 0;
+            }
+            if pipe.overlapped {
+                native_set_last_error(87);
+                return 0;
+            }
+            let mut descriptor = NativePollFd {
+                fd: pipe.endpoint.fd,
+                events: 0x1,
+                revents: 0,
+            };
+            if unsafe { poll(&mut descriptor, 1, -1) } < 0 {
+                native_set_last_error(6);
+                return 0;
+            }
+        }
+    }
+    fn native_submit_pipe_connect(
+        process: &Arc<NativeProcessContext>,
+        handle: u64,
+        pipe: NativePipeHandle,
+        overlapped: u64,
+        event: Option<Arc<NativeEvent>>,
+    ) -> Result<(), u32> {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        {
+            let mut pipes = process.named_pipes.lock().map_err(|_| 6u32)?;
+            if pipes.pending_io.contains_key(&(handle, overlapped)) {
+                return Err(87);
+            }
+            pipes
+                .pending_io
+                .insert((handle, overlapped), cancelled.clone());
+        }
+        native_set_overlapped_status(overlapped, STATUS_PENDING, 0);
+        let worker_process = Arc::clone(process);
+        let spawn = std::thread::Builder::new()
+            .name("wincli-named-pipe-connect".into())
+            .spawn(move || {
+                let status = loop {
+                    if cancelled.load(Ordering::Acquire) {
+                        break 0xc000_0120; // STATUS_CANCELLED
+                    }
+                    let mut descriptor = NativePollFd {
+                        fd: pipe.endpoint.fd,
+                        events: 0x1,
+                        revents: 0,
+                    };
+                    let ready = unsafe { poll(&mut descriptor, 1, 25) };
+                    if ready < 0 {
+                        break 0xc000_0001; // STATUS_UNSUCCESSFUL
+                    }
+                    if ready == 0 {
+                        continue;
+                    }
+                    let mut marker = [0u8; 1];
+                    let count = unsafe {
+                        recv(
+                            pipe.endpoint.fd,
+                            marker.as_mut_ptr().cast(),
+                            1,
+                            0x40, // MSG_DONTWAIT
+                        )
+                    };
+                    if count == 1 && marker[0] == 0xff {
+                        break 0;
+                    }
+                    break 0xc000_014b; // STATUS_PIPE_BROKEN
+                };
+                native_complete_pipe_io(&pipe, overlapped, 0, status, event.as_ref());
+                if let Ok(mut pipes) = worker_process.named_pipes.lock() {
+                    pipes.pending_io.remove(&(handle, overlapped));
+                }
+            });
+        if spawn.is_err() {
+            if let Ok(mut pipes) = process.named_pipes.lock() {
+                pipes.pending_io.remove(&(handle, overlapped));
+            }
+            return Err(8);
+        }
+        Ok(())
+    }
+    extern "win64" fn native_wait_named_pipe_w(path: *const u16, _timeout: u32) -> i32 {
+        let Some(path) = wide(path) else {
+            native_set_last_error(87);
+            return 0;
+        };
+        let Some(name) = native_named_pipe_key(&path) else {
+            native_set_last_error(123);
+            return 0;
+        };
+        let available = process_ctx().is_some_and(|process| {
+            process.named_pipes.lock().is_ok_and(|pipes| {
+                pipes
+                    .pending_clients
+                    .get(&name)
+                    .is_some_and(|queue| !queue.is_empty())
+            })
+        });
+        if available {
+            1
+        } else {
+            native_set_last_error(231); // ERROR_PIPE_BUSY
+            0
+        }
+    }
+    extern "win64" fn native_wait_named_pipe_a(path: *const u8, timeout: u32) -> i32 {
+        let Some(path) = (unsafe { ascii_z(path) }) else {
+            native_set_last_error(87);
+            return 0;
+        };
+        let wide: Vec<u16> = path.bytes().map(u16::from).chain([0]).collect();
+        native_wait_named_pipe_w(wide.as_ptr(), timeout)
     }
     fn native_file_attributes(is_directory: bool) -> u32 {
         if is_directory {
@@ -9292,11 +10482,86 @@ mod imp {
         ov: u64,
     ) -> i32 {
         if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
-            eprintln!("native ReadFile handle={h:#x} len={n} buf={buf:p}");
+            eprintln!("native ReadFile handle={h:#x} len={n} buf={buf:p} overlap={ov:#x}");
         }
         if buf.is_null() && n != 0 {
             native_set_last_error(87);
             return 0;
+        }
+        let pipe = process_ctx().and_then(|process| {
+            process
+                .named_pipes
+                .lock()
+                .ok()
+                .and_then(|pipes| pipes.handles.get(&h).cloned())
+        });
+        if let Some(pipe) = pipe {
+            let can_read = if pipe.endpoint.server {
+                pipe.access & 0x3 & 0x1 != 0
+            } else {
+                pipe.access & 0x8000_0000 != 0
+            };
+            if !can_read {
+                native_set_last_error(5);
+                return 0;
+            }
+            if n == 0 && (!pipe.overlapped || ov == 0) {
+                if !read_count.is_null() {
+                    unsafe { read_count.write(0) };
+                }
+                return 1;
+            }
+            if pipe.overlapped && ov == 0 {
+                native_set_last_error(87);
+                return 0;
+            }
+            if ov != 0 && (ov & 7 != 0 || native_overlapped_status(ov) == STATUS_PENDING) {
+                native_set_last_error(87);
+                return 0;
+            }
+            let event = match native_prepare_overlapped_event(ov) {
+                Ok(event) => event,
+                Err(error) => {
+                    native_set_last_error(error);
+                    return 0;
+                }
+            };
+            if ov != 0 {
+                let Some(process) = process_ctx() else {
+                    return 0;
+                };
+                if let Err(error) = native_submit_pipe_io(
+                    &process,
+                    h,
+                    pipe,
+                    ov,
+                    event,
+                    buf as usize,
+                    None,
+                    n as usize,
+                ) {
+                    native_set_last_error(error);
+                    return 0;
+                }
+                if !read_count.is_null() {
+                    unsafe { read_count.write(0) };
+                }
+                native_set_last_error(997); // ERROR_IO_PENDING
+                return 0;
+            }
+            let count = unsafe { recv(pipe.endpoint.fd, buf.cast(), n as usize, 0) };
+            if count < 0 {
+                native_set_last_error(109);
+                return 0;
+            }
+            if count == 0 && n != 0 {
+                native_set_last_error(109); // ERROR_BROKEN_PIPE
+                return 0;
+            }
+            if !read_count.is_null() {
+                unsafe { read_count.write(count as u32) };
+            }
+            return 1;
         }
         if let Some(fd) = host_standard_fd(h) {
             let count = unsafe { read(fd, buf.cast(), n as usize) };
@@ -9416,6 +10681,45 @@ mod imp {
             return 1;
         }
         let process = process_ctx();
+        if let Some(job) = process.as_ref().and_then(|process| {
+            process
+                .job_objects
+                .lock()
+                .ok()
+                .and_then(|mut jobs| jobs.remove(&h))
+        }) {
+            if job.limit_flags & 0x2000 != 0 {
+                for member in job.members {
+                    native_terminate_process(member, 1);
+                }
+            }
+            return 1;
+        }
+        if process.as_ref().is_some_and(|process| {
+            process.named_pipes.lock().is_ok_and(|mut pipes| {
+                let pending_client = pipes
+                    .handles
+                    .get(&h)
+                    .and_then(|pipe| pipe.pending_client.as_ref().map(Arc::clone));
+                if let Some(endpoint) = pending_client {
+                    if let Some(queue) = pipes.pending_clients.get_mut(&endpoint.name) {
+                        queue.retain(|pending| !Arc::ptr_eq(pending, &endpoint));
+                    }
+                }
+                let pending: Vec<_> = pipes
+                    .pending_io
+                    .iter()
+                    .filter(|((handle, _), _)| *handle == h)
+                    .map(|(_, cancelled)| Arc::clone(cancelled))
+                    .collect();
+                for cancelled in pending {
+                    cancelled.store(true, Ordering::Release);
+                }
+                pipes.handles.remove(&h).is_some()
+            })
+        }) {
+            return 1;
+        }
         if process.as_ref().is_some_and(|process| {
             process
                 .duplicate_handles
@@ -9766,9 +11070,7 @@ mod imp {
             "GetLongPathNameW" => Some(native_get_long_path_name_w as *const () as usize as u64),
             // WinFS has no short-name aliases, so the normalized DOS path is
             // the shortest spelling available for the path.
-            "GetShortPathNameW" => {
-                Some(native_get_long_path_name_w as *const () as usize as u64)
-            }
+            "GetShortPathNameW" => Some(native_get_long_path_name_w as *const () as usize as u64),
             "ReadDirectoryChangesW" => {
                 Some(native_read_directory_changes_w as *const () as usize as u64)
             }
@@ -9783,8 +11085,17 @@ mod imp {
             "SetNamedPipeHandleState" => {
                 Some(native_set_named_pipe_handle_state as *const () as usize as u64)
             }
+            "ConnectNamedPipe" => Some(native_connect_named_pipe as *const () as usize as u64),
+            "WaitNamedPipeW" => Some(native_wait_named_pipe_w as *const () as usize as u64),
+            "WaitNamedPipeA" => Some(native_wait_named_pipe_a as *const () as usize as u64),
+            "CreateNamedPipeW" => Some(native_create_named_pipe_w as *const () as usize as u64),
+            "CreateNamedPipeA" => Some(native_create_named_pipe_a as *const () as usize as u64),
+            "CreateFileA" => Some(native_create_file_a as *const () as usize as u64),
             "GetNamedPipeHandleStateW" => {
                 Some(native_get_named_pipe_handle_state_w as *const () as usize as u64)
+            }
+            "GetNamedPipeHandleStateA" => {
+                Some(native_get_named_pipe_handle_state_a as *const () as usize as u64)
             }
             "RegOpenKeyExW" => Some(native_reg_open_key_ex_w as *const () as usize as u64),
             "RegOpenKeyExA" => Some(native_reg_open_key_ex_a as *const () as usize as u64),
@@ -9812,6 +11123,26 @@ mod imp {
             }
             "CreateSemaphoreA" => Some(native_create_semaphore_a as *const () as usize as u64),
             "ReleaseSemaphore" => Some(native_release_semaphore as *const () as usize as u64),
+            "CreateJobObjectW" => Some(native_create_job_object_w as *const () as usize as u64),
+            "CreateJobObjectA" => Some(native_create_job_object_a as *const () as usize as u64),
+            "SetInformationJobObject" => {
+                Some(native_set_information_job_object as *const () as usize as u64)
+            }
+            "AssignProcessToJobObject" => {
+                Some(native_assign_process_to_job_object as *const () as usize as u64)
+            }
+            "TerminateJobObject" => Some(native_terminate_job_object as *const () as usize as u64),
+            "RegisterWaitForSingleObject" => {
+                Some(native_register_wait_for_single_object as *const () as usize as u64)
+            }
+            "UnregisterWaitEx" => Some(native_unregister_wait_ex as *const () as usize as u64),
+            "UnregisterWait" => Some(native_unregister_wait_ex as *const () as usize as u64),
+            "_get_osfhandle" => Some(native_crt_get_osfhandle as *const () as usize as u64),
+            "_open_osfhandle" => Some(native_crt_open_osfhandle as *const () as usize as u64),
+            "_close" | "close" => Some(native_crt_close as *const () as usize as u64),
+            "_read" | "read" => Some(native_crt_read as *const () as usize as u64),
+            "_write" | "write" => Some(native_crt_write as *const () as usize as u64),
+            "_isatty" | "isatty" => Some(native_crt_isatty as *const () as usize as u64),
             "CreateIoCompletionPort" => {
                 Some(native_create_io_completion_port as *const () as usize as u64)
             }
@@ -10191,26 +11522,306 @@ mod imp {
         {
             return 1;
         }
+        if let Some(process) = process_ctx() {
+            if let Ok(mut pipes) = process.named_pipes.lock() {
+                if let Some(pipe) = pipes.handles.get_mut(&handle) {
+                    if mode.is_null() {
+                        return 1;
+                    }
+                    let mode = unsafe { mode.read() };
+                    if mode & !0x3 != 0 {
+                        native_set_last_error(87);
+                        return 0;
+                    }
+                    pipe.mode = mode;
+                    return 1;
+                }
+            }
+        }
         native_set_last_error(6);
         0
     }
     extern "win64" fn native_get_named_pipe_handle_state_w(
         handle: u64,
         mode: *mut u32,
-        _current_instances: *mut u32,
+        current_instances: *mut u32,
         _max_collection_count: *mut u32,
         _collect_data_timeout: *mut u32,
         _user_name: *mut u16,
         _max_user_name_size: u32,
     ) -> i32 {
-        if !host_standard_fd(handle).is_some_and(|fd| unsafe { isatty(fd) } == 0) {
+        if host_standard_fd(handle).is_some_and(|fd| unsafe { isatty(fd) } == 0) {
+            if !mode.is_null() {
+                unsafe { mode.write(0) };
+            }
+            if !current_instances.is_null() {
+                unsafe { current_instances.write(1) };
+            }
+            return 1;
+        }
+        let Some(pipe) = process_ctx().and_then(|process| {
+            process
+                .named_pipes
+                .lock()
+                .ok()
+                .and_then(|pipes| pipes.handles.get(&handle).cloned())
+        }) else {
             native_set_last_error(6);
             return 0;
-        }
+        };
         if !mode.is_null() {
-            unsafe { mode.write(0) };
+            unsafe { mode.write(pipe.mode) };
         }
         1
+    }
+    extern "win64" fn native_get_named_pipe_handle_state_a(
+        handle: u64,
+        mode: *mut u32,
+        current_instances: *mut u32,
+        max_collection_count: *mut u32,
+        collect_data_timeout: *mut u32,
+        user_name: *mut u8,
+        max_user_name_size: u32,
+    ) -> i32 {
+        if !user_name.is_null() && max_user_name_size != 0 {
+            native_set_last_error(50); // ERROR_NOT_SUPPORTED: client identity is not modeled.
+            return 0;
+        }
+        native_get_named_pipe_handle_state_w(
+            handle,
+            mode,
+            current_instances,
+            max_collection_count,
+            collect_data_timeout,
+            std::ptr::null_mut(),
+            0,
+        )
+    }
+    #[cfg(test)]
+    mod named_pipe_tests {
+        use super::*;
+
+        fn wide(value: &str) -> Vec<u16> {
+            value.encode_utf16().chain([0]).collect()
+        }
+
+        fn server(name: &str, open_mode: u32) -> u64 {
+            let path = wide(&format!(r"\\.\pipe\{name}"));
+            native_create_named_pipe_w(
+                path.as_ptr(),
+                open_mode | 0x0004_0000, // WRITE_DAC, as used by libuv
+                0,
+                1,
+                4096,
+                4096,
+                0,
+                0,
+            )
+        }
+
+        fn client(name: &str, access: u32, flags: u32) -> u64 {
+            let path = wide(&format!(r"\\?\pipe\{name}"));
+            native_create_file_w(path.as_ptr(), access, 0, 0, 3, flags, 0)
+        }
+
+        #[test]
+        fn named_pipe_pair_connects_and_transfers_duplex_bytes() {
+            let name = format!("uv\\wincli-unit-{}", std::process::id());
+            let server = server(&name, 3);
+            assert_ne!(server, u64::MAX);
+            let client = client(&name, 0xc000_0000, 0);
+            assert_ne!(client, u64::MAX);
+            assert_eq!(native_connect_named_pipe(server, 0), 0);
+            assert_eq!(native_get_last_error(), 535);
+
+            let payload = b"duplex-pipe";
+            let mut written = 0;
+            assert_eq!(
+                native_write_file(
+                    server,
+                    payload.as_ptr(),
+                    payload.len() as u32,
+                    &mut written,
+                    0
+                ),
+                1
+            );
+            assert_eq!(written, payload.len() as u32);
+            let mut received = [0u8; 16];
+            let mut read = 0;
+            assert_eq!(
+                native_read_file(
+                    client,
+                    received.as_mut_ptr(),
+                    received.len() as u32,
+                    &mut read,
+                    0,
+                ),
+                1
+            );
+            assert_eq!(&received[..read as usize], payload);
+            assert_eq!(native_get_file_type(server), 3);
+            assert_eq!(native_close_handle(client), 1);
+            assert_eq!(native_close_handle(server), 1);
+        }
+
+        #[test]
+        fn named_pipe_checks_client_direction_and_supports_overlapped_completion() {
+            let name = format!("uv\\wincli-io-{}", std::process::id());
+            let server = server(&name, 2); // Server writes; client must read.
+            assert_ne!(server, u64::MAX);
+            assert_eq!(client(&name, 0x4000_0000, 0), u64::MAX);
+            assert_eq!(native_get_last_error(), 5);
+            let client = client(&name, 0x8000_0000, 0x4000_0000);
+            assert_ne!(client, u64::MAX);
+            assert_eq!(native_connect_named_pipe(server, 0), 0);
+            assert_eq!(native_get_last_error(), 535);
+
+            let port_handle = native_create_io_completion_port(u64::MAX, 0, 0, 1);
+            assert_ne!(port_handle, 0);
+            assert_eq!(
+                native_create_io_completion_port(client, port_handle, 0x1234, 1),
+                port_handle
+            );
+            assert_eq!(
+                native_set_file_completion_notification_modes(client, 0x3),
+                1
+            );
+            let mut overlapped = [0u64; 4];
+            let mut received = [0u8; 32];
+            assert_eq!(
+                native_read_file(
+                    client,
+                    received.as_mut_ptr(),
+                    received.len() as u32,
+                    std::ptr::null_mut(),
+                    overlapped.as_mut_ptr() as u64,
+                ),
+                0
+            );
+            assert_eq!(native_get_last_error(), 997);
+            let payload = b"async-pipe";
+            let mut written = 0;
+            assert_eq!(
+                native_write_file(
+                    server,
+                    payload.as_ptr(),
+                    payload.len() as u32,
+                    &mut written,
+                    0
+                ),
+                1
+            );
+            let process = process_ctx().unwrap();
+            let port = process
+                .completion_ports
+                .lock()
+                .unwrap()
+                .get(&port_handle)
+                .unwrap()
+                .clone();
+            let mut queue = port.queue.lock().unwrap();
+            while queue.is_empty() {
+                queue = port.ready.wait(queue).unwrap();
+            }
+            let completion = queue.pop_front().unwrap();
+            assert_eq!(completion.key, 0x1234);
+            assert_eq!(completion.overlapped, overlapped.as_ptr() as u64);
+            assert_eq!(completion.status, 0);
+            assert_eq!(completion.bytes, payload.len() as u32);
+            assert_eq!(&received[..completion.bytes as usize], payload);
+            assert_eq!(native_close_handle(client), 1);
+            assert_eq!(native_close_handle(server), 1);
+            assert_eq!(native_close_handle(port_handle), 1);
+        }
+
+        #[test]
+        fn named_pipe_overlapped_connect_completes_when_client_arrives_later() {
+            let name = format!("uv\\wincli-connect-{}", std::process::id());
+            let server = server(&name, 0x4000_0003);
+            assert_ne!(server, u64::MAX);
+            let port = native_create_io_completion_port(u64::MAX, 0, 0, 1);
+            assert_eq!(
+                native_create_io_completion_port(server, port, 0x5678, 1),
+                port
+            );
+            let mut overlapped = [0u64; 4];
+            assert_eq!(
+                native_connect_named_pipe(server, overlapped.as_mut_ptr() as u64),
+                0
+            );
+            assert_eq!(native_get_last_error(), 997);
+            let client = client(&name, 0xc000_0000, 0x4000_0000);
+            assert_ne!(client, u64::MAX);
+
+            let process = process_ctx().unwrap();
+            let completion_port = process
+                .completion_ports
+                .lock()
+                .unwrap()
+                .get(&port)
+                .unwrap()
+                .clone();
+            let mut queue = completion_port.queue.lock().unwrap();
+            while queue.is_empty() {
+                queue = completion_port.ready.wait(queue).unwrap();
+            }
+            let completion = queue.pop_front().unwrap();
+            assert_eq!(completion.key, 0x5678);
+            assert_eq!(completion.overlapped, overlapped.as_ptr() as u64);
+            assert_eq!(completion.status, 0);
+            assert_eq!(native_close_handle(client), 1);
+            assert_eq!(native_close_handle(server), 1);
+            assert_eq!(native_close_handle(port), 1);
+        }
+
+        #[test]
+        fn process_startup_inherits_the_requested_windows_standard_handles() {
+            let mut startup = [0u8; 104];
+            unsafe {
+                startup
+                    .as_mut_ptr()
+                    .add(60)
+                    .cast::<u32>()
+                    .write_unaligned(0x100);
+                startup
+                    .as_mut_ptr()
+                    .add(80)
+                    .cast::<u64>()
+                    .write_unaligned(0xb000_0001);
+                startup
+                    .as_mut_ptr()
+                    .add(88)
+                    .cast::<u64>()
+                    .write_unaligned(0xb000_0003);
+                startup
+                    .as_mut_ptr()
+                    .add(96)
+                    .cast::<u64>()
+                    .write_unaligned(0xb000_0005);
+            }
+            assert_eq!(
+                native_startup_std_handles(
+                    startup.as_ptr() as u64,
+                    [0x5000_0000, 0x5000_0001, 0x5000_0002]
+                ),
+                [0xb000_0001, 0xb000_0003, 0xb000_0005]
+            );
+            unsafe {
+                startup
+                    .as_mut_ptr()
+                    .add(60)
+                    .cast::<u32>()
+                    .write_unaligned(0)
+            };
+            assert_eq!(
+                native_startup_std_handles(
+                    startup.as_ptr() as u64,
+                    [0x5000_0000, 0x5000_0001, 0x5000_0002]
+                ),
+                [0x5000_0000, 0x5000_0001, 0x5000_0002]
+            );
+        }
     }
     extern "win64" fn native_reg_open_key_ex_w(
         _key: u64,
@@ -10809,80 +12420,70 @@ mod imp {
         }
         if std::thread::Builder::new()
             .name("wincli-accept-ex".into())
-            .spawn(move || {
-                loop {
-                    let mut descriptor = NativePollFd {
-                        fd: listener,
-                        events: 1,
-                        revents: 0,
-                    };
-                    let result = unsafe { poll(&mut descriptor, 1, 250) };
-                    if result < 0 {
-                        let error = std::io::Error::last_os_error()
-                            .raw_os_error()
-                            .unwrap_or(9);
-                        if error == 4 {
-                            continue;
-                        }
-                        return;
-                    }
-                    if result == 0 {
+            .spawn(move || loop {
+                let mut descriptor = NativePollFd {
+                    fd: listener,
+                    events: 1,
+                    revents: 0,
+                };
+                let result = unsafe { poll(&mut descriptor, 1, 250) };
+                if result < 0 {
+                    let error = std::io::Error::last_os_error().raw_os_error().unwrap_or(9);
+                    if error == 4 {
                         continue;
                     }
-                    if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
-                        eprintln!("native AcceptEx listener became readable");
-                    }
-                    let mut peer = [0u8; 128];
-                    let mut peer_length = peer.len() as u32;
-                    let connection = unsafe {
-                        accept(listener, peer.as_mut_ptr(), &mut peer_length)
-                    };
-                    if connection < 0 {
-                        let error = std::io::Error::last_os_error()
-                            .raw_os_error()
-                            .unwrap_or(9);
-                        if matches!(error, 4 | 11 | 35) {
-                            continue;
-                        }
-                        return;
-                    }
-                    if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
-                        eprintln!("native AcceptEx accepted fd={connection}");
-                    }
-                    if unsafe { dup2(connection, accepted) } < 0 {
-                        unsafe { close(connection) };
-                        return;
-                    }
-                    unsafe { close(connection) };
-                    let mut local = [0u8; 128];
-                    let mut local_length = local.len() as u32;
-                    let mut peer = [0u8; 128];
-                    let mut peer_length = peer.len() as u32;
-                    if unsafe { getsockname(accepted, local.as_mut_ptr(), &mut local_length) } != 0
-                        || unsafe {
-                            getpeername(accepted, peer.as_mut_ptr(), &mut peer_length)
-                        } != 0
-                    {
-                        return;
-                    }
-                    unsafe {
-                        ptr::copy_nonoverlapping(
-                            local.as_ptr(),
-                            (output + address_offsets.0) as *mut u8,
-                            16,
-                        );
-                        ptr::copy_nonoverlapping(
-                            peer.as_ptr(),
-                            (output + address_offsets.1) as *mut u8,
-                            16,
-                        );
-                    }
-                    native_post_pending_socket_completion(listen_socket, overlapped, 0);
-                    if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
-                        eprintln!("native AcceptEx completion posted");
-                    }
-                    break;
+                    return;
                 }
+                if result == 0 {
+                    continue;
+                }
+                if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+                    eprintln!("native AcceptEx listener became readable");
+                }
+                let mut peer = [0u8; 128];
+                let mut peer_length = peer.len() as u32;
+                let connection = unsafe { accept(listener, peer.as_mut_ptr(), &mut peer_length) };
+                if connection < 0 {
+                    let error = std::io::Error::last_os_error().raw_os_error().unwrap_or(9);
+                    if matches!(error, 4 | 11 | 35) {
+                        continue;
+                    }
+                    return;
+                }
+                if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+                    eprintln!("native AcceptEx accepted fd={connection}");
+                }
+                if unsafe { dup2(connection, accepted) } < 0 {
+                    unsafe { close(connection) };
+                    return;
+                }
+                unsafe { close(connection) };
+                let mut local = [0u8; 128];
+                let mut local_length = local.len() as u32;
+                let mut peer = [0u8; 128];
+                let mut peer_length = peer.len() as u32;
+                if unsafe { getsockname(accepted, local.as_mut_ptr(), &mut local_length) } != 0
+                    || unsafe { getpeername(accepted, peer.as_mut_ptr(), &mut peer_length) } != 0
+                {
+                    return;
+                }
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        local.as_ptr(),
+                        (output + address_offsets.0) as *mut u8,
+                        16,
+                    );
+                    ptr::copy_nonoverlapping(
+                        peer.as_ptr(),
+                        (output + address_offsets.1) as *mut u8,
+                        16,
+                    );
+                }
+                native_post_pending_socket_completion(listen_socket, overlapped, 0);
+                if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+                    eprintln!("native AcceptEx completion posted");
+                }
+                break;
             })
             .is_err()
         {
@@ -11976,7 +13577,10 @@ mod imp {
                 AtomicU64::new(STD_HANDLE_BASE + 1),
                 AtomicU64::new(STD_HANDLE_BASE + 2),
             ],
+            crt_fds: Mutex::new(HashMap::new()),
+            crt_fd_next: AtomicI32::new(3),
             fs,
+            named_pipes: Mutex::new(NativeNamedPipeTable::new()),
             error_mode: AtomicU32::new(0),
             pointer_cookie: random_pointer_cookie(),
             heap_allocations: Mutex::new(HashMap::new()),
@@ -11994,6 +13598,8 @@ mod imp {
             events: Mutex::new(HashMap::new()),
             event_names: Mutex::new(HashMap::new()),
             event_next: AtomicU64::new(0x6100_0000),
+            job_objects: Mutex::new(HashMap::new()),
+            wait_registrations: Mutex::new(HashMap::new()),
             completion_ports: Mutex::new(HashMap::new()),
             socket_completion_ports: Mutex::new(HashMap::new()),
             socket_completion_modes: Mutex::new(HashMap::new()),

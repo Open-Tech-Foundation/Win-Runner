@@ -11,6 +11,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added a native byte-mode named-pipe handle model for libuv, with `CreateNamedPipe`,
+  `CreateFile`, `ConnectNamedPipe`, synchronous and overlapped transfers, IOCP
+  completion, cancellation, pipe state/type queries, and inheritable child
+  standard handles. Message-mode pipes remain unsupported.
+- Added native job-object and process-wait shims used during Windows child
+  process startup.
 - Added native Winsock IOCP association, completion-mode handling, `ConnectEx`,
   and zero-byte overlapped receive readiness used by Node.js TLS and npm registry
   installs. Native E2E coverage can verify live registry installs.
