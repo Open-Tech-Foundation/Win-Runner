@@ -365,9 +365,9 @@ mod imp {
             native_delete_critical_section, native_encode_pointer, native_enter_critical_section,
             native_extended_path, native_file_attributes, native_format_message_a,
             native_format_message_w, native_free_environment_strings_w, native_get_acp,
-            native_get_computer_name_ex_w, native_get_console_mode, native_get_console_output_cp,
-            native_get_console_screen_buffer_info, native_get_cp_info,
-            native_get_current_directory_w, native_get_current_process,
+            native_get_computer_name_ex_w, native_get_console_cursor_info, native_get_console_mode,
+            native_get_console_output_cp, native_get_console_screen_buffer_info,
+            native_get_cp_info, native_get_current_directory_w, native_get_current_process,
             native_get_current_process_id, native_get_current_thread, native_get_current_thread_id,
             native_get_environment_strings_w, native_get_environment_variable_w,
             native_get_exit_code_process, native_get_file_type, native_get_full_path_name_w,
@@ -1206,6 +1206,10 @@ mod imp {
         fn import_binding_checks_the_dll_as_well_as_the_function() {
             assert!(super::supports_import("KERNEL32.dll", "ExitProcess"));
             assert!(super::supports_import("KERNEL32.dll", "GetShortPathNameW"));
+            assert!(super::supports_import(
+                "KERNEL32.dll",
+                "GetConsoleCursorInfo"
+            ));
             assert!(super::supports_import("WINMM.dll", "timeGetTime"));
             assert!(!super::supports_import("USER32.dll", "ExitProcess"));
             assert!(!super::supports_import("KERNEL32.dll", "timeGetTime"));
@@ -2056,6 +2060,15 @@ mod imp {
             );
             assert_eq!(i16::from_le_bytes(output[..2].try_into().unwrap()), 80);
             assert_eq!(i16::from_le_bytes(output[2..4].try_into().unwrap()), 25);
+        }
+
+        #[test]
+        fn supplies_standard_console_cursor_information() {
+            let mut output = [0u8; 8];
+            assert_eq!(native_get_console_cursor_info(1, output.as_mut_ptr()), 1);
+            assert_eq!(u32::from_le_bytes(output[..4].try_into().unwrap()), 25);
+            assert_eq!(i32::from_le_bytes(output[4..].try_into().unwrap()), 1);
+            assert_eq!(native_get_console_cursor_info(99, output.as_mut_ptr()), 0);
         }
 
         #[test]
@@ -7274,6 +7287,17 @@ mod imp {
     extern "win64" fn native_get_console_output_cp() -> u32 {
         native_get_acp()
     }
+    extern "win64" fn native_get_console_cursor_info(handle: u64, output: *mut u8) -> i32 {
+        if host_standard_fd(handle).is_none() || output.is_null() {
+            return 0;
+        }
+        // CONSOLE_CURSOR_INFO is { DWORD size; BOOL visible; }.
+        unsafe {
+            (output as *mut u32).write_unaligned(25);
+            (output.add(4) as *mut i32).write_unaligned(1);
+        }
+        1
+    }
     extern "win64" fn native_get_console_screen_buffer_info(handle: u64, output: *mut u8) -> i32 {
         if host_standard_fd(handle).is_none() || output.is_null() {
             return 0;
@@ -11774,6 +11798,9 @@ mod imp {
             "ProcessPrng" => Some(native_process_prng as *const () as usize as u64),
             "GetConsoleMode" => Some(native_get_console_mode as *const () as usize as u64),
             "GetConsoleOutputCP" => Some(native_get_console_output_cp as *const () as usize as u64),
+            "GetConsoleCursorInfo" => {
+                Some(native_get_console_cursor_info as *const () as usize as u64)
+            }
             "GetConsoleScreenBufferInfo" => {
                 Some(native_get_console_screen_buffer_info as *const () as usize as u64)
             }

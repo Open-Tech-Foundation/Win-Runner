@@ -8,6 +8,9 @@ All notable changes to this project will be documented in this file.
 
 - Removed the obsolete backend selection environment variable; WinCLI
   automatically uses the available platform backend.
+- Added interactive shell line editing with cursor movement, insertion,
+  deletion, and history navigation. Added a `GetConsoleCursorInfo` shim for
+  console applications such as npm.
 
 ### Removed
 

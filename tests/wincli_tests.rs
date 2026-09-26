@@ -1269,6 +1269,93 @@ fn run_shell_env(input: &str, envs: &[(&str, &str)]) -> (i32, String, String) {
     run_session_env("shell", input, envs)
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn interactive_shell_inserts_text_at_the_cursor() {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::time::{Duration, Instant};
+
+    let (mut master_fd, mut slave_fd) = (-1, -1);
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        },
+        0,
+        "open pseudo-terminal"
+    );
+    let mut master = unsafe { std::fs::File::from_raw_fd(master_fd) };
+    let slave = unsafe { std::fs::File::from_raw_fd(slave_fd) };
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wincli"))
+        .arg("shell")
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave.try_clone().unwrap()))
+        .spawn()
+        .expect("spawn interactive shell");
+    drop(slave);
+
+    let mut output = Vec::new();
+    let prompt = b"PS C:\\actions-runner\\_work> ";
+    let read_until =
+        |master: &mut std::fs::File, output: &mut Vec<u8>, condition: &dyn Fn(&[u8]) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline && !condition(output) {
+                let mut poll = libc::pollfd {
+                    fd: master.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                if unsafe { libc::poll(&mut poll, 1, 100) } <= 0 {
+                    continue;
+                }
+                let mut chunk = [0; 4096];
+                match master.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(count) => output.extend_from_slice(&chunk[..count]),
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+            condition(output)
+        };
+
+    assert!(
+        read_until(&mut master, &mut output, &|bytes| bytes
+            .windows(prompt.len())
+            .any(|window| window == prompt)),
+        "interactive prompt did not appear: {}",
+        String::from_utf8_lossy(&output)
+    );
+    master.write_all(b"exit 3\x1b[D1\r").unwrap();
+    let exited = read_until(&mut master, &mut output, &|bytes| {
+        bytes.windows(8).any(|window| window == b"\x1b[?2004l")
+    });
+    if !exited {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    assert!(
+        exited,
+        "shell did not exit after edited input: {}",
+        String::from_utf8_lossy(&output)
+    );
+    let status = child.wait().expect("wait for interactive shell");
+    assert!(
+        output
+            .windows(b"exit 13".len())
+            .any(|window| window == b"exit 13"),
+        "left-arrow insertion did not produce `exit 13`: {}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(status.code(), Some(13));
+}
+
 #[test]
 fn test_runner_executes_host_controlled_ephemeral_job() {
     let input = "New-Item C:\\actions-runner\\_work\\job.txt -Value ready\nGet-Content C:\\actions-runner\\_work\\job.txt\nexit\n";

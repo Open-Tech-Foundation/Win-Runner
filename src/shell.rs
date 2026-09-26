@@ -11,6 +11,7 @@
 //! the session (code = argument, else the last guest code).
 
 use crate::{backend, choco, inspect, install, pe, ps1, winfs::WinFs};
+use rustyline::{error::ReadlineError, DefaultEditor};
 use std::io::{BufRead, Write};
 
 /// What the REPL does after a line.
@@ -675,40 +676,62 @@ fn run_session(fs: WinFs, prompt_enabled: bool) -> (i32, WinFs) {
     let stdin = std::io::stdin();
     let tty = prompt_enabled && std::io::IsTerminal::is_terminal(&stdin);
     let mut shell = Shell::with_fs(fs);
-    let prompt = |shell: &Shell| {
-        if tty {
-            eprint!("PS {}> ", shell.cwd());
-            let _ = std::io::stderr().flush();
-        }
-    };
-    prompt(&shell);
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
-        };
-        let mut out = Vec::new();
-        match shell.exec_line(&line, &mut out) {
-            Ok(ShellFlow::Continue) => {
-                let _ = std::io::stdout().write_all(&out);
+    if tty {
+        let mut editor = match DefaultEditor::new() {
+            Ok(editor) => editor,
+            Err(error) => {
+                eprintln!("wincli: cannot initialize terminal input: {error}");
+                return (1, shell.fs);
             }
-            Ok(ShellFlow::Exit(code)) => {
-                let _ = std::io::stdout().write_all(&out);
+        };
+        loop {
+            let prompt = format!("PS {}> ", shell.cwd());
+            match editor.readline(&prompt) {
+                Ok(line) => {
+                    let _ = editor.add_history_entry(line.as_str());
+                    if let Some(code) = execute_input_line(&mut shell, &line) {
+                        return (code, shell.fs);
+                    }
+                }
+                Err(ReadlineError::Eof) => break,
+                Err(ReadlineError::Interrupted) => eprintln!("^C"),
+                Err(error) => {
+                    eprintln!("wincli: terminal input failed: {error}");
+                    break;
+                }
+            }
+        }
+    } else {
+        for line in stdin.lock().lines() {
+            let Ok(line) = line else { break };
+            if let Some(code) = execute_input_line(&mut shell, &line) {
                 return (code, shell.fs);
             }
-            Err(e) => {
-                // Flush partial output first (a real shell streams).
-                let _ = std::io::stdout().write_all(&out);
-                eprintln!("wincli: {e}");
-            }
         }
-        prompt(&shell);
     }
     (shell.last_code, shell.fs)
 }
 
-/// Interactive loop. Returns the process exit code. The prompt goes to
-/// stderr (stdout stays clean for pipes); EOF ends with the last code.
+fn execute_input_line(shell: &mut Shell, line: &str) -> Option<i32> {
+    let mut out = Vec::new();
+    match shell.exec_line(line, &mut out) {
+        Ok(ShellFlow::Continue) => {
+            let _ = std::io::stdout().write_all(&out);
+        }
+        Ok(ShellFlow::Exit(code)) => {
+            let _ = std::io::stdout().write_all(&out);
+            return Some(code);
+        }
+        Err(error) => {
+            let _ = std::io::stdout().write_all(&out);
+            eprintln!("wincli: {error}");
+        }
+    }
+    None
+}
+
+/// Interactive loop. Returns the process exit code. EOF ends with the last
+/// code; piped input remains line-oriented and does not activate the editor.
 pub fn run_shell() -> (i32, WinFs) {
     run_session(WinFs::ephemeral_runner(), true)
 }

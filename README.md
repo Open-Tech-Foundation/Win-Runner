@@ -239,5 +239,7 @@ the host terminal, and pipes (`wincli rg … | head`) behave identically.
   UTF-16→UTF-8 (invalid sequences → U+FFFD); `GetConsoleOutputCP`
   reports UTF-8. `GetConsoleMode` currently reports a basic console mode for
   standard handles, so some programs emit ANSI color into redirected output.
-- Cursor/screen-buffer APIs and Ctrl-C handling are non-goals; unsupported
-  console APIs fail clearly so guests fall back.
+- The interactive shell supports command-line cursor movement, insertion,
+  deletion, and history navigation. `GetConsoleCursorInfo` reports a visible
+  cursor; screen-buffer APIs beyond the basic dimensions and Ctrl-C handling
+  remain unsupported.

@@ -5,6 +5,12 @@ edition = "2021"
 description = "WinCLI: Linux-native PE32+ execution with in-memory WinFS and PS1 scripting"
 license = "Apache-2.0"
 
+[dependencies]
+rustyline = { version = "15", default-features = false }
+
+[dev-dependencies]
+libc = "0.2"
+
 [[bin]]
 name = "wincli"
 path = "src/main.rs"
