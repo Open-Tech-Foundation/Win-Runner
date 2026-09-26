@@ -2,10 +2,14 @@ use std::io::Write;
 use std::path::Path;
 use wincli::{backend, inspect, install, instance, pe, snapshot, winfs::WinFs};
 
+fn exit(code: i32) -> ! {
+    install::cleanup_process_cache();
+    std::process::exit(code)
+}
+
 fn usage() -> ! {
     eprintln!("usage:");
-    eprintln!("  wincli <app.exe|pkg> [args...]  run a Windows program (host path,");
-    eprintln!("                                  cached package, or C:\\bin\\<exe>)");
+    eprintln!("  wincli <app.exe> [args...]      run a Windows program from a host path");
     eprintln!("  wincli <script.ps1>             run a script (no args yet)");
     eprintln!("  wincli shell                    interactive ephemeral runner shell");
     eprintln!("  wincli runner                   run host-controlled job commands from stdin");
@@ -15,10 +19,9 @@ fn usage() -> ! {
     eprintln!("  wincli instance boot <name> [--snapshot=os.snap]");
     eprintln!("  wincli instance status|destroy <name>");
     eprintln!("  wincli instance exec <name> -- <command> [args...]");
-    eprintln!("  wincli inspect <app.exe|pkg>  report PE imports vs supported APIs");
-    eprintln!("  wincli install <pkg>          install a package into the cache");
-    eprintln!("env: WINCLI_CACHE (default ~/.cache/wincli), WINCLI_SOURCE (package dir)");
-    std::process::exit(2);
+    eprintln!("  wincli inspect <app.exe>      report PE imports vs supported APIs");
+    eprintln!("env: WINCLI_SOURCE (local package dir)");
+    exit(2);
 }
 
 fn main() {
@@ -27,10 +30,11 @@ fn main() {
         let snapshot = args.get(4).map(String::as_str);
         if let Err(e) = instance::run_daemon(&args[2], &args[3], snapshot) {
             eprintln!("wincli: instance daemon failed: {e}");
-            std::process::exit(1);
+            exit(1);
         }
         return;
     }
+    install::prepare_process_cache();
     let snapshot_path = args
         .get(1)
         .and_then(|arg| arg.strip_prefix("--snapshot="))
@@ -53,16 +57,12 @@ fn main() {
     if args.len() == 3 && args[1] == "inspect" {
         inspect_target(&args[2]);
     }
-    if args.len() == 3 && args[1] == "install" {
-        install_pkg(&args[2]);
-        return;
-    }
     if args.len() == 5 && args[1] == "snapshot" && args[2] == "build" {
         match snapshot::build_file(&args[3], &args[4]) {
             Ok(count) => println!("Built snapshot {} ({} files)", args[4], count),
             Err(e) => {
                 eprintln!("wincli: cannot build snapshot: {e}");
-                std::process::exit(1);
+                exit(1);
             }
         }
         return;
@@ -80,7 +80,7 @@ fn main() {
                     Ok(()) => println!("Instance {} is running", args[3]),
                     Err(e) => {
                         eprintln!("wincli: cannot boot instance: {e}");
-                        std::process::exit(1);
+                        exit(1);
                     }
                 }
                 return;
@@ -89,14 +89,14 @@ fn main() {
                 Ok(()) => println!("Instance {} is running", args[3]),
                 Err(e) => {
                     eprintln!("wincli: {e}");
-                    std::process::exit(1);
+                    exit(1);
                 }
             },
             "destroy" if args.len() == 4 => match instance::destroy(&args[3]) {
                 Ok(()) => println!("Instance {} destroyed", args[3]),
                 Err(e) => {
                     eprintln!("wincli: {e}");
-                    std::process::exit(1);
+                    exit(1);
                 }
             },
             "exec" if args.len() >= 6 && args[4] == "--" => {
@@ -104,17 +104,17 @@ fn main() {
                     Ok(value) => value,
                     Err(e) => {
                         eprintln!("wincli: {e}");
-                        std::process::exit(2);
+                        exit(2);
                     }
                 };
                 match instance::exec(&args[3], &command) {
                     Ok(result) => {
                         let _ = std::io::stdout().write_all(&result.stdout);
-                        std::process::exit(result.code);
+                        exit(result.code);
                     }
                     Err(e) => {
                         eprintln!("wincli: instance execution failed: {e}");
-                        std::process::exit(1);
+                        exit(1);
                     }
                 }
             }
@@ -129,7 +129,7 @@ fn main() {
         };
         let (code, fs) = wincli::shell::run_shell_with_fs(fs);
         save_snapshot_if_requested(save_snapshot_path.as_deref(), &fs);
-        std::process::exit(code);
+        exit(code);
     }
     if args.len() == 2 && args[1] == "runner" {
         let fs = match snapshot_path.as_deref() {
@@ -138,13 +138,13 @@ fn main() {
         };
         let (code, fs) = wincli::shell::run_runner_with_fs(fs);
         save_snapshot_if_requested(save_snapshot_path.as_deref(), &fs);
-        std::process::exit(code);
+        exit(code);
     }
     if snapshot_path.is_some() || save_snapshot_path.is_some() {
         eprintln!(
             "wincli: --snapshot/--save-snapshot are currently supported with shell or runner"
         );
-        std::process::exit(2);
+        exit(2);
     }
     if args.len() < 2 {
         usage();
@@ -173,7 +173,7 @@ fn load_snapshot(path: &str) -> WinFs {
         Ok(fs) => fs,
         Err(e) => {
             eprintln!("wincli: cannot boot snapshot {path}: {e}");
-            std::process::exit(1);
+            exit(1);
         }
     }
 }
@@ -184,14 +184,13 @@ fn save_snapshot_if_requested(path: Option<&str>, fs: &WinFs) {
         let bytes = snapshot::encode(fs);
         if let Err(e) = std::fs::write(path, &bytes) {
             eprintln!("wincli: cannot save snapshot {path}: {e}");
-            std::process::exit(1);
+            exit(1);
         }
         eprintln!("wincli: saved snapshot {path} ({} bytes)", bytes.len());
     }
 }
 
-/// Run target: host `.exe`/`.ps1` path, cached package name, or guest
-/// `C:\bin\<exe>` path. Host paths win; the rest resolve via the cache.
+/// Run target: host `.exe`/`.ps1` path.
 fn run_target(target: &str, guest_args: &[String]) {
     // 1. host file?
     if Path::new(target).is_file() {
@@ -205,51 +204,19 @@ fn run_target(target: &str, guest_args: &[String]) {
             "ps1" => {
                 if !guest_args.is_empty() {
                     eprintln!("wincli: script args not supported yet");
-                    std::process::exit(2);
+                    exit(2);
                 }
                 run_ps1_file(target);
             }
             _ => {
                 eprintln!("wincli: unsupported file type (expected .exe or .ps1): {target}");
-                std::process::exit(2);
+                exit(2);
             }
         }
         return;
     }
-    // 2. cached package (`name`, `name.exe`, or `C:\bin\name.exe`)?
-    let cache = install::cache_dir();
-    let name = guest_bin_name(target);
-    if let Some(exe_path) = install::find_cached(&cache, &name) {
-        let bytes = match std::fs::read(&exe_path) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("wincli: cannot read {}: {e}", exe_path.display());
-                std::process::exit(1);
-            }
-        };
-        let label = exe_path.display().to_string();
-        let img = match pe::load_lenient(&bytes) {
-            Ok(img) => img,
-            Err(e) => {
-                eprintln!("wincli: failed to load {label}: {e}");
-                std::process::exit(1);
-            }
-        };
-        run_with_runner(&img, &label, target, guest_args);
-        return;
-    }
-    eprintln!("wincli: nothing to run: {target} (no such file; try `wincli install {name}`)");
-    std::process::exit(1);
-}
-
-/// Strip a guest `C:\bin\` prefix (any case, either slash) to a package name.
-fn guest_bin_name(target: &str) -> String {
-    let t = target.replace('/', "\\");
-    if t.len() > 7 && t[..7].eq_ignore_ascii_case("c:\\bin\\") {
-        t[7..].to_string()
-    } else {
-        target.to_string()
-    }
+    eprintln!("wincli: nothing to run: {target} (no such host file; install packages inside `wincli shell`)");
+    exit(1);
 }
 
 fn run_exe_file(path: &str, prog: &str, guest_args: &[String]) {
@@ -259,14 +226,14 @@ fn run_exe_file(path: &str, prog: &str, guest_args: &[String]) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("wincli: cannot read {path}: {e}");
-            std::process::exit(1);
+            exit(1);
         }
     };
     let img = match pe::load_lenient(&data) {
         Ok(img) => img,
         Err(e) => {
             eprintln!("wincli: failed to load {path}: {e}");
-            std::process::exit(1);
+            exit(1);
         }
     };
     run_with_runner(&img, path, prog, guest_args);
@@ -278,17 +245,17 @@ fn run_with_runner(img: &pe::PeImage, path: &str, prog: &str, guest_args: &[Stri
         Ok(value) => value,
         Err(e) => {
             eprintln!("wincli: failed to select execution backend for {path}: {e}");
-            std::process::exit(1);
+            exit(1);
         }
     };
     match backend.execute(img, WinFs::new(), prog, guest_args) {
         Ok(result) => {
             let _ = std::io::stdout().write_all(&result.stdout);
-            std::process::exit(result.code as i32);
+            exit(result.code as i32);
         }
         Err(e) => {
             eprintln!("wincli: {} execution failed for {path}: {e}", backend.id());
-            std::process::exit(1);
+            exit(1);
         }
     }
 }
@@ -298,7 +265,7 @@ fn run_ps1_file(path: &str) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("wincli: cannot read {path}: {e}");
-            std::process::exit(1);
+            exit(1);
         }
     };
     let mut fs = WinFs::new();
@@ -311,30 +278,29 @@ fn run_ps1_file(path: &str) {
             // Flush partial output first (a real shell streams).
             let _ = std::io::stdout().write_all(&out);
             eprintln!("wincli: script error: {e}");
-            std::process::exit(1);
+            exit(1);
         }
     }
 }
 
-/// `wincli inspect <app.exe|pkg>`: print the compatibility report.
-/// A host file path wins; otherwise the package cache is consulted.
+/// `wincli inspect <app.exe>`: print the compatibility report for a host file.
 /// Exit 0 = runnable, 1 = missing imports or invalid file.
 fn inspect_target(target: &str) {
     let data = match read_inspect_target(target) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("wincli: {e}");
-            std::process::exit(1);
+            exit(1);
         }
     };
     match inspect::inspect_pe(&data) {
         Ok(report) => {
             print!("{}", inspect::render(&report));
-            std::process::exit(if report.runnable() { 0 } else { 1 });
+            exit(if report.runnable() { 0 } else { 1 });
         }
         Err(e) => {
             eprintln!("wincli: cannot inspect {target}: {e}");
-            std::process::exit(1);
+            exit(1);
         }
     }
 }
@@ -343,40 +309,7 @@ fn read_inspect_target(target: &str) -> Result<Vec<u8>, String> {
     if Path::new(target).is_file() {
         return std::fs::read(target).map_err(|e| format!("cannot read {target}: {e}"));
     }
-    let cache = install::cache_dir();
-    if let Some(p) = install::find_cached(&cache, target) {
-        return std::fs::read(&p).map_err(|e| format!("cannot read {}: {e}", p.display()));
-    }
     Err(format!(
-        "nothing to inspect: {target} (no such file; try `wincli install {target}`)"
+        "nothing to inspect: {target} (expected a host .exe path)"
     ))
-}
-
-/// `wincli install <pkg>`: local `$WINCLI_SOURCE` dir, else remote catalog.
-/// Guest-logical address is `C:\bin\<exe>`; bytes live in the host cache.
-fn install_pkg(name: &str) {
-    let cache = install::cache_dir();
-    let source = match install::source_from_env() {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("wincli: {e}");
-            std::process::exit(1);
-        }
-    };
-    let result = match source {
-        install::Source::Local(dir) => install::install(name, &dir, &cache),
-        install::Source::Winget => install::install_remote(name, &cache),
-    };
-    match result {
-        Ok(inst) => {
-            println!(
-                "Installed {} {} → {}",
-                inst.name, inst.version, inst.guest_path
-            );
-        }
-        Err(e) => {
-            eprintln!("wincli: install failed: {e}");
-            std::process::exit(1);
-        }
-    }
 }

@@ -3,7 +3,7 @@
 //!
 //! Each input line is, in order: an `exit`/`quit`, a host-only `@seed`
 //! injection directive, an `install`/`inspect` command, a host or guest
-//! `.exe`/`.ps1` file, a cached package
+//! `.exe`/`.ps1` file, a package installed into the guest session
 //! (`name`, `name.exe`, `C:\bin\name.exe` + args), or a PS1 statement run
 //! against the session filesystem. Guest console output streams exactly
 //! like the one-shot CLI paths; errors print as `wincli: ...` and the
@@ -114,6 +114,7 @@ impl Shell {
                     .get(1)
                     .ok_or_else(|| "usage: install <pkg>".to_string())?;
                 let inst = do_install(name)?;
+                self.seed_host_file(&inst.host_path.display().to_string(), &inst.guest_path)?;
                 out.extend_from_slice(
                     format!(
                         "Installed {} {} → {}\n",
@@ -139,7 +140,7 @@ impl Shell {
                 let target = argv
                     .get(1)
                     .ok_or_else(|| "usage: inspect <app.exe|pkg>".to_string())?;
-                let data = read_target_bytes(target)?;
+                let data = read_target_bytes(&self.fs, target)?;
                 let report = inspect::inspect_pe(&data)
                     .map_err(|e| format!("cannot inspect {target}: {e}"))?;
                 out.extend_from_slice(inspect::render(&report).as_bytes());
@@ -149,7 +150,7 @@ impl Shell {
         }
     }
 
-    /// Host file, cached package, or PS1 statement (in that order).
+    /// Host file, guest executable, or PS1 statement (in that order).
     fn run_target_line(
         &mut self,
         argv: &[String],
@@ -201,18 +202,8 @@ impl Shell {
                 }
             }
         }
-        let cache = install::cache_dir();
-        if let Some(exe_path) = install::find_cached(&cache, &guest_bin_name(target)) {
-            return self.run_exe_file(
-                &exe_path.display().to_string(),
-                target,
-                &argv[1..],
-                out,
-                sink,
-            );
-        }
-        // Bare `npm` runs the cached Node.js distribution's npm-cli.js
-        // through the cached node.exe (npm ships as JS, not a PE).
+        // Bare `npm` runs the Node.js distribution's npm-cli.js through the
+        // node.exe installed in this guest disk (npm ships as JS).
         if target.eq_ignore_ascii_case("npm") || target.eq_ignore_ascii_case("npm.cmd") {
             return self.run_npm(&argv[1..], out, sink);
         }
@@ -297,8 +288,8 @@ impl Shell {
             _ => Err("usage: snapshot save <file>".to_string()),
         }
     }
-    /// `choco install nodejs [--version=X.Y.Z]`: fetch the official
-    /// distribution, verify, and cache node.exe plus the bundled npm tree.
+    /// `choco install nodejs [--version=X.Y.Z]`: fetch and verify the official
+    /// distribution, then place node.exe and npm in this guest disk.
     /// `choco` itself is built into wincli (no bootstrap needed).
     fn do_choco(&mut self, argv: &[String], out: &mut Vec<u8>) -> Result<(), String> {
         match choco::parse_args(argv)? {
@@ -407,7 +398,7 @@ impl Shell {
 
     /// Copy a community app onto the guest disk. Keeping the app tree and
     /// PATH entry in WinFS makes it part of snapshots and removes runtime
-    /// dependence on the host package cache.
+    /// dependence on host-side package staging.
     fn seed_choco_app(&mut self, app: &choco::ChocoApp) -> Result<(), String> {
         let mut files = Vec::new();
         collect_host_files(&app.dir_host, &mut files)
@@ -494,8 +485,8 @@ impl Shell {
         Ok(())
     }
 
-    /// Run the cached npm CLI: seed the bundled npm tree into the session
-    /// once, then execute it with the cached node.exe.
+    /// Run npm from this guest disk; a fresh shell must install Node.js or
+    /// boot a snapshot that already contains it.
     fn run_npm(
         &mut self,
         guest_args: &[String],
@@ -509,28 +500,22 @@ impl Shell {
             args.extend_from_slice(guest_args);
             return self.run_exe_bytes(&node, "node", &args, out, sink);
         }
-        let cache = install::cache_dir();
-        let inst = choco::current_nodejs(&cache).ok_or_else(|| {
-            "nothing to run: npm (no nodejs; try `choco install nodejs`)".to_string()
+        let data = self.fs.read_file(node_guest).map_err(|_| {
+            "nothing to run: npm (Node.js is not installed in this session; run `choco install nodejs`)"
+                .to_string()
         })?;
-        if !inst.node_exe_host.is_file() {
+        if self.fs.read_file(npm_guest).is_err() {
             return Err(
-                "nothing to run: npm (cached node.exe is missing; try `choco install nodejs`)"
+                "nothing to run: npm (npm is not installed in this session; run `choco install nodejs`)"
                     .to_string(),
             );
         }
-        self.seed_host_file(&inst.node_exe_host.display().to_string(), node_guest)?;
-        self.seed_npm_tree(&inst)?;
-        let data = self
-            .fs
-            .read_file(node_guest)
-            .map_err(|e| format!("cannot read guest node.exe: {e}"))?;
         let mut args = vec![npm_guest.to_string()];
         args.extend_from_slice(guest_args);
         self.run_exe_bytes(&data, "node", &args, out, sink)
     }
 
-    /// One-way host-to-guest copy of the cached npm tree (`C:\npm`),
+    /// One-way host-to-guest copy of the npm tree (`C:\npm`),
     /// skipped when this session already seeded the same version.
     fn seed_npm_tree(&mut self, inst: &choco::NodeInstalled) -> Result<(), String> {
         const MARKER: &str = r"C:\npm\.wincli-seeded";
@@ -584,7 +569,7 @@ impl Shell {
     }
 }
 
-/// `wincli install <pkg>` shared by the CLI and the shell.
+/// Install a package into process-local staging before copying it into the guest disk.
 fn do_install(name: &str) -> Result<install::Installed, String> {
     let cache = install::cache_dir();
     let source = install::source_from_env()?;
@@ -595,28 +580,25 @@ fn do_install(name: &str) -> Result<install::Installed, String> {
     .map_err(|e| format!("install failed: {e}"))
 }
 
-/// Host file first, else the package cache (mirrors the CLI resolver).
-fn read_target_bytes(target: &str) -> Result<Vec<u8>, String> {
+/// Read a host executable or a file from this session's guest disk.
+fn read_target_bytes(fs: &WinFs, target: &str) -> Result<Vec<u8>, String> {
     if std::path::Path::new(target).is_file() {
         return std::fs::read(target).map_err(|e| format!("cannot read {target}: {e}"));
     }
-    let cache = install::cache_dir();
-    if let Some(p) = install::find_cached(&cache, target) {
-        return std::fs::read(&p).map_err(|e| format!("cannot read {}: {e}", p.display()));
+    for candidate in [
+        target.to_string(),
+        format!(r"C:\bin\{target}"),
+        format!(r"C:\bin\{target}.exe"),
+    ] {
+        if fs.is_file(&candidate) {
+            return fs
+                .read_file(&candidate)
+                .map_err(|e| format!("cannot read guest executable {candidate}: {e}"));
+        }
     }
     Err(format!(
-        "nothing to inspect: {target} (no such file; try `wincli install {target}`)"
+        "nothing to inspect: {target} (no such file; try `install {target}` inside `wincli shell`)"
     ))
-}
-
-/// Strip a guest `C:\bin\` prefix (any case, either slash) to a package name.
-fn guest_bin_name(target: &str) -> String {
-    let t = target.replace('/', "\\");
-    if t.len() > 7 && t[..7].eq_ignore_ascii_case("c:\\bin\\") {
-        t[7..].to_string()
-    } else {
-        target.to_string()
-    }
 }
 
 /// Recursively collect host files under `root` (for npm tree seeding).
@@ -757,10 +739,6 @@ pub fn run_runner_with_fs(fs: WinFs) -> (i32, WinFs) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Tests below mutate `WINCLI_CACHE`; serialize them.
-    static CACHE_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn run_lines(shell: &mut Shell, lines: &[&str]) -> (Vec<u8>, Result<ShellFlow, String>) {
         let mut out = Vec::new();
@@ -908,16 +886,10 @@ mod tests {
 
     #[test]
     fn npm_without_nodejs_hints_choco() {
-        let _guard = CACHE_ENV_LOCK.lock().unwrap();
-        let dir = std::env::temp_dir().join(format!("wincli-npm-hint-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("WINCLI_CACHE", &dir);
         let mut shell = Shell::new();
         let mut out = Vec::new();
         let err = shell.exec_line("npm -v", &mut out).unwrap_err();
         assert!(err.contains("choco install nodejs"), "err: {err}");
-        std::env::remove_var("WINCLI_CACHE");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

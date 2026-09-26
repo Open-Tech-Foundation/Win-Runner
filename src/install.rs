@@ -1,7 +1,7 @@
-//! Package install + cache.
+//! Package install + process-local staging.
 //!
-//! Layout under `$WINCLI_CACHE` (default `$XDG_CACHE_HOME/wincli` or
-//! `~/.cache/wincli`):
+//! Package downloads and extracted host-side staging live in a per-process
+//! temporary directory which is removed when WinCLI exits.
 //!
 //! ```text
 //! index/<name>.json     resolved metadata (version, exe, archive sha256)
@@ -16,24 +16,20 @@
 
 use std::path::{Path, PathBuf};
 
-/// Resolve the cache dir: `$WINCLI_CACHE`, else XDG, else `~/.cache/wincli`.
+/// Resolve package staging to a process-local temporary directory. The path
+/// never reuses another run's downloaded programs.
 pub fn cache_dir() -> PathBuf {
-    if let Ok(p) = std::env::var("WINCLI_CACHE") {
-        if !p.is_empty() {
-            return PathBuf::from(p);
-        }
-    }
-    if let Ok(x) = std::env::var("XDG_CACHE_HOME") {
-        if !x.is_empty() {
-            return PathBuf::from(x).join("wincli");
-        }
-    }
-    if let Ok(h) = std::env::var("HOME") {
-        if !h.is_empty() {
-            return PathBuf::from(h).join(".cache").join("wincli");
-        }
-    }
-    std::env::temp_dir().join("wincli-cache")
+    std::env::temp_dir().join(format!("wincli-session-{}", std::process::id()))
+}
+
+/// Remove a stale directory if the OS reused a PID from an unclean exit.
+pub fn prepare_process_cache() {
+    let _ = std::fs::remove_dir_all(cache_dir());
+}
+
+/// Delete process-local scratch at the end of a CLI process.
+pub fn cleanup_process_cache() {
+    let _ = std::fs::remove_dir_all(cache_dir());
 }
 
 /// Package source: a local directory, or the remote WinGet catalog.
@@ -103,13 +99,13 @@ pub struct Installed {
     pub version: String,
     /// File name of the exe inside the archive.
     pub exe_name: String,
-    /// Guest-logical install location (resolved to the host cache at run time).
+    /// Guest-logical install location (copied into WinFS after download).
     pub guest_path: String,
-    /// Host path of the cached runnable.
+    /// Host path of the runnable in temporary process staging.
     pub host_path: PathBuf,
 }
 
-/// Install a package from a local source dir into the cache.
+/// Install a package from a local source dir into temporary process staging.
 pub fn install(name: &str, source: &Path, cache: &Path) -> Result<Installed, String> {
     if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
         return Err(format!("invalid package name: {name}"));

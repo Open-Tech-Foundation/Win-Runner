@@ -1,6 +1,6 @@
 //! Test-artifact generator: builds the committed Windows guest programs in
 //! `tests/artifacts/exe/` from the `pe::builder` API, plus the offline
-//! package fixtures in `tests/artifacts/packages/` for `wincli install`.
+//! package fixtures in `tests/artifacts/packages/` for shell installation.
 //!
 //! Each `.exe` is a genuine PE32+ x86_64 binary using only the Win32 API
 //! surface WinCLI implements. The `fs_*.exe` guests are self-verifying:

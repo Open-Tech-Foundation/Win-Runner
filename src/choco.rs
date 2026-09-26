@@ -300,7 +300,7 @@ pub struct CommunityPkg {
 
 /// Download a feed package and verify its nupkg against the feed SHA-512.
 /// The returned bytes can be installed directly into WinFS without staging
-/// the package contents in the host cache.
+/// the package contents in temporary host staging.
 pub fn download_community_nupkg(
     id: &str,
     version: Option<&str>,

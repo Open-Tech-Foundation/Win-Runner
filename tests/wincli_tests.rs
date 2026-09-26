@@ -881,187 +881,6 @@ fn run_wincli_env(args: &[&str], envs: &[(&str, &str)]) -> (i32, String, String)
     )
 }
 
-fn isolated_cache(tag: &str) -> std::path::PathBuf {
-    let p = std::env::temp_dir().join(format!(
-        "wincli-cli-cache-{}-{}-{tag}",
-        std::process::id(),
-        counter()
-    ));
-    std::fs::create_dir_all(&p).unwrap();
-    p
-}
-
-#[test]
-fn test_install_inspect_run_offline_loop() {
-    let cache = isolated_cache("loop");
-    let src = artifact("packages").to_string_lossy().to_string();
-    let cc = cache.to_string_lossy().to_string();
-    let envs = [
-        ("WINCLI_CACHE", cc.as_ref()),
-        ("WINCLI_SOURCE", src.as_ref()),
-    ];
-
-    // install from the local fixture source (no network anywhere)
-    let (code, stdout, stderr) = run_wincli_env(&["install", "demo"], &envs);
-    assert_eq!(code, 0, "stderr: {stderr}");
-    assert_eq!(stdout, "Installed demo 0.1.0 → C:\\bin\\demo.exe\n");
-
-    // cache layout: content-addressed blob + runnable + index
-    assert!(cache.join("pkgs").join("demo.exe").is_file());
-    assert!(cache.join("index").join("demo.json").is_file());
-    let blobs: Vec<_> = std::fs::read_dir(cache.join("archives")).unwrap().collect();
-    assert_eq!(blobs.len(), 1);
-
-    // inspect by cached package name
-    let (code, stdout, _) = run_wincli_env(&["inspect", "demo"], &envs);
-    assert_eq!(code, 0);
-    assert!(stdout.contains("Supported imports: 3"));
-
-    // run the cached exe through the real CLI
-    let exe = cache.join("pkgs").join("demo.exe");
-    let (code, stdout, _) = run_wincli_env(&[exe.to_str().unwrap()], &envs);
-    assert_eq!(code, 0);
-    assert_eq!(stdout, "demo 0.1.0");
-
-    std::fs::remove_dir_all(&cache).ok();
-}
-
-#[test]
-fn test_install_unknown_package() {
-    let cache = isolated_cache("unknown");
-    let src = artifact("packages").to_string_lossy().to_string();
-    let cc = cache.to_string_lossy().to_string();
-    let (code, _, stderr) = run_wincli_env(
-        &["install", "nope"],
-        &[
-            ("WINCLI_CACHE", cc.as_ref()),
-            ("WINCLI_SOURCE", src.as_ref()),
-        ],
-    );
-    assert_eq!(code, 1);
-    assert!(
-        stderr.contains("package not found: nope"),
-        "stderr: {stderr}"
-    );
-    std::fs::remove_dir_all(&cache).ok();
-}
-
-#[test]
-fn test_install_missing_source_dir() {
-    let cache = isolated_cache("nosrc");
-    let cc = cache.to_string_lossy().to_string();
-    let bin = env!("CARGO_BIN_EXE_wincli");
-    let output = std::process::Command::new(bin)
-        .args(["install", "demo"])
-        .env("WINCLI_CACHE", &cc)
-        .env("WINCLI_SOURCE", "/nonexistent-source-dir-xyz")
-        .output()
-        .expect("spawn wincli");
-    assert_eq!(output.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    assert!(
-        stderr.contains("package source dir not found"),
-        "stderr: {stderr}"
-    );
-    std::fs::remove_dir_all(&cache).ok();
-}
-
-#[test]
-fn test_inspect_cache_miss_suggests_install() {
-    let cache = isolated_cache("miss");
-    let cc = cache.to_string_lossy().to_string();
-    let (code, _, stderr) =
-        run_wincli_env(&["inspect", "ghost-pkg"], &[("WINCLI_CACHE", cc.as_ref())]);
-    assert_eq!(code, 1);
-    assert!(
-        stderr.contains("wincli install ghost-pkg"),
-        "stderr: {stderr}"
-    );
-    std::fs::remove_dir_all(&cache).ok();
-}
-
-#[test]
-fn test_install_deflated_fixture_offline() {
-    // demoz.zip is deflated (method 8) with a nested path: exercises the
-    // inflate path with zero network.
-    let cache = isolated_cache("demoz");
-    let src = artifact("packages").to_string_lossy().to_string();
-    let cc = cache.to_string_lossy().to_string();
-    let envs = [
-        ("WINCLI_CACHE", cc.as_ref()),
-        ("WINCLI_SOURCE", src.as_ref()),
-    ];
-    let (code, stdout, stderr) = run_wincli_env(&["install", "demoz"], &envs);
-    assert_eq!(code, 0, "stderr: {stderr}");
-    assert_eq!(stdout, "Installed demoz 0.2.0 → C:\\bin\\demo.exe\n");
-    let exe = cache.join("pkgs").join("demoz.exe");
-    let (code, stdout, _) = run_wincli_env(&[exe.to_str().unwrap()], &envs);
-    assert_eq!(code, 0);
-    assert_eq!(stdout, "demoz 0.1.0");
-    std::fs::remove_dir_all(&cache).ok();
-}
-
-/// Live acceptance: real WinGet install of ripgrep, then the harness loop.
-/// Needs network + GitHub API quota. Run explicitly:
-/// `cargo test -- --ignored live_install_ripgrep`.
-#[test]
-#[ignore]
-fn live_install_ripgrep() {
-    let cache = isolated_cache("rg");
-    let cc = cache.to_string_lossy().to_string();
-    let bin = env!("CARGO_BIN_EXE_wincli");
-    // remote default: no WINCLI_SOURCE
-    let out = std::process::Command::new(bin)
-        .args(["install", "rg"])
-        .env("WINCLI_CACHE", &cc)
-        .env_remove("WINCLI_SOURCE")
-        .output()
-        .expect("spawn wincli install");
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    assert!(stdout.starts_with("Installed rg "), "{stdout}");
-    assert!(stdout.contains("→ C:\\bin\\rg.exe"), "{stdout}");
-    assert!(cache.join("pkgs").join("rg.exe").is_file());
-
-    // The native loader binds optional missing imports to fail-on-call stubs.
-    let out = std::process::Command::new(bin)
-        .args(["inspect", "rg"])
-        .env("WINCLI_CACHE", &cc)
-        .env_remove("WINCLI_SOURCE")
-        .output()
-        .expect("spawn wincli inspect");
-    assert!(matches!(out.status.code(), Some(0 | 1)));
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    assert!(stdout.contains("Imports:"), "{stdout}");
-    // ...and searches end to end in a shell session.
-    let (code, stdout, _) = run_shell_env(
-        "Set-Content C:\\log.txt 'error: disk full'\nAdd-Content C:\\log.txt 'info: all good'\nrg --color never --no-heading --no-line-number error C:\\log.txt\nexit\n",
-        &[("WINCLI_CACHE", cc.as_ref())],
-    );
-    assert_eq!(code, 0);
-    assert_eq!(stdout, "error: disk full\n");
-    // A directory walk depends on distinct BY_HANDLE_FILE_INFORMATION IDs.
-    let (code, stdout, stderr) = run_shell_env(
-        "New-Item C:\\data -ItemType Directory\nSet-Content C:\\data\\one.txt 'error: one'\nSet-Content C:\\data\\two.txt 'error: two'\nrg --color never --no-heading --no-line-number --threads 2 error C:\\data\nexit\n",
-        &[("WINCLI_CACHE", cc.as_ref())],
-    );
-    assert_eq!(code, 0, "stderr: {stderr}");
-    assert!(
-        stdout.contains("C:\\data\\one.txt:error: one\n"),
-        "{stdout}"
-    );
-    assert!(
-        stdout.contains("C:\\data\\two.txt:error: two\n"),
-        "{stdout}"
-    );
-    std::fs::remove_dir_all(&cache).ok();
-}
-
 // ---------- P3: argv + name resolution ----------
 
 #[test]
@@ -1088,43 +907,6 @@ fn test_argv_echo_cli() {
     let (code, stdout, stderr) = run_wincli_env(&[ps.as_str(), "hello", "a b", "--version"], &[]);
     assert_eq!(code, 0, "stderr: {stderr}");
     assert_eq!(stdout, format!("{ps} hello \"a b\" --version\n"));
-}
-
-#[test]
-fn test_bare_name_and_guest_path_resolution() {
-    let cache = isolated_cache("resolve");
-    let src = artifact("packages").to_string_lossy().to_string();
-    let cc = cache.to_string_lossy().to_string();
-    let envs = [
-        ("WINCLI_CACHE", cc.as_ref()),
-        ("WINCLI_SOURCE", src.as_ref()),
-    ];
-    // install demoz from fixtures, then run by bare name and guest path
-    let (code, _, stderr) = run_wincli_env(&["install", "demoz"], &envs);
-    assert_eq!(code, 0, "stderr: {stderr}");
-    let (code, stdout, stderr) = run_wincli_env(&["demoz"], &envs);
-    assert_eq!(code, 0, "stderr: {stderr}");
-    assert_eq!(stdout, "demoz 0.1.0");
-    let (code, stdout, stderr) = run_wincli_env(&["C:\\bin\\demoz.exe"], &envs);
-    assert_eq!(code, 0, "stderr: {stderr}");
-    assert_eq!(stdout, "demoz 0.1.0");
-    // argv0 reflects what was typed
-    let (code, _, _) = run_wincli_env(&["install", "demo"], &envs);
-    assert_eq!(code, 0);
-    std::fs::remove_dir_all(&cache).ok();
-}
-
-#[test]
-fn test_run_unknown_name_suggests_install() {
-    let cache = isolated_cache("runknown");
-    let cc = cache.to_string_lossy().to_string();
-    let (code, _, stderr) = run_wincli_env(&["ghost-tool"], &[("WINCLI_CACHE", cc.as_ref())]);
-    assert_eq!(code, 1);
-    assert!(
-        stderr.contains("wincli install ghost-tool"),
-        "stderr: {stderr}"
-    );
-    std::fs::remove_dir_all(&cache).ok();
 }
 
 #[test]
@@ -1241,10 +1023,14 @@ fn test_art_exe_rust_memcpy() {
 // ---------- interactive shell (piped stdin, no network) ----------
 
 fn run_session_env(mode: &str, input: &str, envs: &[(&str, &str)]) -> (i32, String, String) {
+    run_session_args(&[mode.to_string()], input, envs)
+}
+
+fn run_session_args(args: &[String], input: &str, envs: &[(&str, &str)]) -> (i32, String, String) {
     use std::io::Write;
     let bin = env!("CARGO_BIN_EXE_wincli");
     let mut child = std::process::Command::new(bin)
-        .arg(mode)
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1267,6 +1053,51 @@ fn run_session_env(mode: &str, input: &str, envs: &[(&str, &str)]) -> (i32, Stri
 
 fn run_shell_env(input: &str, envs: &[(&str, &str)]) -> (i32, String, String) {
     run_session_env("shell", input, envs)
+}
+
+#[test]
+fn shell_package_install_is_forgotten_without_a_snapshot() {
+    let source = artifact("packages").to_string_lossy().to_string();
+    let (code, stdout, stderr) = run_shell_env(
+        "install demo\ndemo\nexit\n",
+        &[("WINCLI_SOURCE", source.as_str())],
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("Installed demo 0.1.0"), "stdout: {stdout}");
+    assert!(stdout.contains("demo 0.1.0"), "stdout: {stdout}");
+
+    let (code, stdout, stderr) = run_shell_env("demo\nexit\n", &[]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.is_empty(), "stdout: {stdout}");
+    assert!(stderr.contains("nothing to run: demo"), "stderr: {stderr}");
+}
+
+#[test]
+fn snapshot_is_the_only_way_to_carry_installed_packages_between_shells() {
+    let source = artifact("packages").to_string_lossy().to_string();
+    let snapshot = tmp_path("installed.snap");
+    let ignored_cache = tmp_path("ignored-cache");
+    let snapshot_arg = format!("--snapshot={}", snapshot.display());
+    let (code, stdout, stderr) = run_shell_env(
+        &format!("install demo\nsnapshot save {}\nexit\n", snapshot.display()),
+        &[
+            ("WINCLI_SOURCE", source.as_str()),
+            ("WINCLI_CACHE", ignored_cache.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("Installed demo 0.1.0"), "stdout: {stdout}");
+    assert!(
+        !ignored_cache.exists(),
+        "WINCLI_CACHE must not persist staging"
+    );
+
+    let (code, stdout, stderr) =
+        run_session_args(&[snapshot_arg, "shell".to_string()], "demo\nexit\n", &[]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("demo 0.1.0"), "stdout: {stdout}");
+
+    std::fs::remove_file(snapshot).ok();
 }
 
 #[cfg(target_os = "linux")]
@@ -1516,13 +1347,8 @@ fn test_named_instance_boot_status_and_destroy() {
 
 #[test]
 fn test_shell_install_run_session_offline() {
-    let cache = isolated_cache("shell");
     let src = artifact("packages").to_string_lossy().to_string();
-    let cc = cache.to_string_lossy().to_string();
-    let envs = [
-        ("WINCLI_CACHE", cc.as_ref()),
-        ("WINCLI_SOURCE", src.as_ref()),
-    ];
+    let envs = [("WINCLI_SOURCE", src.as_ref())];
     // One session: install, run the package, share PS1 files across lines.
     let input = "install demo\ndemo\nNew-Item C:\\shell-t.txt -Value hi\nGet-Content C:\\shell-t.txt\n$v = 42\necho \"v=$v\"\nif ($v -eq 42) { echo if-ok }\n$langs = @('a', 'b')\nif ('a' -in $langs) { echo in-ok }\nswitch ('q') { 'q' { echo sw-ok } }\nfunction Hi($n) { echo \"hi-$n\" }\nforeach ($i in @('a', 'b')) { Hi $i }\n$ht = @{}\n$ht['k'] = 'v'\nif ($ht.ContainsKey('k')) { echo ht-ok }\ntry { echo try-ok } catch { echo bad }\n$cap = Join-Path 'C:\\x' 'y'\necho $cap\necho $cap | Out-Null\n$m = 'aBc'\necho $m.ToUpper()\n[Environment]::SetEnvironmentVariable('WINCLI_E2E_XYZ', 'e2e-ok', 'User')\necho $([Environment]::GetEnvironmentVariable('WINCLI_E2E_XYZ'))\necho '[{\"tag_name\": \"esrun@0.24.0\"}, {\"tag_name\": \"other\"}]' | ForEach-Object { $_.tag_name } | Where-Object { $_ -match \"esrun\" } | Select-Object -First 1\necho done\nexit\n";
     let (code, stdout, stderr) = run_shell_env(input, &envs);
@@ -1545,21 +1371,15 @@ fn test_shell_install_run_session_offline() {
     assert!(stdout.contains("e2e-ok\n"), "stdout: {stdout}");
     assert!(stdout.contains("esrun@0.24.0\n"), "stdout: {stdout}");
     assert!(stdout.ends_with("done\n"), "stdout: {stdout}");
-    assert!(cache.join("pkgs").join("demo.exe").is_file());
-    std::fs::remove_dir_all(&cache).ok();
 }
 
 #[test]
 fn test_shell_unknown_and_bad_exit() {
-    let cache = isolated_cache("shell-err");
-    let cc = cache.to_string_lossy().to_string();
-    let (code, stdout, stderr) =
-        run_shell_env("frobnicate\nexit abc\n", &[("WINCLI_CACHE", cc.as_ref())]);
+    let (code, stdout, stderr) = run_shell_env("frobnicate\nexit abc\n", &[]);
     // Errors print and the shell continues; a bad exit code is an error,
     // EOF ends the session cleanly.
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(stdout.is_empty(), "stdout: {stdout}");
     assert!(stderr.contains("install frobnicate"), "stderr: {stderr}");
     assert!(stderr.contains("exit: bad code"), "stderr: {stderr}");
-    std::fs::remove_dir_all(&cache).ok();
 }

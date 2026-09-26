@@ -11,6 +11,9 @@ All notable changes to this project will be documented in this file.
 - Added interactive shell line editing with cursor movement, insertion,
   deletion, and history navigation. Added a `GetConsoleCursorInfo` shim for
   console applications such as npm.
+- Removed the persistent host package cache and one-shot `wincli install`
+  command. Package staging and shell guest disks are disposable; snapshots are
+  the only way to carry installed programs or other guest files between runs.
 
 ### Removed
 

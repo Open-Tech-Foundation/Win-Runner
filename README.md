@@ -6,7 +6,7 @@ or host filesystem backing.
 
 ```bash
 wincli app.exe [args...]  # minimal x86_64 PE execution (PE32+, native console apps)
-wincli rg --version       # cached package by bare name (or C:\bin\rg.exe)
+wincli --snapshot=tools.snap shell # boot a saved guest disk
 wincli script.ps1         # minimal PowerShell-like script execution
 wincli shell              # interactive shell: one in-memory WinFS per session
 wincli inspect app.exe    # PE compatibility report: supported vs missing imports
@@ -97,27 +97,33 @@ wincli shell
 
 One in-memory WinFS for the whole session (files created by one command
 are visible to the next). Each line is a PS1 statement, `install`/`inspect`,
-`choco`, `powershell -c`, a host `.exe`/`.ps1` file, or a cached package
-with args — so `install rg` followed by `rg --version` works in one session. Errors print as
+`choco`, `powershell -c`, a host `.exe`/`.ps1` file, or a package installed
+in the session with args — so `install rg` followed by `rg --version` works.
+Errors print as
 `wincli: ...` without ending the session; `exit`/`quit` (or Ctrl-D) ends it
-with the last guest exit code. The prompt goes to stderr, keeping stdout
-clean for pipes.
+with the last guest exit code. Interactive input supports cursor movement,
+insertion, deletion, and history navigation. The prompt goes to stderr,
+keeping stdout clean for pipes.
 
 ## Packages
 
 ```bash
-wincli install rg        # remote WinGet catalog (default source)
-wincli install demo      # WINCLI_SOURCE=tests/artifacts/packages (local dir)
-wincli inspect rg        # inspect the cached package
+wincli shell
+install rg               # remote WinGet catalog (default source)
+rg --version
+install demo             # WINCLI_SOURCE=tests/artifacts/packages (local dir)
+demo
+snapshot save tools.snap
 ```
 
-`install` resolves `<source>/<name>.json` + `<name>.zip`, stores the blob
-content-addressed under `$WINCLI_CACHE/archives/`, extracts the exe to
-`pkgs/<name>.exe`, and reports the guest-logical address (`C:\bin\demo.exe`;
-bytes live in the host cache, the guest FS stays in-memory per run).
-Run targets resolve as: host path first, then cached package
-(`name`, `name.exe`, or `C:\bin\name.exe`); guest argv after the target
-reaches the program via `GetCommandLineW/A` (MSVC quoting).
+`install` resolves `<source>/<name>.json` + `<name>.zip`, stages the download
+in temporary process storage, and copies the executable into the current
+guest disk at `C:\bin\<name>.exe`. Both the staging area and guest disk are
+discarded when WinCLI exits unless you save a snapshot. Load that snapshot on
+the next run with `wincli --snapshot=tools.snap shell`; it is the only way to
+carry installed programs or other guest files between runs. `WINCLI_CACHE` is
+not supported. Guest argv reaches the program via `GetCommandLineW/A` (MSVC
+quoting).
 Remote WinGet-catalog sources, hash verification, and deflate land in P2;
 until then only local directories (`WINCLI_SOURCE=./dir`, stored zips).
 `tests/artifacts/packages/` holds offline fixtures built by
@@ -127,15 +133,17 @@ Remote sources: short aliases (`rg`, `fd`, `jq`, `bat`, `fzf`) or full
 WinGet IDs (`BurntSushi.ripgrep.MSVC`). Manifests come from winget-pkgs
 (version discovery via GitHub API, YAML via raw); only portable/zip x64
 installers are accepted, downloads are SHA-256-verified against the
-manifest, and re-installs never re-download (content-addressed cache).
+manifest. Download staging is reused only during the current process and is
+removed when WinCLI exits.
 
 ## Node.js via `choco`
 
 `choco` is built into the shell (no bootstrap needed). Installing
 Node.js fetches the official
 distribution zip from nodejs.org, verifies it against the release
-`SHASUMS256.txt`, caches `node.exe` as `C:\bin\node.exe`, and extracts
-the bundled npm tree so bare `npm` runs through the cached node:
+`SHASUMS256.txt`, and places `node.exe` plus the bundled npm tree in the
+current guest disk. A new shell starts blank, so Node.js is available only
+after installing it in that session or loading a snapshot that contains it:
 
 ```bash
 wincli shell

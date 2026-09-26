@@ -11,11 +11,9 @@ fn choco_install_nodejs_then_node_and_npm_report_pinned_versions() {
     if std::env::var("WINCLI_TEST_CHOCO").as_deref() != Ok("1") {
         return;
     }
-    let cache = std::env::temp_dir().join(format!("wincli-choco-e2e-{}", std::process::id()));
     let script = "powershell -c \"irm https://community.chocolatey.org/install.ps1|iex\"\nchoco install nodejs --version=\"24.21.0\"\nnode -v\nnpm -v\nexit\n";
     let mut child = Command::new(env!("CARGO_BIN_EXE_wincli"))
         .arg("shell")
-        .env("WINCLI_CACHE", &cache)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -28,7 +26,6 @@ fn choco_install_nodejs_then_node_and_npm_report_pinned_versions() {
         .write_all(script.as_bytes())
         .expect("send choco flow");
     let output = child.wait_with_output().expect("read shell output");
-    std::fs::remove_dir_all(&cache).ok();
     assert_eq!(
         output.status.code(),
         Some(0),
@@ -50,6 +47,27 @@ fn choco_install_nodejs_then_node_and_npm_report_pinned_versions() {
     assert!(
         stdout.lines().any(|line| line.trim() == "11.19.0"),
         "npm -v wrong: {stdout}"
+    );
+
+    let mut fresh = Command::new(env!("CARGO_BIN_EXE_wincli"))
+        .arg("shell")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start a fresh WinCLI shell");
+    fresh
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"node -v\nnpm -v\nexit\n")
+        .expect("check fresh shell has no Node.js");
+    let fresh = fresh.wait_with_output().expect("read fresh shell output");
+    let stderr = String::from_utf8_lossy(&fresh.stderr);
+    assert!(stderr.contains("nothing to run: node"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("Node.js is not installed in this session"),
+        "stderr: {stderr}"
     );
 }
 
