@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- Removed the obsolete backend selection environment variable; WinCLI
+  automatically uses the available platform backend.
+
 ### Removed
 
 - Removed the PE instruction emulator and the `wincli probe` command. Windows
@@ -116,7 +121,7 @@ All notable changes to this project will be documented in this file.
   standard pipe handles, file access queries, and worker thread exit handling
   used by the official Windows Node.js binary.
 - Added a real binary E2E check for Node.js 24.21.0 `--version` and simple
-  JavaScript evaluation with `WINCLI_BACKEND=native`.
+  JavaScript evaluation through the default native platform backend.
 - Added optional strict import validation with `WINCLI_NATIVE_STRICT_IMPORTS=1`.
 
 ### Changed

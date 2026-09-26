@@ -10,7 +10,7 @@ fn run_guest(bytes: &[u8], diagnostic: bool, strict: bool) -> std::process::Outp
     ));
     std::fs::write(&path, bytes).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_wincli"));
-    command.arg(&path).env("WINCLI_BACKEND", "native");
+    command.arg(&path);
     if diagnostic {
         command.env("WINCLI_NATIVE_DIAGNOSTIC", "1");
     }

@@ -13,7 +13,6 @@ fn run_shell(rg: &Path, commands: &str) -> Output {
     let script = commands.replace("{rg}", &format!("\"{}\"", executable.display()));
     let mut child = Command::new(env!("CARGO_BIN_EXE_wincli"))
         .arg("shell")
-        .env("WINCLI_BACKEND", "native")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -36,7 +35,6 @@ fn windows_ripgrep_runs_version_and_searches_guest_files() {
     let version = Command::new(env!("CARGO_BIN_EXE_wincli"))
         .arg(&rg)
         .arg("--version")
-        .env("WINCLI_BACKEND", "native")
         .output()
         .expect("run Windows ripgrep");
     assert_eq!(

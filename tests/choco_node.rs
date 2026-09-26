@@ -15,7 +15,6 @@ fn choco_install_nodejs_then_node_and_npm_report_pinned_versions() {
     let script = "powershell -c \"irm https://community.chocolatey.org/install.ps1|iex\"\nchoco install nodejs --version=\"24.21.0\"\nnode -v\nnpm -v\nexit\n";
     let mut child = Command::new(env!("CARGO_BIN_EXE_wincli"))
         .arg("shell")
-        .env("WINCLI_BACKEND", "native")
         .env("WINCLI_CACHE", &cache)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -64,7 +63,6 @@ fn choco_7zip_install_runs_and_survives_snapshot_reload() {
     let mut install = Command::new(env!("CARGO_BIN_EXE_wincli"))
         .arg(format!("--save-snapshot={}", snapshot.display()))
         .arg("shell")
-        .env("WINCLI_BACKEND", "native")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -93,7 +91,6 @@ fn choco_7zip_install_runs_and_survives_snapshot_reload() {
     let mut reload = Command::new(env!("CARGO_BIN_EXE_wincli"))
         .arg(format!("--snapshot={}", snapshot.display()))
         .arg("shell")
-        .env("WINCLI_BACKEND", "native")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

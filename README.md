@@ -15,8 +15,7 @@ wincli inspect app.exe    # PE compatibility report: supported vs missing import
 ### Native platform backend
 
 On Linux/x86-64, `wincli app.exe` executes PE instructions directly on the
-host CPU in a forked child. `WINCLI_BACKEND=native` and
-`WINCLI_BACKEND=native-linux-x64` select the same backend explicitly. Windows
+host CPU in a forked child. Windows
 imports require native shims; an unsupported import fails with its name if the
 guest calls it. Set `WINCLI_NATIVE_STRICT_IMPORTS=1` to reject unsupported
 imports before entry. `wincli inspect` lists static shim coverage. Other host platforms currently have no PE
@@ -190,8 +189,8 @@ The official Node.js 24.21.0 Windows x64 `node.exe` runs on the Linux native
 backend for version reporting and simple JavaScript evaluation:
 
 ```bash
-WINCLI_BACKEND=native wincli node.exe --version
-WINCLI_BACKEND=native wincli node.exe -e 'console.log(1 + 2)'
+wincli node.exe --version
+wincli node.exe -e 'console.log(1 + 2)'
 ```
 
 The downloaded binary is kept locally under `target/nodejs/` for development

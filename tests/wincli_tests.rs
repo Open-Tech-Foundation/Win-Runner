@@ -88,7 +88,6 @@ fn native_backend_runs_rust_hello_guest() {
     );
     let output = Command::new(bin)
         .arg(exe)
-        .env("WINCLI_BACKEND", "native")
         .output()
         .expect("spawn native backend");
     assert_eq!(output.status.code(), Some(0));
@@ -105,7 +104,6 @@ fn native_backend_runs_rust_argv_guest() {
     );
     let output = Command::new(bin)
         .args([exe, "hello", "a b", "--version"])
-        .env("WINCLI_BACKEND", "native")
         .output()
         .expect("spawn native backend");
     assert_eq!(output.status.code(), Some(0));
@@ -123,7 +121,6 @@ fn native_backend_runs_rust_fs_guest() {
     );
     let output = Command::new(bin)
         .arg(exe)
-        .env("WINCLI_BACKEND", "native")
         .output()
         .expect("spawn native backend");
     assert_eq!(output.status.code(), Some(0));
@@ -138,7 +135,6 @@ fn native_backend_runs_overlapped_iocp_guest() {
             env!("CARGO_MANIFEST_DIR"),
             "/tests/artifacts/exe/rust_iocp.exe"
         ))
-        .env("WINCLI_BACKEND", "native")
         .output()
         .expect("spawn native backend");
     assert_eq!(
@@ -158,7 +154,6 @@ fn native_backend_runs_rust_alloc_guest() {
     );
     let output = Command::new(bin)
         .arg(exe)
-        .env("WINCLI_BACKEND", "native")
         .output()
         .expect("spawn native backend");
     assert_eq!(output.status.code(), Some(0));
@@ -175,7 +170,6 @@ fn native_backend_runs_rust_alloc_fs_guest() {
     );
     let output = Command::new(bin)
         .arg(exe)
-        .env("WINCLI_BACKEND", "native")
         .output()
         .expect("spawn native backend");
     assert_eq!(output.status.code(), Some(0));
@@ -192,7 +186,6 @@ fn native_backend_runs_rust_hashmap_guest() {
     );
     let output = Command::new(bin)
         .arg(exe)
-        .env("WINCLI_BACKEND", "native")
         .output()
         .expect("spawn native backend");
     assert_eq!(output.status.code(), Some(0));
@@ -209,7 +202,6 @@ fn native_backend_runs_rust_lang_guest() {
     );
     let output = Command::new(bin)
         .arg(exe)
-        .env("WINCLI_BACKEND", "native")
         .output()
         .expect("spawn native backend");
     assert_eq!(output.status.code(), Some(0));
@@ -229,7 +221,6 @@ fn native_backend_runs_rust_fp_guest() {
     );
     let output = Command::new(bin)
         .arg(exe)
-        .env("WINCLI_BACKEND", "native")
         .output()
         .expect("spawn native backend");
     assert_eq!(output.status.code(), Some(0));
@@ -1050,14 +1041,14 @@ fn live_install_ripgrep() {
     // ...and searches end to end in a shell session.
     let (code, stdout, _) = run_shell_env(
         "Set-Content C:\\log.txt 'error: disk full'\nAdd-Content C:\\log.txt 'info: all good'\nrg --color never --no-heading --no-line-number error C:\\log.txt\nexit\n",
-        &[("WINCLI_CACHE", cc.as_ref()), ("WINCLI_BACKEND", "native")],
+        &[("WINCLI_CACHE", cc.as_ref())],
     );
     assert_eq!(code, 0);
     assert_eq!(stdout, "error: disk full\n");
     // A directory walk depends on distinct BY_HANDLE_FILE_INFORMATION IDs.
     let (code, stdout, stderr) = run_shell_env(
         "New-Item C:\\data -ItemType Directory\nSet-Content C:\\data\\one.txt 'error: one'\nSet-Content C:\\data\\two.txt 'error: two'\nrg --color never --no-heading --no-line-number --threads 2 error C:\\data\nexit\n",
-        &[("WINCLI_CACHE", cc.as_ref()), ("WINCLI_BACKEND", "native")],
+        &[("WINCLI_CACHE", cc.as_ref())],
     );
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(
@@ -1312,7 +1303,7 @@ fn test_native_runner_commits_guest_files_to_the_session() {
         "@seed {} C:\\actions-runner\\_work\\writer.exe\nC:\\actions-runner\\_work\\writer.exe\nGet-Content C:\\actions-runner\\_work\\native.txt\nexit\n",
         host_exe.display()
     );
-    let (code, stdout, stderr) = run_session_env("runner", &input, &[("WINCLI_BACKEND", "native")]);
+    let (code, stdout, stderr) = run_session_env("runner", &input, &[]);
     std::fs::remove_file(host_exe).ok();
     assert_eq!(code, 0, "stderr: {stderr}");
     assert_eq!(stdout, "persisted\n");

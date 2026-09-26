@@ -120,21 +120,12 @@ pub fn registered() -> [&'static dyn ExecutionBackend; 1] {
     [&NATIVE_LINUX_X64]
 }
 
-/// Choose the configured platform backend. `WINCLI_BACKEND=native` is an alias;
-/// `native-linux-x64` is the stable explicit identifier.
+/// Choose the built-in platform backend for this host.
 pub fn configured() -> Result<&'static dyn ExecutionBackend, String> {
-    let requested = std::env::var("WINCLI_BACKEND").unwrap_or_else(|_| "native-linux-x64".to_string());
-    let requested = match requested.as_str() {
-        "native" => "native-linux-x64",
-        value => value,
-    };
     let backend = registered()
         .into_iter()
-        .find(|backend| backend.id() == requested)
-        .ok_or_else(|| format!("unknown execution backend: {requested}"))?;
-    if !backend.available() {
-        return Err(format!("execution backend is unavailable on this host: {requested}"));
-    }
+        .find(|backend| backend.available())
+        .ok_or_else(|| "no execution backend is available on this host".to_string())?;
     Ok(backend)
 }
 

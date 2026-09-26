@@ -38,7 +38,6 @@ fn official_windows_node_runs_version_and_javascript_natively() {
     let output = Command::new(env!("CARGO_BIN_EXE_wincli"))
         .arg(path)
         .arg("--version")
-        .env("WINCLI_BACKEND", "native")
         .output()
         .expect("start native WinCLI");
     assert_eq!(
@@ -52,7 +51,6 @@ fn official_windows_node_runs_version_and_javascript_natively() {
     let output = Command::new(env!("CARGO_BIN_EXE_wincli"))
         .arg(path)
         .args(["-e", "console.log(1 + 2)"])
-        .env("WINCLI_BACKEND", "native")
         .output()
         .expect("evaluate JavaScript through native WinCLI");
     assert_eq!(
@@ -83,7 +81,6 @@ fn official_windows_node_serves_an_http_request_natively() {
     command
         .arg(node)
         .args(["-e", &source])
-        .env("WINCLI_BACKEND", "native")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     command.process_group(0);
@@ -159,7 +156,6 @@ fn official_windows_node_receives_winfs_directory_changes_natively() {
     let output = Command::new(env!("CARGO_BIN_EXE_wincli"))
         .arg(node)
         .args(["-e", source])
-        .env("WINCLI_BACKEND", "native")
         .output()
         .expect("run native Node fs.watch check");
     assert_eq!(
@@ -191,7 +187,6 @@ fn official_windows_node_reads_guest_file_metadata_and_contents() {
     );
     let mut child = Command::new(env!("CARGO_BIN_EXE_wincli"))
         .arg("shell")
-        .env("WINCLI_BACKEND", "native")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -260,7 +255,6 @@ fn official_windows_node_runs_the_staged_npm_cli_natively() {
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_wincli"))
         .arg("shell")
-        .env("WINCLI_BACKEND", "native")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -324,7 +318,6 @@ fn official_windows_node_installs_and_runs_a_real_npm_package_natively() {
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_wincli"))
         .arg("shell")
-        .env("WINCLI_BACKEND", "native")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -391,7 +384,6 @@ fn official_windows_node_installs_from_the_live_npm_registry_natively() {
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_wincli"))
         .arg("shell")
-        .env("WINCLI_BACKEND", "native")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
