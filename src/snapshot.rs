@@ -5,7 +5,7 @@
 
 use crate::{
     install,
-    winfs::{DiskStore, WinFs},
+    winfs::{DiskStore, SnapshotMetadata, WinFs},
 };
 use std::{
     fs::File,
@@ -18,7 +18,7 @@ const MARKER: &str = "wincli-snapshot/v1";
 const MARKER_CONTENTS: &[u8] = b"wincli snapshot v1\n";
 const FILE_PREFIX: &str = "files/C/";
 const DISK_MAGIC: &[u8; 8] = b"WFSDSK01";
-const DISK_VERSION: u32 = 1;
+const DISK_VERSION: u32 = 2;
 const DISK_HEADER_LEN: u64 = 36;
 const MAX_INDEX_SIZE: u64 = 256 * 1024 * 1024;
 const CHANGE_MAGIC: &[u8; 8] = b"WFSCHG01";
@@ -78,11 +78,13 @@ pub fn save_file(fs: &mut WinFs, output: &str) -> Result<usize, String> {
     }
 
     let directories = fs.snapshot_directories();
+    let metadata = fs.snapshot_metadata();
+    let symlinks = fs.snapshot_symlinks();
     let entry_count = directories
         .len()
         .checked_add(file_records.len())
         .ok_or("too many snapshot entries")?;
-    let index = encode_index(&directories, &file_records)?;
+    let index = encode_index(&directories, &file_records, &metadata, &symlinks)?;
     let index_offset = disk.append(&index)?;
     let mut header = vec![0u8; DISK_HEADER_LEN as usize];
     header[..8].copy_from_slice(DISK_MAGIC);
@@ -128,7 +130,12 @@ fn is_disk_file(path: &Path) -> Result<bool, String> {
     Ok(read == magic.len() && &magic == DISK_MAGIC)
 }
 
-fn encode_index(directories: &[String], files: &[(String, u64, u64)]) -> Result<Vec<u8>, String> {
+fn encode_index(
+    directories: &[String],
+    files: &[(String, u64, u64)],
+    metadata: &[SnapshotMetadata],
+    symlinks: &[(String, String, bool)],
+) -> Result<Vec<u8>, String> {
     let count = directories
         .len()
         .checked_add(files.len())
@@ -143,6 +150,29 @@ fn encode_index(directories: &[String], files: &[(String, u64, u64)]) -> Result<
         encode_index_path(&mut out, 1, path)?;
         out.extend_from_slice(&offset.to_le_bytes());
         out.extend_from_slice(&length.to_le_bytes());
+    }
+    out.extend_from_slice(
+        &u32::try_from(metadata.len())
+            .map_err(|_| "too many metadata entries")?
+            .to_le_bytes(),
+    );
+    for entry in metadata {
+        encode_index_path(&mut out, 0, &entry.path)?;
+        out.extend_from_slice(&entry.file_id.to_le_bytes());
+        out.extend_from_slice(&entry.metadata.attributes.to_le_bytes());
+        out.extend_from_slice(&entry.metadata.creation_time.to_le_bytes());
+        out.extend_from_slice(&entry.metadata.access_time.to_le_bytes());
+        out.extend_from_slice(&entry.metadata.write_time.to_le_bytes());
+    }
+    out.extend_from_slice(
+        &u32::try_from(symlinks.len())
+            .map_err(|_| "too many symbolic links")?
+            .to_le_bytes(),
+    );
+    for (path, target, directory) in symlinks {
+        encode_index_path(&mut out, 0, path)?;
+        encode_index_path(&mut out, 0, target)?;
+        out.push(u8::from(*directory));
     }
     Ok(out)
 }
@@ -163,7 +193,7 @@ fn load_disk_file(path: &Path) -> Result<WinFs, String> {
         return Err("invalid WinFS disk signature".to_string());
     }
     let version = u32::from_le_bytes(header[8..12].try_into().unwrap());
-    if version != DISK_VERSION {
+    if !(1..=DISK_VERSION).contains(&version) {
         return Err(format!("unsupported WinFS disk version {version}"));
     }
     let offset = u64::from_le_bytes(header[12..20].try_into().unwrap());
@@ -213,6 +243,43 @@ fn load_disk_file(path: &Path) -> Result<WinFs, String> {
             }
             _ => return Err(format!("unknown WinFS disk index record {kind}")),
         }
+    }
+    if version >= 2 {
+        let metadata_count = take_u32(&index, &mut cursor)? as usize;
+        if metadata_count > 10_000_000 {
+            return Err("WinFS disk has too many metadata entries".to_string());
+        }
+        let mut metadata = Vec::with_capacity(metadata_count);
+        for _ in 0..metadata_count {
+            let _kind = take_u8(&index, &mut cursor)?;
+            let guest = take_index_path(&index, &mut cursor)?;
+            validate_guest_absolute(&guest)?;
+            metadata.push(SnapshotMetadata {
+                path: guest,
+                file_id: take_u64(&index, &mut cursor)?,
+                metadata: crate::winfs::WinFileMetadata {
+                    attributes: take_u32(&index, &mut cursor)?,
+                    creation_time: take_u64(&index, &mut cursor)?,
+                    access_time: take_u64(&index, &mut cursor)?,
+                    write_time: take_u64(&index, &mut cursor)?,
+                },
+            });
+        }
+        let symlink_count = take_u32(&index, &mut cursor)? as usize;
+        if symlink_count > 1_000_000 {
+            return Err("WinFS disk has too many symbolic links".to_string());
+        }
+        for _ in 0..symlink_count {
+            let _path_kind = take_u8(&index, &mut cursor)?;
+            let link = take_index_path(&index, &mut cursor)?;
+            let _target_kind = take_u8(&index, &mut cursor)?;
+            let target = take_index_path(&index, &mut cursor)?;
+            let directory = take_u8(&index, &mut cursor)? != 0;
+            validate_guest_absolute(&link)?;
+            validate_guest_absolute(&target)?;
+            fs.create_symlink(&link, &target, directory)?;
+        }
+        fs.restore_snapshot_metadata(&metadata)?;
     }
     if cursor != index.len() {
         return Err("trailing bytes in WinFS disk index".to_string());
@@ -340,6 +407,29 @@ pub(crate) fn encode_changes(fs: &WinFs) -> Result<Vec<u8>, String> {
                 out.push(5);
                 push_string(&mut out, path)?;
             }
+            FsChange::SetMetadata { path, metadata } => {
+                out.push(6);
+                push_string(&mut out, path)?;
+                out.extend_from_slice(&metadata.attributes.to_le_bytes());
+                out.extend_from_slice(&metadata.creation_time.to_le_bytes());
+                out.extend_from_slice(&metadata.access_time.to_le_bytes());
+                out.extend_from_slice(&metadata.write_time.to_le_bytes());
+            }
+            FsChange::Symlink {
+                path,
+                target,
+                directory,
+            } => {
+                out.push(7);
+                push_string(&mut out, path)?;
+                push_string(&mut out, target)?;
+                out.push(u8::from(*directory));
+            }
+            FsChange::HardLink { path, target } => {
+                out.push(8);
+                push_string(&mut out, path)?;
+                push_string(&mut out, target)?;
+            }
         }
     }
     Ok(out)
@@ -403,6 +493,24 @@ pub(crate) fn apply_changes(bytes: &[u8], fs: &mut WinFs) -> Result<(), String> 
                 overwrite: take_u8(bytes, &mut cursor)? != 0,
             }),
             5 => changes.push(FsChange::SetCwd(take_string(bytes, &mut cursor)?)),
+            6 => changes.push(FsChange::SetMetadata {
+                path: take_string(bytes, &mut cursor)?,
+                metadata: crate::winfs::WinFileMetadata {
+                    attributes: take_u32(bytes, &mut cursor)?,
+                    creation_time: take_u64(bytes, &mut cursor)?,
+                    access_time: take_u64(bytes, &mut cursor)?,
+                    write_time: take_u64(bytes, &mut cursor)?,
+                },
+            }),
+            7 => changes.push(FsChange::Symlink {
+                path: take_string(bytes, &mut cursor)?,
+                target: take_string(bytes, &mut cursor)?,
+                directory: take_u8(bytes, &mut cursor)? != 0,
+            }),
+            8 => changes.push(FsChange::HardLink {
+                path: take_string(bytes, &mut cursor)?,
+                target: take_string(bytes, &mut cursor)?,
+            }),
             tag => return Err(format!("unknown WinFS change operation {tag}")),
         }
     }
@@ -704,6 +812,47 @@ mod tests {
     }
 
     #[test]
+    fn child_filesystem_transport_replays_metadata_and_link_operations() {
+        let mut parent = WinFs::ephemeral_runner();
+        parent.mkdir(r"C:\work").unwrap();
+        parent
+            .write_file(r"C:\work\source.txt", b"source".to_vec())
+            .unwrap();
+        parent.clear_changes();
+        let mut child = parent.clone();
+        child
+            .set_file_metadata(
+                r"C:\work\source.txt",
+                crate::winfs::WinFileMetadata {
+                    attributes: 0x21,
+                    creation_time: 11,
+                    access_time: 22,
+                    write_time: 33,
+                },
+            )
+            .unwrap();
+        child
+            .create_hard_link(r"C:\work\hard.txt", r"C:\work\source.txt")
+            .unwrap();
+        child
+            .create_symlink(r"C:\work\sym.txt", "source.txt", false)
+            .unwrap();
+        child
+            .write_file(r"C:\work\hard.txt", b"updated".to_vec())
+            .unwrap();
+
+        let changes = encode_changes(&child).unwrap();
+        apply_changes(&changes, &mut parent).unwrap();
+        assert_eq!(parent.read_file(r"C:\work\source.txt").unwrap(), b"updated");
+        assert_eq!(parent.read_file(r"C:\work\sym.txt").unwrap(), b"updated");
+        assert_eq!(
+            parent.file_id(r"C:\work\hard.txt").unwrap(),
+            parent.file_id(r"C:\work\source.txt").unwrap()
+        );
+        assert_eq!(parent.file_metadata(r"C:\work\hard.txt").write_time, 33);
+    }
+
+    #[test]
     fn saves_a_live_instance_as_an_indexed_disk() {
         let mut fs = WinFs::ephemeral_runner();
         fs.mkdir(r"C:\actions-runner\_work").unwrap();
@@ -720,6 +869,52 @@ mod tests {
                 .read_file(r"C:\actions-runner\_work\result.txt")
                 .unwrap(),
             b"done"
+        );
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn snapshot_roundtrip_preserves_metadata_links_and_file_identity() {
+        let mut fs = WinFs::ephemeral_runner();
+        fs.mkdir(r"C:\tools").unwrap();
+        fs.write_file(r"C:\tools\source.txt", b"before".to_vec())
+            .unwrap();
+        fs.create_hard_link(r"C:\tools\hard.txt", r"C:\tools\source.txt")
+            .unwrap();
+        fs.create_symlink(r"C:\tools\sym.txt", "source.txt", false)
+            .unwrap();
+        fs.set_file_metadata(
+            r"C:\tools\source.txt",
+            crate::winfs::WinFileMetadata {
+                attributes: 0x21,
+                creation_time: 132_537_600_000_000_001,
+                access_time: 132_537_600_000_000_002,
+                write_time: 132_537_600_000_000_003,
+            },
+        )
+        .unwrap();
+        let original_id = fs.file_id(r"C:\tools\source.txt").unwrap();
+        let path =
+            std::env::temp_dir().join(format!("wincli-metadata-links-{}.snap", std::process::id()));
+        save_file(&mut fs, path.to_str().unwrap()).unwrap();
+
+        let mut restored = load_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            restored.file_metadata(r"C:\tools\source.txt").attributes,
+            0x21
+        );
+        assert_eq!(
+            restored.file_metadata(r"C:\tools\source.txt").write_time,
+            132_537_600_000_000_003
+        );
+        assert_eq!(restored.file_id(r"C:\tools\hard.txt").unwrap(), original_id);
+        assert_eq!(restored.read_file(r"C:\tools\sym.txt").unwrap(), b"before");
+        restored
+            .write_file(r"C:\tools\hard.txt", b"after".to_vec())
+            .unwrap();
+        assert_eq!(
+            restored.read_file(r"C:\tools\source.txt").unwrap(),
+            b"after"
         );
         std::fs::remove_file(path).ok();
     }

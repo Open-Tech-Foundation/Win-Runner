@@ -71,6 +71,12 @@ All notable changes to this project will be documented in this file.
   aligned-buffer invalid-handle case for `WriteFileGather`.
 - Added wide-path copy and handle-based rename behavior fixtures.
 - Added wide-path move-with-replacement and directory create/remove cases.
+- Persisted Win32 file attributes and timestamps in WinFS snapshots and change
+  replay, including metadata updates through file handles and copied files.
+- Implemented guest hard links with shared file identity/content and symbolic
+  links that resolve to their targets and survive snapshot reload.
+- Routed ANSI file paths through the Windows active code page conversion,
+  including Windows-1252 names in create and enumeration operations.
 - Added deeper file-ID open, privileged valid-data, aligned gather-write, and
   file-handle completion-port behavior fixtures.
 - Implemented native EOF resize and handle-based rename information classes;

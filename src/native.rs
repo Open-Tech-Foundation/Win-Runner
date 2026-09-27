@@ -1516,6 +1516,10 @@ mod imp {
                 super::native_set_file_time(handle, &timestamp, &timestamp, &timestamp),
                 1
             );
+            let metadata = context.lock().unwrap().fs.file_metadata(path);
+            assert_eq!(metadata.creation_time, timestamp);
+            assert_eq!(metadata.access_time, timestamp);
+            assert_eq!(metadata.write_time, timestamp);
             assert_eq!(super::native_close_handle(handle), 1);
             context.lock().unwrap().fs.delete_file(path).unwrap();
         }
@@ -3230,6 +3234,48 @@ mod imp {
                 .unwrap()
                 .fs
                 .exists("C:\\modern_attributes_ansi.txt"));
+        }
+
+        #[test]
+        fn modern_ansi_create_and_enumerate_use_windows_1252_paths() {
+            type CreateFileA =
+                unsafe extern "win64" fn(*const u8, u32, u32, u64, u32, u32, u64) -> u64;
+            let create_file: CreateFileA =
+                unsafe { std::mem::transmute(require_kernel32_api(b"CreateFileA\0") as usize) };
+            let mut path = b"C:\\modern_ansi_".to_vec();
+            path.push(0x80); // Windows-1252 EURO SIGN
+            path.extend_from_slice(b".txt\0");
+            let wide_path = r"C:\modern_ansi_€.txt";
+            let wide = wide_path.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+
+            let handle = unsafe { create_file(path.as_ptr(), 0xC000_0000, 7, 0, 1, 0, 0) };
+            assert_ne!(handle, u64::MAX);
+            let bytes = b"ansi-euro";
+            let mut written = 0;
+            assert_eq!(
+                super::native_write_file(
+                    handle,
+                    bytes.as_ptr(),
+                    bytes.len() as u32,
+                    &mut written,
+                    0
+                ),
+                1
+            );
+            assert_eq!(written, bytes.len() as u32);
+            assert_eq!(
+                context.lock().unwrap().fs.read_file(wide_path).unwrap(),
+                bytes
+            );
+
+            let mut find_data = [0u8; 320];
+            let find = super::native_find_first_file_a(path.as_ptr(), find_data.as_mut_ptr());
+            assert_ne!(find, u64::MAX);
+            assert_eq!(&find_data[44..61], b"modern_ansi_\x80.txt");
+            assert_eq!(super::native_find_close(find), 1);
+            assert_eq!(super::native_close_handle(handle), 1);
+            assert_eq!(super::native_delete_file_w(wide.as_ptr()), 1);
         }
 
         #[test]
@@ -5624,6 +5670,13 @@ mod imp {
                 1
             );
             assert_eq!(byte, input);
+            let euro = [0x80, 0];
+            let mut euro_wide = [0u16; 2];
+            assert_eq!(
+                native_multi_byte_to_wide_char(0, 0, euro.as_ptr(), -1, euro_wide.as_mut_ptr(), 2),
+                2
+            );
+            assert_eq!(euro_wide, [0x20ac, 0]);
         }
 
         #[test]
@@ -5719,6 +5772,22 @@ mod imp {
                 3
             );
             assert_eq!(output, *b"rg\0");
+            let euro = [0x20ac, 0];
+            let mut euro_bytes = [0u8; 2];
+            assert_eq!(
+                native_wide_char_to_multi_byte(
+                    0,
+                    0,
+                    euro.as_ptr(),
+                    -1,
+                    euro_bytes.as_mut_ptr(),
+                    2,
+                    std::ptr::null(),
+                    std::ptr::null_mut()
+                ),
+                2
+            );
+            assert_eq!(euro_bytes, [0x80, 0]);
             assert_eq!(
                 native_wide_char_to_multi_byte(
                     65001,
@@ -8106,7 +8175,6 @@ mod imp {
         file_access: HashMap<u64, u32>,
         file_shares: HashMap<u64, u32>,
         finds: HashMap<u64, NativeFind>,
-        file_attributes: HashMap<String, u32>,
         file_completion_modes: HashMap<u64, u8>,
         delete_on_close: std::collections::HashSet<u64>,
         file_locks: Vec<(String, u64, u64, u64)>,
@@ -8444,7 +8512,6 @@ mod imp {
                 file_access: HashMap::new(),
                 file_shares: HashMap::new(),
                 finds: HashMap::new(),
-                file_attributes: HashMap::new(),
                 file_completion_modes: HashMap::new(),
                 delete_on_close: std::collections::HashSet::new(),
                 file_locks: Vec::new(),
@@ -9166,6 +9233,34 @@ mod imp {
         }
     }
 
+    fn decode_windows_1252(byte: u8) -> u16 {
+        const EXTENDED: [u16; 32] = [
+            0x20ac, 0x0081, 0x201a, 0x0192, 0x201e, 0x2026, 0x2020, 0x2021, 0x02c6, 0x2030, 0x0160,
+            0x2039, 0x0152, 0x008d, 0x017d, 0x008f, 0x0090, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022,
+            0x2013, 0x2014, 0x02dc, 0x2122, 0x0161, 0x203a, 0x0153, 0x009d, 0x017e, 0x0178,
+        ];
+        if (0x80..=0x9f).contains(&byte) {
+            EXTENDED[(byte - 0x80) as usize]
+        } else {
+            byte as u16
+        }
+    }
+
+    fn encode_windows_1252(unit: u16) -> Option<u8> {
+        if unit <= 0x7f || (0xa0..=0xff).contains(&unit) {
+            return Some(unit as u8);
+        }
+        const EXTENDED: [u16; 32] = [
+            0x20ac, 0x0081, 0x201a, 0x0192, 0x201e, 0x2026, 0x2020, 0x2021, 0x02c6, 0x2030, 0x0160,
+            0x2039, 0x0152, 0x008d, 0x017d, 0x008f, 0x0090, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022,
+            0x2013, 0x2014, 0x02dc, 0x2122, 0x0161, 0x203a, 0x0153, 0x009d, 0x017e, 0x0178,
+        ];
+        EXTENDED
+            .iter()
+            .position(|value| *value == unit)
+            .map(|index| index as u8 + 0x80)
+    }
+
     extern "win64" fn native_is_valid_code_page(code_page: u32) -> i32 {
         matches!(native_resolve_code_page(code_page), 1252 | 65001) as i32
     }
@@ -9227,7 +9322,7 @@ mod imp {
             None => return 0,
         };
         let mut wide: Vec<u16> = match native_resolve_code_page(code_page) {
-            1252 => input.into_iter().map(u16::from).collect(),
+            1252 => input.into_iter().map(decode_windows_1252).collect(),
             65001 => match std::str::from_utf8(&input) {
                 Ok(value) => value.encode_utf16().collect(),
                 Err(_) => return 0,
@@ -9362,12 +9457,10 @@ mod imp {
             1252 => units
                 .iter()
                 .map(|unit| {
-                    if *unit <= 0xff {
-                        *unit as u8
-                    } else {
+                    encode_windows_1252(*unit).unwrap_or_else(|| {
                         used_default = true;
                         b'?'
-                    }
+                    })
                 })
                 .collect(),
             65001 => match String::from_utf16(units) {
@@ -11190,25 +11283,44 @@ mod imp {
     }
     extern "win64" fn native_set_file_time(
         handle: u64,
-        _creation: *const u64,
-        _access: *const u64,
-        _write: *const u64,
+        creation: *const u64,
+        access: *const u64,
+        write: *const u64,
     ) -> i32 {
         if host_standard_fd(handle).is_some() {
             return 1;
         }
-        let valid = fs_ctx()
-            .and_then(|context| {
-                context
-                    .lock()
-                    .ok()
-                    .map(|context| context.handles.contains_key(&handle))
-            })
-            .unwrap_or(false);
-        if !valid {
+        let Some(context) = fs_ctx() else {
             native_set_last_error(6);
+            return 0;
+        };
+        let Ok(mut context) = context.lock() else {
+            native_set_last_error(6);
+            return 0;
+        };
+        let Some(path) = context.handles.get(&handle).map(|file| file.path.clone()) else {
+            native_set_last_error(6);
+            return 0;
+        };
+        let mut metadata = context.fs.file_metadata(&path);
+        unsafe {
+            if !creation.is_null() {
+                metadata.creation_time = creation.read_unaligned();
+            }
+            if !access.is_null() {
+                metadata.access_time = access.read_unaligned();
+            }
+            if !write.is_null() {
+                metadata.write_time = write.read_unaligned();
+            }
         }
-        valid as i32
+        match context.fs.set_file_metadata(&path, metadata) {
+            Ok(()) => 1,
+            Err(_) => {
+                native_set_last_error(5);
+                0
+            }
+        }
     }
     extern "win64" fn native_heap_free(heap: u64, _flags: u32, ptr: u64) -> i32 {
         if heap != PROCESS_HEAP_HANDLE || ptr == 0 {
@@ -12731,11 +12843,17 @@ mod imp {
                                 .map_or(0, |data| data.len() as u64)
                         };
                         let file_id = ctx.fs.file_id(&file.path).unwrap_or(0);
+                        let metadata = ctx.fs.file_metadata(&file.path);
                         let written = length.min(104) as usize;
                         unsafe {
                             std::ptr::write_bytes(information, 0, written);
-                            (information.add(32) as *mut u32)
-                                .write_unaligned(native_file_attributes(is_directory));
+                            (information as *mut u64).write_unaligned(metadata.creation_time);
+                            (information.add(8) as *mut u64).write_unaligned(metadata.access_time);
+                            (information.add(16) as *mut u64).write_unaligned(metadata.write_time);
+                            (information.add(24) as *mut u64).write_unaligned(metadata.write_time);
+                            (information.add(32) as *mut u32).write_unaligned(
+                                native_file_attributes_at(&ctx, &file.path, is_directory),
+                            );
                             (information.add(40) as *mut u64).write_unaligned(size);
                             (information.add(48) as *mut u64).write_unaligned(size);
                             (information.add(56) as *mut u32).write_unaligned(1);
@@ -13544,11 +13662,10 @@ mod imp {
         flags: u32,
         template: u64,
     ) -> u64 {
-        let Some(path) = (unsafe { ascii_z(path) }) else {
+        let Some(wide_path) = native_ansi_path(path) else {
             native_set_last_error(87);
             return u64::MAX;
         };
-        let wide_path: Vec<u16> = path.bytes().map(u16::from).chain([0]).collect();
         native_create_file_w(
             wide_path.as_ptr(),
             access,
@@ -13665,11 +13782,10 @@ mod imp {
         default_timeout: u32,
         security: u64,
     ) -> u64 {
-        let Some(path) = (unsafe { ascii_z(path) }) else {
+        let Some(wide_path) = native_ansi_path(path) else {
             native_set_last_error(87);
             return u64::MAX;
         };
-        let wide_path: Vec<u16> = path.bytes().map(u16::from).chain([0]).collect();
         native_create_named_pipe_w(
             wide_path.as_ptr(),
             open_mode,
@@ -13852,12 +13968,11 @@ mod imp {
         }
     }
     extern "win64" fn native_wait_named_pipe_a(path: *const u8, timeout: u32) -> i32 {
-        let Some(path) = (unsafe { ascii_z(path) }) else {
+        let Some(wide_path) = native_ansi_path(path) else {
             native_set_last_error(87);
             return 0;
         };
-        let wide: Vec<u16> = path.bytes().map(u16::from).chain([0]).collect();
-        native_wait_named_pipe_w(wide.as_ptr(), timeout)
+        native_wait_named_pipe_w(wide_path.as_ptr(), timeout)
     }
     fn native_file_attributes(is_directory: bool) -> u32 {
         if is_directory {
@@ -13868,18 +13983,12 @@ mod imp {
     }
     fn native_file_attributes_at(ctx: &NativeFs, path: &str, is_directory: bool) -> u32 {
         let base = native_file_attributes(is_directory);
-        let Some(key) = ctx
-            .fs
-            .normalize(path)
-            .ok()
-            .map(|path| path.display().to_lowercase())
-        else {
-            return base;
-        };
-        ctx.file_attributes
-            .get(&key)
-            .map(|attributes| (attributes & !0x10) | if is_directory { 0x10 } else { 0 })
-            .unwrap_or(base)
+        let attributes = ctx.fs.file_metadata(path).attributes;
+        if attributes == 0 {
+            base
+        } else {
+            (attributes & !0x10) | if is_directory { 0x10 } else { 0 }
+        }
     }
     extern "win64" fn native_get_file_attributes_w(path: *const u16) -> u32 {
         let Some(path) = wide(path) else {
@@ -13961,13 +14070,15 @@ mod imp {
             native_set_last_error(2); // ERROR_FILE_NOT_FOUND
             return 0;
         }
-        let Ok(key) = ctx.fs.normalize(path) else {
-            native_set_last_error(2);
-            return 0;
-        };
-        ctx.file_attributes
-            .insert(key.display().to_lowercase(), attributes);
-        1
+        let mut metadata = ctx.fs.file_metadata(path);
+        metadata.attributes = attributes;
+        match ctx.fs.set_file_metadata(path, metadata) {
+            Ok(()) => 1,
+            Err(_) => {
+                native_set_last_error(5);
+                0
+            }
+        }
     }
     #[repr(C)]
     struct NativeWin32FileAttributeData {
@@ -14019,16 +14130,16 @@ mod imp {
                 }
             }
         };
+        let metadata = ctx.fs.file_metadata(path);
         unsafe {
             output.write_unaligned(NativeWin32FileAttributeData {
                 attributes: native_file_attributes_at(&ctx, path, is_directory),
-                // WinFS does not track timestamps yet.
-                creation_time_low: 0,
-                creation_time_high: 0,
-                last_access_time_low: 0,
-                last_access_time_high: 0,
-                last_write_time_low: 0,
-                last_write_time_high: 0,
+                creation_time_low: metadata.creation_time as u32,
+                creation_time_high: (metadata.creation_time >> 32) as u32,
+                last_access_time_low: metadata.access_time as u32,
+                last_access_time_high: (metadata.access_time >> 32) as u32,
+                last_write_time_low: metadata.write_time as u32,
+                last_write_time_high: (metadata.write_time >> 32) as u32,
                 file_size_high: (size >> 32) as u32,
                 file_size_low: size as u32,
             });
@@ -14094,9 +14205,17 @@ mod imp {
             Ok(value) => value,
             Err(_) => return 0,
         };
+        let metadata = ctx.fs.file_metadata(path);
         unsafe {
             std::ptr::write_bytes(output, 0, 52);
-            (output as *mut u32).write_unaligned(native_file_attributes(is_directory));
+            (output as *mut u32).write_unaligned(native_file_attributes_at(
+                &ctx,
+                path,
+                is_directory,
+            ));
+            (output.add(4) as *mut u64).write_unaligned(metadata.creation_time);
+            (output.add(12) as *mut u64).write_unaligned(metadata.access_time);
+            (output.add(20) as *mut u64).write_unaligned(metadata.write_time);
             (output.add(28) as *mut u32).write_unaligned(0x5743_4C49);
             (output.add(32) as *mut u32).write_unaligned((size >> 32) as u32);
             (output.add(36) as *mut u32).write_unaligned(size as u32);
@@ -14149,6 +14268,7 @@ mod imp {
                 return 0;
             }
         };
+        let metadata = ctx.fs.file_metadata(&file.path);
         if output_size < required_size {
             native_set_last_error(122); // ERROR_INSUFFICIENT_BUFFER
             return 0;
@@ -14157,8 +14277,15 @@ mod imp {
             ptr::write_bytes(output, 0, required_size as usize);
             match information_class {
                 0 => {
-                    (output.add(32) as *mut u32)
-                        .write_unaligned(native_file_attributes(is_directory));
+                    (output as *mut u64).write_unaligned(metadata.creation_time);
+                    (output.add(8) as *mut u64).write_unaligned(metadata.access_time);
+                    (output.add(16) as *mut u64).write_unaligned(metadata.write_time);
+                    (output.add(24) as *mut u64).write_unaligned(metadata.write_time);
+                    (output.add(32) as *mut u32).write_unaligned(native_file_attributes_at(
+                        &ctx,
+                        &file.path,
+                        is_directory,
+                    ));
                 }
                 1 => {
                     let allocation_size = size.saturating_add(4095) & !4095;
@@ -14168,7 +14295,11 @@ mod imp {
                     *output.add(21) = u8::from(is_directory);
                 }
                 9 => {
-                    (output as *mut u32).write_unaligned(native_file_attributes(is_directory));
+                    (output as *mut u32).write_unaligned(native_file_attributes_at(
+                        &ctx,
+                        &file.path,
+                        is_directory,
+                    ));
                 }
                 18 => {
                     (output as *mut u64).write_unaligned(0x5743_4C49);
@@ -14715,18 +14846,7 @@ mod imp {
             native_set_last_error(6);
             return 0;
         };
-        if context
-            .fs
-            .normalize(&path)
-            .ok()
-            .and_then(|key| {
-                context
-                    .file_attributes
-                    .get(&key.display().to_lowercase())
-                    .copied()
-            })
-            .is_some_and(|attributes| attributes & 1 != 0)
-        {
+        if context.fs.file_metadata(&path).attributes & 1 != 0 {
             native_set_last_error(5); // ERROR_ACCESS_DENIED for read-only files
             return 0;
         }
@@ -14850,8 +14970,55 @@ mod imp {
         }
     }
 
+    fn native_ansi_z_bytes(path: *const u8) -> Option<&'static [u8]> {
+        if path.is_null() {
+            return None;
+        }
+        let mut length = 0usize;
+        while length < 32 * 1024 && unsafe { *path.add(length) } != 0 {
+            length += 1;
+        }
+        (length < 32 * 1024).then(|| unsafe { std::slice::from_raw_parts(path, length + 1) })
+    }
+
     fn native_ansi_path(path: *const u8) -> Option<Vec<u16>> {
-        unsafe { ascii_z(path) }.map(|path| path.bytes().map(u16::from).chain([0]).collect())
+        let bytes = native_ansi_z_bytes(path)?;
+        let length = native_multi_byte_to_wide_char(0, 0, bytes.as_ptr(), -1, ptr::null_mut(), 0);
+        if length <= 0 {
+            return None;
+        }
+        let mut wide = vec![0u16; length as usize];
+        (native_multi_byte_to_wide_char(0, 0, bytes.as_ptr(), -1, wide.as_mut_ptr(), length)
+            == length)
+            .then_some(wide)
+    }
+
+    fn native_wide_path_to_ansi(path: &[u16]) -> Option<Vec<u8>> {
+        let length = native_wide_char_to_multi_byte(
+            0,
+            0,
+            path.as_ptr(),
+            -1,
+            ptr::null_mut(),
+            0,
+            ptr::null(),
+            ptr::null_mut(),
+        );
+        if length <= 0 {
+            return None;
+        }
+        let mut bytes = vec![0u8; length as usize];
+        (native_wide_char_to_multi_byte(
+            0,
+            0,
+            path.as_ptr(),
+            -1,
+            bytes.as_mut_ptr(),
+            length,
+            ptr::null(),
+            ptr::null_mut(),
+        ) == length)
+            .then_some(bytes)
     }
 
     fn native_find_data_w_to_a(source: &[u8; 592], output: *mut u8) -> bool {
@@ -14864,15 +15031,48 @@ mod imp {
         let alternate_name =
             unsafe { std::slice::from_raw_parts(source.as_ptr().add(564).cast::<u16>(), 14) };
         let convert = |units: &[u16]| {
-            units
+            let length = units
                 .iter()
-                .copied()
-                .take_while(|unit| *unit != 0)
-                .map(|unit| u8::try_from(unit).unwrap_or(b'?'))
-                .collect::<Vec<_>>()
+                .position(|unit| *unit == 0)
+                .unwrap_or(units.len());
+            let mut converted = native_wide_char_to_multi_byte(
+                0,
+                0,
+                units.as_ptr(),
+                length as i32,
+                ptr::null_mut(),
+                0,
+                ptr::null(),
+                ptr::null_mut(),
+            );
+            if converted < 0 {
+                return None;
+            }
+            let mut bytes = vec![0u8; converted as usize];
+            converted = native_wide_char_to_multi_byte(
+                0,
+                0,
+                units.as_ptr(),
+                length as i32,
+                bytes.as_mut_ptr(),
+                converted,
+                ptr::null(),
+                ptr::null_mut(),
+            );
+            (converted >= 0).then_some(bytes)
         };
-        let file_name = convert(file_name);
-        let alternate_name = convert(alternate_name);
+        let Some(file_name) = convert(file_name) else {
+            native_set_last_error(1113);
+            return false;
+        };
+        let Some(alternate_name) = convert(alternate_name) else {
+            native_set_last_error(1113);
+            return false;
+        };
+        if file_name.len() >= 260 || alternate_name.len() >= 14 {
+            native_set_last_error(1113);
+            return false;
+        }
         unsafe {
             ptr::write_bytes(output, 0, 320);
             ptr::copy_nonoverlapping(source.as_ptr(), output, 44);
@@ -15123,25 +15323,14 @@ mod imp {
             native_set_last_error(183);
             return 0;
         }
-        let is_directory = ctx.fs.is_dir(&target);
-        let result = if is_directory || flags & 1 != 0 {
-            ctx.fs.mkdir(&link)
-        } else {
-            ctx.fs
-                .read_file(&target)
-                .and_then(|data| ctx.fs.write_file(&link, data))
-        };
-        if result.is_err() {
-            native_set_last_error(if ctx.fs.exists(&target) { 3 } else { 2 });
-            return 0;
+        let is_directory = flags & 1 != 0 || ctx.fs.is_dir(&target);
+        match ctx.fs.create_symlink(&link, &target, is_directory) {
+            Ok(()) => 1,
+            Err(_) => {
+                native_set_last_error(if ctx.fs.exists(&target) { 5 } else { 2 });
+                0
+            }
         }
-        if let Ok(normalized) = ctx.fs.normalize(&link) {
-            ctx.file_attributes.insert(
-                normalized.display().to_lowercase(),
-                native_file_attributes(is_directory) | 0x400,
-            );
-        }
-        1
     }
 
     extern "win64" fn native_create_symbolic_link_a(
@@ -15338,7 +15527,7 @@ mod imp {
         output: *mut u8,
     ) -> u32 {
         let (Some(directory), Some(prefix)) =
-            (unsafe { ascii_z(directory) }, unsafe { ascii_z(prefix) })
+            (native_ansi_path(directory), native_ansi_path(prefix))
         else {
             native_set_last_error(87);
             return 0;
@@ -15347,11 +15536,22 @@ mod imp {
             native_set_last_error(87);
             return 0;
         }
-        let Some(path) = native_create_temp_file_path(directory, prefix, unique) else {
+        let (Ok(directory), Ok(prefix)) = (
+            String::from_utf16(&directory[..directory.len().saturating_sub(1)]),
+            String::from_utf16(&prefix[..prefix.len().saturating_sub(1)]),
+        ) else {
+            native_set_last_error(87);
             return 0;
         };
-        unsafe { ptr::copy_nonoverlapping(path.as_ptr(), output, path.len()) };
-        unsafe { output.add(path.len()).write(0) };
+        let Some(path) = native_create_temp_file_path(&directory, &prefix, unique) else {
+            return 0;
+        };
+        let wide_path = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+        let Some(encoded) = native_wide_path_to_ansi(&wide_path) else {
+            native_set_last_error(1113);
+            return 0;
+        };
+        unsafe { ptr::copy_nonoverlapping(encoded.as_ptr(), output, encoded.len()) };
         1
     }
 
@@ -18614,7 +18814,6 @@ mod imp {
                 file_access: HashMap::new(),
                 file_shares: HashMap::new(),
                 finds: HashMap::new(),
-                file_attributes: HashMap::new(),
                 file_completion_modes: HashMap::new(),
                 delete_on_close: std::collections::HashSet::new(),
                 file_locks: Vec::new(),

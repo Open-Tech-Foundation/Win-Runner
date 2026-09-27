@@ -214,6 +214,21 @@ pub(crate) struct SnapshotFile {
     data: FileData,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct WinFileMetadata {
+    pub attributes: u32,
+    pub creation_time: u64,
+    pub access_time: u64,
+    pub write_time: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SnapshotMetadata {
+    pub path: String,
+    pub file_id: u64,
+    pub metadata: WinFileMetadata,
+}
+
 impl SnapshotFile {
     pub(crate) fn disk_location(&self) -> Option<(Arc<DiskStore>, u64, u64)> {
         match &self.data {
@@ -345,6 +360,8 @@ pub struct WinFs {
     mounts: HashMap<char, HostMount>,
     file_ids: HashMap<String, u64>,
     next_file_id: u64,
+    file_metadata: HashMap<String, WinFileMetadata>,
+    symlinks: HashMap<String, String>,
     changes: Vec<FsChange>,
     record_changes: bool,
 }
@@ -377,6 +394,19 @@ pub(crate) enum FsChange {
         overwrite: bool,
     },
     SetCwd(String),
+    SetMetadata {
+        path: String,
+        metadata: WinFileMetadata,
+    },
+    Symlink {
+        path: String,
+        target: String,
+        directory: bool,
+    },
+    HardLink {
+        path: String,
+        target: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -439,6 +469,8 @@ impl WinFs {
             mounts: HashMap::new(),
             file_ids: HashMap::new(),
             next_file_id: 1,
+            file_metadata: HashMap::new(),
+            symlinks: HashMap::new(),
             changes: Vec::new(),
             record_changes: true,
         }
@@ -524,7 +556,7 @@ impl WinFs {
     }
 
     pub(crate) fn snapshot_files(&self) -> Vec<SnapshotFile> {
-        fn visit(node: &Node, path: &str, out: &mut Vec<SnapshotFile>) {
+        fn visit(fs: &WinFs, node: &Node, path: &str, out: &mut Vec<SnapshotFile>) {
             match node {
                 Node::File { data, .. } => out.push(SnapshotFile {
                     path: path.to_string(),
@@ -532,37 +564,117 @@ impl WinFs {
                 }),
                 Node::Dir { children, .. } => {
                     for child in children.values() {
-                        visit(child, &format!("{path}\\{}", child.name()), out);
+                        let child_path = format!("{path}\\{}", child.name());
+                        if fs
+                            .normalize(&child_path)
+                            .ok()
+                            .is_some_and(|path| fs.symlinks.contains_key(&path.key()))
+                        {
+                            continue;
+                        }
+                        visit(fs, child, &child_path, out);
                     }
                 }
             }
         }
         let mut out = Vec::new();
         if let Some(root) = self.drives.get(&'C') {
-            visit(root, "C:", &mut out);
+            visit(self, root, "C:", &mut out);
         }
         out.sort_by(|a, b| a.path.to_lowercase().cmp(&b.path.to_lowercase()));
         out
     }
 
     pub(crate) fn snapshot_directories(&self) -> Vec<String> {
-        fn visit(node: &Node, path: &str, out: &mut Vec<String>) {
+        fn visit(fs: &WinFs, node: &Node, path: &str, out: &mut Vec<String>) {
             if let Node::Dir { children, .. } = node {
                 for child in children.values() {
                     let child_path = format!("{path}\\{}", child.name());
+                    if fs
+                        .normalize(&child_path)
+                        .ok()
+                        .is_some_and(|path| fs.symlinks.contains_key(&path.key()))
+                    {
+                        continue;
+                    }
                     if child.is_dir() {
                         out.push(child_path.clone());
                     }
-                    visit(child, &child_path, out);
+                    visit(fs, child, &child_path, out);
                 }
             }
         }
         let mut out = Vec::new();
         if let Some(root) = self.drives.get(&'C') {
-            visit(root, "C:", &mut out);
+            visit(self, root, "C:", &mut out);
         }
         out.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
         out
+    }
+
+    pub(crate) fn snapshot_metadata(&self) -> Vec<SnapshotMetadata> {
+        fn visit(fs: &WinFs, node: &Node, path: &str, out: &mut Vec<SnapshotMetadata>) {
+            let key = fs
+                .normalize(path)
+                .map(|path| path.key())
+                .unwrap_or_else(|_| path.to_string());
+            let id = if node.is_file() {
+                fs.file_ids.get(&key).copied().unwrap_or_else(|| {
+                    key.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+                        (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3)
+                    })
+                })
+            } else {
+                0
+            };
+            out.push(SnapshotMetadata {
+                path: path.to_string(),
+                file_id: id,
+                metadata: fs.file_metadata.get(&key).copied().unwrap_or_default(),
+            });
+            if let Node::Dir { children, .. } = node {
+                for child in children.values() {
+                    let child_path = format!("{path}\\{}", child.name());
+                    visit(fs, child, &child_path, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        if let Some(root) = self.drives.get(&'C') {
+            visit(self, root, "C:", &mut out);
+        }
+        out.retain(|entry| !entry.path.eq_ignore_ascii_case("C:"));
+        out.sort_by(|left, right| left.path.to_lowercase().cmp(&right.path.to_lowercase()));
+        out
+    }
+
+    pub(crate) fn snapshot_symlinks(&self) -> Vec<(String, String, bool)> {
+        let mut links: Vec<_> = self
+            .symlinks
+            .iter()
+            .filter(|(path, _)| path.starts_with("C:\\"))
+            .map(|(path, target)| (path.clone(), target.clone(), self.is_dir(target)))
+            .collect();
+        links.sort_by(|left, right| left.0.cmp(&right.0));
+        links
+    }
+
+    pub(crate) fn restore_snapshot_metadata(
+        &mut self,
+        entries: &[SnapshotMetadata],
+    ) -> Result<(), String> {
+        for entry in entries {
+            let p = self.normalize(&entry.path)?;
+            let key = p.key();
+            if entry.file_id != 0 {
+                self.file_ids.insert(key.clone(), entry.file_id);
+                self.next_file_id = self.next_file_id.max(entry.file_id.saturating_add(1));
+            }
+            if entry.metadata != WinFileMetadata::default() {
+                self.file_metadata.insert(key, entry.metadata);
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn open_snapshot_file(
@@ -596,6 +708,9 @@ impl WinFs {
                 },
             },
         );
+        let file_id = self.next_file_id;
+        self.next_file_id = self.next_file_id.wrapping_add(1).max(1);
+        self.file_ids.insert(p.key(), file_id);
         Ok(())
     }
 
@@ -642,6 +757,7 @@ impl WinFs {
                         if p.drive != 'C' {
                             continue;
                         }
+                        let file_id = self.file_id(&p.display()).ok();
                         let parent = self.parent_of(&p);
                         self.mkdir(&parent.display())?;
                         let store = self
@@ -656,17 +772,21 @@ impl WinFs {
                             return Err(format!("write parent is a file: {}", parent.display()));
                         };
                         let leaf = p.parts.last().unwrap().clone();
+                        let stored = FileData::Disk {
+                            store,
+                            offset: *offset,
+                            length: *length,
+                        };
                         children.insert(
                             leaf.to_lowercase(),
                             Node::File {
                                 name: leaf,
-                                data: FileData::Disk {
-                                    store,
-                                    offset: *offset,
-                                    length: *length,
-                                },
+                                data: stored.clone(),
                             },
                         );
+                        if let Some(file_id) = file_id {
+                            self.replace_linked_file_data(file_id, stored);
+                        }
                         if self.record_changes {
                             self.changes.push(FsChange::Write {
                                 path: p.display(),
@@ -688,6 +808,23 @@ impl WinFs {
                         overwrite,
                     } => self.copy_path(source, target, !*overwrite)?,
                     FsChange::SetCwd(path) => self.set_cwd(path)?,
+                    FsChange::SetMetadata { path, metadata } => {
+                        self.set_file_metadata(path, *metadata)?;
+                    }
+                    FsChange::Symlink {
+                        path,
+                        target,
+                        directory,
+                    } => {
+                        if !self.is_symlink(path) {
+                            self.create_symlink(path, target, *directory)?;
+                        }
+                    }
+                    FsChange::HardLink { path, target } => {
+                        if !self.exists(path) {
+                            self.create_hard_link(path, target)?;
+                        }
+                    }
                 }
             }
             Ok(())
@@ -801,6 +938,9 @@ impl WinFs {
     /// Case variants and repeated opens of the same path have the same ID.
     pub fn file_id(&self, path: &str) -> Result<u64, String> {
         let key = self.normalize(path)?.key();
+        if let Some(target) = self.symlinks.get(&key) {
+            return self.file_id(target);
+        }
         if let Some(id) = self.file_ids.get(&key) {
             return Ok(*id);
         }
@@ -814,6 +954,122 @@ impl WinFs {
             let swapped = (id << 32) | (id >> 32);
             (*id == file_id || swapped == file_id).then(|| path.clone())
         })
+    }
+
+    pub(crate) fn file_metadata(&self, path: &str) -> WinFileMetadata {
+        self.normalize(path)
+            .ok()
+            .and_then(|p| self.file_metadata.get(&p.key()).copied())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn set_file_metadata(
+        &mut self,
+        path: &str,
+        metadata: WinFileMetadata,
+    ) -> Result<(), String> {
+        let p = self.normalize(path)?;
+        if !self.exists(&p.display()) {
+            return Err(format!("path not found: {}", p.display()));
+        }
+        let key = p.key();
+        let keys = if !self.symlinks.contains_key(&key) {
+            self.file_id(&p.display())
+                .ok()
+                .map(|id| {
+                    self.file_ids
+                        .iter()
+                        .filter_map(|(path, candidate)| (*candidate == id).then_some(path.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .filter(|keys| !keys.is_empty())
+                .unwrap_or_else(|| vec![key.clone()])
+        } else {
+            vec![key.clone()]
+        };
+        for key in keys {
+            if metadata == WinFileMetadata::default() {
+                self.file_metadata.remove(&key);
+            } else {
+                self.file_metadata.insert(key, metadata);
+            }
+        }
+        if self.record_changes && p.drive == 'C' {
+            self.changes.push(FsChange::SetMetadata {
+                path: p.display(),
+                metadata,
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn is_symlink(&self, path: &str) -> bool {
+        self.normalize(path)
+            .ok()
+            .is_some_and(|p| self.symlinks.contains_key(&p.key()))
+    }
+
+    pub fn create_symlink(
+        &mut self,
+        path: &str,
+        target: &str,
+        directory: bool,
+    ) -> Result<(), String> {
+        let p = self.normalize(path)?;
+        if p.parts.is_empty() || self.is_host_drive(p.drive) {
+            return Err("cannot create a symbolic link at this path".to_string());
+        }
+        if self.get_node_raw(&p).is_some() {
+            return Err(format!("destination exists: {}", p.display()));
+        }
+        let target_path =
+            if target.contains(':') || target.starts_with('\\') || target.starts_with('/') {
+                self.normalize(target)?
+            } else {
+                let parent = self.parent_of(&p);
+                self.normalize(&format!("{}\\{target}", parent.display()))?
+            };
+        let parent = self.parent_of(&p);
+        let Some(Node::Dir { children, .. }) = self.get_node_mut(&parent) else {
+            return Err(format!("link parent not found: {}", parent.display()));
+        };
+        let leaf = p.parts.last().unwrap().clone();
+        let placeholder = if directory {
+            Node::Dir {
+                name: leaf.clone(),
+                children: HashMap::new(),
+            }
+        } else {
+            Node::File {
+                name: leaf.clone(),
+                data: FileData::Bytes(Vec::new()),
+            }
+        };
+        children.insert(leaf.to_lowercase(), placeholder);
+        self.symlinks.insert(p.key(), target_path.display());
+        let id = if self.is_file(&target_path.display()) {
+            self.file_id(&target_path.display()).unwrap_or_default()
+        } else {
+            let id = self.next_file_id;
+            self.next_file_id = self.next_file_id.wrapping_add(1).max(1);
+            id
+        };
+        self.file_ids.insert(p.key(), id);
+        self.file_metadata.insert(
+            p.key(),
+            WinFileMetadata {
+                attributes: 0x400 | if directory { 0x10 } else { 0x80 },
+                ..WinFileMetadata::default()
+            },
+        );
+        if self.record_changes {
+            self.changes.push(FsChange::Symlink {
+                path: p.display(),
+                target: target_path.display(),
+                directory,
+            });
+        }
+        Ok(())
     }
 
     pub fn set_cwd(&mut self, path: &str) -> Result<(), String> {
@@ -916,7 +1172,42 @@ impl WinFs {
         Ok(WinPath { drive, parts })
     }
 
+    fn resolve_symlink_path(&self, path: &WinPath) -> Option<WinPath> {
+        let mut resolved = path.clone();
+        for _ in 0..40 {
+            let mut replaced = false;
+            for index in 1..=resolved.parts.len() {
+                let prefix = WinPath {
+                    drive: resolved.drive,
+                    parts: resolved.parts[..index].to_vec(),
+                };
+                let Some(target) = self.symlinks.get(&prefix.key()) else {
+                    continue;
+                };
+                let suffix = resolved.parts[index..].to_vec();
+                let target = self.normalize(target).ok()?;
+                let joined = if suffix.is_empty() {
+                    target.display()
+                } else {
+                    format!("{}\\{}", target.display(), suffix.join("\\"))
+                };
+                resolved = self.normalize(&joined).ok()?;
+                replaced = true;
+                break;
+            }
+            if !replaced {
+                return Some(resolved);
+            }
+        }
+        None
+    }
+
     fn get_node(&self, p: &WinPath) -> Option<&Node> {
+        let resolved = self.resolve_symlink_path(p)?;
+        self.get_node_raw(&resolved)
+    }
+
+    fn get_node_raw(&self, p: &WinPath) -> Option<&Node> {
         let mut node = self.drives.get(&p.drive)?;
         for part in &p.parts {
             match node {
@@ -930,6 +1221,11 @@ impl WinFs {
     }
 
     fn get_node_mut(&mut self, p: &WinPath) -> Option<&mut Node> {
+        let resolved = self.resolve_symlink_path(p)?;
+        self.get_node_raw_mut(&resolved)
+    }
+
+    fn get_node_raw_mut(&mut self, p: &WinPath) -> Option<&mut Node> {
         let mut node = self.drives.get_mut(&p.drive)?;
         for part in &p.parts {
             match node {
@@ -949,6 +1245,17 @@ impl WinFs {
             drive: p.drive,
             parts,
         }
+    }
+
+    fn clear_path_state(&mut self, path: &WinPath) {
+        let prefix = path.key();
+        let child_prefix = format!("{prefix}\\");
+        self.file_ids
+            .retain(|key, _| key != &prefix && !key.starts_with(&child_prefix));
+        self.file_metadata
+            .retain(|key, _| key != &prefix && !key.starts_with(&child_prefix));
+        self.symlinks
+            .retain(|key, _| key != &prefix && !key.starts_with(&child_prefix));
     }
 
     // ---- queries (same API for EXE + PS1) ----
@@ -1272,6 +1579,23 @@ impl WinFs {
         if p.parts.is_empty() {
             return Err("cannot remove root".to_string());
         }
+        if self.symlinks.contains_key(&p.key()) {
+            let parent = self.parent_of(&p);
+            let Some(Node::Dir { children, .. }) = self.get_node_mut(&parent) else {
+                return Err(format!("path not found: {}", p.display()));
+            };
+            children.remove(&p.parts.last().unwrap().to_lowercase());
+            self.symlinks.remove(&p.key());
+            self.file_ids.remove(&p.key());
+            self.file_metadata.remove(&p.key());
+            if self.record_changes {
+                self.changes.push(FsChange::Remove {
+                    path: p.display(),
+                    recursive: false,
+                });
+            }
+            return Ok(());
+        }
         // check empty
         match self.get_node(&p) {
             Some(Node::Dir { children, .. }) => {
@@ -1287,6 +1611,7 @@ impl WinFs {
         let parent_node = self.get_node_mut(&parent).unwrap();
         if let Node::Dir { children, .. } = parent_node {
             children.remove(&leaf_key);
+            self.clear_path_state(&p);
             if self.record_changes {
                 self.changes.push(FsChange::Remove {
                     path: p.display(),
@@ -1312,14 +1637,18 @@ impl WinFs {
         }
         let stored = self.store_file(data)?;
         if self.get_node(&p).is_some() {
-            let node = self.get_node_mut(&p).unwrap();
-            match node {
-                Node::File { data: d, .. } => {
-                    *d = stored;
-                    self.record_write(&p.display())
+            let file_id = self.file_id(&p.display()).ok();
+            match self.get_node_mut(&p) {
+                Some(Node::File { data, .. }) => *data = stored.clone(),
+                Some(Node::Dir { .. }) => {
+                    return Err(format!("path is a directory: {}", p.display()))
                 }
-                Node::Dir { .. } => Err(format!("path is a directory: {}", p.display())),
+                None => return Err(format!("file not found: {}", p.display())),
             }
+            if let Some(file_id) = file_id {
+                self.replace_linked_file_data(file_id, stored);
+            }
+            self.record_write(&p.display())
         } else {
             // create; parent must exist
             let parent = self.parent_of(&p);
@@ -1342,6 +1671,22 @@ impl WinFs {
                     self.record_write(&p.display())
                 }
                 Node::File { .. } => Err("parent is a file".to_string()),
+            }
+        }
+    }
+
+    fn replace_linked_file_data(&mut self, file_id: u64, data: FileData) {
+        let paths: Vec<String> = self
+            .file_ids
+            .iter()
+            .filter(|(_, id)| **id == file_id)
+            .map(|(path, _)| path.clone())
+            .collect();
+        for path in paths {
+            if let Ok(path) = self.normalize(&path) {
+                if let Some(Node::File { data: target, .. }) = self.get_node_raw_mut(&path) {
+                    *target = data.clone();
+                }
             }
         }
     }
@@ -1391,14 +1736,18 @@ impl WinFs {
                     self.store_file(contents)?
                 }
             };
-            let node = self.get_node_mut(&p).unwrap();
-            match node {
-                Node::File { data: d, .. } => {
-                    *d = stored;
-                    self.record_write(&p.display())
+            let file_id = self.file_id(&p.display()).ok();
+            match self.get_node_mut(&p) {
+                Some(Node::File { data: target, .. }) => *target = stored.clone(),
+                Some(Node::Dir { .. }) => {
+                    return Err(format!("path is a directory: {}", p.display()))
                 }
-                Node::Dir { .. } => Err(format!("path is a directory: {}", p.display())),
+                None => return Err(format!("file not found: {}", p.display())),
             }
+            if let Some(file_id) = file_id {
+                self.replace_linked_file_data(file_id, stored);
+            }
+            self.record_write(&p.display())
         } else {
             self.write_file(path, data.to_vec())
         }
@@ -1412,6 +1761,25 @@ impl WinFs {
             return std::fs::remove_file(&host)
                 .map_err(|e| format!("cannot remove mounted file {}: {e}", p.display()));
         }
+        if self.symlinks.contains_key(&p.key()) {
+            let parent = self.parent_of(&p);
+            let parent_node = self
+                .get_node_mut(&parent)
+                .ok_or_else(|| format!("path not found: {}", parent.display()))?;
+            if let Node::Dir { children, .. } = parent_node {
+                children.remove(&p.parts.last().unwrap().to_lowercase());
+            }
+            self.symlinks.remove(&p.key());
+            self.file_ids.remove(&p.key());
+            self.file_metadata.remove(&p.key());
+            if self.record_changes {
+                self.changes.push(FsChange::Remove {
+                    path: p.display(),
+                    recursive: false,
+                });
+            }
+            return Ok(());
+        }
         match self.get_node(&p) {
             Some(Node::File { .. }) => {}
             Some(Node::Dir { .. }) => return Err(format!("is a directory: {}", p.display())),
@@ -1423,6 +1791,8 @@ impl WinFs {
         if let Node::Dir { children, .. } = parent_node {
             children.remove(&leaf_key);
             self.file_ids.remove(&p.key());
+            self.file_metadata.remove(&p.key());
+            self.symlinks.remove(&p.key());
             if self.record_changes {
                 self.changes.push(FsChange::Remove {
                     path: p.display(),
@@ -1470,6 +1840,23 @@ impl WinFs {
             };
             return result.map_err(|e| format!("cannot remove mounted path {}: {e}", p.display()));
         }
+        if self.symlinks.contains_key(&p.key()) {
+            let parent = self.parent_of(&p);
+            let Some(Node::Dir { children, .. }) = self.get_node_mut(&parent) else {
+                return Err(format!("path not found: {}", p.display()));
+            };
+            children.remove(&p.parts.last().unwrap().to_lowercase());
+            self.symlinks.remove(&p.key());
+            self.file_ids.remove(&p.key());
+            self.file_metadata.remove(&p.key());
+            if self.record_changes {
+                self.changes.push(FsChange::Remove {
+                    path: p.display(),
+                    recursive: false,
+                });
+            }
+            return Ok(());
+        }
         let node = self
             .get_node(&p)
             .ok_or_else(|| format!("path not found: {}", p.display()))?
@@ -1485,6 +1872,7 @@ impl WinFs {
                 let parent_node = self.get_node_mut(&parent).unwrap();
                 if let Node::Dir { children, .. } = parent_node {
                     children.remove(&leaf_key);
+                    self.clear_path_state(&p);
                     if self.record_changes {
                         self.changes.push(FsChange::Remove {
                             path: p.display(),
@@ -1532,11 +1920,24 @@ impl WinFs {
                 self.delete_file(src)
             }
         } else {
-            let node = self
-                .get_node(&s)
-                .ok_or_else(|| format!("source not found: {}", s.display()))?
-                .clone();
-            let source_file_id = self.file_id(src).ok();
+            let source_is_symlink = self.symlinks.contains_key(&s.key());
+            let node = if source_is_symlink {
+                self.get_node_raw(&s)
+            } else {
+                self.get_node(&s)
+            }
+            .ok_or_else(|| format!("source not found: {}", s.display()))?
+            .clone();
+            let old_prefix = s.key();
+            let new_prefix = d.key();
+            let move_key = |key: &str| {
+                if key == old_prefix {
+                    Some(new_prefix.clone())
+                } else {
+                    key.strip_prefix(&(old_prefix.clone() + "\\"))
+                        .map(|tail| format!("{new_prefix}\\{tail}"))
+                }
+            };
             if self.get_node(&d).is_some() {
                 return Err(format!("destination exists: {}", d.display()));
             }
@@ -1578,15 +1979,51 @@ impl WinFs {
             if let Node::Dir { children, .. } = sp {
                 children.remove(&skey);
             }
+            let ids: Vec<_> = self
+                .file_ids
+                .iter()
+                .filter_map(|(key, id)| move_key(key).map(|new| (key.clone(), new, *id)))
+                .collect();
+            for (old, _, _) in &ids {
+                self.file_ids.remove(old);
+            }
+            for (_, new, id) in ids {
+                self.file_ids.insert(new, id);
+            }
+            let metadata: Vec<_> = self
+                .file_metadata
+                .iter()
+                .filter_map(|(key, value)| move_key(key).map(|new| (key.clone(), new, *value)))
+                .collect();
+            for (old, _, _) in &metadata {
+                self.file_metadata.remove(old);
+            }
+            for (_, new, value) in metadata {
+                self.file_metadata.insert(new, value);
+            }
+            let links: Vec<_> = self
+                .symlinks
+                .iter()
+                .filter_map(|(key, value)| {
+                    move_key(key).map(|new| (key.clone(), new, value.clone()))
+                })
+                .collect();
+            for (old, _, _) in &links {
+                self.symlinks.remove(old);
+            }
+            for (_, new, value) in links {
+                self.symlinks.insert(new, value);
+            }
+            if source_is_symlink {
+                if let Some(target) = self.symlinks.remove(&old_prefix) {
+                    self.symlinks.insert(new_prefix, target);
+                }
+            }
             if self.record_changes {
                 self.changes.push(FsChange::Move {
                     source: s.display(),
                     target: d.display(),
                 });
-            }
-            if let Some(file_id) = source_file_id {
-                self.file_ids.remove(&s.key());
-                self.file_ids.insert(d.key(), file_id);
             }
             Ok(())
         }
@@ -1623,6 +2060,7 @@ impl WinFs {
             .get_node(&s)
             .ok_or_else(|| format!("source not found: {}", s.display()))?
             .clone();
+        let source_metadata = self.file_metadata(&s.display());
         if self.get_node(&d).is_some() {
             if fail_if_exists {
                 return Err(format!("destination exists: {}", d.display()));
@@ -1648,6 +2086,7 @@ impl WinFs {
                                 overwrite: true,
                             });
                         }
+                        self.set_file_metadata(&d.display(), source_metadata)?;
                         return Ok(());
                     }
                     return Ok(());
@@ -1678,6 +2117,7 @@ impl WinFs {
                         overwrite: false,
                     });
                 }
+                self.set_file_metadata(&d.display(), source_metadata)?;
                 Ok(())
             }
             Node::File { .. } => Err("destination parent is a file".to_string()),
@@ -1727,11 +2167,13 @@ impl WinFs {
         children.insert(leaf.to_lowercase(), linked);
         let identity = self.file_id(source)?;
         self.file_ids.insert(dst.key(), identity);
+        if let Some(metadata) = self.file_metadata.get(&src.key()).copied() {
+            self.file_metadata.insert(dst.key(), metadata);
+        }
         if self.record_changes {
-            self.changes.push(FsChange::Copy {
-                source: src.display(),
-                target: dst.display(),
-                overwrite: false,
+            self.changes.push(FsChange::HardLink {
+                path: dst.display(),
+                target: src.display(),
             });
         }
         Ok(())
@@ -1800,15 +2242,25 @@ mod tests {
         let moved = r"C:\winfs_compat_cases\moved.bin";
 
         fs.write_file(source, b"first".to_vec()).unwrap();
+        let source_metadata = WinFileMetadata {
+            attributes: 0x21,
+            creation_time: 11,
+            access_time: 22,
+            write_time: 33,
+        };
+        fs.set_file_metadata(source, source_metadata).unwrap();
         fs.append_file(source, b"-second").unwrap();
         assert_eq!(fs.read_file(source).unwrap(), b"first-second");
         assert_eq!(fs.file_len(source).unwrap(), 12);
 
         fs.copy_path(source, copy, true).unwrap();
         assert_eq!(fs.read_file(copy).unwrap(), b"first-second");
+        assert_eq!(fs.file_metadata(copy), source_metadata);
+        assert_ne!(fs.file_id(source).unwrap(), fs.file_id(copy).unwrap());
         assert!(fs.copy_path(source, copy, true).is_err());
         fs.copy_path(source, copy, false).unwrap();
         assert_eq!(fs.read_file(copy).unwrap(), b"first-second");
+        assert_eq!(fs.file_metadata(copy), source_metadata);
 
         fs.move_path(copy, moved).unwrap();
         assert!(!fs.exists(copy));
@@ -2076,6 +2528,43 @@ mod tests {
             b"stable identity"
         );
         assert!(!fs.exists(r"C:\compat\before.txt"));
+    }
+
+    #[test]
+    fn hard_link_names_share_updates_and_keep_independent_lifetimes() {
+        let mut fs = WinFs::new();
+        fs.mkdir(r"C:\compat").unwrap();
+        fs.write_file(r"C:\compat\source.txt", b"before".to_vec())
+            .unwrap();
+        fs.create_hard_link(r"C:\compat\alias.txt", r"C:\compat\source.txt")
+            .unwrap();
+        let id = fs.file_id(r"C:\compat\source.txt").unwrap();
+        assert_eq!(fs.file_id(r"C:\compat\alias.txt").unwrap(), id);
+        fs.write_file(r"C:\compat\alias.txt", b"after".to_vec())
+            .unwrap();
+        assert_eq!(fs.read_file(r"C:\compat\source.txt").unwrap(), b"after");
+        fs.append_file(r"C:\compat\source.txt", b"!").unwrap();
+        assert_eq!(fs.read_file(r"C:\compat\alias.txt").unwrap(), b"after!");
+        fs.delete_file(r"C:\compat\alias.txt").unwrap();
+        assert_eq!(fs.read_file(r"C:\compat\source.txt").unwrap(), b"after!");
+    }
+
+    #[test]
+    fn symbolic_links_resolve_reads_writes_and_delete_without_removing_target() {
+        let mut fs = WinFs::new();
+        fs.mkdir(r"C:\compat").unwrap();
+        fs.write_file(r"C:\compat\target.txt", b"target".to_vec())
+            .unwrap();
+        fs.create_symlink(r"C:\compat\link.txt", "target.txt", false)
+            .unwrap();
+        assert!(fs.is_symlink(r"C:\compat\link.txt"));
+        assert_eq!(fs.read_file(r"C:\compat\link.txt").unwrap(), b"target");
+        fs.write_file(r"C:\compat\link.txt", b"changed".to_vec())
+            .unwrap();
+        assert_eq!(fs.read_file(r"C:\compat\target.txt").unwrap(), b"changed");
+        fs.delete_file(r"C:\compat\link.txt").unwrap();
+        assert!(fs.exists(r"C:\compat\target.txt"));
+        assert!(!fs.exists(r"C:\compat\link.txt"));
     }
 
     #[test]
