@@ -56,8 +56,11 @@ Items remain open until implementation and relevant verification are complete.
   support, Winsock shims, and WinFs-backed file/directory/named-pipe APIs are
   separate backend-local modules. Standard stream, descriptor, duplicate, file
   type, and close shims now live in a handles module; the shared per-process
-  handle maps remain in the backend state. Other API groups still need splitting
-  by Windows subsystem while host syscalls remain backend-local for macOS.
+  handle maps remain in the backend state. Critical-section, SRW-lock,
+  condition-variable, and InitOnce shims now live in a synchronization module;
+  event, semaphore, and wait APIs remain to be separated. Other API groups still
+  need splitting by Windows subsystem while host syscalls remain backend-local
+  for macOS.
 - [x] Cache `WINCLI_NATIVE_DIAGNOSTIC` once rather than reading the environment
   from hot shims; initialize the cache before guest forks.
 - [x] Fix Clippy's unevenly grouped hexadecimal literal warnings. A current
