@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Added a guest `C:\bin\powershell.exe` shell link so native child-process
+  launches run scripts through WinCLI's PowerShell-compatible interpreter.
 - Added the `KERNEL32!NeedCurrentDirectoryForExePathW` shim used by child
   process executable lookup.
 - Added the C-locale `msvcrt!mbstowcs` shim used by Nano.

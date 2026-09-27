@@ -26,6 +26,72 @@ use std::sync::Arc;
 const SHELL_HISTORY_PATH: &str = r"C:\.system\shell-history";
 const MAX_SHELL_HISTORY_ENTRIES: usize = 1000;
 const SHELL_HISTORY_FILE_ENV: &str = "WINCLI_HISTORY_FILE";
+pub(crate) const POWERSHELL_SHELL_LINK: &[u8] = b"WINCLI_POWERSHELL_SHELL_LINK/v1\n";
+
+pub(crate) fn is_powershell_shell_link(fs: &WinFs, path: &str) -> bool {
+    fs.read_file(path)
+        .is_ok_and(|contents| contents == POWERSHELL_SHELL_LINK)
+}
+
+fn seed_powershell_shell_link(fs: &mut WinFs) {
+    let path = r"C:\bin\powershell.exe";
+    if fs.is_file(path) {
+        return;
+    }
+    if !fs.is_dir(r"C:\bin") && fs.mkdir(r"C:\bin").is_err() {
+        return;
+    }
+    let _ = fs.write_file(path, POWERSHELL_SHELL_LINK.to_vec());
+}
+
+pub(crate) fn powershell_script(fs: &WinFs, argv: &[String]) -> Result<String, String> {
+    const USAGE: &str = "usage: powershell [-NoProfile] -c <script> | powershell <script.ps1>";
+    let mut args = argv;
+    while let Some(first) = args.first() {
+        let flag = first.to_lowercase();
+        if flag == "-noprofile" || flag == "-noninteractive" || flag == "-nologo" {
+            args = &args[1..];
+        } else if flag == "-executionpolicy" {
+            if args.len() < 2 {
+                return Err(USAGE.to_string());
+            }
+            args = &args[2..];
+        } else {
+            break;
+        }
+    }
+    match args.first().map(|s| s.to_lowercase()) {
+        Some(flag) if flag == "-command" || flag == "-c" || flag == "/c" => {
+            if args.len() < 2 {
+                return Err("usage: powershell -c <script>".to_string());
+            }
+            Ok(args[1..].join(" "))
+        }
+        Some(flag) if flag == "-file" && args.len() == 2 => {
+            if fs.is_file(&args[1]) {
+                let bytes = fs
+                    .read_file(&args[1])
+                    .map_err(|e| format!("cannot read {}: {e}", args[1]))?;
+                String::from_utf8(bytes).map_err(|e| format!("cannot read {}: {e}", args[1]))
+            } else {
+                std::fs::read_to_string(&args[1])
+                    .map_err(|e| format!("cannot read {}: {e}", args[1]))
+            }
+        }
+        Some(_) if args.len() == 1 && args[0].to_lowercase().ends_with(".ps1") => {
+            if fs.is_file(&args[0]) {
+                let bytes = fs
+                    .read_file(&args[0])
+                    .map_err(|e| format!("cannot read {}: {e}", args[0]))?;
+                String::from_utf8(bytes).map_err(|e| format!("cannot read {}: {e}", args[0]))
+            } else {
+                std::fs::read_to_string(&args[0])
+                    .map_err(|e| format!("cannot read {}: {e}", args[0]))
+            }
+        }
+        _ => Err(USAGE.to_string()),
+    }
+}
 
 fn external_history_path() -> Option<std::path::PathBuf> {
     if let Some(path) = std::env::var_os(SHELL_HISTORY_FILE_ENV) {
@@ -344,7 +410,8 @@ impl Shell {
 
     /// Start a session and remember the file it was loaded from for
     /// subsequent `snapshot save` commands without a path.
-    pub fn with_snapshot_path(fs: WinFs, snapshot_path: Option<std::path::PathBuf>) -> Self {
+    pub fn with_snapshot_path(mut fs: WinFs, snapshot_path: Option<std::path::PathBuf>) -> Self {
+        seed_powershell_shell_link(&mut fs);
         let backend_started = std::time::Instant::now();
         let backend = backend::configured().map_err(|e| format!("failed to select backend: {e}"));
         if std::env::var_os("WINCLI_TIMINGS").is_some() {
@@ -808,6 +875,10 @@ impl Shell {
         sink: Option<backend::OutputSink>,
     ) -> Result<ShellFlow, String> {
         let target = &argv[0];
+        if self.fs.is_file(target) && is_powershell_shell_link(&self.fs, target) {
+            self.do_powershell(&argv[1..], out)?;
+            return Ok(ShellFlow::Continue);
+        }
         if std::path::Path::new(target).is_file() {
             let ext = std::path::Path::new(target)
                 .extension()
@@ -857,6 +928,10 @@ impl Shell {
                     format!(r"{directory}\{target}.exe"),
                 ] {
                     if self.fs.is_file(&candidate) {
+                        if is_powershell_shell_link(&self.fs, &candidate) {
+                            self.do_powershell(&argv[1..], out)?;
+                            return Ok(ShellFlow::Continue);
+                        }
                         let file_read_started = std::time::Instant::now();
                         let data = self.fs.read_file(&candidate).map_err(|e| {
                             format!("cannot read guest executable {candidate}: {e}")
@@ -1166,43 +1241,7 @@ impl Shell {
     /// Minimal `powershell -c <script>` passthrough so Windows install
     /// one-liners (`powershell -c "irm ...|iex"`) run as PS1 in-session.
     fn do_powershell(&mut self, argv: &[String], out: &mut Vec<u8>) -> Result<(), String> {
-        let mut args = argv;
-        // Swallow `-NoProfile`, `-NonInteractive`, `-NoLogo`,
-        // `-ExecutionPolicy <policy>`.
-        while let Some(first) = args.first() {
-            let flag = first.to_lowercase();
-            if flag == "-noprofile" || flag == "-noninteractive" || flag == "-nologo" {
-                args = &args[1..];
-            } else if flag == "-executionpolicy" {
-                if args.len() < 2 {
-                    return Err(
-                        "usage: powershell [-NoProfile] -c <script> | powershell <script.ps1>"
-                            .to_string(),
-                    );
-                }
-                args = &args[2..];
-            } else {
-                break;
-            }
-        }
-        let script = match args.first().map(|s| s.to_lowercase()) {
-            Some(flag) if flag == "-command" || flag == "-c" || flag == "/c" => {
-                if args.len() < 2 {
-                    return Err("usage: powershell -c <script>".to_string());
-                }
-                args[1..].join(" ")
-            }
-            Some(_) if args.len() == 1 && args[0].to_lowercase().ends_with(".ps1") => {
-                std::fs::read_to_string(&args[0])
-                    .map_err(|e| format!("cannot read {}: {e}", args[0]))?
-            }
-            _ => {
-                return Err(
-                    "usage: powershell [-NoProfile] -c <script> | powershell <script.ps1>"
-                        .to_string(),
-                );
-            }
-        };
+        let script = powershell_script(&self.fs, argv)?;
         let code = ps1::run_ps1_session(&mut self.sess, &mut self.fs, &script, out)
             .map_err(|e| format!("script error: {e}"))?;
         self.last_code = code;
@@ -2030,6 +2069,23 @@ mod tests {
             .exec_line("powershell -NoProfile -c \"echo ps-ok\"", &mut out)
             .unwrap();
         assert_eq!(out, b"ps-ok\n");
+    }
+
+    #[test]
+    fn powershell_exe_shell_link_is_seeded_and_runs_the_same_handler() {
+        let mut shell = Shell::new();
+        assert!(is_powershell_shell_link(
+            &shell.fs,
+            r"C:\bin\powershell.exe"
+        ));
+        let mut out = Vec::new();
+        shell
+            .exec_line(
+                "powershell.exe -NoProfile -Command \"Write-Output 'linked-ok'\"",
+                &mut out,
+            )
+            .unwrap();
+        assert_eq!(out, b"linked-ok\n");
     }
 
     #[test]
