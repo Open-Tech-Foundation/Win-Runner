@@ -27,7 +27,7 @@ Items remain open until implementation and relevant verification are complete.
 - [x] **4. Keep the control listener alive after invalid connections.** Continue
   accepting until an authenticated WebSocket session is established, and use
   constant-time token comparison.
-- [ ] **5. Define child filesystem visibility and crash semantics.** Current
+- [x] **5. Define child filesystem visibility and crash semantics.** Current
   child changes are applied on normal exit, can be lost on kill/crash, and
   concurrent writers are last-finisher-wins. Document this behavior and plan
   shared/incremental filesystem updates for cooperating processes.

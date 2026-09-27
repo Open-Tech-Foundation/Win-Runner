@@ -41,6 +41,17 @@ controller can launch WinCLI with piped stdio, send input while the program is
 running, and read output until the process exits. Add
 `--save-snapshot=tools.winfs` to persist filesystem changes after it exits.
 
+### Child process filesystem behavior
+
+A guest child starts with its own copy of WinFS. Its changes are applied to the
+parent filesystem when it exits normally, so the parent and sibling processes
+do not see those writes while the child is still running. Changes that were not
+flushed before a child is killed or crashes can be lost. When concurrent
+children modify the same path, their journals are applied as each child exits;
+the later-applied write can replace the earlier one. This process model is
+still evolving and does not yet provide shared, incremental filesystem
+visibility.
+
 The shim code is part of the Rust executable, and an interactive shell selects
 its native backend once when the shell starts. Each PE still gets its own
 image mapping and import resolution, as it would when the OS loads a new

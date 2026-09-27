@@ -15,6 +15,8 @@ All notable changes to this project will be documented in this file.
   pipe-table locks in that child startup path.
 - Kept the headless control listener available after invalid handshakes and
   compared session tokens in constant time.
+- Documented child WinFS snapshot visibility, crash persistence, and the
+  current last-applied-write behavior for concurrent children.
 - Added a guest `C:\bin\powershell.exe` shell link so native child-process
   launches run scripts through WinCLI's PowerShell-compatible interpreter.
 - Added the `KERNEL32!NeedCurrentDirectoryForExePathW` shim used by child
