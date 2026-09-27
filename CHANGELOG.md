@@ -32,6 +32,9 @@ All notable changes to this project will be documented in this file.
   `Remove-Item` recursion condition reported by Clippy.
 - Reproduced the Node `execFileSync`/PowerShell shell-link hang and recorded it
   for pipe inheritance and EOF investigation.
+- Added the confirmed WinFs path, device, UNC, Unicode comparison, node-model,
+  symlink, and mounted-directory findings to the compatibility backlog, with
+  Windows-oracle testing and an ordered implementation plan.
 - Added the C-locale `msvcrt!mbstowcs` shim used by Nano.
 - Added an optional native Node check proving a relative file that Node leaves
   in WinFS appears in the following shell directory listing.

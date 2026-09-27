@@ -99,6 +99,76 @@ Items remain open until implementation and relevant verification are complete.
 - [ ] Add COM initialization stubs where `CoInitializeEx` succeeds and
   `CoCreateInstance` reports that a component is not registered.
 
+## WinFs paths and storage review
+
+The following behaviors were confirmed by comparison with Windows. Preserve
+the input, cwd, expected result, and expected Win32 error in a Windows-oracle
+table, then run the same cases against WinFs unit tests and guest executables.
+Record oracle values from `GetFullPathNameW`, `CreateFileW`, and
+`GetLastError` on real Windows before changing behavior.
+
+### Path compatibility cases
+
+- [ ] **Path oracle table.** Build shared cases with input path, cwd, expected
+  normalized path or device result, and expected error code. Include both
+  WinFs unit tests and guest `.exe` tests.
+- [ ] **Per-drive current directories.** Relative `file.txt` under cwd
+  `Z:\sub` must resolve to `Z:\sub\file.txt`; drive-relative `C:foo` must use
+  the remembered C: cwd even when the active cwd is on another drive. Model
+  Windows `=C:`-style per-drive cwd environment entries.
+- [ ] **DOS device names and console devices.** Treat `NUL` and `C:\work\nul`
+  as the null device, and cover `CON`, `CONIN$`, and `CONOUT$`. Recognize
+  reserved names including `COM1` and `LPT1`, also when followed by extensions
+  such as `nul.txt`.
+- [ ] **Device and pipe namespace.** Parse `\\.\NUL` and
+  `\\.\pipe\foo` as device/pipe paths rather than C: paths.
+- [ ] **UNC paths.** Support `\\server\share\x` and
+  `\\?\UNC\server\share\x`, or reject each explicitly with the correct
+  Windows error instead of silently remapping it onto C:.
+- [ ] **Trailing dots and spaces.** Drop trailing dots and spaces from each
+  path component (`foo.` aliases `foo`, and `foo \bar` trims the component's
+  trailing space); preserve leading spaces (` lead` remains distinct).
+- [ ] **Invalid characters and streams.** Reject invalid path characters such
+  as `|`, `<`, and `>` with `ERROR_INVALID_NAME`; define and test Windows
+  alternate-data-stream behavior for `a:b` instead of creating an ordinary
+  file with that spelling.
+- [ ] **Windows name comparison.** Compare names by uppercasing one Unicode
+  character at a time. In particular, `İ.txt` and `i\u{307}.txt` are distinct;
+  do not use whole-string full-Unicode lowercase conversion.
+- [ ] **Optional MAX_PATH mode.** Add an opt-in strict 260-character path check
+  and cover boundary and extended-path cases in the oracle table.
+- [ ] **One typed path parser.** Add `win_path::parse()` following
+  `GetFullPathNameW` rules, returning `Dos { drive, parts }`,
+  `Unc { server, share, parts }`, `Device(Nul | Con | ConIn | ConOut | Pipe(name))`,
+  or `Invalid(reason)`. Route path-consuming APIs through this parser so
+  parsing and prefix checks do not repeat or allocate per-prefix strings.
+
+### Filesystem representation and mounted drives
+
+- [ ] **ID-based WinFs nodes.** Give every file and directory an ID with its
+  metadata attached; directory entries map names to IDs. Make rename update
+  directory entries rather than rewriting path-keyed metadata, and support
+  hard links through shared IDs.
+- [ ] **Relative symlink targets.** Store the target exactly as supplied and
+  resolve relative targets from the link's parent directory, so moving a
+  containing directory preserves the link.
+- [ ] **Indexed mounted directories.** Cache mounted host directory listings
+  with a case-folded index, refresh when directory modification time changes,
+  and report case collisions such as simultaneous `Foo` and `foo` explicitly.
+- [ ] **Shared filesystem service.** Keep this aligned with the server/worker
+  architecture item below: a shared filesystem owner should make child writes
+  visible immediately. Current child-exit merge and crash-loss behavior is
+  already tracked under High priority #5.
+
+### Suggested implementation order
+
+1. Fix relative paths on non-C: drives and per-drive cwd handling.
+2. Implement NUL and CON-family devices.
+3. Add the typed parser for UNC and device paths.
+4. Normalize trailing dots/spaces and reject invalid/reserved names.
+5. Move WinFs nodes to IDs and retain relative symlink targets.
+6. Add mounted-directory indexes and collision reporting.
+
 ## Measurement and architecture
 
 - [ ] Build a corpus of 30–50 real executables (Git, embeddable Python, curl,
