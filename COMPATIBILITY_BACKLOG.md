@@ -63,8 +63,9 @@ Items remain open until implementation and relevant verification are complete.
   creation, job objects, process identity, child exit, and termination shims now
   live in the process module alongside launch support. File, pipe, TLS,
   filesystem, and per-process context data types now live in a backend-local
-  state module; child lifecycle plumbing, initialization, and global state
-  accessors remain in the backend root. C runtime shims and their
+  state module. Thread-local guest state and active process/filesystem context
+  accessors now live in a context module; child lifecycle plumbing and process
+  initialization remain in the backend root. C runtime shims and their
   process/thread-local state now live in a CRT module. Console screen, mode,
   output, and input-event APIs now live in a console module. Other API groups
   need splitting by Windows subsystem while host syscalls remain backend-local
