@@ -3336,6 +3336,61 @@ mod imp {
         }
 
         #[test]
+        fn modern_move_file_ex_replaces_existing_guest_destination() {
+            type MoveFileExW = unsafe extern "win64" fn(*const u16, *const u16, u32) -> i32;
+            let move_file: MoveFileExW =
+                unsafe { std::mem::transmute(require_kernel32_api(b"MoveFileExW\0") as usize) };
+            let source = r"C:\modern_move_ex_source.txt";
+            let destination = r"C:\modern_move_ex_destination.txt";
+            let source_wide = source.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let destination_wide = destination.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            {
+                let mut ctx = context.lock().unwrap();
+                ctx.fs
+                    .write_file(source, b"new-destination".to_vec())
+                    .unwrap();
+                ctx.fs
+                    .write_file(destination, b"old-destination".to_vec())
+                    .unwrap();
+            }
+
+            assert_eq!(
+                unsafe { move_file(source_wide.as_ptr(), destination_wide.as_ptr(), 1) },
+                1
+            );
+            let ctx = context.lock().unwrap();
+            assert!(!ctx.fs.exists(source));
+            assert_eq!(ctx.fs.read_file(destination).unwrap(), b"new-destination");
+            drop(ctx);
+            context.lock().unwrap().fs.delete_file(destination).unwrap();
+        }
+
+        #[test]
+        fn modern_wide_directory_apis_create_and_remove_guest_directory() {
+            type CreateDirectoryW =
+                unsafe extern "win64" fn(*const u16, *const std::ffi::c_void) -> i32;
+            type RemoveDirectoryW = unsafe extern "win64" fn(*const u16) -> i32;
+            let create_directory: CreateDirectoryW = unsafe {
+                std::mem::transmute(require_kernel32_api(b"CreateDirectoryW\0") as usize)
+            };
+            let remove_directory: RemoveDirectoryW = unsafe {
+                std::mem::transmute(require_kernel32_api(b"RemoveDirectoryW\0") as usize)
+            };
+            let path = r"C:\modern_directory_api";
+            let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+
+            assert_eq!(
+                unsafe { create_directory(wide.as_ptr(), std::ptr::null()) },
+                1
+            );
+            assert!(context.lock().unwrap().fs.exists(path));
+            assert_eq!(unsafe { remove_directory(wide.as_ptr()) }, 1);
+            assert!(!context.lock().unwrap().fs.exists(path));
+        }
+
+        #[test]
         fn initializes_critical_section_with_spin_count() {
             let mut section = [0x5au8; 40];
             assert_eq!(
