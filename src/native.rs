@@ -863,6 +863,197 @@ mod imp {
         }
 
         #[test]
+        fn modern_create_file_ansi_uses_windows_creation_dispositions() {
+            let path = b"C:\\modern_create_file_ansi.txt\0";
+            let context = super::fs_ctx().unwrap();
+            let create = |disposition| {
+                super::native_create_file_a(path.as_ptr(), 0, 0, 0, disposition, 0, 0)
+            };
+
+            let created = create(1); // CREATE_NEW
+            assert_ne!(created, u64::MAX);
+            assert_eq!(super::native_get_file_type(created), 1); // FILE_TYPE_DISK
+            assert_eq!(super::native_close_handle(created), 1);
+            assert_eq!(create(1), u64::MAX);
+            assert_eq!(super::native_get_last_error(), 80); // ERROR_FILE_EXISTS
+
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(r"C:\modern_create_file_ansi.txt", b"preserve".to_vec())
+                .unwrap();
+            let opened = create(4); // OPEN_ALWAYS preserves existing data
+            assert_ne!(opened, u64::MAX);
+            assert_eq!(super::native_close_handle(opened), 1);
+            assert_eq!(
+                context
+                    .lock()
+                    .unwrap()
+                    .fs
+                    .read_file(r"C:\modern_create_file_ansi.txt")
+                    .unwrap(),
+                b"preserve"
+            );
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .delete_file(r"C:\modern_create_file_ansi.txt")
+                .unwrap();
+        }
+
+        #[test]
+        fn modern_find_first_file_ex_covers_all_reference_option_combinations() {
+            let directory = r"C:\modern_find_ex_options";
+            let pattern = format!(r"{directory}\*");
+            let wide = |value: &str| value.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let pattern_wide = wide(&pattern);
+            let context = super::fs_ctx().unwrap();
+            {
+                let mut fs = context.lock().unwrap();
+                fs.fs.mkdir(directory).unwrap();
+                fs.fs.mkdir(&format!(r"{directory}\nested")).unwrap();
+                fs.fs
+                    .write_file(&format!(r"{directory}\Alpha.txt"), b"a".to_vec())
+                    .unwrap();
+                fs.fs
+                    .write_file(&format!(r"{directory}\beta.bin"), b"b".to_vec())
+                    .unwrap();
+            }
+
+            for (info_level, search_op, flags) in [
+                (0, 0, 0),
+                (0, 0, 1),
+                (0, 0, 2),
+                (1, 0, 0),
+                (0, 1, 0),
+                (0, 1, 1),
+                (0, 1, 2),
+                (1, 1, 0),
+            ] {
+                let mut data = [0u8; 592];
+                let find = super::native_find_first_file_ex_w(
+                    pattern_wide.as_ptr(),
+                    info_level,
+                    data.as_mut_ptr(),
+                    search_op,
+                    0,
+                    flags,
+                );
+                assert_ne!(find, u64::MAX, "{info_level}/{search_op}/{flags}");
+                let mut names = Vec::new();
+                loop {
+                    let encoded = unsafe {
+                        std::slice::from_raw_parts(data.as_ptr().add(44).cast::<u16>(), 260)
+                            .iter()
+                            .copied()
+                            .take_while(|unit| *unit != 0)
+                            .collect::<Vec<_>>()
+                    };
+                    names.push(String::from_utf16(&encoded).unwrap());
+                    if super::native_find_next_file_w(find, data.as_mut_ptr()) == 0 {
+                        break;
+                    }
+                }
+                names.sort();
+                assert_eq!(
+                    names,
+                    ["Alpha.txt", "beta.bin", "nested"],
+                    "{info_level}/{search_op}/{flags}"
+                );
+                assert_eq!(super::native_find_close(find), 1);
+            }
+
+            let mut fs = context.lock().unwrap();
+            fs.fs.remove(directory, true).unwrap();
+            drop(fs);
+        }
+
+        #[test]
+        fn modern_create_file_requires_backup_semantics_for_directory_handles() {
+            let directory = r"C:\modern_create_file_directory_flags";
+            let directory_wide = directory.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context.lock().unwrap().fs.mkdir(directory).unwrap();
+
+            let with_backup = super::native_create_file_w(
+                directory_wide.as_ptr(),
+                0,
+                0,
+                0,
+                3,
+                0x0200_0000, // FILE_FLAG_BACKUP_SEMANTICS
+                0,
+            );
+            assert_ne!(with_backup, u64::MAX);
+            assert_eq!(super::native_close_handle(with_backup), 1);
+
+            let without_backup = super::native_create_file_w(
+                directory_wide.as_ptr(),
+                0,
+                0,
+                0,
+                3, // OPEN_EXISTING
+                0,
+                0,
+            );
+            assert_eq!(without_backup, u64::MAX);
+            assert_eq!(super::native_get_last_error(), 5); // ERROR_ACCESS_DENIED
+            context.lock().unwrap().fs.remove(directory, true).unwrap();
+        }
+
+        #[test]
+        fn modern_create_file_posix_directory_attributes_create_a_directory() {
+            let directory = r"C:\modern_posix_directory_creation";
+            let context = super::fs_ctx().unwrap();
+            context.lock().unwrap().fs.mkdir(directory).unwrap();
+            let posix_directory = format!(r"{directory}\posix-created");
+            let posix_wide = posix_directory
+                .encode_utf16()
+                .chain([0])
+                .collect::<Vec<_>>();
+            let dispositions = [(1, true), (4, false), (5, false), (2, true)];
+            let flags = [0x0200_0000, 0x0200_0010, 0x0300_0010, 0x0100_0010];
+            let mut mismatches = Vec::new();
+            for (disposition, cleanup) in dispositions {
+                for flag in flags {
+                    let handle = super::native_create_file_w(
+                        posix_wide.as_ptr(),
+                        0x4000_0000,
+                        0x0000_0004,
+                        0,
+                        disposition,
+                        flag,
+                        0,
+                    );
+                    if handle == u64::MAX {
+                        mismatches.push(format!(
+                            "disposition={disposition} flags={flag:#x}: open failed"
+                        ));
+                        continue;
+                    }
+                    let is_directory = context.lock().unwrap().fs.is_dir(&posix_directory);
+                    let expect_directory = disposition == 1 && flag == 0x0300_0010;
+                    if is_directory != expect_directory {
+                        mismatches.push(format!(
+                            "disposition={disposition} flags={flag:#x}: directory={is_directory}, expected={expect_directory}"
+                        ));
+                    }
+                    assert_eq!(super::native_close_handle(handle), 1);
+                    if cleanup {
+                        let mut fs = context.lock().unwrap();
+                        if fs.fs.exists(&posix_directory) {
+                            fs.fs.remove(&posix_directory, true).unwrap();
+                        }
+                    }
+                }
+            }
+            assert!(mismatches.is_empty(), "POSIX create cases: {mismatches:?}");
+            context.lock().unwrap().fs.remove(directory, true).unwrap();
+        }
+
+        #[test]
         fn move_file_ex_honors_replace_existing_and_rejects_bad_flags() {
             let context = super::fs_ctx().unwrap();
             let source = r"C:\move_file_ex_source.txt";
@@ -1730,6 +1921,45 @@ mod imp {
                 .filter(|api| !super::supports_import("KERNEL32.dll", api))
                 .collect::<Vec<_>>();
             assert!(missing.is_empty(), "unbound modern file APIs: {missing:?}");
+        }
+
+        macro_rules! modern_file_binding_cases {
+            ($($test_name:ident: [$($api:literal),+ $(,)?]),+ $(,)?) => {
+                $(
+                    #[test]
+                    fn $test_name() {
+                        let missing = [$($api),+]
+                            .into_iter()
+                            .filter(|api| !super::supports_import("KERNEL32.dll", api))
+                            .collect::<Vec<_>>();
+                        assert!(missing.is_empty(), "unbound APIs: {missing:?}");
+                    }
+                )+
+            };
+        }
+
+        modern_file_binding_cases! {
+            modern_temp_file_name_apis_are_bound: ["GetTempPathA", "GetTempPathW", "GetTempFileNameA", "GetTempFileNameW"],
+            modern_copy_file_variants_are_bound: ["CopyFileA", "CopyFile2", "CopyFileExW"],
+            modern_create_file2_is_bound: ["CreateFile2"],
+            modern_ansi_delete_and_move_apis_are_bound: ["DeleteFileA", "MoveFileA"],
+            modern_ansi_enumeration_apis_are_bound: ["FindFirstFileA", "FindNextFileA"],
+            modern_ansi_extended_enumeration_is_bound: ["FindFirstFileExA"],
+            modern_file_lock_apis_are_bound: ["LockFile", "UnlockFile"],
+            modern_file_replace_apis_are_bound: ["ReplaceFileA", "ReplaceFileW"],
+            modern_open_file_by_id_is_bound: ["OpenFileById"],
+            modern_set_file_valid_data_is_bound: ["SetFileValidData"],
+            modern_write_file_gather_is_bound: ["WriteFileGather"],
+            modern_ansi_final_path_api_is_bound: ["GetFinalPathNameByHandleA"],
+            modern_set_file_information_by_handle_is_bound: ["SetFileInformationByHandle"],
+            modern_stream_enumeration_is_bound: ["FindFirstStreamW"],
+            modern_reopen_file_is_bound: ["ReOpenFile"],
+            modern_hard_link_apis_are_bound: ["CreateHardLinkA", "CreateHardLinkW"],
+            modern_symbolic_link_apis_are_bound: ["CreateSymbolicLinkA", "CreateSymbolicLinkW"],
+            modern_set_end_of_file_api_is_bound: ["SetEndOfFile"],
+            modern_flush_file_buffers_api_is_bound: ["FlushFileBuffers"],
+            modern_extended_overlapped_result_api_is_bound: ["GetOverlappedResultEx"],
+            modern_ansi_file_attributes_api_is_bound: ["SetFileAttributesA"],
         }
 
         #[test]
