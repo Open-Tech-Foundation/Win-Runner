@@ -50,6 +50,8 @@ All notable changes to this project will be documented in this file.
   it.
 - Normalized trailing dots and spaces out of WinFs path components while
   preserving leading spaces.
+- Rejected invalid Windows path characters and unsupported alternate-data
+  stream syntax with `ERROR_INVALID_NAME` from native `CreateFileW`.
 - Added the C-locale `msvcrt!mbstowcs` shim used by Nano.
 - Added an optional native Node check proving a relative file that Node leaves
   in WinFS appears in the following shell directory listing.

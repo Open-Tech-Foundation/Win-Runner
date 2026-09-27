@@ -138,10 +138,11 @@ Record oracle values from `GetFullPathNameW`, `CreateFileW`, and
   spaces from each component (`foo.` aliases `foo`, and `foo \bar` trims the
   component's trailing space) while preserving leading spaces (` lead` remains
   distinct). WinFs tests cover all three cases.
-- [ ] **Invalid characters and streams.** Reject invalid path characters such
-  as `|`, `<`, and `>` with `ERROR_INVALID_NAME`; define and test Windows
-  alternate-data-stream behavior for `a:b` instead of creating an ordinary
-  file with that spelling.
+- [x] **Invalid characters and streams.** The parser rejects invalid path
+  characters such as `|`, `<`, and `>` and rejects colon stream syntax such as
+  `C:\file.txt:stream` instead of creating an ordinary file. Native
+  `CreateFileW` reports `ERROR_INVALID_NAME` (123); parser and native tests
+  cover these results. Alternate data streams remain unsupported.
 - [ ] **Windows name comparison.** Compare names by uppercasing one Unicode
   character at a time. In particular, `İ.txt` and `i\u{307}.txt` are distinct;
   do not use whole-string full-Unicode lowercase conversion.

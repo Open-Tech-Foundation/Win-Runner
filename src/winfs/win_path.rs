@@ -59,6 +59,12 @@ fn normalize_component(component: &str) -> String {
     }
 }
 
+fn invalid_component(component: &str) -> bool {
+    component.chars().any(|character| {
+        character <= '\u{1f}' || matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*')
+    })
+}
+
 fn strip_prefix_case_insensitive<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
     value
         .get(..prefix.len())
@@ -131,6 +137,12 @@ pub(crate) fn parse(raw: &str) -> ParsedWinPath {
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>();
 
+    if let Some(component) = components.iter().find(|part| invalid_component(part)) {
+        return ParsedWinPath::Invalid(format!(
+            "invalid character in Windows path component: {component}"
+        ));
+    }
+
     if let Some(device) = components.last().and_then(|name| device_name(name)) {
         return ParsedWinPath::Device(device);
     }
@@ -177,5 +189,8 @@ mod tests {
                 components: vec!["x".to_string()],
             }
         );
+        for path in [r"C:\bad|name", r"C:\bad<name>", r"C:\file.txt:stream"] {
+            assert!(matches!(parse(path), ParsedWinPath::Invalid(_)), "{path}");
+        }
     }
 }
