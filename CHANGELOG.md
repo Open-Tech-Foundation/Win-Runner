@@ -87,6 +87,8 @@ All notable changes to this project will be documented in this file.
   state into a Linux backend CRT module.
 - Moved console screen, mode, output, and input-event shims into a Linux backend
   console module.
+- Moved completion-port APIs, directory notifications, and overlapped file I/O
+  queue/cancellation support into a Linux backend module.
 - Added the C-locale `msvcrt!mbstowcs` shim used by Nano.
 - Added an optional native Node check proving a relative file that Node leaves
   in WinFS appears in the following shell directory listing.

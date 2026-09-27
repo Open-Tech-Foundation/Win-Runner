@@ -66,7 +66,9 @@ Items remain open until implementation and relevant verification are complete.
   process/thread-local state now live in a CRT module. Console screen, mode,
   output, and input-event APIs now live in a console module. Other API groups
   need splitting by Windows subsystem while host syscalls remain backend-local
-  for macOS.
+  for macOS. Completion-port APIs, directory notifications, and overlapped file
+  I/O/cancellation code now live in a dedicated module; process-scoped queue and
+  completion state remain in the backend context.
 - [x] Cache `WINCLI_NATIVE_DIAGNOSTIC` once rather than reading the environment
   from hot shims; initialize the cache before guest forks.
 - [x] Fix Clippy's unevenly grouped hexadecimal literal warnings. A current
