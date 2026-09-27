@@ -53,9 +53,10 @@ Items remain open until implementation and relevant verification are complete.
   `native.rs` is now a platform-neutral façade; Linux x86-64 execution and
   unsupported-host behavior live in separate backend modules. Linux host ABI
   declarations, PE import/trampoline lookup, image mapping, and process launch
-  support are separate backend-local modules. The remaining Linux backend still
-  contains most API shims and should be split by Windows API subsystem while
-  keeping host syscalls backend-local so macOS can provide its own.
+  support, and Winsock shims are separate backend-local modules. The remaining
+  Linux backend still contains most API shims and should be split by Windows
+  API subsystem while keeping host syscalls backend-local so macOS can provide
+  its own.
 - [x] Cache `WINCLI_NATIVE_DIAGNOSTIC` once rather than reading the environment
   from hot shims; initialize the cache before guest forks.
 - [x] Fix Clippy's unevenly grouped hexadecimal literal warnings. A current
