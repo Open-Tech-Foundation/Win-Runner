@@ -111,6 +111,8 @@ All notable changes to this project will be documented in this file.
   backend module.
 - Grouped Linux guest heap, virtual-memory, and file-mapping APIs in a memory
   module, with page sizing and protection helpers shared by the PE loader.
+- Moved Linux Windows-version, processor, token, user, and computer/system
+  information shims into a dedicated system module.
 - Added the C-locale `msvcrt!mbstowcs` shim used by Nano.
 - Added an optional native Node check proving a relative file that Node leaves
   in WinFS appears in the following shell directory listing.
