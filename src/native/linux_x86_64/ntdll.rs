@@ -279,6 +279,63 @@ pub(super) extern "win64" fn native_nt_query_information_file(
             return 0; // STATUS_SUCCESS
         }
     }
+    if information_class == 8 && !information.is_null() && length >= 4 {
+        if let Some(pipe) = process_ctx().and_then(|process| {
+            process
+                .named_pipes
+                .lock()
+                .ok()
+                .and_then(|pipes| pipes.handles.get(&original).cloned())
+        }) {
+            let access = pipe.access;
+            let flags = (if access & 0x1 != 0 { 0x1 } else { 0 })
+                | (if access & 0x2 != 0 { 0x2 } else { 0 });
+            unsafe { (information as *mut u32).write_unaligned(flags) };
+            if !io_status.is_null() {
+                unsafe {
+                    (io_status as *mut u32).write_unaligned(0);
+                    (io_status.add(8) as *mut u64).write_unaligned(4);
+                }
+            }
+            return 0; // STATUS_SUCCESS
+        }
+    }
+    // FilePipeLocalInformation is used by libuv to avoid an unnecessary
+    // FlushFileBuffers call when the pipe has no queued writes. Return the
+    // fixed byte-stream pipe quotas and a fully available outbound quota for
+    // these in-memory named pipes.
+    if information_class == 24 && !information.is_null() && length >= 40 {
+        if let Some(pipe) = process_ctx().and_then(|process| {
+            process
+                .named_pipes
+                .lock()
+                .ok()
+                .and_then(|pipes| pipes.handles.get(&original).cloned())
+        }) {
+            let values = [
+                0,                               // FILE_PIPE_BYTE_STREAM_TYPE
+                2,                               // FILE_PIPE_FULL_DUPLEX
+                255,                             // maximum instances
+                1,                               // current instances
+                65_536,                          // inbound quota
+                0,                               // read data available
+                65_536,                          // outbound quota
+                65_536,                          // write quota available
+                3,                               // FILE_PIPE_CONNECTED_STATE
+                u32::from(pipe.endpoint.server), // server or client end
+            ];
+            unsafe {
+                ptr::copy_nonoverlapping(values.as_ptr(), information as *mut u32, values.len());
+            }
+            if !io_status.is_null() {
+                unsafe {
+                    (io_status as *mut u32).write_unaligned(0);
+                    (io_status.add(8) as *mut u64).write_unaligned(40);
+                }
+            }
+            return 0; // STATUS_SUCCESS
+        }
+    }
     if information_class == 18 && !information.is_null() && length >= 96 {
         if let Some(context) = fs_ctx() {
             if let Ok(ctx) = context.lock() {

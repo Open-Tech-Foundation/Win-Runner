@@ -647,6 +647,8 @@ fn native_file_error(status: u64) -> u32 {
         38
     } else if status == STATUS_CANCELLED {
         995 // ERROR_OPERATION_ABORTED
+    } else if status == 0xc000_014b {
+        109 // ERROR_BROKEN_PIPE
     } else {
         1
     }
@@ -1169,6 +1171,30 @@ pub(super) extern "win64" fn native_get_overlapped_result(
     let Some(process) = process_ctx() else {
         return 0;
     };
+    let is_pipe = process
+        .named_pipes
+        .lock()
+        .is_ok_and(|pipes| pipes.handles.contains_key(&handle));
+    if is_pipe {
+        while native_overlapped_status(overlapped) == STATUS_PENDING {
+            if wait == 0 {
+                native_set_last_error(996); // ERROR_IO_INCOMPLETE
+                return 0;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let status = native_overlapped_status(overlapped);
+        if status != 0 {
+            native_set_last_error(native_file_error(status));
+            return 0;
+        }
+        unsafe {
+            bytes.write(
+                (*(overlapped.wrapping_add(8) as *const AtomicU64)).load(Ordering::Acquire) as u32,
+            )
+        };
+        return 1;
+    }
     if !process
         .fs
         .lock()

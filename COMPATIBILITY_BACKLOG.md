@@ -38,15 +38,12 @@ Items remain open until implementation and relevant verification are complete.
   launcher captures stdout and stderr independently, drains both without
   blocking, and reports the channel to the output sink. Legacy callers continue
   receiving guest stderr on host stderr.
-- [ ] **8. Fix Node child-process pipe capture.** `execFileSync` launching the
-  guest `powershell.exe` shim hangs when reading captured output. Reproduced
-  with the official Node 24.21.0 binary seeded into a shell; it did not return
-  within 20 seconds. The named-pipe server now releases its pending client
-  endpoint after connection, so buffered writes are followed by EOF; `CancelIo`
-  now tracks the issuing thread. This removes the hang, but the same Node probe
-  currently returns `spawnSync powershell.exe UNKNOWN` with empty output.
-  Continue tracing IOCP completion/cancellation and child output forwarding
-  before closing this item.
+- [x] **8. Fix Node child-process pipe capture.** Named-pipe EOF after child
+  output, overlapped `GetOverlappedResult`, cancellation/readiness races,
+  `FilePipeLocalInformation`, and null-buffer zero-byte writes to standard
+  handles are handled. The official Node 24.21.0 default
+  `execFileSync('powershell.exe', ...)` probe captures `Hello` without an
+  error.
 
 ## Housekeeping
 

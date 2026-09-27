@@ -35,6 +35,28 @@ pub(in crate::native::linux_x86_64::file_io) fn native_submit_pipe_io(
             let events = if is_write { 0x4 } else { 0x1 };
             let (status, bytes) = loop {
                 if cancelled.load(Ordering::Acquire) {
+                    // Cancellation races with readiness. If a read already
+                    // has bytes (or EOF) waiting, Windows may complete it
+                    // normally instead of reporting STATUS_CANCELLED. This
+                    // matters for child-process capture, which cancels pipe
+                    // reads as soon as the child exits while final output is
+                    // still buffered.
+                    if !is_write && length != 0 {
+                        let count = unsafe {
+                            recv(
+                                worker_pipe.endpoint.fd,
+                                buffer as *mut c_void,
+                                length,
+                                0x40, // MSG_DONTWAIT
+                            )
+                        };
+                        if count > 0 {
+                            break (0, count as u32);
+                        }
+                        if count == 0 {
+                            break (0xc000_014b, 0); // STATUS_PIPE_BROKEN
+                        }
+                    }
                     break (0xc000_0120, 0); // STATUS_CANCELLED
                 }
                 let mut descriptor = NativePollFd {
@@ -326,8 +348,14 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_write_file(
         }
         return 1;
     }
-    if buf.is_null() {
+    if buf.is_null() && len != 0 {
         return 0;
+    }
+    if len == 0 && host_standard_fd(handle).is_some() {
+        if !written.is_null() {
+            unsafe { written.write(0) };
+        }
+        return 1;
     }
     // SAFETY: the guest supplied `buf`/`len`; a bad pointer terminates
     // only its isolated native child, never the parent runtime.

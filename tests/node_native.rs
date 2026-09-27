@@ -253,6 +253,48 @@ fn official_windows_node_reads_guest_file_metadata_and_contents() {
 }
 
 #[test]
+fn official_windows_node_exec_file_sync_captures_powershell_output() {
+    let Ok(node) = std::env::var("WINCLI_NODE_EXE") else {
+        return;
+    };
+    let node = Path::new(&node)
+        .canonicalize()
+        .expect("Windows node.exe exists");
+    let source = "const {execFileSync}=require('child_process'); const output=execFileSync('powershell.exe',['-NoProfile','-Command','Write-Output Hello']); process.stdout.write(output.toString().trim()+'\\n')";
+    let script = format!(
+        "@seed {} C:\\bin\\node.exe\nC:\\bin\\node.exe -e \"{source}\"\nexit\n",
+        node.display()
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wincli"))
+        .arg("shell")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start native WinCLI shell");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .expect("send Node child-process probe");
+    let output = child
+        .wait_with_output()
+        .expect("read Node child-process output");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Hello"),
+        "Node did not capture PowerShell output: {stdout}"
+    );
+}
+
+#[test]
 fn official_windows_node_runs_the_staged_npm_cli_natively() {
     let Ok(node) = std::env::var("WINCLI_NODE_EXE") else {
         return;

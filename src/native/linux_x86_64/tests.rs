@@ -4613,6 +4613,8 @@ mod protection_tests {
         info[..4].copy_from_slice(&275u32.to_le_bytes());
         assert_eq!(native_rtl_get_version(info.as_mut_ptr()), 0xC000_000D);
         assert_eq!(native_rtl_nt_status_to_dos_error(0xC000_0022), 5);
+        assert_eq!(native_rtl_nt_status_to_dos_error(0xC000_0120), 995);
+        assert_eq!(native_rtl_nt_status_to_dos_error(0xC000_014B), 109);
         assert_eq!(native_rtl_nt_status_to_dos_error(0xDEAD_BEEF), 317);
     }
 
@@ -4958,6 +4960,16 @@ mod protection_tests {
     #[test]
     fn reports_the_native_console_output_code_page() {
         assert_eq!(native_get_console_output_cp(), 1252);
+    }
+
+    #[test]
+    fn zero_byte_write_succeeds_for_a_native_standard_handle() {
+        let mut written = u32::MAX;
+        assert_eq!(
+            super::native_write_file(0x5000_0002, std::ptr::null(), 0, &mut written, 0,),
+            1
+        );
+        assert_eq!(written, 0);
     }
 
     #[test]

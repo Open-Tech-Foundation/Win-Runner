@@ -8,8 +8,12 @@ All notable changes to this project will be documented in this file.
 
 - Released the pending client endpoint after named-pipe connection so closing
   a writer delivers EOF after buffered output. Scoped `CancelIo` to the thread
-  that issued the I/O request. Node `execFileSync` with the PowerShell shell link
-  still reports `UNKNOWN` and remains under investigation.
+  that issued the I/O request. Added overlapped named-pipe support to
+  `GetOverlappedResult`, preserved buffered reads when cancellation races with
+  readiness, implemented `FilePipeLocalInformation` for libuv shutdown, and
+  accepted zero-byte writes with null buffers on standard handles. The official
+  Node 24.21.0 `execFileSync` default path now captures PowerShell shell-link
+  output without a pipe error.
 - Launched CLI PE guests in a fresh exec-based WinCLI worker instead of
   forking the multithreaded launcher. Workers reopen mounted drives and
   seekable WinFS extents, and return portable filesystem journals while
