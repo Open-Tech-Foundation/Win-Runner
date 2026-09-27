@@ -1015,7 +1015,7 @@ fn native_timing_reports_load_execution_and_state_stages() {
         "context=",
         "fork=",
         "first_output=",
-        "guest_until_stdout_eof=",
+        "guest_until_output_eof=",
         "state_transfer=",
         "state_decode=",
         "total=",
@@ -1031,7 +1031,7 @@ fn native_timing_reports_load_execution_and_state_stages() {
     assert!(stderr.contains("host_file_read="), "stderr: {stderr}");
     assert!(stderr.contains("pe_load="), "stderr: {stderr}");
     assert!(
-        stderr.contains("guest_until_stdout_eof="),
+        stderr.contains("guest_until_output_eof="),
         "stderr: {stderr}"
     );
 }

@@ -61,6 +61,8 @@ All notable changes to this project will be documented in this file.
   error.
 - Added optional strict `MAX_PATH` checking for WinFs, with extended-length
   paths exempt from the 260 UTF-16 unit limit.
+- Updated the integration assertion to match the current guest output EOF
+  timing label.
 - Added the C-locale `msvcrt!mbstowcs` shim used by Nano.
 - Added an optional native Node check proving a relative file that Node leaves
   in WinFS appears in the following shell directory listing.
