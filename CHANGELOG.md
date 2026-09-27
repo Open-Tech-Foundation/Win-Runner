@@ -109,6 +109,8 @@ All notable changes to this project will be documented in this file.
   into synchronization.
 - Moved Linux NTDLL file, process, and system-information shims into a dedicated
   backend module.
+- Grouped Linux guest heap, virtual-memory, and file-mapping APIs in a memory
+  module, with page sizing and protection helpers shared by the PE loader.
 - Added the C-locale `msvcrt!mbstowcs` shim used by Nano.
 - Added an optional native Node check proving a relative file that Node leaves
   in WinFS appears in the following shell directory listing.

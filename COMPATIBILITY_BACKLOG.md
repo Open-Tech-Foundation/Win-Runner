@@ -59,7 +59,8 @@ Items remain open until implementation and relevant verification are complete.
   handle maps remain in the backend state. Critical-section, SRW-lock,
   condition-variable, InitOnce, single-object wait, event, semaphore, SLIST,
   address-wait, and waitable-timer shims now live in a synchronization module.
-  Remaining process waits and waitable-object types still use separate state maps. Thread
+  Remaining process waits and waitable-object types still use separate state
+  maps. Thread
   creation, job objects, process identity, child exit, and termination shims now
   live in the process module alongside launch support. File, pipe, TLS,
   filesystem, and per-process context data types now live in a backend-local
@@ -74,9 +75,11 @@ Items remain open until implementation and relevant verification are complete.
   output, and input-event APIs now live in a console module. Clock, time-zone,
   and FILETIME shims now live in a clock module; scheduler sleep/yield APIs are
   grouped with synchronization. NTDLL file, process, and system-information
-  shims now live in a dedicated module. Other API groups including locale
-  conversion now live in Windows-subsystem modules while host
-  syscalls remain backend-local for macOS. Completion-port APIs, directory notifications, and overlapped file
+  shims now live in a dedicated module. Heap, virtual-memory, and file-mapping
+  APIs now live in a memory module shared with loader page helpers. Other API
+  groups including locale conversion now live in Windows-subsystem modules while
+  host syscalls remain backend-local for macOS. Completion-port APIs, directory
+  notifications, and overlapped file
   I/O/cancellation code now live in a dedicated module; process-scoped queue and
   completion state remain in the backend context.
 - [x] Cache `WINCLI_NATIVE_DIAGNOSTIC` once rather than reading the environment
