@@ -112,7 +112,10 @@ Errors print as
 `wincli: ...` without ending the session; `exit`/`quit` (or Ctrl-D) ends it
 with the last guest exit code. Interactive input supports cursor movement,
 insertion, deletion, and history navigation. The prompt goes to stderr,
-keeping stdout clean for pipes.
+keeping stdout clean for pipes. Interactive command history lives at
+`C:\.system\shell-history` in WinFS and is carried by saved C: snapshots.
+Use Windows-style `set NAME=value` or `path C:\tools;%PATH%` to update the
+session environment and guest executable search path.
 
 Mount a host folder on a separate guest drive with the `mount` command or at
 startup. Mounted files read and write through to the host folder. Use

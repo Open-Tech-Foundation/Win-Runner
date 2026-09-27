@@ -107,6 +107,16 @@ pub fn run_rust_baseline_argv_with_fs_recoverable(
     imp::run_rust_baseline_argv_with_fs_recoverable(img, fs, prog, args)
 }
 
+pub fn run_rust_baseline_argv_with_fs_environment_recoverable(
+    img: &PeImage,
+    fs: crate::winfs::WinFs,
+    prog: &str,
+    args: &[String],
+    environment: &[(String, String)],
+) -> Result<(u32, Vec<u8>, crate::winfs::WinFs), NativeExecutionFailure> {
+    imp::run_rust_baseline_argv_with_fs_environment_recoverable(img, fs, prog, args, environment)
+}
+
 /// As [`run_rust_baseline_argv_with_fs`], forwarding stdout chunks while the
 /// isolated native child is still running.
 pub fn run_rust_baseline_argv_with_fs_streaming(
@@ -127,6 +137,24 @@ pub fn run_rust_baseline_argv_with_fs_streaming_recoverable(
     output: &dyn Fn(&[u8]),
 ) -> Result<(u32, Vec<u8>, crate::winfs::WinFs), NativeExecutionFailure> {
     imp::run_rust_baseline_argv_with_fs_streaming_recoverable(img, fs, prog, args, output)
+}
+
+pub fn run_rust_baseline_argv_with_fs_streaming_environment_recoverable(
+    img: &PeImage,
+    fs: crate::winfs::WinFs,
+    prog: &str,
+    args: &[String],
+    environment: &[(String, String)],
+    output: &dyn Fn(&[u8]),
+) -> Result<(u32, Vec<u8>, crate::winfs::WinFs), NativeExecutionFailure> {
+    imp::run_rust_baseline_argv_with_fs_streaming_environment_recoverable(
+        img,
+        fs,
+        prog,
+        args,
+        environment,
+        output,
+    )
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -20015,7 +20043,7 @@ mod imp {
         prog: &str,
         args: &[String],
     ) -> Result<(u32, Vec<u8>, WinFs), String> {
-        run_rust_baseline_argv_with_fs_impl(img, instance_fs, prog, args, None)
+        run_rust_baseline_argv_with_fs_impl(img, instance_fs, prog, args, &[], None)
             .map_err(|failure| failure.message)
     }
 
@@ -20025,7 +20053,17 @@ mod imp {
         prog: &str,
         args: &[String],
     ) -> Result<(u32, Vec<u8>, WinFs), super::NativeExecutionFailure> {
-        run_rust_baseline_argv_with_fs_impl(img, instance_fs, prog, args, None)
+        run_rust_baseline_argv_with_fs_impl(img, instance_fs, prog, args, &[], None)
+    }
+
+    pub(super) fn run_rust_baseline_argv_with_fs_environment_recoverable(
+        img: &PeImage,
+        instance_fs: WinFs,
+        prog: &str,
+        args: &[String],
+        environment: &[(String, String)],
+    ) -> Result<(u32, Vec<u8>, WinFs), super::NativeExecutionFailure> {
+        run_rust_baseline_argv_with_fs_impl(img, instance_fs, prog, args, environment, None)
     }
 
     pub(super) fn run_rust_baseline_argv_with_fs_streaming(
@@ -20035,7 +20073,7 @@ mod imp {
         args: &[String],
         output: &dyn Fn(&[u8]),
     ) -> Result<(u32, Vec<u8>, WinFs), String> {
-        run_rust_baseline_argv_with_fs_impl(img, instance_fs, prog, args, Some(output))
+        run_rust_baseline_argv_with_fs_impl(img, instance_fs, prog, args, &[], Some(output))
             .map_err(|failure| failure.message)
     }
 
@@ -20046,7 +20084,18 @@ mod imp {
         args: &[String],
         output: &dyn Fn(&[u8]),
     ) -> Result<(u32, Vec<u8>, WinFs), super::NativeExecutionFailure> {
-        run_rust_baseline_argv_with_fs_impl(img, instance_fs, prog, args, Some(output))
+        run_rust_baseline_argv_with_fs_impl(img, instance_fs, prog, args, &[], Some(output))
+    }
+
+    pub(super) fn run_rust_baseline_argv_with_fs_streaming_environment_recoverable(
+        img: &PeImage,
+        instance_fs: WinFs,
+        prog: &str,
+        args: &[String],
+        environment: &[(String, String)],
+        output: &dyn Fn(&[u8]),
+    ) -> Result<(u32, Vec<u8>, WinFs), super::NativeExecutionFailure> {
+        run_rust_baseline_argv_with_fs_impl(img, instance_fs, prog, args, environment, Some(output))
     }
 
     fn run_rust_baseline_argv_with_fs_impl(
@@ -20054,6 +20103,7 @@ mod imp {
         instance_fs: WinFs,
         prog: &str,
         args: &[String],
+        environment: &[(String, String)],
         output: Option<&dyn Fn(&[u8])>,
     ) -> Result<(u32, Vec<u8>, WinFs), super::NativeExecutionFailure> {
         let mut recovery_fs = Some(instance_fs);
@@ -20106,8 +20156,8 @@ mod imp {
                 parent_process_id: 0,
                 command_line_w,
                 command_line_a,
-                environment: Mutex::new(Vec::new()),
-                environment_block: Mutex::new(vec![0, 0]),
+                environment: Mutex::new(environment.to_vec()),
+                environment_block: Mutex::new(environment_strings(environment)),
                 std_handles: [
                     AtomicU64::new(STD_HANDLE_BASE),
                     AtomicU64::new(STD_HANDLE_BASE + 1),
@@ -20388,6 +20438,19 @@ mod imp {
         })
     }
 
+    pub(super) fn run_rust_baseline_argv_with_fs_environment_recoverable(
+        _: &PeImage,
+        fs: crate::winfs::WinFs,
+        _: &str,
+        _: &[String],
+        _: &[(String, String)],
+    ) -> Result<(u32, Vec<u8>, crate::winfs::WinFs), super::NativeExecutionFailure> {
+        Err(super::NativeExecutionFailure {
+            message: "native backend is available only on Linux x86_64".to_string(),
+            fs,
+        })
+    }
+
     pub(super) fn run_rust_baseline_argv(
         _: &PeImage,
         _: &str,
@@ -20420,6 +20483,20 @@ mod imp {
         fs: crate::winfs::WinFs,
         _: &str,
         _: &[String],
+        _: &dyn Fn(&[u8]),
+    ) -> Result<(u32, Vec<u8>, crate::winfs::WinFs), super::NativeExecutionFailure> {
+        Err(super::NativeExecutionFailure {
+            message: "native backend is available only on Linux x86_64".to_string(),
+            fs,
+        })
+    }
+
+    pub(super) fn run_rust_baseline_argv_with_fs_streaming_environment_recoverable(
+        _: &PeImage,
+        fs: crate::winfs::WinFs,
+        _: &str,
+        _: &[String],
+        _: &[(String, String)],
         _: &dyn Fn(&[u8]),
     ) -> Result<(u32, Vec<u8>, crate::winfs::WinFs), super::NativeExecutionFailure> {
         Err(super::NativeExecutionFailure {

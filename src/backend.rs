@@ -51,6 +51,17 @@ pub trait ExecutionBackend: Sync {
         args: &[String],
     ) -> Result<Execution, ExecutionFailure>;
 
+    fn execute_with_environment(
+        &self,
+        image: &PeImage,
+        fs: WinFs,
+        prog: &str,
+        args: &[String],
+        _environment: &[(String, String)],
+    ) -> Result<Execution, ExecutionFailure> {
+        self.execute(image, fs, prog, args)
+    }
+
     /// Execute while forwarding console output. Backends without a native
     /// incremental console bridge retain the safe default and emit once on
     /// completion; platform add-ons can override this without changing the
@@ -68,6 +79,18 @@ pub trait ExecutionBackend: Sync {
             sink(OutputChannel::Stdout, &result.stdout);
         }
         Ok(result)
+    }
+
+    fn execute_streaming_with_environment(
+        &self,
+        image: &PeImage,
+        fs: WinFs,
+        prog: &str,
+        args: &[String],
+        _environment: &[(String, String)],
+        sink: OutputSink,
+    ) -> Result<Execution, ExecutionFailure> {
+        self.execute_streaming(image, fs, prog, args, sink)
     }
 }
 
@@ -126,6 +149,54 @@ impl ExecutionBackend for NativeLinuxX64 {
             message: failure.message,
             fs: failure.fs,
         })?;
+        Ok(Execution { code, stdout, fs })
+    }
+
+    fn execute_with_environment(
+        &self,
+        image: &PeImage,
+        fs: WinFs,
+        prog: &str,
+        args: &[String],
+        environment: &[(String, String)],
+    ) -> Result<Execution, ExecutionFailure> {
+        let (code, stdout, fs) = native::run_rust_baseline_argv_with_fs_environment_recoverable(
+            image,
+            fs,
+            prog,
+            args,
+            environment,
+        )
+        .map_err(|failure| ExecutionFailure {
+            message: failure.message,
+            fs: failure.fs,
+        })?;
+        Ok(Execution { code, stdout, fs })
+    }
+
+    fn execute_streaming_with_environment(
+        &self,
+        image: &PeImage,
+        fs: WinFs,
+        prog: &str,
+        args: &[String],
+        environment: &[(String, String)],
+        sink: OutputSink,
+    ) -> Result<Execution, ExecutionFailure> {
+        let forward = Arc::clone(&sink);
+        let (code, stdout, fs) =
+            native::run_rust_baseline_argv_with_fs_streaming_environment_recoverable(
+                image,
+                fs,
+                prog,
+                args,
+                environment,
+                &move |chunk| forward(OutputChannel::Stdout, chunk),
+            )
+            .map_err(|failure| ExecutionFailure {
+                message: failure.message,
+                fs: failure.fs,
+            })?;
         Ok(Execution { code, stdout, fs })
     }
 }

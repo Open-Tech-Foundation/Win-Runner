@@ -12,8 +12,30 @@
 
 use crate::{backend, choco, inspect, install, pe, ps1, winfs::WinFs};
 use rustyline::{error::ReadlineError, DefaultEditor};
+use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 use std::sync::Arc;
+
+const SHELL_HISTORY_PATH: &str = r"C:\.system\shell-history";
+const MAX_SHELL_HISTORY_ENTRIES: usize = 1000;
+
+fn default_environment() -> Vec<(String, String)> {
+    BTreeMap::from([
+        (
+            "PATH".to_string(),
+            r"C:\bin;C:\Windows\System32".to_string(),
+        ),
+        ("SystemDrive".to_string(), "C:".to_string()),
+        ("SystemRoot".to_string(), r"C:\Windows".to_string()),
+        ("TEMP".to_string(), r"C:\Windows\Temp".to_string()),
+        ("TMP".to_string(), r"C:\Windows\Temp".to_string()),
+        ("USERPROFILE".to_string(), r"C:\Users\WinCLI".to_string()),
+        ("USERNAME".to_string(), "WinCLI".to_string()),
+        ("WINDIR".to_string(), r"C:\Windows".to_string()),
+    ])
+    .into_iter()
+    .collect()
+}
 
 /// What the REPL does after a line.
 #[derive(Debug)]
@@ -29,6 +51,7 @@ pub struct Shell {
     last_code: i32,
     backend: Result<&'static dyn backend::ExecutionBackend, String>,
     snapshot_path: Option<std::path::PathBuf>,
+    environment: Vec<(String, String)>,
 }
 
 impl Default for Shell {
@@ -66,6 +89,7 @@ impl Shell {
             last_code: 0,
             backend,
             snapshot_path,
+            environment: default_environment(),
         }
     }
 
@@ -76,6 +100,129 @@ impl Shell {
 
     pub fn last_code(&self) -> i32 {
         self.last_code
+    }
+
+    fn shell_history(&self) -> Vec<String> {
+        self.fs
+            .read_file(SHELL_HISTORY_PATH)
+            .ok()
+            .map(|bytes| {
+                String::from_utf8_lossy(&bytes)
+                    .lines()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .rev()
+            .take(MAX_SHELL_HISTORY_ENTRIES)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
+    }
+
+    fn persist_shell_history(&mut self, entries: &[String]) -> Result<(), String> {
+        self.fs.mkdir(r"C:\.system")?;
+        let start = entries.len().saturating_sub(MAX_SHELL_HISTORY_ENTRIES);
+        let mut contents = entries[start..].join("\n");
+        if !contents.is_empty() {
+            contents.push('\n');
+        }
+        self.fs
+            .write_file(SHELL_HISTORY_PATH, contents.into_bytes())
+    }
+
+    fn environment_value(&self, name: &str) -> Option<&str> {
+        self.environment
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    fn set_environment_value(&mut self, name: String, value: Option<String>) {
+        if let Some(index) = self
+            .environment
+            .iter()
+            .position(|(key, _)| key.eq_ignore_ascii_case(&name))
+        {
+            if let Some(value) = value {
+                self.environment[index].1 = value;
+            } else {
+                self.environment.remove(index);
+            }
+        } else if let Some(value) = value {
+            self.environment.push((name, value));
+        }
+    }
+
+    fn expand_environment_references(&self, input: &str) -> String {
+        let chars: Vec<char> = input.chars().collect();
+        let mut output = String::with_capacity(input.len());
+        let mut index = 0;
+        while index < chars.len() {
+            if chars[index] == '%' {
+                if let Some(end) = chars[index + 1..].iter().position(|&ch| ch == '%') {
+                    let end = index + 1 + end;
+                    let name: String = chars[index + 1..end].iter().collect();
+                    if let Some(value) = self.environment_value(&name) {
+                        output.push_str(value);
+                    } else {
+                        output.extend(chars[index..=end].iter());
+                    }
+                    index = end + 1;
+                    continue;
+                }
+            }
+            output.push(chars[index]);
+            index += 1;
+        }
+        output
+    }
+
+    fn do_set(&mut self, argv: &[String], out: &mut Vec<u8>) -> Result<(), String> {
+        if argv.is_empty() {
+            let vars = self
+                .environment
+                .iter()
+                .map(|(name, value)| (name.to_ascii_uppercase(), value.clone()))
+                .collect::<BTreeMap<_, _>>();
+            for (name, value) in vars {
+                out.extend_from_slice(format!("{name}={value}\n").as_bytes());
+            }
+            return Ok(());
+        }
+        let expression = argv.join(" ");
+        let Some((name, value)) = expression.split_once('=') else {
+            let prefix = expression.to_ascii_uppercase();
+            for (name, value) in &self.environment {
+                if name.to_ascii_uppercase().starts_with(&prefix) {
+                    out.extend_from_slice(format!("{name}={value}\n").as_bytes());
+                }
+            }
+            return Ok(());
+        };
+        let name = name.trim();
+        if name.is_empty() || name.chars().any(char::is_whitespace) || name.contains('%') {
+            return Err("set: invalid environment variable name".to_string());
+        }
+        let value = self.expand_environment_references(value);
+        self.set_environment_value(name.to_string(), (!value.is_empty()).then_some(value));
+        Ok(())
+    }
+
+    fn do_path(&mut self, argv: &[String], out: &mut Vec<u8>) {
+        if argv.is_empty() {
+            let value = self.environment_value("PATH").unwrap_or("");
+            out.extend_from_slice(format!("PATH={value}\n").as_bytes());
+            return;
+        }
+        let mut value = argv.join(" ");
+        if let Some(rest) = value.strip_prefix('=') {
+            value = rest.to_string();
+        }
+        let value = self.expand_environment_references(&value);
+        self.set_environment_value("PATH".to_string(), Some(value));
     }
 
     /// Execute one input line; guest/PS1 output is appended to `out`.
@@ -145,6 +292,14 @@ impl Shell {
             }
             "snapshot" => {
                 self.do_snapshot(&argv[1..], out)?;
+                Ok(ShellFlow::Continue)
+            }
+            "set" => {
+                self.do_set(&argv[1..], out)?;
+                Ok(ShellFlow::Continue)
+            }
+            "path" => {
+                self.do_path(&argv[1..], out);
                 Ok(ShellFlow::Continue)
             }
             "mount" => {
@@ -259,18 +414,28 @@ impl Shell {
             report_timing(target, "guest_file_read", file_read_started);
             return self.run_exe_bytes(&data, target, &argv[1..], out, sink);
         }
-        // Bare names resolve on the machine PATH (`C:\bin`), like a real
-        // terminal: `7z` finds `C:\bin\7z.exe` installed on this disk.
+        // Bare names resolve on the guest PATH, like a Windows terminal.
         if !target.contains(['\\', '/', ':']) {
-            for candidate in [format!(r"C:\bin\{target}"), format!(r"C:\bin\{target}.exe")] {
-                if self.fs.is_file(&candidate) {
-                    let file_read_started = std::time::Instant::now();
-                    let data = self
-                        .fs
-                        .read_file(&candidate)
-                        .map_err(|e| format!("cannot read guest executable {candidate}: {e}"))?;
-                    report_timing(&candidate, "guest_file_read", file_read_started);
-                    return self.run_exe_bytes(&data, &candidate, &argv[1..], out, sink);
+            for directory in self
+                .environment_value("PATH")
+                .unwrap_or("")
+                .split(';')
+                .map(str::trim)
+                .map(|directory| directory.trim_matches('"'))
+                .filter(|directory| !directory.is_empty())
+            {
+                for candidate in [
+                    format!(r"{directory}\{target}"),
+                    format!(r"{directory}\{target}.exe"),
+                ] {
+                    if self.fs.is_file(&candidate) {
+                        let file_read_started = std::time::Instant::now();
+                        let data = self.fs.read_file(&candidate).map_err(|e| {
+                            format!("cannot read guest executable {candidate}: {e}")
+                        })?;
+                        report_timing(&candidate, "guest_file_read", file_read_started);
+                        return self.run_exe_bytes(&data, &candidate, &argv[1..], out, sink);
+                    }
                 }
             }
         }
@@ -332,8 +497,15 @@ impl Shell {
         let fs = std::mem::replace(&mut self.fs, WinFs::ephemeral_runner());
         let streaming = sink.is_some();
         let result = match sink {
-            Some(sink) => backend.execute_streaming(&img, fs, prog, guest_args, sink),
-            None => backend.execute(&img, fs, prog, guest_args),
+            Some(sink) => backend.execute_streaming_with_environment(
+                &img,
+                fs,
+                prog,
+                guest_args,
+                &self.environment,
+                sink,
+            ),
+            None => backend.execute_with_environment(&img, fs, prog, guest_args, &self.environment),
         };
         let result = match result {
             Ok(result) => result,
@@ -803,11 +975,23 @@ fn run_session(
                 return (1, shell.fs);
             }
         };
+        let mut history = shell.shell_history();
+        for entry in &history {
+            let _ = editor.add_history_entry(entry.as_str());
+        }
         loop {
             let prompt = format!("PS {}> ", shell.cwd());
             match editor.readline(&prompt) {
                 Ok(line) => {
-                    let _ = editor.add_history_entry(line.as_str());
+                    if editor.add_history_entry(line.as_str()).unwrap_or(false) {
+                        history.push(line.clone());
+                        if history.len() > MAX_SHELL_HISTORY_ENTRIES {
+                            history.remove(0);
+                        }
+                        if let Err(error) = shell.persist_shell_history(&history) {
+                            eprintln!("wincli: cannot save shell history to {SHELL_HISTORY_PATH}: {error}");
+                        }
+                    }
                     if let Some(code) = execute_input_line(&mut shell, &line) {
                         return (code, shell.fs);
                     }
@@ -920,6 +1104,57 @@ mod tests {
             Ok(ShellFlow::Continue)
         ));
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn shell_history_roundtrips_through_c_system_and_snapshot() {
+        let mut shell = Shell::new();
+        let entries = vec!["set PATH=C:\\tools".to_string(), "nano".to_string()];
+        shell.persist_shell_history(&entries).unwrap();
+        assert_eq!(shell.shell_history(), entries);
+
+        let snapshot = std::env::temp_dir().join(format!(
+            "wincli-history-{}-{}.winfs",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        crate::snapshot::save_file(&mut shell.fs, snapshot.to_str().unwrap()).unwrap();
+        let restored = crate::snapshot::load_file(snapshot.to_str().unwrap()).unwrap();
+        std::fs::remove_file(snapshot).unwrap();
+        assert_eq!(Shell::with_fs(restored).shell_history(), entries);
+    }
+
+    #[test]
+    fn set_and_path_update_guest_environment_and_executable_search() {
+        let mut shell = Shell::new();
+        shell.fs.mkdir(r"C:\tools").unwrap();
+        shell
+            .fs
+            .write_file(
+                r"C:\tools\history-probe.exe",
+                crate::pe::builder::hello("found on guest PATH"),
+            )
+            .unwrap();
+        let mut out = Vec::new();
+        shell.exec_line(r"set TOOLS=C:\tools", &mut out).unwrap();
+        shell
+            .exec_line("set PATH=%PATH%;%TOOLS%", &mut out)
+            .unwrap();
+        assert!(shell
+            .environment_value("path")
+            .unwrap()
+            .ends_with(r";C:\tools"));
+        shell.exec_line("path", &mut out).unwrap();
+        assert!(String::from_utf8_lossy(&out).contains(r"C:\tools"));
+        out.clear();
+        shell.exec_line("history-probe", &mut out).unwrap();
+        assert_eq!(out, b"found on guest PATH");
+
+        shell.exec_line("set TOOLS=", &mut out).unwrap();
+        assert_eq!(shell.environment_value("TOOLS"), None);
     }
 
     #[test]
