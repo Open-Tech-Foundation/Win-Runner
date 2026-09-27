@@ -428,6 +428,13 @@ mod imp {
         };
         use crate::winfs::WinFs;
 
+        fn require_kernel32_api(name: &'static [u8]) -> u64 {
+            let address = super::native_get_proc_address(super::API_SET_MODULE, name.as_ptr());
+            let label = String::from_utf8_lossy(&name[..name.len().saturating_sub(1)]);
+            assert_ne!(address, 0, "KERNEL32 API is not available: {label}");
+            address
+        }
+
         #[test]
         fn translates_standard_windows_page_protections() {
             assert_eq!(linux_protection(0x01), Some(0));
@@ -2179,6 +2186,292 @@ mod imp {
             modern_flush_file_buffers_api_is_bound: ["FlushFileBuffers"],
             modern_extended_overlapped_result_api_is_bound: ["GetOverlappedResultEx"],
             modern_ansi_file_attributes_api_is_bound: ["SetFileAttributesA"],
+        }
+
+        #[test]
+        fn modern_reopen_file_preserves_guest_file_contents() {
+            type ReOpenFile = unsafe extern "win64" fn(u64, u32, u32, u32) -> u64;
+            let reopen: ReOpenFile =
+                unsafe { std::mem::transmute(require_kernel32_api(b"ReOpenFile\0") as usize) };
+            let path = r"C:\modern_reopen_file.txt";
+            let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(path, b"reopen-data".to_vec())
+                .unwrap();
+
+            let original = super::native_create_file_w(wide.as_ptr(), 0x8000_0000, 7, 0, 3, 0, 0);
+            assert_ne!(original, u64::MAX);
+            let reopened = unsafe { reopen(original, 0x8000_0000, 7, 0) };
+            assert_ne!(reopened, u64::MAX);
+            assert_eq!(super::native_get_file_type(reopened), 1);
+
+            let mut bytes = [0u8; 11];
+            let mut read = 0;
+            assert_eq!(
+                super::native_read_file(reopened, bytes.as_mut_ptr(), 11, &mut read, 0),
+                1
+            );
+            assert_eq!(read, 11);
+            assert_eq!(&bytes, b"reopen-data");
+            assert_eq!(super::native_close_handle(reopened), 1);
+            assert_eq!(super::native_close_handle(original), 1);
+            context.lock().unwrap().fs.delete_file(path).unwrap();
+        }
+
+        #[test]
+        fn modern_hard_link_shares_guest_file_identity_and_contents() {
+            type CreateHardLinkW = unsafe extern "win64" fn(*const u16, *const u16, u64) -> i32;
+            let create_link: CreateHardLinkW =
+                unsafe { std::mem::transmute(require_kernel32_api(b"CreateHardLinkW\0") as usize) };
+            let source = r"C:\modern_hard_link_source.txt";
+            let link = r"C:\modern_hard_link_alias.txt";
+            let source_wide = source.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let link_wide = link.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(source, b"linked-content".to_vec())
+                .unwrap();
+
+            assert_eq!(
+                unsafe { create_link(link_wide.as_ptr(), source_wide.as_ptr(), 0) },
+                1
+            );
+            assert_eq!(
+                context.lock().unwrap().fs.read_file(link).unwrap(),
+                b"linked-content"
+            );
+            let source_handle =
+                super::native_create_file_w(source_wide.as_ptr(), 0x8000_0000, 7, 0, 3, 0, 0);
+            let link_handle =
+                super::native_create_file_w(link_wide.as_ptr(), 0x8000_0000, 7, 0, 3, 0, 0);
+            assert_ne!(source_handle, u64::MAX);
+            assert_ne!(link_handle, u64::MAX);
+            let mut source_info = [0u8; 52];
+            let mut link_info = [0u8; 52];
+            assert_eq!(
+                super::native_get_file_information_by_handle(
+                    source_handle,
+                    source_info.as_mut_ptr()
+                ),
+                1
+            );
+            assert_eq!(
+                super::native_get_file_information_by_handle(link_handle, link_info.as_mut_ptr()),
+                1
+            );
+            assert_eq!(&source_info[44..52], &link_info[44..52]);
+            assert_eq!(super::native_close_handle(link_handle), 1);
+            assert_eq!(super::native_close_handle(source_handle), 1);
+            let mut ctx = context.lock().unwrap();
+            ctx.fs.delete_file(link).unwrap();
+            ctx.fs.delete_file(source).unwrap();
+        }
+
+        #[test]
+        fn modern_replace_file_moves_old_contents_to_backup() {
+            type ReplaceFileW =
+                unsafe extern "win64" fn(*const u16, *const u16, *const u16, u32, u64, u64) -> i32;
+            let replace: ReplaceFileW =
+                unsafe { std::mem::transmute(require_kernel32_api(b"ReplaceFileW\0") as usize) };
+            let destination = r"C:\modern_replace_destination.txt";
+            let replacement = r"C:\modern_replace_new.txt";
+            let backup = r"C:\modern_replace_backup.txt";
+            let destination_wide = destination.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let replacement_wide = replacement.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let backup_wide = backup.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            {
+                let mut ctx = context.lock().unwrap();
+                ctx.fs
+                    .write_file(destination, b"old-value".to_vec())
+                    .unwrap();
+                ctx.fs
+                    .write_file(replacement, b"new-value".to_vec())
+                    .unwrap();
+            }
+
+            assert_eq!(
+                unsafe {
+                    replace(
+                        destination_wide.as_ptr(),
+                        replacement_wide.as_ptr(),
+                        backup_wide.as_ptr(),
+                        0,
+                        0,
+                        0,
+                    )
+                },
+                1
+            );
+            let ctx = context.lock().unwrap();
+            assert_eq!(ctx.fs.read_file(destination).unwrap(), b"new-value");
+            assert_eq!(ctx.fs.read_file(backup).unwrap(), b"old-value");
+            assert!(!ctx.fs.exists(replacement));
+            drop(ctx);
+            let mut ctx = context.lock().unwrap();
+            ctx.fs.delete_file(backup).unwrap();
+            ctx.fs.delete_file(destination).unwrap();
+        }
+
+        #[test]
+        fn modern_lock_file_locks_and_unlocks_a_byte_range() {
+            type FileRangeOperation = unsafe extern "win64" fn(u64, u32, u32, u32, u32) -> i32;
+            let lock: FileRangeOperation =
+                unsafe { std::mem::transmute(require_kernel32_api(b"LockFile\0") as usize) };
+            let unlock: FileRangeOperation =
+                unsafe { std::mem::transmute(require_kernel32_api(b"UnlockFile\0") as usize) };
+            let path = r"C:\modern_lock_file.txt";
+            let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(path, b"lock".to_vec())
+                .unwrap();
+            let handle = super::native_create_file_w(wide.as_ptr(), 0xC000_0000, 7, 0, 3, 0, 0);
+            assert_ne!(handle, u64::MAX);
+
+            assert_eq!(unsafe { lock(handle, 1, 0, 1, 0) }, 1);
+            assert_eq!(unsafe { unlock(handle, 1, 0, 1, 0) }, 1);
+            assert_eq!(super::native_close_handle(handle), 1);
+            context.lock().unwrap().fs.delete_file(path).unwrap();
+        }
+
+        #[test]
+        fn modern_ansi_move_file_moves_guest_data_without_changing_contents() {
+            type MoveFileA = unsafe extern "win64" fn(*const u8, *const u8) -> i32;
+            let move_file: MoveFileA =
+                unsafe { std::mem::transmute(require_kernel32_api(b"MoveFileA\0") as usize) };
+            let source = b"C:\\modern_move_ansi_source.txt\0";
+            let destination = b"C:\\modern_move_ansi_destination.txt\0";
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file("C:\\modern_move_ansi_source.txt", b"move-data".to_vec())
+                .unwrap();
+
+            assert_eq!(
+                unsafe { move_file(source.as_ptr(), destination.as_ptr()) },
+                1
+            );
+            let ctx = context.lock().unwrap();
+            assert!(!ctx.fs.exists("C:\\modern_move_ansi_source.txt"));
+            assert_eq!(
+                ctx.fs
+                    .read_file("C:\\modern_move_ansi_destination.txt")
+                    .unwrap(),
+                b"move-data"
+            );
+            drop(ctx);
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .delete_file("C:\\modern_move_ansi_destination.txt")
+                .unwrap();
+        }
+
+        #[test]
+        fn modern_ansi_delete_file_removes_guest_file() {
+            type DeleteFileA = unsafe extern "win64" fn(*const u8) -> i32;
+            let delete_file: DeleteFileA =
+                unsafe { std::mem::transmute(require_kernel32_api(b"DeleteFileA\0") as usize) };
+            let path = b"C:\\modern_delete_ansi.txt\0";
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file("C:\\modern_delete_ansi.txt", b"delete-me".to_vec())
+                .unwrap();
+
+            assert_eq!(unsafe { delete_file(path.as_ptr()) }, 1);
+            assert!(!context
+                .lock()
+                .unwrap()
+                .fs
+                .exists("C:\\modern_delete_ansi.txt"));
+        }
+
+        #[test]
+        fn modern_copy_file_a_copies_data_and_honors_fail_if_exists() {
+            type CopyFileA = unsafe extern "win64" fn(*const u8, *const u8, i32) -> i32;
+            let copy_file: CopyFileA =
+                unsafe { std::mem::transmute(require_kernel32_api(b"CopyFileA\0") as usize) };
+            let source = b"C:\\modern_copy_ansi_source.txt\0";
+            let destination = b"C:\\modern_copy_ansi_destination.txt\0";
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file("C:\\modern_copy_ansi_source.txt", b"copy-data".to_vec())
+                .unwrap();
+
+            assert_eq!(
+                unsafe { copy_file(source.as_ptr(), destination.as_ptr(), 1) },
+                1
+            );
+            assert_eq!(
+                context
+                    .lock()
+                    .unwrap()
+                    .fs
+                    .read_file("C:\\modern_copy_ansi_destination.txt")
+                    .unwrap(),
+                b"copy-data"
+            );
+            assert_eq!(
+                unsafe { copy_file(source.as_ptr(), destination.as_ptr(), 1) },
+                0
+            );
+            assert_eq!(super::native_get_last_error(), 80);
+            let mut ctx = context.lock().unwrap();
+            ctx.fs
+                .delete_file("C:\\modern_copy_ansi_destination.txt")
+                .unwrap();
+            ctx.fs
+                .delete_file("C:\\modern_copy_ansi_source.txt")
+                .unwrap();
+        }
+
+        #[test]
+        fn modern_ansi_final_path_returns_the_open_guest_path() {
+            type GetFinalPathNameByHandleA =
+                unsafe extern "win64" fn(u64, *mut u8, u32, u32) -> u32;
+            let get_path: GetFinalPathNameByHandleA = unsafe {
+                std::mem::transmute(require_kernel32_api(b"GetFinalPathNameByHandleA\0") as usize)
+            };
+            let path = r"C:\modern_final_path_ansi.txt";
+            let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(path, b"path-data".to_vec())
+                .unwrap();
+            let handle = super::native_create_file_w(wide.as_ptr(), 0x8000_0000, 7, 0, 3, 0, 0);
+            assert_ne!(handle, u64::MAX);
+
+            let mut output = [0u8; 128];
+            let written = unsafe { get_path(handle, output.as_mut_ptr(), output.len() as u32, 0) };
+            assert_eq!(
+                &output[..written as usize],
+                b"\\\\?\\C:\\modern_final_path_ansi.txt"
+            );
+            assert_eq!(super::native_close_handle(handle), 1);
+            context.lock().unwrap().fs.delete_file(path).unwrap();
         }
 
         #[test]
