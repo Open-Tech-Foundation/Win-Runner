@@ -96,6 +96,8 @@ All notable changes to this project will be documented in this file.
   context accessors into a dedicated context module.
 - Grouped Linux critical section, SLIST, address-wait, and waitable-timer shims
   with the synchronization APIs.
+- Moved Windows code-page conversion and character classification shims into a
+  dedicated Linux backend locale module.
 - Added the C-locale `msvcrt!mbstowcs` shim used by Nano.
 - Added an optional native Node check proving a relative file that Node leaves
   in WinFS appears in the following shell directory listing.
