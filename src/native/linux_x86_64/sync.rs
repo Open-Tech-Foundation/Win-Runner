@@ -417,3 +417,370 @@ pub(super) extern "win64" fn native_sleep_condition_variable_cs(
         0
     }
 }
+
+pub(super) extern "win64" fn native_wait_for_single_object(handle: u64, milliseconds: u32) -> u32 {
+    if native_diagnostic_enabled() {
+        eprintln!("native WaitForSingleObject handle={handle:#x} timeout={milliseconds}");
+    }
+    let process = process_ctx();
+    if let Some(event) = process.as_ref().and_then(|process| {
+        process
+            .events
+            .lock()
+            .ok()
+            .and_then(|events| events.get(&handle).cloned())
+    }) {
+        return native_wait_event(&event, milliseconds);
+    }
+    if let Some(semaphore) = process.as_ref().and_then(|process| {
+        process
+            .semaphores
+            .lock()
+            .ok()
+            .and_then(|semaphores| semaphores.get(&handle).cloned())
+    }) {
+        let Ok(mut count) = semaphore.count.lock() else {
+            return u32::MAX;
+        };
+        if milliseconds == u32::MAX {
+            while *count == 0 {
+                count = match semaphore.changed.wait(count) {
+                    Ok(count) => count,
+                    Err(_) => return u32::MAX,
+                };
+            }
+        } else {
+            let Ok((new_count, _)) = semaphore.changed.wait_timeout_while(
+                count,
+                std::time::Duration::from_millis(milliseconds as u64),
+                |count| *count == 0,
+            ) else {
+                return u32::MAX;
+            };
+            count = new_count;
+            if *count == 0 {
+                return 258;
+            } // WAIT_TIMEOUT
+        }
+        *count -= 1;
+        return 0; // WAIT_OBJECT_0
+    }
+    if process.as_ref().is_some_and(|process| {
+        process
+            .threads
+            .lock()
+            .ok()
+            .is_some_and(|threads| threads.contains_key(&handle))
+    }) {
+        let deadline = if milliseconds == u32::MAX {
+            None
+        } else {
+            std::time::Instant::now()
+                .checked_add(std::time::Duration::from_millis(milliseconds as u64))
+        };
+        loop {
+            let join = {
+                let Some(process) = process.as_ref() else {
+                    return 0xffff_ffff;
+                };
+                let Ok(mut threads) = process.threads.lock() else {
+                    return 0xffff_ffff;
+                };
+                let Some(thread) = threads.get_mut(&handle) else {
+                    return 0xffff_ffff;
+                };
+                if thread.exit_code.is_some() {
+                    return 0;
+                }
+                if thread.join.as_ref().is_some_and(|join| join.is_finished()) {
+                    thread.join.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(join) = join {
+                let code = join.join().unwrap_or(1);
+                if let Some(process) = process.as_ref() {
+                    if let Ok(mut threads) = process.threads.lock() {
+                        if let Some(thread) = threads.get_mut(&handle) {
+                            thread.exit_code = Some(code);
+                        }
+                    }
+                }
+                return 0;
+            }
+            if milliseconds == 0 || deadline.is_some_and(|at| std::time::Instant::now() >= at) {
+                return 258; // WAIT_TIMEOUT; handle remains valid
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    match handle {
+        0x7000_0000..0x8000_0000 => 0,
+        _ => {
+            let Some(process) = process else {
+                native_set_last_error(6);
+                return 0xffff_ffff; // WAIT_FAILED
+            };
+            let Some(child) = child_process(&process, handle) else {
+                native_set_last_error(6);
+                return 0xffff_ffff;
+            };
+            let Ok(mut state) = child.state.lock() else {
+                return 0xffff_ffff;
+            };
+            if state.is_some() {
+                return 0; // WAIT_OBJECT_0
+            }
+            if milliseconds == 0 {
+                return 258; // WAIT_TIMEOUT
+            }
+            if milliseconds == u32::MAX {
+                while state.is_none() {
+                    state = match child.exited.wait(state) {
+                        Ok(state) => state,
+                        Err(_) => return 0xffff_ffff,
+                    };
+                }
+                return 0;
+            }
+            let result = match child.exited.wait_timeout_while(
+                state,
+                std::time::Duration::from_millis(milliseconds as u64),
+                |state| state.is_none(),
+            ) {
+                Ok((state, _)) if state.is_some() => 0,
+                Ok(_) => 258,
+                Err(_) => 0xffff_ffff,
+            };
+            result
+        }
+    }
+}
+fn native_wait_event(event: &NativeEvent, milliseconds: u32) -> u32 {
+    let Ok(mut signaled) = event.signaled.lock() else {
+        return u32::MAX;
+    };
+    if milliseconds == u32::MAX {
+        while !*signaled {
+            signaled = match event.ready.wait(signaled) {
+                Ok(state) => state,
+                Err(_) => return u32::MAX,
+            };
+        }
+    } else if !*signaled {
+        let Ok((state, _)) = event.ready.wait_timeout_while(
+            signaled,
+            std::time::Duration::from_millis(milliseconds as u64),
+            |state| !*state,
+        ) else {
+            return u32::MAX;
+        };
+        signaled = state;
+    }
+    if !*signaled {
+        return 258;
+    }
+    if !event.manual_reset {
+        *signaled = false;
+    }
+    0
+}
+pub(super) fn native_signal_event(event: &NativeEvent) {
+    if let Ok(mut signaled) = event.signaled.lock() {
+        *signaled = true;
+        if event.manual_reset {
+            event.ready.notify_all();
+        } else {
+            event.ready.notify_one();
+        }
+    }
+}
+pub(super) extern "win64" fn native_create_event_w(
+    _attributes: u64,
+    manual_reset: i32,
+    initial_state: i32,
+    name: *const u16,
+) -> u64 {
+    let Some(process) = process_ctx() else {
+        return 0;
+    };
+    let name = if name.is_null() {
+        None
+    } else {
+        match wide(name) {
+            Some(name) if !name.is_empty() => Some(name),
+            _ => {
+                native_set_last_error(87);
+                return 0;
+            }
+        }
+    };
+    let event = if let Some(name) = name {
+        let Ok(mut names) = process.event_names.lock() else {
+            return 0;
+        };
+        if let Some(event) = names.get(&name).and_then(std::sync::Weak::upgrade) {
+            native_set_last_error(183); // ERROR_ALREADY_EXISTS
+            event
+        } else {
+            let event = Arc::new(NativeEvent {
+                signaled: Mutex::new(initial_state != 0),
+                ready: Condvar::new(),
+                manual_reset: manual_reset != 0,
+            });
+            names.insert(name, Arc::downgrade(&event));
+            native_set_last_error(0);
+            event
+        }
+    } else {
+        Arc::new(NativeEvent {
+            signaled: Mutex::new(initial_state != 0),
+            ready: Condvar::new(),
+            manual_reset: manual_reset != 0,
+        })
+    };
+    let handle = process.event_next.fetch_add(4, Ordering::AcqRel);
+    let result = match process.events.lock() {
+        Ok(mut events) => {
+            events.insert(handle, event);
+            handle
+        }
+        Err(_) => 0,
+    };
+    result
+}
+pub(super) extern "win64" fn native_create_event_ex_w(
+    attributes: u64,
+    name: *const u16,
+    flags: u32,
+    _access: u32,
+) -> u64 {
+    if flags & !3 != 0 {
+        native_set_last_error(87);
+        return 0;
+    }
+    native_create_event_w(attributes, (flags & 1) as i32, (flags & 2) as i32, name)
+}
+pub(super) extern "win64" fn native_create_event_a(
+    attributes: u64,
+    manual_reset: i32,
+    initial_state: i32,
+    name: *const u8,
+) -> u64 {
+    if name.is_null() {
+        return native_create_event_w(attributes, manual_reset, initial_state, std::ptr::null());
+    }
+    let Some((bytes, _)) = (unsafe { multibyte_input(name, -1) }) else {
+        native_set_last_error(87);
+        return 0;
+    };
+    let wide: Vec<u16> = bytes
+        .into_iter()
+        .map(u16::from)
+        .chain(std::iter::once(0))
+        .collect();
+    native_create_event_w(attributes, manual_reset, initial_state, wide.as_ptr())
+}
+pub(super) extern "win64" fn native_create_event_ex_a(
+    attributes: u64,
+    name: *const u8,
+    flags: u32,
+    _access: u32,
+) -> u64 {
+    if flags & !3 != 0 {
+        native_set_last_error(87);
+        return 0;
+    }
+    native_create_event_a(attributes, (flags & 1) as i32, (flags & 2) as i32, name)
+}
+pub(super) extern "win64" fn native_set_event(handle: u64) -> i32 {
+    let event = process_ctx().and_then(|process| {
+        process
+            .events
+            .lock()
+            .ok()
+            .and_then(|events| events.get(&handle).cloned())
+    });
+    let Some(event) = event else {
+        native_set_last_error(6);
+        return 0;
+    };
+    native_signal_event(&event);
+    1
+}
+pub(super) extern "win64" fn native_reset_event(handle: u64) -> i32 {
+    let event = process_ctx().and_then(|process| {
+        process
+            .events
+            .lock()
+            .ok()
+            .and_then(|events| events.get(&handle).cloned())
+    });
+    let Some(event) = event else {
+        native_set_last_error(6);
+        return 0;
+    };
+    let Ok(mut signaled) = event.signaled.lock() else {
+        return 0;
+    };
+    *signaled = false;
+    1
+}
+pub(super) extern "win64" fn native_create_semaphore_a(
+    _attributes: *const u8,
+    initial: i32,
+    maximum: i32,
+    _name: *const u8,
+) -> u64 {
+    if initial < 0 || maximum <= 0 || initial > maximum {
+        native_set_last_error(87); // ERROR_INVALID_PARAMETER
+        return 0;
+    }
+    let Some(process) = process_ctx() else {
+        return 0;
+    };
+    let handle = process.semaphore_next.fetch_add(1, Ordering::AcqRel);
+    let semaphore = Arc::new(NativeSemaphore {
+        count: Mutex::new(initial),
+        changed: Condvar::new(),
+        maximum,
+    });
+    if process.semaphores.lock().is_ok_and(|mut values| {
+        values.insert(handle, semaphore);
+        true
+    }) {
+        handle
+    } else {
+        0
+    }
+}
+pub(super) extern "win64" fn native_release_semaphore(
+    handle: u64,
+    release: i32,
+    previous: *mut i32,
+) -> i32 {
+    let Some(semaphore) = process_ctx().and_then(|process| {
+        process
+            .semaphores
+            .lock()
+            .ok()
+            .and_then(|values| values.get(&handle).cloned())
+    }) else {
+        native_set_last_error(6);
+        return 0;
+    };
+    let Ok(mut count) = semaphore.count.lock() else {
+        return 0;
+    };
+    if release <= 0 || release > semaphore.maximum - *count {
+        native_set_last_error(298); // ERROR_TOO_MANY_POSTS
+        return 0;
+    }
+    if !previous.is_null() {
+        unsafe { previous.write(*count) };
+    }
+    *count += release;
+    semaphore.changed.notify_all();
+    1
+}
