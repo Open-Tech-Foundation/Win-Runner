@@ -447,6 +447,23 @@ fn is_drive_letter(c: char) -> bool {
     c.is_ascii_alphabetic()
 }
 
+pub(crate) fn is_unc_path(raw: &str) -> bool {
+    let path = raw.replace('/', "\\");
+    if path
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(r"\\?\UNC\"))
+    {
+        return true;
+    }
+    if path
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(r"\??\UNC\"))
+    {
+        return true;
+    }
+    path.starts_with(r"\\") && !path.starts_with(r"\\.\") && !path.starts_with(r"\\?\")
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DosDevicePath {
     Null,
@@ -1145,6 +1162,9 @@ impl WinFs {
         let s = raw.trim();
         if s.is_empty() {
             return Err("empty path".to_string());
+        }
+        if is_unc_path(s) {
+            return Err("UNC paths are not supported by this WinFs instance".to_string());
         }
         if dos_device_path(s).is_some() {
             return Err("reserved DOS device name is not a filesystem path".to_string());
@@ -2455,6 +2475,22 @@ mod tests {
         }
         assert!(fs.normalize("").is_err());
         assert!(fs.normalize(r"Q:\outside.txt").is_err());
+    }
+
+    #[test]
+    fn unc_paths_are_rejected_instead_of_becoming_drive_relative_paths() {
+        let fs = WinFs::new();
+        for path in [
+            r"\\server\share\x",
+            r"\\?\UNC\server\share\x",
+            r"\??\UNC\server\share\x",
+            "//server/share/x",
+        ] {
+            assert!(is_unc_path(path), "{path}");
+            assert!(fs.normalize(path).is_err(), "{path}");
+        }
+        assert!(!is_unc_path(r"\\.\pipe\foo"));
+        assert!(!is_unc_path(r"\\?\C:\work\file.txt"));
     }
 
     #[test]

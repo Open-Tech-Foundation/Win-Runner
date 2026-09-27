@@ -129,9 +129,10 @@ Record oracle values from `GetFullPathNameW`, `CreateFileW`, and
   PE guest test cover these cases.
 - [ ] **Device and pipe namespace.** Parse `\\.\NUL` and
   `\\.\pipe\foo` as device/pipe paths rather than C: paths.
-- [ ] **UNC paths.** Support `\\server\share\x` and
-  `\\?\UNC\server\share\x`, or reject each explicitly with the correct
-  Windows error instead of silently remapping it onto C:.
+- [x] **UNC paths.** WinFs rejects `\\server\share\x`,
+  `\\?\UNC\server\share\x`, and `\??\UNC\server\share\x` instead of
+  remapping them onto C:. Native `CreateFileW` reports
+  `ERROR_BAD_NETPATH` (53) for the unsupported UNC share paths.
 - [ ] **Trailing dots and spaces.** Drop trailing dots and spaces from each
   path component (`foo.` aliases `foo`, and `foo \bar` trims the component's
   trailing space); preserve leading spaces (` lead` remains distinct).

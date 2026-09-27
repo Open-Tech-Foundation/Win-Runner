@@ -3438,6 +3438,18 @@ mod imp {
         }
 
         #[test]
+        fn create_file_rejects_unc_paths_with_bad_netpath() {
+            for path in [r"\\server\share\x", r"\\?\UNC\server\share\x"] {
+                let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+                assert_eq!(
+                    super::native_create_file_w(wide.as_ptr(), 0x8000_0000, 7, 0, 3, 0, 0),
+                    u64::MAX
+                );
+                assert_eq!(super::native_get_last_error(), 53); // ERROR_BAD_NETPATH
+            }
+        }
+
+        #[test]
         fn modern_get_file_type_distinguishes_disk_handles_from_invalid_handles() {
             type GetFileType = unsafe extern "win64" fn(u64) -> u32;
             let get_file_type: GetFileType =
@@ -15368,6 +15380,10 @@ mod imp {
                 return u64::MAX;
             }
         };
+        if crate::winfs::is_unc_path(&path) {
+            native_set_last_error(53); // ERROR_BAD_NETPATH: UNC shares are unsupported.
+            return u64::MAX;
+        }
         if native_named_pipe_key(&path).is_some() {
             return native_open_named_pipe(&path, access, share, flags, security);
         }
