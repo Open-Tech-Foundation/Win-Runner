@@ -2387,6 +2387,23 @@ mod tests {
     }
 
     #[test]
+    fn path_components_drop_trailing_dots_and_spaces_but_keep_leading_spaces() {
+        let fs = WinFs::new();
+        assert_eq!(
+            fs.normalize(r"C:\work\foo.").unwrap().key(),
+            fs.normalize(r"C:\work\foo").unwrap().key()
+        );
+        assert_eq!(
+            fs.normalize(r"C:\work\foo \bar").unwrap().key(),
+            fs.normalize(r"C:\work\foo\bar").unwrap().key()
+        );
+        assert_ne!(
+            fs.normalize(r"C:\work\ lead").unwrap().key(),
+            fs.normalize(r"C:\work\lead").unwrap().key()
+        );
+    }
+
+    #[test]
     fn unc_paths_are_rejected_instead_of_becoming_drive_relative_paths() {
         let fs = WinFs::new();
         for path in [

@@ -48,6 +48,8 @@ All notable changes to this project will be documented in this file.
 - Added a shared typed WinFs path parser for DOS, UNC, device, and named-pipe
   paths, and routed WinFs normalization and device/UNC classification through
   it.
+- Normalized trailing dots and spaces out of WinFs path components while
+  preserving leading spaces.
 - Added the C-locale `msvcrt!mbstowcs` shim used by Nano.
 - Added an optional native Node check proving a relative file that Node leaves
   in WinFS appears in the following shell directory listing.

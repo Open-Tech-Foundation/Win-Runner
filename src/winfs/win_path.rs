@@ -51,6 +51,14 @@ fn device_name(name: &str) -> Option<DosDevicePath> {
     }
 }
 
+fn normalize_component(component: &str) -> String {
+    if component == "." || component == ".." {
+        component.to_string()
+    } else {
+        component.trim_end_matches(['.', ' ']).to_string()
+    }
+}
+
 fn strip_prefix_case_insensitive<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
     value
         .get(..prefix.len())
@@ -119,7 +127,8 @@ pub(crate) fn parse(raw: &str) -> ParsedWinPath {
     let components = body
         .split('\\')
         .filter(|part| !part.is_empty())
-        .map(str::to_string)
+        .map(normalize_component)
+        .filter(|part| !part.is_empty())
         .collect::<Vec<_>>();
 
     if let Some(device) = components.last().and_then(|name| device_name(name)) {

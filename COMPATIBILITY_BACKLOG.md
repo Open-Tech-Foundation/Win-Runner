@@ -134,9 +134,10 @@ Record oracle values from `GetFullPathNameW`, `CreateFileW`, and
   `\\?\UNC\server\share\x`, and `\??\UNC\server\share\x` instead of
   remapping them onto C:. Native `CreateFileW` reports
   `ERROR_BAD_NETPATH` (53) for the unsupported UNC share paths.
-- [ ] **Trailing dots and spaces.** Drop trailing dots and spaces from each
-  path component (`foo.` aliases `foo`, and `foo \bar` trims the component's
-  trailing space); preserve leading spaces (` lead` remains distinct).
+- [x] **Trailing dots and spaces.** The typed parser drops trailing dots and
+  spaces from each component (`foo.` aliases `foo`, and `foo \bar` trims the
+  component's trailing space) while preserving leading spaces (` lead` remains
+  distinct). WinFs tests cover all three cases.
 - [ ] **Invalid characters and streams.** Reject invalid path characters such
   as `|`, `<`, and `>` with `ERROR_INVALID_NAME`; define and test Windows
   alternate-data-stream behavior for `a:b` instead of creating an ordinary
