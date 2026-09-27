@@ -85,6 +85,8 @@ All notable changes to this project will be documented in this file.
 - Grouped registered wait callbacks with the synchronization APIs.
 - Moved the C runtime shims and their environment, errno, stream, and startup
   state into a Linux backend CRT module.
+- Moved console screen, mode, output, and input-event shims into a Linux backend
+  console module.
 - Added the C-locale `msvcrt!mbstowcs` shim used by Nano.
 - Added an optional native Node check proving a relative file that Node leaves
   in WinFS appears in the following shell directory listing.
