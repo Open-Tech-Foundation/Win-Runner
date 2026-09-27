@@ -56,6 +56,8 @@ All notable changes to this project will be documented in this file.
   association cases.
 - Added file-type and file-size metadata checks for directory handles, null
   outputs, and invalid handles.
+- Added API-level `SetFilePointer`/`SetFilePointerEx` and
+  `GetOverlappedResult` position, completion, and error checks.
 - Added WinFS edge-case tests for truncating writes, recursive tree copy/move,
   and invalid directory create/remove operations.
 - Added NT file compatibility tests for EOF resizing, rename-by-handle, and

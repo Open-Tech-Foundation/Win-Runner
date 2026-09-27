@@ -2875,6 +2875,87 @@ mod imp {
         }
 
         #[test]
+        fn modern_set_file_pointer_apis_update_position_and_extend_on_write() {
+            type SetFilePointer = unsafe extern "win64" fn(u64, i32, *mut i32, u32) -> u32;
+            type SetFilePointerEx = unsafe extern "win64" fn(u64, i64, *mut i64, u32) -> i32;
+            let set_pointer: SetFilePointer =
+                unsafe { std::mem::transmute(require_kernel32_api(b"SetFilePointer\0") as usize) };
+            let set_pointer_ex: SetFilePointerEx = unsafe {
+                std::mem::transmute(require_kernel32_api(b"SetFilePointerEx\0") as usize)
+            };
+            let path = r"C:\modern_set_file_pointer_apis.txt";
+            let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(path, b"abc".to_vec())
+                .unwrap();
+            let handle = super::native_create_file_w(wide.as_ptr(), 0xC000_0000, 7, 0, 3, 0, 0);
+            assert_ne!(handle, u64::MAX);
+
+            assert_eq!(
+                unsafe { set_pointer(handle, 5, std::ptr::null_mut(), 0) },
+                5
+            );
+            let marker = b'X';
+            let mut written = 0;
+            assert_eq!(
+                super::native_write_file(handle, &marker, 1, &mut written, 0),
+                1
+            );
+            assert_eq!(written, 1);
+            let mut position = -1i64;
+            assert_eq!(unsafe { set_pointer_ex(handle, 0, &mut position, 2) }, 1);
+            assert_eq!(position, 6);
+            assert_eq!(
+                context.lock().unwrap().fs.read_file(path).unwrap(),
+                b"abc\0\0X"
+            );
+            assert_eq!(super::native_close_handle(handle), 1);
+            context.lock().unwrap().fs.delete_file(path).unwrap();
+        }
+
+        #[test]
+        fn modern_get_overlapped_result_reports_pending_complete_and_invalid() {
+            type GetOverlappedResult = unsafe extern "win64" fn(u64, u64, *mut u32, i32) -> i32;
+            let get_result: GetOverlappedResult = unsafe {
+                std::mem::transmute(require_kernel32_api(b"GetOverlappedResult\0") as usize)
+            };
+            let path = r"C:\modern_get_overlapped_result.txt";
+            let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(path, b"data".to_vec())
+                .unwrap();
+            let handle = super::native_create_file_w(wide.as_ptr(), 0x8000_0000, 7, 0, 3, 0, 0);
+            assert_ne!(handle, u64::MAX);
+            let mut overlapped = [0u64; 4];
+            let pointer = overlapped.as_mut_ptr() as u64;
+            let mut transferred = 0;
+
+            super::native_set_overlapped_status(pointer, super::STATUS_PENDING, 0);
+            let pending = unsafe { get_result(handle, pointer, &mut transferred, 0) };
+            let pending_error = super::native_get_last_error();
+            super::native_set_overlapped_status(pointer, 0, 4);
+            let completed = unsafe { get_result(handle, pointer, &mut transferred, 0) };
+            let invalid = unsafe { get_result(u64::MAX, pointer, &mut transferred, 0) };
+            let invalid_error = super::native_get_last_error();
+            assert_eq!(super::native_close_handle(handle), 1);
+            context.lock().unwrap().fs.delete_file(path).unwrap();
+            assert_eq!(pending, 0);
+            assert_eq!(pending_error, 996); // ERROR_IO_INCOMPLETE
+            assert_eq!(completed, 1);
+            assert_eq!(transferred, 4);
+            assert_eq!(invalid, 0);
+            assert_eq!(invalid_error, 6); // ERROR_INVALID_HANDLE
+        }
+
+        #[test]
         fn modern_ansi_hard_link_shares_source_contents() {
             type CreateHardLinkA = unsafe extern "win64" fn(*const u8, *const u8, u64) -> i32;
             let create_link: CreateHardLinkA =
