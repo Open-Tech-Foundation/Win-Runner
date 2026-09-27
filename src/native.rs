@@ -2799,6 +2799,82 @@ mod imp {
         }
 
         #[test]
+        fn modern_get_file_type_distinguishes_disk_handles_from_invalid_handles() {
+            type GetFileType = unsafe extern "win64" fn(u64) -> u32;
+            let get_file_type: GetFileType =
+                unsafe { std::mem::transmute(require_kernel32_api(b"GetFileType\0") as usize) };
+            let file_path = r"C:\modern_get_file_type.txt";
+            let directory_path = r"C:\modern_get_file_type_directory";
+            let file_wide = file_path.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let directory_wide = directory_path.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            {
+                let mut ctx = context.lock().unwrap();
+                ctx.fs.write_file(file_path, b"data".to_vec()).unwrap();
+                ctx.fs.mkdir(directory_path).unwrap();
+            }
+            let file = super::native_create_file_w(file_wide.as_ptr(), 0x8000_0000, 7, 0, 3, 0, 0);
+            let directory = super::native_create_file_w(
+                directory_wide.as_ptr(),
+                0x8000_0000,
+                7,
+                0,
+                3,
+                0x0200_0000, // FILE_FLAG_BACKUP_SEMANTICS
+                0,
+            );
+            assert_ne!(file, u64::MAX);
+            assert_ne!(directory, u64::MAX);
+
+            let file_type = unsafe { get_file_type(file) };
+            let directory_type = unsafe { get_file_type(directory) };
+            let invalid_type = unsafe { get_file_type(u64::MAX) };
+            let invalid_error = super::native_get_last_error();
+            assert_eq!(super::native_close_handle(directory), 1);
+            assert_eq!(super::native_close_handle(file), 1);
+            let mut ctx = context.lock().unwrap();
+            ctx.fs.delete_file(file_path).unwrap();
+            ctx.fs.rmdir(directory_path).unwrap();
+            assert_eq!(file_type, 1); // FILE_TYPE_DISK
+            assert_eq!(directory_type, 1); // directories are disk handles
+            assert_eq!(invalid_type, 0); // FILE_TYPE_UNKNOWN
+            assert_eq!(invalid_error, 6); // ERROR_INVALID_HANDLE
+        }
+
+        #[test]
+        fn modern_get_file_size_ex_reports_null_output_and_invalid_handle() {
+            type GetFileSizeEx = unsafe extern "win64" fn(u64, *mut i64) -> i32;
+            let get_size: GetFileSizeEx =
+                unsafe { std::mem::transmute(require_kernel32_api(b"GetFileSizeEx\0") as usize) };
+            let path = r"C:\modern_get_file_size_ex_errors.txt";
+            let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(path, b"size-data".to_vec())
+                .unwrap();
+            let handle = super::native_create_file_w(wide.as_ptr(), 0x8000_0000, 7, 0, 3, 0, 0);
+            assert_ne!(handle, u64::MAX);
+
+            let mut size = -1i64;
+            let valid_result = unsafe { get_size(handle, &mut size) };
+            let null_result = unsafe { get_size(handle, std::ptr::null_mut()) };
+            let null_error = super::native_get_last_error();
+            let invalid_result = unsafe { get_size(u64::MAX, &mut size) };
+            let invalid_error = super::native_get_last_error();
+            assert_eq!(super::native_close_handle(handle), 1);
+            context.lock().unwrap().fs.delete_file(path).unwrap();
+            assert_eq!(valid_result, 1);
+            assert_eq!(size, 9);
+            assert_eq!(null_result, 0);
+            assert_eq!(null_error, 998); // ERROR_NOACCESS
+            assert_eq!(invalid_result, 0);
+            assert_eq!(invalid_error, 6); // ERROR_INVALID_HANDLE
+        }
+
+        #[test]
         fn modern_ansi_hard_link_shares_source_contents() {
             type CreateHardLinkA = unsafe extern "win64" fn(*const u8, *const u8, u64) -> i32;
             let create_link: CreateHardLinkA =

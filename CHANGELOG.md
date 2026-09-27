@@ -54,6 +54,8 @@ All notable changes to this project will be documented in this file.
 - Added destination-conflict checks for wide copy and move operations.
 - Added ANSI file-mapping persistence and duplicate file completion-port
   association cases.
+- Added file-type and file-size metadata checks for directory handles, null
+  outputs, and invalid handles.
 - Added WinFS edge-case tests for truncating writes, recursive tree copy/move,
   and invalid directory create/remove operations.
 - Added NT file compatibility tests for EOF resizing, rename-by-handle, and
