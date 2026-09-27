@@ -1224,3 +1224,11 @@ pub(super) extern "win64" fn native_query_depth_slist(head: *const u8) -> u16 {
     };
     unsafe { head.add(8).cast::<u16>().read() }
 }
+
+pub(super) extern "win64" fn native_sleep(milliseconds: u32) {
+    std::thread::sleep(std::time::Duration::from_millis(milliseconds as u64));
+}
+pub(super) extern "win64" fn native_switch_to_thread() -> i32 {
+    std::thread::yield_now();
+    1
+}

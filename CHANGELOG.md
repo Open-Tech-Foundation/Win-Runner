@@ -104,6 +104,9 @@ All notable changes to this project will be documented in this file.
   APIs into a dedicated Linux backend environment module.
 - Isolated Linux TEB/TLS setup and per-thread last-error access in a thread
   runtime module.
+- Grouped Linux performance counters, monotonic tick counts, time-zone data,
+  and UTC-to-FILETIME conversions in a clock module; moved sleep/yield shims
+  into synchronization.
 - Added the C-locale `msvcrt!mbstowcs` shim used by Nano.
 - Added an optional native Node check proving a relative file that Node leaves
   in WinFS appears in the following shell directory listing.

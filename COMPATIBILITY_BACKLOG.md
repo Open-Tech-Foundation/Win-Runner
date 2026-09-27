@@ -71,8 +71,10 @@ Items remain open until implementation and relevant verification are complete.
   now live in an environment module. TEB/TLS setup and per-thread last-error
   access now live in a thread-runtime module. C runtime shims and their
   process/thread-local state now live in a CRT module. Console screen, mode,
-  output, and input-event APIs now live in a console module. Other API groups
-  including locale conversion now live in Windows-subsystem modules while host
+  output, and input-event APIs now live in a console module. Clock, time-zone,
+  and FILETIME shims now live in a clock module; scheduler sleep/yield APIs are
+  grouped with synchronization. Other API groups including locale conversion
+  now live in Windows-subsystem modules while host
   syscalls remain backend-local for macOS. Completion-port APIs, directory notifications, and overlapped file
   I/O/cancellation code now live in a dedicated module; process-scoped queue and
   completion state remain in the backend context.
