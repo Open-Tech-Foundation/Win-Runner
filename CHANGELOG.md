@@ -46,6 +46,8 @@ All notable changes to this project will be documented in this file.
 - Added direct wide-path `MoveFileW` and `DeleteFileW` behavior cases.
 - Added wide-path move and delete failure cases for existing destinations and
   missing files.
+- Added API-level wide-path attribute toggling and extended metadata success
+  and missing-file cases.
 - Added ANSI temporary-file and symbolic-link cases, all reference
   `FindFirstFileExA` option combinations, and invalid-input checks for
   `OpenFileById` and `SetFileValidData`.

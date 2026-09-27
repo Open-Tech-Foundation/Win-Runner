@@ -3233,6 +3233,69 @@ mod imp {
         }
 
         #[test]
+        fn modern_wide_file_attributes_toggle_readonly_state() {
+            type GetFileAttributesW = unsafe extern "win64" fn(*const u16) -> u32;
+            type SetFileAttributesW = unsafe extern "win64" fn(*const u16, u32) -> i32;
+            let get_attributes: GetFileAttributesW = unsafe {
+                std::mem::transmute(require_kernel32_api(b"GetFileAttributesW\0") as usize)
+            };
+            let set_attributes: SetFileAttributesW = unsafe {
+                std::mem::transmute(require_kernel32_api(b"SetFileAttributesW\0") as usize)
+            };
+            let path = r"C:\modern_attributes_wide.txt";
+            let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(path, b"wide-attributes".to_vec())
+                .unwrap();
+
+            assert_eq!(unsafe { set_attributes(wide.as_ptr(), 0x3) }, 1);
+            assert_eq!(unsafe { get_attributes(wide.as_ptr()) }, 0x3);
+            assert_eq!(unsafe { set_attributes(wide.as_ptr(), 0x80) }, 1);
+            assert_eq!(super::native_delete_file_w(wide.as_ptr()), 1);
+            assert!(!context.lock().unwrap().fs.exists(path));
+        }
+
+        #[test]
+        fn modern_get_file_attributes_ex_w_reports_file_and_missing_path() {
+            type GetFileAttributesExW =
+                unsafe extern "win64" fn(*const u16, i32, *mut std::ffi::c_void) -> i32;
+            let get_attributes: GetFileAttributesExW = unsafe {
+                std::mem::transmute(require_kernel32_api(b"GetFileAttributesExW\0") as usize)
+            };
+            let path = r"C:\modern_attributes_ex_wide.txt";
+            let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let missing = r"C:\modern_attributes_ex_wide_missing.txt"
+                .encode_utf16()
+                .chain([0])
+                .collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(path, b"metadata".to_vec())
+                .unwrap();
+            let mut data = [0u32; 9];
+
+            assert_eq!(
+                unsafe { get_attributes(wide.as_ptr(), 0, data.as_mut_ptr().cast()) },
+                1
+            );
+            assert_eq!(data[0], 0x80);
+            assert_eq!((data[7], data[8]), (0, 8));
+            assert_eq!(
+                unsafe { get_attributes(missing.as_ptr(), 0, data.as_mut_ptr().cast()) },
+                0
+            );
+            assert_eq!(super::native_get_last_error(), 2); // ERROR_FILE_NOT_FOUND
+            context.lock().unwrap().fs.delete_file(path).unwrap();
+        }
+
+        #[test]
         fn modern_ansi_find_first_file_returns_matching_name() {
             type FindFirstFileA = unsafe extern "win64" fn(*const u8, *mut std::ffi::c_void) -> u64;
             let find_first: FindFirstFileA =
