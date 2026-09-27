@@ -351,6 +351,8 @@ pub struct WinFs {
     /// current drive + parts (original casing)
     cwd_drive: char,
     cwd_parts: Vec<String>,
+    /// Windows remembers a separate working directory for each drive.
+    drive_cwds: HashMap<char, Vec<String>>,
     /// Append-only staging area for writes made after a disk image was opened.
     /// It keeps large guest files out of the host process heap.
     overlay: Option<Arc<DiskStore>>,
@@ -465,6 +467,7 @@ impl WinFs {
             drives,
             cwd_drive: 'C',
             cwd_parts: Vec::new(),
+            drive_cwds: HashMap::from([('C', Vec::new())]),
             overlay: DiskStore::temporary(),
             mounts: HashMap::new(),
             file_ids: HashMap::new(),
@@ -541,6 +544,7 @@ impl WinFs {
                 children: HashMap::new(),
             },
         );
+        self.drive_cwds.entry(drive).or_default();
         self.mounts.insert(drive, HostMount { root, read_only });
         Ok(())
     }
@@ -1079,7 +1083,8 @@ impl WinFs {
             return Err(format!("path not found: {path}"));
         }
         self.cwd_drive = p.drive;
-        self.cwd_parts = p.parts;
+        self.cwd_parts = p.parts.clone();
+        self.drive_cwds.insert(p.drive, p.parts);
         if self.record_changes {
             self.changes.push(FsChange::SetCwd(self.cwd()));
         }
@@ -1122,12 +1127,7 @@ impl WinFs {
             (self.cwd_drive, s.as_str())
         } else {
             // relative: start from cwd
-            let base_parts = if self.cwd_drive == 'C' {
-                self.cwd_parts.clone()
-            } else {
-                vec![]
-            };
-            let mut parts = base_parts;
+            let mut parts = self.cwd_parts.clone();
             for comp in s.split('\\') {
                 match comp {
                     "" | "." => continue,
@@ -1147,12 +1147,9 @@ impl WinFs {
         let mut parts: Vec<String> = if rest.starts_with('\\') {
             Vec::new()
         } else {
-            // e.g. "C:foo" -> drive-relative; treat as cwd-relative on that drive
-            if self.cwd_drive == drive {
-                self.cwd_parts.clone()
-            } else {
-                Vec::new()
-            }
+            // e.g. "C:foo" is relative to C:'s remembered working directory,
+            // which may differ from the active drive's current directory.
+            self.drive_cwds.get(&drive).cloned().unwrap_or_default()
         };
         // strip leading backslashes
         let rest = rest.trim_start_matches('\\');
@@ -2684,6 +2681,41 @@ mod tests {
         );
         fs.delete_file(r"Z:\new\nested\created.txt").unwrap();
         assert!(!root.join("new/nested/created.txt").exists());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn relative_paths_and_drive_relative_paths_use_their_drive_cwds() {
+        let root = std::env::temp_dir().join(format!(
+            "wincli-drive-cwd-{}-{}",
+            std::process::id(),
+            NEXT_DISK_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/file.txt"), b"mounted-relative").unwrap();
+
+        let mut fs = WinFs::new();
+        fs.mkdir(r"C:\remembered").unwrap();
+        fs.mount_host_dir('Z', &root, false).unwrap();
+        fs.set_cwd(r"C:\remembered").unwrap();
+        fs.set_cwd(r"Z:\sub").unwrap();
+
+        assert_eq!(fs.cwd(), r"Z:\sub");
+        assert_eq!(
+            fs.normalize("file.txt").unwrap().display(),
+            r"Z:\sub\file.txt"
+        );
+        assert_eq!(fs.read_file("file.txt").unwrap(), b"mounted-relative");
+        assert_eq!(
+            fs.normalize("C:foo").unwrap().display(),
+            r"C:\remembered\foo"
+        );
+
+        fs.set_cwd("C:").unwrap();
+        assert_eq!(fs.cwd(), r"C:\remembered");
+        fs.set_cwd("Z:").unwrap();
+        assert_eq!(fs.cwd(), r"Z:\sub");
+
         std::fs::remove_dir_all(root).ok();
     }
 

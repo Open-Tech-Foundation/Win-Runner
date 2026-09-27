@@ -35,6 +35,8 @@ All notable changes to this project will be documented in this file.
 - Added the confirmed WinFs path, device, UNC, Unicode comparison, node-model,
   symlink, and mounted-directory findings to the compatibility backlog, with
   Windows-oracle testing and an ordered implementation plan.
+- Fixed WinFs relative paths on mounted drives and retained a separate current
+  directory for each drive, including drive-relative paths such as `C:foo`.
 - Added the C-locale `msvcrt!mbstowcs` shim used by Nano.
 - Added an optional native Node check proving a relative file that Node leaves
   in WinFS appears in the following shell directory listing.

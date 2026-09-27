@@ -112,10 +112,12 @@ Record oracle values from `GetFullPathNameW`, `CreateFileW`, and
 - [ ] **Path oracle table.** Build shared cases with input path, cwd, expected
   normalized path or device result, and expected error code. Include both
   WinFs unit tests and guest `.exe` tests.
-- [ ] **Per-drive current directories.** Relative `file.txt` under cwd
+- [x] **Per-drive current directories.** Relative `file.txt` under cwd
   `Z:\sub` must resolve to `Z:\sub\file.txt`; drive-relative `C:foo` must use
   the remembered C: cwd even when the active cwd is on another drive. Model
-  Windows `=C:`-style per-drive cwd environment entries.
+  Windows `=C:`-style per-drive cwd behavior. WinFs now retains a cwd per
+  mounted drive and tests relative resolution on Z: plus C: drive-relative
+  lookup while Z: is active.
 - [ ] **DOS device names and console devices.** Treat `NUL` and `C:\work\nul`
   as the null device, and cover `CON`, `CONIN$`, and `CONOUT$`. Recognize
   reserved names including `COM1` and `LPT1`, also when followed by extensions
