@@ -2956,6 +2956,81 @@ mod imp {
         }
 
         #[test]
+        fn modern_get_overlapped_result_ex_returns_completed_byte_count() {
+            type GetOverlappedResultEx =
+                unsafe extern "win64" fn(u64, u64, *mut u32, u32, i32) -> i32;
+            let get_result: GetOverlappedResultEx = unsafe {
+                std::mem::transmute(require_kernel32_api(b"GetOverlappedResultEx\0") as usize)
+            };
+            let path = r"C:\modern_get_overlapped_result_ex.txt";
+            let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(path, b"completed-data".to_vec())
+                .unwrap();
+            let handle = super::native_create_file_w(wide.as_ptr(), 0x8000_0000, 7, 0, 3, 0, 0);
+            assert_ne!(handle, u64::MAX);
+            let mut overlapped = [0u64; 4];
+            let pointer = overlapped.as_mut_ptr() as u64;
+            super::native_set_overlapped_status(pointer, 0, 14);
+            let mut transferred = 0;
+
+            let result = unsafe { get_result(handle, pointer, &mut transferred, 0, 0) };
+            assert_eq!(super::native_close_handle(handle), 1);
+            context.lock().unwrap().fs.delete_file(path).unwrap();
+            assert_eq!(result, 1);
+            assert_eq!(transferred, 14);
+        }
+
+        #[test]
+        fn modern_get_file_information_by_handle_reports_file_record() {
+            type GetFileInformationByHandle = unsafe extern "win64" fn(u64, *mut u8) -> i32;
+            let get_information: GetFileInformationByHandle = unsafe {
+                std::mem::transmute(require_kernel32_api(b"GetFileInformationByHandle\0") as usize)
+            };
+            let path = r"C:\modern_file_information_by_handle.txt";
+            let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(path, b"record".to_vec())
+                .unwrap();
+            let handle = super::native_create_file_w(wide.as_ptr(), 0x8000_0000, 7, 0, 3, 0, 0);
+            assert_ne!(handle, u64::MAX);
+            let mut information = [0u8; 52];
+
+            let result = unsafe { get_information(handle, information.as_mut_ptr()) };
+            let invalid = unsafe { get_information(u64::MAX, information.as_mut_ptr()) };
+            let null = unsafe { get_information(handle, std::ptr::null_mut()) };
+            assert_eq!(super::native_close_handle(handle), 1);
+            context.lock().unwrap().fs.delete_file(path).unwrap();
+            assert_eq!(result, 1);
+            assert_eq!(
+                u32::from_le_bytes(information[..4].try_into().unwrap()),
+                0x80
+            );
+            assert_eq!(
+                u32::from_le_bytes(information[28..32].try_into().unwrap()),
+                0x5743_4C49
+            );
+            assert_eq!(
+                u32::from_le_bytes(information[36..40].try_into().unwrap()),
+                6
+            );
+            assert_eq!(
+                u32::from_le_bytes(information[40..44].try_into().unwrap()),
+                1
+            );
+            assert_eq!(invalid, 0);
+            assert_eq!(null, 0);
+        }
+
+        #[test]
         fn modern_ansi_hard_link_shares_source_contents() {
             type CreateHardLinkA = unsafe extern "win64" fn(*const u8, *const u8, u64) -> i32;
             let create_link: CreateHardLinkA =
