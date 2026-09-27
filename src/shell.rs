@@ -1034,7 +1034,7 @@ mod tests {
         let err = shell
             .exec_line("choco install python", &mut out)
             .unwrap_err();
-        assert!(err.contains("no such package"), "err: {err}");
+        assert!(err.contains("package not found"), "err: {err}");
     }
 
     #[test]

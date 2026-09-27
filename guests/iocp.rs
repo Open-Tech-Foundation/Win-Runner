@@ -120,7 +120,7 @@ pub extern "C" fn guest_entry() {
         unsafe { WaitForSingleObject(reopened, 0) } == 0 && unsafe { CloseHandle(reopened) } != 0,
     );
     let mut count = 0;
-    let file = unsafe { CreateFileW(path.as_ptr(), 0xc000_0000, 0, 0, 2, 0x80, 0) };
+    let file = unsafe { CreateFileW(path.as_ptr(), 0xc000_0000, 7, 0, 2, 0x80, 0) };
     check(file != !0);
     check(
         unsafe {
@@ -139,7 +139,7 @@ pub extern "C" fn guest_entry() {
     check(unsafe { GetLastError() } == 87);
     check(unsafe { CloseHandle(file) } != 0);
 
-    let file = unsafe { CreateFileW(path.as_ptr(), 0xc000_0000, 0, 0, 3, 0x4000_0080, 0) };
+    let file = unsafe { CreateFileW(path.as_ptr(), 0xc000_0000, 7, 0, 3, 0x4000_0080, 0) };
     check(file != !0);
     let port = unsafe { CreateIoCompletionPort(file, 0, 0x1234, 0) };
     check(port != 0);
@@ -177,7 +177,7 @@ pub extern "C" fn guest_entry() {
     check(unsafe { GetLastError() } == 38);
     check(unsafe { GetQueuedCompletionStatus(port, &mut bytes, &mut key, &mut returned, 0) } == 0);
     check(unsafe { GetLastError() } == 258);
-    let second = unsafe { CreateFileW(path.as_ptr(), 0x8000_0000, 0, 0, 3, 0x4000_0080, 0) };
+    let second = unsafe { CreateFileW(path.as_ptr(), 0x8000_0000, 7, 0, 3, 0x4000_0080, 0) };
     check(second != !0);
     check(unsafe { CreateIoCompletionPort(second, port, 0x5678, 0) } == port);
     let mut second_ov = ov(0);

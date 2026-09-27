@@ -6,6 +6,22 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Corrected WinFS file identity preservation across renames, directory
+  creation through POSIX-style `CreateFileW` flags, backup-semantics checks,
+  completion modes for overlapped file handles, and `MoveFileW` error codes.
+- Added native shims for `CreateFile2`, `FlushFileBuffers`, `SetEndOfFile`,
+  `ReOpenFile`, and `GetOverlappedResultEx`.
+- Added file-ID opens, privilege-checked valid-data handling, and aligned
+  vectored `WriteFileGather` support.
+- Added byte-range lock tracking and default data-stream enumeration for WinFS
+  handles.
+- Added ANSI file-operation wrappers, copy variants, and temporary path/file
+  name APIs.
+- Added wildcard-filtered wide enumeration and ANSI find-data conversion for
+  `FindFirstFileA` and `FindFirstFileExA`.
+- Added hard-link identity tracking, symbolic-link entries, and replacement
+  operations in both ANSI and wide forms.
+- Added the missing ANSI directory-removal and final-path-name exports.
 - Removed the obsolete backend selection environment variable; WinCLI
   automatically uses the available platform backend.
 - Added interactive shell line editing with cursor movement, insertion,
@@ -57,6 +73,11 @@ All notable changes to this project will be documented in this file.
 - Added wide-path move-with-replacement and directory create/remove cases.
 - Added deeper file-ID open, privileged valid-data, aligned gather-write, and
   file-handle completion-port behavior fixtures.
+- Implemented native EOF resize and handle-based rename information classes;
+  enforced WinFS handle access, sharing, and read-only deletion rules, and
+  completed valid guest-handle timestamp updates.
+- Corrected wildcard test cleanup paths and asynchronous EOF completion
+  expectations in the IOCP fixture.
 - Added failed-mutation coverage for overlapping locks, hard-link destination
   conflicts, and invalid handle-information classes.
 - Added destination-conflict checks for wide copy and move operations.

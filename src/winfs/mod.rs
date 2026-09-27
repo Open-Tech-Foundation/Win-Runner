@@ -343,6 +343,8 @@ pub struct WinFs {
     /// Their file contents remain in the host filesystem and never enter a
     /// C-drive snapshot.
     mounts: HashMap<char, HostMount>,
+    file_ids: HashMap<String, u64>,
+    next_file_id: u64,
     changes: Vec<FsChange>,
     record_changes: bool,
 }
@@ -435,6 +437,8 @@ impl WinFs {
             cwd_parts: Vec::new(),
             overlay: DiskStore::temporary(),
             mounts: HashMap::new(),
+            file_ids: HashMap::new(),
+            next_file_id: 1,
             changes: Vec::new(),
             record_changes: true,
         }
@@ -797,9 +801,19 @@ impl WinFs {
     /// Case variants and repeated opens of the same path have the same ID.
     pub fn file_id(&self, path: &str) -> Result<u64, String> {
         let key = self.normalize(path)?.key();
+        if let Some(id) = self.file_ids.get(&key) {
+            return Ok(*id);
+        }
         Ok(key.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3)
         }))
+    }
+
+    pub fn path_for_file_id(&self, file_id: u64) -> Option<String> {
+        self.file_ids.iter().find_map(|(path, id)| {
+            let swapped = (id << 32) | (id >> 32);
+            (*id == file_id || swapped == file_id).then(|| path.clone())
+        })
     }
 
     pub fn set_cwd(&mut self, path: &str) -> Result<(), String> {
@@ -1322,6 +1336,9 @@ impl WinFs {
                             data: stored,
                         },
                     );
+                    let file_id = self.next_file_id;
+                    self.next_file_id = self.next_file_id.wrapping_add(1).max(1);
+                    self.file_ids.insert(p.key(), file_id);
                     self.record_write(&p.display())
                 }
                 Node::File { .. } => Err("parent is a file".to_string()),
@@ -1405,6 +1422,7 @@ impl WinFs {
         let parent_node = self.get_node_mut(&parent).unwrap();
         if let Node::Dir { children, .. } = parent_node {
             children.remove(&leaf_key);
+            self.file_ids.remove(&p.key());
             if self.record_changes {
                 self.changes.push(FsChange::Remove {
                     path: p.display(),
@@ -1518,6 +1536,7 @@ impl WinFs {
                 .get_node(&s)
                 .ok_or_else(|| format!("source not found: {}", s.display()))?
                 .clone();
+            let source_file_id = self.file_id(src).ok();
             if self.get_node(&d).is_some() {
                 return Err(format!("destination exists: {}", d.display()));
             }
@@ -1564,6 +1583,10 @@ impl WinFs {
                     source: s.display(),
                     target: d.display(),
                 });
+            }
+            if let Some(file_id) = source_file_id {
+                self.file_ids.remove(&s.key());
+                self.file_ids.insert(d.key(), file_id);
             }
             Ok(())
         }
@@ -1672,6 +1695,46 @@ impl WinFs {
             None => return Err(format!("source not found: {}", s.display())),
         }
         self.copy_path(src, dst, fail_if_exists)
+    }
+
+    pub fn create_hard_link(&mut self, destination: &str, source: &str) -> Result<(), String> {
+        let src = self.normalize(source)?;
+        let dst = self.normalize(destination)?;
+        if self.is_host_drive(src.drive) || self.is_host_drive(dst.drive) {
+            return Err("hard links are not supported on mounted drives".to_string());
+        }
+        let Some(Node::File { .. }) = self.get_node(&src) else {
+            return Err(format!("source file not found: {}", src.display()));
+        };
+        if self.get_node(&dst).is_some() {
+            return Err(format!("destination exists: {}", dst.display()));
+        }
+        if dst.parts.is_empty() {
+            return Err("cannot create a hard link to a drive root".to_string());
+        }
+        let mut linked = self.get_node(&src).unwrap().clone();
+        let leaf = dst.parts.last().unwrap().clone();
+        if let Node::File { name, .. } = &mut linked {
+            *name = leaf.clone();
+        }
+        let parent = self.parent_of(&dst);
+        let Some(Node::Dir { children, .. }) = self.get_node_mut(&parent) else {
+            return Err(format!(
+                "destination parent not found: {}",
+                parent.display()
+            ));
+        };
+        children.insert(leaf.to_lowercase(), linked);
+        let identity = self.file_id(source)?;
+        self.file_ids.insert(dst.key(), identity);
+        if self.record_changes {
+            self.changes.push(FsChange::Copy {
+                source: src.display(),
+                target: dst.display(),
+                overwrite: false,
+            });
+        }
+        Ok(())
     }
 }
 

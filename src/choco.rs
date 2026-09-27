@@ -918,9 +918,13 @@ mod tests {
     #[test]
     fn rejects_bad_packages_versions_and_options() {
         let argv = |words: &[&str]| words.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert!(parse_args(&argv(&["install", "python"]))
-            .unwrap_err()
-            .contains("no such package"));
+        assert_eq!(
+            parse_args(&argv(&["install", "python"])).unwrap(),
+            ChocoCmd::InstallCommunity {
+                id: "python".into(),
+                version: None,
+            }
+        );
         assert!(parse_args(&argv(&["install"]))
             .unwrap_err()
             .contains("usage"));
