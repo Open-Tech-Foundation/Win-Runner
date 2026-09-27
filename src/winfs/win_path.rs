@@ -34,6 +34,14 @@ pub(super) fn windows_name_key(value: &str) -> String {
         .collect()
 }
 
+pub(super) fn is_extended_path(raw: &str) -> bool {
+    let path = raw.replace('/', "\\");
+    [r"\\?\", r"\??\"].iter().any(|prefix| {
+        path.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    })
+}
+
 fn device_name(name: &str) -> Option<DosDevicePath> {
     let name = name
         .split(['.', ':'])

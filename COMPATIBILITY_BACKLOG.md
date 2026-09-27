@@ -147,8 +147,9 @@ Record oracle values from `GetFullPathNameW`, `CreateFileW`, and
   character at a time instead of applying whole-string lowercase expansion.
   `İ.txt` and `i\u{307}.txt` stay distinct while ASCII case variants continue
   to resolve to the same file; unit tests cover identity and contents.
-- [ ] **Optional MAX_PATH mode.** Add an opt-in strict 260-character path check
-  and cover boundary and extended-path cases in the oracle table.
+- [x] **Optional MAX_PATH mode.** WinFs exposes an opt-in strict 260 UTF-16
+  unit check (including the terminator); extended-length paths bypass it.
+  Unit tests cover 259/260-character boundaries and extended paths.
 - [x] **One typed path parser.** Added `win_path::parse()` returning
   `Dos { drive, absolute, components }`, `Unc { server, share, components }`,
   `Device(Nul | Con | ConIn | ConOut | Reserved | Pipe(name))`, or

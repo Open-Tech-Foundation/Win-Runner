@@ -22,7 +22,7 @@ use std::{
 };
 
 mod win_path;
-use win_path::windows_name_key;
+use win_path::{is_extended_path, windows_name_key};
 pub(crate) use win_path::{parse as parse_win_path, DosDevicePath, ParsedWinPath};
 
 static NEXT_DISK_ID: AtomicU64 = AtomicU64::new(1);
@@ -359,6 +359,7 @@ pub struct WinFs {
     cwd_parts: Vec<String>,
     /// Windows remembers a separate working directory for each drive.
     drive_cwds: HashMap<char, Vec<String>>,
+    strict_max_path: bool,
     /// Append-only staging area for writes made after a disk image was opened.
     /// It keeps large guest files out of the host process heap.
     overlay: Option<Arc<DiskStore>>,
@@ -579,6 +580,7 @@ impl WinFs {
             cwd_drive: 'C',
             cwd_parts: Vec::new(),
             drive_cwds: HashMap::from([('C', Vec::new())]),
+            strict_max_path: false,
             overlay: DiskStore::temporary(),
             mounts: HashMap::new(),
             file_ids: HashMap::new(),
@@ -624,6 +626,12 @@ impl WinFs {
             parts: self.cwd_parts.clone(),
         }
         .display()
+    }
+
+    /// Enable Win32's traditional MAX_PATH limit for non-extended paths.
+    /// Extended-length paths retain their long-path behavior.
+    pub fn set_strict_max_path(&mut self, enabled: bool) {
+        self.strict_max_path = enabled;
     }
 
     /// Mount an existing host directory as a guest drive. The mount is live:
@@ -1257,7 +1265,14 @@ impl WinFs {
                 _ => parts.push(comp),
             }
         }
-        Ok(WinPath { drive, parts })
+        let normalized = WinPath { drive, parts };
+        if self.strict_max_path
+            && !is_extended_path(raw)
+            && normalized.display().encode_utf16().count() + 1 > 260
+        {
+            return Err("path exceeds the traditional MAX_PATH limit".to_string());
+        }
+        Ok(normalized)
     }
 
     fn resolve_symlink_path(&self, path: &WinPath) -> Option<WinPath> {
@@ -2531,6 +2546,29 @@ mod tests {
         );
         assert_eq!(fs.read_file(dotted_capital).unwrap(), b"capital");
         assert_eq!(fs.read_file(dotted_small).unwrap(), b"small");
+    }
+
+    #[test]
+    fn strict_max_path_mode_checks_the_260_character_boundary() {
+        let mut fs = WinFs::new();
+        let path_of_length = |last_component: usize| {
+            format!(
+                r"C:\{}\{}\{}",
+                "a".repeat(100),
+                "b".repeat(100),
+                "c".repeat(last_component)
+            )
+        };
+        let within_limit = path_of_length(54); // 259 UTF-16 units + terminator.
+        let over_limit = path_of_length(55); // 260 UTF-16 units + terminator.
+        assert_eq!(within_limit.encode_utf16().count(), 259);
+        assert_eq!(over_limit.encode_utf16().count(), 260);
+        assert!(fs.normalize(&over_limit).is_ok()); // Default is long-path mode.
+
+        fs.set_strict_max_path(true);
+        assert!(fs.normalize(&within_limit).is_ok());
+        assert!(fs.normalize(&over_limit).is_err());
+        assert!(fs.normalize(&format!(r"\\?\{over_limit}")).is_ok());
     }
 
     #[test]
