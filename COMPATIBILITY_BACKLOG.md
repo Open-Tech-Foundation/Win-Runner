@@ -127,8 +127,9 @@ Record oracle values from `GetFullPathNameW`, `CreateFileW`, and
   invalid read/write directions fail. Reserved names including `COM1` and
   `LPT1` are rejected even with extensions. Unit tests and a generated native
   PE guest test cover these cases.
-- [ ] **Device and pipe namespace.** Parse `\\.\NUL` and
-  `\\.\pipe\foo` as device/pipe paths rather than C: paths.
+- [x] **Device and pipe namespace.** The typed parser classifies DOS device
+  aliases and `\\.\pipe\foo` as device paths instead of ordinary C: paths;
+  native `CreateFileW` dispatches pipe names to the named-pipe implementation.
 - [x] **UNC paths.** WinFs rejects `\\server\share\x`,
   `\\?\UNC\server\share\x`, and `\??\UNC\server\share\x` instead of
   remapping them onto C:. Native `CreateFileW` reports
@@ -145,11 +146,12 @@ Record oracle values from `GetFullPathNameW`, `CreateFileW`, and
   do not use whole-string full-Unicode lowercase conversion.
 - [ ] **Optional MAX_PATH mode.** Add an opt-in strict 260-character path check
   and cover boundary and extended-path cases in the oracle table.
-- [ ] **One typed path parser.** Add `win_path::parse()` following
-  `GetFullPathNameW` rules, returning `Dos { drive, parts }`,
-  `Unc { server, share, parts }`, `Device(Nul | Con | ConIn | ConOut | Pipe(name))`,
-  or `Invalid(reason)`. Route path-consuming APIs through this parser so
-  parsing and prefix checks do not repeat or allocate per-prefix strings.
+- [x] **One typed path parser.** Added `win_path::parse()` returning
+  `Dos { drive, absolute, components }`, `Unc { server, share, components }`,
+  `Device(Nul | Con | ConIn | ConOut | Reserved | Pipe(name))`, or
+  `Invalid(reason)`. WinFs normalization, UNC detection, and DOS-device
+  classification use this parser; native filesystem APIs therefore share the
+  same path classification before lookup.
 
 ### Filesystem representation and mounted drives
 
@@ -172,7 +174,7 @@ Record oracle values from `GetFullPathNameW`, `CreateFileW`, and
 
 1. Fix relative paths on non-C: drives and per-drive cwd handling.
 2. [x] Implement NUL and CON-family devices, and reject reserved COM/LPT names.
-3. Add the typed parser for UNC and device paths.
+3. [x] Add the typed parser for UNC and device paths.
 4. Normalize trailing dots/spaces and reject invalid/reserved names.
 5. Move WinFs nodes to IDs and retain relative symlink targets.
 6. Add mounted-directory indexes and collision reporting.

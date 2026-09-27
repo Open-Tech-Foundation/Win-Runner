@@ -15426,6 +15426,9 @@ mod imp {
                 native_set_last_error(123); // ERROR_INVALID_NAME
                 return u64::MAX;
             }
+            Some(crate::winfs::DosDevicePath::Pipe(_)) => {
+                return native_open_named_pipe(&path, access, share, flags, security);
+            }
             None => None,
         };
         if let Some(device) = device {

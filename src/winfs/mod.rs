@@ -19,6 +19,9 @@ use std::{
     },
 };
 
+mod win_path;
+pub(crate) use win_path::{parse as parse_win_path, DosDevicePath, ParsedWinPath};
+
 static NEXT_DISK_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Seekable backing storage for WinFS file contents. Snapshot files and the
@@ -443,72 +446,14 @@ impl WinPath {
     }
 }
 
-fn is_drive_letter(c: char) -> bool {
-    c.is_ascii_alphabetic()
-}
-
 pub(crate) fn is_unc_path(raw: &str) -> bool {
-    let path = raw.replace('/', "\\");
-    if path
-        .get(..8)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(r"\\?\UNC\"))
-    {
-        return true;
-    }
-    if path
-        .get(..8)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(r"\??\UNC\"))
-    {
-        return true;
-    }
-    path.starts_with(r"\\") && !path.starts_with(r"\\.\") && !path.starts_with(r"\\?\")
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DosDevicePath {
-    Null,
-    Console,
-    ConsoleIn,
-    ConsoleOut,
-    Reserved,
+    matches!(parse_win_path(raw), ParsedWinPath::Unc { .. })
 }
 
 pub(crate) fn dos_device_path(raw: &str) -> Option<DosDevicePath> {
-    let mut path = raw.trim().replace('/', "\\");
-    if let Some(rest) = path.strip_prefix(r"\\.\") {
-        path = rest.to_string();
-    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
-        path = rest.to_string();
-    } else if let Some(rest) = path.strip_prefix(r"\??\") {
-        path = rest.to_string();
-    }
-    if path
-        .get(..5)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("pipe\\"))
-    {
-        return None;
-    }
-    let leaf = path.rsplit('\\').next().unwrap_or(&path);
-    let device_name = leaf
-        .split(['.', ':'])
-        .next()
-        .unwrap_or(leaf)
-        .trim_end_matches(' ');
-    if device_name.eq_ignore_ascii_case("NUL") {
-        Some(DosDevicePath::Null)
-    } else if device_name.eq_ignore_ascii_case("CON") {
-        Some(DosDevicePath::Console)
-    } else if device_name.eq_ignore_ascii_case("CONIN$") {
-        Some(DosDevicePath::ConsoleIn)
-    } else if device_name.eq_ignore_ascii_case("CONOUT$") {
-        Some(DosDevicePath::ConsoleOut)
-    } else {
-        let upper = device_name.to_ascii_uppercase();
-        let bytes = upper.as_bytes();
-        let reserved_port = bytes.len() == 4
-            && (bytes.starts_with(b"COM") || bytes.starts_with(b"LPT"))
-            && (b'1'..=b'9').contains(&bytes[3]);
-        reserved_port.then_some(DosDevicePath::Reserved)
+    match parse_win_path(raw) {
+        ParsedWinPath::Device(device) => Some(device),
+        _ => None,
     }
 }
 
@@ -1159,82 +1104,46 @@ impl WinFs {
     /// Parse + normalize a Windows path. Handles `\` and `/`, drive letters,
     /// absolute (`C:\...`, `\...`) vs relative, `.` and `..`.
     pub fn normalize(&self, raw: &str) -> Result<WinPath, String> {
-        let s = raw.trim();
-        if s.is_empty() {
-            return Err("empty path".to_string());
-        }
-        if is_unc_path(s) {
-            return Err("UNC paths are not supported by this WinFs instance".to_string());
-        }
-        if dos_device_path(s).is_some() {
-            return Err("reserved DOS device name is not a filesystem path".to_string());
-        }
-        // Normalize separators to backslash for parsing (but keep case).
-        let mut s = s.replace('/', "\\");
-        // Win32 and libuv use the extended-length DOS namespace to bypass
-        // MAX_PATH handling. It has the same drive/path semantics as a DOS
-        // path for this filesystem; normalize the prefix before parsing so
-        // recursive mkdir/stat operations don't mistake `\\?` for a path
-        // component. `\??\` is the corresponding NT object-manager prefix.
-        if let Some(rest) = s.strip_prefix("\\\\?\\") {
-            s = rest.to_string();
-        } else if let Some(rest) = s.strip_prefix("\\??\\") {
-            s = rest.to_string();
-        }
-
-        let (drive, rest): (char, &str) = if s.len() >= 2
-            && is_drive_letter(s.chars().next().unwrap())
-            && s.chars().nth(1) == Some(':')
-        {
-            let d = s.chars().next().unwrap().to_ascii_uppercase();
+        let (drive, absolute, components) = match parse_win_path(raw) {
+            ParsedWinPath::Dos {
+                drive,
+                absolute,
+                components,
+            } => (drive, absolute, components),
+            ParsedWinPath::Unc { .. } => {
+                return Err("UNC paths are not supported by this WinFs instance".to_string())
+            }
+            ParsedWinPath::Device(_) => {
+                return Err("device names are not filesystem paths".to_string())
+            }
+            ParsedWinPath::Invalid(reason) => return Err(reason),
+        };
+        let drive_was_explicit = drive.is_some();
+        let drive = if let Some(d) = drive {
+            let d = d.to_ascii_uppercase();
             if !self.drives.contains_key(&d) {
                 return Err(format!(
                     "unsupported drive in path: {raw} ({d}: is not mounted)"
                 ));
             }
-            let rest = &s[2..];
-            (d, rest)
-        } else if s.starts_with('\\') {
-            (self.cwd_drive, s.as_str())
+            d
         } else {
-            // relative: start from cwd
-            let mut parts = self.cwd_parts.clone();
-            for comp in s.split('\\') {
-                match comp {
-                    "" | "." => continue,
-                    ".." => {
-                        parts.pop();
-                    }
-                    _ => parts.push(comp.to_string()),
-                }
-            }
-            return Ok(WinPath {
-                drive: self.cwd_drive,
-                parts,
-            });
+            self.cwd_drive
         };
-
-        // absolute on drive
-        let mut parts: Vec<String> = if rest.starts_with('\\') {
+        let mut parts = if absolute {
             Vec::new()
-        } else {
-            // e.g. "C:foo" is relative to C:'s remembered working directory,
-            // which may differ from the active drive's current directory.
+        } else if drive_was_explicit {
             self.drive_cwds.get(&drive).cloned().unwrap_or_default()
+        } else {
+            self.cwd_parts.clone()
         };
-        // strip leading backslashes
-        let rest = rest.trim_start_matches('\\');
-        if rest.is_empty() {
-            return Ok(WinPath { drive, parts });
-        }
-        for comp in rest.split('\\') {
-            match comp {
-                "" => continue, // collapse duplicate separators / trailing slash
-                "." => continue,
+        for comp in components {
+            match comp.as_str() {
+                "" | "." => continue,
                 ".." => {
                     parts.pop();
                 }
-                _ => parts.push(comp.to_string()),
+                _ => parts.push(comp),
             }
         }
         Ok(WinPath { drive, parts })
@@ -2491,6 +2400,7 @@ mod tests {
         }
         assert!(!is_unc_path(r"\\.\pipe\foo"));
         assert!(!is_unc_path(r"\\?\C:\work\file.txt"));
+        assert!(fs.normalize(r"\\.\pipe\foo").is_err());
     }
 
     #[test]
@@ -2526,7 +2436,10 @@ mod tests {
             );
             assert!(fs.write_file(path, b"ordinary file".to_vec()).is_err());
         }
-        assert_eq!(dos_device_path(r"\\.\pipe\NUL"), None);
+        assert_eq!(
+            dos_device_path(r"\\.\pipe\NUL"),
+            Some(DosDevicePath::Pipe("NUL".to_string()))
+        );
         assert_eq!(dos_device_path("COM1.txt"), Some(DosDevicePath::Reserved));
     }
 
