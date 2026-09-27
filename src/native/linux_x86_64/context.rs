@@ -26,6 +26,7 @@ pub(super) static NATIVE_GUEST_ACTIVE: AtomicBool = AtomicBool::new(false);
 pub(super) static TEST_PROCESS: LazyLock<Arc<NativeProcessContext>> = LazyLock::new(|| {
     Arc::new(NativeProcessContext {
         image_base: 0x0001_4000_0000,
+        image_size: 0x10000,
         module_path: r"C:\winrun\winrun.exe".to_string(),
         process_id: 1,
         process_handle: u64::MAX,
@@ -93,6 +94,7 @@ pub(super) static TEST_PROCESS: LazyLock<Arc<NativeProcessContext>> = LazyLock::
         exit_status: AtomicU32::new(259),
         exited: AtomicBool::new(false),
         children: Mutex::new(NativeProcessTable::new()),
+        loaded_modules: Mutex::new(HashMap::new()),
     })
 });
 

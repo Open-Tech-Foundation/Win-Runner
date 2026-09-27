@@ -28,6 +28,7 @@ pub(crate) fn write_image(image: &PeImage, directory: &Path) -> Result<PathBuf, 
         })
     });
     let metadata = serde_json::json!({
+        "is_dll": image.is_dll,
         "image_base": image.image_base,
         "entry_rva": image.entry_rva,
         "size_of_image": image.size_of_image,
@@ -115,6 +116,7 @@ pub(crate) fn read_image(directory: &Path) -> Result<PeImage, String> {
         })
         .transpose()?;
     Ok(PeImage {
+        is_dll: metadata["is_dll"].as_bool().unwrap_or(false),
         image_base: number(&metadata, "image_base")?,
         entry_rva: number(&metadata, "entry_rva")? as u32,
         size_of_image: number(&metadata, "size_of_image")? as u32,

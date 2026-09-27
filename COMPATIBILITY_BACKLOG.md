@@ -117,6 +117,12 @@ Items remain open until implementation and relevant verification are complete.
     and implement `LoadLibrary`/`GetProcAddress` against real modules.
     - [x] Parse bounded PE export tables, including names, ordinals, and
       forwarder strings, as input to runtime export resolution.
+    - [x] Track the main image and loaded guest modules; load WinFS DLLs whose
+      imports are already shimmed, invoke process-attach `DllMain`, and resolve
+      named/ordinal exports plus forwarders to shim-backed system modules.
+    - [ ] Resolve guest-DLL dependencies recursively; implement DLL TLS and
+      thread notifications, custom-DLL forwarder loading, and FreeLibrary
+      reference-count/unload semantics.
   - [ ] Host `hostfxr.dll`, `hostpolicy.dll`, and `coreclr.dll` using the
     supported native hosting interfaces; cover shared, app-local, and
     self-contained runtime layouts, then add single-file apps.

@@ -26,6 +26,8 @@ pub struct Export {
 
 #[derive(Debug, Clone)]
 pub struct PeImage {
+    /// IMAGE_FILE_DLL in the PE COFF header.
+    pub is_dll: bool,
     pub image_base: u64,
     pub entry_rva: u32,
     pub size_of_image: u32,
@@ -203,6 +205,7 @@ fn load_inner(data: &[u8], strict: bool) -> Result<PeImage, String> {
         ));
     }
     let num_sections = u16le(data, coff + 2)? as usize;
+    let characteristics = u16le(data, coff + 18)?;
     let opt_size = u16le(data, coff + 16)? as usize;
     let opt = coff + 20;
     if num_sections == 0 || num_sections > 32 {
@@ -477,6 +480,7 @@ fn load_inner(data: &[u8], strict: bool) -> Result<PeImage, String> {
     };
 
     Ok(PeImage {
+        is_dll: characteristics & 0x2000 != 0,
         image_base,
         entry_rva,
         size_of_image,

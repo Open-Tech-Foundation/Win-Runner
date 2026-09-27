@@ -470,6 +470,7 @@ fn run_rust_baseline_argv_with_fs_impl(
             .unwrap_or([STD_HANDLE_BASE, STD_HANDLE_BASE + 1, STD_HANDLE_BASE + 2]);
         let process = Arc::new(NativeProcessContext {
             image_base: img.image_base,
+            image_size: img.size_of_image,
             module_path: prog.to_string(),
             process_id: std::env::var("WINRUN_NATIVE_PROCESS_ID")
                 .ok()
@@ -528,6 +529,16 @@ fn run_rust_baseline_argv_with_fs_impl(
             exit_status: AtomicU32::new(259), // STILL_ACTIVE
             exited: AtomicBool::new(false),
             children: Mutex::new(NativeProcessTable::new()),
+            loaded_modules: Mutex::new(HashMap::from([(
+                img.image_base,
+                NativeLoadedModule {
+                    path: prog.to_string(),
+                    name: prog.rsplit(['\\', '/']).next().unwrap_or(prog).to_string(),
+                    base: img.image_base,
+                    size_of_image: img.size_of_image,
+                    exports: img.exports.clone(),
+                },
+            )])),
         });
         recovery_process = Some(Arc::clone(&process));
         if let Ok(mut context) = NATIVE_PROCESS.lock() {

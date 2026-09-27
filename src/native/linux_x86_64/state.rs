@@ -130,6 +130,7 @@ pub(super) enum NativeDevice {
 /// Mutable state owned by one Windows guest process.
 pub(super) struct NativeProcessContext {
     pub(super) image_base: u64,
+    pub(super) image_size: u32,
     pub(super) module_path: String,
     pub(super) process_id: u32,
     pub(super) process_handle: u64,
@@ -182,6 +183,16 @@ pub(super) struct NativeProcessContext {
     pub(super) exit_status: AtomicU32,
     pub(super) exited: AtomicBool,
     pub(super) children: Mutex<NativeProcessTable>,
+    /// Real PE DLLs loaded through LoadLibrary in this guest process.
+    pub(super) loaded_modules: Mutex<HashMap<u64, NativeLoadedModule>>,
+}
+
+pub(super) struct NativeLoadedModule {
+    pub(super) path: String,
+    pub(super) name: String,
+    pub(super) base: u64,
+    pub(super) size_of_image: u32,
+    pub(super) exports: Vec<crate::pe::Export>,
 }
 
 pub(super) struct NativeThread {

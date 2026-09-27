@@ -13,6 +13,9 @@ All notable changes to this project will be documented in this file.
   runtime is planned.
 - Parse PE export tables into named, ordinal-only, and forwarded export records
   as the first implementation step toward loading guest DLLs.
+- Add per-process module records, LoadLibrary support for WinFS DLLs backed only
+  by existing native shims, process-attach DllMain calls, and dynamic
+  GetProcAddress for named, ordinal, and shim-forwarded exports.
 
 - Added an Apache 2.0 `NOTICE` file and linked it from the README.
 - Added `--save` to write changes back to the loaded snapshot on exit, without
