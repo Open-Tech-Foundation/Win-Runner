@@ -56,6 +56,9 @@ All notable changes to this project will be documented in this file.
   keeping the distinct Windows names `İ.txt` and `i` plus a combining dot apart.
 - Preserved relative symlink targets as written and resolve them from the
   link's parent directory, including after directory moves and change replay.
+- Cached mounted host directory name indexes and refresh them when directory
+  modification times change; case-colliding host names now return an explicit
+  error.
 - Added the C-locale `msvcrt!mbstowcs` shim used by Nano.
 - Added an optional native Node check proving a relative file that Node leaves
   in WinFS appears in the following shell directory listing.

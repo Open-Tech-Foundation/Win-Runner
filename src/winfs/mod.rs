@@ -10,6 +10,7 @@
 
 use std::{
     collections::HashMap,
+    ffi::OsString,
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -17,6 +18,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 mod win_path;
@@ -376,6 +378,104 @@ pub struct WinFs {
 struct HostMount {
     root: PathBuf,
     read_only: bool,
+    directories: Arc<Mutex<HashMap<PathBuf, HostDirectoryIndex>>>,
+}
+
+#[derive(Debug, Clone)]
+struct HostDirectoryIndex {
+    modified: SystemTime,
+    names: HashMap<String, Vec<OsString>>,
+}
+
+impl HostMount {
+    fn refresh_directory_index(&self, directory: &Path) -> Result<(), String> {
+        let modified = std::fs::metadata(directory)
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(UNIX_EPOCH);
+        let entries = std::fs::read_dir(directory).map_err(|error| {
+            format!(
+                "cannot list mounted directory {}: {error}",
+                directory.display()
+            )
+        })?;
+        let mut names = HashMap::<String, Vec<OsString>>::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "cannot read mounted directory entry in {}: {error}",
+                    directory.display()
+                )
+            })?;
+            let name = entry.file_name();
+            names
+                .entry(windows_name_key(&name.to_string_lossy()))
+                .or_default()
+                .push(name);
+        }
+        self.directories
+            .lock()
+            .map_err(|_| "mounted directory index lock is poisoned".to_string())?
+            .insert(
+                directory.to_path_buf(),
+                HostDirectoryIndex { modified, names },
+            );
+        Ok(())
+    }
+
+    fn find_child(&self, directory: &Path, name: &str) -> Result<Option<PathBuf>, String> {
+        let modified = std::fs::metadata(directory)
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(UNIX_EPOCH);
+        let directories = self
+            .directories
+            .lock()
+            .map_err(|_| "mounted directory index lock is poisoned".to_string())?;
+        let refresh = directories
+            .get(directory)
+            .is_none_or(|index| index.modified != modified);
+        drop(directories);
+        if refresh {
+            self.refresh_directory_index(directory)?;
+        }
+        let key = windows_name_key(name);
+        let mut directories = self
+            .directories
+            .lock()
+            .map_err(|_| "mounted directory index lock is poisoned".to_string())?;
+        if !refresh
+            && directories
+                .get(directory)
+                .is_some_and(|index| !index.names.contains_key(&key))
+        {
+            // Some mounted filesystems expose coarse or synthetic directory
+            // timestamps. Rescan on cache misses so newly added host files
+            // remain visible even when the timestamp did not advance.
+            drop(directories);
+            self.refresh_directory_index(directory)?;
+            directories = self
+                .directories
+                .lock()
+                .map_err(|_| "mounted directory index lock is poisoned".to_string())?;
+        }
+        let Some(names) = directories
+            .get(directory)
+            .and_then(|index| index.names.get(&key))
+        else {
+            return Ok(None);
+        };
+        if names.len() > 1 {
+            return Err(format!(
+                "case-colliding host names in {} for {name}: {}",
+                directory.display(),
+                names
+                    .iter()
+                    .map(|entry| entry.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        Ok(names.first().map(|entry| directory.join(entry)))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -556,7 +656,14 @@ impl WinFs {
             },
         );
         self.drive_cwds.entry(drive).or_default();
-        self.mounts.insert(drive, HostMount { root, read_only });
+        self.mounts.insert(
+            drive,
+            HostMount {
+                root,
+                read_only,
+                directories: Arc::new(Mutex::new(HashMap::new())),
+            },
+        );
         Ok(())
     }
 
@@ -897,14 +1004,8 @@ impl WinFs {
             .ok_or_else(|| format!("drive {}: is not mounted", p.drive))?;
         let mut current = mount.root.clone();
         for (index, component) in p.parts.iter().enumerate() {
-            let found = std::fs::read_dir(&current).ok().and_then(|entries| {
-                entries.filter_map(Result::ok).find(|entry| {
-                    windows_name_key(&entry.file_name().to_string_lossy())
-                        == windows_name_key(component)
-                })
-            });
-            if let Some(entry) = found {
-                current = entry.path();
+            if let Some(found) = mount.find_child(&current, component)? {
+                current = found;
                 let metadata = std::fs::symlink_metadata(&current).map_err(|e| {
                     format!("cannot inspect mounted path {}: {e}", current.display())
                 })?;
@@ -2783,6 +2884,19 @@ mod tests {
         assert!(fs.is_dir(r"Z:\folder"));
         assert_eq!(fs.read_file(r"z:\FOLDER\hello.TXT").unwrap(), b"host-data");
         assert_eq!(fs.list_dir(r"Z:\folder").unwrap(), vec!["Hello.txt"]);
+        let folder = root.join("Folder").canonicalize().unwrap();
+        fs.mounts[&'Z']
+            .directories
+            .lock()
+            .unwrap()
+            .get_mut(&folder)
+            .unwrap()
+            .modified = UNIX_EPOCH;
+        std::fs::write(root.join("Folder/Added-after-index.txt"), b"fresh").unwrap();
+        assert_eq!(
+            fs.read_file(r"Z:\folder\added-after-index.txt").unwrap(),
+            b"fresh"
+        );
 
         fs.mkdir(r"Z:\new\nested").unwrap();
         fs.write_file(r"Z:\new\nested\created.txt", b"guest-write".to_vec())
@@ -2795,6 +2909,24 @@ mod tests {
         );
         fs.delete_file(r"Z:\new\nested\created.txt").unwrap();
         assert!(!root.join("new/nested/created.txt").exists());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn mounted_host_drive_reports_case_collisions() {
+        let root = std::env::temp_dir().join(format!(
+            "wincli-mount-case-collision-{}-{}",
+            std::process::id(),
+            NEXT_DISK_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Foo"), b"upper").unwrap();
+        std::fs::write(root.join("foo"), b"lower").unwrap();
+        let mut fs = WinFs::new();
+        fs.mount_host_dir('Z', &root, false).unwrap();
+        let error = fs.read_file(r"Z:\FOO").unwrap_err();
+        assert!(error.contains("case-colliding host names"), "{error}");
+        assert!(error.contains("Foo") && error.contains("foo"), "{error}");
         std::fs::remove_dir_all(root).ok();
     }
 

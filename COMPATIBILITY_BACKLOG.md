@@ -166,9 +166,12 @@ Record oracle values from `GetFullPathNameW`, `CreateFileW`, and
   supplied and resolves relative targets from the link's parent directory, so
   moving a containing directory preserves the link. Unit tests cover moves
   and filesystem change replay.
-- [ ] **Indexed mounted directories.** Cache mounted host directory listings
-  with a case-folded index, refresh when directory modification time changes,
-  and report case collisions such as simultaneous `Foo` and `foo` explicitly.
+- [x] **Indexed mounted directories.** Host mounts cache each directory's
+  one-character-uppercase name index, refresh it when the directory
+  modification time changes, and report case collisions such as simultaneous
+  `Foo` and `foo` explicitly. Cache misses trigger a rescan too, for mounted
+  filesystems with coarse or synthetic timestamps. Unit tests cover refresh
+  and collision errors.
 - [ ] **Shared filesystem service.** Keep this aligned with the server/worker
   architecture item below: a shared filesystem owner should make child writes
   visible immediately. Current child-exit merge and crash-loss behavior is
