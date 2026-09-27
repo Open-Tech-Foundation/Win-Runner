@@ -37,6 +37,8 @@ All notable changes to this project will be documented in this file.
   Windows-oracle testing and an ordered implementation plan.
 - Fixed WinFs relative paths on mounted drives and retained a separate current
   directory for each drive, including drive-relative paths such as `C:foo`.
+- Added native `NUL` device opens with discarded writes, EOF reads, and no
+  corresponding ordinary WinFs file creation.
 - Added the C-locale `msvcrt!mbstowcs` shim used by Nano.
 - Added an optional native Node check proving a relative file that Node leaves
   in WinFS appears in the following shell directory listing.

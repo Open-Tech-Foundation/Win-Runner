@@ -3362,6 +3362,52 @@ mod imp {
         }
 
         #[test]
+        fn nul_device_opens_as_character_sink_and_never_creates_a_disk_entry() {
+            let context = super::fs_ctx().unwrap();
+            {
+                let mut ctx = context.lock().unwrap();
+                if !ctx.fs.is_dir(r"C:\nul_device_unit") {
+                    ctx.fs.mkdir(r"C:\nul_device_unit").unwrap();
+                }
+            }
+            let payload = b"discard this output";
+            for path in [
+                "NUL",
+                r"C:\nul_device_unit\nul.txt",
+                r"\\.\NUL",
+                r"\\?\C:\nul_device_unit\NUL",
+            ] {
+                let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+                let handle = super::native_create_file_w(wide.as_ptr(), 0xC000_0000, 7, 0, 3, 0, 0);
+                assert_ne!(handle, u64::MAX, "failed to open {path}");
+                assert_eq!(super::native_get_file_type(handle), 2); // FILE_TYPE_CHAR
+                let mut written = 0;
+                assert_eq!(
+                    super::native_write_file(
+                        handle,
+                        payload.as_ptr(),
+                        payload.len() as u32,
+                        &mut written,
+                        0,
+                    ),
+                    1
+                );
+                assert_eq!(written as usize, payload.len());
+                let mut read = u32::MAX;
+                assert_eq!(
+                    super::native_read_file(handle, payload.as_ptr() as *mut u8, 8, &mut read, 0),
+                    1
+                );
+                assert_eq!(read, 0); // NUL reads as EOF.
+                let mut size = -1;
+                assert_eq!(super::native_get_file_size_ex(handle, &mut size), 1);
+                assert_eq!(size, 0);
+                assert_eq!(super::native_close_handle(handle), 1);
+            }
+            assert!(!context.lock().unwrap().fs.exists(r"C:\nul_device_unit\nul"));
+        }
+
+        #[test]
         fn modern_get_file_type_distinguishes_disk_handles_from_invalid_handles() {
             type GetFileType = unsafe extern "win64" fn(u64) -> u32;
             let get_file_type: GetFileType =
@@ -8799,6 +8845,7 @@ mod imp {
     struct NativeFs {
         fs: WinFs,
         handles: HashMap<u64, NativeFile>,
+        devices: HashMap<u64, NativeDevice>,
         file_access: HashMap<u64, u32>,
         file_shares: HashMap<u64, u32>,
         finds: HashMap<u64, NativeFind>,
@@ -8815,6 +8862,7 @@ mod imp {
             Ok(Self {
                 fs,
                 handles: self.handles.clone(),
+                devices: self.devices.clone(),
                 file_access: self.file_access.clone(),
                 file_shares: self.file_shares.clone(),
                 finds: self.finds.clone(),
@@ -8824,6 +8872,30 @@ mod imp {
                 next: self.next,
             })
         }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum NativeDevice {
+        Null,
+    }
+
+    fn native_device(handle: u64) -> Option<(NativeDevice, u32)> {
+        let handle = process_ctx()
+            .and_then(|process| {
+                process
+                    .duplicate_handles
+                    .lock()
+                    .ok()
+                    .and_then(|values| values.get(&handle).copied())
+            })
+            .unwrap_or(handle);
+        let context = fs_ctx()?;
+        let context = context.lock().ok()?;
+        let device = context.devices.get(&handle).copied()?;
+        Some((
+            device,
+            context.file_access.get(&handle).copied().unwrap_or(0),
+        ))
     }
 
     // CreateProcessW will allocate these once PE mapping is attached to the
@@ -9160,6 +9232,7 @@ mod imp {
             fs: Arc::new(Mutex::new(NativeFs {
                 fs: WinFs::new(),
                 handles: HashMap::new(),
+                devices: HashMap::new(),
                 file_access: HashMap::new(),
                 file_shares: HashMap::new(),
                 finds: HashMap::new(),
@@ -9443,6 +9516,9 @@ mod imp {
         handle: u64,
         bytes: &[u8],
     ) -> bool {
+        if matches!(native_device(handle), Some((NativeDevice::Null, _))) {
+            return true;
+        }
         if let Some(pipe) = pipe {
             let can_write = if pipe.endpoint.server {
                 pipe.access & 0x3 & 0x2 != 0
@@ -9879,6 +9955,7 @@ mod imp {
             .unwrap_or(source_handle);
         let valid = matches!(original, u64::MAX | 0xffff_ffff_ffff_fffe)
             || host_standard_fd(original).is_some()
+            || native_device(original).is_some()
             || process
                 .threads
                 .lock()
@@ -9933,6 +10010,10 @@ mod imp {
     }
 
     extern "win64" fn native_get_file_type(handle: u64) -> u32 {
+        if matches!(native_device(handle), Some((NativeDevice::Null, _))) {
+            native_set_last_error(0);
+            return 0x0002; // FILE_TYPE_CHAR
+        }
         if crate::control::is_control_session() && host_standard_fd(handle).is_some() {
             return 0x0002; // FILE_TYPE_CHAR for the controlled virtual console.
         }
@@ -12663,6 +12744,17 @@ mod imp {
             }
             return 1;
         }
+        if let Some((NativeDevice::Null, access)) = native_device(handle) {
+            if len != 0 && access & 0x4000_0000 == 0 {
+                native_set_last_error(5); // ERROR_ACCESS_DENIED
+                return 0;
+            }
+            if !written.is_null() {
+                unsafe { written.write(len) };
+            }
+            native_set_last_error(0);
+            return 1; // NUL discards all bytes written to it.
+        }
         if !matches!(host_standard_fd(handle), Some(1 | 2)) {
             let context = match fs_ctx() {
                 Some(v) => v,
@@ -15220,6 +15312,15 @@ mod imp {
             Ok(value) => value,
             Err(_) => return u64::MAX,
         };
+        if crate::winfs::is_null_device_path(&path) {
+            let handle = ctx.next;
+            ctx.next = ctx.next.saturating_add(1);
+            ctx.devices.insert(handle, NativeDevice::Null);
+            ctx.file_access.insert(handle, access);
+            ctx.file_shares.insert(handle, share);
+            native_set_last_error(0);
+            return handle;
+        }
         let exists = ctx.fs.exists(&path);
         let Ok(path_key) = ctx.fs.normalize(&path) else {
             native_set_last_error(3);
@@ -16065,6 +16166,10 @@ mod imp {
             native_set_last_error(6);
             return 0;
         };
+        if ctx.devices.contains_key(&handle) {
+            unsafe { output.write_unaligned(0) };
+            return 1;
+        }
         let Some(file) = ctx.handles.get(&handle) else {
             native_set_last_error(6); // ERROR_INVALID_HANDLE
             return 0;
@@ -16257,6 +16362,17 @@ mod imp {
                 unsafe { read_count.write(count as u32) };
             }
             return 1;
+        }
+        if let Some((NativeDevice::Null, access)) = native_device(h) {
+            if n != 0 && access & 0x8000_0000 == 0 {
+                native_set_last_error(5); // ERROR_ACCESS_DENIED
+                return 0;
+            }
+            if !read_count.is_null() {
+                unsafe { read_count.write(0) };
+            }
+            native_set_last_error(0);
+            return 1; // NUL reads as immediate EOF.
         }
         if let Some(fd) = host_standard_fd(h) {
             let count = unsafe { read(fd, buf.cast(), n as usize) };
@@ -16504,13 +16620,14 @@ mod imp {
                     c.file_completion_modes.remove(&h);
                     c.file_access.remove(&h);
                     c.file_shares.remove(&h);
+                    let device_closed = c.devices.remove(&h).is_some();
                     if c.delete_on_close.remove(&h) {
                         if let Some(file) = c.handles.get(&h) {
                             let path = file.path.clone();
                             let _ = c.fs.delete_file(&path);
                         }
                     }
-                    c.handles.remove(&h).is_some() || c.finds.remove(&h).is_some()
+                    device_closed || c.handles.remove(&h).is_some() || c.finds.remove(&h).is_some()
                 })
             })
             .unwrap_or(false);
@@ -20720,6 +20837,7 @@ mod imp {
             let fs = Arc::new(Mutex::new(NativeFs {
                 fs: instance_fs,
                 handles: HashMap::new(),
+                devices: HashMap::new(),
                 file_access: HashMap::new(),
                 file_shares: HashMap::new(),
                 finds: HashMap::new(),

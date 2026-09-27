@@ -447,6 +447,30 @@ fn is_drive_letter(c: char) -> bool {
     c.is_ascii_alphabetic()
 }
 
+pub(crate) fn is_null_device_path(raw: &str) -> bool {
+    let mut path = raw.trim().replace('/', "\\");
+    if let Some(rest) = path.strip_prefix(r"\\.\") {
+        path = rest.to_string();
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        path = rest.to_string();
+    } else if let Some(rest) = path.strip_prefix(r"\??\") {
+        path = rest.to_string();
+    }
+    if path
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("pipe\\"))
+    {
+        return false;
+    }
+    let leaf = path.rsplit('\\').next().unwrap_or(&path);
+    let device_name = leaf
+        .split(['.', ':'])
+        .next()
+        .unwrap_or(leaf)
+        .trim_end_matches(' ');
+    device_name.eq_ignore_ascii_case("NUL")
+}
+
 impl Default for WinFs {
     fn default() -> Self {
         Self::new()
@@ -1097,6 +1121,9 @@ impl WinFs {
         let s = raw.trim();
         if s.is_empty() {
             return Err("empty path".to_string());
+        }
+        if is_null_device_path(s) {
+            return Err("NUL is a device, not a filesystem path".to_string());
         }
         // Normalize separators to backslash for parsing (but keep case).
         let mut s = s.replace('/', "\\");
@@ -2404,6 +2431,28 @@ mod tests {
         }
         assert!(fs.normalize("").is_err());
         assert!(fs.normalize(r"Q:\outside.txt").is_err());
+    }
+
+    #[test]
+    fn null_device_aliases_are_not_normal_filesystem_paths() {
+        let mut fs = WinFs::new();
+        fs.mkdir(r"C:\work").unwrap();
+        for path in [
+            "NUL",
+            "nul.txt",
+            r"C:\work\nul",
+            r"\\.\NUL",
+            r"\\?\C:\work\NUL.txt",
+        ] {
+            assert!(is_null_device_path(path), "{path}");
+            assert!(
+                fs.normalize(path).is_err(),
+                "{path} must not be a disk path"
+            );
+            assert!(fs.write_file(path, b"ordinary file".to_vec()).is_err());
+        }
+        assert!(!fs.exists(r"C:\work\nul"));
+        assert!(!is_null_device_path(r"\\.\pipe\NUL"));
     }
 
     #[test]

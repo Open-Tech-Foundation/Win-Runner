@@ -118,10 +118,13 @@ Record oracle values from `GetFullPathNameW`, `CreateFileW`, and
   Windows `=C:`-style per-drive cwd behavior. WinFs now retains a cwd per
   mounted drive and tests relative resolution on Z: plus C: drive-relative
   lookup while Z: is active.
-- [ ] **DOS device names and console devices.** Treat `NUL` and `C:\work\nul`
-  as the null device, and cover `CON`, `CONIN$`, and `CONOUT$`. Recognize
-  reserved names including `COM1` and `LPT1`, also when followed by extensions
-  such as `nul.txt`.
+- [x] **Null device.** `NUL`, `nul.txt`, `C:\work\nul`, and `\\.\NUL` open
+  as a character device through `CreateFileW`; writes are discarded, reads
+  return EOF, and no WinFs file entry is created. Unit and generated native PE
+  guest tests cover these semantics.
+- [ ] **Console and reserved DOS device names.** Cover `CON`, `CONIN$`, and
+  `CONOUT$`; recognize reserved names including `COM1` and `LPT1`, also when
+  followed by extensions such as `nul.txt`.
 - [ ] **Device and pipe namespace.** Parse `\\.\NUL` and
   `\\.\pipe\foo` as device/pipe paths rather than C: paths.
 - [ ] **UNC paths.** Support `\\server\share\x` and

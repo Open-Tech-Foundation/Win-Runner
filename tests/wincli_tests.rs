@@ -262,6 +262,65 @@ fn native_timer_imports_run_on_the_host_clock() {
 }
 
 #[test]
+fn native_guest_writes_to_nul_without_creating_a_winfs_file() {
+    use pe::builder::{build, Asm};
+    let mut asm = Asm::new();
+    let path = asm.add_utf16("NUL");
+    let payload = asm.add_data(b"discarded".to_vec());
+    let written = asm.add_zeroed(4);
+    let failed = asm.fresh_label();
+
+    asm.sub_rsp(0x48);
+    asm.lea_reg_rip(1, path); // RCX = lpFileName
+    asm.mov_edx_imm(0xC000_0000); // GENERIC_READ | GENERIC_WRITE
+    asm.mov_r8d_imm(7); // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+    asm.emit(&[0x45, 0x33, 0xC9]); // xor r9d, r9d
+    asm.mov_rspoff_imm32(0x20, 3); // OPEN_EXISTING
+    asm.emit(&[0x48, 0x31, 0xC0]); // xor rax, rax
+    asm.mov_rspoff_rax(0x28); // dwFlagsAndAttributes
+    asm.mov_rspoff_rax(0x30); // hTemplateFile
+    asm.call_import(0); // CreateFileW
+    asm.cmp_rax_m1();
+    asm.jz(failed);
+    asm.mov_rspoff_reg(0x38, 0); // save handle
+
+    asm.mov_reg_rspoff(1, 0x38); // RCX = handle
+    asm.lea_reg_rip(2, payload); // RDX = buffer
+    asm.mov_r8d_imm(9); // R8D = byte count
+    asm.lea_reg_rip(9, written); // R9 = bytes written
+    asm.emit(&[0x48, 0x31, 0xC0]); // xor rax, rax
+    asm.mov_rspoff_rax(0x20); // lpOverlapped = NULL
+    asm.call_import(1); // WriteFile
+    asm.test_eax_eax();
+    asm.jz(failed);
+
+    asm.mov_reg_rspoff(1, 0x38);
+    asm.call_import(2); // CloseHandle
+    asm.mov_ecx_imm(0);
+    asm.call_import(3); // ExitProcess
+    asm.mark(failed);
+    asm.mov_ecx_imm(1);
+    asm.call_import(3); // ExitProcess
+
+    let image = pe::load(&build(
+        asm,
+        &[
+            ("KERNEL32.dll", "CreateFileW"),
+            ("KERNEL32.dll", "WriteFile"),
+            ("KERNEL32.dll", "CloseHandle"),
+            ("KERNEL32.dll", "ExitProcess"),
+        ],
+    ))
+    .unwrap();
+    let (code, stdout, fs) =
+        wincli::native::run_rust_baseline_argv_with_fs(&image, WinFs::new(), "nul-device.exe", &[])
+            .unwrap();
+    assert_eq!(code, 0);
+    assert!(stdout.is_empty());
+    assert!(!fs.exists(r"C:\NUL"));
+}
+
+#[test]
 fn native_global_memory_status_ex_validates_and_populates_guest_buffer() {
     use pe::builder::{build, Asm};
     let mut a = Asm::new();
