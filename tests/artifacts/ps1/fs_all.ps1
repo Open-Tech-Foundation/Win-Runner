@@ -1,5 +1,5 @@
-# WinCLI FS smoke test: exercises every supported cmdlet.
-# Run: wincli fs_all.ps1
+# Win-Runner FS smoke test: exercises every supported cmdlet.
+# Run: winrun fs_all.ps1
 # Expected stdout:
 #   two
 #   three

@@ -151,7 +151,7 @@ pub(crate) fn execute_request(path: &Path) -> Result<u32, String> {
         let descriptors =
             crate::native::receive_worker_pipe_descriptors(socket_path, descriptor_count)?;
         std::env::set_var(
-            "WINCLI_NATIVE_PIPE_FDS",
+            "WINRUN_NATIVE_PIPE_FDS",
             descriptors
                 .iter()
                 .map(i32::to_string)
@@ -159,7 +159,7 @@ pub(crate) fn execute_request(path: &Path) -> Result<u32, String> {
                 .join(","),
         );
     } else {
-        std::env::remove_var("WINCLI_NATIVE_PIPE_FDS");
+        std::env::remove_var("WINRUN_NATIVE_PIPE_FDS");
     }
     let text = |key: &str| -> Result<String, String> {
         request
@@ -233,19 +233,19 @@ pub(crate) fn execute_request(path: &Path) -> Result<u32, String> {
     use std::os::fd::IntoRawFd;
     let result_fd = result_file.into_raw_fd();
     crate::native::set_worker_result_fd(result_fd);
-    std::env::set_var("WINCLI_NATIVE_WORKER", "1");
+    std::env::set_var("WINRUN_NATIVE_WORKER", "1");
     if request.get("native_fs").is_some() {
-        std::env::set_var("WINCLI_NATIVE_REQUEST_PATH", path);
+        std::env::set_var("WINRUN_NATIVE_REQUEST_PATH", path);
     } else {
-        std::env::remove_var("WINCLI_NATIVE_REQUEST_PATH");
+        std::env::remove_var("WINRUN_NATIVE_REQUEST_PATH");
     }
-    std::env::set_var("WINCLI_NATIVE_PROCESS_ID", process_id.to_string());
+    std::env::set_var("WINRUN_NATIVE_PROCESS_ID", process_id.to_string());
     std::env::set_var(
-        "WINCLI_NATIVE_PARENT_PROCESS_ID",
+        "WINRUN_NATIVE_PARENT_PROCESS_ID",
         parent_process_id.to_string(),
     );
     std::env::set_var(
-        "WINCLI_NATIVE_STATE_FD",
+        "WINRUN_NATIVE_STATE_FD",
         state_file.into_raw_fd().to_string(),
     );
     let program = text("program")?;

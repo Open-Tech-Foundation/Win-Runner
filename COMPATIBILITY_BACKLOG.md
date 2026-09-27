@@ -32,7 +32,7 @@ Items remain open until implementation and relevant verification are complete.
   child changes are applied on normal exit, can be lost on kill/crash, and
   concurrent writers are last-finisher-wins. Document this behavior and plan
   shared/incremental filesystem updates for cooperating processes.
-- [x] **6. Preserve guest arguments after the executable.** Parse WinCLI
+- [x] **6. Preserve guest arguments after the executable.** Parse Win-Runner
   options only before the target program; pass later `--snapshot`, `--mount`,
   `--control`, and `--headless` arguments through unchanged.
 - [x] **7. Route guest stderr through the control channel.** The native
@@ -64,7 +64,7 @@ Items remain open until implementation and relevant verification are complete.
   backend-specific to support future macOS native backends. Wait and
   process-scoped object maps remain follow-up architecture work, not outstanding
   source separation.
-- [x] Cache `WINCLI_NATIVE_DIAGNOSTIC` once rather than reading the environment
+- [x] Cache `WINRUN_NATIVE_DIAGNOSTIC` once rather than reading the environment
   from hot shims; initialize the cache before guest forks.
 - [x] Fix Clippy's unevenly grouped hexadecimal literal warnings. A current
   all-targets Clippy run still reports unrelated warnings across the codebase.
@@ -205,7 +205,7 @@ Record oracle values from `GetFullPathNameW`, `CreateFileW`, and
 
 - [ ] Build a corpus of 30–50 real executables (Git, embeddable Python, curl,
   7-Zip, jq, CMake, Go/Deno/Rust builds, and others); run
-  `wincli inspect --json`, aggregate missing imports by executable, and rank
+  `winrun inspect --json`, aggregate missing imports by executable, and rank
   shim work by measured demand.
 - [ ] Replace split `supports_import` and `baseline_trampoline` registration
   with one shim registry that drives import binding, inspect output, and
@@ -213,8 +213,8 @@ Record oracle values from `GetFullPathNameW`, `CreateFileW`, and
 - [ ] Introduce one typed object manager for process, thread, event, semaphore,
   mutex, file, and pipe handles so wait, duplicate, and inheritance behavior
   share one model.
-- [ ] Move to a server/worker process model: the main WinCLI server owns WinFS
-  and process/handle tables; fresh WinCLI workers execute guest processes over
+- [ ] Move to a server/worker process model: the main Win-Runner server owns WinFS
+  and process/handle tables; fresh Win-Runner workers execute guest processes over
   a Unix socket. Use this boundary for per-process sandboxing and incremental
   filesystem updates.
 - [ ] Extend the WebSocket/instance protocol with structured jobs: timeout,

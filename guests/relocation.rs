@@ -7,8 +7,8 @@
 
 #[no_mangle]
 #[used]
-pub static WINCLI_RELOCATION_TARGET: u8 = 0;
+pub static WINRUN_RELOCATION_TARGET: u8 = 0;
 
 #[no_mangle]
 #[used]
-pub static WINCLI_RELOCATION_ANCHOR: &'static u8 = &WINCLI_RELOCATION_TARGET;
+pub static WINRUN_RELOCATION_ANCHOR: &'static u8 = &WINRUN_RELOCATION_TARGET;

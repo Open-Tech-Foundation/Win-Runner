@@ -1,5 +1,5 @@
 //! Optional real Node.js Windows binary compatibility check.
-//! Set WINCLI_NODE_EXE to an official Windows x64 node.exe to run it.
+//! Set WINRUN_NODE_EXE to an official Windows x64 node.exe to run it.
 
 #[cfg(unix)]
 use std::io::Read;
@@ -22,12 +22,12 @@ unsafe extern "C" {
 
 #[test]
 fn official_windows_node_runs_version_and_javascript_natively() {
-    let Ok(path) = std::env::var("WINCLI_NODE_EXE") else {
+    let Ok(path) = std::env::var("WINRUN_NODE_EXE") else {
         return;
     };
     let path = Path::new(&path);
-    let bytes = std::fs::read(path).expect("read WINCLI_NODE_EXE");
-    let report = wincli::inspect::inspect_pe(&bytes).expect("parse Windows node.exe");
+    let bytes = std::fs::read(path).expect("read WINRUN_NODE_EXE");
+    let report = winrun::inspect::inspect_pe(&bytes).expect("parse Windows node.exe");
     assert_eq!(report.arch, "x86_64");
     assert!(report.total() > 400, "unexpected Node.js import table");
     assert!(
@@ -35,11 +35,11 @@ fn official_windows_node_runs_version_and_javascript_natively() {
         "inspection still lists optional static imports"
     );
 
-    let output = Command::new(env!("CARGO_BIN_EXE_wincli"))
+    let output = Command::new(env!("CARGO_BIN_EXE_winrun"))
         .arg(path)
         .arg("--version")
         .output()
-        .expect("start native WinCLI");
+        .expect("start native Win-Runner");
     assert_eq!(
         output.status.code(),
         Some(0),
@@ -48,11 +48,11 @@ fn official_windows_node_runs_version_and_javascript_natively() {
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "v24.21.0");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_wincli"))
+    let output = Command::new(env!("CARGO_BIN_EXE_winrun"))
         .arg(path)
         .args(["-e", "console.log(1 + 2)"])
         .output()
-        .expect("evaluate JavaScript through native WinCLI");
+        .expect("evaluate JavaScript through native Win-Runner");
     assert_eq!(
         output.status.code(),
         Some(0),
@@ -65,7 +65,7 @@ fn official_windows_node_runs_version_and_javascript_natively() {
 #[test]
 #[cfg(unix)]
 fn official_windows_node_serves_an_http_request_natively() {
-    let Ok(node) = std::env::var("WINCLI_NODE_EXE") else {
+    let Ok(node) = std::env::var("WINRUN_NODE_EXE") else {
         return;
     };
     let node = Path::new(&node)
@@ -77,7 +77,7 @@ fn official_windows_node_serves_an_http_request_natively() {
     let source = format!(
         "require('node:http').createServer((req,res)=>res.end('native-node-http-ok')).listen({port},'127.0.0.1')"
     );
-    let mut command = Command::new(env!("CARGO_BIN_EXE_wincli"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_winrun"));
     command
         .arg(node)
         .args(["-e", &source])
@@ -146,14 +146,14 @@ fn official_windows_node_serves_an_http_request_natively() {
 
 #[test]
 fn official_windows_node_receives_winfs_directory_changes_natively() {
-    let Ok(node) = std::env::var("WINCLI_NODE_EXE") else {
+    let Ok(node) = std::env::var("WINRUN_NODE_EXE") else {
         return;
     };
     let node = Path::new(&node)
         .canonicalize()
         .expect("Windows node.exe exists");
     let source = "const fs=require('node:fs');fs.mkdirSync('C:/watch');const timeout=setTimeout(()=>process.exit(2),5000);const watcher=fs.watch('C:/watch',{recursive:true},(event,name)=>{if(name==='probe.txt'){clearTimeout(timeout);watcher.close();console.log('winfs-watch-ok:'+event+':'+name)}});setTimeout(()=>fs.writeFileSync('C:/watch/probe.txt','changed'),200)";
-    let output = Command::new(env!("CARGO_BIN_EXE_wincli"))
+    let output = Command::new(env!("CARGO_BIN_EXE_winrun"))
         .arg(node)
         .args(["-e", source])
         .output()
@@ -172,7 +172,7 @@ fn official_windows_node_receives_winfs_directory_changes_natively() {
 
 #[test]
 fn official_windows_node_relative_file_remains_visible_to_shell_dir() {
-    let Ok(node) = std::env::var("WINCLI_NODE_EXE") else {
+    let Ok(node) = std::env::var("WINRUN_NODE_EXE") else {
         return;
     };
     let node = Path::new(&node)
@@ -182,13 +182,13 @@ fn official_windows_node_relative_file_remains_visible_to_shell_dir() {
         "\"{}\" -e 'const fs=require(\"fs\");fs.writeFileSync(\"node-test.txt\",\"Hello from Node\");console.log(fs.readdirSync(\".\").includes(\"node-test.txt\"))'\nls\nexit\n",
         node.display()
     );
-    let mut child = Command::new(env!("CARGO_BIN_EXE_wincli"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_winrun"))
         .arg("shell")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("start native WinCLI shell");
+        .expect("start native Win-Runner shell");
     child
         .stdin
         .take()
@@ -209,32 +209,32 @@ fn official_windows_node_relative_file_remains_visible_to_shell_dir() {
     );
     assert!(
         stdout.lines().any(|line| line.trim() == "node-test.txt"),
-        "WinCLI dir did not list Node's retained file: {stdout}"
+        "Win-Runner dir did not list Node's retained file: {stdout}"
     );
 }
 
 #[test]
 fn official_windows_node_reads_guest_file_metadata_and_contents() {
-    let Ok(node) = std::env::var("WINCLI_NODE_EXE") else {
+    let Ok(node) = std::env::var("WINRUN_NODE_EXE") else {
         return;
     };
     let node = Path::new(&node)
         .canonicalize()
         .expect("Windows node.exe exists");
-    let host_file = std::env::temp_dir().join(format!("wincli-node-fs-{}.txt", std::process::id()));
+    let host_file = std::env::temp_dir().join(format!("winrun-node-fs-{}.txt", std::process::id()));
     std::fs::write(&host_file, b"npm-probe\n").expect("create host seed file");
     let script = format!(
         "@seed {} C:\\probe.txt\n\"{}\" -e \"const fs=require('node:fs');const p='C:\\\\probe.txt';console.log(fs.statSync(p).size+':'+fs.readFileSync(p,'utf8').trim()+':'+fs.readdirSync('C:/').includes('probe.txt'))\"\nexit\n",
         host_file.display(),
         node.display(),
     );
-    let mut child = Command::new(env!("CARGO_BIN_EXE_wincli"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_winrun"))
         .arg("shell")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("start native WinCLI shell");
+        .expect("start native Win-Runner shell");
     child
         .stdin
         .take()
@@ -254,7 +254,7 @@ fn official_windows_node_reads_guest_file_metadata_and_contents() {
 
 #[test]
 fn official_windows_node_exec_file_sync_captures_powershell_output() {
-    let Ok(node) = std::env::var("WINCLI_NODE_EXE") else {
+    let Ok(node) = std::env::var("WINRUN_NODE_EXE") else {
         return;
     };
     let node = Path::new(&node)
@@ -265,13 +265,13 @@ fn official_windows_node_exec_file_sync_captures_powershell_output() {
         "@seed {} C:\\bin\\node.exe\nC:\\bin\\node.exe -e \"{source}\"\nexit\n",
         node.display()
     );
-    let mut child = Command::new(env!("CARGO_BIN_EXE_wincli"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_winrun"))
         .arg("shell")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("start native WinCLI shell");
+        .expect("start native Win-Runner shell");
     child
         .stdin
         .take()
@@ -296,7 +296,7 @@ fn official_windows_node_exec_file_sync_captures_powershell_output() {
 
 #[test]
 fn official_windows_node_starts_nested_node_in_an_exec_worker() {
-    let Ok(node) = std::env::var("WINCLI_NODE_EXE") else {
+    let Ok(node) = std::env::var("WINRUN_NODE_EXE") else {
         return;
     };
     let node = Path::new(&node)
@@ -307,13 +307,13 @@ fn official_windows_node_starts_nested_node_in_an_exec_worker() {
         "@seed {} C:\\bin\\node.exe\nC:\\bin\\node.exe -e \"{source}\"\nexit\n",
         node.display()
     );
-    let mut child = Command::new(env!("CARGO_BIN_EXE_wincli"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_winrun"))
         .arg("shell")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("start native WinCLI shell");
+        .expect("start native Win-Runner shell");
     child
         .stdin
         .take()
@@ -342,13 +342,13 @@ fn official_windows_node_starts_nested_node_in_an_exec_worker() {
 
 #[test]
 fn official_windows_node_runs_the_staged_npm_cli_natively() {
-    let Ok(node) = std::env::var("WINCLI_NODE_EXE") else {
+    let Ok(node) = std::env::var("WINRUN_NODE_EXE") else {
         return;
     };
     let node = Path::new(&node)
         .canonicalize()
         .expect("Windows node.exe exists");
-    let npm = std::env::var_os("WINCLI_NPM_ROOT")
+    let npm = std::env::var_os("WINRUN_NPM_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| node.parent().unwrap().join("npm-stage/C/npm"));
     if !npm.join("bin/npm-cli.js").is_file() {
@@ -384,13 +384,13 @@ fn official_windows_node_runs_the_staged_npm_cli_natively() {
         node.display()
     ));
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_wincli"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_winrun"))
         .arg("shell")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("start native WinCLI shell");
+        .expect("start native Win-Runner shell");
     child
         .stdin
         .take()
@@ -412,13 +412,13 @@ fn official_windows_node_runs_the_staged_npm_cli_natively() {
 
 #[test]
 fn official_windows_node_installs_and_runs_a_real_npm_package_natively() {
-    let Ok(node) = std::env::var("WINCLI_NODE_EXE") else {
+    let Ok(node) = std::env::var("WINRUN_NODE_EXE") else {
         return;
     };
     let node = Path::new(&node)
         .canonicalize()
         .expect("Windows node.exe exists");
-    let npm = std::env::var_os("WINCLI_NPM_ROOT")
+    let npm = std::env::var_os("WINRUN_NPM_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| node.parent().unwrap().join("npm-stage/C/npm"));
     if !npm.join("bin/npm-cli.js").is_file() {
@@ -430,7 +430,7 @@ fn official_windows_node_installs_and_runs_a_real_npm_package_natively() {
     collect_files(&npm, &mut files);
     files.sort();
     let mut script = String::from(
-        "New-Item -ItemType Directory -Force C:\\Users\\wincli\\npm-cache\\_cacache\\tmp | Out-Null\nNew-Item -ItemType Directory -Force C:\\Users\\wincli\\npm-cache\\_logs | Out-Null\nNew-Item -ItemType Directory -Force C:\\project | Out-Null\n",
+        "New-Item -ItemType Directory -Force C:\\Users\\winrun\\npm-cache\\_cacache\\tmp | Out-Null\nNew-Item -ItemType Directory -Force C:\\Users\\winrun\\npm-cache\\_logs | Out-Null\nNew-Item -ItemType Directory -Force C:\\project | Out-Null\n",
     );
     for file in files {
         let relative = file.strip_prefix(&npm).unwrap();
@@ -447,13 +447,13 @@ fn official_windows_node_installs_and_runs_a_real_npm_package_natively() {
         node.display()
     ));
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_wincli"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_winrun"))
         .arg("shell")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("start native WinCLI shell");
+        .expect("start native Win-Runner shell");
     child
         .stdin
         .take()
@@ -479,16 +479,16 @@ fn official_windows_node_installs_and_runs_a_real_npm_package_natively() {
 
 #[test]
 fn official_windows_node_installs_from_the_live_npm_registry_natively() {
-    if std::env::var("WINCLI_TEST_LIVE_NPM").as_deref() != Ok("1") {
+    if std::env::var("WINRUN_TEST_LIVE_NPM").as_deref() != Ok("1") {
         return;
     }
-    let Ok(node) = std::env::var("WINCLI_NODE_EXE") else {
+    let Ok(node) = std::env::var("WINRUN_NODE_EXE") else {
         return;
     };
     let node = Path::new(&node)
         .canonicalize()
         .expect("Windows node.exe exists");
-    let npm = std::env::var_os("WINCLI_NPM_ROOT")
+    let npm = std::env::var_os("WINRUN_NPM_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| node.parent().unwrap().join("npm-stage/C/npm"));
     if !npm.join("bin/npm-cli.js").is_file() {
@@ -501,7 +501,7 @@ fn official_windows_node_installs_from_the_live_npm_registry_natively() {
     collect_files(&npm, &mut files);
     files.sort();
     let mut script = String::from(
-        "New-Item -ItemType Directory -Force C:\\Users\\wincli\\npm-cache\\_cacache\\tmp | Out-Null\nNew-Item -ItemType Directory -Force C:\\Users\\wincli\\npm-cache\\_logs | Out-Null\nNew-Item -ItemType Directory -Force C:\\project | Out-Null\n",
+        "New-Item -ItemType Directory -Force C:\\Users\\winrun\\npm-cache\\_cacache\\tmp | Out-Null\nNew-Item -ItemType Directory -Force C:\\Users\\winrun\\npm-cache\\_logs | Out-Null\nNew-Item -ItemType Directory -Force C:\\project | Out-Null\n",
     );
     for file in files {
         let relative = file.strip_prefix(&npm).unwrap();
@@ -513,13 +513,13 @@ fn official_windows_node_installs_from_the_live_npm_registry_natively() {
         probe.display(), node.display(), node.display()
     ));
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_wincli"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_winrun"))
         .arg("shell")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("start native WinCLI shell");
+        .expect("start native Win-Runner shell");
     child
         .stdin
         .take()

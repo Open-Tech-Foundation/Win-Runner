@@ -1,4 +1,4 @@
-//! Windows console API shims over the WinCLI terminal and standard handles.
+//! Windows console API shims over the Win-Runner terminal and standard handles.
 
 use super::*;
 

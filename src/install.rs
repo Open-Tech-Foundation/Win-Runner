@@ -1,7 +1,7 @@
 //! Package install + process-local staging.
 //!
 //! Package downloads and extracted host-side staging live in a per-process
-//! temporary directory which is removed when WinCLI exits.
+//! temporary directory which is removed when Win-Runner exits.
 //!
 //! ```text
 //! index/<name>.json     resolved metadata (version, exe, archive sha256)
@@ -9,7 +9,7 @@
 //! pkgs/<name>.exe       extracted runnable EXEs
 //! ```
 //!
-//! Sources: a local directory (`$WINCLI_SOURCE` set to a path, holding
+//! Sources: a local directory (`$WINRUN_SOURCE` set to a path, holding
 //! `<name>.json` + `<name>.zip` per package) or, by default, the remote
 //! WinGet catalog (see `winget`). Archives may be stored or deflated zips,
 //! or (remote portable installers) the exe itself.
@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 /// Resolve package staging to a process-local temporary directory. The path
 /// never reuses another run's downloaded programs.
 pub fn cache_dir() -> PathBuf {
-    std::env::temp_dir().join(format!("wincli-session-{}", std::process::id()))
+    std::env::temp_dir().join(format!("winrun-session-{}", std::process::id()))
 }
 
 /// Remove a stale directory if the OS reused a PID from an unclean exit.
@@ -39,10 +39,10 @@ pub enum Source {
     Winget,
 }
 
-/// Resolve the source: `$WINCLI_SOURCE` unset/`winget` → remote catalog,
+/// Resolve the source: `$WINRUN_SOURCE` unset/`winget` → remote catalog,
 /// otherwise a local package directory (must exist).
 pub fn source_from_env() -> Result<Source, String> {
-    match std::env::var("WINCLI_SOURCE") {
+    match std::env::var("WINRUN_SOURCE") {
         Ok(p) if !p.is_empty() && p != "winget" => {
             let dir = PathBuf::from(&p);
             if !dir.is_dir() {
@@ -59,7 +59,7 @@ pub fn source_dir() -> Result<PathBuf, String> {
     match source_from_env()? {
         Source::Local(p) => Ok(p),
         Source::Winget => {
-            Err("no local package source: set WINCLI_SOURCE to a package directory".to_string())
+            Err("no local package source: set WINRUN_SOURCE to a package directory".to_string())
         }
     }
 }
@@ -73,7 +73,7 @@ pub fn fetch_url(url: &str, max_time_secs: u64) -> Result<Vec<u8>, String> {
             "--max-time",
             &max_time_secs.to_string(),
             "-A",
-            "wincli/0.1.0",
+            "winrun/0.1.0",
             url,
         ])
         .output()
@@ -629,7 +629,7 @@ mod tests {
     fn tmpdir(tag: &str) -> PathBuf {
         static C: AtomicU64 = AtomicU64::new(0);
         let p = std::env::temp_dir().join(format!(
-            "wincli-install-test-{}-{}-{tag}",
+            "winrun-install-test-{}-{}-{tag}",
             std::process::id(),
             C.fetch_add(1, Ordering::SeqCst)
         ));

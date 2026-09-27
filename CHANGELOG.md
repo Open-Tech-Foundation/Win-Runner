@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Renamed the Cargo package to `win-runner` and both the Rust library crate
+  and command-line executable to `winrun` (project name: Win-Runner).
+- Kept interactive shell history exclusively in guest
+  `C:\.system\shell-history`; it follows the WinFS instance or snapshot and
+  no longer writes to host state directories.
+- Changed the synthetic guest user and profile name to Win-Runner, and made
+  `GetUserNameW` read the guest process environment instead of the host.
+
 - Released the pending client endpoint after named-pipe connection so closing
   a writer delivers EOF after buffered output. Scoped `CancelIo` to the thread
   that issued the I/O request. Added overlapped named-pipe support to

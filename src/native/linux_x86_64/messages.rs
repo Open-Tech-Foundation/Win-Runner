@@ -15,9 +15,13 @@ pub(super) extern "win64" fn native_format_message_w(
         b'W' as u16,
         b'i' as u16,
         b'n' as u16,
-        b'C' as u16,
-        b'L' as u16,
-        b'I' as u16,
+        b'-' as u16,
+        b'R' as u16,
+        b'u' as u16,
+        b'n' as u16,
+        b'n' as u16,
+        b'e' as u16,
+        b'r' as u16,
         b' ' as u16,
         b'n' as u16,
         b'a' as u16,
@@ -53,7 +57,7 @@ pub(super) extern "win64" fn native_format_message_a(
     output_len: u32,
     _arguments: u64,
 ) -> u32 {
-    const MESSAGE: &[u8] = b"WinCLI native error.\r\n";
+    const MESSAGE: &[u8] = b"Win-Runner native error.\r\n";
     if flags & 0x100 != 0 || output.is_null() || output_len <= MESSAGE.len() as u32 {
         native_set_last_error(122);
         return 0;

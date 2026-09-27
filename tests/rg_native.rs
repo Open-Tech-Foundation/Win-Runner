@@ -1,23 +1,23 @@
-//! Real Windows ripgrep checks. Set WINCLI_RG_EXE to an x64 rg.exe to enable.
+//! Real Windows ripgrep checks. Set WINRUN_RG_EXE to an x64 rg.exe to enable.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 fn rg_path() -> Option<PathBuf> {
-    std::env::var_os("WINCLI_RG_EXE").map(PathBuf::from)
+    std::env::var_os("WINRUN_RG_EXE").map(PathBuf::from)
 }
 
 fn run_shell(rg: &Path, commands: &str) -> Output {
-    let executable = rg.canonicalize().expect("WINCLI_RG_EXE exists");
+    let executable = rg.canonicalize().expect("WINRUN_RG_EXE exists");
     let script = commands.replace("{rg}", &format!("\"{}\"", executable.display()));
-    let mut child = Command::new(env!("CARGO_BIN_EXE_wincli"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_winrun"))
         .arg("shell")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("start native WinCLI shell");
+        .expect("start native Win-Runner shell");
     child
         .stdin
         .take()
@@ -32,7 +32,7 @@ fn windows_ripgrep_runs_version_and_searches_guest_files() {
     let Some(rg) = rg_path() else {
         return;
     };
-    let version = Command::new(env!("CARGO_BIN_EXE_wincli"))
+    let version = Command::new(env!("CARGO_BIN_EXE_winrun"))
         .arg(&rg)
         .arg("--version")
         .output()

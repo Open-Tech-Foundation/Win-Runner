@@ -25,7 +25,16 @@ pub(super) extern "win64" fn native_get_user_name_w(name: *mut u16, size: *mut u
         native_set_last_error(87);
         return 0;
     }
-    let value = std::env::var("USERNAME").unwrap_or_else(|_| "WinCLI".to_string());
+    let value = process_ctx()
+        .and_then(|context| {
+            context.environment.lock().ok().and_then(|environment| {
+                environment
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("USERNAME"))
+                    .map(|(_, value)| value.clone())
+            })
+        })
+        .unwrap_or_else(|| "Win-Runner".to_string());
     let encoded: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
     let capacity = unsafe { size.read() } as usize;
     if capacity < encoded.len() {

@@ -1,4 +1,4 @@
-//! Persistent, named WinCLI instance lifecycle.
+//! Persistent, named Win-Runner instance lifecycle.
 //!
 //! Each daemon owns one loaded snapshot and its writable WinFs overlay. The
 //! initial Linux transport is a mode-0600 Unix-domain socket; higher layers
@@ -17,9 +17,9 @@ use std::path::{Path, PathBuf};
 const SOCKET_SUFFIX: &str = ".sock";
 
 pub fn state_dir() -> PathBuf {
-    std::env::var_os("WINCLI_INSTANCE_DIR")
+    std::env::var_os("WINRUN_INSTANCE_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("wincli-instances"))
+        .unwrap_or_else(|| std::env::temp_dir().join("winrun-instances"))
 }
 
 pub fn validate_name(name: &str) -> Result<(), String> {
@@ -59,7 +59,7 @@ pub fn boot(name: &str, snapshot_path: Option<&str>) -> Result<(), String> {
             )
         })?;
     }
-    let exe = std::env::current_exe().map_err(|e| format!("cannot find wincli executable: {e}"))?;
+    let exe = std::env::current_exe().map_err(|e| format!("cannot find winrun executable: {e}"))?;
     let mut command = std::process::Command::new(exe);
     command
         .arg("__instance-daemon")
@@ -206,7 +206,7 @@ fn request(_: &str, _: &[u8]) -> Result<Vec<u8>, String> {
     Err("named-pipe instance transport is not implemented on this host".to_string())
 }
 
-/// Internal daemon entry point. Called only by `wincli __instance-daemon`.
+/// Internal daemon entry point. Called only by `winrun __instance-daemon`.
 pub fn run_daemon(name: &str, dir: &str, snapshot_path: Option<&str>) -> Result<(), String> {
     #[cfg(not(unix))]
     {

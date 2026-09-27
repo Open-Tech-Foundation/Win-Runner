@@ -1,4 +1,4 @@
-//! Platform execution backends for a platform-neutral WinCLI instance.
+//! Platform execution backends for a platform-neutral Win-Runner instance.
 //!
 //! The instance lifecycle, WinFs snapshots, and control protocol must not
 //! depend on the host OS. Backends are the narrow extension point that turns

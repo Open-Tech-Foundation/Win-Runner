@@ -24,7 +24,7 @@ if [[ ! -x "$LLD" ]]; then
 fi
 
 mkdir -p "$OUT"
-# Import library for exactly the APIs WinCLI implements.
+# Import library for exactly the APIs Win-Runner implements.
 "$LLD" -flavor link \
     "/DEF:$ROOT/guests/kernel32.def" \
     "/OUT:$OUT/kernel32.lib" \

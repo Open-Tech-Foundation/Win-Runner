@@ -1,4 +1,4 @@
-//! Floating-point guest for WinCLI: scalar-double arithmetic and compare.
+//! Floating-point guest for Win-Runner: scalar-double arithmetic and compare.
 //!
 //! Exercises MOVSD/ADDSD/SUBSD/MULSD/DIVSD/CMPLTSD/UCOMISD/ANDPD via real
 //! rustc output (`black_box` defeats constant folding). Prints `FP-OK` +

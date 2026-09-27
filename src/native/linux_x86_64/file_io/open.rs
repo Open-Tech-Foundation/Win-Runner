@@ -518,7 +518,7 @@ pub(in crate::native::linux_x86_64) fn native_submit_pipe_connect(
     native_set_overlapped_status(overlapped, STATUS_PENDING, 0);
     let worker_process = Arc::clone(process);
     let spawn = std::thread::Builder::new()
-        .name("wincli-named-pipe-connect".into())
+        .name("winrun-named-pipe-connect".into())
         .spawn(move || {
             let status = loop {
                 if cancelled.load(Ordering::Acquire) {

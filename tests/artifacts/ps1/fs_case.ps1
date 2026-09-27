@@ -1,5 +1,5 @@
-# WinCLI case-insensitivity test.
-# Run: wincli fs_case.ps1
+# Win-Runner case-insensitivity test.
+# Run: winrun fs_case.ps1
 # Expected stdout:
 #   ci-ok
 #   CaSe.TxT

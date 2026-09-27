@@ -1,6 +1,6 @@
-//! Rust FS self-test guest for WinCLI (`x86_64-pc-windows-msvc`).
+//! Rust FS self-test guest for Win-Runner (`x86_64-pc-windows-msvc`).
 //!
-//! `no_std` + `no_main` + custom entry: exercises every Win32 FS API WinCLI
+//! `no_std` + `no_main` + custom entry: exercises every Win32 FS API Win-Runner
 //! implements, verifies results inside the guest, and reports `PASS` + exit 0
 //! (or `FAIL` + exit 1). Build with `guests/build.sh`.
 //!

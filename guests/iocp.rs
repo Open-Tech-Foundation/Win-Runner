@@ -107,7 +107,7 @@ pub extern "C" fn guest_entry() {
     check(named_again != 0 && named_again != named && unsafe { GetLastError() } == 183);
     check(unsafe { WaitForSingleObject(named_again, 0) } == 258);
     check(unsafe { SetEvent(named) } != 0 && unsafe { WaitForSingleObject(named_again, 0) } == 0);
-    let named_ansi = unsafe { CreateEventA(0, 0, 0, b"wincli-io\0".as_ptr()) };
+    let named_ansi = unsafe { CreateEventA(0, 0, 0, b"winrun-io\0".as_ptr()) };
     check(named_ansi != 0 && unsafe { GetLastError() } == 183);
     check(
         unsafe { WaitForSingleObject(named_ansi, 0) } == 0

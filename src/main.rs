@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
-use wincli::{backend, inspect, install, instance, pe, snapshot, winfs::WinFs};
+use winrun::{backend, inspect, install, instance, pe, snapshot, winfs::WinFs};
 
 fn exit(code: i32) -> ! {
     install::cleanup_process_cache();
@@ -10,22 +10,22 @@ fn exit(code: i32) -> ! {
 
 fn usage() -> ! {
     eprintln!("usage:");
-    eprintln!("  wincli <app.exe> [args...]      run a Windows program from a host path");
-    eprintln!("  wincli <script.ps1>             run a script (no args yet)");
-    eprintln!("  wincli shell                    interactive ephemeral runner shell");
-    eprintln!("  wincli runner                   run host-controlled job commands from stdin");
-    eprintln!("  wincli --headless --control=127.0.0.1:0 shell  run a remotely controlled shell");
-    eprintln!("  wincli --snapshot=os.disk shell|runner  boot an indexed C: disk image");
-    eprintln!("  wincli --save-snapshot=disk.winfs shell|runner|app.exe  persist C: on exit");
-    eprintln!("  wincli --snapshot=os.disk <app.exe> [args...]  run headless with streamed stdio");
-    eprintln!("  wincli --mount=Z:/host/folder shell  mount a writable host folder");
-    eprintln!("  wincli --mount-ro=Z:/host/folder shell  mount a read-only host folder");
-    eprintln!("  wincli snapshot build <dir> <os.winfs>  build image from <dir>/C");
-    eprintln!("  wincli instance boot <name> [--snapshot=os.snap]");
-    eprintln!("  wincli instance status|destroy <name>");
-    eprintln!("  wincli instance exec <name> -- <command> [args...]");
-    eprintln!("  wincli inspect <app.exe>      report PE imports vs supported APIs");
-    eprintln!("env: WINCLI_SOURCE (local package dir)");
+    eprintln!("  winrun <app.exe> [args...]      run a Windows program from a host path");
+    eprintln!("  winrun <script.ps1>             run a script (no args yet)");
+    eprintln!("  winrun shell                    interactive ephemeral runner shell");
+    eprintln!("  winrun runner                   run host-controlled job commands from stdin");
+    eprintln!("  winrun --headless --control=127.0.0.1:0 shell  run a remotely controlled shell");
+    eprintln!("  winrun --snapshot=os.disk shell|runner  boot an indexed C: disk image");
+    eprintln!("  winrun --save-snapshot=disk.winfs shell|runner|app.exe  persist C: on exit");
+    eprintln!("  winrun --snapshot=os.disk <app.exe> [args...]  run headless with streamed stdio");
+    eprintln!("  winrun --mount=Z:/host/folder shell  mount a writable host folder");
+    eprintln!("  winrun --mount-ro=Z:/host/folder shell  mount a read-only host folder");
+    eprintln!("  winrun snapshot build <dir> <os.winfs>  build image from <dir>/C");
+    eprintln!("  winrun instance boot <name> [--snapshot=os.snap]");
+    eprintln!("  winrun instance status|destroy <name>");
+    eprintln!("  winrun instance exec <name> -- <command> [args...]");
+    eprintln!("  winrun inspect <app.exe>      report PE imports vs supported APIs");
+    eprintln!("env: WINRUN_SOURCE (local package dir)");
     exit(2);
 }
 
@@ -39,9 +39,9 @@ struct RuntimeOptions {
     headless: bool,
 }
 
-/// Consume WinCLI options only before the command target. Everything from the
+/// Consume Win-Runner options only before the command target. Everything from the
 /// target onward belongs to the guest program, even when it resembles a
-/// WinCLI option.
+/// Win-Runner option.
 fn parse_runtime_options(argv: &[String]) -> (RuntimeOptions, Vec<String>) {
     let mut options = RuntimeOptions::default();
     let mut args = argv.first().cloned().into_iter().collect::<Vec<_>>();
@@ -82,21 +82,21 @@ fn parse_runtime_options(argv: &[String]) -> (RuntimeOptions, Vec<String>) {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() == 3 && args[1] == "__native-worker" {
-        match wincli::native::execute_worker_request(Path::new(&args[2])) {
+        match winrun::native::execute_worker_request(Path::new(&args[2])) {
             Ok(code) => std::process::exit(code as i32),
             Err(error) => {
-                eprintln!("wincli: native worker failed: {error}");
+                eprintln!("winrun: native worker failed: {error}");
                 std::process::exit(127);
             }
         }
     }
     if let Ok(executable) = std::env::current_exe() {
-        std::env::set_var("WINCLI_NATIVE_WORKER_EXE", executable);
+        std::env::set_var("WINRUN_NATIVE_WORKER_EXE", executable);
     }
     if (args.len() == 4 || args.len() == 5) && args[1] == "__instance-daemon" {
         let snapshot = args.get(4).map(String::as_str);
         if let Err(e) = instance::run_daemon(&args[2], &args[3], snapshot) {
-            eprintln!("wincli: instance daemon failed: {e}");
+            eprintln!("winrun: instance daemon failed: {e}");
             exit(1);
         }
         return;
@@ -111,7 +111,7 @@ fn main() {
     let headless = options.headless;
     if let Some(bind) = control_bind.as_deref() {
         if !headless || args.len() != 2 || args[1] != "shell" {
-            eprintln!("wincli: --control requires --headless and the shell target");
+            eprintln!("winrun: --control requires --headless and the shell target");
             exit(2);
         }
         let mut fs = match snapshot_path.as_deref() {
@@ -120,10 +120,10 @@ fn main() {
         };
         fs = mount_host_dirs(fs, &mount_specs, &read_only_mount_specs);
         let active_snapshot = save_snapshot_path.as_deref().or(snapshot_path.as_deref());
-        let control = match wincli::control::ControlHandle::start(bind) {
+        let control = match winrun::control::ControlHandle::start(bind) {
             Ok(control) => control,
             Err(error) => {
-                eprintln!("wincli: cannot start control session: {error}");
+                eprintln!("winrun: cannot start control session: {error}");
                 exit(1);
             }
         };
@@ -133,13 +133,13 @@ fn main() {
         );
         let _ = std::io::stdout().flush();
         let (code, mut fs) =
-            wincli::shell::run_controlled_shell_with_snapshot(fs, active_snapshot, &control);
+            winrun::shell::run_controlled_shell_with_snapshot(fs, active_snapshot, &control);
         save_snapshot_if_requested(save_snapshot_path.as_deref(), &mut fs);
         control.finish(code);
         exit(code);
     }
     if headless {
-        eprintln!("wincli: --headless requires --control=<loopback-address> shell");
+        eprintln!("winrun: --headless requires --control=<loopback-address> shell");
         exit(2);
     }
     if args.len() == 3 && args[1] == "inspect" {
@@ -149,7 +149,7 @@ fn main() {
         match snapshot::build_file(&args[3], &args[4]) {
             Ok(count) => println!("Built snapshot {} ({} files)", args[4], count),
             Err(e) => {
-                eprintln!("wincli: cannot build snapshot: {e}");
+                eprintln!("winrun: cannot build snapshot: {e}");
                 exit(1);
             }
         }
@@ -167,7 +167,7 @@ fn main() {
                 match instance::boot(&args[3], snapshot) {
                     Ok(()) => println!("Instance {} is running", args[3]),
                     Err(e) => {
-                        eprintln!("wincli: cannot boot instance: {e}");
+                        eprintln!("winrun: cannot boot instance: {e}");
                         exit(1);
                     }
                 }
@@ -176,14 +176,14 @@ fn main() {
             "status" if args.len() == 4 => match instance::status(&args[3]) {
                 Ok(()) => println!("Instance {} is running", args[3]),
                 Err(e) => {
-                    eprintln!("wincli: {e}");
+                    eprintln!("winrun: {e}");
                     exit(1);
                 }
             },
             "destroy" if args.len() == 4 => match instance::destroy(&args[3]) {
                 Ok(()) => println!("Instance {} destroyed", args[3]),
                 Err(e) => {
-                    eprintln!("wincli: {e}");
+                    eprintln!("winrun: {e}");
                     exit(1);
                 }
             },
@@ -191,7 +191,7 @@ fn main() {
                 let command = match shell_command(&args[5..]) {
                     Ok(value) => value,
                     Err(e) => {
-                        eprintln!("wincli: {e}");
+                        eprintln!("winrun: {e}");
                         exit(2);
                     }
                 };
@@ -201,7 +201,7 @@ fn main() {
                         exit(result.code);
                     }
                     Err(e) => {
-                        eprintln!("wincli: instance execution failed: {e}");
+                        eprintln!("winrun: instance execution failed: {e}");
                         exit(1);
                     }
                 }
@@ -217,7 +217,7 @@ fn main() {
         };
         let fs = mount_host_dirs(fs, &mount_specs, &read_only_mount_specs);
         let active_snapshot = save_snapshot_path.as_deref().or(snapshot_path.as_deref());
-        let (code, mut fs) = wincli::shell::run_shell_with_snapshot(fs, active_snapshot);
+        let (code, mut fs) = winrun::shell::run_shell_with_snapshot(fs, active_snapshot);
         save_snapshot_if_requested(save_snapshot_path.as_deref(), &mut fs);
         exit(code);
     }
@@ -228,7 +228,7 @@ fn main() {
         };
         let fs = mount_host_dirs(fs, &mount_specs, &read_only_mount_specs);
         let active_snapshot = save_snapshot_path.as_deref().or(snapshot_path.as_deref());
-        let (code, mut fs) = wincli::shell::run_runner_with_snapshot(fs, active_snapshot);
+        let (code, mut fs) = winrun::shell::run_runner_with_snapshot(fs, active_snapshot);
         save_snapshot_if_requested(save_snapshot_path.as_deref(), &mut fs);
         exit(code);
     }
@@ -242,7 +242,7 @@ fn main() {
             None => WinFs::ephemeral_runner(),
         };
         let fs = mount_host_dirs(fs, &mount_specs, &read_only_mount_specs);
-        let (code, mut fs) = wincli::shell::run_headless_program(fs, &args[1], &args[2..]);
+        let (code, mut fs) = winrun::shell::run_headless_program(fs, &args[1], &args[2..]);
         save_snapshot_if_requested(save_snapshot_path.as_deref(), &mut fs);
         exit(code);
     }
@@ -251,7 +251,7 @@ fn main() {
         || !mount_specs.is_empty()
         || !read_only_mount_specs.is_empty()
     {
-        eprintln!("wincli: --snapshot/--save-snapshot/--mount require shell, runner, or an executable target");
+        eprintln!("winrun: --snapshot/--save-snapshot/--mount require shell, runner, or an executable target");
         exit(2);
     }
     if args.len() < 2 {
@@ -280,7 +280,7 @@ fn load_snapshot(path: &str) -> WinFs {
     match snapshot::load_file(path) {
         Ok(fs) => fs,
         Err(e) => {
-            eprintln!("wincli: cannot boot snapshot {path}: {e}");
+            eprintln!("winrun: cannot boot snapshot {path}: {e}");
             exit(1);
         }
     }
@@ -293,16 +293,16 @@ fn mount_host_dirs(mut fs: WinFs, writable: &[String], read_only: &[String]) -> 
         .chain(read_only.iter().map(|value| (value, true)))
     {
         let Some((drive, path)) = spec.split_once(':') else {
-            eprintln!("wincli: invalid mount {spec:?}; use --mount=Z:/host/folder");
+            eprintln!("winrun: invalid mount {spec:?}; use --mount=Z:/host/folder");
             exit(2);
         };
         let mut chars = drive.chars();
         let Some(drive) = chars.next().filter(|_| chars.next().is_none()) else {
-            eprintln!("wincli: invalid mount drive in {spec:?}");
+            eprintln!("winrun: invalid mount drive in {spec:?}");
             exit(2);
         };
         if let Err(error) = fs.mount_host_dir(drive, std::path::Path::new(path), ro) {
-            eprintln!("wincli: cannot mount {spec:?}: {error}");
+            eprintln!("winrun: cannot mount {spec:?}: {error}");
             exit(2);
         }
     }
@@ -313,10 +313,10 @@ fn mount_host_dirs(mut fs: WinFs, writable: &[String], read_only: &[String]) -> 
 fn save_snapshot_if_requested(path: Option<&str>, fs: &mut WinFs) {
     if let Some(path) = path {
         if let Err(e) = snapshot::save_file(fs, path) {
-            eprintln!("wincli: cannot save snapshot {path}: {e}");
+            eprintln!("winrun: cannot save snapshot {path}: {e}");
             exit(1);
         }
-        eprintln!("wincli: saved C: disk snapshot {path}");
+        eprintln!("winrun: saved C: disk snapshot {path}");
     }
 }
 
@@ -331,7 +331,7 @@ mod tests {
     #[test]
     fn runtime_options_stop_at_guest_program() {
         let input = argv(&[
-            "wincli",
+            "winrun",
             "--snapshot=disk.winfs",
             "--mount=Z:/host",
             "C:\\bin\\tool.exe",
@@ -347,7 +347,7 @@ mod tests {
         assert_eq!(
             args,
             argv(&[
-                "wincli",
+                "winrun",
                 "C:\\bin\\tool.exe",
                 "--mount=guest-value",
                 "--snapshot=guest-value",
@@ -360,7 +360,7 @@ mod tests {
     #[test]
     fn runtime_option_separator_passes_remaining_arguments_through() {
         let input = argv(&[
-            "wincli",
+            "winrun",
             "--snapshot=disk.winfs",
             "--",
             "C:\\bin\\tool.exe",
@@ -370,7 +370,7 @@ mod tests {
         assert_eq!(options.snapshot_path.as_deref(), Some("disk.winfs"));
         assert_eq!(
             args,
-            argv(&["wincli", "C:\\bin\\tool.exe", "--mount=guest-value"])
+            argv(&["winrun", "C:\\bin\\tool.exe", "--mount=guest-value"])
         );
     }
 }
@@ -388,19 +388,19 @@ fn run_target(target: &str, guest_args: &[String]) {
             "exe" => run_exe_file(target, target, guest_args),
             "ps1" => {
                 if !guest_args.is_empty() {
-                    eprintln!("wincli: script args not supported yet");
+                    eprintln!("winrun: script args not supported yet");
                     exit(2);
                 }
                 run_ps1_file(target);
             }
             _ => {
-                eprintln!("wincli: unsupported file type (expected .exe or .ps1): {target}");
+                eprintln!("winrun: unsupported file type (expected .exe or .ps1): {target}");
                 exit(2);
             }
         }
         return;
     }
-    eprintln!("wincli: nothing to run: {target} (no such host file; install packages inside `wincli shell`)");
+    eprintln!("winrun: nothing to run: {target} (no such host file; install packages inside `winrun shell`)");
     exit(1);
 }
 
@@ -411,13 +411,13 @@ fn run_exe_file(path: &str, prog: &str, guest_args: &[String]) {
     let data = match std::fs::read(path) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("wincli: cannot read {path}: {e}");
+            eprintln!("winrun: cannot read {path}: {e}");
             exit(1);
         }
     };
-    if std::env::var_os("WINCLI_TIMINGS").is_some() {
+    if std::env::var_os("WINRUN_TIMINGS").is_some() {
         eprintln!(
-            "wincli timing: {prog}: host_read={:.3}ms",
+            "winrun timing: {prog}: host_read={:.3}ms",
             read_started.elapsed().as_secs_f64() * 1000.0
         );
     }
@@ -425,13 +425,13 @@ fn run_exe_file(path: &str, prog: &str, guest_args: &[String]) {
     let img = match pe::load_lenient(&data) {
         Ok(img) => img,
         Err(e) => {
-            eprintln!("wincli: failed to load {path}: {e}");
+            eprintln!("winrun: failed to load {path}: {e}");
             exit(1);
         }
     };
-    if std::env::var_os("WINCLI_TIMINGS").is_some() {
+    if std::env::var_os("WINRUN_TIMINGS").is_some() {
         eprintln!(
-            "wincli timing: {prog}: pe_load={:.3}ms",
+            "winrun timing: {prog}: pe_load={:.3}ms",
             pe_load_started.elapsed().as_secs_f64() * 1000.0
         );
     }
@@ -443,7 +443,7 @@ fn run_with_runner(img: &pe::PeImage, path: &str, prog: &str, guest_args: &[Stri
     let backend = match backend::configured() {
         Ok(value) => value,
         Err(e) => {
-            eprintln!("wincli: failed to select execution backend for {path}: {e}");
+            eprintln!("winrun: failed to select execution backend for {path}: {e}");
             exit(1);
         }
     };
@@ -465,7 +465,7 @@ fn run_with_runner(img: &pe::PeImage, path: &str, prog: &str, guest_args: &[Stri
         }
         Err(e) => {
             eprintln!(
-                "wincli: {} execution failed for {path}: {}",
+                "winrun: {} execution failed for {path}: {}",
                 backend.id(),
                 e.message
             );
@@ -478,32 +478,32 @@ fn run_ps1_file(path: &str) {
     let script = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("wincli: cannot read {path}: {e}");
+            eprintln!("winrun: cannot read {path}: {e}");
             exit(1);
         }
     };
     let mut fs = WinFs::new();
     let mut out = Vec::new();
-    match wincli::ps1::run_ps1(&mut fs, &script, &mut out) {
+    match winrun::ps1::run_ps1(&mut fs, &script, &mut out) {
         Ok(_) => {
             let _ = std::io::stdout().write_all(&out);
         }
         Err(e) => {
             // Flush partial output first (a real shell streams).
             let _ = std::io::stdout().write_all(&out);
-            eprintln!("wincli: script error: {e}");
+            eprintln!("winrun: script error: {e}");
             exit(1);
         }
     }
 }
 
-/// `wincli inspect <app.exe>`: print the compatibility report for a host file.
+/// `winrun inspect <app.exe>`: print the compatibility report for a host file.
 /// Exit 0 = runnable, 1 = missing imports or invalid file.
 fn inspect_target(target: &str) {
     let data = match read_inspect_target(target) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("wincli: {e}");
+            eprintln!("winrun: {e}");
             exit(1);
         }
     };
@@ -513,7 +513,7 @@ fn inspect_target(target: &str) {
             exit(if report.runnable() { 0 } else { 1 });
         }
         Err(e) => {
-            eprintln!("wincli: cannot inspect {target}: {e}");
+            eprintln!("winrun: cannot inspect {target}: {e}");
             exit(1);
         }
     }

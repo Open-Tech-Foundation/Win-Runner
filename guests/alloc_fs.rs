@@ -1,4 +1,4 @@
-//! Alloc + WinFS guest for WinCLI: formatted file write/read roundtrip.
+//! Alloc + WinFS guest for Win-Runner: formatted file write/read roundtrip.
 //!
 //! Builds file content with `format!` (width, precision, padding, floats),
 //! writes it via CreateFileW/WriteFile, reads it back, and verifies exact

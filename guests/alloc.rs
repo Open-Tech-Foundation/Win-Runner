@@ -1,4 +1,4 @@
-//! Allocator guest for WinCLI: `Vec`/`String`/`format!` on a HeapAlloc heap.
+//! Allocator guest for Win-Runner: `Vec`/`String`/`format!` on a HeapAlloc heap.
 //!
 //! `include!("support.rs")` provides the allocator, OOM gates and C
 //! intrinsics; this file adds the `A<n>` phases. Final `PASS` + exit 0.

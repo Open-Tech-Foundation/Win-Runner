@@ -1,4 +1,4 @@
-//! Versioned, transport-neutral framing for WinCLI instance control.
+//! Versioned, transport-neutral framing for Win-Runner instance control.
 //!
 //! Unix sockets, Windows named pipes, and a future remote worker transport
 //! carry these same frames. The frame is intentionally small and supports

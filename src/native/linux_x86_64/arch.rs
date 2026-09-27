@@ -2,9 +2,9 @@
 
 std::arch::global_asm!(
     ".text",
-    ".global wincli_native_rtl_capture_context",
-    ".type wincli_native_rtl_capture_context,@function",
-    "wincli_native_rtl_capture_context:",
+    ".global winrun_native_rtl_capture_context",
+    ".type winrun_native_rtl_capture_context,@function",
+    "winrun_native_rtl_capture_context:",
     "mov [rcx + 208], r11",
     "mov r11, rcx",
     "mov qword ptr [r11 + 0], 0",
@@ -61,8 +61,8 @@ std::arch::global_asm!(
     "rep stosq",
     "mov rdi, [r11 + 176]",
     "ret",
-    ".size wincli_native_rtl_capture_context, .-wincli_native_rtl_capture_context",
+    ".size winrun_native_rtl_capture_context, .-winrun_native_rtl_capture_context",
 );
 unsafe extern "win64" {
-    pub(super) fn wincli_native_rtl_capture_context(context: *mut u8);
+    pub(super) fn winrun_native_rtl_capture_context(context: *mut u8);
 }

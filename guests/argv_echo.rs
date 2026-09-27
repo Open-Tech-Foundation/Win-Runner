@@ -1,4 +1,4 @@
-//! argv echo guest for WinCLI: prints `GetCommandLineW()` as UTF-8.
+//! argv echo guest for Win-Runner: prints `GetCommandLineW()` as UTF-8.
 //!
 //! Proves guest argv plumbing with a real rustc binary. ASCII passes
 //! through; other units become `?`. Build with `guests/build.sh`.

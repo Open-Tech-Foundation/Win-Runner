@@ -3,14 +3,14 @@
 //! package fixtures in `tests/artifacts/packages/` for shell installation.
 //!
 //! Each `.exe` is a genuine PE32+ x86_64 binary using only the Win32 API
-//! surface WinCLI implements. The `fs_*.exe` guests are self-verifying:
+//! surface Win-Runner implements. The `fs_*.exe` guests are self-verifying:
 //! they print `PASS` + exit 0 on success, `FAIL` + exit 1 on failure, so
-//! `wincli <artifact>` is a fully observable black box (fresh WinFS per run).
+//! `winrun <artifact>` is a fully observable black box (fresh WinFS per run).
 //!
 //! Regenerate with: `cargo run --example gen_artifacts`
 
 use std::path::PathBuf;
-use wincli::pe::builder;
+use winrun::pe::builder;
 
 fn out_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/artifacts/exe")

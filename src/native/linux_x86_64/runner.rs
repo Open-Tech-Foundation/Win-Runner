@@ -109,7 +109,7 @@ fn run_exec_worker(
     let total_started = std::time::Instant::now();
     let failed = |message: String, fs: WinFs| super::super::NativeExecutionFailure { message, fs };
     let id = NEXT_WORKER_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-    let directory = std::env::temp_dir().join(format!("wincli-worker-{}-{id}", std::process::id()));
+    let directory = std::env::temp_dir().join(format!("winrun-worker-{}-{id}", std::process::id()));
     if let Err(error) = std::fs::create_dir(&directory) {
         return Err(failed(
             format!("cannot create native worker directory: {error}"),
@@ -164,7 +164,7 @@ fn run_exec_worker(
     let mut child = match Command::new(executable)
         .arg("__native-worker")
         .arg(&request_path)
-        .env_remove("WINCLI_NATIVE_WORKER")
+        .env_remove("WINRUN_NATIVE_WORKER")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -263,12 +263,12 @@ fn run_exec_worker(
             ))
         }
     }
-    if std::env::var_os("WINCLI_TIMINGS").is_some() {
+    if std::env::var_os("WINRUN_TIMINGS").is_some() {
         let state_bytes = std::fs::metadata(&state_path)
             .map(|metadata| metadata.len())
             .unwrap_or(0);
         eprintln!(
-            "wincli timing: {program}: worker_start={worker_start_ms:.3}ms guest_until_output_eof={guest_ms:.3}ms state_apply={:.3}ms state_bytes={state_bytes} total={:.3}ms",
+            "winrun timing: {program}: worker_start={worker_start_ms:.3}ms guest_until_output_eof={guest_ms:.3}ms state_apply={:.3}ms state_bytes={state_bytes} total={:.3}ms",
             state_started.elapsed().as_secs_f64() * 1000.0,
             total_started.elapsed().as_secs_f64() * 1000.0
         );
@@ -400,8 +400,8 @@ fn run_rust_baseline_argv_with_fs_impl(
     environment: &[(String, String)],
     output: Option<&dyn Fn(bool, &[u8])>,
 ) -> Result<(u32, Vec<u8>, WinFs), super::super::NativeExecutionFailure> {
-    if std::env::var_os("WINCLI_NATIVE_WORKER").as_deref() != Some(std::ffi::OsStr::new("1")) {
-        if let Some(executable) = std::env::var_os("WINCLI_NATIVE_WORKER_EXE") {
+    if std::env::var_os("WINRUN_NATIVE_WORKER").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        if let Some(executable) = std::env::var_os("WINRUN_NATIVE_WORKER_EXE") {
             return run_exec_worker(
                 executable.into(),
                 img,
@@ -420,7 +420,7 @@ fn run_rust_baseline_argv_with_fs_impl(
         // Initialize this cache before any guest fork; shims read it in
         // potentially multithreaded children.
         let _ = native_diagnostic_enabled();
-        let timing = std::env::var_os("WINCLI_TIMINGS").is_some();
+        let timing = std::env::var_os("WINRUN_TIMINGS").is_some();
         let lock_started = std::time::Instant::now();
         let _run = NATIVE_RUN_LOCK
             .lock()
@@ -433,7 +433,7 @@ fn run_rust_baseline_argv_with_fs_impl(
         let mapping = map(img)?;
         let map_ms = map_started.elapsed().as_secs_f64() * 1000.0;
         let import_started = std::time::Instant::now();
-        let strict_imports = std::env::var("WINCLI_NATIVE_STRICT_IMPORTS").as_deref() == Ok("1");
+        let strict_imports = std::env::var("WINRUN_NATIVE_STRICT_IMPORTS").as_deref() == Ok("1");
         let _import_stubs = registry::patch_baseline_imports(&mapping, img, strict_imports)?;
         let import_ms = import_started.elapsed().as_secs_f64() * 1000.0;
         let tls_started = std::time::Instant::now();
@@ -461,12 +461,12 @@ fn run_rust_baseline_argv_with_fs_impl(
         let process = Arc::new(NativeProcessContext {
             image_base: img.image_base,
             module_path: prog.to_string(),
-            process_id: std::env::var("WINCLI_NATIVE_PROCESS_ID")
+            process_id: std::env::var("WINRUN_NATIVE_PROCESS_ID")
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(1),
             process_handle: u64::MAX,
-            parent_process_id: std::env::var("WINCLI_NATIVE_PARENT_PROCESS_ID")
+            parent_process_id: std::env::var("WINRUN_NATIVE_PARENT_PROCESS_ID")
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0),
@@ -527,13 +527,13 @@ fn run_rust_baseline_argv_with_fs_impl(
             *context = Some(Arc::clone(&process));
         }
         let context_ms = context_started.elapsed().as_secs_f64() * 1000.0;
-        if std::env::var_os("WINCLI_NATIVE_WORKER").as_deref() == Some(std::ffi::OsStr::new("1")) {
-            let state_fd = std::env::var("WINCLI_NATIVE_STATE_FD")
+        if std::env::var_os("WINRUN_NATIVE_WORKER").as_deref() == Some(std::ffi::OsStr::new("1")) {
+            let state_fd = std::env::var("WINRUN_NATIVE_STATE_FD")
                 .ok()
                 .and_then(|value| value.parse::<u32>().ok())
                 .ok_or("native worker has no state journal descriptor")?;
             process.state_fd.store(state_fd, Ordering::Release);
-            if let Ok(request_path) = std::env::var("WINCLI_NATIVE_REQUEST_PATH") {
+            if let Ok(request_path) = std::env::var("WINRUN_NATIVE_REQUEST_PATH") {
                 super::process::restore_worker_native_fs(
                     &process,
                     std::path::Path::new(&request_path),
@@ -542,7 +542,7 @@ fn run_rust_baseline_argv_with_fs_impl(
             protect_exec(&mapping)?;
             let guest_process = Arc::clone(&process);
             let code = std::thread::Builder::new()
-                .name("wincli-native-guest".to_string())
+                .name("winrun-native-guest".to_string())
                 .stack_size(16 * 1024 * 1024)
                 .spawn(move || {
                     THREAD_NATIVE_PROCESS.with(|active| {
@@ -828,7 +828,7 @@ fn run_rust_baseline_argv_with_fs_impl(
                 .map(|milliseconds| format!("{milliseconds:.3}ms"))
                 .unwrap_or_else(|| "none".to_string());
             eprintln!(
-            "wincli timing: {prog}: lock={lock_wait_ms:.3}ms entry={entry_ms:.3}ms map={map_ms:.3}ms imports={import_ms:.3}ms tls={tls_ms:.3}ms context={context_ms:.3}ms fork={fork_ms:.3}ms first_output={first_output} guest_until_output_eof={guest_ms:.3}ms state_transfer={state_transfer_ms:.3}ms state_decode={state_decode_ms:.3}ms stdout_bytes={} state_bytes={} total={:.3}ms",
+            "winrun timing: {prog}: lock={lock_wait_ms:.3}ms entry={entry_ms:.3}ms map={map_ms:.3}ms imports={import_ms:.3}ms tls={tls_ms:.3}ms context={context_ms:.3}ms fork={fork_ms:.3}ms first_output={first_output} guest_until_output_eof={guest_ms:.3}ms state_transfer={state_transfer_ms:.3}ms state_decode={state_decode_ms:.3}ms stdout_bytes={} state_bytes={} total={:.3}ms",
             out.len(),
             state.len(),
             total_started.elapsed().as_secs_f64() * 1000.0

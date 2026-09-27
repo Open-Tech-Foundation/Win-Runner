@@ -4,7 +4,7 @@ use std::sync::atomic::AtomicI32;
 use std::sync::{LazyLock, Mutex};
 
 pub(super) static NATIVE_DIAGNOSTIC_ENABLED: LazyLock<bool> = LazyLock::new(|| {
-    std::env::var_os("WINCLI_NATIVE_DIAGNOSTIC").is_some_and(|value| value == "1")
+    std::env::var_os("WINRUN_NATIVE_DIAGNOSTIC").is_some_and(|value| value == "1")
 });
 
 #[inline]

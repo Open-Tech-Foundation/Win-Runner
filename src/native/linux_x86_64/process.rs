@@ -147,7 +147,7 @@ pub(super) fn execute_powershell_shell_link(
     let _ = fs.set_cwd(&cwd);
     match result {
         Ok(code) => (code as u32, stdout, Vec::new()),
-        Err(error) => (1, stdout, format!("wincli: {error}\n").into_bytes()),
+        Err(error) => (1, stdout, format!("winrun: {error}\n").into_bytes()),
     }
 }
 
@@ -283,7 +283,7 @@ pub(super) fn native_create_powershell_shell_child(
     let worker_parent = Arc::clone(&parent);
     let worker_child = Arc::clone(&child);
     if std::thread::Builder::new()
-        .name("wincli-powershell-shell-link".to_string())
+        .name("winrun-powershell-shell-link".to_string())
         .spawn(move || {
             let _ = powershell_fs.set_cwd(&launch.current_directory);
             let (code, stdout, stderr) = execute_powershell_shell_link(&mut powershell_fs, &args);
@@ -732,7 +732,7 @@ pub(super) fn finish_native_child(
                     let _ = native_fs.fs.set_cwd(&parent_cwd);
                 }
                 Err(error) => {
-                    eprintln!("wincli: cannot apply child filesystem changes: {error}")
+                    eprintln!("winrun: cannot apply child filesystem changes: {error}")
                 }
             }
         }
@@ -1089,7 +1089,7 @@ fn restore_worker_pipe_handles(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let fds = std::env::var("WINCLI_NATIVE_PIPE_FDS")
+    let fds = std::env::var("WINRUN_NATIVE_PIPE_FDS")
         .map_err(|_| "worker did not receive inherited pipe descriptors".to_string())?
         .split(',')
         .map(|value| value.parse::<i32>().map_err(|error| error.to_string()))
@@ -1386,7 +1386,7 @@ fn create_exec_worker_child(
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
 
-    let executable = std::env::var_os("WINCLI_NATIVE_WORKER_EXE").ok_or(120u32)?;
+    let executable = std::env::var_os("WINRUN_NATIVE_WORKER_EXE").ok_or(120u32)?;
     let pipes = parent.named_pipes.lock().map_err(|_| 6u32)?;
     let stdio = child_std_handles
         .map(|handle| worker_stdio_for_handle(handle, &pipes))
@@ -1416,7 +1416,7 @@ fn create_exec_worker_child(
 
     let id = NEXT_EXEC_CHILD_DIRECTORY.fetch_add(1, Ordering::Relaxed);
     let directory =
-        std::env::temp_dir().join(format!("wincli-child-worker-{}-{id}", std::process::id()));
+        std::env::temp_dir().join(format!("winrun-child-worker-{}-{id}", std::process::id()));
     std::fs::create_dir(&directory).map_err(|_| 8u32)?;
     let _ = std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700));
     let directory_guard = ChildWorkerDirectory(directory.clone());
@@ -1490,7 +1490,7 @@ fn create_exec_worker_child(
     command
         .arg("__native-worker")
         .arg(&request_path)
-        .env_remove("WINCLI_NATIVE_WORKER")
+        .env_remove("WINRUN_NATIVE_WORKER")
         .stdin(stdio.next().ok_or(8u32)?)
         .stdout(stdio.next().ok_or(8u32)?)
         .stderr(stdio.next().ok_or(8u32)?);
@@ -1533,7 +1533,7 @@ fn create_exec_worker_child(
     let monitor_fs = Arc::clone(&parent.fs);
     let state_path_for_monitor = state_path.clone();
     std::thread::Builder::new()
-        .name("wincli-native-worker-child".to_string())
+        .name("winrun-native-worker-child".to_string())
         .spawn(move || {
             let status = worker.wait();
             if let Ok(encoded) = std::fs::read(&state_path_for_monitor) {
@@ -1543,7 +1543,7 @@ fn create_exec_worker_child(
                         if let Err(error) =
                             crate::snapshot::apply_changes(&encoded, &mut native_fs.fs)
                         {
-                            eprintln!("wincli: cannot apply child filesystem changes: {error}");
+                            eprintln!("winrun: cannot apply child filesystem changes: {error}");
                         }
                         let _ = native_fs.fs.set_cwd(&cwd);
                     }
@@ -1568,7 +1568,7 @@ fn create_exec_worker_child(
 }
 
 pub(super) extern "win64" fn native_exit_process(code: u32) -> ! {
-    if std::env::var_os("WINCLI_NATIVE_WORKER").as_deref() == Some(std::ffi::OsStr::new("1")) {
+    if std::env::var_os("WINRUN_NATIVE_WORKER").as_deref() == Some(std::ffi::OsStr::new("1")) {
         if process_ctx().is_some_and(|process| process.parent_process_id == 0) {
             let fd = NATIVE_WORKER_RESULT_FD.load(Ordering::Acquire);
             if fd >= 0 {
@@ -1693,7 +1693,7 @@ pub(super) extern "win64" fn native_create_process_w(
             .map(|environment| environment.clone())
             .unwrap_or_default()
     });
-    if std::env::var_os("WINCLI_NATIVE_WORKER_EXE").is_some() {
+    if std::env::var_os("WINRUN_NATIVE_WORKER_EXE").is_some() {
         let child_fs = match context.lock() {
             Ok(parent_fs) => match parent_fs.clone_for_child(&launch.current_directory) {
                 Ok(child_fs) => child_fs,
@@ -1892,7 +1892,7 @@ pub(super) extern "win64" fn native_create_process_w(
     let monitor_child = Arc::clone(&child);
     let monitor_fs = Arc::clone(&context);
     if std::thread::Builder::new()
-        .name("wincli-native-child".to_string())
+        .name("winrun-native-child".to_string())
         .spawn(move || finish_native_child(monitor_child, monitor_fs, state_fds[0], pid))
         .is_err()
     {
@@ -1929,7 +1929,7 @@ pub(super) fn native_flush_instance_state() {
         return;
     };
     let encoded =
-        if std::env::var_os("WINCLI_NATIVE_WORKER").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        if std::env::var_os("WINRUN_NATIVE_WORKER").as_deref() == Some(std::ffi::OsStr::new("1")) {
             crate::snapshot::encode_portable_changes(&ctx.fs)
         } else {
             crate::snapshot::encode_changes(&ctx.fs)
@@ -1976,7 +1976,7 @@ pub(super) extern "win64" fn native_get_module_file_name_w(
     }
     let module_path = process_ctx()
         .map(|process| process.module_path.clone())
-        .unwrap_or_else(|| r"C:\wincli\wincli.exe".to_string());
+        .unwrap_or_else(|| r"C:\winrun\winrun.exe".to_string());
     let encoded: Vec<u16> = module_path.encode_utf16().collect();
     let capacity = output_len as usize;
     let copied = encoded.len().min(capacity);

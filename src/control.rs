@@ -1,4 +1,4 @@
-//! Headless, cross-language control for a persistent WinCLI shell.
+//! Headless, cross-language control for a persistent Win-Runner shell.
 //!
 //! The public transport is a localhost WebSocket carrying JSON messages. A
 //! private Unix stream connects controller input to the shell and native
@@ -35,7 +35,7 @@ pub fn terminal_size() -> (usize, usize) {
         return (80, 25);
     }
     // SAFETY: this mapping is created before guest processes fork and remains
-    // mapped until the WinCLI process exits.
+    // mapped until the Win-Runner process exits.
     let shared = unsafe { &*shared };
     (
         shared.columns.load(Ordering::Relaxed).max(1),
@@ -62,7 +62,7 @@ impl ControlHandle {
             .parse()
             .map_err(|error| format!("invalid control address {bind}: {error}"))?;
         if !address.ip().is_loopback() {
-            return Err("WinCLI control listener must bind to a loopback address".to_string());
+            return Err("Win-Runner control listener must bind to a loopback address".to_string());
         }
         let listener = TcpListener::bind(address)
             .map_err(|error| format!("cannot bind control listener {address}: {error}"))?;
@@ -121,7 +121,7 @@ impl ControlHandle {
 
         let (output, receiver) = mpsc::channel();
         let server = thread::Builder::new()
-            .name("wincli-control-ws".to_string())
+            .name("winrun-control-ws".to_string())
             .spawn(move || serve(listener, stdin_writer, receiver, path))
             .map_err(|error| format!("cannot start control listener: {error}"))?;
         Ok(Self {
@@ -172,7 +172,7 @@ fn serve(
     expected_path: String,
 ) {
     if let Err(error) = listener.set_nonblocking(true) {
-        eprintln!("wincli: cannot configure control listener: {error}");
+        eprintln!("winrun: cannot configure control listener: {error}");
         return;
     }
     let mut pending = Vec::new();
@@ -205,14 +205,14 @@ fn serve(
             ) {
                 Ok(socket) => break socket,
                 Err(error) => {
-                    eprintln!("wincli: rejected control connection: {error}");
+                    eprintln!("winrun: rejected control connection: {error}");
                 }
             },
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(10));
             }
             Err(error) => {
-                eprintln!("wincli: control accept failed: {error}");
+                eprintln!("winrun: control accept failed: {error}");
                 thread::sleep(Duration::from_millis(20));
             }
         }
@@ -299,7 +299,7 @@ fn serve(
                 ) => {}
             Err(WsError::ConnectionClosed | WsError::AlreadyClosed) => return,
             Err(error) => {
-                eprintln!("wincli: control connection failed: {error}");
+                eprintln!("winrun: control connection failed: {error}");
                 return;
             }
         }

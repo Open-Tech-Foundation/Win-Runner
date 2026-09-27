@@ -1,4 +1,4 @@
-//! Language-construct guest for WinCLI: conditionals, loops, match, calls.
+//! Language-construct guest for Win-Runner: conditionals, loops, match, calls.
 //!
 //! Each phase prints `P<n>` on success; any mismatch prints `FAIL<n>` and
 //! exits 1. Final `PASS` + exit 0 means every construct below runs.

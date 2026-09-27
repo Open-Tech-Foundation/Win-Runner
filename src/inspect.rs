@@ -1,8 +1,8 @@
-//! `wincli inspect`: static compatibility report for a Windows PE.
+//! `winrun inspect`: static compatibility report for a Windows PE.
 //!
 //! Lists every import with its supported/missing verdict against the active
 //! native platform backend. Uses [`load_lenient`](crate::pe::load_lenient),
-//! so binaries WinCLI cannot (yet) run still produce a full missing-API list —
+//! so binaries Win-Runner cannot (yet) run still produce a full missing-API list —
 //! the fast path for expanding support one real program at a time.
 //!
 //! Exit-code contract (harness-friendly): `0` = runnable (nothing missing),

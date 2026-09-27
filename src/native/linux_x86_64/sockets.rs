@@ -36,7 +36,7 @@ pub(super) extern "win64" fn native_wsa_startup(requested: u16, data: *mut Nativ
         max_udp_datagram: 0,
         vendor_info: std::ptr::null(),
     };
-    value.description[..6].copy_from_slice(b"WinCLI");
+    value.description[..6].copy_from_slice(b"Win-Runner");
     value.system_status[..7].copy_from_slice(b"Running");
     unsafe { data.write(value) };
     0
@@ -242,7 +242,7 @@ pub(super) extern "win64" fn native_accept_ex(
         eprintln!("native AcceptEx listen={listen_socket:#x} accept={accept_socket:#x} overlapped={overlapped:#x}");
     }
     if std::thread::Builder::new()
-        .name("wincli-accept-ex".into())
+        .name("winrun-accept-ex".into())
         .spawn(move || loop {
             let mut descriptor = NativePollFd {
                 fd: listener,

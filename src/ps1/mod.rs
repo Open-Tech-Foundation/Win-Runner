@@ -5133,12 +5133,12 @@ mod tests {
 
     #[test]
     fn env_var_reads_host() {
-        std::env::set_var("WINCLI_TEST_VAR_XYZ", "env-ok");
-        let (out, r) = run_session("echo $env:WINCLI_TEST_VAR_XYZ");
-        std::env::remove_var("WINCLI_TEST_VAR_XYZ");
+        std::env::set_var("WINRUN_TEST_VAR_XYZ", "env-ok");
+        let (out, r) = run_session("echo $env:WINRUN_TEST_VAR_XYZ");
+        std::env::remove_var("WINRUN_TEST_VAR_XYZ");
         assert!(r.is_ok());
         assert_eq!(out, b"env-ok\n");
-        let (_, r) = run_session("echo $env:WINCLI_DEFINITELY_NOT_SET_XYZ");
+        let (_, r) = run_session("echo $env:WINRUN_DEFINITELY_NOT_SET_XYZ");
         assert!(r.is_ok());
     }
 
@@ -5300,16 +5300,16 @@ mod tests {
     #[test]
     fn static_environment_roundtrip() {
         let (out, r) = run_session(
-            "[Environment]::SetEnvironmentVariable('WINCLI_DOTNET_XYZ', 'dotnet-ok', 'User')",
+            "[Environment]::SetEnvironmentVariable('WINRUN_DOTNET_XYZ', 'dotnet-ok', 'User')",
         );
         assert!(r.is_ok());
         assert!(out.is_empty());
-        let (out, r) = run_session("[Environment]::SetEnvironmentVariable('WINCLI_DOTNET_XYZ', 'dotnet-ok', 'User')\n[Environment]::GetEnvironmentVariable('WINCLI_DOTNET_XYZ')");
+        let (out, r) = run_session("[Environment]::SetEnvironmentVariable('WINRUN_DOTNET_XYZ', 'dotnet-ok', 'User')\n[Environment]::GetEnvironmentVariable('WINRUN_DOTNET_XYZ')");
         assert!(r.is_ok());
         assert_eq!(out, b"dotnet-ok\n");
         // Process target and missing names behave the same way.
         let (out, r) =
-            run_session("[Environment]::GetEnvironmentVariable('WINCLI_DEFINITELY_NOT_SET_XYZ')");
+            run_session("[Environment]::GetEnvironmentVariable('WINRUN_DEFINITELY_NOT_SET_XYZ')");
         assert!(r.is_ok());
         assert_eq!(out, b"\n");
         assert!(run_session("[Environment]::Nope('x')")

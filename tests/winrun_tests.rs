@@ -1,6 +1,6 @@
-//! Required acceptance tests for WinCLI.
+//! Required acceptance tests for Win-Runner.
 //!
-//! 1. `wincli hello.exe` prints `Hello from Windows`.
+//! 1. `winrun hello.exe` prints `Hello from Windows`.
 //! 2. PE exit codes propagate correctly.
 //! 3. EXE can create/read/write/delete files in WinFS.
 //! 4. `.ps1` can create/read/write/delete the same kinds of files.
@@ -12,29 +12,39 @@
 
 use std::io::{BufRead, Read, Write};
 use std::process::{Command, Stdio};
-use wincli::pe;
-use wincli::winfs::WinFs;
+use winrun::pe;
+use winrun::winfs::WinFs;
 
 // ---------- helpers ----------
+
+#[test]
+fn renamed_cli_uses_winrun_command_name() {
+    let output = Command::new(env!("CARGO_BIN_EXE_winrun"))
+        .output()
+        .expect("start winrun without arguments");
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("winrun <app.exe>"), "stderr: {stderr}");
+}
 
 fn run_exe_on_fs(data: &[u8], fs: WinFs) -> (u32, WinFs, Vec<u8>) {
     let image = pe::load(data).expect("PE should load with native imports");
     let (code, output, fs) =
-        wincli::native::run_rust_baseline_argv_with_fs(&image, fs, "test.exe", &[])
+        winrun::native::run_rust_baseline_argv_with_fs(&image, fs, "test.exe", &[])
             .expect("native PE should run");
     (code, fs, output)
 }
 
 fn run_ps1_on_fs(fs: &mut WinFs, script: &str) -> Vec<u8> {
     let mut out = Vec::new();
-    wincli::ps1::run_ps1(fs, script, &mut out).expect("ps1 should run");
+    winrun::ps1::run_ps1(fs, script, &mut out).expect("ps1 should run");
     out
 }
 
 fn tmp_path(name: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
     p.push(format!(
-        "wincli-test-{}-{}-{name}",
+        "winrun-test-{}-{}-{name}",
         std::process::id(),
         counter()
     ));
@@ -48,13 +58,13 @@ fn counter() -> u64 {
 }
 
 fn run_cli(file: &std::path::Path) -> (i32, String, String) {
-    let bin = env!("CARGO_BIN_EXE_wincli");
+    let bin = env!("CARGO_BIN_EXE_winrun");
     let output = Command::new(bin)
         .arg(file)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .expect("spawn wincli");
+        .expect("spawn winrun");
     let code = output.status.code().unwrap_or(-1);
     (
         code,
@@ -81,7 +91,7 @@ fn test1_hello_exe_prints() {
 
 #[test]
 fn exec_worker_returns_guest_filesystem_changes_to_the_launcher() {
-    let binary = env!("CARGO_BIN_EXE_wincli");
+    let binary = env!("CARGO_BIN_EXE_winrun");
     let program_path = tmp_path("worker-writes.exe");
     let snapshot_path = tmp_path("worker-state.winfs");
     let image = pe::builder::write_file(r"C:\worker-result.txt", b"written in exec worker");
@@ -90,14 +100,14 @@ fn exec_worker_returns_guest_filesystem_changes_to_the_launcher() {
         .arg(format!("--save-snapshot={}", snapshot_path.display()))
         .arg(&program_path)
         .output()
-        .expect("start wincli exec worker");
+        .expect("start winrun exec worker");
     assert_eq!(
         output.status.code(),
         Some(0),
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let fs = wincli::snapshot::load_file(snapshot_path.to_str().unwrap()).unwrap();
+    let fs = winrun::snapshot::load_file(snapshot_path.to_str().unwrap()).unwrap();
     assert_eq!(
         fs.read_file(r"C:\worker-result.txt").unwrap(),
         b"written in exec worker"
@@ -108,13 +118,13 @@ fn exec_worker_returns_guest_filesystem_changes_to_the_launcher() {
 
 #[test]
 fn exec_worker_reads_files_from_an_existing_winfs_snapshot() {
-    let binary = env!("CARGO_BIN_EXE_wincli");
+    let binary = env!("CARGO_BIN_EXE_winrun");
     let snapshot_path = tmp_path("worker-input.winfs");
     let program_path = tmp_path("worker-read.exe");
     let mut fs = WinFs::ephemeral_runner();
     fs.write_file(r"C:\worker-input.txt", b"snapshot extent".to_vec())
         .unwrap();
-    wincli::snapshot::save_file(&mut fs, snapshot_path.to_str().unwrap()).unwrap();
+    winrun::snapshot::save_file(&mut fs, snapshot_path.to_str().unwrap()).unwrap();
     std::fs::write(
         &program_path,
         pe::builder::read_file_to_stdout(r"C:\worker-input.txt"),
@@ -133,7 +143,7 @@ fn exec_worker_reads_files_from_an_existing_winfs_snapshot() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(output.stdout, b"snapshot extent");
-    let loaded = wincli::snapshot::load_file(snapshot_path.to_str().unwrap()).unwrap();
+    let loaded = winrun::snapshot::load_file(snapshot_path.to_str().unwrap()).unwrap();
     assert_eq!(
         loaded.read_file(r"C:\worker-input.txt").unwrap(),
         b"snapshot extent"
@@ -146,10 +156,10 @@ fn exec_worker_reads_files_from_an_existing_winfs_snapshot() {
 fn exec_worker_preserves_guest_exit_codes() {
     let program_path = tmp_path("worker-exit.exe");
     std::fs::write(&program_path, pe::builder::exit_code(37)).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_wincli"))
+    let output = Command::new(env!("CARGO_BIN_EXE_winrun"))
         .arg(&program_path)
         .output()
-        .expect("start wincli guest with a nonzero exit code");
+        .expect("start winrun guest with a nonzero exit code");
     assert_eq!(
         output.status.code(),
         Some(37),
@@ -161,7 +171,7 @@ fn exec_worker_preserves_guest_exit_codes() {
 
 #[test]
 fn exec_worker_reopens_mounted_host_drives() {
-    let binary = env!("CARGO_BIN_EXE_wincli");
+    let binary = env!("CARGO_BIN_EXE_winrun");
     let host_dir = tmp_path("worker-mount");
     std::fs::create_dir(&host_dir).unwrap();
     let program_path = tmp_path("worker-mount.exe");
@@ -172,7 +182,7 @@ fn exec_worker_reopens_mounted_host_drives() {
         .arg(mount)
         .arg(&program_path)
         .output()
-        .expect("start wincli with mounted drive");
+        .expect("start winrun with mounted drive");
     assert_eq!(
         output.status.code(),
         Some(0),
@@ -190,7 +200,7 @@ fn exec_worker_reopens_mounted_host_drives() {
 
 #[test]
 fn native_backend_runs_rust_hello_guest() {
-    let bin = env!("CARGO_BIN_EXE_wincli");
+    let bin = env!("CARGO_BIN_EXE_winrun");
     let exe = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/artifacts/exe/rust_hello.exe"
@@ -206,7 +216,7 @@ fn native_backend_runs_rust_hello_guest() {
 
 #[test]
 fn native_backend_runs_rust_argv_guest() {
-    let bin = env!("CARGO_BIN_EXE_wincli");
+    let bin = env!("CARGO_BIN_EXE_winrun");
     let exe = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/artifacts/exe/rust_argv.exe"
@@ -223,7 +233,7 @@ fn native_backend_runs_rust_argv_guest() {
 
 #[test]
 fn native_backend_runs_rust_fs_guest() {
-    let bin = env!("CARGO_BIN_EXE_wincli");
+    let bin = env!("CARGO_BIN_EXE_winrun");
     let exe = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/artifacts/exe/rust_fs.exe"
@@ -239,7 +249,7 @@ fn native_backend_runs_rust_fs_guest() {
 
 #[test]
 fn native_backend_runs_overlapped_iocp_guest() {
-    let output = Command::new(env!("CARGO_BIN_EXE_wincli"))
+    let output = Command::new(env!("CARGO_BIN_EXE_winrun"))
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/artifacts/exe/rust_iocp.exe"
@@ -256,7 +266,7 @@ fn native_backend_runs_overlapped_iocp_guest() {
 
 #[test]
 fn native_backend_runs_rust_alloc_guest() {
-    let bin = env!("CARGO_BIN_EXE_wincli");
+    let bin = env!("CARGO_BIN_EXE_winrun");
     let exe = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/artifacts/exe/rust_alloc.exe"
@@ -272,7 +282,7 @@ fn native_backend_runs_rust_alloc_guest() {
 
 #[test]
 fn native_backend_runs_rust_alloc_fs_guest() {
-    let bin = env!("CARGO_BIN_EXE_wincli");
+    let bin = env!("CARGO_BIN_EXE_winrun");
     let exe = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/artifacts/exe/rust_alloc_fs.exe"
@@ -288,7 +298,7 @@ fn native_backend_runs_rust_alloc_fs_guest() {
 
 #[test]
 fn native_backend_runs_rust_hashmap_guest() {
-    let bin = env!("CARGO_BIN_EXE_wincli");
+    let bin = env!("CARGO_BIN_EXE_winrun");
     let exe = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/artifacts/exe/rust_hashmap.exe"
@@ -304,7 +314,7 @@ fn native_backend_runs_rust_hashmap_guest() {
 
 #[test]
 fn native_backend_runs_rust_lang_guest() {
-    let bin = env!("CARGO_BIN_EXE_wincli");
+    let bin = env!("CARGO_BIN_EXE_winrun");
     let exe = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/artifacts/exe/rust_lang.exe"
@@ -323,7 +333,7 @@ fn native_backend_runs_rust_lang_guest() {
 
 #[test]
 fn native_backend_runs_rust_fp_guest() {
-    let bin = env!("CARGO_BIN_EXE_wincli");
+    let bin = env!("CARGO_BIN_EXE_winrun");
     let exe = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/artifacts/exe/rust_fp.exe"
@@ -365,7 +375,7 @@ fn native_timer_imports_run_on_the_host_clock() {
     );
     let image = pe::load_lenient(&exe).unwrap();
     let (code, _, _) =
-        wincli::native::run_rust_baseline_argv_with_fs(&image, WinFs::new(), "timer.exe", &[])
+        winrun::native::run_rust_baseline_argv_with_fs(&image, WinFs::new(), "timer.exe", &[])
             .unwrap();
     assert_eq!(code, 0);
 }
@@ -422,7 +432,7 @@ fn native_guest_writes_to_nul_without_creating_a_winfs_file() {
     ))
     .unwrap();
     let (code, stdout, fs) =
-        wincli::native::run_rust_baseline_argv_with_fs(&image, WinFs::new(), "nul-device.exe", &[])
+        winrun::native::run_rust_baseline_argv_with_fs(&image, WinFs::new(), "nul-device.exe", &[])
             .unwrap();
     assert_eq!(code, 0);
     assert!(stdout.is_empty());
@@ -480,7 +490,7 @@ fn native_guest_writes_to_conout_through_its_standard_output() {
     ))
     .unwrap();
     let (code, stdout, _) =
-        wincli::native::run_rust_baseline_argv_with_fs(&image, WinFs::new(), "conout.exe", &[])
+        winrun::native::run_rust_baseline_argv_with_fs(&image, WinFs::new(), "conout.exe", &[])
             .unwrap();
     assert_eq!(code, 0);
     assert_eq!(stdout, b"console-device-output");
@@ -517,7 +527,7 @@ fn native_global_memory_status_ex_validates_and_populates_guest_buffer() {
     ))
     .unwrap();
     let (code, _, _) =
-        wincli::native::run_rust_baseline_argv_with_fs(&image, WinFs::new(), "memory.exe", &[])
+        winrun::native::run_rust_baseline_argv_with_fs(&image, WinFs::new(), "memory.exe", &[])
             .unwrap();
     assert_eq!(code, 0);
 }
@@ -537,7 +547,7 @@ fn native_allows_unused_imports_without_a_platform_shim() {
         ],
     );
     let image = pe::load_lenient(&exe).unwrap();
-    let (code, _, _) = wincli::native::run_rust_baseline_argv_with_fs(
+    let (code, _, _) = winrun::native::run_rust_baseline_argv_with_fs(
         &image,
         WinFs::new(),
         "unsupported.exe",
@@ -741,7 +751,7 @@ fn test6_dotdot_normalization() {
 
 #[test]
 fn test7_no_host_side_effects() {
-    let sentinel = format!("wincli-sentinel-{}-{}.txt", std::process::id(), counter());
+    let sentinel = format!("winrun-sentinel-{}-{}.txt", std::process::id(), counter());
     let host_before: Vec<bool> = [
         format!("/tmp/{sentinel}"),
         format!("./{sentinel}"),
@@ -761,7 +771,7 @@ fn test7_no_host_side_effects() {
 
     // PS1 creates another
     let sentinel2 = format!(
-        "wincli-sentinel-ps1-{}-{}.txt",
+        "winrun-sentinel-ps1-{}-{}.txt",
         std::process::id(),
         counter()
     );
@@ -783,7 +793,7 @@ fn test7_no_host_side_effects() {
             for e in entries.flatten() {
                 let n = e.file_name().to_string_lossy().to_string();
                 assert!(
-                    !n.contains("wincli-sentinel"),
+                    !n.contains("winrun-sentinel"),
                     "guest file leaked to host dir {dir}: {n}"
                 );
             }
@@ -827,7 +837,7 @@ fn test9_exe_and_ps1_share_winfs() {
         std::any::type_name::<T>()
     }
     // Both runners are generic over the same concrete type.
-    assert_eq!(type_name_of_val(&WinFs::new()), "wincli::winfs::WinFs");
+    assert_eq!(type_name_of_val(&WinFs::new()), "winrun::winfs::WinFs");
 
     // EXE -> PS1 direction
     let mut fs = WinFs::new();
@@ -859,7 +869,7 @@ fn test9_exe_and_ps1_share_winfs() {
 // The .exe files are genuine PE32+ x86_64 guests generated by
 // `cargo run --example gen_artifacts` (see examples/gen_artifacts.rs).
 // The fs_*.exe guests self-verify inside the guest (PASS/exit 0), so each
-// `wincli` invocation is fully observable through guest output and exit status.
+// `winrun` invocation is fully observable through guest output and exit status.
 
 fn artifact(rel: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -987,12 +997,12 @@ fn test_art_exe_rust_fs_selftest() {
 }
 
 fn run_inspect(file: &std::path::Path) -> (i32, String, String) {
-    let bin = env!("CARGO_BIN_EXE_wincli");
+    let bin = env!("CARGO_BIN_EXE_winrun");
     let output = std::process::Command::new(bin)
         .arg("inspect")
         .arg(file)
         .output()
-        .expect("spawn wincli inspect");
+        .expect("spawn winrun inspect");
     (
         output.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&output.stdout).to_string(),
@@ -1090,15 +1100,15 @@ fn test_inspect_invalid_file() {
 
 // ---------- command-line helpers ----------
 
-fn run_wincli_env(args: &[&str], envs: &[(&str, &str)]) -> (i32, String, String) {
-    let bin = env!("CARGO_BIN_EXE_wincli");
+fn run_winrun_env(args: &[&str], envs: &[(&str, &str)]) -> (i32, String, String) {
+    let bin = env!("CARGO_BIN_EXE_winrun");
     let mut cmd = std::process::Command::new(bin);
     cmd.args(args);
     for (k, v) in envs {
         cmd.env(k, v);
     }
     // Never inherit package-source configuration from the developer machine.
-    let output = cmd.output().expect("spawn wincli");
+    let output = cmd.output().expect("spawn winrun");
     (
         output.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&output.stdout).to_string(),
@@ -1110,7 +1120,7 @@ fn run_wincli_env(args: &[&str], envs: &[(&str, &str)]) -> (i32, String, String)
 fn native_timing_reports_load_execution_and_state_stages() {
     let path = artifact("exe/hello.exe");
     let path = path.to_string_lossy().to_string();
-    let (code, stdout, stderr) = run_wincli_env(&[&path], &[("WINCLI_TIMINGS", "1")]);
+    let (code, stdout, stderr) = run_winrun_env(&[&path], &[("WINRUN_TIMINGS", "1")]);
     assert_eq!(code, 0, "stderr: {stderr}");
     assert_eq!(stdout, "Hello from Windows");
     for stage in [
@@ -1125,7 +1135,7 @@ fn native_timing_reports_load_execution_and_state_stages() {
     }
 
     let (code, stdout, stderr) =
-        run_shell_env(&format!("{path}\nexit\n"), &[("WINCLI_TIMINGS", "1")]);
+        run_shell_env(&format!("{path}\nexit\n"), &[("WINRUN_TIMINGS", "1")]);
     assert_eq!(code, 0, "stderr: {stderr}");
     assert_eq!(stdout, "Hello from Windows");
     assert!(stderr.contains("shell backend_init="), "stderr: {stderr}");
@@ -1150,7 +1160,7 @@ fn test_argv_echo_lib_level() {
     ];
     let image = pe::load(&bytes).unwrap();
     let (code, out, _) =
-        wincli::native::run_rust_baseline_argv_with_fs(&image, WinFs::new(), "myprog.exe", &args)
+        winrun::native::run_rust_baseline_argv_with_fs(&image, WinFs::new(), "myprog.exe", &args)
             .unwrap();
     assert_eq!(code, 0);
     assert_eq!(out, b"myprog.exe hello \"a b\" --version\n");
@@ -1160,13 +1170,13 @@ fn test_argv_echo_lib_level() {
 fn test_argv_echo_cli() {
     let p = artifact("exe/rust_argv.exe");
     let ps = p.to_string_lossy().to_string();
-    let (code, stdout, stderr) = run_wincli_env(&[ps.as_str(), "hello", "a b", "--version"], &[]);
+    let (code, stdout, stderr) = run_winrun_env(&[ps.as_str(), "hello", "a b", "--version"], &[]);
     assert_eq!(code, 0, "stderr: {stderr}");
     assert_eq!(stdout, format!("{ps} hello \"a b\" --version\n"));
 }
 
 #[test]
-fn guest_arguments_that_match_wincli_options_are_preserved() {
+fn guest_arguments_that_match_winrun_options_are_preserved() {
     let snapshot = tmp_path("guest-options.winfs");
     let mut fs = WinFs::new();
     fs.mkdir(r"C:\bin").unwrap();
@@ -1175,7 +1185,7 @@ fn guest_arguments_that_match_wincli_options_are_preserved() {
         std::fs::read(artifact("exe/rust_argv.exe")).unwrap(),
     )
     .unwrap();
-    wincli::snapshot::save_file(&mut fs, snapshot.to_str().unwrap()).unwrap();
+    winrun::snapshot::save_file(&mut fs, snapshot.to_str().unwrap()).unwrap();
 
     let guest_args = [
         "--mount=guest-drive".to_string(),
@@ -1183,12 +1193,12 @@ fn guest_arguments_that_match_wincli_options_are_preserved() {
         "--headless".to_string(),
         "--control=guest-address".to_string(),
     ];
-    let output = Command::new(env!("CARGO_BIN_EXE_wincli"))
+    let output = Command::new(env!("CARGO_BIN_EXE_winrun"))
         .arg(format!("--snapshot={}", snapshot.display()))
         .arg(r"C:\bin\rust_argv.exe")
         .args(&guest_args)
         .output()
-        .expect("run guest with WinCLI-like arguments");
+        .expect("run guest with Win-Runner-like arguments");
     let _ = std::fs::remove_file(snapshot);
     assert_eq!(
         output.status.code(),
@@ -1204,7 +1214,7 @@ fn guest_arguments_that_match_wincli_options_are_preserved() {
 
 #[test]
 fn test_ps1_with_args_rejected() {
-    let (code, _, stderr) = run_wincli_env(
+    let (code, _, stderr) = run_winrun_env(
         &[artifact("ps1/fs_dots.ps1").to_str().unwrap(), "extra"],
         &[],
     );
@@ -1321,7 +1331,7 @@ fn run_session_env(mode: &str, input: &str, envs: &[(&str, &str)]) -> (i32, Stri
 
 fn run_session_args(args: &[String], input: &str, envs: &[(&str, &str)]) -> (i32, String, String) {
     use std::io::Write;
-    let bin = env!("CARGO_BIN_EXE_wincli");
+    let bin = env!("CARGO_BIN_EXE_winrun");
     let mut child = std::process::Command::new(bin)
         .args(args)
         .stdin(Stdio::piped())
@@ -1329,7 +1339,7 @@ fn run_session_args(args: &[String], input: &str, envs: &[(&str, &str)]) -> (i32
         .stderr(Stdio::piped())
         .envs(envs.iter().copied())
         .spawn()
-        .expect("spawn wincli session");
+        .expect("spawn winrun session");
     child
         .stdin
         .take()
@@ -1353,7 +1363,7 @@ fn shell_package_install_is_forgotten_without_a_snapshot() {
     let source = artifact("packages").to_string_lossy().to_string();
     let (code, stdout, stderr) = run_shell_env(
         "install demo\ndemo\nexit\n",
-        &[("WINCLI_SOURCE", source.as_str())],
+        &[("WINRUN_SOURCE", source.as_str())],
     );
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(stdout.contains("Installed demo 0.1.0"), "stdout: {stdout}");
@@ -1377,15 +1387,15 @@ fn snapshot_is_the_only_way_to_carry_installed_packages_between_shells() {
             snapshot.display()
         ),
         &[
-            ("WINCLI_SOURCE", source.as_str()),
-            ("WINCLI_CACHE", ignored_cache.to_str().unwrap()),
+            ("WINRUN_SOURCE", source.as_str()),
+            ("WINRUN_CACHE", ignored_cache.to_str().unwrap()),
         ],
     );
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(stdout.contains("Installed demo 0.1.0"), "stdout: {stdout}");
     assert!(
         !ignored_cache.exists(),
-        "WINCLI_CACHE must not persist staging"
+        "WINRUN_CACHE must not persist staging"
     );
 
     let (code, stdout, stderr) = run_session_args(
@@ -1413,10 +1423,10 @@ fn winget_builtin_installs_a_package_into_the_guest_session() {
     let source = artifact("packages").to_string_lossy().to_string();
     let (code, stdout, stderr) = run_shell_env(
         "winget --version\nwinget install -e --id demo --silent\ndemo\nexit\n",
-        &[("WINCLI_SOURCE", source.as_str())],
+        &[("WINRUN_SOURCE", source.as_str())],
     );
     assert_eq!(code, 0, "stderr: {stderr}");
-    assert!(stdout.contains("wincli-winget"), "stdout: {stdout}");
+    assert!(stdout.contains("winrun-winget"), "stdout: {stdout}");
     assert!(stdout.contains("Installed demo 0.1.0"), "stdout: {stdout}");
     assert!(stdout.contains("demo 0.1.0"), "stdout: {stdout}");
 }
@@ -1449,7 +1459,7 @@ fn failed_guest_execution_preserves_unsaved_c_drive_changes() {
     let snapshot_arg = format!("--snapshot={}", snapshot.display());
     let (code, _, stderr) = run_shell_env(
         &format!("install demo\nsnapshot save {}\nexit\n", snapshot.display()),
-        &[("WINCLI_SOURCE", source.as_str())],
+        &[("WINRUN_SOURCE", source.as_str())],
     );
     assert_eq!(code, 0, "stderr: {stderr}");
 
@@ -1457,7 +1467,7 @@ fn failed_guest_execution_preserves_unsaved_c_drive_changes() {
     let (code, _, stderr) = run_session_args(
         &[snapshot_arg.clone(), "shell".to_string()],
         &format!("Set-Content C:\\actions-runner\\_work\\keep.txt before-failure\n{bad_exe}\nsnapshot save\nexit\n"),
-        &[("WINCLI_NATIVE_STRICT_IMPORTS", "1")],
+        &[("WINRUN_NATIVE_STRICT_IMPORTS", "1")],
     );
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(!stderr.contains("restored from snapshot"), "{stderr}");
@@ -1496,10 +1506,12 @@ fn interactive_shell_completes_commands_and_inserts_text_at_the_cursor() {
     );
     let mut master = unsafe { std::fs::File::from_raw_fd(master_fd) };
     let slave = unsafe { std::fs::File::from_raw_fd(slave_fd) };
-    let history_file = tmp_path("interactive-shell-history");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_wincli"))
+    let snapshot_path = tmp_path("interactive-shell-history.winfs");
+    let host_history_canary = tmp_path("must-not-be-created-host-history");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_winrun"))
+        .arg(format!("--save-snapshot={}", snapshot_path.display()))
         .arg("shell")
-        .env("WINCLI_HISTORY_FILE", &history_file)
+        .env("WINRUN_HISTORY_FILE", &host_history_canary)
         .stdin(Stdio::from(slave.try_clone().unwrap()))
         .stdout(Stdio::from(slave.try_clone().unwrap()))
         .stderr(Stdio::from(slave.try_clone().unwrap()))
@@ -1542,8 +1554,8 @@ fn interactive_shell_completes_commands_and_inserts_text_at_the_cursor() {
     master.write_all(b"wi\t --version\r").unwrap();
     assert!(
         read_until(&mut master, &mut output, &|bytes| bytes
-            .windows(b"wincli-winget".len())
-            .any(|window| window == b"wincli-winget")),
+            .windows(b"winrun-winget".len())
+            .any(|window| window == b"winrun-winget")),
         "Tab did not complete the winget command: {}",
         String::from_utf8_lossy(&output)
     );
@@ -1575,7 +1587,14 @@ fn interactive_shell_completes_commands_and_inserts_text_at_the_cursor() {
         String::from_utf8_lossy(&output)
     );
     let status = child.wait().expect("wait for interactive shell");
-    let saved_history = std::fs::read_to_string(&history_file).expect("read saved shell history");
+    let saved_disk = winrun::snapshot::load_file(snapshot_path.to_str().unwrap())
+        .expect("load saved guest disk");
+    let saved_history = String::from_utf8(
+        saved_disk
+            .read_file(r"C:\.system\shell-history")
+            .expect("read shell history from guest disk"),
+    )
+    .unwrap();
     assert!(
         saved_history.contains("winget --version"),
         "history: {saved_history}"
@@ -1584,7 +1603,11 @@ fn interactive_shell_completes_commands_and_inserts_text_at_the_cursor() {
         saved_history.contains("exit 13"),
         "history: {saved_history}"
     );
-    std::fs::remove_file(history_file).ok();
+    std::fs::remove_file(snapshot_path).ok();
+    assert!(
+        !host_history_canary.exists(),
+        "shell history must not be written to host state"
+    );
     assert!(
         output
             .windows(b"exit 13".len())
@@ -1646,7 +1669,7 @@ fn test_runner_boots_snapshot_file() {
         b"booted",
     )
     .unwrap();
-    let bin = env!("CARGO_BIN_EXE_wincli");
+    let bin = env!("CARGO_BIN_EXE_winrun");
     let built = Command::new(bin)
         .args(["snapshot", "build"])
         .arg(&input)
@@ -1685,9 +1708,9 @@ fn headless_snapshot_program_accepts_controlled_stdin_and_streams_output() {
     fs.mkdir(r"C:\bin").unwrap();
     fs.write_file(r"C:\bin\stdin-echo.exe", pe::builder::stdin_echo())
         .unwrap();
-    wincli::snapshot::save_file(&mut fs, snapshot.to_str().unwrap()).unwrap();
+    winrun::snapshot::save_file(&mut fs, snapshot.to_str().unwrap()).unwrap();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_wincli"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_winrun"))
         .arg(format!("--snapshot={}", snapshot.display()))
         .arg(r"C:\bin\stdin-echo.exe")
         .stdin(Stdio::piped())
@@ -1734,9 +1757,9 @@ fn headless_control_session_streams_shell_output_and_exits_cleanly() {
     .unwrap();
     fs.write_file(r"C:\bin\stdin-echo.exe", pe::builder::stdin_echo())
         .unwrap();
-    wincli::snapshot::save_file(&mut fs, snapshot.to_str().unwrap()).unwrap();
+    winrun::snapshot::save_file(&mut fs, snapshot.to_str().unwrap()).unwrap();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_wincli"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_winrun"))
         .args([
             "--headless".to_string(),
             "--control=127.0.0.1:0".to_string(),
@@ -1747,7 +1770,7 @@ fn headless_control_session_streams_shell_output_and_exits_cleanly() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn controlled WinCLI shell");
+        .expect("spawn controlled Win-Runner shell");
     let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
     let mut ready_line = String::new();
     stdout
@@ -1867,10 +1890,10 @@ fn headless_control_session_streams_shell_output_and_exits_cleanly() {
 fn test_named_instance_boot_status_and_destroy() {
     let state = tmp_path("instances");
     let name = format!("test-{}", counter());
-    let bin = env!("CARGO_BIN_EXE_wincli");
+    let bin = env!("CARGO_BIN_EXE_winrun");
     let boot = Command::new(bin)
         .args(["instance", "boot", &name])
-        .env("WINCLI_INSTANCE_DIR", &state)
+        .env("WINRUN_INSTANCE_DIR", &state)
         .output()
         .expect("boot instance");
     assert_eq!(
@@ -1881,7 +1904,7 @@ fn test_named_instance_boot_status_and_destroy() {
     );
     let status = Command::new(bin)
         .args(["instance", "status", &name])
-        .env("WINCLI_INSTANCE_DIR", &state)
+        .env("WINRUN_INSTANCE_DIR", &state)
         .output()
         .expect("query instance");
     assert_eq!(status.status.code(), Some(0));
@@ -1896,7 +1919,7 @@ fn test_named_instance_boot_status_and_destroy() {
             "-Value",
             "live",
         ])
-        .env("WINCLI_INSTANCE_DIR", &state)
+        .env("WINRUN_INSTANCE_DIR", &state)
         .output()
         .expect("write in instance");
     assert_eq!(
@@ -1914,7 +1937,7 @@ fn test_named_instance_boot_status_and_destroy() {
             "Get-Content",
             "C:\\actions-runner\\_work\\live.txt",
         ])
-        .env("WINCLI_INSTANCE_DIR", &state)
+        .env("WINRUN_INSTANCE_DIR", &state)
         .output()
         .expect("read in instance");
     assert_eq!(
@@ -1926,7 +1949,7 @@ fn test_named_instance_boot_status_and_destroy() {
     assert_eq!(read.stdout, b"live\n");
     let destroy = Command::new(bin)
         .args(["instance", "destroy", &name])
-        .env("WINCLI_INSTANCE_DIR", &state)
+        .env("WINRUN_INSTANCE_DIR", &state)
         .output()
         .expect("destroy instance");
     assert_eq!(
@@ -1941,9 +1964,9 @@ fn test_named_instance_boot_status_and_destroy() {
 #[test]
 fn test_shell_install_run_session_offline() {
     let src = artifact("packages").to_string_lossy().to_string();
-    let envs = [("WINCLI_SOURCE", src.as_ref())];
+    let envs = [("WINRUN_SOURCE", src.as_ref())];
     // One session: install, run the package, share PS1 files across lines.
-    let input = "install demo\ndemo\nNew-Item C:\\shell-t.txt -Value hi\nGet-Content C:\\shell-t.txt\n$v = 42\necho \"v=$v\"\nif ($v -eq 42) { echo if-ok }\n$langs = @('a', 'b')\nif ('a' -in $langs) { echo in-ok }\nswitch ('q') { 'q' { echo sw-ok } }\nfunction Hi($n) { echo \"hi-$n\" }\nforeach ($i in @('a', 'b')) { Hi $i }\n$ht = @{}\n$ht['k'] = 'v'\nif ($ht.ContainsKey('k')) { echo ht-ok }\ntry { echo try-ok } catch { echo bad }\n$cap = Join-Path 'C:\\x' 'y'\necho $cap\necho $cap | Out-Null\n$m = 'aBc'\necho $m.ToUpper()\n[Environment]::SetEnvironmentVariable('WINCLI_E2E_XYZ', 'e2e-ok', 'User')\necho $([Environment]::GetEnvironmentVariable('WINCLI_E2E_XYZ'))\necho '[{\"tag_name\": \"esrun@0.24.0\"}, {\"tag_name\": \"other\"}]' | ForEach-Object { $_.tag_name } | Where-Object { $_ -match \"esrun\" } | Select-Object -First 1\necho done\nexit\n";
+    let input = "install demo\ndemo\nNew-Item C:\\shell-t.txt -Value hi\nGet-Content C:\\shell-t.txt\n$v = 42\necho \"v=$v\"\nif ($v -eq 42) { echo if-ok }\n$langs = @('a', 'b')\nif ('a' -in $langs) { echo in-ok }\nswitch ('q') { 'q' { echo sw-ok } }\nfunction Hi($n) { echo \"hi-$n\" }\nforeach ($i in @('a', 'b')) { Hi $i }\n$ht = @{}\n$ht['k'] = 'v'\nif ($ht.ContainsKey('k')) { echo ht-ok }\ntry { echo try-ok } catch { echo bad }\n$cap = Join-Path 'C:\\x' 'y'\necho $cap\necho $cap | Out-Null\n$m = 'aBc'\necho $m.ToUpper()\n[Environment]::SetEnvironmentVariable('WINRUN_E2E_XYZ', 'e2e-ok', 'User')\necho $([Environment]::GetEnvironmentVariable('WINRUN_E2E_XYZ'))\necho '[{\"tag_name\": \"esrun@0.24.0\"}, {\"tag_name\": \"other\"}]' | ForEach-Object { $_.tag_name } | Where-Object { $_ -match \"esrun\" } | Select-Object -First 1\necho done\nexit\n";
     let (code, stdout, stderr) = run_shell_env(input, &envs);
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(

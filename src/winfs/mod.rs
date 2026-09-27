@@ -68,7 +68,7 @@ impl DiskStore {
     fn temporary() -> Option<Arc<Self>> {
         let id = NEXT_DISK_ID.fetch_add(1, Ordering::Relaxed);
         let path =
-            std::env::temp_dir().join(format!("wincli-disk-{}-{id}.tmp", std::process::id()));
+            std::env::temp_dir().join(format!("winrun-disk-{}-{id}.tmp", std::process::id()));
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -2873,15 +2873,15 @@ mod tests {
     #[test]
     fn extended_dos_and_nt_paths_resolve_like_dos_paths() {
         let mut fs = WinFs::new();
-        fs.mkdir(r"C:\Users\wincli\npm-cache\_cacache\tmp").unwrap();
+        fs.mkdir(r"C:\Users\winrun\npm-cache\_cacache\tmp").unwrap();
         for extended in [
-            r"\\?\C:\Users\wincli\npm-cache\_cacache\tmp",
-            r"\??\C:\Users\wincli\npm-cache\_cacache\tmp",
+            r"\\?\C:\Users\winrun\npm-cache\_cacache\tmp",
+            r"\??\C:\Users\winrun\npm-cache\_cacache\tmp",
         ] {
             assert!(fs.is_dir(extended), "{extended}");
             assert_eq!(
                 fs.normalize(extended).unwrap(),
-                fs.normalize(r"C:\Users\wincli\npm-cache\_cacache\tmp")
+                fs.normalize(r"C:\Users\winrun\npm-cache\_cacache\tmp")
                     .unwrap()
             );
         }
@@ -2935,7 +2935,7 @@ mod tests {
     #[test]
     fn mounted_host_drive_maps_files_and_writes_through() {
         let root = std::env::temp_dir().join(format!(
-            "wincli-mount-{}-{}",
+            "winrun-mount-{}-{}",
             std::process::id(),
             NEXT_DISK_ID.fetch_add(1, Ordering::Relaxed)
         ));
@@ -2977,7 +2977,7 @@ mod tests {
     #[test]
     fn mounted_host_drive_reports_case_collisions() {
         let root = std::env::temp_dir().join(format!(
-            "wincli-mount-case-collision-{}-{}",
+            "winrun-mount-case-collision-{}-{}",
             std::process::id(),
             NEXT_DISK_ID.fetch_add(1, Ordering::Relaxed)
         ));
@@ -2995,7 +2995,7 @@ mod tests {
     #[test]
     fn relative_paths_and_drive_relative_paths_use_their_drive_cwds() {
         let root = std::env::temp_dir().join(format!(
-            "wincli-drive-cwd-{}-{}",
+            "winrun-drive-cwd-{}-{}",
             std::process::id(),
             NEXT_DISK_ID.fetch_add(1, Ordering::Relaxed)
         ));
@@ -3030,7 +3030,7 @@ mod tests {
     #[test]
     fn mounted_host_drive_can_be_read_only() {
         let root = std::env::temp_dir().join(format!(
-            "wincli-mount-ro-{}-{}",
+            "winrun-mount-ro-{}-{}",
             std::process::id(),
             NEXT_DISK_ID.fetch_add(1, Ordering::Relaxed)
         ));

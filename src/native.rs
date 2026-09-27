@@ -9,7 +9,7 @@
 //!
 //! CLI guests execute in a freshly exec'd worker process; the library API can
 //! also run a forked child when no worker executable is configured. Neither is
-//! a security sandbox: guest code can issue host syscalls with WinCLI's
+//! a security sandbox: guest code can issue host syscalls with Win-Runner's
 //! privileges. Windows APIs require explicit native trampolines; unsupported
 //! imports fail if guest code calls them. Strict pre-entry validation is optional.
 

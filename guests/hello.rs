@@ -1,7 +1,7 @@
-//! Minimal Rust guest for WinCLI (`x86_64-pc-windows-msvc`).
+//! Minimal Rust guest for Win-Runner (`x86_64-pc-windows-msvc`).
 //!
 //! `no_std` + `no_main` + custom entry: no CRT startup, no TEB/PEB access,
-//! only the Win32 APIs WinCLI implements. Build with `guests/build.sh`.
+//! only the Win32 APIs Win-Runner implements. Build with `guests/build.sh`.
 
 #![no_std]
 #![no_main]

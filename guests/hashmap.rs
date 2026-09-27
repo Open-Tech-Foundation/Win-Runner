@@ -1,4 +1,4 @@
-//! HashMap guest for WinCLI: hand-rolled open-addressing map.
+//! HashMap guest for Win-Runner: hand-rolled open-addressing map.
 //!
 //! `std` has no `HashMap` in `no_std`, so this guest carries a minimal one:
 //! FNV-1a hashing, linear probing, backward-shift deletion, doubling growth

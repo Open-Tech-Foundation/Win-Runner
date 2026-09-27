@@ -918,7 +918,7 @@ mod tests {
 
     #[test]
     fn builds_indexed_seekable_boot_disk() {
-        let root = std::env::temp_dir().join(format!("wincli-snapshot-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("winrun-snapshot-{}", std::process::id()));
         let input = root.join("input");
         let output = root.join("os.snap");
         std::fs::create_dir_all(input.join("C/tools")).unwrap();
@@ -937,7 +937,7 @@ mod tests {
     #[test]
     fn saving_updates_the_index_without_rewriting_existing_extents() {
         let output =
-            std::env::temp_dir().join(format!("wincli-indexed-update-{}.disk", std::process::id()));
+            std::env::temp_dir().join(format!("winrun-indexed-update-{}.disk", std::process::id()));
         let mut fs = WinFs::ephemeral_runner();
         fs.mkdir(r"C:\tools").unwrap();
         fs.write_file(r"C:\tools\node.exe", b"node-data".to_vec())
@@ -965,7 +965,7 @@ mod tests {
     #[test]
     fn c_drive_snapshot_does_not_capture_a_live_mounted_drive() {
         let root =
-            std::env::temp_dir().join(format!("wincli-snapshot-mount-{}", std::process::id()));
+            std::env::temp_dir().join(format!("winrun-snapshot-mount-{}", std::process::id()));
         let output = root.with_extension("snap");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("host.txt"), b"external").unwrap();
@@ -1061,7 +1061,7 @@ mod tests {
         fs.write_file(r"C:\actions-runner\_work\result.txt", b"done".to_vec())
             .unwrap();
         let path =
-            std::env::temp_dir().join(format!("wincli-live-disk-{}.snap", std::process::id()));
+            std::env::temp_dir().join(format!("winrun-live-disk-{}.snap", std::process::id()));
         save_file(&mut fs, path.to_str().unwrap()).unwrap();
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(&bytes[..8], DISK_MAGIC);
@@ -1097,7 +1097,7 @@ mod tests {
         .unwrap();
         let original_id = fs.file_id(r"C:\tools\source.txt").unwrap();
         let path =
-            std::env::temp_dir().join(format!("wincli-metadata-links-{}.snap", std::process::id()));
+            std::env::temp_dir().join(format!("winrun-metadata-links-{}.snap", std::process::id()));
         save_file(&mut fs, path.to_str().unwrap()).unwrap();
 
         let mut restored = load_file(path.to_str().unwrap()).unwrap();
@@ -1126,7 +1126,7 @@ mod tests {
         let mut fs = WinFs::new();
         fs.mkdir(r"C:\Empty\Nested").unwrap();
         let path =
-            std::env::temp_dir().join(format!("wincli-empty-disk-{}.snap", std::process::id()));
+            std::env::temp_dir().join(format!("winrun-empty-disk-{}.snap", std::process::id()));
         save_file(&mut fs, path.to_str().unwrap()).unwrap();
         let restored = load_file(path.to_str().unwrap()).unwrap();
         assert!(restored.is_dir(r"C:\Empty\Nested"));

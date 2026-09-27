@@ -835,7 +835,7 @@ pub(super) extern "win64" fn native_register_wait_for_single_object(
     }
     let worker_process = Arc::clone(&process);
     if std::thread::Builder::new()
-        .name("wincli-process-wait".into())
+        .name("winrun-process-wait".into())
         .spawn(move || {
             loop {
                 if registration.cancelled.load(Ordering::Acquire) {

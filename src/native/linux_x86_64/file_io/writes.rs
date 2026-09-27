@@ -29,7 +29,7 @@ pub(in crate::native::linux_x86_64::file_io) fn native_submit_pipe_io(
     let worker_pipe = pipe.clone();
     let worker_process = Arc::clone(process);
     let spawn = std::thread::Builder::new()
-        .name("wincli-named-pipe-io".into())
+        .name("winrun-named-pipe-io".into())
         .spawn(move || {
             let is_write = data.is_some();
             let events = if is_write { 0x4 } else { 0x1 };
@@ -486,7 +486,7 @@ mod named_pipe_tests {
 
     #[test]
     fn named_pipe_pair_connects_and_transfers_duplex_bytes() {
-        let name = format!("uv\\wincli-unit-{}", std::process::id());
+        let name = format!("uv\\winrun-unit-{}", std::process::id());
         let server = server(&name, 3);
         assert_ne!(server, u64::MAX);
         let client = client(&name, 0xc000_0000, 0);
@@ -527,7 +527,7 @@ mod named_pipe_tests {
 
     #[test]
     fn connected_pipe_releases_pending_client_reference_for_eof() {
-        let name = format!("uv\\wincli-eof-{}", std::process::id());
+        let name = format!("uv\\winrun-eof-{}", std::process::id());
         let server = server(&name, 1); // Server reads; child client writes.
         assert_ne!(server, u64::MAX);
         let client = client(&name, 0x4000_0000, 0);
@@ -569,7 +569,7 @@ mod named_pipe_tests {
 
     #[test]
     fn named_pipe_checks_client_direction_and_supports_overlapped_completion() {
-        let name = format!("uv\\wincli-io-{}", std::process::id());
+        let name = format!("uv\\winrun-io-{}", std::process::id());
         let server = server(&name, 2); // Server writes; client must read.
         assert_ne!(server, u64::MAX);
         assert_eq!(client(&name, 0x4000_0000, 0), u64::MAX);
@@ -639,7 +639,7 @@ mod named_pipe_tests {
 
     #[test]
     fn named_pipe_overlapped_connect_completes_when_client_arrives_later() {
-        let name = format!("uv\\wincli-connect-{}", std::process::id());
+        let name = format!("uv\\winrun-connect-{}", std::process::id());
         let server = server(&name, 0x4000_0003);
         assert_ne!(server, u64::MAX);
         let port = native_create_io_completion_port(u64::MAX, 0, 0, 1);

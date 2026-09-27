@@ -1,43 +1,43 @@
-# Win-CLI
+# Win-Runner
 
 Minimal Linux tool for running Windows console programs and filesystem scripts
 against an indexed WinFS disk. Its default C: disk is temporary and discarded
 when the session ends. No Wine, VM, or host Windows installation is required.
 
 ```bash
-wincli app.exe [args...]  # minimal x86_64 PE execution (PE32+, native console apps)
-wincli --snapshot=tools.winfs shell # boot a saved C: guest disk
-wincli --snapshot=tools.winfs C:\bin\app.exe [args...] # run a guest PE headlessly
-wincli --headless --control=127.0.0.1:0 shell # externally controlled shell
-wincli --mount=Z:/host/folder shell # expose a host folder as a live drive
-wincli script.ps1         # minimal PowerShell-like script execution
-wincli shell              # interactive shell: one ephemeral WinFS per session
-wincli inspect app.exe    # PE compatibility report: supported vs missing imports
+winrun app.exe [args...]  # minimal x86_64 PE execution (PE32+, native console apps)
+winrun --snapshot=tools.winfs shell # boot a saved C: guest disk
+winrun --snapshot=tools.winfs C:\bin\app.exe [args...] # run a guest PE headlessly
+winrun --headless --control=127.0.0.1:0 shell # externally controlled shell
+winrun --mount=Z:/host/folder shell # expose a host folder as a live drive
+winrun script.ps1         # minimal PowerShell-like script execution
+winrun shell              # interactive shell: one ephemeral WinFS per session
+winrun inspect app.exe    # PE compatibility report: supported vs missing imports
 ```
 
 ### Native platform backend
 
-On Linux/x86-64, `wincli app.exe` executes PE instructions directly on the
+On Linux/x86-64, `winrun app.exe` executes PE instructions directly on the
 host CPU in a forked child. Windows
 imports require native shims; an unsupported import fails with its name if the
-guest calls it. Set `WINCLI_NATIVE_STRICT_IMPORTS=1` to reject unsupported
-imports before entry. `wincli inspect` lists static shim coverage. Other host platforms currently have no PE
+guest calls it. Set `WINRUN_NATIVE_STRICT_IMPORTS=1` to reject unsupported
+imports before entry. `winrun inspect` lists static shim coverage. Other host platforms currently have no PE
 execution backend.
 
 ### Security boundary
 
-WinCLI is a Windows compatibility runtime, not a security sandbox. Native PE
+Win-Runner is a Windows compatibility runtime, not a security sandbox. Native PE
 code runs on the host CPU and can issue Linux system calls with the privileges
-of the WinCLI process. WinFS and read-only guest mounts are compatibility
+of the Win-Runner process. WinFS and read-only guest mounts are compatibility
 features, not host access controls; mounted drives intentionally expose their
-host directories. Do not use WinCLI alone to isolate untrusted executables or
+host directories. Do not use Win-Runner alone to isolate untrusted executables or
 package install scripts. Use an operating-system sandbox, container, or VM
 when host isolation is required. Per-process sandboxing is not currently
 implemented.
 
 Headless snapshot runs keep the program's standard input connected to the
-WinCLI process and stream its output to standard output/error. An external
-controller can launch WinCLI with piped stdio, send input while the program is
+Win-Runner process and stream its output to standard output/error. An external
+controller can launch Win-Runner with piped stdio, send input while the program is
 running, and read output until the process exits. Add
 `--save-snapshot=tools.winfs` to persist filesystem changes after it exits.
 
@@ -80,7 +80,7 @@ tests/artifacts/  committed test artifacts (see below)
 ```
 
 Unsupported PE imports fail with a named error when called. Strict import
-binding is available through `WINCLI_NATIVE_STRICT_IMPORTS=1`.
+binding is available through `WINRUN_NATIVE_STRICT_IMPORTS=1`.
 
 ## Test artifacts
 
@@ -88,7 +88,7 @@ binding is available through `WINCLI_NATIVE_STRICT_IMPORTS=1`.
   case-insensitivity, `./..` normalization, and an error-path script.
 - `tests/artifacts/exe/*.exe` — real PE32+ x86_64 guest programs. The
   `fs_*.exe` guests self-verify inside the guest (print `PASS`, exit 0), so
-  each `wincli` run is a fully observable black box despite the per-process
+  each `winrun` run is a fully observable black box despite the per-process
   WinFS.
 - `examples/gen_artifacts.rs` — the Rust generator that builds the `.exe`
   artifacts from the `pe::builder` API. Regenerate with:
@@ -101,7 +101,7 @@ cargo run --example gen_artifacts
 
 Real Rust programs targeting `x86_64-pc-windows-msvc`, written `no_std` +
 `no_main` with a custom entry so they need no CRT startup and only the Win32
-APIs WinCLI implements. Built with rustup parts only (`rustc` + `rust-lld`,
+APIs Win-Runner implements. Built with rustup parts only (`rustc` + `rust-lld`,
 no mingw/xwin):
 
 ```bash
@@ -130,7 +130,7 @@ cargo test   # unit tests + CLI end-to-end tests against tests/artifacts/
 ## Interactive shell
 
 ```bash
-wincli shell
+winrun shell
 ```
 
 One ephemeral WinFS for the whole session (files created by one command
@@ -141,15 +141,14 @@ are visible to the next). Common shell commands include `cd`/`chdir`, `pwd`,
 installed in the session with args — so `install rg` followed by `rg --version`
 works. Use `help` to list the built-in commands.
 Errors print as
-`wincli: ...` without ending the session; `exit`/`quit` (or Ctrl-D) ends it
+`winrun: ...` without ending the session; `exit`/`quit` (or Ctrl-D) ends it
 with the last guest exit code. Interactive input supports cursor movement,
 insertion, deletion, history navigation, and Tab completion for built-in
 commands, PATH executables, and entries in the current guest directory. The
-prompt goes to stderr, keeping stdout clean for pipes. Interactive command history lives at
-`$XDG_STATE_HOME/wincli/shell-history` (or `~/.local/state/wincli/shell-history`)
-on the host, so it survives fresh ephemeral shells. A copy also lives at
-`C:\.system\shell-history` in WinFS and is carried by saved C: snapshots.
-Set `WINCLI_HISTORY_FILE` to choose a different host history file.
+prompt goes to stderr, keeping stdout clean for pipes. Interactive command
+history is stored only at `C:\.system\shell-history` in the guest filesystem.
+It follows a named instance or a saved C: snapshot; a fresh ephemeral shell
+starts with empty history. Win-Runner does not write shell history to host state.
 Use Windows-style `set NAME=value` or `path C:\tools;%PATH%` to update the
 session environment and guest executable search path.
 
@@ -158,12 +157,12 @@ session environment and guest executable search path.
 Start one persistent shell with a localhost WebSocket control endpoint:
 
 ```bash
-wincli --headless --control=127.0.0.1:0 shell
-wincli --headless --control=127.0.0.1:0 --snapshot=tools.winfs \
+winrun --headless --control=127.0.0.1:0 shell
+winrun --headless --control=127.0.0.1:0 --snapshot=tools.winfs \
   --save-snapshot=tools.winfs shell
 ```
 
-WinCLI prints one JSON `ready` line on stdout with the endpoint URL. Connect
+Win-Runner prints one JSON `ready` line on stdout with the endpoint URL. Connect
 using any WebSocket client (TypeScript, Python, Rust, or another language),
 then send JSON messages. The URL includes a random per-session token and the
 listener binds only to loopback.
@@ -203,18 +202,18 @@ loaded and are converted the next time they are saved.
 ## Packages
 
 ```bash
-wincli shell
+winrun shell
 winget install BurntSushi.ripgrep.MSVC
 rg --version
 choco install nodejs
 node --version
-install demo             # WINCLI_SOURCE=tests/artifacts/packages (local dir)
+install demo             # WINRUN_SOURCE=tests/artifacts/packages (local dir)
 demo
 snapshot save tools.snap
 ```
 
-`winget` and `choco` are WinCLI shell builtins, not the upstream package
-manager executables. WinCLI implements a limited install subset for portable
+`winget` and `choco` are Win-Runner shell builtins, not the upstream package
+manager executables. Win-Runner implements a limited install subset for portable
 packages; it verifies catalog hashes and stages installed commands on C:.
 `winget install <id>` supports portable or ZIP x64 packages, including
 architecture-neutral manifests whose payload validates as x64 PE. Common
@@ -225,9 +224,9 @@ and interactive installer packages are not supported.
 It resolves `<source>/<name>.json` + `<name>.zip` for local fixtures, stages
 the download in temporary process storage, and copies the executable into the
 current guest disk at `C:\bin\<name>.exe`. Both the staging area and guest disk are
-discarded when WinCLI exits unless you save a snapshot. Load that snapshot on
-the next run with `wincli --snapshot=tools.snap shell`; it is the only way to
-carry installed programs or other guest files between runs. `WINCLI_CACHE` is
+discarded when Win-Runner exits unless you save a snapshot. Load that snapshot on
+the next run with `winrun --snapshot=tools.snap shell`; it is the only way to
+carry installed programs or other guest files between runs. `WINRUN_CACHE` is
 not supported. Guest argv reaches the program via `GetCommandLineW/A` (MSVC
 quoting).
 `tests/artifacts/packages/` holds offline fixtures built by
@@ -239,7 +238,7 @@ WinGet IDs (`BurntSushi.ripgrep.MSVC`). Manifests come from winget-pkgs
 portable/zip x64 packages are accepted (plus neutral portable executables
 validated as x64 PE), downloads are SHA-256-verified against the
 manifest. Download staging is reused only during the current process and is
-removed when WinCLI exits.
+removed when Win-Runner exits.
 
 ## Node.js via `choco`
 
@@ -251,7 +250,7 @@ current guest disk. A new shell starts blank, so Node.js is available only
 after installing it in that session or loading a snapshot that contains it:
 
 ```bash
-wincli shell
+winrun shell
 choco install nodejs --version="24.21.0"
 node -v   # v24.21.0
 npm -v    # 11.19.0
@@ -272,38 +271,38 @@ Save the in-session disk, including Chocolatey-installed commands, and load it
 on a later run:
 
 ```bash
-wincli shell
+winrun shell
 choco install nodejs
 choco install 7zip.install -y
-snapshot save wincli.snap
+snapshot save winrun.snap
 exit
-wincli --snapshot=wincli.snap shell
+winrun --snapshot=winrun.snap shell
 node -v
 7z -h
 snapshot save                # overwrite the snapshot this shell loaded
 ```
 
-`wincli --save-snapshot=wincli.snap shell` also writes the disk when the shell
+`winrun --save-snapshot=winrun.snap shell` also writes the disk when the shell
 exits. A named `snapshot save <file>` establishes the default for later
 `snapshot save` commands; without a loaded or previously saved path, the first
 save needs a filename.
 
-Set `WINCLI_TEST_CHOCO=1` to run the live download-and-verify E2E test
+Set `WINRUN_TEST_CHOCO=1` to run the live download-and-verify E2E test
 (`cargo test --test choco_node`).
 
 ## Compatibility harness
 
-`wincli inspect` statically reports which imports a real Windows binary needs
-versus what WinCLI implements (exit 0 = runnable, 1 = missing APIs). Point it
+`winrun inspect` statically reports which imports a real Windows binary needs
+versus what Win-Runner implements (exit 0 = runnable, 1 = missing APIs). Point it
 at portable Windows CLI tools to drive expansion one program at a time:
 
 ```bash
-wincli inspect rg.exe
+winrun inspect rg.exe
 ```
 
 Native program output streams to the terminal while the program runs. To see
-where time is spent, start the shell with `WINCLI_TIMINGS=1 wincli shell`;
-WinCLI prints PE loading, native setup, time to first output, guest execution,
+where time is spent, start the shell with `WINRUN_TIMINGS=1 winrun shell`;
+Win-Runner prints PE loading, native setup, time to first output, guest execution,
 and filesystem-state timing details to stderr for each PE program, including
 the guest-disk read when a program is launched from the shell.
 
@@ -311,30 +310,30 @@ The official Node.js 24.21.0 Windows x64 `node.exe` runs on the Linux native
 backend for version reporting and simple JavaScript evaluation:
 
 ```bash
-wincli node.exe --version
-wincli node.exe -e 'console.log(1 + 2)'
+winrun node.exe --version
+winrun node.exe -e 'console.log(1 + 2)'
 ```
 
 The downloaded binary is kept locally under `target/nodejs/` for development
 and is not committed to this repository. Node still imports Windows APIs that
-WinCLI does not implement; untested Node features may stop at a named missing
-API. Set `WINCLI_NATIVE_DIAGNOSTIC=1` to log dynamic import misses and native
+Win-Runner does not implement; untested Node features may stop at a named missing
+API. Set `WINRUN_NATIVE_DIAGNOSTIC=1` to log dynamic import misses and native
 startup calls.
 Node can load JavaScript modules and read and stat files in WinFS. With the
 staged npm files under `target/nodejs/npm-stage/C/npm`, its CLI `--version`
 command also runs on the native backend. The offline tarball and live registry
 install paths have both been exercised.
-Set `WINCLI_NODE_EXE=target/nodejs/node-v24.21.0-win-x64.exe` when running
+Set `WINRUN_NODE_EXE=target/nodejs/node-v24.21.0-win-x64.exe` when running
 `cargo test --test node_native` to include the real binary checks. Set
-`WINCLI_TEST_LIVE_NPM=1` as well to install a package from the live npm registry.
-The npm E2E uses `WINCLI_NPM_ROOT` if set; otherwise it looks for
+`WINRUN_TEST_LIVE_NPM=1` as well to install a package from the live npm registry.
+The npm E2E uses `WINRUN_NPM_ROOT` if set; otherwise it looks for
 `npm-stage/C/npm` beside the Node executable. The executable
 comes from `https://nodejs.org/download/release/v24.21.0/win-x64/node.exe`;
 its official SHA-256 is
 `ba4e6d110e8c1592a1ecd390f6b05f3da124b13871a5be62b341a07a853c6c32`.
 
 The official ripgrep 15.2.0 Windows x64 `rg.exe` is a smaller native
-filesystem target. With a guest file created in `wincli shell`, it searches
+filesystem target. With a guest file created in `winrun shell`, it searches
 files and directories, lists paths, filters globs, and writes JSON results.
 Its Windows x64 zip is available from the [ripgrep release page](https://github.com/BurntSushi/ripgrep/releases/tag/15.2.0).
 The archive SHA-256 is
@@ -343,10 +342,10 @@ Keep the extracted executable under `target/compat/rg.exe` and run the real
 binary checks with:
 
 ```bash
-WINCLI_RG_EXE=target/compat/rg.exe cargo test --test rg_native
+WINRUN_RG_EXE=target/compat/rg.exe cargo test --test rg_native
 ```
 
-Like Node, ripgrep has optional static imports that `wincli inspect` lists as
+Like Node, ripgrep has optional static imports that `winrun inspect` lists as
 missing even when these tested paths run successfully.
 
 ## Console contract

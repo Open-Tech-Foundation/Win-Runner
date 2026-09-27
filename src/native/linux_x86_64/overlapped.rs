@@ -728,7 +728,7 @@ fn native_file_io_queue(
     for index in 0..FILE_IO_WORKERS {
         let worker_queue = Arc::clone(&queue);
         if std::thread::Builder::new()
-            .name(format!("wincli-file-io-{index}"))
+            .name(format!("winrun-file-io-{index}"))
             .spawn(move || native_file_io_worker(worker_queue))
             .is_err()
         {

@@ -1,5 +1,5 @@
 //! Optional live Chocolatey-style Node.js flow.
-//! Set WINCLI_TEST_CHOCO=1 to download the official `node-v24.21.0-win-x64`
+//! Set WINRUN_TEST_CHOCO=1 to download the official `node-v24.21.0-win-x64`
 //! distribution from nodejs.org, install it through the shell's `choco`
 //! builtin, and check `node -v` / `npm -v` on the native backend.
 
@@ -8,17 +8,17 @@ use std::process::{Command, Stdio};
 
 #[test]
 fn choco_install_nodejs_then_node_and_npm_report_pinned_versions() {
-    if std::env::var("WINCLI_TEST_CHOCO").as_deref() != Ok("1") {
+    if std::env::var("WINRUN_TEST_CHOCO").as_deref() != Ok("1") {
         return;
     }
     let script = "powershell -c \"irm https://community.chocolatey.org/install.ps1|iex\"\nchoco install nodejs --version=\"24.21.0\"\nnode -v\nnpm -v\nexit\n";
-    let mut child = Command::new(env!("CARGO_BIN_EXE_wincli"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_winrun"))
         .arg("shell")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("start WinCLI shell");
+        .expect("start Win-Runner shell");
     child
         .stdin
         .take()
@@ -49,13 +49,13 @@ fn choco_install_nodejs_then_node_and_npm_report_pinned_versions() {
         "npm -v wrong: {stdout}"
     );
 
-    let mut fresh = Command::new(env!("CARGO_BIN_EXE_wincli"))
+    let mut fresh = Command::new(env!("CARGO_BIN_EXE_winrun"))
         .arg("shell")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("start a fresh WinCLI shell");
+        .expect("start a fresh Win-Runner shell");
     fresh
         .stdin
         .take()
@@ -73,19 +73,19 @@ fn choco_install_nodejs_then_node_and_npm_report_pinned_versions() {
 
 #[test]
 fn choco_7zip_install_runs_and_survives_snapshot_reload() {
-    if std::env::var("WINCLI_TEST_CHOCO").as_deref() != Ok("1") {
+    if std::env::var("WINRUN_TEST_CHOCO").as_deref() != Ok("1") {
         return;
     }
-    let snapshot = std::env::temp_dir().join(format!("wincli-7zip-{}.snap", std::process::id()));
+    let snapshot = std::env::temp_dir().join(format!("winrun-7zip-{}.snap", std::process::id()));
     let script = "choco install 7zip.install -y\n7z -h\nexit\n";
-    let mut install = Command::new(env!("CARGO_BIN_EXE_wincli"))
+    let mut install = Command::new(env!("CARGO_BIN_EXE_winrun"))
         .arg(format!("--save-snapshot={}", snapshot.display()))
         .arg("shell")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("start WinCLI shell");
+        .expect("start Win-Runner shell");
     install
         .stdin
         .take()
@@ -106,14 +106,14 @@ fn choco_7zip_install_runs_and_survives_snapshot_reload() {
     );
     assert!(output.contains("7-Zip"), "7z did not run: {output}");
 
-    let mut reload = Command::new(env!("CARGO_BIN_EXE_wincli"))
+    let mut reload = Command::new(env!("CARGO_BIN_EXE_winrun"))
         .arg(format!("--snapshot={}", snapshot.display()))
         .arg("shell")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("reload WinCLI snapshot");
+        .expect("reload Win-Runner snapshot");
     reload
         .stdin
         .take()

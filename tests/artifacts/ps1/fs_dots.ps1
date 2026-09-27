@@ -1,5 +1,5 @@
-# WinCLI `.` / `..` / `/` normalization test.
-# Run: wincli fs_dots.ps1
+# Win-Runner `.` / `..` / `/` normalization test.
+# Run: winrun fs_dots.ps1
 # Expected stdout:
 #   dots-ok
 #   dots-ok

@@ -1,21 +1,21 @@
 use std::process::Command;
-use wincli::pe::builder::{build, Asm};
+use winrun::pe::builder::{build, Asm};
 
 fn run_guest(bytes: &[u8], diagnostic: bool, strict: bool) -> std::process::Output {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let path = std::env::temp_dir().join(format!(
-        "wincli-native-diag-{}-{}.exe",
+        "winrun-native-diag-{}-{}.exe",
         std::process::id(),
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::write(&path, bytes).unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_wincli"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_winrun"));
     command.arg(&path);
     if diagnostic {
-        command.env("WINCLI_NATIVE_DIAGNOSTIC", "1");
+        command.env("WINRUN_NATIVE_DIAGNOSTIC", "1");
     }
     if strict {
-        command.env("WINCLI_NATIVE_STRICT_IMPORTS", "1");
+        command.env("WINRUN_NATIVE_STRICT_IMPORTS", "1");
     }
     let output = command.output().unwrap();
     std::fs::remove_file(path).ok();
@@ -24,7 +24,7 @@ fn run_guest(bytes: &[u8], diagnostic: bool, strict: bool) -> std::process::Outp
 
 #[test]
 fn diagnostic_names_a_called_missing_import_in_native_guest() {
-    let output = run_guest(&wincli::pe::builder::unknown_import(), true, false);
+    let output = run_guest(&winrun::pe::builder::unknown_import(), true, false);
     assert_eq!(output.status.code(), Some(126));
     assert!(String::from_utf8_lossy(&output.stderr)
         .contains("unsupported native import called: KERNEL32.dll!NoSuchApiForTest"));

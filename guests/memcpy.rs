@@ -1,4 +1,4 @@
-//! Memory-copy torture guest for WinCLI: every copy size/shape the real
+//! Memory-copy torture guest for Win-Runner: every copy size/shape the real
 //! `rg.exe --help` path uses, verified byte-exact.
 //!
 //! M1: `copy_nonoverlapping` sizes 1..=320 (scalar/SSE/rep lowerings).

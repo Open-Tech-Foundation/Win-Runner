@@ -1074,7 +1074,7 @@ pub fn copy_file(src: &str, dst: &str) -> Vec<u8> {
 
 // ---------- self-verifying guest programs (used as committed test artifacts) ----------
 // Each prints `PASS\n` + exit 0 on success, `FAIL\n` + exit 1 on any failure,
-// so `wincli the.exe` is fully observable black-box (fresh WinFS per process).
+// so `winrun the.exe` is fully observable black-box (fresh WinFS per process).
 
 const CF: usize = 0; // CreateFileW
 const WF: usize = 1; // WriteFile

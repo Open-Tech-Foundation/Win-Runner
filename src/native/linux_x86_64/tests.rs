@@ -1988,7 +1988,7 @@ mod protection_tests {
 
     #[test]
     fn crt_getenv_reads_guest_environment_case_insensitively() {
-        let key: Vec<u16> = "WINCLI_TEST_CRT_GETENV"
+        let key: Vec<u16> = "WINRUN_TEST_CRT_GETENV"
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
@@ -2000,14 +2000,14 @@ mod protection_tests {
             super::native_set_environment_variable_w(key.as_ptr(), value.as_ptr()),
             1
         );
-        let lookup = b"wincli_test_crt_getenv\0";
+        let lookup = b"winrun_test_crt_getenv\0";
         let result = super::native_crt_getenv(lookup.as_ptr());
         assert!(!result.is_null());
         assert_eq!(
             unsafe { std::ffi::CStr::from_ptr(result.cast()) }.to_bytes(),
             b"guest-value"
         );
-        assert!(super::native_crt_getenv(b"WINCLI_MISSING_CRT_GETENV\0".as_ptr()).is_null());
+        assert!(super::native_crt_getenv(b"WINRUN_MISSING_CRT_GETENV\0".as_ptr()).is_null());
         assert_eq!(
             super::native_set_environment_variable_w(key.as_ptr(), std::ptr::null()),
             1
@@ -5005,7 +5005,7 @@ mod protection_tests {
 
     #[test]
     fn sets_reads_and_removes_a_guest_environment_variable() {
-        let name: Vec<u16> = "WINCLI_TEST_NODE_ENV"
+        let name: Vec<u16> = "WINRUN_TEST_NODE_ENV"
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
@@ -5445,13 +5445,16 @@ mod protection_tests {
             native_get_user_profile_directory_w(u64::MAX - 3, std::ptr::null_mut(), &mut len),
             0
         );
-        assert_eq!(len, 16);
-        let mut output = [0; 16];
+        assert_eq!(len, 20);
+        let mut output = [0; 32];
         assert_eq!(
             native_get_user_profile_directory_w(u64::MAX - 3, output.as_mut_ptr(), &mut len),
             1
         );
-        assert_eq!(String::from_utf16_lossy(&output[..15]), "C:\\Users\\wincli");
+        assert_eq!(
+            String::from_utf16_lossy(&output[..19]),
+            "C:\\Users\\Win-Runner"
+        );
     }
 
     #[test]
@@ -5553,7 +5556,7 @@ mod protection_tests {
         let count = native_format_message_w(0, 0, 5, 0, output.as_mut_ptr(), 32, 0);
         assert_eq!(
             String::from_utf16_lossy(&output[..count as usize]),
-            "WinCLI native error.\r\n"
+            "Win-Runner native error.\r\n"
         );
     }
 
@@ -5566,7 +5569,7 @@ mod protection_tests {
         );
         let mut output = [0u8; 64];
         let count = native_format_message_a(0x1000, 0, 5, 0, output.as_mut_ptr(), 64, 0);
-        assert_eq!(&output[..count as usize], b"WinCLI native error.\r\n");
+        assert_eq!(&output[..count as usize], b"Win-Runner native error.\r\n");
         assert_eq!(output[count as usize], 0);
     }
 
@@ -5763,7 +5766,7 @@ mod protection_tests {
         let len = native_get_module_file_name_w(0, path.as_mut_ptr(), path.len() as u32);
         assert_eq!(
             String::from_utf16(&path[..len as usize]).unwrap(),
-            "C:\\wincli\\wincli.exe"
+            "C:\\winrun\\winrun.exe"
         );
         let mut short = [0; 3];
         assert_eq!(native_get_module_file_name_w(0, short.as_mut_ptr(), 3), 3);

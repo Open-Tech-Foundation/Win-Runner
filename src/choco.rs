@@ -1,7 +1,7 @@
 //! Chocolatey-compatible package installer (shell builtin).
 //!
 //! Real Chocolatey is a Windows service with a full PowerShell runtime
-//! behind it; instead of executing the bootstrap script, wincli ships the
+//! behind it; instead of executing the bootstrap script, winrun ships the
 //! `choco` command natively. `choco install nodejs` downloads the official
 //! `node-v<version>-win-x64.zip` from nodejs.org, verifies its SHA-256
 //! against the release `SHASUMS256.txt`, caches `node.exe` as the `node`
@@ -31,7 +31,7 @@ pub const SHIM_VERSION: &str = "0.1.0";
 /// Override the distribution base URL (tests point this at a local
 /// directory; `curl` serves `file://` URLs too).
 fn dist_base() -> String {
-    match std::env::var("WINCLI_NODEJS_DIST") {
+    match std::env::var("WINRUN_NODEJS_DIST") {
         Ok(base) if !base.is_empty() => base.trim_end_matches('/').to_string(),
         _ => "https://nodejs.org/dist".to_string(),
     }
@@ -284,7 +284,7 @@ fn base64_decode(raw: &str) -> Result<Vec<u8>, String> {
 
 /// Community feed base (tests point this at a local directory).
 fn community_feed_base() -> String {
-    match std::env::var("WINCLI_CHOCOLATEY_FEED") {
+    match std::env::var("WINRUN_CHOCOLATEY_FEED") {
         Ok(base) if !base.is_empty() => base.trim_end_matches('/').to_string(),
         _ => "https://community.chocolatey.org/api/v2".to_string(),
     }
@@ -959,7 +959,7 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    /// Tests mutate `WINCLI_NODEJS_DIST`; serialize them (Rust runs tests
+    /// Tests mutate `WINRUN_NODEJS_DIST`; serialize them (Rust runs tests
     /// in parallel threads of one process).
     static DIST_ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1026,7 +1026,7 @@ mod tests {
 
     #[test]
     fn safe_archive_paths_reject_host_and_windows_escape_forms() {
-        let root = std::env::temp_dir().join(format!("wincli-archive-path-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("winrun-archive-path-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         for path in [
             "../../../.bashrc",
@@ -1052,7 +1052,7 @@ mod tests {
 
     #[test]
     fn nupkg_extraction_rejects_traversal_before_host_write() {
-        let root = std::env::temp_dir().join(format!("wincli-nupkg-slip-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("winrun-nupkg-slip-{}", std::process::id()));
         let dest = root.join("cache");
         std::fs::create_dir_all(&root).unwrap();
         let blob = zip_stored(&[("tools/../../../outside.txt", b"owned")]);
@@ -1064,7 +1064,7 @@ mod tests {
 
     #[test]
     fn nested_zip_extraction_rejects_absolute_and_traversal_paths() {
-        let root = std::env::temp_dir().join(format!("wincli-nested-slip-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("winrun-nested-slip-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let payload = root.join("payload.zip");
         std::fs::write(&payload, zip_stored(&[(r"C:\outside.txt", b"owned")])).unwrap();
@@ -1077,7 +1077,7 @@ mod tests {
 
     #[test]
     fn npm_tree_extraction_rejects_drive_prefixed_members() {
-        let root = std::env::temp_dir().join(format!("wincli-npm-slip-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("winrun-npm-slip-{}", std::process::id()));
         let dest = root.join("npm");
         std::fs::create_dir_all(&root).unwrap();
         let blob = zip_stored(&[("node/node_modules/npm/C:/outside.txt", b"owned")]);
@@ -1091,7 +1091,7 @@ mod tests {
     #[test]
     fn safe_archive_join_rejects_existing_symlink_components() {
         use std::os::unix::fs::symlink;
-        let root = std::env::temp_dir().join(format!("wincli-archive-link-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("winrun-archive-link-{}", std::process::id()));
         let outside = root.join("outside");
         let dest = root.join("dest");
         std::fs::create_dir_all(&outside).unwrap();
@@ -1137,7 +1137,7 @@ mod tests {
     #[test]
     fn installs_nodejs_from_a_fixture_dist() {
         let _guard = DIST_ENV_LOCK.lock().unwrap();
-        let tag = format!("wincli-choco-{}", std::process::id());
+        let tag = format!("winrun-choco-{}", std::process::id());
         let dist = std::env::temp_dir().join(format!("{tag}-dist"));
         let cache = std::env::temp_dir().join(format!("{tag}-cache"));
         std::fs::create_dir_all(dist.join("v9.9.9")).unwrap();
@@ -1159,7 +1159,7 @@ mod tests {
             format!("{sha}  node-v9.9.9-win-x64.zip\n"),
         )
         .unwrap();
-        std::env::set_var("WINCLI_NODEJS_DIST", format!("file://{}", dist.display()));
+        std::env::set_var("WINRUN_NODEJS_DIST", format!("file://{}", dist.display()));
         let inst = install_nodejs("9.9.9", &cache).unwrap();
         assert_eq!(inst.version, "9.9.9");
         assert_eq!(inst.npm_version, "9.9.9");
@@ -1167,7 +1167,7 @@ mod tests {
         assert!(inst.npm_root_host.join("bin").join("npm-cli.js").is_file());
         // Second run is a cache hit (no network needed).
         std::fs::remove_dir_all(&dist).unwrap();
-        std::env::remove_var("WINCLI_NODEJS_DIST");
+        std::env::remove_var("WINRUN_NODEJS_DIST");
         let again = install_nodejs("9.9.9", &cache).unwrap();
         assert_eq!(again.npm_version, "9.9.9");
         let _ = std::fs::remove_dir_all(&cache);
@@ -1176,7 +1176,7 @@ mod tests {
     #[test]
     fn refuses_tampered_fixture_zip() {
         let _guard = DIST_ENV_LOCK.lock().unwrap();
-        let tag = format!("wincli-choco-tamper-{}", std::process::id());
+        let tag = format!("winrun-choco-tamper-{}", std::process::id());
         let dist = std::env::temp_dir().join(format!("{tag}-dist"));
         let cache = std::env::temp_dir().join(format!("{tag}-cache"));
         std::fs::create_dir_all(dist.join("v9.9.8")).unwrap();
@@ -1190,10 +1190,10 @@ mod tests {
             format!("{}  node-v9.9.8-win-x64.zip\n", "0".repeat(64)),
         )
         .unwrap();
-        std::env::set_var("WINCLI_NODEJS_DIST", format!("file://{}", dist.display()));
+        std::env::set_var("WINRUN_NODEJS_DIST", format!("file://{}", dist.display()));
         let err = install_nodejs("9.9.8", &cache).unwrap_err();
         assert!(err.contains("SHA-256 mismatch"), "{err}");
-        std::env::remove_var("WINCLI_NODEJS_DIST");
+        std::env::remove_var("WINRUN_NODEJS_DIST");
         let _ = std::fs::remove_dir_all(&dist);
         let _ = std::fs::remove_dir_all(&cache);
     }

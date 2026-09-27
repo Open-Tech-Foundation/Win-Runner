@@ -323,7 +323,7 @@ pub(super) extern "win64" fn native_crt_mbstowcs(
             }
             return converted;
         }
-        // WinCLI's CRT currently uses the C locale: multibyte input is
+        // Win-Runner's CRT currently uses the C locale: multibyte input is
         // ASCII, with bytes outside that range reported as EILSEQ.
         if byte > 0x7f {
             THREAD_CRT_ERRNO.with(|error| error.set(42));

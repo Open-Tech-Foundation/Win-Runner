@@ -203,7 +203,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
             NATIVE_CRT_ACMDLN.store(empty, Ordering::Release);
             Some(NATIVE_CRT_ACMDLN.as_ptr() as u64)
         }
-        "RtlCaptureContext" => Some(wincli_native_rtl_capture_context as *const () as usize as u64),
+        "RtlCaptureContext" => Some(winrun_native_rtl_capture_context as *const () as usize as u64),
         // Winsock's stable ordinal exports for byte-order conversion.
         "#8" | "#14" => Some(native_network_u32 as *const () as usize as u64),
         "#9" | "#15" => Some(native_network_u16 as *const () as usize as u64),
@@ -772,7 +772,7 @@ extern "win64" fn native_missing_import(message: *const u8, len: u64) -> ! {
         }
         offset += written as usize;
     }
-    if std::env::var_os("WINCLI_NATIVE_WORKER").as_deref() == Some(std::ffi::OsStr::new("1")) {
+    if std::env::var_os("WINRUN_NATIVE_WORKER").as_deref() == Some(std::ffi::OsStr::new("1")) {
         let fd = NATIVE_WORKER_RESULT_FD.load(Ordering::Acquire);
         if fd >= 0 {
             let code = 126u32.to_le_bytes();
