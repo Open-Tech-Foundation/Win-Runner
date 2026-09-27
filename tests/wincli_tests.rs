@@ -949,6 +949,43 @@ fn test_argv_echo_cli() {
 }
 
 #[test]
+fn guest_arguments_that_match_wincli_options_are_preserved() {
+    let snapshot = tmp_path("guest-options.winfs");
+    let mut fs = WinFs::new();
+    fs.mkdir(r"C:\bin").unwrap();
+    fs.write_file(
+        r"C:\bin\rust_argv.exe",
+        std::fs::read(artifact("exe/rust_argv.exe")).unwrap(),
+    )
+    .unwrap();
+    wincli::snapshot::save_file(&mut fs, snapshot.to_str().unwrap()).unwrap();
+
+    let guest_args = [
+        "--mount=guest-drive".to_string(),
+        "--snapshot=guest-snapshot".to_string(),
+        "--headless".to_string(),
+        "--control=guest-address".to_string(),
+    ];
+    let output = Command::new(env!("CARGO_BIN_EXE_wincli"))
+        .arg(format!("--snapshot={}", snapshot.display()))
+        .arg(r"C:\bin\rust_argv.exe")
+        .args(&guest_args)
+        .output()
+        .expect("run guest with WinCLI-like arguments");
+    let _ = std::fs::remove_file(snapshot);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        b"C:\\bin\\rust_argv.exe --mount=guest-drive --snapshot=guest-snapshot --headless --control=guest-address\n"
+    );
+}
+
+#[test]
 fn test_ps1_with_args_rejected() {
     let (code, _, stderr) = run_wincli_env(
         &[artifact("ps1/fs_dots.ps1").to_str().unwrap(), "extra"],

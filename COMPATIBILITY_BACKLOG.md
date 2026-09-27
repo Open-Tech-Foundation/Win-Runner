@@ -31,7 +31,7 @@ Items remain open until implementation and relevant verification are complete.
   child changes are applied on normal exit, can be lost on kill/crash, and
   concurrent writers are last-finisher-wins. Document this behavior and plan
   shared/incremental filesystem updates for cooperating processes.
-- [ ] **6. Preserve guest arguments after the executable.** Parse WinCLI
+- [x] **6. Preserve guest arguments after the executable.** Parse WinCLI
   options only before the target program; pass later `--snapshot`, `--mount`,
   `--control`, and `--headless` arguments through unchanged.
 - [ ] **7. Verify stderr on the control channel.** Trace native guest stderr and

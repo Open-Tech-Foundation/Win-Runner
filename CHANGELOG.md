@@ -17,6 +17,8 @@ All notable changes to this project will be documented in this file.
   compared session tokens in constant time.
 - Documented child WinFS snapshot visibility, crash persistence, and the
   current last-applied-write behavior for concurrent children.
+- Stopped consuming WinCLI options after the target program, preserving
+  guest arguments that happen to match WinCLI flags.
 - Added a guest `C:\bin\powershell.exe` shell link so native child-process
   launches run scripts through WinCLI's PowerShell-compatible interpreter.
 - Added the `KERNEL32!NeedCurrentDirectoryForExePathW` shim used by child

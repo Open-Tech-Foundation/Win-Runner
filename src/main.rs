@@ -29,8 +29,58 @@ fn usage() -> ! {
     exit(2);
 }
 
+#[derive(Default)]
+struct RuntimeOptions {
+    snapshot_path: Option<String>,
+    save_snapshot_path: Option<String>,
+    mount_specs: Vec<String>,
+    read_only_mount_specs: Vec<String>,
+    control_bind: Option<String>,
+    headless: bool,
+}
+
+/// Consume WinCLI options only before the command target. Everything from the
+/// target onward belongs to the guest program, even when it resembles a
+/// WinCLI option.
+fn parse_runtime_options(argv: &[String]) -> (RuntimeOptions, Vec<String>) {
+    let mut options = RuntimeOptions::default();
+    let mut args = argv.first().cloned().into_iter().collect::<Vec<_>>();
+    let mut index = 1;
+    while index < argv.len() {
+        let arg = &argv[index];
+        if arg == "--" {
+            args.extend(argv[index + 1..].iter().cloned());
+            break;
+        }
+        if let Some(value) = arg.strip_prefix("--snapshot=") {
+            options
+                .snapshot_path
+                .get_or_insert_with(|| value.to_string());
+        } else if let Some(value) = arg.strip_prefix("--save-snapshot=") {
+            options
+                .save_snapshot_path
+                .get_or_insert_with(|| value.to_string());
+        } else if let Some(value) = arg.strip_prefix("--mount=") {
+            options.mount_specs.push(value.to_string());
+        } else if let Some(value) = arg.strip_prefix("--mount-ro=") {
+            options.read_only_mount_specs.push(value.to_string());
+        } else if let Some(value) = arg.strip_prefix("--control=") {
+            options
+                .control_bind
+                .get_or_insert_with(|| value.to_string());
+        } else if arg == "--headless" {
+            options.headless = true;
+        } else {
+            args.extend(argv[index..].iter().cloned());
+            break;
+        }
+        index += 1;
+    }
+    (options, args)
+}
+
 fn main() {
-    let mut args: Vec<String> = std::env::args().collect();
+    let args: Vec<String> = std::env::args().collect();
     if (args.len() == 4 || args.len() == 5) && args[1] == "__instance-daemon" {
         let snapshot = args.get(4).map(String::as_str);
         if let Err(e) = instance::run_daemon(&args[2], &args[3], snapshot) {
@@ -40,39 +90,13 @@ fn main() {
         return;
     }
     install::prepare_process_cache();
-    let snapshot_path = args
-        .iter()
-        .find_map(|arg| arg.strip_prefix("--snapshot="))
-        .map(str::to_string);
-    let save_snapshot_path = args
-        .iter()
-        .find_map(|arg| arg.strip_prefix("--save-snapshot="))
-        .map(str::to_string);
-    let mount_specs: Vec<String> = args
-        .iter()
-        .filter_map(|arg| arg.strip_prefix("--mount=").map(str::to_string))
-        .collect();
-    let read_only_mount_specs: Vec<String> = args
-        .iter()
-        .filter_map(|arg| arg.strip_prefix("--mount-ro=").map(str::to_string))
-        .collect();
-    let control_bind = args
-        .iter()
-        .find_map(|arg| arg.strip_prefix("--control="))
-        .map(str::to_string);
-    let headless = args.iter().any(|arg| arg == "--headless");
-    args.retain(|arg| {
-        !arg.starts_with("--snapshot=") && !arg.starts_with("--control=") && arg != "--headless"
-    });
-    if let Some(path) = save_snapshot_path.as_deref() {
-        if let Some(index) = args
-            .iter()
-            .position(|arg| arg == &format!("--save-snapshot={path}"))
-        {
-            args.remove(index);
-        }
-    }
-    args.retain(|arg| !arg.starts_with("--mount=") && !arg.starts_with("--mount-ro="));
+    let (options, args) = parse_runtime_options(&args);
+    let snapshot_path = options.snapshot_path.as_deref();
+    let save_snapshot_path = options.save_snapshot_path.as_deref();
+    let mount_specs = options.mount_specs;
+    let read_only_mount_specs = options.read_only_mount_specs;
+    let control_bind = options.control_bind;
+    let headless = options.headless;
     if let Some(bind) = control_bind.as_deref() {
         if !headless || args.len() != 2 || args[1] != "shell" {
             eprintln!("wincli: --control requires --headless and the shell target");
@@ -281,6 +305,61 @@ fn save_snapshot_if_requested(path: Option<&str>, fs: &mut WinFs) {
             exit(1);
         }
         eprintln!("wincli: saved C: disk snapshot {path}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_runtime_options;
+
+    fn argv(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| (*word).to_string()).collect()
+    }
+
+    #[test]
+    fn runtime_options_stop_at_guest_program() {
+        let input = argv(&[
+            "wincli",
+            "--snapshot=disk.winfs",
+            "--mount=Z:/host",
+            "C:\\bin\\tool.exe",
+            "--mount=guest-value",
+            "--snapshot=guest-value",
+            "--headless",
+            "--control=guest-value",
+        ]);
+        let (options, args) = parse_runtime_options(&input);
+        assert_eq!(options.snapshot_path.as_deref(), Some("disk.winfs"));
+        assert_eq!(options.mount_specs, ["Z:/host"]);
+        assert!(!options.headless);
+        assert_eq!(
+            args,
+            argv(&[
+                "wincli",
+                "C:\\bin\\tool.exe",
+                "--mount=guest-value",
+                "--snapshot=guest-value",
+                "--headless",
+                "--control=guest-value",
+            ])
+        );
+    }
+
+    #[test]
+    fn runtime_option_separator_passes_remaining_arguments_through() {
+        let input = argv(&[
+            "wincli",
+            "--snapshot=disk.winfs",
+            "--",
+            "C:\\bin\\tool.exe",
+            "--mount=guest-value",
+        ]);
+        let (options, args) = parse_runtime_options(&input);
+        assert_eq!(options.snapshot_path.as_deref(), Some("disk.winfs"));
+        assert_eq!(
+            args,
+            argv(&["wincli", "C:\\bin\\tool.exe", "--mount=guest-value"])
+        );
     }
 }
 
