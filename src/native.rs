@@ -3554,6 +3554,67 @@ mod imp {
         }
 
         #[test]
+        fn modern_file_handle_cannot_be_associated_with_two_completion_ports() {
+            let path = r"C:\modern_duplicate_file_iocp.txt";
+            let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(path, Vec::new())
+                .unwrap();
+            let handle =
+                super::native_create_file_w(wide.as_ptr(), 0x4000_0000, 7, 0, 3, 0x4000_0000, 0);
+            assert_ne!(handle, u64::MAX);
+            let first_port = super::native_create_io_completion_port(handle, 0, 0x1111, 0);
+            assert_ne!(first_port, 0);
+
+            let second_port = super::native_create_io_completion_port(handle, 0, 0x2222, 0);
+            let error = super::native_get_last_error();
+            assert_eq!(super::native_close_handle(handle), 1);
+            assert_eq!(super::native_close_handle(first_port), 1);
+            context.lock().unwrap().fs.delete_file(path).unwrap();
+            assert_eq!(second_port, 0);
+            assert_eq!(error, 87); // ERROR_INVALID_PARAMETER
+        }
+
+        #[test]
+        fn modern_ansi_file_mapping_view_commits_guest_file_changes() {
+            type CreateFileMappingA =
+                unsafe extern "win64" fn(u64, u64, u32, u32, u32, *const u8) -> u64;
+            let create_mapping: CreateFileMappingA = unsafe {
+                std::mem::transmute(require_kernel32_api(b"CreateFileMappingA\0") as usize)
+            };
+            let path = r"C:\modern_file_mapping_ansi.txt";
+            let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(path, b"abcdef".to_vec())
+                .unwrap();
+            let file = super::native_create_file_w(wide.as_ptr(), 0xC000_0000, 7, 0, 3, 0, 0);
+            assert_ne!(file, u64::MAX);
+
+            let mapping = unsafe { create_mapping(file, 0, 0x04, 0, 6, std::ptr::null()) };
+            assert_ne!(mapping, 0);
+            let view = super::native_map_view_of_file(mapping, 0x2, 0, 0, 6);
+            assert!(!view.is_null());
+            unsafe { view.add(2).write(b'Z') };
+            assert_eq!(super::native_flush_view_of_file(view.cast(), 0), 1);
+            assert_eq!(
+                context.lock().unwrap().fs.read_file(path).unwrap(),
+                b"abZdef"
+            );
+            assert_eq!(super::native_unmap_view_of_file(view.cast()), 1);
+            assert_eq!(super::native_close_handle(mapping), 1);
+            assert_eq!(super::native_close_handle(file), 1);
+            context.lock().unwrap().fs.delete_file(path).unwrap();
+        }
+
+        #[test]
         fn modern_ansi_replace_file_moves_old_data_to_backup() {
             type ReplaceFileA =
                 unsafe extern "win64" fn(*const u8, *const u8, *const u8, u32, u64, u64) -> i32;
