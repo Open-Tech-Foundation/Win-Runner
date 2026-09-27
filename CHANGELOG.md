@@ -72,6 +72,8 @@ All notable changes to this project will be documented in this file.
   modules, keeping their host-specific implementation beside the Linux backend.
 - Moved Winsock API shims into a Linux backend socket module, with Linux socket
   ABI calls remaining in the backend-local host bindings.
+- Moved WinFs-backed file, directory, and named-pipe API shims into a dedicated
+  Linux backend module.
 - Added the C-locale `msvcrt!mbstowcs` shim used by Nano.
 - Added an optional native Node check proving a relative file that Node leaves
   in WinFS appears in the following shell directory listing.
