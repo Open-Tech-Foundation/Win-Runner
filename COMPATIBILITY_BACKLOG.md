@@ -54,9 +54,10 @@ Items remain open until implementation and relevant verification are complete.
   unsupported-host behavior live in separate backend modules. Linux host ABI
   declarations, PE import/trampoline lookup, image mapping, and process launch
   support, Winsock shims, and WinFs-backed file/directory/named-pipe APIs are
-  separate backend-local modules. The remaining Linux backend still contains
-  other API groups and should be split by Windows API subsystem while keeping
-  host syscalls backend-local so macOS can provide its own.
+  separate backend-local modules. Standard stream, descriptor, duplicate, file
+  type, and close shims now live in a handles module; the shared per-process
+  handle maps remain in the backend state. Other API groups still need splitting
+  by Windows subsystem while host syscalls remain backend-local for macOS.
 - [x] Cache `WINCLI_NATIVE_DIAGNOSTIC` once rather than reading the environment
   from hot shims; initialize the cache before guest forks.
 - [x] Fix Clippy's unevenly grouped hexadecimal literal warnings. A current

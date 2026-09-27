@@ -74,6 +74,8 @@ All notable changes to this project will be documented in this file.
   ABI calls remaining in the backend-local host bindings.
 - Moved WinFs-backed file, directory, and named-pipe API shims into a dedicated
   Linux backend module.
+- Moved standard stream, descriptor conversion, duplication, type, and close
+  APIs into a dedicated Linux backend handle module.
 - Added the C-locale `msvcrt!mbstowcs` shim used by Nano.
 - Added an optional native Node check proving a relative file that Node leaves
   in WinFS appears in the following shell directory listing.
