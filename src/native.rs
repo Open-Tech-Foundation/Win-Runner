@@ -2496,6 +2496,40 @@ mod imp {
         }
 
         #[test]
+        fn modern_wide_move_file_preserves_existing_destination() {
+            type MoveFileW = unsafe extern "win64" fn(*const u16, *const u16) -> i32;
+            let move_file: MoveFileW =
+                unsafe { std::mem::transmute(require_kernel32_api(b"MoveFileW\0") as usize) };
+            let source = r"C:\modern_move_wide_conflict_source.txt";
+            let destination = r"C:\modern_move_wide_conflict_destination.txt";
+            let source_wide = source.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let destination_wide = destination.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            {
+                let mut ctx = context.lock().unwrap();
+                ctx.fs.write_file(source, b"source-data".to_vec()).unwrap();
+                ctx.fs
+                    .write_file(destination, b"destination-data".to_vec())
+                    .unwrap();
+            }
+
+            assert_eq!(
+                unsafe { move_file(source_wide.as_ptr(), destination_wide.as_ptr()) },
+                0
+            );
+            let error = super::native_get_last_error();
+            let ctx = context.lock().unwrap();
+            assert!(ctx.fs.exists(source));
+            assert_eq!(ctx.fs.read_file(source).unwrap(), b"source-data");
+            assert_eq!(ctx.fs.read_file(destination).unwrap(), b"destination-data");
+            drop(ctx);
+            let mut ctx = context.lock().unwrap();
+            ctx.fs.delete_file(source).unwrap();
+            ctx.fs.delete_file(destination).unwrap();
+            assert_eq!(error, 183); // ERROR_ALREADY_EXISTS
+        }
+
+        #[test]
         fn modern_wide_delete_file_removes_guest_file() {
             type DeleteFileW = unsafe extern "win64" fn(*const u16) -> i32;
             let delete_file: DeleteFileW =
@@ -2512,6 +2546,18 @@ mod imp {
 
             assert_eq!(unsafe { delete_file(wide.as_ptr()) }, 1);
             assert!(!context.lock().unwrap().fs.exists(path));
+        }
+
+        #[test]
+        fn modern_wide_delete_file_reports_missing_path() {
+            type DeleteFileW = unsafe extern "win64" fn(*const u16) -> i32;
+            let delete_file: DeleteFileW =
+                unsafe { std::mem::transmute(require_kernel32_api(b"DeleteFileW\0") as usize) };
+            let path = r"C:\modern_delete_wide_missing.txt";
+            let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+
+            assert_eq!(unsafe { delete_file(wide.as_ptr()) }, 0);
+            assert_eq!(super::native_get_last_error(), 2); // ERROR_FILE_NOT_FOUND
         }
 
         #[test]

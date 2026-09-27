@@ -44,6 +44,8 @@ All notable changes to this project will be documented in this file.
   and invalid-handle errors; corrected handle setup in several pending API
   behavior fixtures.
 - Added direct wide-path `MoveFileW` and `DeleteFileW` behavior cases.
+- Added wide-path move and delete failure cases for existing destinations and
+  missing files.
 - Added ANSI temporary-file and symbolic-link cases, all reference
   `FindFirstFileExA` option combinations, and invalid-input checks for
   `OpenFileById` and `SetFileValidData`.
