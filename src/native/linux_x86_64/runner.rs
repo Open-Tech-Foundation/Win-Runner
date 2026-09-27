@@ -461,9 +461,15 @@ fn run_rust_baseline_argv_with_fs_impl(
         let process = Arc::new(NativeProcessContext {
             image_base: img.image_base,
             module_path: prog.to_string(),
-            process_id: 1,
+            process_id: std::env::var("WINCLI_NATIVE_PROCESS_ID")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1),
             process_handle: u64::MAX,
-            parent_process_id: 0,
+            parent_process_id: std::env::var("WINCLI_NATIVE_PARENT_PROCESS_ID")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0),
             command_line_w,
             command_line_a,
             environment: Mutex::new(environment.to_vec()),

@@ -25,6 +25,7 @@ unsafe extern "C" {
     pub(super) fn pipe(fds: *mut i32) -> i32;
     pub(super) fn socketpair(domain: i32, kind: i32, protocol: i32, fds: *mut i32) -> i32;
     pub(super) fn fork() -> i32;
+    pub(super) fn dup(fd: i32) -> i32;
     #[cfg(test)]
     pub(super) fn pause() -> i32;
     pub(super) fn dup2(oldfd: i32, newfd: i32) -> i32;

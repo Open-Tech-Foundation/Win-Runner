@@ -752,6 +752,239 @@ pub(super) fn finish_native_child(
     }
 }
 
+struct ChildWorkerDirectory(std::path::PathBuf);
+
+static NEXT_EXEC_CHILD_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+
+impl Drop for ChildWorkerDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn worker_stdio_for_handle(
+    handle: u64,
+    pipes: &NativeNamedPipeTable,
+) -> Result<std::process::Stdio, u32> {
+    use std::os::fd::FromRawFd;
+    use std::process::Stdio;
+    if let Some((device, _)) = native_device(handle) {
+        return match device {
+            NativeDevice::Null => Ok(Stdio::null()),
+            NativeDevice::Console { .. }
+            | NativeDevice::ConsoleIn(_)
+            | NativeDevice::ConsoleOut(_) => Ok(Stdio::inherit()),
+        };
+    }
+    if matches!(handle, 0..=2 | STD_HANDLE_BASE..=0x5000_0002) {
+        return Ok(Stdio::inherit());
+    }
+    let Some(pipe) = pipes.handles.get(&handle) else {
+        return Err(6); // ERROR_INVALID_HANDLE
+    };
+    let fd = unsafe { dup(pipe.endpoint.fd) };
+    if fd < 0 {
+        return Err(8); // ERROR_NOT_ENOUGH_MEMORY
+    }
+    // SAFETY: dup returned a new descriptor whose ownership moves into Stdio.
+    let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    Ok(Stdio::from(owned))
+}
+
+fn can_exec_worker_child(
+    child_fs: &NativeFs,
+    parent: &NativeProcessContext,
+    std_handles: [u64; 3],
+    inherit_handles: bool,
+) -> bool {
+    // The current worker request transports the filesystem image and the
+    // three standard streams. Open WinFS handles, locks, and mapped files need
+    // a process-wide handle protocol before they can cross an exec boundary.
+    if !child_fs.handles.is_empty()
+        || !child_fs.file_shares.is_empty()
+        || !child_fs.finds.is_empty()
+        || !child_fs.file_completion_modes.is_empty()
+        || !child_fs.delete_on_close.is_empty()
+        || !child_fs.file_locks.is_empty()
+        || !child_fs.file_access.is_empty()
+    {
+        return false;
+    }
+    if child_fs
+        .devices
+        .keys()
+        .any(|handle| !std_handles.contains(handle))
+    {
+        return false;
+    }
+    let Ok(pipes) = parent.named_pipes.lock() else {
+        return false;
+    };
+    if inherit_handles {
+        let std_set = std_handles
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        if pipes
+            .handles
+            .iter()
+            .any(|(handle, pipe)| pipe.inheritable && !std_set.contains(handle))
+        {
+            return false;
+        }
+    }
+    std_handles.iter().all(|handle| {
+        if matches!(handle, 0..=2 | STD_HANDLE_BASE..=0x5000_0002)
+            || native_device(*handle).is_some()
+        {
+            return true;
+        }
+        if pipes.handles.contains_key(handle) {
+            return inherit_handles;
+        }
+        host_standard_fd(*handle).is_some()
+    })
+}
+
+fn create_exec_worker_child(
+    parent: &Arc<NativeProcessContext>,
+    launch: &NativeLaunchSpec,
+    image: &PeImage,
+    mut child_fs: WinFs,
+    child_std_handles: [u64; 3],
+    inherit_handles: bool,
+    environment: &[(String, String)],
+    process_information: u64,
+) -> Result<(), u32> {
+    use std::process::Command;
+
+    let executable = std::env::var_os("WINCLI_NATIVE_WORKER_EXE").ok_or(120u32)?;
+    let pipes = parent.named_pipes.lock().map_err(|_| 6u32)?;
+    let stdio = child_std_handles
+        .map(|handle| worker_stdio_for_handle(handle, &pipes))
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    if inherit_handles {
+        let std_handles = child_std_handles
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        if pipes
+            .handles
+            .iter()
+            .any(|(handle, pipe)| pipe.inheritable && !std_handles.contains(handle))
+        {
+            return Err(120); // ERROR_CALL_NOT_IMPLEMENTED until non-stdio handles are transferable.
+        }
+    }
+    drop(pipes);
+
+    let id = NEXT_EXEC_CHILD_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+    let directory =
+        std::env::temp_dir().join(format!("wincli-child-worker-{}-{id}", std::process::id()));
+    std::fs::create_dir(&directory).map_err(|_| 8u32)?;
+    let directory_guard = ChildWorkerDirectory(directory.clone());
+    let image_path = match super::super::worker::write_image(image, &directory) {
+        Ok(path) => path,
+        Err(_) => return Err(8),
+    };
+    let snapshot_path = match crate::snapshot::save_worker_manifest(&child_fs, &directory) {
+        Ok(path) => path,
+        Err(_) => return Err(8),
+    };
+    let state_path = directory.join("state.bin");
+    let result_path = directory.join("result.bin");
+    let request_path = directory.join("request.json");
+    let (process_handle, thread_handle, child) = parent
+        .children
+        .lock()
+        .map_err(|_| 6u32)?
+        .allocate(parent.process_id);
+    child_fs.clear_changes();
+    let request = serde_json::json!({
+        "image_path": image_path,
+        "snapshot_path": snapshot_path,
+        "state_path": state_path,
+        "result_path": result_path,
+        "program": launch.application,
+        "args": launch.arguments.get(1..).unwrap_or(&[]),
+        "environment": environment,
+        "process_id": child.process_id,
+        "parent_process_id": parent.process_id,
+        "mounts": child_fs.host_mounts(),
+        "drive_cwds": child_fs.drive_current_directories(),
+        "cwd": launch.current_directory,
+    });
+    let request_bytes = serde_json::to_vec(&request).map_err(|_| 8u32)?;
+    std::fs::write(&request_path, request_bytes).map_err(|_| 8u32)?;
+
+    let mut stdio = stdio.into_iter();
+    let mut command = Command::new(executable);
+    command
+        .arg("__native-worker")
+        .arg(&request_path)
+        .env_remove("WINCLI_NATIVE_WORKER")
+        .stdin(stdio.next().ok_or(8u32)?)
+        .stdout(stdio.next().ok_or(8u32)?)
+        .stderr(stdio.next().ok_or(8u32)?);
+    let mut worker = match command.spawn() {
+        Ok(worker) => worker,
+        Err(_) => {
+            return Err(8);
+        }
+    };
+    // Close this process's copies immediately; only the worker should retain
+    // the inherited standard pipe endpoints after a successful spawn.
+    drop(stdio);
+    child.host_pid.store(worker.id() as i32, Ordering::Release);
+    if !write_process_information(
+        process_information,
+        process_handle,
+        thread_handle,
+        child.process_id,
+    ) {
+        let _ = worker.kill();
+        let _ = worker.wait();
+        return Err(87);
+    }
+    let monitor_child = Arc::clone(&child);
+    let monitor_fs = Arc::clone(&parent.fs);
+    let state_path_for_monitor = state_path.clone();
+    std::thread::Builder::new()
+        .name("wincli-native-worker-child".to_string())
+        .spawn(move || {
+            let status = worker.wait();
+            if let Ok(encoded) = std::fs::read(&state_path_for_monitor) {
+                if !encoded.is_empty() {
+                    if let Ok(mut native_fs) = monitor_fs.lock() {
+                        let cwd = native_fs.fs.cwd();
+                        if let Err(error) =
+                            crate::snapshot::apply_changes(&encoded, &mut native_fs.fs)
+                        {
+                            eprintln!("wincli: cannot apply child filesystem changes: {error}");
+                        }
+                        let _ = native_fs.fs.set_cwd(&cwd);
+                    }
+                }
+            }
+            if let Ok(mut state) = monitor_child.state.lock() {
+                if state.is_none() {
+                    *state = Some(
+                        status
+                            .ok()
+                            .and_then(|status| status.code())
+                            .map(|code| code as u32)
+                            .unwrap_or(1),
+                    );
+                }
+                monitor_child.exited.notify_all();
+            }
+            drop(directory_guard);
+        })
+        .map_err(|_| 8u32)?;
+    Ok(())
+}
+
 pub(super) extern "win64" fn native_exit_process(code: u32) -> ! {
     if std::env::var_os("WINCLI_NATIVE_WORKER").as_deref() == Some(std::ffi::OsStr::new("1")) {
         if process_ctx().is_some_and(|process| process.parent_process_id == 0) {
@@ -871,6 +1104,49 @@ pub(super) extern "win64" fn native_create_process_w(
         }
     };
     drop(fs);
+    let environment = explicit_environment.unwrap_or_else(|| {
+        parent
+            .environment
+            .lock()
+            .map(|environment| environment.clone())
+            .unwrap_or_default()
+    });
+    if std::env::var_os("WINCLI_NATIVE_WORKER_EXE").is_some() {
+        let child_fs = match context.lock() {
+            Ok(parent_fs) => match parent_fs.clone_for_child(&launch.current_directory) {
+                Ok(child_fs) => child_fs,
+                Err(_) => {
+                    native_set_last_error(267); // ERROR_DIRECTORY
+                    return 0;
+                }
+            },
+            Err(_) => {
+                native_set_last_error(6);
+                return 0;
+            }
+        };
+        if can_exec_worker_child(&child_fs, &parent, child_std_handles, inherit_handles != 0) {
+            match create_exec_worker_child(
+                &parent,
+                &launch,
+                &image,
+                child_fs.fs,
+                child_std_handles,
+                inherit_handles != 0,
+                &environment,
+                process_information,
+            ) {
+                Ok(()) => {
+                    native_set_last_error(0);
+                    return 1;
+                }
+                Err(error) => {
+                    native_set_last_error(error);
+                    return 0;
+                }
+            }
+        }
+    }
     let (mapping, image) = match map_relocated(&image) {
         Ok(value) => value,
         Err(_) => {
@@ -896,13 +1172,6 @@ pub(super) extern "win64" fn native_create_process_w(
             return 0;
         }
     };
-    let environment = explicit_environment.unwrap_or_else(|| {
-        parent
-            .environment
-            .lock()
-            .map(|environment| environment.clone())
-            .unwrap_or_default()
-    });
     let (process_handle, thread_handle, child) = match parent.children.lock() {
         Ok(mut children) => children.allocate(parent.process_id),
         Err(_) => {

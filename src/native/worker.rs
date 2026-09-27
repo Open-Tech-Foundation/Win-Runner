@@ -180,6 +180,14 @@ pub(crate) fn execute_request(path: &Path) -> Result<u32, String> {
             .ok_or_else(|| "native worker request is missing environment".to_string())?,
     )
     .map_err(|error| format!("invalid native worker environment: {error}"))?;
+    let process_id = request
+        .get("process_id")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(1);
+    let parent_process_id = request
+        .get("parent_process_id")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
     let image = read_image(directory)?;
     let state_path = text("state_path")?;
     let state_file = std::fs::OpenOptions::new()
@@ -198,6 +206,11 @@ pub(crate) fn execute_request(path: &Path) -> Result<u32, String> {
     let result_fd = result_file.into_raw_fd();
     crate::native::set_worker_result_fd(result_fd);
     std::env::set_var("WINCLI_NATIVE_WORKER", "1");
+    std::env::set_var("WINCLI_NATIVE_PROCESS_ID", process_id.to_string());
+    std::env::set_var(
+        "WINCLI_NATIVE_PARENT_PROCESS_ID",
+        parent_process_id.to_string(),
+    );
     std::env::set_var(
         "WINCLI_NATIVE_STATE_FD",
         state_file.into_raw_fd().to_string(),

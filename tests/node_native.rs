@@ -295,6 +295,52 @@ fn official_windows_node_exec_file_sync_captures_powershell_output() {
 }
 
 #[test]
+fn official_windows_node_starts_nested_node_in_an_exec_worker() {
+    let Ok(node) = std::env::var("WINCLI_NODE_EXE") else {
+        return;
+    };
+    let node = Path::new(&node)
+        .canonicalize()
+        .expect("Windows node.exe exists");
+    let source = "const {execFileSync}=require('node:child_process');const out=execFileSync('C:\\\\bin\\\\node.exe',['-p','process.pid']);process.stdout.write(out.toString())";
+    let script = format!(
+        "@seed {} C:\\bin\\node.exe\nC:\\bin\\node.exe -e \"{source}\"\nexit\n",
+        node.display()
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wincli"))
+        .arg("shell")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start native WinCLI shell");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .expect("send nested Node process probe");
+    let output = child
+        .wait_with_output()
+        .expect("read nested Node process output");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let child_pid = stdout
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .find(|pid| *pid > 1);
+    assert!(
+        child_pid.is_some(),
+        "nested child PID was not reported: {stdout}"
+    );
+}
+
+#[test]
 fn official_windows_node_runs_the_staged_npm_cli_natively() {
     let Ok(node) = std::env::var("WINCLI_NODE_EXE") else {
         return;
