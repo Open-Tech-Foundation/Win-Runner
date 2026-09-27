@@ -4,7 +4,18 @@ use super::*;
 
 pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
     let module = dll.to_ascii_uppercase();
-    let allowed = match module.as_str() {
+    let module = if module.starts_with("API-MS-WIN-CRT-") {
+        "UCRTBASE.DLL"
+    } else if module.starts_with("API-MS-WIN-CORE-") || module.starts_with("EXT-MS-WIN-KERNEL32-") {
+        "KERNEL32.DLL"
+    } else if module.starts_with("API-MS-WIN-SECURITY-")
+        || module.starts_with("EXT-MS-WIN-ADVAPI32-")
+    {
+        "ADVAPI32.DLL"
+    } else {
+        module.as_str()
+    };
+    let allowed = match module {
         "MSVCRT.DLL" | "UCRTBASE.DLL" => {
             matches!(
                 func,
@@ -128,12 +139,6 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                 | "NtReadFile"
                 | "NtWriteFile"
         ),
-        "API-MS-WIN-CORE-SYNCH-L1-2-0.DLL" => {
-            matches!(
-                func,
-                "WaitOnAddress" | "WakeByAddressAll" | "WakeByAddressSingle"
-            )
-        }
         "KERNEL32.DLL" | "KERNELBASE.DLL" => {
             !func.starts_with('#')
                 && !matches!(

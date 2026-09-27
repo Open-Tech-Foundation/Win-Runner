@@ -13,9 +13,11 @@ All notable changes to this project will be documented in this file.
   runtime is planned.
 - Parse PE export tables into named, ordinal-only, and forwarded export records
   as the first implementation step toward loading guest DLLs.
-- Add per-process module records, LoadLibrary support for WinFS DLLs backed only
-  by existing native shims, process-attach DllMain calls, and dynamic
-  GetProcAddress for named, ordinal, and shim-forwarded exports.
+- Add per-process module records, LoadLibrary support for WinFS DLLs,
+  process-attach `DllMain` calls, and dynamic `GetProcAddress` for named,
+  ordinal, and shim-forwarded exports.
+- Resolve acyclic guest-DLL dependency graphs recursively and map common
+  Kernel32, UCRT, and Advapi32 API-set names onto existing shim registrations.
 
 - Added a "Why Win-Runner?" section to the README explaining the project's focus
   and how it differs from Wine, VMs, and Windows CI runners.

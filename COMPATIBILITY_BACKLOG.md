@@ -80,6 +80,11 @@ Items remain open until implementation and relevant verification are complete.
   run `DllMain` and DLL TLS callbacks.
 - [ ] Map common API-set DLL names to supported host implementations, starting
   with the UCRT API-set families.
+  - [x] Route common `api-ms-win-core-*`, `api-ms-win-crt-*`,
+    `api-ms-win-security-*`, and related `ext-ms-win-*` names through existing
+    Kernel32/UCRT/Advapi32 shim registrations.
+  - [ ] Expand family mappings and exports as CoreCLR import inspection
+    identifies additional modules and functions.
 - [ ] Implement UCRT startup (`_configure_narrow_argv`,
   `_initialize_narrow_environment`, `__p___argc`, `__p___argv`, `_crt_atexit`,
   `_register_onexit_function`, `_seh_filter_exe`, `_set_new_mode`,
@@ -117,12 +122,12 @@ Items remain open until implementation and relevant verification are complete.
     and implement `LoadLibrary`/`GetProcAddress` against real modules.
     - [x] Parse bounded PE export tables, including names, ordinals, and
       forwarder strings, as input to runtime export resolution.
-    - [x] Track the main image and loaded guest modules; load WinFS DLLs whose
-      imports are already shimmed, invoke process-attach `DllMain`, and resolve
-      named/ordinal exports plus forwarders to shim-backed system modules.
-    - [ ] Resolve guest-DLL dependencies recursively; implement DLL TLS and
-      thread notifications, custom-DLL forwarder loading, and FreeLibrary
-      reference-count/unload semantics.
+    - [x] Track the main image and loaded guest modules; load WinFS DLLs,
+      recursively resolve guest-DLL dependencies and shim-backed imports,
+      invoke process-attach `DllMain`, and resolve named/ordinal exports plus
+      forwarders to shim-backed system modules.
+    - [ ] Support circular dependency initialization, DLL TLS callbacks and
+      thread notifications, plus FreeLibrary reference-count/unload semantics.
   - [ ] Host `hostfxr.dll`, `hostpolicy.dll`, and `coreclr.dll` using the
     supported native hosting interfaces; cover shared, app-local, and
     self-contained runtime layouts, then add single-file apps.

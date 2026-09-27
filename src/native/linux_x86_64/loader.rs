@@ -116,12 +116,90 @@ mod relocated_map_tests {
 #[cfg(test)]
 mod module_export_tests {
     use super::{
-        load_guest_module, native_free_library, native_get_module_handle_w,
-        native_get_proc_address, API_SET_MODULE,
+        native_free_library, native_get_module_handle_w, native_get_proc_address,
+        native_load_library_ex_w, API_SET_MODULE,
     };
     use crate::native::linux_x86_64::state::NativeLoadedModule;
     use crate::pe::Export;
     use std::ffi::CString;
+
+    fn dll_fixture(
+        imports: &[(&str, &str)],
+        export_name: Option<&str>,
+        image_base: u64,
+    ) -> Vec<u8> {
+        let mut asm = crate::pe::builder::Asm::new();
+        asm.mov_r32_imm(0, 1);
+        asm.ret();
+        let mut bytes = crate::pe::builder::build(asm, imports);
+        let pe = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
+        let coff = pe + 4;
+        let opt = coff + 20;
+        let section = opt + 0xf0;
+        let characteristics = u16::from_le_bytes(bytes[coff + 18..coff + 20].try_into().unwrap());
+        bytes[coff + 18..coff + 20].copy_from_slice(&(characteristics | 0x2000).to_le_bytes());
+        bytes[opt + 24..opt + 32].copy_from_slice(&image_base.to_le_bytes());
+        let Some(export_name) = export_name else {
+            return bytes;
+        };
+
+        let old_vsize = u32::from_le_bytes(bytes[section + 8..section + 12].try_into().unwrap());
+        let export_rva = crate::pe::builder::SECTION_RVA + ((old_vsize + 7) & !7);
+        let function_rva_table = export_rva + 40;
+        let names_rva_table = function_rva_table + 4;
+        let ordinal_table = names_rva_table + 4;
+        let name_rva = ordinal_table + 2;
+        let data_end = name_rva + export_name.len() as u32 + 1;
+        let raw_size = (data_end - crate::pe::builder::SECTION_RVA + 0x1ff) & !0x1ff;
+        bytes.resize(crate::pe::builder::FILE_OFF + raw_size as usize, 0);
+        let export_off =
+            crate::pe::builder::FILE_OFF + (export_rva - crate::pe::builder::SECTION_RVA) as usize;
+        let write32 = |bytes: &mut Vec<u8>, offset: usize, value: u32| {
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        };
+        let write16 = |bytes: &mut Vec<u8>, offset: usize, value: u16| {
+            bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+        };
+        write32(&mut bytes, export_off + 16, 1);
+        write32(&mut bytes, export_off + 20, 1);
+        write32(&mut bytes, export_off + 24, 1);
+        write32(&mut bytes, export_off + 28, function_rva_table);
+        write32(&mut bytes, export_off + 32, names_rva_table);
+        write32(&mut bytes, export_off + 36, ordinal_table);
+        write32(
+            &mut bytes,
+            crate::pe::builder::FILE_OFF
+                + (function_rva_table - crate::pe::builder::SECTION_RVA) as usize,
+            crate::pe::builder::SECTION_RVA,
+        );
+        write32(
+            &mut bytes,
+            crate::pe::builder::FILE_OFF
+                + (names_rva_table - crate::pe::builder::SECTION_RVA) as usize,
+            name_rva,
+        );
+        write16(
+            &mut bytes,
+            crate::pe::builder::FILE_OFF
+                + (ordinal_table - crate::pe::builder::SECTION_RVA) as usize,
+            0,
+        );
+        let name_off =
+            crate::pe::builder::FILE_OFF + (name_rva - crate::pe::builder::SECTION_RVA) as usize;
+        bytes[name_off..name_off + export_name.len()].copy_from_slice(export_name.as_bytes());
+        bytes[name_off + export_name.len()] = 0;
+        write32(&mut bytes, opt + 112, export_rva);
+        write32(&mut bytes, opt + 116, data_end - export_rva);
+        let virtual_size = data_end - crate::pe::builder::SECTION_RVA;
+        write32(&mut bytes, section + 8, virtual_size);
+        write32(&mut bytes, section + 16, raw_size);
+        write32(
+            &mut bytes,
+            opt + 56,
+            (crate::pe::builder::SECTION_RVA + virtual_size + 0xfff) & !0xfff,
+        );
+        bytes
+    }
 
     #[test]
     fn get_proc_address_resolves_named_and_ordinal_dll_exports() {
@@ -185,16 +263,7 @@ mod module_export_tests {
 
     #[test]
     fn load_library_maps_a_guest_dll_from_winfs() {
-        let mut asm = crate::pe::builder::Asm::new();
-        asm.mov_r32_imm(0, 1); // DllMain reports successful process attach
-        asm.ret();
-        let mut bytes = crate::pe::builder::build(asm, &[]);
-        let pe = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
-        let coff = pe + 4;
-        let opt = coff + 20;
-        let characteristics = u16::from_le_bytes(bytes[coff + 18..coff + 20].try_into().unwrap());
-        bytes[coff + 18..coff + 20].copy_from_slice(&(characteristics | 0x2000).to_le_bytes());
-        bytes[opt + 24..opt + 32].copy_from_slice(&0x0000_5000_0000_0000u64.to_le_bytes());
+        let bytes = dll_fixture(&[], None, 0x0000_5000_0000_0000);
 
         let process = &*super::TEST_PROCESS;
         let path = r"C:\loader-tests\sample-runtime.dll";
@@ -204,12 +273,72 @@ mod module_export_tests {
             native_fs.fs.write_file(path, bytes).unwrap();
         }
         let name: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
-        let handle = load_guest_module(path);
-        let handle = handle.expect("WinFS DLL loads");
+        let handle = native_load_library_ex_w(name.as_ptr(), 0, 0);
+        assert_ne!(handle, 0, "WinFS DLL loads");
         assert_ne!(handle, API_SET_MODULE);
         assert_eq!(handle, native_get_module_handle_w(name.as_ptr()));
         assert_eq!(native_free_library(handle), 1);
         process.fs.lock().unwrap().fs.delete_file(path).unwrap();
+    }
+
+    #[test]
+    fn load_library_resolves_recursive_guest_dll_imports() {
+        let process = &*super::TEST_PROCESS;
+        let dependency_path = r"C:\loader-tests\dependency.dll";
+        let consumer_path = r"C:\loader-tests\consumer.dll";
+        {
+            let mut native_fs = process.fs.lock().unwrap();
+            native_fs.fs.mkdir(r"C:\loader-tests").unwrap();
+            native_fs
+                .fs
+                .write_file(
+                    dependency_path,
+                    dll_fixture(&[], Some("DependencyEntry"), 0x0000_5001_0000_0000),
+                )
+                .unwrap();
+            native_fs
+                .fs
+                .write_file(
+                    consumer_path,
+                    dll_fixture(
+                        &[("dependency.dll", "DependencyEntry")],
+                        None,
+                        crate::pe::builder::IMAGE_BASE,
+                    ),
+                )
+                .unwrap();
+        }
+        let consumer_name: Vec<u16> = "consumer.dll".encode_utf16().chain(Some(0)).collect();
+        let consumer = native_load_library_ex_w(consumer_name.as_ptr(), 0, 0);
+        assert_ne!(consumer, 0, "consumer DLL resolves its guest dependency");
+        let dependency_name = CString::new("dependency.dll").unwrap();
+        let dependency = super::native_get_module_handle_a(dependency_name.as_ptr().cast());
+        assert_ne!(dependency, 0, "dependency module is loaded");
+
+        let consumer_image = crate::pe::load_lenient(&dll_fixture(
+            &[("dependency.dll", "DependencyEntry")],
+            None,
+            crate::pe::builder::IMAGE_BASE,
+        ))
+        .unwrap();
+        let import_rva = consumer_image
+            .imports
+            .iter()
+            .chain(&consumer_image.unsupported)
+            .next()
+            .unwrap()
+            .iat_rva;
+        let imported_address =
+            unsafe { std::ptr::read_unaligned((consumer + import_rva as u64) as *const u64) };
+        assert_eq!(
+            imported_address,
+            dependency + crate::pe::builder::SECTION_RVA as u64
+        );
+        native_free_library(consumer);
+        native_free_library(dependency);
+        let mut native_fs = process.fs.lock().unwrap();
+        native_fs.fs.delete_file(consumer_path).unwrap();
+        native_fs.fs.delete_file(dependency_path).unwrap();
     }
 }
 
@@ -251,25 +380,30 @@ fn native_module_name_supported(name: &str) -> bool {
         .next()
         .unwrap_or(name)
         .to_ascii_lowercase();
-    matches!(
-        module.as_str(),
-        "kernel32"
-            | "kernel32.dll"
-            | "kernelbase"
-            | "kernelbase.dll"
-            | "ntdll"
-            | "ntdll.dll"
-            | "advapi32"
-            | "advapi32.dll"
-            | "bcryptprimitives"
-            | "bcryptprimitives.dll"
-            | "userenv"
-            | "userenv.dll"
-            | "winmm"
-            | "winmm.dll"
-            | "ws2_32"
-            | "ws2_32.dll"
-    )
+    module.starts_with("api-ms-win-core-")
+        || module.starts_with("api-ms-win-crt-")
+        || module.starts_with("api-ms-win-security-")
+        || module.starts_with("ext-ms-win-kernel32-")
+        || module.starts_with("ext-ms-win-advapi32-")
+        || matches!(
+            module.as_str(),
+            "kernel32"
+                | "kernel32.dll"
+                | "kernelbase"
+                | "kernelbase.dll"
+                | "ntdll"
+                | "ntdll.dll"
+                | "advapi32"
+                | "advapi32.dll"
+                | "bcryptprimitives"
+                | "bcryptprimitives.dll"
+                | "userenv"
+                | "userenv.dll"
+                | "winmm"
+                | "winmm.dll"
+                | "ws2_32"
+                | "ws2_32.dll"
+        )
 }
 pub(super) extern "win64" fn native_get_module_handle_ex_w(
     flags: u32,
@@ -415,6 +549,17 @@ fn guest_module_path(name: &str) -> Option<(String, Vec<u8>)> {
 }
 
 fn load_guest_module(name: &str) -> Option<u64> {
+    load_guest_module_inner(name, &mut std::collections::HashSet::new(), 0)
+}
+
+fn load_guest_module_inner(
+    name: &str,
+    loading: &mut std::collections::HashSet<String>,
+    depth: usize,
+) -> Option<u64> {
+    if depth >= 64 {
+        return None;
+    }
     if native_module_name_supported(name) {
         return Some(API_SET_MODULE);
     }
@@ -422,68 +567,97 @@ fn load_guest_module(name: &str) -> Option<u64> {
         return Some(handle);
     }
     let (path, bytes) = guest_module_path(name)?;
-    let image = crate::pe::load_lenient(&bytes).ok()?;
-    if !image.is_dll {
+    let key = path.to_uppercase();
+    if !loading.insert(key.clone()) {
         return None;
     }
-    // This first loader slice supports DLLs whose dependencies are already
-    // backed by native shims. Recursive guest-DLL resolution and DLL TLS are
-    // added in subsequent loader work.
-    if image.tls.is_some()
-        || image
-            .imports
-            .iter()
-            .chain(&image.unsupported)
-            .any(|import| !super::registry::supports_import(&import.dll, &import.func))
-    {
-        return None;
-    }
-    let (mapping, image) = match map_relocated(&image) {
-        Ok(mapped) => mapped,
-        Err(_) if image.relocations.is_empty() => (map(&image).ok()?, image),
-        Err(_) => return None,
-    };
-    let stubs = super::registry::patch_baseline_imports(&mapping, &image, false).ok()?;
-    protect_exec(&mapping).ok()?;
-    let base = mapping.ptr as u64;
-    let module = NativeLoadedModule {
-        path: path.clone(),
-        name: module_basename(&path),
-        base,
-        size_of_image: image.size_of_image,
-        exports: image.exports,
-    };
-    let process = process_ctx()?;
-    let handle = module.base;
-    {
-        let mut modules = process.loaded_modules.lock().ok()?;
-        if let Some(existing) = modules.values().find(|loaded| {
-            loaded.path.eq_ignore_ascii_case(&path)
-                || loaded.name.eq_ignore_ascii_case(&module.name)
-        }) {
-            return Some(existing.base);
-        }
-        modules.insert(handle, module);
-    }
-    if image.entry_rva != 0 {
-        let entry = base.checked_add(image.entry_rva as u64)?;
-        // SAFETY: the validated PE entry RVA is inside the executable mapping.
-        let dll_main: unsafe extern "win64" fn(u64, u32, u64) -> i32 =
-            unsafe { std::mem::transmute(entry as usize) };
-        if unsafe { dll_main(base, 1, 0) } == 0 {
-            if let Ok(mut modules) = process.loaded_modules.lock() {
-                modules.remove(&handle);
-            }
+    let result = (|| {
+        let image = crate::pe::load_lenient(&bytes).ok()?;
+        if !image.is_dll || image.tls.is_some() {
             return None;
         }
-    }
-    if let Some(stubs) = stubs {
-        std::mem::forget(stubs);
-    }
-    // The mapping belongs to the guest process and remains live until that
-    // worker exits. FreeLibrary reference counting will own unmapping later.
-    std::mem::forget(mapping);
-    Some(handle)
+
+        let mut shim_imports = Vec::new();
+        let mut guest_imports = Vec::new();
+        for import in image.imports.iter().chain(&image.unsupported) {
+            if super::registry::supports_import(&import.dll, &import.func) {
+                shim_imports.push(import.clone());
+                continue;
+            }
+            if native_module_name_supported(&import.dll) {
+                return None;
+            }
+            let dependency = load_guest_module_inner(&import.dll, loading, depth + 1)?;
+            if dependency == API_SET_MODULE {
+                return None;
+            }
+            let target = resolve_module_export(dependency, &import.func, 0)?;
+            guest_imports.push((import.iat_rva, target));
+        }
+
+        let (mapping, image) = match map_relocated(&image) {
+            Ok(mapped) => mapped,
+            Err(_) if image.relocations.is_empty() => (map(&image).ok()?, image),
+            Err(_) => return None,
+        };
+        let mut shim_image = image.clone();
+        shim_image.imports = shim_imports;
+        shim_image.unsupported.clear();
+        let stubs = super::registry::patch_baseline_imports(&mapping, &shim_image, false).ok()?;
+        for (iat_rva, target) in guest_imports {
+            let offset = iat_rva as usize;
+            if offset.checked_add(8)? > mapping.len {
+                return None;
+            }
+            // SAFETY: the PE import parser supplied an RVA and the range was
+            // checked against this module's mapped image above.
+            unsafe {
+                ptr::write_unaligned(mapping.ptr.add(offset).cast::<u64>(), target);
+            }
+        }
+        protect_exec(&mapping).ok()?;
+        let base = mapping.ptr as u64;
+        let module = NativeLoadedModule {
+            path: path.clone(),
+            name: module_basename(&path),
+            base,
+            size_of_image: image.size_of_image,
+            exports: image.exports,
+        };
+        let process = process_ctx()?;
+        let handle = module.base;
+        {
+            let mut modules = process.loaded_modules.lock().ok()?;
+            if let Some(existing) = modules.values().find(|loaded| {
+                loaded.path.eq_ignore_ascii_case(&path)
+                    || loaded.name.eq_ignore_ascii_case(&module.name)
+            }) {
+                return Some(existing.base);
+            }
+            modules.insert(handle, module);
+        }
+        if image.entry_rva != 0 {
+            let entry = base.checked_add(image.entry_rva as u64)?;
+            // SAFETY: the validated PE entry RVA is inside the executable mapping.
+            let dll_main: unsafe extern "win64" fn(u64, u32, u64) -> i32 =
+                unsafe { std::mem::transmute(entry as usize) };
+            if unsafe { dll_main(base, 1, 0) } == 0 {
+                if let Ok(mut modules) = process.loaded_modules.lock() {
+                    modules.remove(&handle);
+                }
+                return None;
+            }
+        }
+        if let Some(stubs) = stubs {
+            std::mem::forget(stubs);
+        }
+        // DLL mappings remain live until the guest worker exits. Complete
+        // FreeLibrary reference counting/unmapping is tracked separately.
+        std::mem::forget(mapping);
+        Some(handle)
+    })();
+    loading.remove(&key);
+    result
 }
 
 pub(super) extern "win64" fn native_get_proc_address(module: u64, name: *const u8) -> u64 {

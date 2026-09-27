@@ -2040,6 +2040,18 @@ mod protection_tests {
         assert!(super::supports_import("KERNEL32.dll", "GetTickCount"));
         assert!(super::supports_import("KERNEL32.dll", "GetTickCount64"));
         assert!(super::supports_import(
+            "api-ms-win-core-file-l1-1-0.dll",
+            "CreateFileW"
+        ));
+        assert!(super::supports_import(
+            "api-ms-win-core-synch-l1-2-0.dll",
+            "WaitOnAddress"
+        ));
+        assert!(super::supports_import(
+            "api-ms-win-crt-heap-l1-1-0.dll",
+            "malloc"
+        ));
+        assert!(super::supports_import(
             "KERNEL32.dll",
             "NeedCurrentDirectoryForExePathW"
         ));
