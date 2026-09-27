@@ -25,6 +25,7 @@ All notable changes to this project will be documented in this file.
   process executable lookup.
 - Captured guest stdout and stderr separately and forwarded both channels to
   control clients while preserving stderr for existing host-facing callers.
+- Ignored generated snapshot disk files (`*.snap` and `*.winfs`).
 - Added the C-locale `msvcrt!mbstowcs` shim used by Nano.
 - Added an optional native Node check proving a relative file that Node leaves
   in WinFS appears in the following shell directory listing.

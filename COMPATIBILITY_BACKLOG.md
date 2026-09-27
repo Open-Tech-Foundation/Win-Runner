@@ -45,7 +45,7 @@ Items remain open until implementation and relevant verification are complete.
 
 ## Housekeeping
 
-- [ ] Ignore generated `*.snap` and `*.winfs` files so local disks are not
+- [x] Ignore generated `*.snap` and `*.winfs` files so local disks are not
   accidentally staged.
 - [ ] Split `src/native.rs` by subsystem: loader, handles, file I/O, sync,
   processes, sockets, and related Windows API groups.

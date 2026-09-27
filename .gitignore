@@ -2,6 +2,8 @@
 # will have compiled files and executables
 debug
 target
+*.snap
+*.winfs
 
 # Rust guest build output (see guests/build.sh); the committed
 # tests/artifacts/exe/rust_*.exe files are the checked-in copies.
