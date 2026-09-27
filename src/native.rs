@@ -283,6 +283,21 @@ mod tests {
     }
 
     #[test]
+    fn framework_entry_is_rejected_with_runtime_diagnostic() {
+        let img = crate::pe::load_lenient(&build(Asm::new(), &[("mscoree.dll", "_CorExeMain")]))
+            .expect("framework entry fixture loads");
+        let mut fs = WinFs::ephemeral_runner();
+        fs.write_file(r"C:\keep.txt", b"state".to_vec()).unwrap();
+        let failure = run_rust_baseline_argv_with_fs_recoverable(&img, fs, "framework.exe", &[])
+            .expect_err("Framework runtime is unavailable");
+        assert_eq!(
+            failure.message,
+            ".NET Framework executables are not supported yet"
+        );
+        assert_eq!(failure.fs.read_file(r"C:\keep.txt").unwrap(), b"state");
+    }
+
+    #[test]
     fn executes_the_checked_in_rust_hello_guest_with_native_trampolines() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),

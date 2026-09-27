@@ -34,6 +34,19 @@ pub struct PeImage {
     pub relocations: Vec<u32>,
 }
 
+impl PeImage {
+    /// Old .NET Framework executables enter through the CLR shim exported by
+    /// mscoree.dll. Win-Runner currently runs native x86-64 code only and has
+    /// no CLR host for this entry point.
+    pub fn is_dotnet_framework_image(&self) -> bool {
+        self.imports.iter().chain(&self.unsupported).any(|import| {
+            import.dll.eq_ignore_ascii_case("mscoree.dll")
+                && (import.func.eq_ignore_ascii_case("_CorExeMain")
+                    || import.func.eq_ignore_ascii_case("_CorDllMain"))
+        })
+    }
+}
+
 /// Thread-local storage directory (IMAGE_TLS_DIRECTORY64, RVAs).
 #[derive(Debug, Clone)]
 pub struct TlsDir {

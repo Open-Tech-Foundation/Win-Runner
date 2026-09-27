@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Detect .NET Framework `_CorExeMain`/`_CorDllMain` images and report the clear
+  unsupported-runtime limitation in `winrun inspect` and native execution.
+- Replaced the PS1 interpreter's proposed install-script .NET API expansion
+  with a CoreCLR hosting roadmap for modern .NET executables; no custom IL
+  runtime is planned.
+
 - Added an Apache 2.0 `NOTICE` file and linked it from the README.
 - Added `--save` to write changes back to the loaded snapshot on exit, without
   repeating the snapshot path.

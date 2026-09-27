@@ -105,36 +105,33 @@ Items remain open until implementation and relevant verification are complete.
 - [ ] Cover Winsock imports by name: `WSAStartup`, `socket`, `connect`,
   `send`, `recv`, `closesocket`, `select`, `getaddrinfo`, `setsockopt`, and
   `ioctlsocket`.
-- [ ] **PowerShell install-script .NET surface.** Add `Int`, `Bool`, `Bytes`,
-  and `Object` values, then use one registry for type names, static methods,
-  constructors, instance methods, and properties. Keep unsupported calls strict
-  and identify both the type and method in the error.
-  - `System.IO`: `Path.Combine`, `GetFileName`, `GetFileNameWithoutExtension`,
-    `GetExtension`, `GetDirectoryName`, `GetFullPath`, `GetTempPath`,
-    `GetTempFileName`, `IsPathRooted`, and `ChangeExtension`; `File.Exists`,
-    `ReadAllText/Lines/Bytes`, `WriteAllText/Lines/Bytes`, `AppendAllText`,
-    `Copy`, `Move`, and `Delete`; `Directory.Exists`, `CreateDirectory`,
-    `Delete`, `GetFiles`, and `GetDirectories`. Reuse WinFS.
-  - Networking: `(New-Object System.Net.WebClient).DownloadFile/DownloadString`,
-    `[Uri]` construction and its `Host`, `AbsolutePath`, and `Segments`,
-    `Invoke-WebRequest -OutFile`, and accepted no-op
-    `[Net.ServicePointManager]::SecurityProtocol = 'Tls12'` settings.
-    Route downloads through `fetch_url` so a future network-off option applies
-    consistently.
-  - Environment and values: `Environment.GetFolderPath` (`ProgramData`,
-    `LocalApplicationData`), `Is64BitOperatingSystem`, `NewLine`, `MachineName`,
-    `ProcessorCount`, and `CurrentDirectory`; `[Text.Encoding]::UTF8.GetBytes`/
-    `GetString`, `[Convert]::ToBase64String`/`FromBase64String`,
-    `[DateTime]::Now/UtcNow`, `[Math]::Max/Min`, and `[int]`/`[string]`/`[bool]`
-    casts.
-  - Archives and hashes: `[IO.Compression.ZipFile]::ExtractToDirectory`, no-op
-    `Add-Type -AssemblyName System.IO.Compression.FileSystem`, and
-    `[Security.Cryptography.SHA256]::Create().ComputeHash(...)`. Reuse existing
-    archive and hash implementations.
-  - Later: `Start-Process`, `Diagnostics.Process`, `HttpClient`, POST
-    `Invoke-RestMethod`, and clear unsupported errors for COM objects.
-  - Use the Chocolatey community `install.ps1` as the first end-to-end target;
-    then sample 10–20 common CI/install scripts and rank API demand by frequency.
+- [ ] **Modern .NET via Microsoft's real CoreCLR.** Do not implement an IL
+  interpreter or a replacement CLR. Run modern .NET apphosts and bundled
+  Windows runtime DLLs through the native x86-64 backend, using redistributable
+  Microsoft CoreCLR files. This is also the route toward real PowerShell 7.
+  - [x] Identify .NET Framework PE entry imports and report
+    `.NET Framework executables are not supported yet`; CoreCLR hosting does
+    not yet imply Framework compatibility.
+  - [ ] Load guest DLLs from WinFS: map PE sections, resolve imports
+    recursively, handle forwarded exports, invoke `DllMain` and TLS callbacks,
+    and implement `LoadLibrary`/`GetProcAddress` against real modules.
+  - [ ] Host `hostfxr.dll`, `hostpolicy.dll`, and `coreclr.dll` using the
+    supported native hosting interfaces; cover shared, app-local, and
+    self-contained runtime layouts, then add single-file apps.
+  - [ ] Complete SEH dispatch and stack unwinding, including native fault
+    translation required by CoreCLR.
+  - [ ] Complete virtual memory semantics used by the GC/JIT: reserve versus
+    commit, guard pages, and writable/executable protection transitions.
+  - [ ] Implement GC thread suspension/context APIs (`SuspendThread`,
+    `GetThreadContext`, `SetThreadContext`, `FlushProcessWriteBuffers`) with a
+    Linux signal-based stop/resume protocol.
+  - [ ] Complete thread/TLS/FLS, events/waits, timers, and thread-pool support
+    required by CoreCLR.
+  - [ ] Install an official redistributable CoreCLR package into guest WinFS
+    and validate first with a minimal modern .NET app, then `pwsh.exe`.
+  - [ ] Leave old .NET Framework unsupported with the clear diagnostic above;
+    consider routing `_CorExeMain` to CoreCLR only as a later compatibility
+    experiment. NativeAOT remains ordinary native PE execution.
 
 ### P2: broader APIs
 

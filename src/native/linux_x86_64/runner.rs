@@ -400,6 +400,12 @@ fn run_rust_baseline_argv_with_fs_impl(
     environment: &[(String, String)],
     output: Option<&dyn Fn(bool, &[u8])>,
 ) -> Result<(u32, Vec<u8>, WinFs), super::super::NativeExecutionFailure> {
+    if img.is_dotnet_framework_image() {
+        return Err(super::super::NativeExecutionFailure {
+            message: ".NET Framework executables are not supported yet".to_string(),
+            fs: instance_fs,
+        });
+    }
     if std::env::var_os("WINRUN_NATIVE_WORKER").as_deref() != Some(std::ffi::OsStr::new("1")) {
         if let Some(executable) = std::env::var_os("WINRUN_NATIVE_WORKER_EXE") {
             return run_exec_worker(

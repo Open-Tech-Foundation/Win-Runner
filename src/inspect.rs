@@ -32,7 +32,10 @@ impl InspectReport {
 
 pub fn inspect_pe(data: &[u8]) -> Result<InspectReport, String> {
     let img = load_lenient(data)?;
-    let limitations = Vec::new();
+    let mut limitations = Vec::new();
+    if img.is_dotnet_framework_image() {
+        limitations.push(".NET Framework executables are not supported yet".to_string());
+    }
     Ok(InspectReport {
         arch: "x86_64".to_string(),
         entry_rva: img.entry_rva,
@@ -102,6 +105,19 @@ mod tests {
         let out = render(&rep);
         assert!(out.contains("Missing imports:   1"));
         assert!(out.contains("NoSuchApiForTest"));
+    }
+
+    #[test]
+    fn framework_executables_report_runtime_limitation() {
+        let exe = builder::build(builder::Asm::new(), &[("mscoree.dll", "_CorExeMain")]);
+        let report = inspect_pe(&exe).unwrap();
+        assert!(!report.runnable());
+        assert!(report
+            .limitations
+            .iter()
+            .any(|limitation| limitation == ".NET Framework executables are not supported yet"));
+        assert!(render(&report)
+            .contains("Loader limitation: .NET Framework executables are not supported yet"));
     }
 
     #[test]
