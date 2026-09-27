@@ -36,6 +36,8 @@ All notable changes to this project will be documented in this file.
 - Added behavior fixtures for handle reopening, hard links, file replacement,
   byte-range locking, ANSI path operations, and file copying so missing native
   API support has explicit WinFS expectations.
+- Added modern WinFS behavior fixtures for temporary files, `CreateFile2`,
+  `CopyFile2`/`CopyFileExW`, stream enumeration, and handle-based deletion.
 - Added WinFS edge-case tests for truncating writes, recursive tree copy/move,
   and invalid directory create/remove operations.
 - Added NT file compatibility tests for EOF resizing, rename-by-handle, and

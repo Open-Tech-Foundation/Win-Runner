@@ -2475,6 +2475,229 @@ mod imp {
         }
 
         #[test]
+        fn modern_temp_file_name_creates_a_unique_guest_file() {
+            type GetTempPathW = unsafe extern "win64" fn(u32, *mut u16) -> u32;
+            type GetTempFileNameW =
+                unsafe extern "win64" fn(*const u16, *const u16, u32, *mut u16) -> u32;
+            let get_temp_path: GetTempPathW =
+                unsafe { std::mem::transmute(require_kernel32_api(b"GetTempPathW\0") as usize) };
+            let get_temp_file: GetTempFileNameW = unsafe {
+                std::mem::transmute(require_kernel32_api(b"GetTempFileNameW\0") as usize)
+            };
+            let mut directory = [0u16; 512];
+            let length =
+                unsafe { get_temp_path(directory.len() as u32, directory.as_mut_ptr()) } as usize;
+            assert!(length > 0 && length < directory.len());
+            assert_eq!(directory[length], 0);
+            let prefix = [b'w' as u16, b'f' as u16, b's' as u16, 0];
+            let mut filename = [0u16; 1024];
+            assert_ne!(
+                unsafe {
+                    get_temp_file(
+                        directory.as_ptr(),
+                        prefix.as_ptr(),
+                        0,
+                        filename.as_mut_ptr(),
+                    )
+                },
+                0
+            );
+            let path = String::from_utf16(
+                &filename[..filename.iter().position(|unit| *unit == 0).unwrap()],
+            )
+            .unwrap();
+            let context = super::fs_ctx().unwrap();
+            assert!(context.lock().unwrap().fs.exists(&path));
+            context.lock().unwrap().fs.delete_file(&path).unwrap();
+        }
+
+        #[test]
+        fn modern_create_file2_opens_existing_guest_file() {
+            type CreateFile2 =
+                unsafe extern "win64" fn(*const u16, u32, u32, u32, *const std::ffi::c_void) -> u64;
+            let create_file2: CreateFile2 =
+                unsafe { std::mem::transmute(require_kernel32_api(b"CreateFile2\0") as usize) };
+            let path = r"C:\modern_create_file2.txt";
+            let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(path, b"create-file2-data".to_vec())
+                .unwrap();
+
+            let handle =
+                unsafe { create_file2(wide.as_ptr(), 0x8000_0000, 7, 3, std::ptr::null()) };
+            assert_ne!(handle, u64::MAX);
+            let mut bytes = [0u8; 17];
+            let mut read = 0;
+            assert_eq!(
+                super::native_read_file(handle, bytes.as_mut_ptr(), 17, &mut read, 0),
+                1
+            );
+            assert_eq!(read, 17);
+            assert_eq!(&bytes, b"create-file2-data");
+            assert_eq!(super::native_close_handle(handle), 1);
+            context.lock().unwrap().fs.delete_file(path).unwrap();
+        }
+
+        #[test]
+        fn modern_copy_file2_copies_contents_and_preserves_source() {
+            type CopyFile2 =
+                unsafe extern "win64" fn(*const u16, *const u16, *const std::ffi::c_void) -> i32;
+            let copy_file2: CopyFile2 =
+                unsafe { std::mem::transmute(require_kernel32_api(b"CopyFile2\0") as usize) };
+            let source = r"C:\modern_copy_file2_source.txt";
+            let destination = r"C:\modern_copy_file2_destination.txt";
+            let source_wide = source.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let destination_wide = destination.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(source, b"copy-file2-source".to_vec())
+                .unwrap();
+
+            assert_eq!(
+                unsafe {
+                    copy_file2(
+                        source_wide.as_ptr(),
+                        destination_wide.as_ptr(),
+                        std::ptr::null(),
+                    )
+                },
+                0 // HRESULT S_OK
+            );
+            assert_eq!(
+                context.lock().unwrap().fs.read_file(destination).unwrap(),
+                b"copy-file2-source"
+            );
+            assert_eq!(
+                context.lock().unwrap().fs.read_file(source).unwrap(),
+                b"copy-file2-source"
+            );
+            let mut ctx = context.lock().unwrap();
+            ctx.fs.delete_file(destination).unwrap();
+            ctx.fs.delete_file(source).unwrap();
+        }
+
+        #[test]
+        fn modern_copy_file_ex_honors_fail_if_exists_flag() {
+            type CopyFileExW =
+                unsafe extern "win64" fn(*const u16, *const u16, u64, u64, *mut i32, u32) -> i32;
+            let copy_file_ex: CopyFileExW =
+                unsafe { std::mem::transmute(require_kernel32_api(b"CopyFileExW\0") as usize) };
+            let source = r"C:\modern_copy_file_ex_source.txt";
+            let destination = r"C:\modern_copy_file_ex_destination.txt";
+            let source_wide = source.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let destination_wide = destination.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            {
+                let mut ctx = context.lock().unwrap();
+                ctx.fs
+                    .write_file(source, b"copy-ex-source".to_vec())
+                    .unwrap();
+                ctx.fs
+                    .write_file(destination, b"keep-existing".to_vec())
+                    .unwrap();
+            }
+
+            assert_eq!(
+                unsafe {
+                    copy_file_ex(
+                        source_wide.as_ptr(),
+                        destination_wide.as_ptr(),
+                        0,
+                        0,
+                        std::ptr::null_mut(),
+                        1,
+                    )
+                },
+                0
+            );
+            assert_eq!(super::native_get_last_error(), 80);
+            assert_eq!(
+                context.lock().unwrap().fs.read_file(destination).unwrap(),
+                b"keep-existing"
+            );
+            let mut ctx = context.lock().unwrap();
+            ctx.fs.delete_file(destination).unwrap();
+            ctx.fs.delete_file(source).unwrap();
+        }
+
+        #[test]
+        fn modern_find_first_stream_reports_the_default_data_stream() {
+            type FindFirstStreamW =
+                unsafe extern "win64" fn(*const u16, i32, *mut std::ffi::c_void, u32) -> u64;
+            let find_first_stream: FindFirstStreamW = unsafe {
+                std::mem::transmute(require_kernel32_api(b"FindFirstStreamW\0") as usize)
+            };
+            let path = r"C:\modern_stream_enumeration.txt";
+            let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(path, b"stream-content".to_vec())
+                .unwrap();
+
+            let mut stream_data = [0u8; 600];
+            let find =
+                unsafe { find_first_stream(wide.as_ptr(), 0, stream_data.as_mut_ptr().cast(), 0) };
+            assert_ne!(find, u64::MAX);
+            assert_eq!(i64::from_le_bytes(stream_data[..8].try_into().unwrap()), 14);
+            let stream_name = unsafe {
+                std::slice::from_raw_parts(stream_data.as_ptr().add(8).cast::<u16>(), 296)
+                    .iter()
+                    .copied()
+                    .take_while(|unit| *unit != 0)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(String::from_utf16(&stream_name).unwrap(), r"::$DATA");
+            assert_eq!(super::native_find_close(find), 1);
+            context.lock().unwrap().fs.delete_file(path).unwrap();
+        }
+
+        #[test]
+        fn modern_set_file_information_by_handle_deletes_on_last_close() {
+            type SetFileInformationByHandle =
+                unsafe extern "win64" fn(u64, i32, *const std::ffi::c_void, u32) -> i32;
+            let set_information: SetFileInformationByHandle = unsafe {
+                std::mem::transmute(require_kernel32_api(b"SetFileInformationByHandle\0") as usize)
+            };
+            let path = r"C:\modern_disposition_by_handle.txt";
+            let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(path, b"delete-on-close".to_vec())
+                .unwrap();
+            let handle = super::native_create_file_w(wide.as_ptr(), 0x0001_0000, 7, 3, 0, 0, 0);
+            assert_ne!(handle, u64::MAX);
+
+            let disposition = [1u8]; // FILE_DISPOSITION_INFO.DeleteFile
+            assert_eq!(
+                unsafe {
+                    set_information(
+                        handle,
+                        4,
+                        disposition.as_ptr().cast(),
+                        disposition.len() as u32,
+                    )
+                },
+                1
+            );
+            assert!(context.lock().unwrap().fs.exists(path));
+            assert_eq!(super::native_close_handle(handle), 1);
+            assert!(!context.lock().unwrap().fs.exists(path));
+        }
+
+        #[test]
         fn initializes_critical_section_with_spin_count() {
             let mut section = [0x5au8; 40];
             assert_eq!(
