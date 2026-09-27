@@ -30,6 +30,8 @@ All notable changes to this project will be documented in this file.
   environment lookups from API shims.
 - Grouped PE image-base hex literals consistently and simplified a redundant
   `Remove-Item` recursion condition reported by Clippy.
+- Reproduced the Node `execFileSync`/PowerShell shell-link hang and recorded it
+  for pipe inheritance and EOF investigation.
 - Added the C-locale `msvcrt!mbstowcs` shim used by Nano.
 - Added an optional native Node check proving a relative file that Node leaves
   in WinFS appears in the following shell directory listing.

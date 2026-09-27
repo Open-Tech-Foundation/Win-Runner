@@ -39,9 +39,10 @@ Items remain open until implementation and relevant verification are complete.
   blocking, and reports the channel to the output sink. Legacy callers continue
   receiving guest stderr on host stderr.
 - [ ] **8. Fix Node child-process pipe capture.** `execFileSync` launching the
-  guest `powershell.exe` shim has been observed hanging while reading captured
-  output. Reproduce through the control API and fix pipe inheritance/EOF and
-  child output forwarding.
+  guest `powershell.exe` shim hangs when reading captured output. Reproduced
+  with the official Node 24.21.0 binary seeded into a shell; it did not return
+  within 20 seconds. Trace and fix pipe inheritance/EOF and child output
+  forwarding.
 
 ## Housekeeping
 
@@ -53,6 +54,8 @@ Items remain open until implementation and relevant verification are complete.
   from hot shims; initialize the cache before guest forks.
 - [x] Fix Clippy's unevenly grouped hexadecimal literal warnings. A current
   all-targets Clippy run still reports unrelated warnings across the codebase.
+- [ ] Triage remaining Clippy warnings. Current toolchain reports 81 library
+  warnings and 14 binary warnings, plus repeated warnings in test targets.
 
 ## Compatibility coverage priorities
 
