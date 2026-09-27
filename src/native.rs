@@ -7,9 +7,11 @@
 //! personality around that code (DLL loading, import trampolines, TEB/PEB,
 //! exceptions, threads, and isolation).
 //!
-//! PE instructions execute in a contained Linux child. Windows APIs require
-//! explicit native trampolines; unsupported imports fail if guest code calls
-//! them. Strict pre-entry validation is optional.
+//! PE instructions execute in a forked Linux child. This is a process boundary
+//! for implementation, not a security sandbox: guest code can issue host
+//! syscalls with the WinCLI process's privileges. Windows APIs require explicit
+//! native trampolines; unsupported imports fail if guest code calls them.
+//! Strict pre-entry validation is optional.
 
 use crate::pe::PeImage;
 
@@ -10378,9 +10380,9 @@ mod imp {
         };
         let host_pid = child.host_pid.load(Ordering::Acquire);
         if host_pid > 0 {
-            // SIGTERM is the contained host-side equivalent of terminating a
-            // guest child. The monitor remains responsible for reaping it and
-            // publishing completion to WaitForSingleObject/GetExitCodeProcess.
+            // SIGTERM is the host-side equivalent of terminating a guest
+            // child. The monitor reaps it and publishes completion to
+            // WaitForSingleObject/GetExitCodeProcess.
             if let Ok(mut termination_code) = child.termination_code.lock() {
                 *termination_code = Some(code);
             } else {

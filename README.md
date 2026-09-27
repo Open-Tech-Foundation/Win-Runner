@@ -24,6 +24,17 @@ guest calls it. Set `WINCLI_NATIVE_STRICT_IMPORTS=1` to reject unsupported
 imports before entry. `wincli inspect` lists static shim coverage. Other host platforms currently have no PE
 execution backend.
 
+### Security boundary
+
+WinCLI is a Windows compatibility runtime, not a security sandbox. Native PE
+code runs on the host CPU and can issue Linux system calls with the privileges
+of the WinCLI process. WinFS and read-only guest mounts are compatibility
+features, not host access controls; mounted drives intentionally expose their
+host directories. Do not use WinCLI alone to isolate untrusted executables or
+package install scripts. Use an operating-system sandbox, container, or VM
+when host isolation is required. Per-process sandboxing is not currently
+implemented.
+
 Headless snapshot runs keep the program's standard input connected to the
 WinCLI process and stream its output to standard output/error. An external
 controller can launch WinCLI with piped stdio, send input while the program is

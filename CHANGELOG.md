@@ -8,6 +8,8 @@ All notable changes to this project will be documented in this file.
 
 - Hardened Chocolatey and npm archive extraction against traversal, absolute
   paths, drive prefixes, and existing symlink components.
+- Documented that native guest execution and mounted host folders are not a
+  security sandbox.
 - Added a guest `C:\bin\powershell.exe` shell link so native child-process
   launches run scripts through WinCLI's PowerShell-compatible interpreter.
 - Added the `KERNEL32!NeedCurrentDirectoryForExePathW` shim used by child

@@ -11,7 +11,7 @@ Items remain open until implementation and relevant verification are complete.
   traversal, absolute paths, drive prefixes, alternate data stream syntax, and
   unsafe existing symlink components. Validate external 7-Zip archive paths
   before extraction.
-- [ ] **2. Clarify the guest security boundary.** Guest PE code runs natively
+- [x] **2. Clarify the guest security boundary.** Guest PE code runs natively
   and can issue Linux syscalls, so WinFS and read-only mounts are not a
   security sandbox. Document this clearly; assess seccomp, namespaces, and
   Landlock as a separate implementation project.
