@@ -6,6 +6,23 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Added `GetTickCount` and `GetTickCount64` shims using the monotonic host clock,
+  plus CRT C-locale setup, guest environment lookup, thread-local errno and
+  standard stream storage, and string comparison, case-folding, search, and
+  decimal parsing, C-locale case conversion, bounded string copying, and
+  zero-initialized allocation, and standard output writes used by Nano.
+- Added basic guest console screen-buffer sizing, switching, and
+  window-rectangle handling.
+- Added CRT signal registration and bounded `sprintf` support for the formats
+  used by Nano, plus allocated `_strdup` copies and C-locale `wcstombs`.
+- Added CRT `realloc` support that preserves existing allocation contents.
+- Added `_stat64` metadata lookup for files and directories in WinFS.
+- Added CRT `_access` checks for WinFS paths and read/write mode flags.
+- Added a headless `MessageBeep` success shim for console applications.
+- Added validation for console cursor visibility and shape updates.
+- Added rectangular `WriteConsoleOutputA` cell rendering through host ANSI
+  cursor positioning and console colors.
+- Added host ANSI cursor positioning for console applications.
 - Added a `winget install` shell builtin alongside `choco`, with package ID
   forms, common silent/exact flags, hash-verified portable installs, and
   manifest command aliases. Architecture-neutral portable packages are

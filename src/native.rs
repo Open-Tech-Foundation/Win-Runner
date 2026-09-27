@@ -165,6 +165,8 @@ mod imp {
         LazyLock::new(|| Mutex::new(HashMap::new()));
     static NATIVE_ADDRESS_WAITERS: LazyLock<Mutex<HashMap<usize, Weak<NativeAddressWaiters>>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
+    static NATIVE_CRT_SIGNAL_HANDLERS: LazyLock<Mutex<HashMap<(u32, i32), u64>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
 
     struct NativeCriticalSection {
         owner_and_recursion: Mutex<(Option<u64>, u32)>,
@@ -415,12 +417,15 @@ mod imp {
             native_query_depth_slist, native_query_performance_frequency,
             native_release_srw_lock_exclusive, native_release_srw_lock_shared,
             native_resolve_code_page, native_rtl_get_version, native_rtl_nt_status_to_dos_error,
-            native_set_console_mode, native_set_environment_variable_w, native_set_file_time,
-            native_set_last_error, native_set_thread_stack_guarantee,
-            native_set_unhandled_exception_filter, native_set_waitable_timer,
-            native_shutdown_socket, native_sleep_condition_variable_srw, native_terminate_process,
-            native_try_acquire_srw_lock_shared, native_wait_for_single_object,
-            native_wait_on_address, native_wake_all_condition_variable, native_wake_by_address_all,
+            native_set_console_active_screen_buffer, native_set_console_cursor_info,
+            native_set_console_cursor_position, native_set_console_mode,
+            native_set_console_screen_buffer_size, native_set_console_window_info,
+            native_set_environment_variable_w, native_set_file_time, native_set_last_error,
+            native_set_thread_stack_guarantee, native_set_unhandled_exception_filter,
+            native_set_waitable_timer, native_shutdown_socket, native_sleep_condition_variable_srw,
+            native_terminate_process, native_try_acquire_srw_lock_shared,
+            native_wait_for_single_object, native_wait_on_address,
+            native_wake_all_condition_variable, native_wake_by_address_all,
             native_wide_char_to_multi_byte, native_write_console_w, native_wsa_get_last_error,
             native_wsa_inet_addr, parse_windows_command_line, process_ctx, uppercase_ascii_utf16,
             waitpid, write_process_information, NativeLaunchSpec, NativeMemoryStatus,
@@ -2058,13 +2063,374 @@ mod imp {
         }
 
         #[test]
+        fn tick_count_apis_report_monotonic_milliseconds() {
+            let before = super::native_get_tick_count64();
+            let tick32 = super::native_get_tick_count();
+            let after = super::native_get_tick_count64();
+            assert!(after >= before);
+            assert!(tick32.wrapping_sub(before as u32) < 1000);
+            assert!(super::baseline_trampoline("GetTickCount").is_some());
+            assert!(super::baseline_trampoline("GetTickCount64").is_some());
+        }
+
+        #[test]
+        fn user32_message_beep_is_a_successful_headless_noop() {
+            assert!(super::supports_import("USER32.DLL", "MessageBeep"));
+            assert_ne!(super::native_message_beep(0), 0);
+        }
+
+        #[test]
+        fn crt_strncmp_compares_unsigned_bytes_within_the_requested_limit() {
+            let left = b"nano\0";
+            let same_prefix = b"name\0";
+            let non_ascii = [0x80, 0];
+            let ascii = [0x7f, 0];
+            assert_eq!(
+                super::native_crt_strncmp(left.as_ptr(), same_prefix.as_ptr(), 2),
+                0
+            );
+            assert!(super::native_crt_strncmp(left.as_ptr(), same_prefix.as_ptr(), 3) > 0);
+            assert!(super::native_crt_strncmp(non_ascii.as_ptr(), ascii.as_ptr(), 1) > 0);
+            assert_eq!(
+                super::native_crt_strncmp(std::ptr::null(), std::ptr::null(), 0),
+                0
+            );
+        }
+
+        #[test]
+        fn crt_setlocale_exposes_the_supported_c_locale() {
+            let c_locale = b"C\0";
+            let locale = super::native_crt_setlocale(0, c_locale.as_ptr());
+            assert!(!locale.is_null());
+            assert_eq!(unsafe { std::slice::from_raw_parts(locale, 2) }, b"C\0");
+            assert_eq!(super::native_crt_setlocale(0, std::ptr::null()), locale);
+            assert!(super::native_crt_setlocale(6, std::ptr::null()).is_null());
+            assert!(super::native_crt_setlocale(0, b"fr_FR\0".as_ptr()).is_null());
+        }
+
+        #[test]
+        fn crt_strchr_finds_bytes_and_the_terminating_nul() {
+            let text = b"nano\0";
+            let found = super::native_crt_strchr(text.as_ptr(), b'n' as i32);
+            assert_eq!(found, text.as_ptr() as *mut u8);
+            assert_eq!(super::native_crt_strchr(text.as_ptr(), 0), unsafe {
+                text.as_ptr().add(text.len() - 1) as *mut u8
+            });
+            assert!(super::native_crt_strchr(text.as_ptr(), b'z' as i32).is_null());
+        }
+
+        #[test]
+        fn crt_strrchr_returns_the_last_matching_byte() {
+            let text = b"nanometer\0";
+            assert_eq!(
+                super::native_crt_strrchr(text.as_ptr(), b'e' as i32),
+                unsafe { text.as_ptr().add(7) as *mut u8 }
+            );
+            assert_eq!(super::native_crt_strrchr(text.as_ptr(), 0), unsafe {
+                text.as_ptr().add(text.len() - 1) as *mut u8
+            });
+            assert!(super::native_crt_strrchr(text.as_ptr(), b'z' as i32).is_null());
+        }
+
+        #[test]
+        fn crt_case_insensitive_string_comparisons_fold_ascii() {
+            let upper = b"NaNo\0";
+            let lower = b"nano\0";
+            assert_eq!(super::native_crt_stricmp(upper.as_ptr(), lower.as_ptr()), 0);
+            assert_eq!(
+                super::native_crt_strnicmp(upper.as_ptr(), b"NAtch\0".as_ptr(), 2),
+                0
+            );
+            assert!(super::native_crt_strnicmp(upper.as_ptr(), b"NAtch\0".as_ptr(), 3) < 0);
+        }
+
+        #[test]
+        fn crt_atoi_parses_signed_decimal_prefixes() {
+            assert_eq!(super::native_crt_atoi(b"  -42tail\0".as_ptr()), -42);
+            assert_eq!(super::native_crt_atoi(b"+17\0".as_ptr()), 17);
+            assert_eq!(super::native_crt_atoi(b"tail\0".as_ptr()), 0);
+            assert_eq!(super::native_crt_atoi(std::ptr::null()), 0);
+        }
+
+        #[test]
+        fn crt_case_conversion_matches_the_c_locale() {
+            assert_eq!(super::native_crt_tolower(b'Q' as i32), b'q' as i32);
+            assert_eq!(super::native_crt_tolower(b'?' as i32), b'?' as i32);
+            assert_eq!(super::native_crt_toupper(b'q' as i32), b'Q' as i32);
+            assert_eq!(super::native_crt_toupper(-1), -1);
+        }
+
+        #[test]
+        fn crt_strncpy_zero_pads_short_sources() {
+            let input = b"xy\0";
+            let mut output = [0xff; 5];
+            assert_eq!(
+                super::native_crt_strncpy(output.as_mut_ptr(), input.as_ptr(), output.len()),
+                output.as_mut_ptr()
+            );
+            assert_eq!(output, [b'x', b'y', 0, 0, 0]);
+            let mut truncated = [0; 2];
+            super::native_crt_strncpy(truncated.as_mut_ptr(), input.as_ptr(), 2);
+            assert_eq!(truncated, [b'x', b'y']);
+        }
+
+        #[test]
+        fn crt_calloc_zeroes_and_checks_size_overflow() {
+            let allocation = super::native_crt_calloc(4, 2).cast::<u8>();
+            assert!(!allocation.is_null());
+            assert_eq!(
+                unsafe { std::slice::from_raw_parts(allocation, 8) },
+                &[0; 8]
+            );
+            super::native_crt_free(allocation.cast());
+            assert!(super::native_crt_calloc(usize::MAX, 2).is_null());
+        }
+
+        #[test]
+        fn crt_fwrite_handles_empty_and_overflowing_requests() {
+            assert_eq!(
+                super::native_crt_fwrite(std::ptr::null(), 0, 5, std::ptr::null_mut()),
+                0
+            );
+            assert_eq!(
+                super::native_crt_fwrite(std::ptr::null(), usize::MAX, 2, std::ptr::null_mut()),
+                0
+            );
+        }
+
+        #[test]
+        fn crt_sprintf_formats_strings_integers_and_escaped_percent() {
+            let name = b"nano\0";
+            let format = b"%s:%04d %%\0";
+            let mut output = [0u8; 32];
+            let written = super::native_crt_sprintf(
+                output.as_mut_ptr(),
+                format.as_ptr(),
+                name.as_ptr() as u64,
+                (-7i32 as i64) as u64,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            );
+            assert_eq!(written, 11);
+            assert_eq!(&output[..written as usize], b"nano:-007 %");
+        }
+
+        #[test]
+        fn crt_strdup_returns_an_independent_nul_terminated_copy() {
+            let input = b"nano\0";
+            let duplicate = super::native_crt_strdup(input.as_ptr());
+            assert!(!duplicate.is_null());
+            assert_ne!(duplicate, input.as_ptr() as *mut u8);
+            assert_eq!(
+                unsafe { std::ffi::CStr::from_ptr(duplicate.cast()) }.to_bytes(),
+                b"nano"
+            );
+            super::native_crt_free(duplicate.cast());
+            assert!(super::native_crt_strdup(std::ptr::null()).is_null());
+        }
+
+        #[test]
+        fn crt_realloc_preserves_existing_bytes() {
+            let allocation = super::native_crt_malloc(2).cast::<u8>();
+            assert!(!allocation.is_null());
+            unsafe { std::ptr::copy_nonoverlapping(b"ok".as_ptr(), allocation, 2) };
+            let grown = super::native_crt_realloc(allocation.cast(), 8).cast::<u8>();
+            assert!(!grown.is_null());
+            assert_eq!(unsafe { std::slice::from_raw_parts(grown, 2) }, b"ok");
+            super::native_crt_free(grown.cast());
+            let fresh = super::native_crt_realloc(std::ptr::null_mut(), 8);
+            assert!(!fresh.is_null());
+            super::native_crt_free(fresh);
+        }
+
+        #[test]
+        fn crt_wcstombs_converts_c_locale_and_reports_unrepresentable_text() {
+            let input = [b'n' as u16, b'a' as u16, b'n' as u16, b'o' as u16, 0];
+            let mut output = [0xff; 5];
+            assert_eq!(
+                super::native_crt_wcstombs(output.as_mut_ptr(), input.as_ptr(), output.len()),
+                4
+            );
+            assert_eq!(&output, b"nano\0");
+            assert_eq!(
+                super::native_crt_wcstombs(std::ptr::null_mut(), input.as_ptr(), 0),
+                4
+            );
+            assert_eq!(
+                super::native_crt_wcstombs(output.as_mut_ptr(), input.as_ptr(), 2),
+                2
+            );
+            let non_ascii = [0x00e9, 0];
+            assert_eq!(
+                super::native_crt_wcstombs(output.as_mut_ptr(), non_ascii.as_ptr(), output.len()),
+                usize::MAX
+            );
+            assert_eq!(super::THREAD_CRT_ERRNO.with(std::cell::Cell::get), 42);
+        }
+
+        #[test]
+        fn crt_stat64_reports_winfs_file_type_and_size() {
+            let context = super::fs_ctx().unwrap();
+            let path = r"C:\stat64_probe.txt";
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(path, b"probe".to_vec())
+                .unwrap();
+            let path = b"C:\\stat64_probe.txt\0";
+            let mut status = [0u8; 56];
+            assert_eq!(
+                super::native_crt_stat64(path.as_ptr(), status.as_mut_ptr()),
+                0
+            );
+            assert_eq!(u32::from_ne_bytes(status[..4].try_into().unwrap()), 2);
+            assert_eq!(u16::from_ne_bytes(status[6..8].try_into().unwrap()), 0x8180);
+            assert_eq!(i64::from_ne_bytes(status[24..32].try_into().unwrap()), 5);
+            assert_eq!(
+                super::native_crt_stat64(b"C:\\missing-stat64\0".as_ptr(), status.as_mut_ptr()),
+                -1
+            );
+            assert_eq!(super::THREAD_CRT_ERRNO.with(std::cell::Cell::get), 2);
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .delete_file(r"C:\stat64_probe.txt")
+                .unwrap();
+        }
+
+        #[test]
+        fn crt_access_checks_winfs_paths_and_validates_modes() {
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(r"C:\access_probe.txt", b"x".to_vec())
+                .unwrap();
+            assert_eq!(
+                super::native_crt_access(b"C:\\access_probe.txt\0".as_ptr(), 0),
+                0
+            );
+            assert_eq!(
+                super::native_crt_access(b"C:\\missing-access\0".as_ptr(), 0),
+                -1
+            );
+            assert_eq!(
+                super::native_crt_access(b"C:\\access_probe.txt\0".as_ptr(), 1),
+                -1
+            );
+            assert_eq!(super::THREAD_CRT_ERRNO.with(std::cell::Cell::get), 22);
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .delete_file(r"C:\access_probe.txt")
+                .unwrap();
+        }
+
+        #[test]
+        fn crt_signal_records_handlers_per_process_and_rejects_invalid_numbers() {
+            let process_id = super::process_ctx().unwrap().process_id;
+            assert_eq!(super::native_crt_signal(2, 0x1234), 0);
+            assert_eq!(super::native_crt_signal(2, 0x5678), 0x1234);
+            assert_eq!(super::native_crt_signal(2, 0), 0x5678);
+            assert_eq!(super::native_crt_signal(0, 0x1234), u64::MAX);
+            assert!(super::supports_import("msvcrt.dll", "signal"));
+            assert!(super::supports_import("MSVCRT.DLL", "signal"));
+            super::NATIVE_CRT_SIGNAL_HANDLERS
+                .lock()
+                .unwrap()
+                .remove(&(process_id, 2));
+        }
+
+        #[test]
+        fn crt_errno_returns_thread_local_storage() {
+            let errno = super::native_crt_errno();
+            unsafe { errno.write(22) };
+            let other_value = std::thread::spawn(|| {
+                let other_errno = super::native_crt_errno();
+                unsafe {
+                    other_errno.write(5);
+                    other_errno.read()
+                }
+            })
+            .join()
+            .unwrap();
+            assert_eq!(other_value, 5);
+            assert_eq!(unsafe { errno.read() }, 22);
+        }
+
+        #[test]
+        fn crt_iob_func_returns_the_static_stream_table() {
+            assert_eq!(
+                super::native_crt_iob_func(),
+                super::NATIVE_CRT_IOB.as_ptr().cast_mut().cast()
+            );
+        }
+
+        #[test]
+        fn crt_getenv_reads_guest_environment_case_insensitively() {
+            let key: Vec<u16> = "WINCLI_TEST_CRT_GETENV"
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let value: Vec<u16> = "guest-value"
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            assert_eq!(
+                super::native_set_environment_variable_w(key.as_ptr(), value.as_ptr()),
+                1
+            );
+            let lookup = b"wincli_test_crt_getenv\0";
+            let result = super::native_crt_getenv(lookup.as_ptr());
+            assert!(!result.is_null());
+            assert_eq!(
+                unsafe { std::ffi::CStr::from_ptr(result.cast()) }.to_bytes(),
+                b"guest-value"
+            );
+            assert!(super::native_crt_getenv(b"WINCLI_MISSING_CRT_GETENV\0".as_ptr()).is_null());
+            assert_eq!(
+                super::native_set_environment_variable_w(key.as_ptr(), std::ptr::null()),
+                1
+            );
+        }
+
+        #[test]
         fn import_binding_checks_the_dll_as_well_as_the_function() {
+            assert!(super::supports_import("MSVCRT.dll", "__lconv_init"));
+            assert!(super::supports_import("MSVCRT.dll", "strncmp"));
+            assert!(super::supports_import("MSVCRT.dll", "setlocale"));
+            assert!(super::supports_import("MSVCRT.dll", "strchr"));
+            assert!(super::supports_import("MSVCRT.dll", "strrchr"));
+            assert!(super::supports_import("MSVCRT.dll", "_stricmp"));
+            assert!(super::supports_import("MSVCRT.dll", "_strnicmp"));
+            assert!(super::supports_import("MSVCRT.dll", "atoi"));
+            assert!(super::supports_import("MSVCRT.dll", "tolower"));
+            assert!(super::supports_import("MSVCRT.dll", "toupper"));
+            assert!(super::supports_import("MSVCRT.dll", "strncpy"));
+            assert!(super::supports_import("MSVCRT.dll", "calloc"));
+            assert!(super::supports_import("MSVCRT.dll", "fwrite"));
+            assert!(super::supports_import("MSVCRT.dll", "sprintf"));
+            assert!(super::supports_import("MSVCRT.dll", "_errno"));
+            assert!(super::supports_import("MSVCRT.dll", "getenv"));
+            assert!(super::supports_import("MSVCRT.dll", "__iob_func"));
             assert!(super::supports_import("KERNEL32.dll", "ExitProcess"));
             assert!(super::supports_import("KERNEL32.dll", "GetShortPathNameW"));
             assert!(super::supports_import(
                 "KERNEL32.dll",
                 "GetConsoleCursorInfo"
             ));
+            assert!(super::supports_import("KERNEL32.dll", "GetTickCount"));
+            assert!(super::supports_import("KERNEL32.dll", "GetTickCount64"));
             assert!(super::supports_import("WINMM.dll", "timeGetTime"));
             assert!(!super::supports_import("USER32.dll", "ExitProcess"));
             assert!(!super::supports_import("KERNEL32.dll", "timeGetTime"));
@@ -5346,9 +5712,76 @@ mod imp {
         }
 
         #[test]
+        fn validates_console_cursor_shape_without_resizing_host_terminal() {
+            let mut information = [0u8; 8];
+            information[..4].copy_from_slice(&25u32.to_le_bytes());
+            information[4..].copy_from_slice(&0i32.to_le_bytes());
+            assert_eq!(native_set_console_cursor_info(1, information.as_ptr()), 1);
+            information[..4].copy_from_slice(&101u32.to_le_bytes());
+            assert_eq!(native_set_console_cursor_info(1, information.as_ptr()), 0);
+            assert_eq!(native_set_console_cursor_info(99, information.as_ptr()), 0);
+        }
+
+        #[test]
+        fn validates_cursor_positions_for_terminal_dimensions() {
+            assert_eq!(native_set_console_cursor_position(1, 79 | (24 << 16)), 1);
+            assert_eq!(native_set_console_cursor_position(1, 80), 0);
+            assert_eq!(native_set_console_cursor_position(99, 0), 0);
+        }
+
+        #[test]
+        fn console_output_cell_api_is_bound_and_rejects_invalid_geometry() {
+            let cell = [b' '; 4];
+            let mut region = [0i16, 0, 0, 0];
+            assert!(super::baseline_trampoline("WriteConsoleOutputA").is_some());
+            assert_eq!(
+                super::native_write_console_output_a(
+                    1,
+                    cell.as_ptr(),
+                    0,
+                    0,
+                    region.as_mut_ptr().cast(),
+                ),
+                0
+            );
+        }
+
+        #[test]
         fn accepts_console_mode_changes_for_standard_handles() {
             assert_eq!(native_set_console_mode(1, 5), 1);
             assert_eq!(native_set_console_mode(99, 5), 0);
+        }
+
+        #[test]
+        fn accepts_valid_console_screen_buffer_sizes_for_standard_handles() {
+            let coord = u32::from(80u16) | (u32::from(25u16) << 16);
+            assert_eq!(native_set_console_screen_buffer_size(1, coord), 1);
+            assert_eq!(native_set_console_screen_buffer_size(99, coord), 0);
+            assert_eq!(native_set_console_screen_buffer_size(1, 0), 0);
+        }
+
+        #[test]
+        fn validates_console_window_rectangles_without_resizing_the_host() {
+            let valid = [0i16, 0, 79, 24];
+            let invalid = [4i16, 0, 3, 24];
+            assert_eq!(
+                native_set_console_window_info(1, 1, valid.as_ptr().cast()),
+                1
+            );
+            assert_eq!(
+                native_set_console_window_info(1, 1, invalid.as_ptr().cast()),
+                0
+            );
+            assert_eq!(
+                native_set_console_window_info(99, 1, valid.as_ptr().cast()),
+                0
+            );
+        }
+
+        #[test]
+        fn accepts_standard_console_as_active_screen_buffer() {
+            assert_eq!(native_set_console_active_screen_buffer(1), 1);
+            assert_eq!(native_set_console_active_screen_buffer(99), 0);
         }
 
         #[test]
@@ -8466,6 +8899,9 @@ mod imp {
     thread_local! {
         static THREAD_TLS_VALUES: std::cell::RefCell<[(u64, u64); 64]> =
             const { std::cell::RefCell::new([(0, 0); 64]) };
+        static THREAD_CRT_ERRNO: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+        static THREAD_CRT_GETENV_VALUE: std::cell::RefCell<Vec<u8>> =
+            const { std::cell::RefCell::new(Vec::new()) };
         static THREAD_WSA_ERROR: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
         static THREAD_NATIVE_HANDLE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         static THREAD_LAST_ERROR: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -8473,6 +8909,7 @@ mod imp {
     }
     static NATIVE_CRT_FMODE: AtomicI32 = AtomicI32::new(0);
     static NATIVE_CRT_COMMODE: AtomicI32 = AtomicI32::new(0);
+    static NATIVE_CRT_C_LOCALE: [u8; 2] = *b"C\0";
     static NATIVE_CRT_ACMDLN: AtomicU64 = AtomicU64::new(0);
     static NATIVE_CRT_EMPTY_COMMAND_LINE: [u8; 1] = [0];
     static NATIVE_CRT_INITENV: AtomicU64 = AtomicU64::new(0);
@@ -9750,7 +10187,7 @@ mod imp {
         }
         1
     }
-    extern "win64" fn native_time_get_time() -> u32 {
+    fn native_monotonic_milliseconds() -> u64 {
         let mut time = NativeTimespec {
             seconds: 0,
             nanoseconds: 0,
@@ -9759,7 +10196,19 @@ mod imp {
             // CLOCK_MONOTONIC
             return 0;
         }
-        (time.seconds as u64 * 1000 + time.nanoseconds as u64 / 1_000_000) as u32
+        time.seconds as u64 * 1000 + time.nanoseconds as u64 / 1_000_000
+    }
+
+    extern "win64" fn native_time_get_time() -> u32 {
+        native_monotonic_milliseconds() as u32
+    }
+
+    extern "win64" fn native_get_tick_count() -> u32 {
+        native_monotonic_milliseconds() as u32
+    }
+
+    extern "win64" fn native_get_tick_count64() -> u64 {
+        native_monotonic_milliseconds()
     }
     #[repr(C)]
     struct NativeMemoryStatus {
@@ -10675,6 +11124,40 @@ mod imp {
         }
         1
     }
+    extern "win64" fn native_set_console_cursor_info(handle: u64, input: *const u8) -> i32 {
+        if host_standard_fd(handle).is_none() || input.is_null() {
+            native_set_last_error(87);
+            return 0;
+        }
+        let size = unsafe { (input as *const u32).read_unaligned() };
+        let visible = unsafe { (input.add(4) as *const i32).read_unaligned() };
+        if !(1..=100).contains(&size) || !matches!(visible, 0 | 1) {
+            native_set_last_error(87);
+            return 0;
+        }
+        // Cursor visibility and shape are owned by the host terminal.
+        1
+    }
+    extern "win64" fn native_set_console_cursor_position(handle: u64, position: u32) -> i32 {
+        let Some(fd @ (1 | 2)) = host_standard_fd(handle) else {
+            native_set_last_error(6);
+            return 0;
+        };
+        let x = position as u16 as i16;
+        let y = (position >> 16) as u16 as i16;
+        if !(0..80).contains(&x) || !(0..25).contains(&y) {
+            native_set_last_error(87);
+            return 0;
+        }
+        let sequence = format!("\x1b[{};{}H", y + 1, x + 1);
+        if unsafe { write(fd, sequence.as_ptr().cast(), sequence.len()) } == sequence.len() as isize
+        {
+            1
+        } else {
+            native_set_last_error(5);
+            0
+        }
+    }
     extern "win64" fn native_get_console_screen_buffer_info(handle: u64, output: *mut u8) -> i32 {
         if host_standard_fd(handle).is_none() || output.is_null() {
             return 0;
@@ -10693,6 +11176,46 @@ mod imp {
     }
     extern "win64" fn native_set_console_mode(handle: u64, _mode: u32) -> i32 {
         host_standard_fd(handle).is_some() as i32
+    }
+    extern "win64" fn native_set_console_screen_buffer_size(handle: u64, size: u32) -> i32 {
+        let width = size as u16 as i16;
+        let height = (size >> 16) as u16 as i16;
+        if host_standard_fd(handle).is_none() || width <= 0 || height <= 0 {
+            native_set_last_error(87);
+            return 0;
+        }
+        // The host terminal owns the physical dimensions; accept a valid
+        // guest buffer size without attempting to resize that terminal.
+        1
+    }
+    extern "win64" fn native_set_console_window_info(
+        handle: u64,
+        _absolute: i32,
+        rect: *const u8,
+    ) -> i32 {
+        if host_standard_fd(handle).is_none() || rect.is_null() {
+            native_set_last_error(87);
+            return 0;
+        }
+        let left = unsafe { (rect as *const i16).read_unaligned() };
+        let top = unsafe { (rect.add(2) as *const i16).read_unaligned() };
+        let right = unsafe { (rect.add(4) as *const i16).read_unaligned() };
+        let bottom = unsafe { (rect.add(6) as *const i16).read_unaligned() };
+        if right < left || bottom < top {
+            native_set_last_error(87);
+            return 0;
+        }
+        // Window geometry belongs to the host terminal; validate the guest
+        // rectangle without attempting to resize the host window.
+        1
+    }
+    extern "win64" fn native_set_console_active_screen_buffer(handle: u64) -> i32 {
+        if host_standard_fd(handle).is_some() {
+            1
+        } else {
+            native_set_last_error(6);
+            0
+        }
     }
     extern "win64" fn native_set_console_title_w(title: *const u16) -> i32 {
         if title.is_null() {
@@ -11826,6 +12349,125 @@ mod imp {
         1
     }
 
+    extern "win64" fn native_write_console_output_a(
+        handle: u64,
+        cells: *const u8,
+        dimensions: u32,
+        source: u32,
+        region: *mut u8,
+    ) -> i32 {
+        let Some(fd @ (1 | 2)) = host_standard_fd(handle) else {
+            native_set_last_error(6);
+            return 0;
+        };
+        if cells.is_null() || region.is_null() {
+            native_set_last_error(87);
+            return 0;
+        }
+        let width = dimensions as u16 as i16;
+        let height = (dimensions >> 16) as u16 as i16;
+        let source_x = source as u16 as i16;
+        let source_y = (source >> 16) as u16 as i16;
+        let (mut left, mut top, mut right, mut bottom) = unsafe {
+            (
+                region.cast::<i16>().read_unaligned(),
+                region.add(2).cast::<i16>().read_unaligned(),
+                region.add(4).cast::<i16>().read_unaligned(),
+                region.add(6).cast::<i16>().read_unaligned(),
+            )
+        };
+        if width <= 0 || height <= 0 || source_x < 0 || source_y < 0 || right < left || bottom < top
+        {
+            native_set_last_error(87);
+            return 0;
+        }
+        let original_left = left;
+        let original_top = top;
+        left = left.max(0);
+        top = top.max(0);
+        right = right.min(width - 1);
+        bottom = bottom.min(height - 1);
+        if right < left || bottom < top {
+            native_set_last_error(87);
+            return 0;
+        }
+        let output_width = (right - left + 1) as usize;
+        let output_height = (bottom - top + 1) as usize;
+        if output_width.saturating_mul(output_height) > 2_000_000
+            || source_x as usize + (left - original_left) as usize + output_width > width as usize
+            || source_y as usize + (top - original_top) as usize + output_height > height as usize
+        {
+            native_set_last_error(87);
+            return 0;
+        }
+        unsafe {
+            region.cast::<i16>().write_unaligned(left);
+            region.add(2).cast::<i16>().write_unaligned(top);
+            region.add(4).cast::<i16>().write_unaligned(right);
+            region.add(6).cast::<i16>().write_unaligned(bottom);
+        }
+        let source_left = source_x as usize + (left - original_left) as usize;
+        let source_top = source_y as usize + (top - original_top) as usize;
+        let mut terminal = Vec::with_capacity(output_height * (output_width + 32));
+        for row in 0..output_height {
+            terminal.extend_from_slice(
+                format!(
+                    "\x1b[{};{}H\x1b[0m",
+                    top as usize + row + 1,
+                    left as usize + 1
+                )
+                .as_bytes(),
+            );
+            let mut style = u16::MAX;
+            for column in 0..output_width {
+                let index = ((source_top + row) * width as usize + source_left + column) * 4;
+                let character = unsafe { cells.add(index).read() };
+                let attributes = unsafe { cells.add(index + 2).cast::<u16>().read_unaligned() };
+                if attributes != style {
+                    style = attributes;
+                    let foreground = (attributes & 0x0f) as u8;
+                    let background = ((attributes >> 4) & 0x0f) as u8;
+                    let fg = if foreground & 8 != 0 {
+                        90 + (foreground & 7)
+                    } else {
+                        30 + foreground
+                    };
+                    let bg = if background & 8 != 0 {
+                        100 + (background & 7)
+                    } else {
+                        40 + background
+                    };
+                    terminal.extend_from_slice(format!("\x1b[{fg};{bg}m").as_bytes());
+                    if attributes & 0x80 != 0 {
+                        terminal.extend_from_slice(b"\x1b[7m");
+                    }
+                }
+                terminal.push(if (0x20..=0x7e).contains(&character) {
+                    character
+                } else {
+                    b' '
+                });
+            }
+        }
+        terminal.extend_from_slice(b"\x1b[0m");
+        let mut written = 0;
+        while written < terminal.len() {
+            let count = unsafe {
+                write(
+                    fd,
+                    terminal[written..].as_ptr().cast(),
+                    terminal.len() - written,
+                )
+            };
+            if count <= 0 {
+                native_set_last_error(5);
+                return 0;
+            }
+            written += count as usize;
+        }
+        1
+    }
+
     extern "win64" fn native_exit_process(code: u32) -> ! {
         if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
             eprintln!("native ExitProcess code={code:#x}");
@@ -12151,6 +12793,82 @@ mod imp {
             .unwrap_or(0)
     }
     extern "win64" fn native_crt_set_app_type(_app_type: i32) {}
+    extern "win64" fn native_crt_iob_func() -> *mut u8 {
+        NATIVE_CRT_IOB.as_ptr().cast_mut().cast()
+    }
+    extern "win64" fn native_crt_errno() -> *mut i32 {
+        THREAD_CRT_ERRNO.with(std::cell::Cell::as_ptr)
+    }
+    extern "win64" fn native_crt_signal(signal: i32, handler: u64) -> u64 {
+        let Some(process) = process_ctx() else {
+            return u64::MAX;
+        };
+        if !(1..=22).contains(&signal) {
+            return u64::MAX; // SIG_ERR
+        }
+        let Ok(mut handlers) = NATIVE_CRT_SIGNAL_HANDLERS.lock() else {
+            return u64::MAX;
+        };
+        handlers
+            .insert((process.process_id, signal), handler)
+            .unwrap_or(0)
+    }
+    extern "win64" fn native_crt_getenv(name: *const u8) -> *mut u8 {
+        if name.is_null() {
+            return std::ptr::null_mut();
+        }
+        let mut key = Vec::new();
+        for index in 0..32768usize {
+            let byte = unsafe { name.add(index).read() };
+            if byte == 0 {
+                break;
+            }
+            key.push(byte);
+        }
+        if key.is_empty() {
+            return std::ptr::null_mut();
+        }
+        let key = String::from_utf8_lossy(&key);
+        let Some(value) = process_ctx().and_then(|process| {
+            process.environment.lock().ok().and_then(|environment| {
+                environment.iter().find_map(|(name, value)| {
+                    name.eq_ignore_ascii_case(&key).then(|| value.clone())
+                })
+            })
+        }) else {
+            return std::ptr::null_mut();
+        };
+        THREAD_CRT_GETENV_VALUE.with(|buffer| {
+            let mut buffer = buffer.borrow_mut();
+            buffer.clear();
+            buffer.extend_from_slice(value.as_bytes());
+            buffer.push(0);
+            buffer.as_mut_ptr()
+        })
+    }
+    // The native runtime starts in the C locale, whose initial locale
+    // conversion data is zero-initialized. MinGW CRTs call this initializer
+    // during startup; no additional setup is needed for that default locale.
+    extern "win64" fn native_crt_lconv_init() {}
+    extern "win64" fn native_crt_setlocale(category: i32, locale: *const u8) -> *const u8 {
+        if !(0..=5).contains(&category) {
+            return std::ptr::null();
+        }
+        if !locale.is_null() {
+            let mut value = Vec::new();
+            for index in 0..128usize {
+                let byte = unsafe { locale.add(index).read() };
+                if byte == 0 {
+                    break;
+                }
+                value.push(byte.to_ascii_lowercase());
+            }
+            if !value.is_empty() && value != b"c" && value != b"posix" {
+                return std::ptr::null();
+            }
+        }
+        NATIVE_CRT_C_LOCALE.as_ptr()
+    }
     extern "win64" fn native_crt_cexit() {}
     extern "win64" fn native_crt_onexit(callback: u64) -> u64 {
         callback
@@ -12174,6 +12892,433 @@ mod imp {
             }
         }
         0
+    }
+    extern "win64" fn native_crt_strncmp(left: *const u8, right: *const u8, count: usize) -> i32 {
+        for index in 0..count {
+            let (a, b) = unsafe { (left.add(index).read(), right.add(index).read()) };
+            if a != b || a == 0 {
+                return i32::from(a) - i32::from(b);
+            }
+        }
+        0
+    }
+    extern "win64" fn native_crt_strchr(input: *const u8, value: i32) -> *mut u8 {
+        if input.is_null() {
+            return std::ptr::null_mut();
+        }
+        let target = value as u8;
+        for index in 0..1_048_576usize {
+            let byte = unsafe { input.add(index).read() };
+            if byte == target {
+                return unsafe { input.add(index) as *mut u8 };
+            }
+            if byte == 0 {
+                return std::ptr::null_mut();
+            }
+        }
+        std::ptr::null_mut()
+    }
+    extern "win64" fn native_crt_strrchr(input: *const u8, value: i32) -> *mut u8 {
+        if input.is_null() {
+            return std::ptr::null_mut();
+        }
+        let target = value as u8;
+        let mut found = std::ptr::null_mut();
+        for index in 0..1_048_576usize {
+            let byte = unsafe { input.add(index).read() };
+            if byte == target {
+                found = unsafe { input.add(index) as *mut u8 };
+            }
+            if byte == 0 {
+                return found;
+            }
+        }
+        found
+    }
+    fn native_crt_fold_ascii(byte: u8) -> u8 {
+        if byte.is_ascii_uppercase() {
+            byte + (b'a' - b'A')
+        } else {
+            byte
+        }
+    }
+    extern "win64" fn native_crt_stricmp(left: *const u8, right: *const u8) -> i32 {
+        for index in 0..1_048_576usize {
+            let (a, b) = unsafe { (left.add(index).read(), right.add(index).read()) };
+            let (a, b) = (native_crt_fold_ascii(a), native_crt_fold_ascii(b));
+            if a != b || a == 0 {
+                return i32::from(a) - i32::from(b);
+            }
+        }
+        0
+    }
+    extern "win64" fn native_crt_strnicmp(left: *const u8, right: *const u8, count: usize) -> i32 {
+        for index in 0..count {
+            let (a, b) = unsafe { (left.add(index).read(), right.add(index).read()) };
+            let (a, b) = (native_crt_fold_ascii(a), native_crt_fold_ascii(b));
+            if a != b || a == 0 {
+                return i32::from(a) - i32::from(b);
+            }
+        }
+        0
+    }
+    extern "win64" fn native_crt_atoi(input: *const u8) -> i32 {
+        if input.is_null() {
+            return 0;
+        }
+        let mut index = 0usize;
+        while index < 1_048_576 && unsafe { input.add(index).read() }.is_ascii_whitespace() {
+            index += 1;
+        }
+        let negative = match unsafe { input.add(index).read() } {
+            b'-' => {
+                index += 1;
+                true
+            }
+            b'+' => {
+                index += 1;
+                false
+            }
+            _ => false,
+        };
+        let mut value = 0i32;
+        let mut digits = 0usize;
+        while index < 1_048_576 {
+            let byte = unsafe { input.add(index).read() };
+            if !byte.is_ascii_digit() {
+                break;
+            }
+            value = value.wrapping_mul(10).wrapping_add(i32::from(byte - b'0'));
+            index += 1;
+            digits += 1;
+        }
+        if digits == 0 {
+            0
+        } else if negative {
+            value.wrapping_neg()
+        } else {
+            value
+        }
+    }
+    extern "win64" fn native_crt_tolower(value: i32) -> i32 {
+        if (b'A' as i32..=b'Z' as i32).contains(&value) {
+            value + (b'a' - b'A') as i32
+        } else {
+            value
+        }
+    }
+    extern "win64" fn native_crt_toupper(value: i32) -> i32 {
+        if (b'a' as i32..=b'z' as i32).contains(&value) {
+            value - (b'a' - b'A') as i32
+        } else {
+            value
+        }
+    }
+    extern "win64" fn native_crt_strncpy(
+        output: *mut u8,
+        input: *const u8,
+        count: usize,
+    ) -> *mut u8 {
+        if count == 0 {
+            return output;
+        }
+        let mut index = 0usize;
+        while index < count {
+            let byte = unsafe { input.add(index).read() };
+            unsafe { output.add(index).write(byte) };
+            index += 1;
+            if byte == 0 {
+                while index < count {
+                    unsafe { output.add(index).write(0) };
+                    index += 1;
+                }
+                break;
+            }
+        }
+        output
+    }
+    extern "win64" fn native_crt_wcstombs(
+        output: *mut u8,
+        input: *const u16,
+        count: usize,
+    ) -> usize {
+        if input.is_null() {
+            return usize::MAX;
+        }
+        let mut converted = 0usize;
+        for index in 0..32768usize {
+            if !output.is_null() && converted == count {
+                return converted;
+            }
+            let wide = unsafe { input.add(index).read() };
+            if wide == 0 {
+                if !output.is_null() && converted < count {
+                    unsafe { output.add(converted).write(0) };
+                }
+                return converted;
+            }
+            if wide > 0x7f {
+                THREAD_CRT_ERRNO.with(|error| error.set(42)); // EILSEQ in the C locale.
+                return usize::MAX;
+            }
+            if !output.is_null() && converted < count {
+                unsafe { output.add(converted).write(wide as u8) };
+            }
+            converted += 1;
+        }
+        THREAD_CRT_ERRNO.with(|error| error.set(22)); // EINVAL: no terminator in bounded scan.
+        usize::MAX
+    }
+    extern "win64" fn native_crt_stat64(path: *const u8, output: *mut u8) -> i32 {
+        if path.is_null() || output.is_null() {
+            THREAD_CRT_ERRNO.with(|error| error.set(22)); // EINVAL
+            return -1;
+        }
+        let Some(wide_path) = native_ansi_path(path) else {
+            THREAD_CRT_ERRNO.with(|error| error.set(2)); // ENOENT
+            return -1;
+        };
+        let path =
+            String::from_utf16_lossy(wide_path.strip_suffix(&[0]).unwrap_or(wide_path.as_slice()));
+        let Some(context) = fs_ctx() else {
+            THREAD_CRT_ERRNO.with(|error| error.set(2));
+            return -1;
+        };
+        let Ok(ctx) = context.lock() else {
+            THREAD_CRT_ERRNO.with(|error| error.set(22));
+            return -1;
+        };
+        let is_directory = ctx.fs.is_dir(&path);
+        let is_file = ctx.fs.is_file(&path);
+        if !is_directory && !is_file {
+            THREAD_CRT_ERRNO.with(|error| error.set(2));
+            return -1;
+        }
+
+        // MSVC's x64 __stat64 layout: scalar fields through st_rdev, then
+        // 8-byte aligned size and three 64-bit Unix timestamps.
+        unsafe { std::ptr::write_bytes(output, 0, 56) };
+        let device = path
+            .as_bytes()
+            .first()
+            .filter(|_| path.as_bytes().get(1) == Some(&b':'))
+            .map(|letter| letter.to_ascii_uppercase().saturating_sub(b'A'))
+            .unwrap_or(2) as u32;
+        let inode = ctx.fs.file_id(&path).unwrap_or_default() as u16;
+        let mode = if is_directory {
+            0x4000u16
+        } else {
+            0x8000u16 | 0x0180
+        };
+        unsafe {
+            output.cast::<u32>().write_unaligned(device);
+            output.add(4).cast::<u16>().write_unaligned(inode);
+            output.add(6).cast::<u16>().write_unaligned(mode);
+            output.add(8).cast::<u16>().write_unaligned(1);
+            output.add(14).cast::<u32>().write_unaligned(device);
+            output.add(24).cast::<i64>().write_unaligned(if is_file {
+                ctx.fs.file_len(&path).unwrap_or_default() as i64
+            } else {
+                0
+            });
+        }
+        let metadata = ctx.fs.file_metadata(&path);
+        let to_unix_seconds = |filetime: u64| (filetime / 10_000_000) as i64 - 11_644_473_600i64;
+        unsafe {
+            output
+                .add(32)
+                .cast::<i64>()
+                .write_unaligned(to_unix_seconds(metadata.access_time));
+            output
+                .add(40)
+                .cast::<i64>()
+                .write_unaligned(to_unix_seconds(metadata.write_time));
+            output
+                .add(48)
+                .cast::<i64>()
+                .write_unaligned(to_unix_seconds(metadata.creation_time));
+        }
+        0
+    }
+    extern "win64" fn native_crt_access(path: *const u8, mode: i32) -> i32 {
+        if path.is_null() || !(0..=6).contains(&mode) || mode & !6 != 0 {
+            THREAD_CRT_ERRNO.with(|error| error.set(22)); // EINVAL
+            return -1;
+        }
+        let Some(wide_path) = native_ansi_path(path) else {
+            THREAD_CRT_ERRNO.with(|error| error.set(2));
+            return -1;
+        };
+        let path =
+            String::from_utf16_lossy(wide_path.strip_suffix(&[0]).unwrap_or(wide_path.as_slice()));
+        let exists = fs_ctx().is_some_and(|context| {
+            context
+                .lock()
+                .is_ok_and(|ctx| ctx.fs.is_file(&path) || ctx.fs.is_dir(&path))
+        });
+        if exists {
+            0
+        } else {
+            THREAD_CRT_ERRNO.with(|error| error.set(2));
+            -1
+        }
+    }
+    extern "win64" fn native_crt_sprintf(
+        output: *mut u8,
+        format: *const u8,
+        a0: u64,
+        a1: u64,
+        a2: u64,
+        a3: u64,
+        a4: u64,
+        a5: u64,
+        a6: u64,
+        a7: u64,
+        a8: u64,
+        a9: u64,
+    ) -> i32 {
+        if output.is_null() || format.is_null() {
+            return -1;
+        }
+        let args = [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9];
+        let mut arg = 0usize;
+        let mut index = 0usize;
+        let mut result = Vec::new();
+        while index < 1_048_576 {
+            let ch = unsafe { format.add(index).read() };
+            if ch == 0 {
+                break;
+            }
+            index += 1;
+            if ch != b'%' {
+                result.push(ch);
+                continue;
+            }
+            if unsafe { format.add(index).read() } == b'%' {
+                result.push(b'%');
+                index += 1;
+                continue;
+            }
+            let mut zero_pad = false;
+            if unsafe { format.add(index).read() } == b'0' {
+                zero_pad = true;
+                index += 1;
+            }
+            let mut width = 0usize;
+            while unsafe { format.add(index).read() }.is_ascii_digit() {
+                width =
+                    (width * 10 + (unsafe { format.add(index).read() } - b'0') as usize).min(4096);
+                index += 1;
+            }
+            let mut precision = None;
+            if unsafe { format.add(index).read() } == b'.' {
+                index += 1;
+                let mut value = 0usize;
+                while unsafe { format.add(index).read() }.is_ascii_digit() {
+                    value = (value * 10 + (unsafe { format.add(index).read() } - b'0') as usize)
+                        .min(4096);
+                    index += 1;
+                }
+                precision = Some(value);
+            }
+            let mut long_long = false;
+            if unsafe { format.add(index).read() } == b'l' {
+                index += 1;
+                if unsafe { format.add(index).read() } == b'l' {
+                    long_long = true;
+                    index += 1;
+                }
+            } else if matches!(unsafe { format.add(index).read() }, b'z' | b'I') {
+                long_long = true;
+                index += 1;
+            }
+            let spec = unsafe { format.add(index).read() };
+            if spec == 0 {
+                break;
+            }
+            index += 1;
+            let value = args.get(arg).copied().unwrap_or(0);
+            arg += 1;
+            let mut part = match spec {
+                b's' => {
+                    let mut bytes = Vec::new();
+                    if value != 0 {
+                        for offset in 0..1_048_576usize {
+                            let byte = unsafe { (value as *const u8).add(offset).read() };
+                            if byte == 0 {
+                                break;
+                            }
+                            bytes.push(byte);
+                        }
+                    } else {
+                        bytes.extend_from_slice(b"(null)");
+                    }
+                    if let Some(limit) = precision {
+                        bytes.truncate(limit);
+                    }
+                    bytes
+                }
+                b'c' => vec![value as u8],
+                b'd' | b'i' => {
+                    let number = if long_long {
+                        value as i64
+                    } else {
+                        value as i32 as i64
+                    };
+                    number.to_string().into_bytes()
+                }
+                b'u' => {
+                    let number = if long_long {
+                        value
+                    } else {
+                        value as u32 as u64
+                    };
+                    number.to_string().into_bytes()
+                }
+                b'x' | b'X' | b'p' => {
+                    let number = if spec == b'p' || long_long {
+                        value
+                    } else {
+                        value as u32 as u64
+                    };
+                    let mut digits = format!("{number:x}").into_bytes();
+                    if spec == b'X' {
+                        digits.make_ascii_uppercase();
+                    }
+                    if spec == b'p' {
+                        let mut prefixed = b"0x".to_vec();
+                        prefixed.extend(digits);
+                        prefixed
+                    } else {
+                        digits
+                    }
+                }
+                _ => return -1,
+            };
+            if part.len() < width {
+                let pad = width - part.len();
+                let byte = if zero_pad { b'0' } else { b' ' };
+                let mut padded = Vec::with_capacity(width);
+                if zero_pad && part.first() == Some(&b'-') {
+                    padded.push(b'-');
+                    padded.resize(1 + pad, b'0');
+                    padded.extend_from_slice(&part[1..]);
+                } else {
+                    padded.resize(pad, byte);
+                    padded.extend_from_slice(&part);
+                }
+                part = padded;
+            }
+            result.extend(part);
+            if result.len() > 1_048_576 {
+                return -1;
+            }
+        }
+        unsafe {
+            output.copy_from_nonoverlapping(result.as_ptr(), result.len());
+            output.add(result.len()).write(0);
+        }
+        result.len() as i32
     }
     extern "win64" fn native_crt_wcscmp(left: *const u16, right: *const u16) -> i32 {
         for index in 0..1_048_576usize {
@@ -12237,10 +13382,69 @@ mod imp {
     extern "win64" fn native_crt_malloc(size: usize) -> *mut c_void {
         unsafe { malloc(size.max(1)) }
     }
+    extern "win64" fn native_crt_realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
+        unsafe { realloc(ptr, size.max(1)) }
+    }
+    extern "win64" fn native_crt_strdup(input: *const u8) -> *mut u8 {
+        if input.is_null() {
+            return std::ptr::null_mut();
+        }
+        let length = native_crt_strlen(input);
+        let Some(allocation_size) = length.checked_add(1) else {
+            return std::ptr::null_mut();
+        };
+        let output = native_crt_malloc(allocation_size).cast::<u8>();
+        if output.is_null() {
+            return output;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(input, output, allocation_size) };
+        output
+    }
+    extern "win64" fn native_crt_calloc(count: usize, size: usize) -> *mut c_void {
+        let Some(length) = count.checked_mul(size) else {
+            return std::ptr::null_mut();
+        };
+        let ptr = unsafe { malloc(length.max(1)) };
+        if !ptr.is_null() && length != 0 {
+            unsafe { std::ptr::write_bytes(ptr, 0, length) };
+        }
+        ptr
+    }
     extern "win64" fn native_crt_free(ptr: *mut c_void) {
         if !ptr.is_null() {
             unsafe { free(ptr) };
         }
+    }
+    extern "win64" fn native_crt_fwrite(
+        buffer: *const u8,
+        size: usize,
+        count: usize,
+        _stream: *mut u8,
+    ) -> usize {
+        let Some(length) = size.checked_mul(count) else {
+            return 0;
+        };
+        if size == 0 || length == 0 {
+            return 0;
+        }
+        if buffer.is_null() {
+            return 0;
+        }
+        let mut written = 0usize;
+        while written < length {
+            let result = unsafe {
+                write(
+                    1,
+                    buffer.add(written).cast(),
+                    length.saturating_sub(written),
+                )
+            };
+            if result <= 0 {
+                break;
+            }
+            written += result as usize;
+        }
+        written / size
     }
     extern "win64" fn native_crt_memcmp(left: *const u8, right: *const u8, len: usize) -> i32 {
         for index in 0..len {
@@ -15980,6 +17184,8 @@ mod imp {
                 matches!(
                     func,
                     "__set_app_type"
+                        | "__lconv_init"
+                        | "setlocale"
                         | "_fmode"
                         | "_commode"
                         | "_acmdln"
@@ -15991,13 +17197,34 @@ mod imp {
                         | "_c_exit"
                         | "_onexit"
                         | "malloc"
+                        | "realloc"
                         | "free"
                         | "memcmp"
                         | "memcpy"
                         | "memmove"
                         | "memset"
                         | "strlen"
+                        | "_strdup"
                         | "strcmp"
+                        | "strncmp"
+                        | "strchr"
+                        | "strrchr"
+                        | "_stricmp"
+                        | "_strnicmp"
+                        | "_errno"
+                        | "getenv"
+                        | "__iob_func"
+                        | "atoi"
+                        | "signal"
+                        | "tolower"
+                        | "toupper"
+                        | "strncpy"
+                        | "wcstombs"
+                        | "_stat64"
+                        | "_access"
+                        | "calloc"
+                        | "fwrite"
+                        | "sprintf"
                         | "wcscmp"
                         | "wcsstr"
                         | "fflush"
@@ -16065,7 +17292,7 @@ mod imp {
                     | "WSASend"
                     | "listen"
             ),
-            "USER32.DLL" => func == "GetSystemMetrics",
+            "USER32.DLL" => matches!(func, "GetSystemMetrics" | "MessageBeep"),
             "IPHLPAPI.DLL" => func == "GetAdaptersAddresses",
             "NTDLL.DLL" => matches!(
                 func,
@@ -16096,13 +17323,35 @@ mod imp {
     fn baseline_trampoline(name: &str) -> Option<u64> {
         match name {
             "__set_app_type" => Some(native_crt_set_app_type as *const () as usize as u64),
+            "_errno" => Some(native_crt_errno as *const () as usize as u64),
+            "getenv" => Some(native_crt_getenv as *const () as usize as u64),
+            "__iob_func" => Some(native_crt_iob_func as *const () as usize as u64),
+            "__lconv_init" => Some(native_crt_lconv_init as *const () as usize as u64),
+            "setlocale" => Some(native_crt_setlocale as *const () as usize as u64),
             "_initterm" => Some(native_crt_initterm as *const () as usize as u64),
             "__getmainargs" => Some(native_crt_getmainargs as *const () as usize as u64),
             "exit" | "_exit" => Some(native_exit_process as *const () as usize as u64),
             "_cexit" | "_c_exit" => Some(native_crt_cexit as *const () as usize as u64),
             "_onexit" => Some(native_crt_onexit as *const () as usize as u64),
             "strlen" => Some(native_crt_strlen as *const () as usize as u64),
+            "_strdup" => Some(native_crt_strdup as *const () as usize as u64),
             "strcmp" => Some(native_crt_strcmp as *const () as usize as u64),
+            "strncmp" => Some(native_crt_strncmp as *const () as usize as u64),
+            "strchr" => Some(native_crt_strchr as *const () as usize as u64),
+            "strrchr" => Some(native_crt_strrchr as *const () as usize as u64),
+            "_stricmp" => Some(native_crt_stricmp as *const () as usize as u64),
+            "_strnicmp" => Some(native_crt_strnicmp as *const () as usize as u64),
+            "atoi" => Some(native_crt_atoi as *const () as usize as u64),
+            "signal" => Some(native_crt_signal as *const () as usize as u64),
+            "tolower" => Some(native_crt_tolower as *const () as usize as u64),
+            "toupper" => Some(native_crt_toupper as *const () as usize as u64),
+            "strncpy" => Some(native_crt_strncpy as *const () as usize as u64),
+            "wcstombs" => Some(native_crt_wcstombs as *const () as usize as u64),
+            "_stat64" => Some(native_crt_stat64 as *const () as usize as u64),
+            "_access" => Some(native_crt_access as *const () as usize as u64),
+            "calloc" => Some(native_crt_calloc as *const () as usize as u64),
+            "fwrite" => Some(native_crt_fwrite as *const () as usize as u64),
+            "sprintf" => Some(native_crt_sprintf as *const () as usize as u64),
             "wcscmp" => Some(native_crt_wcscmp as *const () as usize as u64),
             "wcsstr" => Some(native_crt_wcsstr as *const () as usize as u64),
             "fflush" => Some(native_crt_fflush as *const () as usize as u64),
@@ -16111,6 +17360,7 @@ mod imp {
             "_iob" => Some(NATIVE_CRT_IOB.as_ptr() as u64),
             "__initenv" => Some(NATIVE_CRT_INITENV.as_ptr() as u64),
             "malloc" => Some(native_crt_malloc as *const () as usize as u64),
+            "realloc" => Some(native_crt_realloc as *const () as usize as u64),
             "free" => Some(native_crt_free as *const () as usize as u64),
             "memcmp" => Some(native_crt_memcmp as *const () as usize as u64),
             "memcpy" => Some(native_crt_memcpy as *const () as usize as u64),
@@ -16156,6 +17406,7 @@ mod imp {
             "#111" => Some(native_wsa_get_last_error as *const () as usize as u64),
             "#112" => Some(native_wsa_set_last_error as *const () as usize as u64),
             "GetSystemMetrics" => Some(native_get_system_metrics as *const () as usize as u64),
+            "MessageBeep" => Some(native_message_beep as *const () as usize as u64),
             "CompareStringOrdinal" => {
                 Some(native_compare_string_ordinal as *const () as usize as u64)
             }
@@ -16325,6 +17576,8 @@ mod imp {
             "QueryPerformanceFrequency" => {
                 Some(native_query_performance_frequency as *const () as usize as u64)
             }
+            "GetTickCount" => Some(native_get_tick_count as *const () as usize as u64),
+            "GetTickCount64" => Some(native_get_tick_count64 as *const () as usize as u64),
             "Sleep" => Some(native_sleep as *const () as usize as u64),
             "SwitchToThread" => Some(native_switch_to_thread as *const () as usize as u64),
             "GetTimeZoneInformation" => {
@@ -16503,8 +17756,23 @@ mod imp {
             "GetConsoleCursorInfo" => {
                 Some(native_get_console_cursor_info as *const () as usize as u64)
             }
+            "SetConsoleCursorInfo" => {
+                Some(native_set_console_cursor_info as *const () as usize as u64)
+            }
+            "SetConsoleCursorPosition" => {
+                Some(native_set_console_cursor_position as *const () as usize as u64)
+            }
             "GetConsoleScreenBufferInfo" => {
                 Some(native_get_console_screen_buffer_info as *const () as usize as u64)
+            }
+            "SetConsoleScreenBufferSize" => {
+                Some(native_set_console_screen_buffer_size as *const () as usize as u64)
+            }
+            "SetConsoleWindowInfo" => {
+                Some(native_set_console_window_info as *const () as usize as u64)
+            }
+            "SetConsoleActiveScreenBuffer" => {
+                Some(native_set_console_active_screen_buffer as *const () as usize as u64)
             }
             "SetConsoleMode" => Some(native_set_console_mode as *const () as usize as u64),
             "SetConsoleTitleW" => Some(native_set_console_title_w as *const () as usize as u64),
@@ -16531,6 +17799,9 @@ mod imp {
             "SetFilePointer" => Some(native_set_file_pointer as *const () as usize as u64),
             "WriteFile" => Some(native_write_file as *const () as usize as u64),
             "WriteConsoleW" => Some(native_write_console_w as *const () as usize as u64),
+            "WriteConsoleOutputA" => {
+                Some(native_write_console_output_a as *const () as usize as u64)
+            }
             "ExitProcess" => Some(native_exit_process as *const () as usize as u64),
             "CreateProcessW" => Some(native_create_process_w as *const () as usize as u64),
             "CreateFileW" => Some(native_create_file_w as *const () as usize as u64),
@@ -16630,6 +17901,12 @@ mod imp {
         // The native CLI guest has no Windows desktop session. The documented
         // value for absent/unsupported system metrics is zero.
         0
+    }
+
+    extern "win64" fn native_message_beep(_kind: u32) -> i32 {
+        // The CLI guest has no Windows sound device; match the successful
+        // best-effort behavior of MessageBeep without producing host audio.
+        1
     }
 
     extern "win64" fn native_get_locale_info_ex(
