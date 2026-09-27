@@ -52,8 +52,9 @@ Items remain open until implementation and relevant verification are complete.
   processes, sockets, and related Windows API groups. **Started:** the public
   `native.rs` is now a platform-neutral façade; Linux x86-64 execution and
   unsupported-host behavior live in separate backend modules. Linux host ABI
-  declarations and PE import/trampoline lookup are separate backend-local
-  modules. Next, split the Linux implementation by Windows API subsystem while
+  declarations, PE import/trampoline lookup, image mapping, and process launch
+  support are separate backend-local modules. The remaining Linux backend still
+  contains most API shims and should be split by Windows API subsystem while
   keeping host syscalls backend-local so macOS can provide its own.
 - [x] Cache `WINCLI_NATIVE_DIAGNOSTIC` once rather than reading the environment
   from hot shims; initialize the cache before guest forks.

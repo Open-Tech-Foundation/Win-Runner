@@ -68,6 +68,8 @@ All notable changes to this project will be documented in this file.
   toward platform-specific native backends.
 - Separated Linux host ABI declarations and PE import/trampoline selection
   into backend-local modules.
+- Split Linux x86-64 PE mapping and process-launch support into backend-local
+  modules, keeping their host-specific implementation beside the Linux backend.
 - Added the C-locale `msvcrt!mbstowcs` shim used by Nano.
 - Added an optional native Node check proving a relative file that Node leaves
   in WinFS appears in the following shell directory listing.
