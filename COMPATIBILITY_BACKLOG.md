@@ -62,8 +62,10 @@ Items remain open until implementation and relevant verification are complete.
   process waits and waitable-object types still use separate state maps. Thread
   creation, job objects, process identity, child exit, and termination shims now
   live in the process module alongside launch support. Child lifecycle plumbing
-  and per-process state still need extraction; other API groups need splitting
-  by Windows subsystem while host syscalls remain backend-local for macOS.
+  and per-process state still need extraction. C runtime shims and their
+  process/thread-local state now live in a CRT module. Other API groups need
+  splitting by Windows subsystem while host syscalls remain backend-local for
+  macOS.
 - [x] Cache `WINCLI_NATIVE_DIAGNOSTIC` once rather than reading the environment
   from hot shims; initialize the cache before guest forks.
 - [x] Fix Clippy's unevenly grouped hexadecimal literal warnings. A current
