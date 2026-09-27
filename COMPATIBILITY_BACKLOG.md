@@ -34,8 +34,14 @@ Items remain open until implementation and relevant verification are complete.
 - [x] **6. Preserve guest arguments after the executable.** Parse WinCLI
   options only before the target program; pass later `--snapshot`, `--mount`,
   `--control`, and `--headless` arguments through unchanged.
-- [ ] **7. Verify stderr on the control channel.** Trace native guest stderr and
-  ensure it is emitted as `OutputChannel::Stderr` rather than host fd 2.
+- [x] **7. Route guest stderr through the control channel.** The native
+  launcher captures stdout and stderr independently, drains both without
+  blocking, and reports the channel to the output sink. Legacy callers continue
+  receiving guest stderr on host stderr.
+- [ ] **8. Fix Node child-process pipe capture.** `execFileSync` launching the
+  guest `powershell.exe` shim has been observed hanging while reading captured
+  output. Reproduce through the control API and fix pipe inheritance/EOF and
+  child output forwarding.
 
 ## Housekeeping
 

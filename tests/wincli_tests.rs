@@ -1510,6 +1510,11 @@ fn headless_control_session_streams_shell_output_and_exits_cleanly() {
     let snapshot = tmp_path("controlled-shell.winfs");
     let mut fs = WinFs::new();
     fs.mkdir(r"C:\bin").unwrap();
+    fs.write_file(
+        r"C:\bin\bad_import.exe",
+        std::fs::read(artifact("exe/bad_import.exe")).expect("read bad-import fixture"),
+    )
+    .unwrap();
     fs.write_file(r"C:\bin\stdin-echo.exe", pe::builder::stdin_echo())
         .unwrap();
     wincli::snapshot::save_file(&mut fs, snapshot.to_str().unwrap()).unwrap();
@@ -1565,6 +1570,26 @@ fn headless_control_session_streams_shell_output_and_exits_cleanly() {
             && event["text"]
                 .as_str()
                 .is_some_and(|text| text.contains("C:\\"));
+    }
+
+    socket
+        .send(tungstenite::Message::Text(
+            r#"{"op":"write","id":10,"text":"C:\\bin\\bad_import.exe\r"}"#
+                .to_string()
+                .into(),
+        ))
+        .unwrap();
+    let mut saw_guest_stderr = false;
+    while !saw_guest_stderr {
+        let event: serde_json::Value = match socket.read().unwrap() {
+            tungstenite::Message::Text(message) => serde_json::from_str(&message).unwrap(),
+            message => panic!("expected JSON control event, got {message:?}"),
+        };
+        saw_guest_stderr = event["event"] == "output"
+            && event["channel"] == "stderr"
+            && event["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("unsupported native import"));
     }
 
     socket

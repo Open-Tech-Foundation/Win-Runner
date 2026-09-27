@@ -23,6 +23,8 @@ All notable changes to this project will be documented in this file.
   launches run scripts through WinCLI's PowerShell-compatible interpreter.
 - Added the `KERNEL32!NeedCurrentDirectoryForExePathW` shim used by child
   process executable lookup.
+- Captured guest stdout and stderr separately and forwarded both channels to
+  control clients while preserving stderr for existing host-facing callers.
 - Added the C-locale `msvcrt!mbstowcs` shim used by Nano.
 - Added an optional native Node check proving a relative file that Node leaves
   in WinFS appears in the following shell directory listing.

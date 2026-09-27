@@ -138,17 +138,27 @@ impl ExecutionBackend for NativeLinuxX64 {
         sink: OutputSink,
     ) -> Result<Execution, ExecutionFailure> {
         let forward = Arc::clone(&sink);
-        let (code, stdout, fs) = native::run_rust_baseline_argv_with_fs_streaming_recoverable(
-            image,
-            fs,
-            prog,
-            args,
-            &move |chunk| forward(OutputChannel::Stdout, chunk),
-        )
-        .map_err(|failure| ExecutionFailure {
-            message: failure.message,
-            fs: failure.fs,
-        })?;
+        let (code, stdout, fs) =
+            native::run_rust_baseline_argv_with_fs_streaming_channels_recoverable(
+                image,
+                fs,
+                prog,
+                args,
+                &move |is_stderr, chunk| {
+                    forward(
+                        if is_stderr {
+                            OutputChannel::Stderr
+                        } else {
+                            OutputChannel::Stdout
+                        },
+                        chunk,
+                    )
+                },
+            )
+            .map_err(|failure| ExecutionFailure {
+                message: failure.message,
+                fs: failure.fs,
+            })?;
         Ok(Execution { code, stdout, fs })
     }
 
@@ -185,13 +195,22 @@ impl ExecutionBackend for NativeLinuxX64 {
     ) -> Result<Execution, ExecutionFailure> {
         let forward = Arc::clone(&sink);
         let (code, stdout, fs) =
-            native::run_rust_baseline_argv_with_fs_streaming_environment_recoverable(
+            native::run_rust_baseline_argv_with_fs_streaming_channels_environment_recoverable(
                 image,
                 fs,
                 prog,
                 args,
                 environment,
-                &move |chunk| forward(OutputChannel::Stdout, chunk),
+                &move |is_stderr, chunk| {
+                    forward(
+                        if is_stderr {
+                            OutputChannel::Stderr
+                        } else {
+                            OutputChannel::Stdout
+                        },
+                        chunk,
+                    )
+                },
             )
             .map_err(|failure| ExecutionFailure {
                 message: failure.message,

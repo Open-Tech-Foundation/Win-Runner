@@ -141,6 +141,16 @@ pub fn run_rust_baseline_argv_with_fs_streaming_recoverable(
     imp::run_rust_baseline_argv_with_fs_streaming_recoverable(img, fs, prog, args, output)
 }
 
+pub fn run_rust_baseline_argv_with_fs_streaming_channels_recoverable(
+    img: &PeImage,
+    fs: crate::winfs::WinFs,
+    prog: &str,
+    args: &[String],
+    output: &dyn Fn(bool, &[u8]),
+) -> Result<(u32, Vec<u8>, crate::winfs::WinFs), NativeExecutionFailure> {
+    imp::run_rust_baseline_argv_with_fs_streaming_channels_recoverable(img, fs, prog, args, output)
+}
+
 pub fn run_rust_baseline_argv_with_fs_streaming_environment_recoverable(
     img: &PeImage,
     fs: crate::winfs::WinFs,
@@ -150,6 +160,24 @@ pub fn run_rust_baseline_argv_with_fs_streaming_environment_recoverable(
     output: &dyn Fn(&[u8]),
 ) -> Result<(u32, Vec<u8>, crate::winfs::WinFs), NativeExecutionFailure> {
     imp::run_rust_baseline_argv_with_fs_streaming_environment_recoverable(
+        img,
+        fs,
+        prog,
+        args,
+        environment,
+        output,
+    )
+}
+
+pub fn run_rust_baseline_argv_with_fs_streaming_channels_environment_recoverable(
+    img: &PeImage,
+    fs: crate::winfs::WinFs,
+    prog: &str,
+    args: &[String],
+    environment: &[(String, String)],
+    output: &dyn Fn(bool, &[u8]),
+) -> Result<(u32, Vec<u8>, crate::winfs::WinFs), NativeExecutionFailure> {
+    imp::run_rust_baseline_argv_with_fs_streaming_channels_environment_recoverable(
         img,
         fs,
         prog,
@@ -20521,6 +20549,11 @@ mod imp {
             .map_err(|failure| failure.message)
     }
 
+    fn write_host_stderr(bytes: &[u8]) {
+        use std::io::Write;
+        let _ = std::io::stderr().lock().write_all(bytes);
+    }
+
     pub(super) fn run_rust_baseline_argv_with_fs_recoverable(
         img: &PeImage,
         instance_fs: WinFs,
@@ -20547,8 +20580,21 @@ mod imp {
         args: &[String],
         output: &dyn Fn(&[u8]),
     ) -> Result<(u32, Vec<u8>, WinFs), String> {
-        run_rust_baseline_argv_with_fs_impl(img, instance_fs, prog, args, &[], Some(output))
-            .map_err(|failure| failure.message)
+        run_rust_baseline_argv_with_fs_impl(
+            img,
+            instance_fs,
+            prog,
+            args,
+            &[],
+            Some(&|is_stderr, chunk| {
+                if is_stderr {
+                    write_host_stderr(chunk);
+                } else {
+                    output(chunk);
+                }
+            }),
+        )
+        .map_err(|failure| failure.message)
     }
 
     pub(super) fn run_rust_baseline_argv_with_fs_streaming_recoverable(
@@ -20557,6 +20603,29 @@ mod imp {
         prog: &str,
         args: &[String],
         output: &dyn Fn(&[u8]),
+    ) -> Result<(u32, Vec<u8>, WinFs), super::NativeExecutionFailure> {
+        run_rust_baseline_argv_with_fs_impl(
+            img,
+            instance_fs,
+            prog,
+            args,
+            &[],
+            Some(&|is_stderr, chunk| {
+                if is_stderr {
+                    write_host_stderr(chunk);
+                } else {
+                    output(chunk);
+                }
+            }),
+        )
+    }
+
+    pub(super) fn run_rust_baseline_argv_with_fs_streaming_channels_recoverable(
+        img: &PeImage,
+        instance_fs: WinFs,
+        prog: &str,
+        args: &[String],
+        output: &dyn Fn(bool, &[u8]),
     ) -> Result<(u32, Vec<u8>, WinFs), super::NativeExecutionFailure> {
         run_rust_baseline_argv_with_fs_impl(img, instance_fs, prog, args, &[], Some(output))
     }
@@ -20569,6 +20638,30 @@ mod imp {
         environment: &[(String, String)],
         output: &dyn Fn(&[u8]),
     ) -> Result<(u32, Vec<u8>, WinFs), super::NativeExecutionFailure> {
+        run_rust_baseline_argv_with_fs_impl(
+            img,
+            instance_fs,
+            prog,
+            args,
+            environment,
+            Some(&|is_stderr, chunk| {
+                if is_stderr {
+                    write_host_stderr(chunk);
+                } else {
+                    output(chunk);
+                }
+            }),
+        )
+    }
+
+    pub(super) fn run_rust_baseline_argv_with_fs_streaming_channels_environment_recoverable(
+        img: &PeImage,
+        instance_fs: WinFs,
+        prog: &str,
+        args: &[String],
+        environment: &[(String, String)],
+        output: &dyn Fn(bool, &[u8]),
+    ) -> Result<(u32, Vec<u8>, WinFs), super::NativeExecutionFailure> {
         run_rust_baseline_argv_with_fs_impl(img, instance_fs, prog, args, environment, Some(output))
     }
 
@@ -20578,7 +20671,7 @@ mod imp {
         prog: &str,
         args: &[String],
         environment: &[(String, String)],
-        output: Option<&dyn Fn(&[u8])>,
+        output: Option<&dyn Fn(bool, &[u8])>,
     ) -> Result<(u32, Vec<u8>, WinFs), super::NativeExecutionFailure> {
         let mut recovery_fs = Some(instance_fs);
         let mut recovery_process: Option<Arc<NativeProcessContext>> = None;
@@ -20691,11 +20784,24 @@ mod imp {
                     std::io::Error::last_os_error()
                 ));
             }
+            let mut stderr_fds = [-1, -1];
+            if unsafe { pipe(stderr_fds.as_mut_ptr()) } != 0 {
+                unsafe {
+                    close(fds[0]);
+                    close(fds[1]);
+                }
+                return Err(format!(
+                    "native backend could not create stderr pipe: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
             let mut state_fds = [-1, -1];
             if unsafe { pipe(state_fds.as_mut_ptr()) } != 0 {
                 unsafe {
                     close(fds[0]);
                     close(fds[1]);
+                    close(stderr_fds[0]);
+                    close(stderr_fds[1]);
                 }
                 return Err(format!(
                     "native backend could not create state pipe: {}",
@@ -20710,6 +20816,8 @@ mod imp {
                 unsafe {
                     close(fds[0]);
                     close(fds[1]);
+                    close(stderr_fds[0]);
+                    close(stderr_fds[1]);
                     close(state_fds[0]);
                     close(state_fds[1]);
                 }
@@ -20724,10 +20832,15 @@ mod imp {
                 unsafe {
                     close(fds[0]);
                     close(state_fds[0]);
+                    close(stderr_fds[0]);
                     if dup2(fds[1], 1) < 0 {
                         _exit(127);
                     }
                     close(fds[1]);
+                    if dup2(stderr_fds[1], 2) < 0 {
+                        _exit(127);
+                    }
+                    close(stderr_fds[1]);
                 }
                 process
                     .state_fd
@@ -20773,36 +20886,81 @@ mod imp {
             }
             unsafe {
                 close(fds[1]);
+                close(stderr_fds[1]);
                 close(state_fds[1]);
             }
             let mut out = Vec::new();
             let mut buf = [0u8; 4096];
             let guest_started = std::time::Instant::now();
             let mut first_output_ms = None;
-            loop {
-                let n = unsafe { read(fds[0], buf.as_mut_ptr().cast(), buf.len()) };
-                if n == 0 {
-                    break;
-                }
-                if n < 0 {
+            let mut output_fds = [
+                NativePollFd {
+                    fd: fds[0],
+                    events: 1,
+                    revents: 0,
+                },
+                NativePollFd {
+                    fd: stderr_fds[0],
+                    events: 1,
+                    revents: 0,
+                },
+            ];
+            let mut open_output_fds = output_fds.len();
+            while open_output_fds > 0 {
+                let ready = unsafe { poll(output_fds.as_mut_ptr(), output_fds.len(), -1) };
+                if ready < 0 {
                     unsafe {
-                        close(fds[0]);
+                        for descriptor in &output_fds {
+                            if descriptor.fd >= 0 {
+                                close(descriptor.fd);
+                            }
+                        }
                     }
                     return Err(format!(
-                        "native backend could not read guest stdout: {}",
+                        "native backend could not poll guest output: {}",
                         std::io::Error::last_os_error()
                     ));
                 }
-                if first_output_ms.is_none() {
-                    first_output_ms = Some(guest_started.elapsed().as_secs_f64() * 1000.0);
+                for (index, descriptor) in output_fds.iter_mut().enumerate() {
+                    if descriptor.fd < 0 || descriptor.revents == 0 {
+                        continue;
+                    }
+                    let n = unsafe { read(descriptor.fd, buf.as_mut_ptr().cast(), buf.len()) };
+                    if n == 0 {
+                        unsafe {
+                            close(descriptor.fd);
+                        }
+                        descriptor.fd = -1;
+                        open_output_fds -= 1;
+                        continue;
+                    }
+                    if n < 0 {
+                        unsafe {
+                            for descriptor in &output_fds {
+                                if descriptor.fd >= 0 {
+                                    close(descriptor.fd);
+                                }
+                            }
+                        }
+                        return Err(format!(
+                            "native backend could not read guest {}: {}",
+                            if index == 0 { "stdout" } else { "stderr" },
+                            std::io::Error::last_os_error()
+                        ));
+                    }
+                    if first_output_ms.is_none() {
+                        first_output_ms = Some(guest_started.elapsed().as_secs_f64() * 1000.0);
+                    }
+                    let chunk = &buf[..n as usize];
+                    if index == 0 {
+                        out.extend_from_slice(chunk);
+                    }
+                    if let Some(output) = output {
+                        output(index == 1, chunk);
+                    } else if index == 1 {
+                        write_host_stderr(chunk);
+                    }
                 }
-                out.extend_from_slice(&buf[..n as usize]);
-                if let Some(output) = output {
-                    output(&buf[..n as usize]);
-                }
-            }
-            unsafe {
-                close(fds[0]);
             }
             let guest_ms = guest_started.elapsed().as_secs_f64() * 1000.0;
             let state_started = std::time::Instant::now();
@@ -20865,7 +21023,7 @@ mod imp {
                     .map(|milliseconds| format!("{milliseconds:.3}ms"))
                     .unwrap_or_else(|| "none".to_string());
                 eprintln!(
-                "wincli timing: {prog}: lock={lock_wait_ms:.3}ms entry={entry_ms:.3}ms map={map_ms:.3}ms imports={import_ms:.3}ms tls={tls_ms:.3}ms context={context_ms:.3}ms fork={fork_ms:.3}ms first_output={first_output} guest_until_stdout_eof={guest_ms:.3}ms state_transfer={state_transfer_ms:.3}ms state_decode={state_decode_ms:.3}ms stdout_bytes={} state_bytes={} total={:.3}ms",
+                "wincli timing: {prog}: lock={lock_wait_ms:.3}ms entry={entry_ms:.3}ms map={map_ms:.3}ms imports={import_ms:.3}ms tls={tls_ms:.3}ms context={context_ms:.3}ms fork={fork_ms:.3}ms first_output={first_output} guest_until_output_eof={guest_ms:.3}ms state_transfer={state_transfer_ms:.3}ms state_decode={state_decode_ms:.3}ms stdout_bytes={} state_bytes={} total={:.3}ms",
                 out.len(),
                 state.len(),
                 total_started.elapsed().as_secs_f64() * 1000.0
@@ -20908,6 +21066,19 @@ mod imp {
         fs: crate::winfs::WinFs,
         _: &str,
         _: &[String],
+    ) -> Result<(u32, Vec<u8>, crate::winfs::WinFs), super::NativeExecutionFailure> {
+        Err(super::NativeExecutionFailure {
+            message: "native backend is available only on Linux x86_64".to_string(),
+            fs,
+        })
+    }
+
+    pub(super) fn run_rust_baseline_argv_with_fs_streaming_channels_recoverable(
+        _: &PeImage,
+        fs: crate::winfs::WinFs,
+        _: &str,
+        _: &[String],
+        _: &dyn Fn(bool, &[u8]),
     ) -> Result<(u32, Vec<u8>, crate::winfs::WinFs), super::NativeExecutionFailure> {
         Err(super::NativeExecutionFailure {
             message: "native backend is available only on Linux x86_64".to_string(),
@@ -20975,6 +21146,20 @@ mod imp {
         _: &[String],
         _: &[(String, String)],
         _: &dyn Fn(&[u8]),
+    ) -> Result<(u32, Vec<u8>, crate::winfs::WinFs), super::NativeExecutionFailure> {
+        Err(super::NativeExecutionFailure {
+            message: "native backend is available only on Linux x86_64".to_string(),
+            fs,
+        })
+    }
+
+    pub(super) fn run_rust_baseline_argv_with_fs_streaming_channels_environment_recoverable(
+        _: &PeImage,
+        fs: crate::winfs::WinFs,
+        _: &str,
+        _: &[String],
+        _: &[(String, String)],
+        _: &dyn Fn(bool, &[u8]),
     ) -> Result<(u32, Vec<u8>, crate::winfs::WinFs), super::NativeExecutionFailure> {
         Err(super::NativeExecutionFailure {
             message: "native backend is available only on Linux x86_64".to_string(),
