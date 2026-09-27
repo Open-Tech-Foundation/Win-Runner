@@ -15,7 +15,8 @@ fn usage() -> ! {
     eprintln!("  wincli shell                    interactive ephemeral runner shell");
     eprintln!("  wincli runner                   run host-controlled job commands from stdin");
     eprintln!("  wincli --snapshot=os.disk shell|runner  boot an indexed C: disk image");
-    eprintln!("  wincli --save-snapshot=disk.winfs shell|runner  persist C: on exit");
+    eprintln!("  wincli --save-snapshot=disk.winfs shell|runner|app.exe  persist C: on exit");
+    eprintln!("  wincli --snapshot=os.disk <app.exe> [args...]  run headless with streamed stdio");
     eprintln!("  wincli --mount=Z:/host/folder shell  mount a writable host folder");
     eprintln!("  wincli --mount-ro=Z:/host/folder shell  mount a read-only host folder");
     eprintln!("  wincli snapshot build <dir> <os.winfs>  build image from <dir>/C");
@@ -156,12 +157,26 @@ fn main() {
         save_snapshot_if_requested(save_snapshot_path.as_deref(), &mut fs);
         exit(code);
     }
+    let configured_guest_run = snapshot_path.is_some()
+        || save_snapshot_path.is_some()
+        || !mount_specs.is_empty()
+        || !read_only_mount_specs.is_empty();
+    if configured_guest_run && args.len() >= 2 {
+        let fs = match snapshot_path.as_deref() {
+            Some(path) => load_snapshot(path),
+            None => WinFs::ephemeral_runner(),
+        };
+        let fs = mount_host_dirs(fs, &mount_specs, &read_only_mount_specs);
+        let (code, mut fs) = wincli::shell::run_headless_program(fs, &args[1], &args[2..]);
+        save_snapshot_if_requested(save_snapshot_path.as_deref(), &mut fs);
+        exit(code);
+    }
     if snapshot_path.is_some()
         || save_snapshot_path.is_some()
         || !mount_specs.is_empty()
         || !read_only_mount_specs.is_empty()
     {
-        eprintln!("wincli: --snapshot/--save-snapshot/--mount are supported with shell or runner");
+        eprintln!("wincli: --snapshot/--save-snapshot/--mount require shell, runner, or an executable target");
         exit(2);
     }
     if args.len() < 2 {

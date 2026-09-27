@@ -552,6 +552,80 @@ pub fn hello(msg: &str) -> Vec<u8> {
     )
 }
 
+/// Read exactly four bytes from standard input and write them to standard
+/// output. Used to verify headless, controller-driven guest input.
+pub fn stdin_echo() -> Vec<u8> {
+    const GH: usize = 0;
+    const RF: usize = 1;
+    const WF: usize = 2;
+    const XP: usize = 3;
+    let mut a = Asm::new();
+    let prompt = a.add_data(b"READY".to_vec());
+    let buffer = a.add_zeroed(4);
+    let read = a.add_zeroed(8);
+    let written = a.add_zeroed(8);
+    let fail = a.fresh_label();
+
+    a.sub_rsp(0x48);
+    // Emit a readiness marker before blocking for input.
+    a.mov_ecx_imm(0xFFFF_FFF5);
+    a.call_import(GH);
+    a.mov_rcx_rax();
+    a.lea_reg_rip(2, prompt);
+    a.mov_r8d_imm(5);
+    a.lea_reg_rip(9, written);
+    a.xor_eax();
+    a.mov_rspoff_rax(0x20);
+    a.call_import(WF);
+    a.test_eax_eax();
+    a.jz(fail);
+    // GetStdHandle(STD_INPUT_HANDLE)
+    a.mov_ecx_imm(0xFFFF_FFF6);
+    a.call_import(GH);
+    a.emit(&[0x48, 0x89, 0x44, 0x24, 0x40]);
+    // ReadFile(stdin, buffer, 4, &read, NULL)
+    a.emit(&[0x48, 0x8B, 0x4C, 0x24, 0x40]);
+    a.lea_reg_rip(2, buffer);
+    a.mov_r8d_imm(4);
+    a.lea_reg_rip(9, read);
+    a.xor_eax();
+    a.mov_rspoff_rax(0x20);
+    a.call_import(RF);
+    a.test_eax_eax();
+    a.jz(fail);
+    // WriteFile(stdout, buffer, 4, &written, NULL)
+    a.mov_ecx_imm(0xFFFF_FFF5);
+    a.call_import(GH);
+    a.mov_rcx_rax();
+    a.lea_reg_rip(2, buffer);
+    a.mov_r8d_imm(4);
+    a.lea_reg_rip(9, written);
+    a.xor_eax();
+    a.mov_rspoff_rax(0x20);
+    a.call_import(WF);
+    a.test_eax_eax();
+    a.jz(fail);
+    a.mov_ecx_imm(0);
+    a.call_import(XP);
+    a.add_rsp(0x48);
+    a.ret();
+    a.mark(fail);
+    a.mov_ecx_imm(1);
+    a.call_import(XP);
+    a.add_rsp(0x48);
+    a.ret();
+
+    build(
+        a,
+        &[
+            ("KERNEL32.dll", "GetStdHandle"),
+            ("KERNEL32.dll", "ReadFile"),
+            ("KERNEL32.dll", "WriteFile"),
+            ("KERNEL32.dll", "ExitProcess"),
+        ],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::hello;

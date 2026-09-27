@@ -1516,6 +1516,41 @@ pub fn run_runner_with_snapshot(fs: WinFs, snapshot_path: Option<&str>) -> (i32,
     run_session(fs, false, snapshot_path.map(std::path::PathBuf::from))
 }
 
+/// Run one host or guest PE without a shell prompt. Standard input stays
+/// connected to the guest, and output is forwarded as it is written.
+pub fn run_headless_program(fs: WinFs, target: &str, args: &[String]) -> (i32, WinFs) {
+    let mut shell = Shell::with_fs(fs);
+    let mut argv = Vec::with_capacity(args.len() + 1);
+    argv.push(target.to_string());
+    argv.extend_from_slice(args);
+    let mut out = Vec::new();
+    let sink: backend::OutputSink = Arc::new(|channel, chunk| match channel {
+        backend::OutputChannel::Stdout => {
+            let mut stdout = std::io::stdout().lock();
+            let _ = stdout.write_all(chunk);
+            let _ = stdout.flush();
+        }
+        backend::OutputChannel::Stderr => {
+            let mut stderr = std::io::stderr().lock();
+            let _ = stderr.write_all(chunk);
+            let _ = stderr.flush();
+        }
+    });
+    match shell.run_target_line(&argv, target, &mut out, Some(sink)) {
+        Ok(ShellFlow::Continue) => {
+            let mut stdout = std::io::stdout().lock();
+            let _ = stdout.write_all(&out);
+            let _ = stdout.flush();
+            (shell.last_code, shell.fs)
+        }
+        Ok(ShellFlow::Exit(code)) => (code, shell.fs),
+        Err(error) => {
+            eprintln!("wincli: {error}");
+            (1, shell.fs)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

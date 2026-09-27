@@ -10,6 +10,8 @@ All notable changes to this project will be documented in this file.
   file display/copy/move/deletion, directory creation/removal, and screen clear.
 - Added interactive Tab completion for shell commands, PATH executables, and
   files and directories in the current guest working directory.
+- Added headless execution of a program from a C: snapshot with controller-fed
+  standard input and streamed output.
 - Added `GetTickCount` and `GetTickCount64` shims using the monotonic host clock,
   plus CRT C-locale setup, guest environment lookup, thread-local errno and
   standard stream storage, and string comparison, case-folding, search, and

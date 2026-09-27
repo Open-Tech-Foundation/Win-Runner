@@ -1425,6 +1425,50 @@ fn test_runner_boots_snapshot_file() {
 }
 
 #[test]
+fn headless_snapshot_program_accepts_controlled_stdin_and_streams_output() {
+    let snapshot = tmp_path("headless-control.winfs");
+    let mut fs = WinFs::new();
+    fs.mkdir(r"C:\bin").unwrap();
+    fs.write_file(r"C:\bin\stdin-echo.exe", pe::builder::stdin_echo())
+        .unwrap();
+    wincli::snapshot::save_file(&mut fs, snapshot.to_str().unwrap()).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wincli"))
+        .arg(format!("--snapshot={}", snapshot.display()))
+        .arg(r"C:\bin\stdin-echo.exe")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn headless guest program");
+    let mut input = child.stdin.take().unwrap();
+    let mut output = child.stdout.take().unwrap();
+
+    let mut ready = [0; 5];
+    output
+        .read_exact(&mut ready)
+        .expect("read guest readiness output");
+    assert_eq!(&ready, b"READY");
+    input.write_all(b"ping").unwrap();
+    input.flush().unwrap();
+
+    let mut echoed = [0; 4];
+    output.read_exact(&mut echoed).expect("read guest response");
+    assert_eq!(&echoed, b"ping");
+    drop(input);
+    let status = child.wait().expect("wait for headless guest");
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    std::fs::remove_file(snapshot).ok();
+    assert_eq!(status.code(), Some(0), "stderr: {stderr}");
+}
+
+#[test]
 fn test_named_instance_boot_status_and_destroy() {
     let state = tmp_path("instances");
     let name = format!("test-{}", counter());

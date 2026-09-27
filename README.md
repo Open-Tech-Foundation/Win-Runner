@@ -7,6 +7,7 @@ when the session ends. No Wine, VM, or host Windows installation is required.
 ```bash
 wincli app.exe [args...]  # minimal x86_64 PE execution (PE32+, native console apps)
 wincli --snapshot=tools.winfs shell # boot a saved C: guest disk
+wincli --snapshot=tools.winfs C:\bin\app.exe [args...] # run a guest PE headlessly
 wincli --mount=Z:/host/folder shell # expose a host folder as a live drive
 wincli script.ps1         # minimal PowerShell-like script execution
 wincli shell              # interactive shell: one ephemeral WinFS per session
@@ -21,6 +22,12 @@ imports require native shims; an unsupported import fails with its name if the
 guest calls it. Set `WINCLI_NATIVE_STRICT_IMPORTS=1` to reject unsupported
 imports before entry. `wincli inspect` lists static shim coverage. Other host platforms currently have no PE
 execution backend.
+
+Headless snapshot runs keep the program's standard input connected to the
+WinCLI process and stream its output to standard output/error. An external
+controller can launch WinCLI with piped stdio, send input while the program is
+running, and read output until the process exits. Add
+`--save-snapshot=tools.winfs` to persist filesystem changes after it exits.
 
 The shim code is part of the Rust executable, and an interactive shell selects
 its native backend once when the shell starts. Each PE still gets its own
