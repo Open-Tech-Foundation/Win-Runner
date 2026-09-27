@@ -225,6 +225,103 @@ impl Shell {
         self.set_environment_value("PATH".to_string(), Some(value));
     }
 
+    fn do_cd(&mut self, argv: &[String], out: &mut Vec<u8>) -> Result<(), String> {
+        let path = match argv {
+            [] => {
+                out.extend_from_slice(format!("{}\n", self.fs.cwd()).as_bytes());
+                return Ok(());
+            }
+            [path] => path.as_str(),
+            [flag, path] if flag.eq_ignore_ascii_case("/d") => path.as_str(),
+            _ => return Err("usage: cd [/d] [directory]".to_string()),
+        };
+        self.fs.set_cwd(path).map_err(|e| format!("cd: {e}"))
+    }
+
+    fn do_dir(&self, argv: &[String], out: &mut Vec<u8>) -> Result<(), String> {
+        if argv.len() > 1 {
+            return Err("usage: dir [directory]".to_string());
+        }
+        let path = argv.first().map(String::as_str).unwrap_or("");
+        let path = if path.is_empty() {
+            self.fs.cwd()
+        } else {
+            path.to_string()
+        };
+        let entries = self.fs.list_dir(&path).map_err(|e| format!("dir: {e}"))?;
+        for name in entries {
+            let child = format!("{}\\{}", path.trim_end_matches(['\\', '/']), name);
+            if self.fs.is_dir(&child) {
+                out.extend_from_slice(format!("<DIR>       {name}\n").as_bytes());
+            } else {
+                let size = self.fs.file_len(&child).unwrap_or(0);
+                out.extend_from_slice(format!("{size:>10} {name}\n").as_bytes());
+            }
+        }
+        Ok(())
+    }
+
+    fn do_type(&self, argv: &[String], out: &mut Vec<u8>) -> Result<(), String> {
+        if argv.is_empty() {
+            return Err("usage: type <file> [...]".to_string());
+        }
+        for path in argv {
+            let bytes = self.fs.read_file(path).map_err(|e| format!("type: {e}"))?;
+            out.extend_from_slice(&bytes);
+            if !bytes.ends_with(b"\n") {
+                out.push(b'\n');
+            }
+        }
+        Ok(())
+    }
+
+    fn do_copy_move(&mut self, command: &str, argv: &[String], moving: bool) -> Result<(), String> {
+        if argv.len() != 2 {
+            return Err(format!("usage: {command} <source> <destination>"));
+        }
+        if moving {
+            self.fs.move_path(&argv[0], &argv[1])
+        } else {
+            self.fs.copy_path(&argv[0], &argv[1], false)
+        }
+        .map_err(|e| format!("{command}: {e}"))
+    }
+
+    fn do_delete(&mut self, argv: &[String]) -> Result<(), String> {
+        if argv.len() != 1 {
+            return Err("usage: del <file>".to_string());
+        }
+        self.fs
+            .remove(&argv[0], false)
+            .map_err(|e| format!("del: {e}"))
+    }
+
+    fn do_mkdir(&mut self, argv: &[String]) -> Result<(), String> {
+        if argv.len() != 1 {
+            return Err("usage: mkdir <directory>".to_string());
+        }
+        self.fs.mkdir(&argv[0]).map_err(|e| format!("mkdir: {e}"))
+    }
+
+    fn do_rmdir(&mut self, argv: &[String]) -> Result<(), String> {
+        let (recursive, path) = match argv {
+            [path] => (false, path.as_str()),
+            [flag, path] if flag.eq_ignore_ascii_case("/s") => (true, path.as_str()),
+            [flag, quiet, path]
+                if flag.eq_ignore_ascii_case("/s") && quiet.eq_ignore_ascii_case("/q") =>
+            {
+                (true, path.as_str())
+            }
+            _ => return Err("usage: rmdir [/s [/q]] <directory>".to_string()),
+        };
+        if recursive {
+            self.fs.remove(path, true)
+        } else {
+            self.fs.rmdir(path)
+        }
+        .map_err(|e| format!("rmdir: {e}"))
+    }
+
     /// Execute one input line; guest/PS1 output is appended to `out`.
     /// `Err` is a printable error: show it and continue the session.
     pub fn exec_line(&mut self, line: &str, out: &mut Vec<u8>) -> Result<ShellFlow, String> {
@@ -300,6 +397,56 @@ impl Shell {
             }
             "path" => {
                 self.do_path(&argv[1..], out);
+                Ok(ShellFlow::Continue)
+            }
+            "help" => {
+                out.extend_from_slice(b"Built-in commands: cd, pwd, dir, type, copy, move, del, mkdir, rmdir, cls, set, path, mount, choco, winget, powershell, snapshot, inspect, exit\n");
+                Ok(ShellFlow::Continue)
+            }
+            "cd" | "chdir" => {
+                self.do_cd(&argv[1..], out)?;
+                Ok(ShellFlow::Continue)
+            }
+            "pwd" | "cwd" => {
+                if argv.len() != 1 {
+                    return Err("usage: pwd".to_string());
+                }
+                out.extend_from_slice(format!("{}\n", self.fs.cwd()).as_bytes());
+                Ok(ShellFlow::Continue)
+            }
+            "dir" | "ls" => {
+                self.do_dir(&argv[1..], out)?;
+                Ok(ShellFlow::Continue)
+            }
+            "type" | "cat" => {
+                self.do_type(&argv[1..], out)?;
+                Ok(ShellFlow::Continue)
+            }
+            "copy" | "cp" => {
+                self.do_copy_move("copy", &argv[1..], false)?;
+                Ok(ShellFlow::Continue)
+            }
+            "move" | "mv" | "ren" | "rename" => {
+                self.do_copy_move("move", &argv[1..], true)?;
+                Ok(ShellFlow::Continue)
+            }
+            "del" | "erase" | "rm" => {
+                self.do_delete(&argv[1..])?;
+                Ok(ShellFlow::Continue)
+            }
+            "mkdir" | "md" => {
+                self.do_mkdir(&argv[1..])?;
+                Ok(ShellFlow::Continue)
+            }
+            "rmdir" | "rd" => {
+                self.do_rmdir(&argv[1..])?;
+                Ok(ShellFlow::Continue)
+            }
+            "cls" | "clear" => {
+                if argv.len() != 1 {
+                    return Err("usage: cls".to_string());
+                }
+                out.extend_from_slice(b"\x1b[2J\x1b[H");
                 Ok(ShellFlow::Continue)
             }
             "mount" => {
@@ -1273,6 +1420,70 @@ mod tests {
             .unwrap_err();
         std::fs::remove_file(&p).ok();
         assert!(err.contains("cannot inspect"), "err: {err}");
+    }
+
+    #[test]
+    fn common_filesystem_commands_operate_on_the_guest_c_drive() {
+        let mut shell = Shell::new();
+        let mut out = Vec::new();
+        let initial_cwd = shell.cwd();
+
+        shell.exec_line("mkdir work\\nested", &mut out).unwrap();
+        shell
+            .fs
+            .write_file("work\\nested\\hello.txt", b"hello".to_vec())
+            .unwrap();
+        shell.exec_line("cd work\\nested", &mut out).unwrap();
+        assert_eq!(shell.cwd(), format!("{initial_cwd}\\work\\nested"));
+        shell.exec_line("pwd", &mut out).unwrap();
+        assert!(String::from_utf8_lossy(&out).ends_with(&format!("{}\n", shell.cwd())));
+
+        shell.exec_line("dir", &mut out).unwrap();
+        assert!(String::from_utf8_lossy(&out).contains("hello.txt"));
+        out.clear();
+        shell.exec_line("type hello.txt", &mut out).unwrap();
+        assert_eq!(out, b"hello\n");
+
+        shell
+            .exec_line("copy hello.txt copy.txt", &mut out)
+            .unwrap();
+        assert_eq!(shell.fs.read_file("copy.txt").unwrap(), b"hello");
+        shell
+            .exec_line("move copy.txt moved.txt", &mut out)
+            .unwrap();
+        assert!(!shell.fs.exists("copy.txt"));
+        assert!(shell.fs.exists("moved.txt"));
+        shell.exec_line("del moved.txt", &mut out).unwrap();
+        assert!(!shell.fs.exists("moved.txt"));
+
+        shell.exec_line("cd /d C:\\", &mut out).unwrap();
+        assert_eq!(shell.cwd(), r"C:\");
+        shell
+            .exec_line(&format!("rmdir /s \"{initial_cwd}\\work\""), &mut out)
+            .unwrap();
+        assert!(!shell.fs.exists(&format!("{initial_cwd}\\work")));
+    }
+
+    #[test]
+    fn common_filesystem_commands_report_usage_and_path_errors() {
+        let mut shell = Shell::new();
+        let mut out = Vec::new();
+        assert!(shell
+            .exec_line("cd one two", &mut out)
+            .unwrap_err()
+            .contains("usage"));
+        assert!(shell
+            .exec_line("copy one", &mut out)
+            .unwrap_err()
+            .contains("usage"));
+        assert!(shell
+            .exec_line("type missing.txt", &mut out)
+            .unwrap_err()
+            .contains("type:"));
+        assert!(shell
+            .exec_line("cd missing", &mut out)
+            .unwrap_err()
+            .contains("cd:"));
     }
 
     #[test]

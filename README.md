@@ -104,10 +104,12 @@ wincli shell
 ```
 
 One ephemeral WinFS for the whole session (files created by one command
-are visible to the next). Each line is a PS1 statement, `install`/`inspect`,
+are visible to the next). Common shell commands include `cd`/`chdir`, `pwd`,
+`dir`/`ls`, `type`/`cat`, `copy`/`cp`, `move`/`mv`, `del`/`rm`, `mkdir`,
+`rmdir`, and `cls`. Each line can also be a PS1 statement, `install`/`inspect`,
 `winget`, `choco`, `powershell -c`, a host `.exe`/`.ps1` file, or a package
 installed in the session with args — so `install rg` followed by `rg --version`
-works.
+works. Use `help` to list the built-in commands.
 Errors print as
 `wincli: ...` without ending the session; `exit`/`quit` (or Ctrl-D) ends it
 with the last guest exit code. Interactive input supports cursor movement,

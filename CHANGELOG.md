@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Added common WinFS-backed shell commands for navigation, directory listing,
+  file display/copy/move/deletion, directory creation/removal, and screen clear.
 - Added `GetTickCount` and `GetTickCount64` shims using the monotonic host clock,
   plus CRT C-locale setup, guest environment lookup, thread-local errno and
   standard stream storage, and string comparison, case-folding, search, and
