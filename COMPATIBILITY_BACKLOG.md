@@ -57,9 +57,9 @@ Items remain open until implementation and relevant verification are complete.
   separate backend-local modules. Standard stream, descriptor, duplicate, file
   type, and close shims now live in a handles module; the shared per-process
   handle maps remain in the backend state. Critical-section, SRW-lock,
-  condition-variable, and InitOnce shims now live in a synchronization module;
-  single-object wait, event, and semaphore shims have now joined them. Remaining
-  process waits and waitable-object types still use separate state maps. Thread
+  condition-variable, InitOnce, single-object wait, event, semaphore, SLIST,
+  address-wait, and waitable-timer shims now live in a synchronization module.
+  Remaining process waits and waitable-object types still use separate state maps. Thread
   creation, job objects, process identity, child exit, and termination shims now
   live in the process module alongside launch support. File, pipe, TLS,
   filesystem, and per-process context data types now live in a backend-local

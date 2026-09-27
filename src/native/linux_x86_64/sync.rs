@@ -910,3 +910,317 @@ pub(super) extern "win64" fn native_unregister_wait_ex(wait: u64, completion_eve
     }
     1
 }
+
+static NATIVE_SLIST_LOCK: Mutex<()> = Mutex::new(());
+static NATIVE_CRITICAL_SECTIONS: LazyLock<Mutex<HashMap<usize, Arc<NativeCriticalSection>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static NATIVE_ADDRESS_WAITERS: LazyLock<Mutex<HashMap<usize, Weak<NativeAddressWaiters>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+struct NativeCriticalSection {
+    owner_and_recursion: Mutex<(Option<u64>, u32)>,
+    ready: Condvar,
+}
+
+impl NativeCriticalSection {
+    fn new() -> Self {
+        Self {
+            owner_and_recursion: Mutex::new((None, 0)),
+            ready: Condvar::new(),
+        }
+    }
+}
+
+struct NativeAddressWaiters {
+    generation: Mutex<u64>,
+    ready: Condvar,
+}
+
+impl NativeAddressWaiters {
+    fn new() -> Self {
+        Self {
+            generation: Mutex::new(0),
+            ready: Condvar::new(),
+        }
+    }
+}
+
+pub(super) extern "win64" fn native_wait_on_address(
+    address: *const u8,
+    compare: *const u8,
+    size: usize,
+    milliseconds: u32,
+) -> i32 {
+    if address.is_null()
+        || compare.is_null()
+        || !(1..=8).contains(&size)
+        || (address as usize) % size != 0
+    {
+        native_set_last_error(87);
+        return 0;
+    }
+    let expected = unsafe { native_compare_value(compare, size) };
+    let equal = || unsafe { native_address_value(address, size) == expected };
+    if !equal() {
+        return 1;
+    }
+    let waiter = match NATIVE_ADDRESS_WAITERS.lock() {
+        Ok(mut waiters) => {
+            waiters.retain(|_, waiter| waiter.strong_count() > 0);
+            if let Some(waiter) = waiters.get(&(address as usize)).and_then(Weak::upgrade) {
+                waiter
+            } else {
+                let waiter = Arc::new(NativeAddressWaiters::new());
+                waiters.insert(address as usize, Arc::downgrade(&waiter));
+                waiter
+            }
+        }
+        Err(_) => return 0,
+    };
+    let Ok(generation) = waiter.generation.lock() else {
+        return 0;
+    };
+    let before = *generation;
+    if !equal() {
+        return 1;
+    }
+    let changed = if milliseconds == u32::MAX {
+        waiter
+            .ready
+            .wait_while(generation, |current| equal() && *current == before)
+            .is_ok_and(|generation| !equal() || *generation != before)
+    } else {
+        waiter
+            .ready
+            .wait_timeout_while(
+                generation,
+                std::time::Duration::from_millis(milliseconds as u64),
+                |current| equal() && *current == before,
+            )
+            .map(|(generation, _)| !equal() || *generation != before)
+            .unwrap_or(false)
+    };
+    if changed {
+        1
+    } else {
+        native_set_last_error(1460);
+        0
+    }
+}
+
+unsafe fn native_address_value(address: *const u8, size: usize) -> u64 {
+    match size {
+        1 => (*(address as *const std::sync::atomic::AtomicU8)).load(Ordering::Acquire) as u64,
+        2 => (*(address as *const std::sync::atomic::AtomicU16)).load(Ordering::Acquire) as u64,
+        4 => (*(address as *const AtomicU32)).load(Ordering::Acquire) as u64,
+        8 => (*(address as *const AtomicU64)).load(Ordering::Acquire),
+        _ => 0,
+    }
+}
+
+unsafe fn native_compare_value(address: *const u8, size: usize) -> u64 {
+    match size {
+        1 => address.read() as u64,
+        2 => address.cast::<u16>().read_unaligned() as u64,
+        4 => address.cast::<u32>().read_unaligned() as u64,
+        8 => address.cast::<u64>().read_unaligned(),
+        _ => 0,
+    }
+}
+
+fn native_wake_address(address: *const u8, all: bool) {
+    if address.is_null() {
+        return;
+    }
+    let waiter = NATIVE_ADDRESS_WAITERS
+        .lock()
+        .ok()
+        .and_then(|waiters| waiters.get(&(address as usize)).and_then(Weak::upgrade));
+    let Some(waiter) = waiter else { return };
+    if let Ok(mut generation) = waiter.generation.lock() {
+        *generation = generation.wrapping_add(1);
+        if all {
+            waiter.ready.notify_all();
+        } else {
+            waiter.ready.notify_one();
+        }
+    };
+}
+
+pub(super) extern "win64" fn native_wake_by_address_all(address: *const u8) {
+    native_wake_address(address, true);
+}
+
+pub(super) extern "win64" fn native_wake_by_address_single(address: *const u8) {
+    native_wake_address(address, false);
+}
+pub(super) extern "win64" fn native_create_waitable_timer_ex_w(
+    _attributes: *const u8,
+    _name: *const u16,
+    _flags: u32,
+    _access: u32,
+) -> u64 {
+    process_ctx()
+        .map(|process| process.timer_next.fetch_add(1, Ordering::AcqRel))
+        .unwrap_or(0)
+}
+pub(super) extern "win64" fn native_set_waitable_timer(
+    handle: u64,
+    _due_time: *const i64,
+    _period: i32,
+    _completion: u64,
+    _arg: u64,
+    _resume: i32,
+) -> i32 {
+    (0x7000_0000..0x8000_0000).contains(&handle) as i32
+}
+
+fn native_critical_section(section: *mut u8) -> Option<Arc<NativeCriticalSection>> {
+    if section.is_null() {
+        return None;
+    }
+    let mut sections = NATIVE_CRITICAL_SECTIONS.lock().ok()?;
+    Some(
+        sections
+            .entry(section as usize)
+            .or_insert_with(|| Arc::new(NativeCriticalSection::new()))
+            .clone(),
+    )
+}
+
+fn native_critical_section_owner() -> u64 {
+    THREAD_NATIVE_HANDLE.with(|handle| handle.get())
+}
+
+pub(super) extern "win64" fn native_enter_critical_section(section: *mut u8) {
+    let Some(section) = native_critical_section(section) else {
+        return;
+    };
+    let owner = native_critical_section_owner();
+    let Ok(mut state) = section.owner_and_recursion.lock() else {
+        return;
+    };
+    while state.0.is_some_and(|current| current != owner) {
+        state = match section.ready.wait(state) {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+    }
+    state.0 = Some(owner);
+    state.1 = state.1.saturating_add(1);
+}
+
+pub(super) extern "win64" fn native_leave_critical_section(section: *mut u8) {
+    let Some(section) = native_critical_section(section) else {
+        return;
+    };
+    let owner = native_critical_section_owner();
+    let Ok(mut state) = section.owner_and_recursion.lock() else {
+        return;
+    };
+    if state.0 != Some(owner) || state.1 == 0 {
+        return;
+    }
+    state.1 -= 1;
+    if state.1 == 0 {
+        state.0 = None;
+        section.ready.notify_one();
+    }
+}
+
+pub(super) extern "win64" fn native_delete_critical_section(section: *mut u8) {
+    if !section.is_null() {
+        if let Ok(mut sections) = NATIVE_CRITICAL_SECTIONS.lock() {
+            sections.remove(&(section as usize));
+        }
+        unsafe { std::ptr::write_bytes(section, 0, 40) };
+    }
+}
+
+pub(super) extern "win64" fn native_initialize_slist_head(head: *mut u8) {
+    if !head.is_null() {
+        // SLIST_HEADER occupies 16 bytes on 64-bit Windows.
+        unsafe { std::ptr::write_bytes(head, 0, 16) };
+    }
+}
+
+pub(super) extern "win64" fn native_interlocked_push_entry_slist(
+    head: *mut u8,
+    entry: *mut u8,
+) -> *mut u8 {
+    if native_diagnostic_enabled() {
+        eprintln!("native InterlockedPushEntrySList head={head:p} entry={entry:p}");
+    }
+    if head.is_null() || entry.is_null() || (head as usize) & 15 != 0 || (entry as usize) & 15 != 0
+    {
+        return ptr::null_mut();
+    }
+    let Ok(_guard) = NATIVE_SLIST_LOCK.lock() else {
+        return ptr::null_mut();
+    };
+    unsafe {
+        let first = head as *mut u64;
+        let depth = head.add(8) as *mut u16;
+        let previous = first.read();
+        (entry as *mut u64).write(previous);
+        first.write(entry as u64);
+        depth.write(depth.read().wrapping_add(1));
+        previous as *mut u8
+    }
+}
+
+pub(super) extern "win64" fn native_interlocked_pop_entry_slist(head: *mut u8) -> *mut u8 {
+    if native_diagnostic_enabled() {
+        eprintln!("native InterlockedPopEntrySList head={head:p}");
+    }
+    if head.is_null() || (head as usize) & 15 != 0 {
+        return ptr::null_mut();
+    }
+    let Ok(_guard) = NATIVE_SLIST_LOCK.lock() else {
+        return ptr::null_mut();
+    };
+    unsafe {
+        let first = head as *mut u64;
+        let depth = head.add(8) as *mut u16;
+        let entry = first.read();
+        if entry == 0 {
+            return ptr::null_mut();
+        }
+        first.write((entry as *const u64).read());
+        depth.write(depth.read().wrapping_sub(1));
+        entry as *mut u8
+    }
+}
+
+pub(super) extern "win64" fn native_interlocked_flush_slist(head: *mut u8) -> *mut u8 {
+    if native_diagnostic_enabled() {
+        eprintln!("native InterlockedFlushSList head={head:p}");
+    }
+    if head.is_null() || (head as usize) & 15 != 0 {
+        return ptr::null_mut();
+    }
+    let Ok(_guard) = NATIVE_SLIST_LOCK.lock() else {
+        return ptr::null_mut();
+    };
+    unsafe {
+        let first = head as *mut u64;
+        let depth = head.add(8) as *mut u16;
+        let entries = first.read();
+        first.write(0);
+        depth.write(0);
+        entries as *mut u8
+    }
+}
+
+pub(super) extern "win64" fn native_query_depth_slist(head: *const u8) -> u16 {
+    if native_diagnostic_enabled() {
+        eprintln!("native QueryDepthSList head={head:p}");
+    }
+    if head.is_null() || (head as usize) & 15 != 0 {
+        return 0;
+    }
+    let Ok(_guard) = NATIVE_SLIST_LOCK.lock() else {
+        return 0;
+    };
+    unsafe { head.add(8).cast::<u16>().read() }
+}

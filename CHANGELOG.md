@@ -94,6 +94,8 @@ All notable changes to this project will be documented in this file.
   remain in the backend root.
 - Moved Linux backend thread-local guest state and active process/filesystem
   context accessors into a dedicated context module.
+- Grouped Linux critical section, SLIST, address-wait, and waitable-timer shims
+  with the synchronization APIs.
 - Added the C-locale `msvcrt!mbstowcs` shim used by Nano.
 - Added an optional native Node check proving a relative file that Node leaves
   in WinFS appears in the following shell directory listing.
