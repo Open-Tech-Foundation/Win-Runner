@@ -49,7 +49,11 @@ Items remain open until implementation and relevant verification are complete.
 - [x] Ignore generated `*.snap` and `*.winfs` files so local disks are not
   accidentally staged.
 - [ ] Split `src/native.rs` by subsystem: loader, handles, file I/O, sync,
-  processes, sockets, and related Windows API groups.
+  processes, sockets, and related Windows API groups. **Started:** the public
+  `native.rs` is now a platform-neutral façade; Linux x86-64 execution and
+  unsupported-host behavior live in separate backend modules. Next, split the
+  Linux backend by Windows API subsystem while keeping host syscalls behind
+  backend-local interfaces so a macOS implementation can provide its own.
 - [x] Cache `WINCLI_NATIVE_DIAGNOSTIC` once rather than reading the environment
   from hot shims; initialize the cache before guest forks.
 - [x] Fix Clippy's unevenly grouped hexadecimal literal warnings. A current
