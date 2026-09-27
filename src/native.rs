@@ -2275,6 +2275,35 @@ mod imp {
         }
 
         #[test]
+        fn modern_hard_link_does_not_replace_existing_destination() {
+            type CreateHardLinkW = unsafe extern "win64" fn(*const u16, *const u16, u64) -> i32;
+            let create_link: CreateHardLinkW =
+                unsafe { std::mem::transmute(require_kernel32_api(b"CreateHardLinkW\0") as usize) };
+            let source = r"C:\modern_hard_link_conflict_source.txt";
+            let link = r"C:\modern_hard_link_conflict_destination.txt";
+            let source_wide = source.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let link_wide = link.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            {
+                let mut ctx = context.lock().unwrap();
+                ctx.fs.write_file(source, b"source-data".to_vec()).unwrap();
+                ctx.fs
+                    .write_file(link, b"destination-data".to_vec())
+                    .unwrap();
+            }
+
+            let result = unsafe { create_link(link_wide.as_ptr(), source_wide.as_ptr(), 0) };
+            let source_bytes = context.lock().unwrap().fs.read_file(source).unwrap();
+            let link_bytes = context.lock().unwrap().fs.read_file(link).unwrap();
+            let mut ctx = context.lock().unwrap();
+            ctx.fs.delete_file(link).unwrap();
+            ctx.fs.delete_file(source).unwrap();
+            assert_eq!(result, 0);
+            assert_eq!(source_bytes, b"source-data");
+            assert_eq!(link_bytes, b"destination-data");
+        }
+
+        #[test]
         fn modern_replace_file_moves_old_contents_to_backup() {
             type ReplaceFileW =
                 unsafe extern "win64" fn(*const u16, *const u16, *const u16, u32, u64, u64) -> i32;
@@ -2343,6 +2372,41 @@ mod imp {
             assert_eq!(unsafe { unlock(handle, 1, 0, 1, 0) }, 1);
             assert_eq!(super::native_close_handle(handle), 1);
             context.lock().unwrap().fs.delete_file(path).unwrap();
+        }
+
+        #[test]
+        fn modern_lock_file_rejects_overlapping_lock_until_unlocked() {
+            type FileRangeOperation = unsafe extern "win64" fn(u64, u32, u32, u32, u32) -> i32;
+            let lock: FileRangeOperation =
+                unsafe { std::mem::transmute(require_kernel32_api(b"LockFile\0") as usize) };
+            let unlock: FileRangeOperation =
+                unsafe { std::mem::transmute(require_kernel32_api(b"UnlockFile\0") as usize) };
+            let path = r"C:\modern_lock_conflict.txt";
+            let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(path, b"locked-range".to_vec())
+                .unwrap();
+            let first = super::native_create_file_w(wide.as_ptr(), 0xC000_0000, 7, 0, 3, 0, 0);
+            let second = super::native_create_file_w(wide.as_ptr(), 0xC000_0000, 7, 0, 3, 0, 0);
+            assert_ne!(first, u64::MAX);
+            assert_ne!(second, u64::MAX);
+
+            assert_eq!(unsafe { lock(first, 2, 0, 4, 0) }, 1);
+            assert_eq!(unsafe { lock(second, 4, 0, 2, 0) }, 0);
+            let conflict_error = super::native_get_last_error();
+            assert_eq!(unsafe { unlock(first, 2, 0, 4, 0) }, 1);
+            let after_unlock = unsafe { lock(second, 2, 0, 4, 0) };
+            assert_eq!(unsafe { unlock(second, 2, 0, 4, 0) }, 1);
+            assert_eq!(super::native_close_handle(second), 1);
+            assert_eq!(super::native_close_handle(first), 1);
+            context.lock().unwrap().fs.delete_file(path).unwrap();
+
+            assert_eq!(conflict_error, 33); // ERROR_LOCK_VIOLATION
+            assert_eq!(after_unlock, 1);
         }
 
         #[test]
@@ -2695,6 +2759,43 @@ mod imp {
             assert!(context.lock().unwrap().fs.exists(path));
             assert_eq!(super::native_close_handle(handle), 1);
             assert!(!context.lock().unwrap().fs.exists(path));
+        }
+
+        #[test]
+        fn modern_set_file_information_by_handle_rejects_unknown_class() {
+            type SetFileInformationByHandle =
+                unsafe extern "win64" fn(u64, i32, *const std::ffi::c_void, u32) -> i32;
+            let set_information: SetFileInformationByHandle = unsafe {
+                std::mem::transmute(require_kernel32_api(b"SetFileInformationByHandle\0") as usize)
+            };
+            let path = r"C:\modern_invalid_file_information_class.txt";
+            let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(path, b"unchanged".to_vec())
+                .unwrap();
+            let handle = super::native_create_file_w(wide.as_ptr(), 0xC000_0000, 7, 0, 3, 0, 0);
+            assert_ne!(handle, u64::MAX);
+
+            let information = [0u8; 16];
+            let result = unsafe {
+                set_information(
+                    handle,
+                    0x7fff,
+                    information.as_ptr().cast(),
+                    information.len() as u32,
+                )
+            };
+            let error = super::native_get_last_error();
+            let contents = context.lock().unwrap().fs.read_file(path).unwrap();
+            assert_eq!(super::native_close_handle(handle), 1);
+            context.lock().unwrap().fs.delete_file(path).unwrap();
+            assert_eq!(result, 0);
+            assert_eq!(error, 87); // ERROR_INVALID_PARAMETER
+            assert_eq!(contents, b"unchanged");
         }
 
         #[test]
