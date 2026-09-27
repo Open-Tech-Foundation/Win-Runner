@@ -105,8 +105,9 @@ wincli shell
 
 One ephemeral WinFS for the whole session (files created by one command
 are visible to the next). Each line is a PS1 statement, `install`/`inspect`,
-`choco`, `powershell -c`, a host `.exe`/`.ps1` file, or a package installed
-in the session with args — so `install rg` followed by `rg --version` works.
+`winget`, `choco`, `powershell -c`, a host `.exe`/`.ps1` file, or a package
+installed in the session with args — so `install rg` followed by `rg --version`
+works.
 Errors print as
 `wincli: ...` without ending the session; `exit`/`quit` (or Ctrl-D) ends it
 with the last guest exit code. Interactive input supports cursor movement,
@@ -127,30 +128,40 @@ loaded and are converted the next time they are saved.
 
 ```bash
 wincli shell
-install rg               # remote WinGet catalog (default source)
+winget install BurntSushi.ripgrep.MSVC
 rg --version
+choco install nodejs
+node --version
 install demo             # WINCLI_SOURCE=tests/artifacts/packages (local dir)
 demo
 snapshot save tools.snap
 ```
 
-`install` resolves `<source>/<name>.json` + `<name>.zip`, stages the download
-in temporary process storage, and copies the executable into the current
-guest disk at `C:\bin\<name>.exe`. Both the staging area and guest disk are
+`winget` and `choco` are WinCLI shell builtins, not the upstream package
+manager executables. WinCLI implements a limited install subset for portable
+packages; it verifies catalog hashes and stages installed commands on C:.
+`winget install <id>` supports portable or ZIP x64 packages, including
+architecture-neutral manifests whose payload validates as x64 PE. Common
+WinGet forms such as `-e`, `--exact`, and `--silent` are accepted. MSI, MSIX,
+and interactive installer packages are not supported.
+
+`install` is a shorthand for installing from the configured package source.
+It resolves `<source>/<name>.json` + `<name>.zip` for local fixtures, stages
+the download in temporary process storage, and copies the executable into the
+current guest disk at `C:\bin\<name>.exe`. Both the staging area and guest disk are
 discarded when WinCLI exits unless you save a snapshot. Load that snapshot on
 the next run with `wincli --snapshot=tools.snap shell`; it is the only way to
 carry installed programs or other guest files between runs. `WINCLI_CACHE` is
 not supported. Guest argv reaches the program via `GetCommandLineW/A` (MSVC
 quoting).
-Remote WinGet-catalog sources, hash verification, and deflate land in P2;
-until then only local directories (`WINCLI_SOURCE=./dir`, stored zips).
 `tests/artifacts/packages/` holds offline fixtures built by
 `cargo run --example gen_artifacts`.
 
 Remote sources: short aliases (`rg`, `fd`, `jq`, `bat`, `fzf`) or full
 WinGet IDs (`BurntSushi.ripgrep.MSVC`). Manifests come from winget-pkgs
 (version discovery via GitHub API, YAML via raw); only portable/zip x64
-installers are accepted, downloads are SHA-256-verified against the
+portable/zip x64 packages are accepted (plus neutral portable executables
+validated as x64 PE), downloads are SHA-256-verified against the
 manifest. Download staging is reused only during the current process and is
 removed when WinCLI exits.
 

@@ -10,6 +10,71 @@
 
 pub const RAW_BASE: &str = "https://raw.githubusercontent.com/microsoft/winget-pkgs/master";
 pub const API_BASE: &str = "https://api.github.com/repos/microsoft/winget-pkgs/contents";
+pub const SHIM_VERSION: &str = "0.1.0";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WingetCmd {
+    Install { id: String },
+    Version,
+}
+
+/// Parse the supported shell-facing subset of WinGet's CLI.
+pub fn parse_args(argv: &[String]) -> Result<WingetCmd, String> {
+    const USAGE: &str =
+        "usage: winget install <package-id> [-e|--exact] [--silent] | winget --version";
+    match argv.first().map(|arg| arg.to_ascii_lowercase()).as_deref() {
+        Some("--version") | Some("-v") | Some("version") => Ok(WingetCmd::Version),
+        Some("install") => {
+            let mut id = None;
+            let mut positional = Vec::new();
+            let mut i = 1;
+            while i < argv.len() {
+                let arg = &argv[i];
+                if arg == "-e"
+                    || arg.eq_ignore_ascii_case("--exact")
+                    || arg.eq_ignore_ascii_case("--silent")
+                    || arg.eq_ignore_ascii_case("--accept-package-agreements")
+                    || arg.eq_ignore_ascii_case("--accept-source-agreements")
+                    || arg.eq_ignore_ascii_case("--disable-interactivity")
+                {
+                    i += 1;
+                } else if arg.eq_ignore_ascii_case("--id") {
+                    let value = argv.get(i + 1).ok_or_else(|| USAGE.to_string())?;
+                    if id.replace(value.clone()).is_some() {
+                        return Err(format!(
+                            "winget install: package ID specified more than once ({USAGE})"
+                        ));
+                    }
+                    i += 2;
+                } else if let Some(value) = arg.strip_prefix("--id=") {
+                    if id.replace(value.to_string()).is_some() {
+                        return Err(format!(
+                            "winget install: package ID specified more than once ({USAGE})"
+                        ));
+                    }
+                    i += 1;
+                } else if arg.starts_with('-') {
+                    return Err(format!(
+                        "winget install: unsupported option '{arg}' ({USAGE})"
+                    ));
+                } else {
+                    positional.push(arg.clone());
+                    i += 1;
+                }
+            }
+            let id = match id {
+                Some(id) if positional.is_empty() => id,
+                None if positional.len() == 1 => positional.remove(0),
+                _ => return Err(USAGE.to_string()),
+            };
+            if id.is_empty() {
+                return Err(USAGE.to_string());
+            }
+            Ok(WingetCmd::Install { id })
+        }
+        _ => Err(USAGE.to_string()),
+    }
+}
 
 /// Short-name bootstrap aliases (not a package database).
 pub fn alias(name: &str) -> Option<&'static str> {
@@ -41,6 +106,8 @@ pub struct RemotePkg {
     pub kind: Kind,
     /// Suggested exe file name for the guest address.
     pub exe_name: String,
+    /// Optional command alias declared by the manifest.
+    pub command: Option<String>,
 }
 
 /// Resolve `name` (alias or full ID) to a downloadable portable artifact.
@@ -71,7 +138,7 @@ pub fn resolve(name: &str) -> Result<RemotePkg, String> {
         Kind::Exe
     };
     let _ = itype;
-    let exe_name = match &kind {
+    let mut exe_name = match &kind {
         Kind::Exe => url_basename(&item.url),
         Kind::Zip { nested } => nested
             .rsplit(['/', '\\'])
@@ -79,6 +146,20 @@ pub fn resolve(name: &str) -> Result<RemotePkg, String> {
             .unwrap_or("app.exe")
             .to_string(),
     };
+    let command = man.commands.iter().find_map(|command| {
+        (!command.is_empty()
+            && command
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+        .then(|| command.clone())
+    });
+    if let Some(command) = &command {
+        exe_name = if command.to_ascii_lowercase().ends_with(".exe") {
+            command.clone()
+        } else {
+            format!("{command}.exe")
+        };
+    }
     Ok(RemotePkg {
         id: id.to_string(),
         version,
@@ -86,6 +167,7 @@ pub fn resolve(name: &str) -> Result<RemotePkg, String> {
         sha256,
         kind,
         exe_name,
+        command,
     })
 }
 
@@ -167,6 +249,7 @@ struct Installer {
 struct Manifest {
     identifier: String,
     top_type: Option<String>,
+    commands: Vec<String>,
     installers: Vec<Installer>,
 }
 
@@ -174,15 +257,27 @@ fn parse_installer(doc: &str) -> Result<Manifest, String> {
     let mut man = Manifest {
         identifier: String::new(),
         top_type: None,
+        commands: Vec::new(),
         installers: Vec::new(),
     };
     let mut cur: Option<Installer> = None;
+    let mut section = "";
     for raw_line in doc.lines() {
         let line = raw_line.trim_end();
         if line.trim_start().starts_with('#') || line.trim().is_empty() {
             continue;
         }
         if let Some(rest) = line.strip_prefix("- ") {
+            if section.eq_ignore_ascii_case("Commands") {
+                let command = unquote(rest.to_string());
+                if !command.is_empty() {
+                    man.commands.push(command);
+                }
+                continue;
+            }
+            if !section.eq_ignore_ascii_case("Installers") {
+                continue;
+            }
             // new installer item (column 0)
             if let Some(prev) = cur.take() {
                 man.installers.push(prev);
@@ -220,6 +315,15 @@ fn parse_installer(doc: &str) -> Result<Manifest, String> {
             if let Some(prev) = cur.take() {
                 man.installers.push(prev);
             }
+            if k.eq_ignore_ascii_case("Commands") || k.eq_ignore_ascii_case("Installers") {
+                section = if k.eq_ignore_ascii_case("Commands") {
+                    "Commands"
+                } else {
+                    "Installers"
+                };
+                continue;
+            }
+            section = "";
             put_field(None, &mut man, k, v);
         }
     }
@@ -288,7 +392,9 @@ fn put_field(it: Option<&mut Installer>, man: &mut Manifest, k: String, v: Strin
 fn select_installer(man: &Manifest) -> Result<(Installer, String), String> {
     let mut best: Option<(u8, Installer, String)> = None;
     for it in &man.installers {
-        if !it.arch.eq_ignore_ascii_case("x64") {
+        let x64 = it.arch.eq_ignore_ascii_case("x64");
+        let neutral = it.arch.eq_ignore_ascii_case("neutral");
+        if !x64 && !neutral {
             continue;
         }
         let t = it
@@ -296,10 +402,21 @@ fn select_installer(man: &Manifest) -> Result<(Installer, String), String> {
             .clone()
             .or_else(|| man.top_type.clone())
             .unwrap_or_default();
+        if neutral && !t.eq_ignore_ascii_case("portable") {
+            continue;
+        }
         let score = if t.eq_ignore_ascii_case("portable") {
-            0u8
+            if x64 {
+                0u8
+            } else {
+                1u8
+            }
         } else if t.eq_ignore_ascii_case("zip") || it.url.to_lowercase().ends_with(".zip") {
-            1u8
+            if x64 {
+                2u8
+            } else {
+                3u8
+            }
         } else {
             continue;
         };
@@ -327,7 +444,7 @@ fn select_installer(man: &Manifest) -> Result<(Installer, String), String> {
             })
             .collect();
         format!(
-            "no portable/zip x64 installer (has: {}); MSI/MSIX/setup are not supported",
+            "no portable/zip x64 or architecture-neutral installer (has: {}); MSI/MSIX/setup are not supported",
             have.join(", ")
         )
     })
@@ -414,6 +531,64 @@ mod tests {
     fn aliases() {
         assert_eq!(alias("rg"), Some("BurntSushi.ripgrep.MSVC"));
         assert_eq!(alias("BurntSushi.ripgrep.MSVC"), None); // full IDs pass through
+    }
+
+    #[test]
+    fn parses_supported_winget_install_forms() {
+        assert_eq!(
+            parse_args(&["install".into(), "GNU.Nano".into()]).unwrap(),
+            WingetCmd::Install {
+                id: "GNU.Nano".into()
+            }
+        );
+        assert_eq!(
+            parse_args(&[
+                "install".into(),
+                "-e".into(),
+                "--id".into(),
+                "GNU.Nano".into(),
+                "--silent".into(),
+                "--accept-package-agreements".into(),
+            ])
+            .unwrap(),
+            WingetCmd::Install {
+                id: "GNU.Nano".into()
+            }
+        );
+        assert_eq!(
+            parse_args(&["--version".into()]).unwrap(),
+            WingetCmd::Version
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_winget_options_and_conflicting_ids() {
+        assert!(parse_args(&["install".into()]).is_err());
+        assert!(parse_args(&[
+            "install".into(),
+            "GNU.Nano".into(),
+            "--version".into(),
+            "2".into()
+        ])
+        .unwrap_err()
+        .contains("unsupported option"));
+        assert!(parse_args(&[
+            "install".into(),
+            "GNU.Nano".into(),
+            "--id".into(),
+            "GNU.Nano".into()
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn parses_neutral_portable_manifest_and_command_alias() {
+        let doc = "PackageIdentifier: GNU.Nano\nPackageVersion: 2.7.5\nCommands:\n- nano\nInstallerType: portable\nInstallers:\n- Architecture: neutral\n  InstallerUrl: https://example.test/nano.exe\n  InstallerSha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+        let man = parse_installer(doc).unwrap();
+        assert_eq!(man.commands, ["nano"]);
+        let (installer, kind) = select_installer(&man).unwrap();
+        assert_eq!(installer.arch, "neutral");
+        assert_eq!(kind, "portable");
     }
 
     #[test]

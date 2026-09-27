@@ -1155,6 +1155,19 @@ fn snapshot_is_the_only_way_to_carry_installed_packages_between_shells() {
 }
 
 #[test]
+fn winget_builtin_installs_a_package_into_the_guest_session() {
+    let source = artifact("packages").to_string_lossy().to_string();
+    let (code, stdout, stderr) = run_shell_env(
+        "winget --version\nwinget install -e --id demo --silent\ndemo\nexit\n",
+        &[("WINCLI_SOURCE", source.as_str())],
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("wincli-winget"), "stdout: {stdout}");
+    assert!(stdout.contains("Installed demo 0.1.0"), "stdout: {stdout}");
+    assert!(stdout.contains("demo 0.1.0"), "stdout: {stdout}");
+}
+
+#[test]
 fn shell_mounts_host_folder_as_a_live_guest_drive() {
     let root = tmp_path("mount-drive");
     std::fs::create_dir_all(&root).unwrap();

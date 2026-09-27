@@ -194,6 +194,10 @@ impl Shell {
                 self.do_choco(&argv[1..], out)?;
                 Ok(ShellFlow::Continue)
             }
+            "winget" => {
+                self.do_winget(&argv[1..], out)?;
+                Ok(ShellFlow::Continue)
+            }
             "powershell" => {
                 self.do_powershell(&argv[1..], out)?;
                 Ok(ShellFlow::Continue)
@@ -416,6 +420,35 @@ impl Shell {
                     format!(
                         "Installed {} {} → C:\\bin\\{}.exe\n",
                         app.name, app.version, app.name
+                    )
+                    .as_bytes(),
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// WinGet-compatible shell entry point for verified portable catalog
+    /// packages. This deliberately supports only `install` and `--version`.
+    fn do_winget(&mut self, argv: &[String], out: &mut Vec<u8>) -> Result<(), String> {
+        match crate::winget::parse_args(argv)? {
+            crate::winget::WingetCmd::Version => {
+                out.extend_from_slice(
+                    format!("wincli-winget {}\n", crate::winget::SHIM_VERSION).as_bytes(),
+                );
+                Ok(())
+            }
+            crate::winget::WingetCmd::Install { id } => {
+                let installed = do_install(&id)?;
+                self.seed_host_file(
+                    &installed.host_path.display().to_string(),
+                    &installed.guest_path,
+                )?;
+                self.last_code = 0;
+                out.extend_from_slice(
+                    format!(
+                        "Installed {} {} → {}\n",
+                        installed.name, installed.version, installed.guest_path
                     )
                     .as_bytes(),
                 );
@@ -1023,6 +1056,22 @@ mod tests {
             out,
             format!("wincli-choco {}\n", choco::SHIM_VERSION).as_bytes()
         );
+    }
+
+    #[test]
+    fn winget_reports_builtin_version_and_parses_install_command() {
+        let mut shell = Shell::new();
+        let mut out = Vec::new();
+        shell.exec_line("winget --version", &mut out).unwrap();
+        assert_eq!(
+            out,
+            format!("wincli-winget {}\n", crate::winget::SHIM_VERSION).as_bytes()
+        );
+
+        let error = shell
+            .exec_line("winget install", &mut Vec::new())
+            .unwrap_err();
+        assert!(error.contains("usage: winget install"), "{error}");
     }
 
     #[test]

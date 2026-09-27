@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Added a `winget install` shell builtin alongside `choco`, with package ID
+  forms, common silent/exact flags, hash-verified portable installs, and
+  manifest command aliases. Architecture-neutral portable packages are
+  accepted only when their payload validates as x64 PE.
 - Corrected WinFS file identity preservation across renames, directory
   creation through POSIX-style `CreateFileW` flags, backup-semantics checks,
   completion modes for overlapped file handles, and `MoveFileW` error codes.

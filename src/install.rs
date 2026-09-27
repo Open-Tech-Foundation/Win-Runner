@@ -177,10 +177,18 @@ pub fn install_remote(name: &str, cache: &Path) -> Result<Installed, String> {
             nested.clone(),
         ),
     };
-    if exe_bytes.len() < 2 || &exe_bytes[0..2] != b"MZ" {
-        return Err(format!("package {}: payload is not a PE file", r.id));
+    crate::pe::load_lenient(&exe_bytes).map_err(|e| {
+        format!(
+            "package {}: payload is not a supported x64 PE file: {e}",
+            r.id
+        )
+    })?;
+    let mut installed = finalize(name, &r.version, &exe_rel, &blob, ext, cache)?;
+    if r.command.is_some() {
+        installed.exe_name = r.exe_name;
+        installed.guest_path = format!("C:\\bin\\{}", installed.exe_name);
     }
-    finalize(name, &r.version, &exe_rel, &blob, ext, cache)
+    Ok(installed)
 }
 
 fn check_name(name: &str) -> Result<(), String> {
