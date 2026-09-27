@@ -2159,12 +2159,9 @@ impl<'a> Interpreter<'a> {
             .or_else(|| pos.first().cloned())
             .ok_or_else(|| "Remove-Item: missing -Path".to_string())?;
         let recurse = named.contains_key("recurse");
-        // -Force also implies recursive-ish leniency? keep: recurse only via -Recurse.
+        // `-Force` does not imply recursive deletion; only `-Recurse` does.
         self.fs
-            .remove(
-                &path,
-                recurse || named.contains_key("force") && self.fs.is_dir(&path) && recurse,
-            )
+            .remove(&path, recurse)
             .map_err(|e| format!("Remove-Item: {e}"))?;
         Ok(())
     }

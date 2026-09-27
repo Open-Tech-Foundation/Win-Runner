@@ -51,7 +51,8 @@ Items remain open until implementation and relevant verification are complete.
   processes, sockets, and related Windows API groups.
 - [x] Cache `WINCLI_NATIVE_DIAGNOSTIC` once rather than reading the environment
   from hot shims; initialize the cache before guest forks.
-- [ ] Fix Clippy's unevenly grouped hexadecimal literal warnings.
+- [x] Fix Clippy's unevenly grouped hexadecimal literal warnings. A current
+  all-targets Clippy run still reports unrelated warnings across the codebase.
 
 ## Compatibility coverage priorities
 

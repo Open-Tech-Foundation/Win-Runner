@@ -524,16 +524,16 @@ mod relocation_tests {
     #[test]
     fn applies_positive_and_negative_relocation_deltas() {
         let mut image = vec![0; 16];
-        image[..8].copy_from_slice(&0x1400_0010_0u64.to_le_bytes());
-        apply_base_relocations(&mut image, &[0], 0x1400_0000_0, 0x1500_0000_0).unwrap();
+        image[..8].copy_from_slice(&0x0001_4000_0100u64.to_le_bytes());
+        apply_base_relocations(&mut image, &[0], 0x0001_4000_0000, 0x0001_5000_0000).unwrap();
         assert_eq!(
             u64::from_le_bytes(image[..8].try_into().unwrap()),
-            0x1500_0010_0
+            0x0001_5000_0100
         );
-        apply_base_relocations(&mut image, &[0], 0x1500_0000_0, 0x1400_0000_0).unwrap();
+        apply_base_relocations(&mut image, &[0], 0x0001_5000_0000, 0x0001_4000_0000).unwrap();
         assert_eq!(
             u64::from_le_bytes(image[..8].try_into().unwrap()),
-            0x1400_0010_0
+            0x0001_4000_0100
         );
         assert!(apply_base_relocations(&mut image, &[12], 1, 2).is_err());
     }

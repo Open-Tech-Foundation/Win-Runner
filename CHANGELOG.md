@@ -28,6 +28,8 @@ All notable changes to this project will be documented in this file.
 - Ignored generated snapshot disk files (`*.snap` and `*.winfs`).
 - Cached the native diagnostic setting before guest forks to avoid repeated
   environment lookups from API shims.
+- Grouped PE image-base hex literals consistently and simplified a redundant
+  `Remove-Item` recursion condition reported by Clippy.
 - Added the C-locale `msvcrt!mbstowcs` shim used by Nano.
 - Added an optional native Node check proving a relative file that Node leaves
   in WinFS appears in the following shell directory listing.

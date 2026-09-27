@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-pub const IMAGE_BASE: u64 = 0x1400_0000_000;
+pub const IMAGE_BASE: u64 = 0x0140_0000_0000;
 pub const SECTION_RVA: u32 = 0x1000;
 pub const FILE_OFF: usize = 0x200;
 

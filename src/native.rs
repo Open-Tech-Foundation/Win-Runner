@@ -5996,7 +5996,10 @@ mod imp {
 
         #[test]
         fn exposes_the_main_module_handle() {
-            assert_eq!(native_get_module_handle_w(std::ptr::null()), 0x1400_0000_0);
+            assert_eq!(
+                native_get_module_handle_w(std::ptr::null()),
+                0x0001_4000_0000
+            );
         }
 
         #[test]
@@ -6006,7 +6009,7 @@ mod imp {
                 native_get_module_handle_ex_w(0, std::ptr::null(), &mut handle),
                 1
             );
-            assert_eq!(handle, 0x1400_0000_0);
+            assert_eq!(handle, 0x0001_4000_0000);
         }
 
         #[test]
@@ -6508,9 +6511,9 @@ mod imp {
         #[test]
         fn maps_at_the_reserved_address_and_applies_dir64_delta() {
             let mut bytes = vec![0; 16];
-            bytes[..8].copy_from_slice(&0x1400_0010_0u64.to_le_bytes());
+            bytes[..8].copy_from_slice(&0x0001_4000_0100u64.to_le_bytes());
             let image = PeImage {
-                image_base: 0x1400_0000_0,
+                image_base: 0x0001_4000_0000,
                 entry_rva: 0,
                 size_of_image: 16,
                 image: bytes,
@@ -9138,7 +9141,7 @@ mod imp {
     #[cfg(test)]
     static TEST_PROCESS: LazyLock<Arc<NativeProcessContext>> = LazyLock::new(|| {
         Arc::new(NativeProcessContext {
-            image_base: 0x1400_0000_0,
+            image_base: 0x0001_4000_0000,
             module_path: r"C:\wincli\wincli.exe".to_string(),
             process_id: 1,
             process_handle: u64::MAX,
