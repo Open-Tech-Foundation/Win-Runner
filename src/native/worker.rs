@@ -133,6 +133,29 @@ pub(crate) fn execute_request(path: &Path) -> Result<u32, String> {
         .map_err(|error| format!("cannot read native worker request: {error}"))?;
     let request: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|error| format!("invalid native worker request: {error}"))?;
+    let inherited_pipes = request
+        .get("inherited_pipes")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !inherited_pipes.is_empty() {
+        let socket_path = request
+            .get("pipe_transfer_socket")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "worker request has no pipe transfer socket".to_string())?;
+        let descriptors =
+            crate::native::receive_worker_pipe_descriptors(socket_path, inherited_pipes.len())?;
+        std::env::set_var(
+            "WINCLI_NATIVE_PIPE_FDS",
+            descriptors
+                .iter()
+                .map(i32::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    } else {
+        std::env::remove_var("WINCLI_NATIVE_PIPE_FDS");
+    }
     let text = |key: &str| -> Result<String, String> {
         request
             .get(key)
@@ -206,6 +229,11 @@ pub(crate) fn execute_request(path: &Path) -> Result<u32, String> {
     let result_fd = result_file.into_raw_fd();
     crate::native::set_worker_result_fd(result_fd);
     std::env::set_var("WINCLI_NATIVE_WORKER", "1");
+    if request.get("native_fs").is_some() {
+        std::env::set_var("WINCLI_NATIVE_REQUEST_PATH", path);
+    } else {
+        std::env::remove_var("WINCLI_NATIVE_REQUEST_PATH");
+    }
     std::env::set_var("WINCLI_NATIVE_PROCESS_ID", process_id.to_string());
     std::env::set_var(
         "WINCLI_NATIVE_PARENT_PROCESS_ID",

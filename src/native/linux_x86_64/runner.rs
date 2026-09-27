@@ -533,6 +533,12 @@ fn run_rust_baseline_argv_with_fs_impl(
                 .and_then(|value| value.parse::<u32>().ok())
                 .ok_or("native worker has no state journal descriptor")?;
             process.state_fd.store(state_fd, Ordering::Release);
+            if let Ok(request_path) = std::env::var("WINCLI_NATIVE_REQUEST_PATH") {
+                super::process::restore_worker_native_fs(
+                    &process,
+                    std::path::Path::new(&request_path),
+                )?;
+            }
             protect_exec(&mapping)?;
             let guest_process = Arc::clone(&process);
             let code = std::thread::Builder::new()

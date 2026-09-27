@@ -16,13 +16,14 @@ Items remain open until implementation and relevant verification are complete.
   security sandbox. Document this clearly; assess seccomp, namespaces, and
   Landlock as a separate implementation project.
 - [ ] **3. Remove unsafe fork-after-threads behavior.** `CreateProcessW` still
-  still has a fork fallback for `CreateProcessW`. CLI guests and eligible
-  Windows children now run in fresh exec workers. Child workers receive their
-  Windows process IDs, cwd, environment, WinFS state, and inherited standard
-  streams; a real Node 24 nested-process check covers this route. The fork path
-  remains when the child needs open WinFS handles, mapped files, or inherited
-  non-standard pipe handles. Finish the shared handle protocol and remove that
-  fallback before considering this item complete.
+  has a fork fallback. CLI guests and eligible Windows children now run in
+  fresh exec workers. Child workers receive their Windows process IDs, cwd,
+  environment, WinFS state, inherited standard streams, and ordinary open WinFS
+  file-handle metadata; a real Node 24 nested-process check covers this route.
+  Connected inherited non-standard pipe handles now cross exec through Unix
+  descriptor passing. The fork path remains for pending pipes and handles
+  attached to completion ports. Finish transfer for those states and remove
+  the fallback before considering this item complete.
 - [x] **4. Keep the control listener alive after invalid connections.** Continue
   accepting until an authenticated WebSocket session is established, and use
   constant-time token comparison.

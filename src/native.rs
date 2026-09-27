@@ -72,8 +72,25 @@ pub fn set_worker_result_fd(fd: i32) {
     platform_backend::set_worker_result_fd(fd);
 }
 
+/// Receive inherited Unix descriptors for a Linux native worker.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn receive_worker_pipe_descriptors(
+    socket_path: &str,
+    expected: usize,
+) -> Result<Vec<i32>, String> {
+    platform_backend::receive_worker_pipe_descriptors(socket_path, expected)
+}
+
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 pub fn set_worker_result_fd(_fd: i32) {}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+pub fn receive_worker_pipe_descriptors(
+    _socket_path: &str,
+    _expected: usize,
+) -> Result<Vec<i32>, String> {
+    Err("worker pipe descriptor transfer is supported only on Linux x86-64".to_string())
+}
 
 /// True when this build can execute the initial native backend.
 pub const AVAILABLE: bool = cfg!(all(target_os = "linux", target_arch = "x86_64"));

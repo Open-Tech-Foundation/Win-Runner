@@ -118,3 +118,12 @@ mod tests;
 pub(super) fn set_worker_result_fd(fd: i32) {
     NATIVE_WORKER_RESULT_FD.store(fd, Ordering::Release);
 }
+
+pub(super) fn receive_worker_pipe_descriptors(
+    socket_path: &str,
+    expected: usize,
+) -> Result<Vec<i32>, String> {
+    let stream = std::os::unix::net::UnixStream::connect(socket_path)
+        .map_err(|error| format!("cannot connect worker pipe transfer socket: {error}"))?;
+    process::receive_worker_pipe_fds(&stream, expected)
+}

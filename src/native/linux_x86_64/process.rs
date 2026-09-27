@@ -797,16 +797,12 @@ fn can_exec_worker_child(
     std_handles: [u64; 3],
     inherit_handles: bool,
 ) -> bool {
-    // The current worker request transports the filesystem image and the
-    // three standard streams. Open WinFS handles, locks, and mapped files need
-    // a process-wide handle protocol before they can cross an exec boundary.
-    if !child_fs.handles.is_empty()
-        || !child_fs.file_shares.is_empty()
-        || !child_fs.finds.is_empty()
-        || !child_fs.file_completion_modes.is_empty()
-        || !child_fs.delete_on_close.is_empty()
-        || !child_fs.file_locks.is_empty()
-        || !child_fs.file_access.is_empty()
+    // File handles are serialized into the worker request. Handles attached
+    // to completion ports still need a process-wide completion protocol.
+    if child_fs
+        .handles
+        .values()
+        .any(|file| file.completion.is_some())
     {
         return false;
     }
@@ -820,15 +816,16 @@ fn can_exec_worker_child(
     let Ok(pipes) = parent.named_pipes.lock() else {
         return false;
     };
-    if inherit_handles {
-        let std_set = std_handles
-            .iter()
-            .copied()
-            .collect::<std::collections::HashSet<_>>();
-        if pipes
-            .handles
-            .iter()
-            .any(|(handle, pipe)| pipe.inheritable && !std_set.contains(handle))
+    for (handle, pipe) in &pipes.handles {
+        if std_handles.contains(handle)
+            && (pipe.pending_client.is_some() || pipe.completion.is_some())
+        {
+            return false;
+        }
+        if inherit_handles
+            && pipe.inheritable
+            && !std_handles.contains(handle)
+            && (pipe.pending_client.is_some() || pipe.completion.is_some())
         {
             return false;
         }
@@ -846,16 +843,507 @@ fn can_exec_worker_child(
     })
 }
 
+fn encode_worker_native_fs(native_fs: &NativeFs) -> Result<serde_json::Value, String> {
+    let files = native_fs
+        .handles
+        .iter()
+        .map(|(handle, file)| {
+            if file.completion.is_some() {
+                return Err(
+                    "file handle completion ports cannot cross a worker boundary".to_string(),
+                );
+            }
+            Ok(serde_json::json!({
+                "handle": handle,
+                "path": file.path,
+                "offset": file.offset,
+                "overlapped": file.overlapped,
+            }))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let devices = native_fs
+        .devices
+        .iter()
+        .map(|(handle, device)| {
+            let value = match device {
+                NativeDevice::Null => serde_json::json!({"kind": "null"}),
+                NativeDevice::Console { input, output } => {
+                    serde_json::json!({"kind": "console", "input": input, "output": output})
+                }
+                NativeDevice::ConsoleIn(input) => {
+                    serde_json::json!({"kind": "console_in", "input": input})
+                }
+                NativeDevice::ConsoleOut(output) => {
+                    serde_json::json!({"kind": "console_out", "output": output})
+                }
+            };
+            serde_json::json!({"handle": handle, "device": value})
+        })
+        .collect::<Vec<_>>();
+    Ok(serde_json::json!({
+        "files": files,
+        "devices": devices,
+        "file_access": native_fs.file_access,
+        "file_shares": native_fs.file_shares,
+        "finds": native_fs.finds.iter().map(|(handle, find)| serde_json::json!({
+            "handle": handle,
+            "names": find.names,
+            "index": find.index,
+        })).collect::<Vec<_>>(),
+        "file_completion_modes": native_fs.file_completion_modes,
+        "delete_on_close": native_fs.delete_on_close,
+        "file_locks": native_fs.file_locks,
+        "next": native_fs.next,
+    }))
+}
+
+fn send_worker_pipe_fds(
+    stream: &std::os::unix::net::UnixStream,
+    fds: &[i32],
+) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+    if fds.is_empty() {
+        return Ok(());
+    }
+    let payload = [0x57u8];
+    let control_bytes = unsafe { libc::CMSG_SPACE(std::mem::size_of_val(fds) as u32) as usize };
+    let mut control = vec![0usize; control_bytes.div_ceil(std::mem::size_of::<usize>())];
+    // SAFETY: msghdr and cmsghdr point into the allocated control buffer.
+    unsafe {
+        let mut message: libc::msghdr = std::mem::zeroed();
+        let mut iovec = libc::iovec {
+            iov_base: payload.as_ptr() as *mut libc::c_void,
+            iov_len: payload.len(),
+        };
+        message.msg_iov = &mut iovec;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = control_bytes;
+        let header = libc::CMSG_FIRSTHDR(&message);
+        if header.is_null() {
+            return Err("cannot allocate worker pipe descriptor message".to_string());
+        }
+        (*header).cmsg_level = libc::SOL_SOCKET;
+        (*header).cmsg_type = libc::SCM_RIGHTS;
+        (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(fds) as u32) as usize;
+        std::ptr::copy_nonoverlapping(
+            fds.as_ptr().cast::<u8>(),
+            libc::CMSG_DATA(header),
+            std::mem::size_of_val(fds),
+        );
+        let sent = libc::sendmsg(stream.as_raw_fd(), &message, 0);
+        if sent != payload.len() as isize {
+            return Err(format!(
+                "cannot transfer worker pipe descriptors: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn receive_worker_pipe_fds(
+    stream: &std::os::unix::net::UnixStream,
+    expected: usize,
+) -> Result<Vec<i32>, String> {
+    use std::os::fd::AsRawFd;
+    let control_bytes =
+        unsafe { libc::CMSG_SPACE((expected * std::mem::size_of::<i32>()) as u32) as usize };
+    let mut control = vec![0usize; control_bytes.div_ceil(std::mem::size_of::<usize>())];
+    let mut payload = [0u8; 1];
+    // SAFETY: msghdr and cmsghdr point into the allocated control buffer.
+    let (received, fds) = unsafe {
+        let mut message: libc::msghdr = std::mem::zeroed();
+        let mut iovec = libc::iovec {
+            iov_base: payload.as_mut_ptr().cast(),
+            iov_len: payload.len(),
+        };
+        message.msg_iov = &mut iovec;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = control_bytes;
+        let received = libc::recvmsg(stream.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC);
+        if received != payload.len() as isize || payload[0] != 0x57 {
+            return Err(format!(
+                "cannot receive worker pipe descriptors: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let header = libc::CMSG_FIRSTHDR(&message);
+        if header.is_null()
+            || (*header).cmsg_level != libc::SOL_SOCKET
+            || (*header).cmsg_type != libc::SCM_RIGHTS
+        {
+            return Err("worker did not send pipe descriptors".to_string());
+        }
+        let payload_bytes = (*header)
+            .cmsg_len
+            .saturating_sub(libc::CMSG_LEN(0) as usize);
+        let count = payload_bytes / std::mem::size_of::<i32>();
+        let data = libc::CMSG_DATA(header).cast::<i32>();
+        let fds = std::slice::from_raw_parts(data, count).to_vec();
+        (received, fds)
+    };
+    let _ = received;
+    if fds.len() != expected {
+        for fd in fds {
+            unsafe { close(fd) };
+        }
+        return Err("worker pipe descriptor count does not match request".to_string());
+    }
+    Ok(fds)
+}
+
+pub(super) fn restore_worker_native_fs(
+    process: &NativeProcessContext,
+    request_path: &std::path::Path,
+) -> Result<(), String> {
+    let request: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(request_path)
+            .map_err(|error| format!("cannot read worker request: {error}"))?,
+    )
+    .map_err(|error| format!("invalid worker request: {error}"))?;
+    let encoded = request
+        .get("native_fs")
+        .ok_or_else(|| "worker request has no native filesystem state".to_string())?;
+    let mut fs = process
+        .fs
+        .lock()
+        .map_err(|_| "worker filesystem lock is poisoned".to_string())?;
+    apply_worker_native_fs(&mut fs, encoded)?;
+    drop(fs);
+    restore_worker_pipe_handles(process, &request)
+}
+
+fn restore_worker_pipe_handles(
+    process: &NativeProcessContext,
+    request: &serde_json::Value,
+) -> Result<(), String> {
+    let Some(items) = request
+        .get("inherited_pipes")
+        .and_then(serde_json::Value::as_array)
+        .filter(|items| !items.is_empty())
+    else {
+        return Ok(());
+    };
+    struct PipeInfo {
+        handle: u64,
+        name: String,
+        server: bool,
+        endpoint_access: u32,
+        overlapped: bool,
+        inheritable: bool,
+        access: u32,
+        mode: u32,
+        completion_modes: u8,
+    }
+    let number = |value: &serde_json::Value, key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| format!("invalid inherited pipe field {key}"))
+    };
+    let infos = items
+        .iter()
+        .map(|item| {
+            Ok::<_, String>(PipeInfo {
+                handle: number(item, "handle")?,
+                name: item
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or("inherited pipe has invalid name")?
+                    .to_owned(),
+                server: item
+                    .get("server")
+                    .and_then(serde_json::Value::as_bool)
+                    .ok_or("inherited pipe has invalid endpoint role")?,
+                endpoint_access: number(item, "endpoint_access")? as u32,
+                overlapped: item
+                    .get("overlapped")
+                    .and_then(serde_json::Value::as_bool)
+                    .ok_or("inherited pipe has invalid overlapped flag")?,
+                inheritable: item
+                    .get("inheritable")
+                    .and_then(serde_json::Value::as_bool)
+                    .ok_or("inherited pipe has invalid inheritability")?,
+                access: number(item, "access")? as u32,
+                mode: number(item, "mode")? as u32,
+                completion_modes: number(item, "completion_modes")? as u8,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let fds = std::env::var("WINCLI_NATIVE_PIPE_FDS")
+        .map_err(|_| "worker did not receive inherited pipe descriptors".to_string())?
+        .split(',')
+        .map(|value| value.parse::<i32>().map_err(|error| error.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    if fds.len() != infos.len() {
+        for fd in fds {
+            unsafe { close(fd) };
+        }
+        return Err("inherited pipe descriptor count does not match request".to_string());
+    }
+    let mut pipes = process
+        .named_pipes
+        .lock()
+        .map_err(|_| "worker pipe table is poisoned".to_string())?;
+    for (info, fd) in infos.into_iter().zip(fds) {
+        let endpoint = Arc::new(NativePipeEndpoint {
+            fd,
+            name: info.name,
+            server: info.server,
+            access: info.endpoint_access,
+        });
+        pipes.handles.insert(
+            info.handle,
+            NativePipeHandle {
+                endpoint,
+                pending_client: None,
+                overlapped: info.overlapped,
+                inheritable: info.inheritable,
+                access: info.access,
+                mode: info.mode,
+                completion: None,
+                completion_modes: info.completion_modes,
+            },
+        );
+        pipes.next = pipes.next.max(info.handle.saturating_add(1));
+    }
+    Ok(())
+}
+
+fn apply_worker_native_fs(fs: &mut NativeFs, encoded: &serde_json::Value) -> Result<(), String> {
+    let number = |value: &serde_json::Value, key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| format!("invalid worker filesystem field {key}"))
+    };
+    let files = encoded
+        .get("files")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("worker filesystem has invalid files")?;
+    for item in files {
+        let handle = number(item, "handle")?;
+        let path = item
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("worker file handle has invalid path")?
+            .to_owned();
+        let offset = number(item, "offset")? as usize;
+        let overlapped = item
+            .get("overlapped")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or("worker file handle has invalid overlapped flag")?;
+        fs.handles.insert(
+            handle,
+            NativeFile {
+                path,
+                offset,
+                overlapped,
+                completion: None,
+            },
+        );
+    }
+    let devices = encoded
+        .get("devices")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("worker filesystem has invalid devices")?;
+    for item in devices {
+        let handle = number(item, "handle")?;
+        let device = item
+            .get("device")
+            .ok_or("worker device handle has no device data")?;
+        let kind = device
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("worker device has invalid kind")?;
+        let device = match kind {
+            "null" => NativeDevice::Null,
+            "console" => NativeDevice::Console {
+                input: number(device, "input")?,
+                output: number(device, "output")?,
+            },
+            "console_in" => NativeDevice::ConsoleIn(number(device, "input")?),
+            "console_out" => NativeDevice::ConsoleOut(number(device, "output")?),
+            _ => return Err(format!("unknown worker device kind {kind}")),
+        };
+        fs.devices.insert(handle, device);
+    }
+    macro_rules! restore_map {
+        ($field:ident, $ty:ty) => {
+            fs.$field = serde_json::from_value::<HashMap<u64, $ty>>(
+                encoded
+                    .get(stringify!($field))
+                    .cloned()
+                    .ok_or_else(|| format!("worker filesystem has no {}", stringify!($field)))?,
+            )
+            .map_err(|error| format!("invalid worker {}: {error}", stringify!($field)))?;
+        };
+    }
+    restore_map!(file_access, u32);
+    restore_map!(file_shares, u32);
+    restore_map!(file_completion_modes, u8);
+    let finds = encoded
+        .get("finds")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("worker filesystem has invalid find handles")?;
+    for item in finds {
+        let handle = number(item, "handle")?;
+        let names = serde_json::from_value(
+            item.get("names")
+                .cloned()
+                .ok_or("worker find handle has no names")?,
+        )
+        .map_err(|error| format!("invalid worker find names: {error}"))?;
+        let index = number(item, "index")? as usize;
+        fs.finds.insert(handle, NativeFind { names, index });
+    }
+    fs.delete_on_close = serde_json::from_value(
+        encoded
+            .get("delete_on_close")
+            .cloned()
+            .ok_or("worker filesystem has no delete-on-close handles")?,
+    )
+    .map_err(|error| format!("invalid worker delete-on-close handles: {error}"))?;
+    fs.file_locks = serde_json::from_value(
+        encoded
+            .get("file_locks")
+            .cloned()
+            .ok_or("worker filesystem has no file locks")?,
+    )
+    .map_err(|error| format!("invalid worker file locks: {error}"))?;
+    fs.next = number(encoded, "next")?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod worker_native_fs_tests {
+    use super::*;
+
+    fn empty_fs() -> NativeFs {
+        NativeFs {
+            fs: WinFs::ephemeral_runner(),
+            handles: HashMap::new(),
+            devices: HashMap::new(),
+            file_access: HashMap::new(),
+            file_shares: HashMap::new(),
+            finds: HashMap::new(),
+            file_completion_modes: HashMap::new(),
+            delete_on_close: std::collections::HashSet::new(),
+            file_locks: Vec::new(),
+            next: 0x100,
+        }
+    }
+
+    #[test]
+    fn worker_native_fs_roundtrip_preserves_open_file_state() {
+        let mut original = empty_fs();
+        original.handles.insert(
+            0x123,
+            NativeFile {
+                path: r"C:\data.txt".to_string(),
+                offset: 17,
+                overlapped: true,
+                completion: None,
+            },
+        );
+        original.file_access.insert(0x123, 0x8000_0000);
+        original.file_shares.insert(0x123, 3);
+        original.file_completion_modes.insert(0x123, 1);
+        original.devices.insert(0x125, NativeDevice::Null);
+        original.finds.insert(
+            0x124,
+            NativeFind {
+                names: vec!["one.txt".to_string(), "two.txt".to_string()],
+                index: 1,
+            },
+        );
+        original.delete_on_close.insert(0x123);
+        original
+            .file_locks
+            .push((r"C:\data.txt".to_string(), 4, 8, 0x123));
+        original.next = 0x125;
+
+        let encoded = encode_worker_native_fs(&original).unwrap();
+        let mut restored = empty_fs();
+        apply_worker_native_fs(&mut restored, &encoded).unwrap();
+
+        let file = restored.handles.get(&0x123).unwrap();
+        assert_eq!(file.path, r"C:\data.txt");
+        assert_eq!(file.offset, 17);
+        assert!(file.overlapped);
+        assert_eq!(restored.file_access.get(&0x123), Some(&0x8000_0000));
+        assert_eq!(restored.file_shares.get(&0x123), Some(&3));
+        assert_eq!(restored.file_completion_modes.get(&0x123), Some(&1));
+        assert_eq!(restored.devices.get(&0x125), Some(&NativeDevice::Null));
+        assert_eq!(restored.finds.get(&0x124).unwrap().index, 1);
+        assert!(restored.delete_on_close.contains(&0x123));
+        assert_eq!(restored.file_locks, original.file_locks);
+        assert_eq!(restored.next, 0x125);
+    }
+
+    #[test]
+    fn worker_native_fs_rejects_completion_port_handles() {
+        let mut original = empty_fs();
+        original.handles.insert(
+            0x123,
+            NativeFile {
+                path: r"C:\data.txt".to_string(),
+                offset: 0,
+                overlapped: true,
+                completion: Some((
+                    Arc::new(NativeCompletionPort {
+                        queue: Mutex::new(std::collections::VecDeque::new()),
+                        ready: Condvar::new(),
+                    }),
+                    0,
+                )),
+            },
+        );
+        assert!(encode_worker_native_fs(&original).is_err());
+    }
+
+    #[test]
+    fn worker_pipe_transfer_passes_live_file_descriptors() {
+        let mut pipe_fds = [-1; 2];
+        assert_eq!(unsafe { pipe(pipe_fds.as_mut_ptr()) }, 0);
+        let (sender, receiver) = std::os::unix::net::UnixStream::pair().unwrap();
+        let sender_thread = std::thread::spawn(move || {
+            send_worker_pipe_fds(&sender, &[pipe_fds[1]]).unwrap();
+            unsafe { close(pipe_fds[1]) };
+        });
+        let received = receive_worker_pipe_fds(&receiver, 1).unwrap();
+        sender_thread.join().unwrap();
+        let byte = [b'x'];
+        assert_eq!(
+            unsafe { write(received[0], byte.as_ptr().cast(), byte.len()) },
+            1
+        );
+        let mut read_byte = [0u8];
+        assert_eq!(
+            unsafe { read(pipe_fds[0], read_byte.as_mut_ptr().cast(), 1) },
+            1
+        );
+        assert_eq!(read_byte, byte);
+        unsafe {
+            close(received[0]);
+            close(pipe_fds[0]);
+        }
+    }
+}
+
 fn create_exec_worker_child(
     parent: &Arc<NativeProcessContext>,
     launch: &NativeLaunchSpec,
     image: &PeImage,
-    mut child_fs: WinFs,
+    mut child_fs: NativeFs,
     child_std_handles: [u64; 3],
     inherit_handles: bool,
     environment: &[(String, String)],
     process_information: u64,
 ) -> Result<(), u32> {
+    use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
 
     let executable = std::env::var_os("WINCLI_NATIVE_WORKER_EXE").ok_or(120u32)?;
@@ -864,18 +1352,25 @@ fn create_exec_worker_child(
         .map(|handle| worker_stdio_for_handle(handle, &pipes))
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?;
-    if inherit_handles {
-        let std_handles = child_std_handles
-            .iter()
-            .copied()
-            .collect::<std::collections::HashSet<_>>();
-        if pipes
+    let std_set = child_std_handles
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    let transferable_pipes = if inherit_handles {
+        pipes
             .handles
             .iter()
-            .any(|(handle, pipe)| pipe.inheritable && !std_handles.contains(handle))
-        {
-            return Err(120); // ERROR_CALL_NOT_IMPLEMENTED until non-stdio handles are transferable.
-        }
+            .filter(|(handle, pipe)| pipe.inheritable && !std_set.contains(handle))
+            .map(|(handle, pipe)| (*handle, pipe.clone()))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    if transferable_pipes
+        .iter()
+        .any(|(_, pipe)| pipe.pending_client.is_some() || pipe.completion.is_some())
+    {
+        return Err(120); // ERROR_CALL_NOT_IMPLEMENTED for pending/completion-associated pipe handles.
     }
     drop(pipes);
 
@@ -883,12 +1378,39 @@ fn create_exec_worker_child(
     let directory =
         std::env::temp_dir().join(format!("wincli-child-worker-{}-{id}", std::process::id()));
     std::fs::create_dir(&directory).map_err(|_| 8u32)?;
+    let _ = std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700));
     let directory_guard = ChildWorkerDirectory(directory.clone());
+    let pipe_transfer_path = directory.join("inherited-pipes.sock");
+    let pipe_listener = if transferable_pipes.is_empty() {
+        None
+    } else {
+        Some(std::os::unix::net::UnixListener::bind(&pipe_transfer_path).map_err(|_| 8u32)?)
+    };
+    let inherited_pipe_metadata = transferable_pipes
+        .iter()
+        .map(|(handle, pipe)| {
+            serde_json::json!({
+                "handle": handle,
+                "name": pipe.endpoint.name,
+                "server": pipe.endpoint.server,
+                "endpoint_access": pipe.endpoint.access,
+                "overlapped": pipe.overlapped,
+                "inheritable": pipe.inheritable,
+                "access": pipe.access,
+                "mode": pipe.mode,
+                "completion_modes": pipe.completion_modes,
+            })
+        })
+        .collect::<Vec<_>>();
+    let inherited_pipe_fds = transferable_pipes
+        .iter()
+        .map(|(_, pipe)| pipe.endpoint.fd)
+        .collect::<Vec<_>>();
     let image_path = match super::super::worker::write_image(image, &directory) {
         Ok(path) => path,
         Err(_) => return Err(8),
     };
-    let snapshot_path = match crate::snapshot::save_worker_manifest(&child_fs, &directory) {
+    let snapshot_path = match crate::snapshot::save_worker_manifest(&child_fs.fs, &directory) {
         Ok(path) => path,
         Err(_) => return Err(8),
     };
@@ -900,7 +1422,7 @@ fn create_exec_worker_child(
         .lock()
         .map_err(|_| 6u32)?
         .allocate(parent.process_id);
-    child_fs.clear_changes();
+    child_fs.fs.clear_changes();
     let request = serde_json::json!({
         "image_path": image_path,
         "snapshot_path": snapshot_path,
@@ -911,8 +1433,11 @@ fn create_exec_worker_child(
         "environment": environment,
         "process_id": child.process_id,
         "parent_process_id": parent.process_id,
-        "mounts": child_fs.host_mounts(),
-        "drive_cwds": child_fs.drive_current_directories(),
+        "native_fs": encode_worker_native_fs(&child_fs).map_err(|_| 8u32)?,
+        "inherited_pipes": inherited_pipe_metadata,
+        "pipe_transfer_socket": pipe_listener.as_ref().map(|_| pipe_transfer_path),
+        "mounts": child_fs.fs.host_mounts(),
+        "drive_cwds": child_fs.fs.drive_current_directories(),
         "cwd": launch.current_directory,
     });
     let request_bytes = serde_json::to_vec(&request).map_err(|_| 8u32)?;
@@ -933,6 +1458,21 @@ fn create_exec_worker_child(
             return Err(8);
         }
     };
+    if let Some(listener) = pipe_listener {
+        let (stream, _) = match listener.accept() {
+            Ok(connection) => connection,
+            Err(_) => {
+                let _ = worker.kill();
+                let _ = worker.wait();
+                return Err(8);
+            }
+        };
+        if send_worker_pipe_fds(&stream, &inherited_pipe_fds).is_err() {
+            let _ = worker.kill();
+            let _ = worker.wait();
+            return Err(8);
+        }
+    }
     // Close this process's copies immediately; only the worker should retain
     // the inherited standard pipe endpoints after a successful spawn.
     drop(stdio);
@@ -1130,7 +1670,7 @@ pub(super) extern "win64" fn native_create_process_w(
                 &parent,
                 &launch,
                 &image,
-                child_fs.fs,
+                child_fs,
                 child_std_handles,
                 inherit_handles != 0,
                 &environment,

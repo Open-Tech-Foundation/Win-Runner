@@ -21,7 +21,10 @@ All notable changes to this project will be documented in this file.
 - Started eligible `CreateProcessW` children in fresh exec workers too. The
   worker protocol carries child identity, cwd, environment, WinFS state, and
   inherited standard streams; a real Node 24 nested-process check covers the
-  route. Children with other open WinFS handles still use the fork path.
+  route. Worker requests also preserve open WinFS file-handle offsets and
+  metadata. Connected inherited non-standard pipes cross the worker boundary
+  through Unix descriptor passing. Pending or completion-port-associated pipes
+  still use the fork path.
 - Completed the Linux native backend split: launch/output orchestration, shared
   runtime state, x86-64 assembly, and shared string helpers are in dedicated
   modules; file I/O is divided into open/read, namespace, temporary/metadata,
