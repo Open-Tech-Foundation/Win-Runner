@@ -80,6 +80,9 @@ All notable changes to this project will be documented in this file.
   a Linux backend synchronization module.
 - Grouped single-object waits, event, and semaphore shims with the
   synchronization APIs.
+- Moved thread creation, job-object, process identity, child exit, and
+  termination shims into the Linux process module.
+- Grouped registered wait callbacks with the synchronization APIs.
 - Added the C-locale `msvcrt!mbstowcs` shim used by Nano.
 - Added an optional native Node check proving a relative file that Node leaves
   in WinFS appears in the following shell directory listing.

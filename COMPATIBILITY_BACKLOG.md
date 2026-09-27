@@ -59,9 +59,11 @@ Items remain open until implementation and relevant verification are complete.
   handle maps remain in the backend state. Critical-section, SRW-lock,
   condition-variable, and InitOnce shims now live in a synchronization module;
   single-object wait, event, and semaphore shims have now joined them. Remaining
-  process waits and waitable-object types still use separate state maps; other
-  API groups need splitting by Windows subsystem while host syscalls remain
-  backend-local for macOS.
+  process waits and waitable-object types still use separate state maps. Thread
+  creation, job objects, process identity, child exit, and termination shims now
+  live in the process module alongside launch support. Child lifecycle plumbing
+  and per-process state still need extraction; other API groups need splitting
+  by Windows subsystem while host syscalls remain backend-local for macOS.
 - [x] Cache `WINCLI_NATIVE_DIAGNOSTIC` once rather than reading the environment
   from hot shims; initialize the cache before guest forks.
 - [x] Fix Clippy's unevenly grouped hexadecimal literal warnings. A current

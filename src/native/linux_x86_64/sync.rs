@@ -784,3 +784,129 @@ pub(super) extern "win64" fn native_release_semaphore(
     semaphore.changed.notify_all();
     1
 }
+
+struct NativeWaitCallbackInvocation {
+    callback: u64,
+    context: u64,
+}
+pub(super) extern "win64" fn native_wait_callback_entry(parameter: u64) -> u32 {
+    if parameter == 0 {
+        return 0;
+    }
+    let invocation = unsafe { Box::from_raw(parameter as *mut NativeWaitCallbackInvocation) };
+    let callback: unsafe extern "win64" fn(u64, i32) =
+        unsafe { std::mem::transmute(invocation.callback) };
+    unsafe { callback(invocation.context, 0) };
+    0
+}
+pub(super) extern "win64" fn native_register_wait_for_single_object(
+    output: *mut u64,
+    object: u64,
+    callback: u64,
+    context: u64,
+    milliseconds: u32,
+    flags: u32,
+) -> i32 {
+    if output.is_null() || callback == 0 || milliseconds != u32::MAX || flags & !0x3f != 0 {
+        native_set_last_error(87);
+        return 0;
+    }
+    let Some(process) = process_ctx() else {
+        return 0;
+    };
+    let Some(child) = child_process(&process, object) else {
+        native_set_last_error(6);
+        return 0;
+    };
+    let handle = process.completion_next.fetch_add(1, Ordering::AcqRel);
+    let registration = Arc::new(NativeWaitRegistration {
+        callback,
+        context,
+        child,
+        cancelled: Arc::new(AtomicBool::new(false)),
+        execute_once: flags & 0x8 != 0,
+    });
+    if !process.wait_registrations.lock().is_ok_and(|mut waits| {
+        waits.insert(handle, Arc::clone(&registration));
+        true
+    }) {
+        native_set_last_error(6);
+        return 0;
+    }
+    let worker_process = Arc::clone(&process);
+    if std::thread::Builder::new()
+        .name("wincli-process-wait".into())
+        .spawn(move || {
+            loop {
+                if registration.cancelled.load(Ordering::Acquire) {
+                    break;
+                }
+                let signaled = registration
+                    .child
+                    .state
+                    .lock()
+                    .is_ok_and(|state| state.is_some());
+                if signaled {
+                    let invocation = Box::new(NativeWaitCallbackInvocation {
+                        callback: registration.callback,
+                        context: registration.context,
+                    });
+                    let parameter = Box::into_raw(invocation) as u64;
+                    if native_create_thread(
+                        0,
+                        0,
+                        native_wait_callback_entry as *const () as usize as u64,
+                        parameter,
+                        0,
+                        std::ptr::null_mut(),
+                    ) == 0
+                    {
+                        unsafe {
+                            drop(Box::from_raw(
+                                parameter as *mut NativeWaitCallbackInvocation,
+                            ));
+                        }
+                    }
+                    if registration.execute_once {
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            if registration.execute_once {
+                if let Ok(mut waits) = worker_process.wait_registrations.lock() {
+                    waits.remove(&handle);
+                }
+            }
+        })
+        .is_err()
+    {
+        process
+            .wait_registrations
+            .lock()
+            .ok()
+            .map(|mut waits| waits.remove(&handle));
+        native_set_last_error(8);
+        return 0;
+    }
+    unsafe { output.write(handle) };
+    1
+}
+pub(super) extern "win64" fn native_unregister_wait_ex(wait: u64, completion_event: u64) -> i32 {
+    let registration = process_ctx().and_then(|process| {
+        process
+            .wait_registrations
+            .lock()
+            .ok()
+            .and_then(|mut waits| waits.remove(&wait))
+    });
+    let Some(registration) = registration else {
+        native_set_last_error(6);
+        return 0;
+    };
+    registration.cancelled.store(true, Ordering::Release);
+    if completion_event != 0 && completion_event != u64::MAX {
+        let _ = native_set_event(completion_event);
+    }
+    1
+}

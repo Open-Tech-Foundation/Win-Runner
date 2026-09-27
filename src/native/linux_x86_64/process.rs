@@ -367,3 +367,320 @@ pub(super) fn load_native_child_image(
         193u32
     }) // ERROR_BAD_EXE_FORMAT
 }
+
+pub(super) extern "win64" fn native_create_thread(
+    _security: u64,
+    stack_size: usize,
+    start: u64,
+    parameter: u64,
+    flags: u32,
+    thread_id: *mut u32,
+) -> u64 {
+    if start == 0 {
+        native_set_last_error(87);
+        return 0;
+    }
+    let Some(process) = process_ctx() else {
+        native_set_last_error(6);
+        return 0;
+    };
+    let tls = process
+        .tls_template
+        .lock()
+        .ok()
+        .and_then(|value| value.as_ref().map(NativeTls::clone_for_thread));
+    let handle = process.thread_next.fetch_add(1, Ordering::AcqRel);
+    // Windows CreateThread uses the image's default stack when callers
+    // pass zero. Node's libuv worker pool does this, and small host thread
+    // defaults are too small for its nested module loading / async work.
+    let builder = std::thread::Builder::new().stack_size(stack_size.max(4 * 1024 * 1024));
+    let thread_process = Arc::clone(&process);
+    let suspension = Arc::new((Mutex::new((flags & 4 != 0) as u32), Condvar::new()));
+    let thread_suspension = Arc::clone(&suspension);
+    let spawned = builder.spawn(move || {
+        THREAD_NATIVE_HANDLE.set(handle);
+        THREAD_NATIVE_PROCESS.with(|active| {
+            *active.borrow_mut() = Some(Arc::clone(&thread_process));
+        });
+        let (count, ready) = &*thread_suspension;
+        let Ok(mut count) = count.lock() else {
+            return 1;
+        };
+        while *count != 0 {
+            count = match ready.wait(count) {
+                Ok(count) => count,
+                Err(_) => return 1,
+            };
+        }
+        drop(count);
+        let mut _tls = tls;
+        if let Some(tls) = _tls.as_mut() {
+            set_teb_stack_bounds(&mut tls.teb);
+            if !unsafe { set_gs(tls.teb.as_ptr() as u64) } {
+                return 1;
+            }
+            THREAD_TEB_BASE.set(tls.teb.as_ptr() as u64);
+        } else if thread_process.gs_base.load(Ordering::Acquire) != 0 {
+            return 1;
+        }
+        let entry: unsafe extern "win64" fn(u64) -> u32 = unsafe { std::mem::transmute(start) };
+        unsafe { entry(parameter) }
+    });
+    let Ok(join) = spawned else {
+        native_set_last_error(8);
+        return 0;
+    };
+    if !thread_id.is_null() {
+        unsafe { thread_id.write(handle as u32) }
+    }
+    let result = match process.threads.lock() {
+        Ok(mut threads) => {
+            threads.insert(
+                handle,
+                NativeThread {
+                    join: Some(join),
+                    exit_code: None,
+                    suspension,
+                },
+            );
+            handle
+        }
+        Err(_) => {
+            native_set_last_error(6);
+            0
+        }
+    };
+    if native_diagnostic_enabled() {
+        eprintln!("native CreateThread start={start:#x} handle={result:#x}");
+    }
+    result
+}
+pub(super) extern "win64" fn native_resume_thread(handle: u64) -> u32 {
+    let Some(suspension) = process_ctx().and_then(|process| {
+        process.threads.lock().ok().and_then(|threads| {
+            threads
+                .get(&handle)
+                .map(|thread| Arc::clone(&thread.suspension))
+        })
+    }) else {
+        native_set_last_error(6);
+        return u32::MAX;
+    };
+    let (count, ready) = &*suspension;
+    let Ok(mut count) = count.lock() else {
+        return u32::MAX;
+    };
+    let previous = *count;
+    if *count > 0 {
+        *count -= 1;
+        if *count == 0 {
+            ready.notify_one();
+        }
+    }
+    previous
+}
+
+pub(super) extern "win64" fn native_create_job_object_w(_attributes: u64, name: *const u16) -> u64 {
+    if !name.is_null() {
+        native_set_last_error(50); // Named kernel objects are not mounted in this process.
+        return 0;
+    }
+    let Some(process) = process_ctx() else {
+        return 0;
+    };
+    let handle = process.completion_next.fetch_add(1, Ordering::AcqRel);
+    if process.job_objects.lock().is_ok_and(|mut jobs| {
+        jobs.insert(
+            handle,
+            NativeJobObject {
+                limit_flags: 0,
+                members: std::collections::HashSet::new(),
+            },
+        );
+        true
+    }) {
+        handle
+    } else {
+        0
+    }
+}
+pub(super) extern "win64" fn native_create_job_object_a(attributes: u64, name: *const u8) -> u64 {
+    if !name.is_null() {
+        native_set_last_error(50);
+        return 0;
+    }
+    native_create_job_object_w(attributes, std::ptr::null())
+}
+pub(super) extern "win64" fn native_set_information_job_object(
+    job: u64,
+    information_class: i32,
+    information: *const u8,
+    length: u32,
+) -> i32 {
+    if information.is_null() || information_class != 9 || length < 144 {
+        native_set_last_error(87);
+        return 0;
+    }
+    let flags = unsafe { ((information as usize + 24) as *const u32).read_unaligned() };
+    let Some(process) = process_ctx() else {
+        return 0;
+    };
+    let Some(_) = process.job_objects.lock().ok().and_then(|mut jobs| {
+        jobs.get_mut(&job).map(|job| {
+            job.limit_flags = flags;
+        })
+    }) else {
+        native_set_last_error(6);
+        return 0;
+    };
+    1
+}
+pub(super) extern "win64" fn native_assign_process_to_job_object(
+    job: u64,
+    process_handle: u64,
+) -> i32 {
+    let Some(process) = process_ctx() else {
+        return 0;
+    };
+    let is_child = process
+        .children
+        .lock()
+        .is_ok_and(|children| children.children.contains_key(&process_handle));
+    let is_current_process =
+        process_handle == PROCESS_TOKEN_HANDLE || process_handle == process.process_handle;
+    if !is_child && !is_current_process {
+        native_set_last_error(6);
+        return 0;
+    }
+    if process.job_objects.lock().is_ok_and(|mut jobs| {
+        jobs.get_mut(&job)
+            .is_some_and(|job| job.members.insert(process_handle))
+    }) {
+        1
+    } else {
+        native_set_last_error(6);
+        0
+    }
+}
+pub(super) extern "win64" fn native_terminate_job_object(job: u64, exit_code: u32) -> i32 {
+    let Some(process) = process_ctx() else {
+        return 0;
+    };
+    let members = process.job_objects.lock().ok().and_then(|jobs| {
+        jobs.get(&job)
+            .map(|job| job.members.iter().copied().collect::<Vec<_>>())
+    });
+    let Some(members) = members else {
+        native_set_last_error(6);
+        return 0;
+    };
+    for member in members {
+        native_terminate_process(member, exit_code);
+    }
+    1
+}
+
+pub(super) extern "win64" fn native_get_current_thread_id() -> u32 {
+    THREAD_NATIVE_HANDLE.with(|handle| (handle.get() as u32).max(1))
+}
+pub(super) extern "win64" fn native_get_current_process_id() -> u32 {
+    process_ctx()
+        .map(|process| {
+            debug_assert!(process.parent_process_id <= process.process_id);
+            process.process_id
+        })
+        .unwrap_or(0)
+}
+pub(super) extern "win64" fn native_get_current_process() -> u64 {
+    process_ctx()
+        .map(|process| process.process_handle)
+        .unwrap_or(u64::MAX)
+}
+
+pub(super) fn child_process(
+    process: &NativeProcessContext,
+    handle: u64,
+) -> Option<Arc<NativeChildProcess>> {
+    let table = process.children.lock().ok()?;
+    table
+        .children
+        .get(&handle)
+        .or_else(|| table.primary_threads.get(&handle))
+        .cloned()
+}
+
+pub(super) extern "win64" fn native_get_exit_code_process(handle: u64, code: *mut u32) -> i32 {
+    if code.is_null() {
+        native_set_last_error(87); // ERROR_INVALID_PARAMETER
+        return 0;
+    }
+    let Some(process) = process_ctx() else {
+        native_set_last_error(6); // ERROR_INVALID_HANDLE
+        return 0;
+    };
+    if handle == process.process_handle {
+        let exit_code = if process.exited.load(Ordering::Acquire) {
+            process.exit_status.load(Ordering::Acquire)
+        } else {
+            259 // STILL_ACTIVE
+        };
+        unsafe { code.write(exit_code) };
+        return 1;
+    }
+    let Some(child) = child_process(&process, handle) else {
+        native_set_last_error(6); // ERROR_INVALID_HANDLE
+        return 0;
+    };
+    let exit_code = child
+        .state
+        .lock()
+        .ok()
+        .and_then(|state| *state)
+        .unwrap_or(259);
+    unsafe { code.write(exit_code) };
+    1
+}
+pub(super) extern "win64" fn native_terminate_process(handle: u64, code: u32) -> i32 {
+    let Some(process) = process_ctx() else {
+        native_set_last_error(6); // ERROR_INVALID_HANDLE
+        return 0;
+    };
+    if handle == process.process_handle {
+        process.exit_status.store(code, Ordering::Release);
+        process.exited.store(true, Ordering::Release);
+        native_exit_process(code)
+    }
+    let Some(child) = child_process(&process, handle) else {
+        native_set_last_error(6); // ERROR_INVALID_HANDLE
+        return 0;
+    };
+    let host_pid = child.host_pid.load(Ordering::Acquire);
+    if host_pid > 0 {
+        // SIGTERM is the host-side equivalent of terminating a guest
+        // child. The monitor reaps it and publishes completion to
+        // WaitForSingleObject/GetExitCodeProcess.
+        if let Ok(mut termination_code) = child.termination_code.lock() {
+            *termination_code = Some(code);
+        } else {
+            native_set_last_error(6);
+            return 0;
+        }
+        if unsafe { kill(host_pid, 15) } == 0 {
+            return 1;
+        }
+        native_set_last_error(6);
+        return 0;
+    }
+    let Ok(mut state) = child.state.lock() else {
+        native_set_last_error(6);
+        return 0;
+    };
+    if state.is_none() {
+        *state = Some(code);
+        child.exited.notify_all();
+    }
+    1
+}
+pub(super) extern "win64" fn native_get_current_thread() -> u64 {
+    u64::MAX - 1
+}
