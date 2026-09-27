@@ -2741,7 +2741,7 @@ mod imp {
                 .fs
                 .write_file(path, b"delete-on-close".to_vec())
                 .unwrap();
-            let handle = super::native_create_file_w(wide.as_ptr(), 0x0001_0000, 7, 3, 0, 0, 0);
+            let handle = super::native_create_file_w(wide.as_ptr(), 0x0001_0000, 7, 0, 3, 0, 0);
             assert_ne!(handle, u64::MAX);
 
             let disposition = [1u8]; // FILE_DISPOSITION_INFO.DeleteFile
@@ -3094,7 +3094,7 @@ mod imp {
                 0
             );
             let handle =
-                super::native_create_file_w(link_wide.as_ptr(), 0x8000_0000, 7, 3, 0, 0, 0);
+                super::native_create_file_w(link_wide.as_ptr(), 0x8000_0000, 7, 0, 3, 0, 0);
             assert_ne!(handle, u64::MAX);
             let mut bytes = [0u8; 14];
             let mut read = 0;
@@ -3181,7 +3181,7 @@ mod imp {
         }
 
         #[test]
-        fn modern_set_end_of_file_truncates_at_the_current_pointer() {
+        fn modern_set_end_of_file_truncates_and_extends_at_the_current_pointer() {
             type SetEndOfFile = unsafe extern "win64" fn(u64) -> i32;
             let set_end_of_file: SetEndOfFile =
                 unsafe { std::mem::transmute(require_kernel32_api(b"SetEndOfFile\0") as usize) };
@@ -3194,7 +3194,7 @@ mod imp {
                 .fs
                 .write_file(path, b"truncate-here".to_vec())
                 .unwrap();
-            let handle = super::native_create_file_w(wide.as_ptr(), 0xC000_0000, 7, 3, 0, 0, 0);
+            let handle = super::native_create_file_w(wide.as_ptr(), 0xC000_0000, 7, 0, 3, 0, 0);
             assert_ne!(handle, u64::MAX);
             let offset = 8i64;
             assert_eq!(
@@ -3207,8 +3207,29 @@ mod imp {
                 context.lock().unwrap().fs.read_file(path).unwrap(),
                 b"truncate"
             );
+
+            let extended_offset = 12i64;
+            assert_eq!(
+                super::native_set_file_pointer_ex(handle, extended_offset, std::ptr::null_mut(), 0),
+                1
+            );
+            assert_eq!(unsafe { set_end_of_file(handle) }, 1);
+            assert_eq!(
+                context.lock().unwrap().fs.read_file(path).unwrap(),
+                b"truncate\0\0\0\0"
+            );
             assert_eq!(super::native_close_handle(handle), 1);
             context.lock().unwrap().fs.delete_file(path).unwrap();
+        }
+
+        #[test]
+        fn modern_set_end_of_file_rejects_invalid_handle() {
+            type SetEndOfFile = unsafe extern "win64" fn(u64) -> i32;
+            let set_end_of_file: SetEndOfFile =
+                unsafe { std::mem::transmute(require_kernel32_api(b"SetEndOfFile\0") as usize) };
+
+            assert_eq!(unsafe { set_end_of_file(u64::MAX) }, 0);
+            assert_eq!(super::native_get_last_error(), 6); // ERROR_INVALID_HANDLE
         }
 
         #[test]
@@ -3226,7 +3247,7 @@ mod imp {
                 .fs
                 .write_file(path, b"before-flush".to_vec())
                 .unwrap();
-            let handle = super::native_create_file_w(wide.as_ptr(), 0xC000_0000, 7, 3, 0, 0, 0);
+            let handle = super::native_create_file_w(wide.as_ptr(), 0xC000_0000, 7, 0, 3, 0, 0);
             assert_ne!(handle, u64::MAX);
             let replacement = b"after-flush";
             let mut written = 0;
@@ -3535,7 +3556,7 @@ mod imp {
                 0
             );
             let handle =
-                super::native_create_file_w(link_wide.as_ptr(), 0x8000_0000, 7, 3, 0, 0, 0);
+                super::native_create_file_w(link_wide.as_ptr(), 0x8000_0000, 7, 0, 3, 0, 0);
             assert_ne!(handle, u64::MAX);
             let mut bytes = [0u8; 11];
             let mut read = 0;
@@ -3625,7 +3646,7 @@ mod imp {
                 0x0200_0000, // FILE_FLAG_BACKUP_SEMANTICS
                 0,
             );
-            let file = super::native_create_file_w(wide.as_ptr(), 0x8000_0000, 7, 3, 0, 0, 0);
+            let file = super::native_create_file_w(wide.as_ptr(), 0x8000_0000, 7, 0, 3, 0, 0);
             assert_ne!(volume, u64::MAX);
             assert_ne!(file, u64::MAX);
             let mut information = [0u8; 52];
@@ -4154,7 +4175,7 @@ mod imp {
                 .write_file(source, b"rename-by-handle".to_vec())
                 .unwrap();
             let handle =
-                super::native_create_file_w(source_wide.as_ptr(), 0xC001_0000, 7, 3, 0, 0, 0);
+                super::native_create_file_w(source_wide.as_ptr(), 0xC001_0000, 7, 0, 3, 0, 0);
             assert_ne!(handle, u64::MAX);
 
             let encoded = destination.encode_utf16().collect::<Vec<_>>();

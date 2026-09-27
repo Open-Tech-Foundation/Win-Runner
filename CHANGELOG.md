@@ -40,6 +40,9 @@ All notable changes to this project will be documented in this file.
   `CopyFile2`/`CopyFileExW`, stream enumeration, and handle-based deletion.
 - Added behavior fixtures for symbolic and hard links, ANSI attributes and
   enumeration, `SetEndOfFile`, buffer flushing, and extended overlapped results.
+- Extended `SetEndOfFile` coverage to verify truncation, zero-filled extension,
+  and invalid-handle errors; corrected handle setup in several pending API
+  behavior fixtures.
 - Added ANSI temporary-file and symbolic-link cases, all reference
   `FindFirstFileExA` option combinations, and invalid-input checks for
   `OpenFileById` and `SetFileValidData`.
