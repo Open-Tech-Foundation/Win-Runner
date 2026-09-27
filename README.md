@@ -82,3 +82,7 @@ Win-Runner implements Windows APIs needed by supported programs incrementally; u
 Run the test suite with `cargo test --offline`; native changes should also be exercised with real Windows binaries or E2E fixtures.
 
 See [CHANGELOG.md](CHANGELOG.md) for release notes and [COMPATIBILITY_BACKLOG.md](COMPATIBILITY_BACKLOG.md) for tracked compatibility work.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE); see [NOTICE](NOTICE).

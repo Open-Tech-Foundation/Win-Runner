@@ -6,6 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Added an Apache 2.0 `NOTICE` file and linked it from the README.
 - Added `--save` to write changes back to the loaded snapshot on exit, without
   repeating the snapshot path.
 - Simplified the README, aligned its opening with the organization project format,
