@@ -117,6 +117,11 @@ All notable changes to this project will be documented in this file.
   pipe writes, and `WriteFile` with the existing file I/O APIs.
 - Moved the in-memory Windows registry and `LocalFree` APIs into the registry
   module beside import registration and trampoline dispatch.
+- Grouped dynamic library and module lookup APIs with the Linux PE loader, and
+  command-line, startup, and per-thread exit APIs with process support.
+- Moved ordinal locale comparison and locale-information APIs into the locale
+  module, network byte-order helpers into Winsock, and named-pipe state APIs
+  into file I/O.
 - Added the C-locale `msvcrt!mbstowcs` shim used by Nano.
 - Added an optional native Node check proving a relative file that Node leaves
   in WinFS appears in the following shell directory listing.

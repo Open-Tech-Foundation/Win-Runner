@@ -1089,3 +1089,78 @@ pub(super) fn native_flush_instance_state() {
     unsafe { close(fd as i32) };
     process.state_fd.store(u32::MAX, Ordering::Release);
 }
+
+pub(super) extern "win64" fn native_get_command_line_w() -> u64 {
+    process_ctx()
+        .map(|process| process.command_line_w.as_ptr() as u64)
+        .unwrap_or(0)
+}
+pub(super) extern "win64" fn native_get_command_line_a() -> u64 {
+    process_ctx()
+        .map(|process| process.command_line_a.as_ptr() as u64)
+        .unwrap_or(0)
+}
+
+pub(super) extern "win64" fn native_get_module_file_name_w(
+    _module: u64,
+    output: *mut u16,
+    output_len: u32,
+) -> u32 {
+    if output.is_null() || output_len == 0 {
+        return 0;
+    }
+    let module_path = process_ctx()
+        .map(|process| process.module_path.clone())
+        .unwrap_or_else(|| r"C:\wincli\wincli.exe".to_string());
+    let encoded: Vec<u16> = module_path.encode_utf16().collect();
+    let capacity = output_len as usize;
+    let copied = encoded.len().min(capacity);
+    unsafe { std::ptr::copy_nonoverlapping(encoded.as_ptr(), output, copied) };
+    if copied < capacity {
+        unsafe { output.add(copied).write(0) };
+    }
+    copied as u32
+}
+
+pub(super) extern "win64" fn native_set_error_mode(mode: u32) -> u32 {
+    process_ctx()
+        .map(|process| process.error_mode.swap(mode, Ordering::AcqRel))
+        .unwrap_or(0)
+}
+pub(super) extern "win64" fn native_get_startup_info_w(startup_info: *mut u8) {
+    if startup_info.is_null() {
+        return;
+    }
+    // STARTUPINFOW is 104 bytes on 64-bit Windows. The native runner has
+    // no inherited Windows handles, so a zeroed record is the appropriate
+    // console-process baseline.
+    unsafe {
+        std::ptr::write_bytes(startup_info, 0, 104);
+        (startup_info as *mut u32).write_unaligned(104);
+    }
+}
+
+pub(super) extern "win64" fn native_get_startup_info_a(startup_info: *mut u8) {
+    // STARTUPINFOA and STARTUPINFOW have the same 64-bit layout; the
+    // zeroed console-process baseline contains no character fields.
+    native_get_startup_info_w(startup_info);
+}
+
+pub(super) extern "win64" fn native_free_library_and_exit_thread(_module: u64, _code: u32) -> ! {
+    if native_diagnostic_enabled() {
+        eprintln!("native FreeLibraryAndExitThread");
+    }
+    let handle = THREAD_NATIVE_HANDLE.get();
+    if let Some(process) = process_ctx() {
+        if let Ok(mut threads) = process.threads.lock() {
+            if let Some(thread) = threads.get_mut(&handle) {
+                thread.exit_code = Some(_code);
+            }
+        }
+    }
+    // SYS_exit terminates only this Linux thread. pthread_exit would
+    // force-unwind across PE and Rust frames and abort the guest process.
+    unsafe {
+        core::arch::asm!("syscall", in("rax") 60u64, in("rdi") _code as u64, options(noreturn))
+    }
+}

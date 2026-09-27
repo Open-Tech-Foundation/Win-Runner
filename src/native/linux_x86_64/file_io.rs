@@ -3036,3 +3036,317 @@ pub(super) extern "win64" fn native_write_file(
     }
     1
 }
+
+pub(super) extern "win64" fn native_set_named_pipe_handle_state(
+    handle: u64,
+    mode: *const u32,
+    _max_collection_count: *const u32,
+    _collect_data_timeout: *const u32,
+) -> i32 {
+    if host_standard_fd(handle).is_some_and(|fd| unsafe { isatty(fd) } == 0)
+        && (mode.is_null() || unsafe { mode.read() } & !0x3 == 0)
+    {
+        return 1;
+    }
+    if let Some(process) = process_ctx() {
+        if let Ok(mut pipes) = process.named_pipes.lock() {
+            if let Some(pipe) = pipes.handles.get_mut(&handle) {
+                if mode.is_null() {
+                    return 1;
+                }
+                let mode = unsafe { mode.read() };
+                if mode & !0x3 != 0 {
+                    native_set_last_error(87);
+                    return 0;
+                }
+                pipe.mode = mode;
+                return 1;
+            }
+        }
+    }
+    native_set_last_error(6);
+    0
+}
+pub(super) extern "win64" fn native_get_named_pipe_handle_state_w(
+    handle: u64,
+    mode: *mut u32,
+    current_instances: *mut u32,
+    _max_collection_count: *mut u32,
+    _collect_data_timeout: *mut u32,
+    _user_name: *mut u16,
+    _max_user_name_size: u32,
+) -> i32 {
+    if host_standard_fd(handle).is_some_and(|fd| unsafe { isatty(fd) } == 0) {
+        if !mode.is_null() {
+            unsafe { mode.write(0) };
+        }
+        if !current_instances.is_null() {
+            unsafe { current_instances.write(1) };
+        }
+        return 1;
+    }
+    let Some(pipe) = process_ctx().and_then(|process| {
+        process
+            .named_pipes
+            .lock()
+            .ok()
+            .and_then(|pipes| pipes.handles.get(&handle).cloned())
+    }) else {
+        native_set_last_error(6);
+        return 0;
+    };
+    if !mode.is_null() {
+        unsafe { mode.write(pipe.mode) };
+    }
+    1
+}
+pub(super) extern "win64" fn native_get_named_pipe_handle_state_a(
+    handle: u64,
+    mode: *mut u32,
+    current_instances: *mut u32,
+    max_collection_count: *mut u32,
+    collect_data_timeout: *mut u32,
+    user_name: *mut u8,
+    max_user_name_size: u32,
+) -> i32 {
+    if !user_name.is_null() && max_user_name_size != 0 {
+        native_set_last_error(50); // ERROR_NOT_SUPPORTED: client identity is not modeled.
+        return 0;
+    }
+    native_get_named_pipe_handle_state_w(
+        handle,
+        mode,
+        current_instances,
+        max_collection_count,
+        collect_data_timeout,
+        std::ptr::null_mut(),
+        0,
+    )
+}
+
+#[cfg(test)]
+mod named_pipe_tests {
+    use super::*;
+
+    fn wide(value: &str) -> Vec<u16> {
+        value.encode_utf16().chain([0]).collect()
+    }
+
+    fn server(name: &str, open_mode: u32) -> u64 {
+        let path = wide(&format!(r"\\.\pipe\{name}"));
+        native_create_named_pipe_w(
+            path.as_ptr(),
+            open_mode | 0x0004_0000, // WRITE_DAC, as used by libuv
+            0,
+            1,
+            4096,
+            4096,
+            0,
+            0,
+        )
+    }
+
+    fn client(name: &str, access: u32, flags: u32) -> u64 {
+        let path = wide(&format!(r"\\?\pipe\{name}"));
+        native_create_file_w(path.as_ptr(), access, 0, 0, 3, flags, 0)
+    }
+
+    #[test]
+    fn named_pipe_pair_connects_and_transfers_duplex_bytes() {
+        let name = format!("uv\\wincli-unit-{}", std::process::id());
+        let server = server(&name, 3);
+        assert_ne!(server, u64::MAX);
+        let client = client(&name, 0xc000_0000, 0);
+        assert_ne!(client, u64::MAX);
+        assert_eq!(native_connect_named_pipe(server, 0), 0);
+        assert_eq!(native_get_last_error(), 535);
+
+        let payload = b"duplex-pipe";
+        let mut written = 0;
+        assert_eq!(
+            native_write_file(
+                server,
+                payload.as_ptr(),
+                payload.len() as u32,
+                &mut written,
+                0
+            ),
+            1
+        );
+        assert_eq!(written, payload.len() as u32);
+        let mut received = [0u8; 16];
+        let mut read = 0;
+        assert_eq!(
+            native_read_file(
+                client,
+                received.as_mut_ptr(),
+                received.len() as u32,
+                &mut read,
+                0,
+            ),
+            1
+        );
+        assert_eq!(&received[..read as usize], payload);
+        assert_eq!(native_get_file_type(server), 3);
+        assert_eq!(native_close_handle(client), 1);
+        assert_eq!(native_close_handle(server), 1);
+    }
+
+    #[test]
+    fn named_pipe_checks_client_direction_and_supports_overlapped_completion() {
+        let name = format!("uv\\wincli-io-{}", std::process::id());
+        let server = server(&name, 2); // Server writes; client must read.
+        assert_ne!(server, u64::MAX);
+        assert_eq!(client(&name, 0x4000_0000, 0), u64::MAX);
+        assert_eq!(native_get_last_error(), 5);
+        let client = client(&name, 0x8000_0000, 0x4000_0000);
+        assert_ne!(client, u64::MAX);
+        assert_eq!(native_connect_named_pipe(server, 0), 0);
+        assert_eq!(native_get_last_error(), 535);
+
+        let port_handle = native_create_io_completion_port(u64::MAX, 0, 0, 1);
+        assert_ne!(port_handle, 0);
+        assert_eq!(
+            native_create_io_completion_port(client, port_handle, 0x1234, 1),
+            port_handle
+        );
+        assert_eq!(
+            native_set_file_completion_notification_modes(client, 0x3),
+            1
+        );
+        let mut overlapped = [0u64; 4];
+        let mut received = [0u8; 32];
+        assert_eq!(
+            native_read_file(
+                client,
+                received.as_mut_ptr(),
+                received.len() as u32,
+                std::ptr::null_mut(),
+                overlapped.as_mut_ptr() as u64,
+            ),
+            0
+        );
+        assert_eq!(native_get_last_error(), 997);
+        let payload = b"async-pipe";
+        let mut written = 0;
+        assert_eq!(
+            native_write_file(
+                server,
+                payload.as_ptr(),
+                payload.len() as u32,
+                &mut written,
+                0
+            ),
+            1
+        );
+        let process = process_ctx().unwrap();
+        let port = process
+            .completion_ports
+            .lock()
+            .unwrap()
+            .get(&port_handle)
+            .unwrap()
+            .clone();
+        let mut queue = port.queue.lock().unwrap();
+        while queue.is_empty() {
+            queue = port.ready.wait(queue).unwrap();
+        }
+        let completion = queue.pop_front().unwrap();
+        assert_eq!(completion.key, 0x1234);
+        assert_eq!(completion.overlapped, overlapped.as_ptr() as u64);
+        assert_eq!(completion.status, 0);
+        assert_eq!(completion.bytes, payload.len() as u32);
+        assert_eq!(&received[..completion.bytes as usize], payload);
+        assert_eq!(native_close_handle(client), 1);
+        assert_eq!(native_close_handle(server), 1);
+        assert_eq!(native_close_handle(port_handle), 1);
+    }
+
+    #[test]
+    fn named_pipe_overlapped_connect_completes_when_client_arrives_later() {
+        let name = format!("uv\\wincli-connect-{}", std::process::id());
+        let server = server(&name, 0x4000_0003);
+        assert_ne!(server, u64::MAX);
+        let port = native_create_io_completion_port(u64::MAX, 0, 0, 1);
+        assert_eq!(
+            native_create_io_completion_port(server, port, 0x5678, 1),
+            port
+        );
+        let mut overlapped = [0u64; 4];
+        assert_eq!(
+            native_connect_named_pipe(server, overlapped.as_mut_ptr() as u64),
+            0
+        );
+        assert_eq!(native_get_last_error(), 997);
+        let client = client(&name, 0xc000_0000, 0x4000_0000);
+        assert_ne!(client, u64::MAX);
+
+        let process = process_ctx().unwrap();
+        let completion_port = process
+            .completion_ports
+            .lock()
+            .unwrap()
+            .get(&port)
+            .unwrap()
+            .clone();
+        let mut queue = completion_port.queue.lock().unwrap();
+        while queue.is_empty() {
+            queue = completion_port.ready.wait(queue).unwrap();
+        }
+        let completion = queue.pop_front().unwrap();
+        assert_eq!(completion.key, 0x5678);
+        assert_eq!(completion.overlapped, overlapped.as_ptr() as u64);
+        assert_eq!(completion.status, 0);
+        assert_eq!(native_close_handle(client), 1);
+        assert_eq!(native_close_handle(server), 1);
+        assert_eq!(native_close_handle(port), 1);
+    }
+
+    #[test]
+    fn process_startup_inherits_the_requested_windows_standard_handles() {
+        let mut startup = [0u8; 104];
+        unsafe {
+            startup
+                .as_mut_ptr()
+                .add(60)
+                .cast::<u32>()
+                .write_unaligned(0x100);
+            startup
+                .as_mut_ptr()
+                .add(80)
+                .cast::<u64>()
+                .write_unaligned(0xb000_0001);
+            startup
+                .as_mut_ptr()
+                .add(88)
+                .cast::<u64>()
+                .write_unaligned(0xb000_0003);
+            startup
+                .as_mut_ptr()
+                .add(96)
+                .cast::<u64>()
+                .write_unaligned(0xb000_0005);
+        }
+        assert_eq!(
+            native_startup_std_handles(
+                startup.as_ptr() as u64,
+                [0x5000_0000, 0x5000_0001, 0x5000_0002]
+            ),
+            [0xb000_0001, 0xb000_0003, 0xb000_0005]
+        );
+        unsafe {
+            startup
+                .as_mut_ptr()
+                .add(60)
+                .cast::<u32>()
+                .write_unaligned(0)
+        };
+        assert_eq!(
+            native_startup_std_handles(
+                startup.as_ptr() as u64,
+                [0x5000_0000, 0x5000_0001, 0x5000_0002]
+            ),
+            [0x5000_0000, 0x5000_0001, 0x5000_0002]
+        );
+    }
+}

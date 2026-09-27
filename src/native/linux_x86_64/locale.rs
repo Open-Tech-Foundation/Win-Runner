@@ -1,5 +1,7 @@
 //! Windows code-page, character classification, and locale conversion shims.
 
+use super::*;
+
 pub(super) extern "win64" fn native_get_acp() -> u32 {
     1252
 }
@@ -266,4 +268,137 @@ pub(super) extern "win64" fn native_wide_char_to_multi_byte(
     }
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), output, bytes.len()) };
     bytes.len().try_into().unwrap_or(0)
+}
+
+unsafe fn utf16_argument(ptr: *const u16, len: i32) -> Option<Vec<u16>> {
+    if ptr.is_null() || len < -1 {
+        return None;
+    }
+    if len >= 0 {
+        return Some(unsafe { std::slice::from_raw_parts(ptr, len as usize) }.to_vec());
+    }
+    let mut count = 0;
+    while count < 32 * 1024 && unsafe { *ptr.add(count) } != 0 {
+        count += 1;
+    }
+    (count < 32 * 1024).then(|| unsafe { std::slice::from_raw_parts(ptr, count) }.to_vec())
+}
+
+pub(super) fn uppercase_ascii_utf16(value: &mut [u16]) {
+    for unit in value {
+        if (b'a' as u16..=b'z' as u16).contains(unit) {
+            *unit -= (b'a' - b'A') as u16;
+        }
+    }
+}
+
+pub(super) extern "win64" fn native_compare_string_ex(
+    _locale: *const u16,
+    flags: u32,
+    left: *const u16,
+    left_len: i32,
+    right: *const u16,
+    right_len: i32,
+    _version: *const c_void,
+    _reserved: *const c_void,
+    _param: isize,
+) -> i32 {
+    let (mut left, mut right) = match unsafe {
+        (
+            utf16_argument(left, left_len),
+            utf16_argument(right, right_len),
+        )
+    } {
+        (Some(left), Some(right)) => (left, right),
+        _ => return 0,
+    };
+    // NORM_IGNORECASE is the only comparison flag needed by the CRT's
+    // API-set probing path. Full Windows locale collation is future work.
+    if flags & 0x1 != 0 {
+        uppercase_ascii_utf16(&mut left);
+        uppercase_ascii_utf16(&mut right);
+    }
+    match left.cmp(&right) {
+        std::cmp::Ordering::Less => 1,
+        std::cmp::Ordering::Equal => 2,
+        std::cmp::Ordering::Greater => 3,
+    }
+}
+
+pub(super) extern "win64" fn native_compare_string_ordinal(
+    left: *const u16,
+    left_len: i32,
+    right: *const u16,
+    right_len: i32,
+    ignore_case: i32,
+) -> i32 {
+    let (mut left, mut right) = match unsafe {
+        (
+            utf16_argument(left, left_len),
+            utf16_argument(right, right_len),
+        )
+    } {
+        (Some(left), Some(right)) => (left, right),
+        _ => return 0,
+    };
+    if ignore_case != 0 {
+        uppercase_ascii_utf16(&mut left);
+        uppercase_ascii_utf16(&mut right);
+    }
+    match left.cmp(&right) {
+        std::cmp::Ordering::Less => 1,
+        std::cmp::Ordering::Equal => 2,
+        std::cmp::Ordering::Greater => 3,
+    }
+}
+
+#[cfg(test)]
+mod compare_string_ordinal_tests {
+    use super::*;
+
+    #[test]
+    fn compares_utf16_text_case_sensitively_or_ordinally() {
+        let left: Vec<u16> = "npm".encode_utf16().chain([0]).collect();
+        let right: Vec<u16> = "NPM".encode_utf16().chain([0]).collect();
+        assert_eq!(
+            native_compare_string_ordinal(left.as_ptr(), -1, right.as_ptr(), -1, 1),
+            2
+        );
+        assert_eq!(
+            native_compare_string_ordinal(left.as_ptr(), -1, right.as_ptr(), -1, 0),
+            3
+        );
+    }
+}
+
+pub(super) extern "win64" fn native_get_locale_info_ex(
+    locale: *const u16,
+    kind: u32,
+    output: *mut u16,
+    capacity: i32,
+) -> i32 {
+    if native_diagnostic_enabled() {
+        eprintln!(
+            "native GetLocaleInfoEx locale={:?} kind={kind:#x}",
+            wide(locale)
+        );
+    }
+    if kind == 0x5c {
+        let value: Vec<u16> = "en-US\0".encode_utf16().collect();
+        if capacity == 0 {
+            return value.len() as i32;
+        }
+        if capacity > 0 && (capacity as usize) >= value.len() && !output.is_null() {
+            unsafe { ptr::copy_nonoverlapping(value.as_ptr(), output, value.len()) };
+            return value.len() as i32;
+        }
+        native_set_last_error(122);
+        return 0;
+    }
+    native_set_last_error(87);
+    0
+}
+
+pub(super) extern "win64" fn native_are_file_apis_ansi() -> i32 {
+    1
 }

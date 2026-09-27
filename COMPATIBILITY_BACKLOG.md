@@ -80,7 +80,11 @@ Items remain open until implementation and relevant verification are complete.
   groups including locale conversion and system-information APIs now live in
   Windows-subsystem modules while host syscalls remain backend-local for macOS.
   File path expansion, directory enumeration, timestamps, named-pipe writes,
-  and `WriteFile` now live in the file I/O module. Completion-port APIs,
+  handle state, and `WriteFile` now live in file I/O. Dynamic module lookup and
+  load APIs now live with the PE loader; command-line, startup, and per-thread
+  exit APIs live with process support. Ordinal comparisons and locale
+  information are in the locale module, with byte-order helpers in Winsock.
+  Completion-port APIs,
   directory notifications, and overlapped file
   I/O/cancellation code now live in a dedicated module. Registry storage and
   `LocalFree` APIs share the import registry module. Process-scoped queue and

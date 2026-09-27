@@ -1108,3 +1108,11 @@ pub(super) extern "win64" fn native_wsa_get_last_error() -> i32 {
 pub(super) extern "win64" fn native_wsa_set_last_error(value: i32) {
     THREAD_WSA_ERROR.with(|error| error.set(value));
 }
+
+pub(super) extern "win64" fn native_network_u16(value: u16) -> u16 {
+    value.swap_bytes()
+}
+
+pub(super) extern "win64" fn native_network_u32(value: u32) -> u32 {
+    value.swap_bytes()
+}
