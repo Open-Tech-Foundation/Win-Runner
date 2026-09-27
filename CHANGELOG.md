@@ -113,6 +113,8 @@ All notable changes to this project will be documented in this file.
   module, with page sizing and protection helpers shared by the PE loader.
 - Moved Linux Windows-version, processor, token, user, and computer/system
   information shims into a dedicated system module.
+- Grouped Linux file path expansion, directory enumeration, timestamps, named
+  pipe writes, and `WriteFile` with the existing file I/O APIs.
 - Added the C-locale `msvcrt!mbstowcs` shim used by Nano.
 - Added an optional native Node check proving a relative file that Node leaves
   in WinFS appears in the following shell directory listing.
