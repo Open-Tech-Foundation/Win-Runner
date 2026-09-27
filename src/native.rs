@@ -2942,6 +2942,211 @@ mod imp {
         }
 
         #[test]
+        fn modern_ansi_temp_file_name_creates_a_unique_guest_file() {
+            type GetTempPathA = unsafe extern "win64" fn(u32, *mut u8) -> u32;
+            type GetTempFileNameA =
+                unsafe extern "win64" fn(*const u8, *const u8, u32, *mut u8) -> u32;
+            let get_temp_path: GetTempPathA =
+                unsafe { std::mem::transmute(require_kernel32_api(b"GetTempPathA\0") as usize) };
+            let get_temp_file: GetTempFileNameA = unsafe {
+                std::mem::transmute(require_kernel32_api(b"GetTempFileNameA\0") as usize)
+            };
+            let mut directory = [0u8; 512];
+            let length =
+                unsafe { get_temp_path(directory.len() as u32, directory.as_mut_ptr()) } as usize;
+            assert!(length > 0 && length < directory.len());
+            assert_eq!(directory[length], 0);
+            let prefix = b"wfs\0";
+            let mut filename = [0u8; 1024];
+            assert_ne!(
+                unsafe {
+                    get_temp_file(
+                        directory.as_ptr(),
+                        prefix.as_ptr(),
+                        0,
+                        filename.as_mut_ptr(),
+                    )
+                },
+                0
+            );
+            let path = String::from_utf8(
+                filename[..filename.iter().position(|byte| *byte == 0).unwrap()].to_vec(),
+            )
+            .unwrap();
+            let context = super::fs_ctx().unwrap();
+            assert!(context.lock().unwrap().fs.exists(&path));
+            context.lock().unwrap().fs.delete_file(&path).unwrap();
+        }
+
+        #[test]
+        fn modern_ansi_find_first_file_ex_covers_reference_options() {
+            type FindFirstFileExA = unsafe extern "win64" fn(
+                *const u8,
+                i32,
+                *mut std::ffi::c_void,
+                i32,
+                *const std::ffi::c_void,
+                u32,
+            ) -> u64;
+            type FindNextFileA = unsafe extern "win64" fn(u64, *mut std::ffi::c_void) -> i32;
+            let find_first: FindFirstFileExA = unsafe {
+                std::mem::transmute(require_kernel32_api(b"FindFirstFileExA\0") as usize)
+            };
+            let find_next: FindNextFileA =
+                unsafe { std::mem::transmute(require_kernel32_api(b"FindNextFileA\0") as usize) };
+            let directory = r"C:\modern_find_ex_ansi";
+            let pattern = b"C:\\modern_find_ex_ansi\\*\0";
+            let context = super::fs_ctx().unwrap();
+            {
+                let mut ctx = context.lock().unwrap();
+                ctx.fs.mkdir(directory).unwrap();
+                ctx.fs.mkdir(r"C:\modern_find_ex_ansi\nested").unwrap();
+                ctx.fs
+                    .write_file(r"C:\modern_find_ex_ansi\Alpha.txt", b"a".to_vec())
+                    .unwrap();
+                ctx.fs
+                    .write_file(r"C:\modern_find_ex_ansi\beta.bin", b"b".to_vec())
+                    .unwrap();
+            }
+
+            for (info_level, search_op, flags) in [
+                (0, 0, 0),
+                (0, 0, 1),
+                (0, 0, 2),
+                (1, 0, 0),
+                (0, 1, 0),
+                (0, 1, 1),
+                (0, 1, 2),
+                (1, 1, 0),
+            ] {
+                let mut data = [0u8; 320];
+                let find = unsafe {
+                    find_first(
+                        pattern.as_ptr(),
+                        info_level,
+                        data.as_mut_ptr().cast(),
+                        search_op,
+                        std::ptr::null(),
+                        flags,
+                    )
+                };
+                assert_ne!(find, u64::MAX, "{info_level}/{search_op}/{flags}");
+                let mut names = Vec::new();
+                loop {
+                    let name = unsafe {
+                        std::slice::from_raw_parts(data.as_ptr().add(44), 260)
+                            .iter()
+                            .copied()
+                            .take_while(|byte| *byte != 0)
+                            .collect::<Vec<_>>()
+                    };
+                    names.push(String::from_utf8(name).unwrap());
+                    if unsafe { find_next(find, data.as_mut_ptr().cast()) } == 0 {
+                        break;
+                    }
+                }
+                names.sort();
+                assert_eq!(
+                    names,
+                    ["Alpha.txt", "beta.bin", "nested"],
+                    "{info_level}/{search_op}/{flags}"
+                );
+                assert_eq!(super::native_find_close(find), 1);
+            }
+
+            context.lock().unwrap().fs.remove(directory, true).unwrap();
+        }
+
+        #[test]
+        fn modern_ansi_symbolic_link_resolves_to_guest_target() {
+            type CreateSymbolicLinkA = unsafe extern "win64" fn(*const u8, *const u8, u32) -> i32;
+            let create_link: CreateSymbolicLinkA = unsafe {
+                std::mem::transmute(require_kernel32_api(b"CreateSymbolicLinkA\0") as usize)
+            };
+            let target = b"C:\\modern_symlink_ansi_target.txt\0";
+            let link = b"C:\\modern_symlink_ansi_alias.txt\0";
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(
+                    "C:\\modern_symlink_ansi_target.txt",
+                    b"ansi-target".to_vec(),
+                )
+                .unwrap();
+
+            assert_eq!(unsafe { create_link(link.as_ptr(), target.as_ptr(), 2) }, 1);
+            let link_wide = "C:\\modern_symlink_ansi_alias.txt"
+                .encode_utf16()
+                .chain([0])
+                .collect::<Vec<_>>();
+            assert_ne!(
+                super::native_get_file_attributes_w(link_wide.as_ptr()) & 0x400,
+                0
+            );
+            let handle =
+                super::native_create_file_w(link_wide.as_ptr(), 0x8000_0000, 7, 3, 0, 0, 0);
+            assert_ne!(handle, u64::MAX);
+            let mut bytes = [0u8; 11];
+            let mut read = 0;
+            assert_eq!(
+                super::native_read_file(handle, bytes.as_mut_ptr(), 11, &mut read, 0),
+                1
+            );
+            assert_eq!(&bytes, b"ansi-target");
+            assert_eq!(super::native_close_handle(handle), 1);
+            let mut ctx = context.lock().unwrap();
+            ctx.fs
+                .delete_file("C:\\modern_symlink_ansi_alias.txt")
+                .unwrap();
+            ctx.fs
+                .delete_file("C:\\modern_symlink_ansi_target.txt")
+                .unwrap();
+        }
+
+        #[test]
+        fn modern_open_file_by_id_rejects_invalid_volume_handle() {
+            type OpenFileById = unsafe extern "win64" fn(
+                u64,
+                *const std::ffi::c_void,
+                u32,
+                u32,
+                *const std::ffi::c_void,
+                u32,
+            ) -> u64;
+            let open_by_id: OpenFileById =
+                unsafe { std::mem::transmute(require_kernel32_api(b"OpenFileById\0") as usize) };
+            let mut descriptor = [0u8; 24];
+            descriptor[..4].copy_from_slice(&24u32.to_le_bytes());
+
+            assert_eq!(
+                unsafe {
+                    open_by_id(
+                        u64::MAX,
+                        descriptor.as_ptr().cast(),
+                        0x8000_0000,
+                        7,
+                        std::ptr::null(),
+                        0,
+                    )
+                },
+                u64::MAX
+            );
+            assert_eq!(super::native_get_last_error(), 6);
+        }
+
+        #[test]
+        fn modern_set_file_valid_data_rejects_invalid_handle() {
+            type SetFileValidData = unsafe extern "win64" fn(u64, i64) -> i32;
+            let set_valid_data: SetFileValidData = unsafe {
+                std::mem::transmute(require_kernel32_api(b"SetFileValidData\0") as usize)
+            };
+            assert_eq!(unsafe { set_valid_data(u64::MAX, 0) }, 0);
+            assert_eq!(super::native_get_last_error(), 6);
+        }
+
+        #[test]
         fn initializes_critical_section_with_spin_count() {
             let mut section = [0x5au8; 40];
             assert_eq!(
