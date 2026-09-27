@@ -17,6 +17,8 @@ All notable changes to this project will be documented in this file.
   by existing native shims, process-attach DllMain calls, and dynamic
   GetProcAddress for named, ordinal, and shim-forwarded exports.
 
+- Added a "Why Win-Runner?" section to the README explaining the project's focus
+  and how it differs from Wine, VMs, and Windows CI runners.
 - Added an Apache 2.0 `NOTICE` file and linked it from the README.
 - Added `--save` to write changes back to the loaded snapshot on exit, without
   repeating the snapshot path.

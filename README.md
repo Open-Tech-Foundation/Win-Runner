@@ -21,6 +21,31 @@
 > [!WARNING]
 > Win-Runner is a compatibility runtime, not a security sandbox. Native guest programs can make Linux system calls with Win-Runner's privileges. The built-in sandbox is a work in progress; use an OS sandbox for untrusted programs.
 
+## Why Win-Runner?
+
+Testing a Windows command-line program usually means a Windows machine, a VM, or a
+paid CI runner. Wine can run it elsewhere, but it is built for desktop apps: a large
+prefix to set up and reset, noisy logs, and quiet workarounds that can hide bugs.
+
+Win-Runner is built for one job: **fast, repeatable, scriptable runs of Windows CLI
+programs**, driven by people, CI pipelines, and coding agents.
+
+- **Instant, clean state:** every run starts from a fresh in-memory C: drive or a
+  saved snapshot. There is no prefix to create, copy, or clean up.
+- **Native speed:** x86-64 code runs directly on the host CPU; only Windows API calls
+  go through compatibility shims.
+- **Honest failures:** unsupported APIs are reported by name, and `winrun inspect`
+  shows what a program needs before it runs. A missing feature fails loudly
+  instead of silently changing behavior.
+- **Built for automation:** the headless WebSocket control API streams output,
+  accepts input, key, and resize events, and reports exit codes, so an agent can
+  build, run, and check Windows programs without a Windows machine.
+- **One small binary:** a single Rust executable with a shell, PowerShell-style
+  scripts, and `choco`/`winget` package installs built in.
+
+Win-Runner does not aim to replace Wine. It targets command-line programs, not GUI
+apps, games, or drivers. For those, use Wine or a real Windows machine.
+
 ## Quick start
 
 ```bash
