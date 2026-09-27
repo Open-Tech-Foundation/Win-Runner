@@ -1654,6 +1654,85 @@ mod imp {
         }
 
         #[test]
+        fn modern_file_api_imports_are_registered_for_compatibility_coverage() {
+            // Keep the modern file-operation surface visible to Rust tests.
+            // A missing binding is reported as a test failure so the API can
+            // be added to the compatibility suite before its implementation.
+            let apis = [
+                "GetTempPathA",
+                "GetTempPathW",
+                "GetTempFileNameA",
+                "GetTempFileNameW",
+                "CopyFileA",
+                "CopyFileW",
+                "CopyFileExW",
+                "CopyFile2",
+                "CreateFileA",
+                "CreateFileW",
+                "CreateFile2",
+                "DeleteFileA",
+                "DeleteFileW",
+                "MoveFileA",
+                "MoveFileW",
+                "FindFirstFileA",
+                "FindFirstFileW",
+                "FindNextFileA",
+                "FindNextFileW",
+                "FindFirstFileExA",
+                "FindFirstFileExW",
+                "LockFile",
+                "UnlockFile",
+                "GetFileType",
+                "RemoveDirectoryA",
+                "RemoveDirectoryW",
+                "ReplaceFileA",
+                "ReplaceFileW",
+                "GetFileInformationByHandleEx",
+                "OpenFileById",
+                "SetFileValidData",
+                "WriteFileGather",
+                "GetFinalPathNameByHandleA",
+                "GetFinalPathNameByHandleW",
+                "SetFileInformationByHandle",
+                "GetFileAttributesExW",
+                "SetFileTime",
+                "ReOpenFile",
+                "CreateHardLinkW",
+                "CreateSymbolicLinkW",
+                "SetEndOfFile",
+                "SetFilePointer",
+                "SetFilePointerEx",
+                "GetFileSizeEx",
+                "GetFileInformationByHandle",
+                "FlushFileBuffers",
+                "GetOverlappedResult",
+                "GetOverlappedResultEx",
+                "CreateFileMappingA",
+                "CreateFileMappingW",
+                "MapViewOfFile",
+                "UnmapViewOfFile",
+                "GetQueuedCompletionStatus",
+                "GetQueuedCompletionStatusEx",
+                "PostQueuedCompletionStatus",
+                "FindFirstStreamW",
+                "SetFileCompletionNotificationModes",
+                "CreateHardLinkA",
+                "CreateSymbolicLinkA",
+                "SetFileAttributesA",
+                "SetFileAttributesW",
+                "CreateDirectoryW",
+                "MoveFileExW",
+                "ReadFile",
+                "WriteFile",
+            ];
+            let missing = apis
+                .into_iter()
+                .filter(|api| !super::supports_import("KERNEL32.dll", api))
+                .collect::<Vec<_>>();
+            assert!(missing.is_empty(), "unbound modern file APIs: {missing:?}");
+        }
+
+        #[test]
         fn initializes_critical_section_with_spin_count() {
             let mut section = [0x5au8; 40];
             assert_eq!(

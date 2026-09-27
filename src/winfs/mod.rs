@@ -1859,6 +1859,139 @@ mod tests {
     }
 
     #[test]
+    fn modern_path_lookup_handles_drive_root_relative_and_parent_paths() {
+        let mut fs = WinFs::new();
+        fs.mkdir(r"C:\compat\nested").unwrap();
+        fs.write_file(r"C:\compat\root.txt", b"root".to_vec())
+            .unwrap();
+        fs.write_file(r"C:\compat\nested\child.txt", b"child".to_vec())
+            .unwrap();
+
+        assert!(fs.is_dir(r"C:\"));
+        assert_eq!(
+            fs.read_file(r"C:\compat\nested\..\root.txt").unwrap(),
+            b"root"
+        );
+        fs.set_cwd(r"C:\compat\nested").unwrap();
+        assert_eq!(fs.read_file(r"..\ROOT.txt").unwrap(), b"root");
+        assert_eq!(fs.read_file(r"\compat\nested\child.txt").unwrap(), b"child");
+        assert!(fs.set_cwd(r"C:\compat\root.txt").is_err());
+        assert!(fs.set_cwd(r"C:\missing").is_err());
+    }
+
+    #[test]
+    fn modern_path_normalization_accepts_mixed_separators_and_extended_namespaces() {
+        let fs = WinFs::new();
+        let expected = fs.normalize(r"C:\compat\folder\file.txt").unwrap();
+        for path in [
+            r"c:/COMPAT/folder/file.txt",
+            r"\\?\C:\compat\folder\file.txt",
+            r"\??\C:\compat\folder\file.txt",
+        ] {
+            assert_eq!(fs.normalize(path).unwrap().key(), expected.key(), "{path}");
+        }
+        assert!(fs.normalize("").is_err());
+        assert!(fs.normalize(r"Q:\outside.txt").is_err());
+    }
+
+    #[test]
+    fn modern_file_and_directory_operations_reject_wrong_node_types() {
+        let mut fs = WinFs::new();
+        fs.mkdir(r"C:\compat\folder").unwrap();
+        fs.write_file(r"C:\compat\entry.txt", b"entry".to_vec())
+            .unwrap();
+
+        assert!(fs.read_file(r"C:\compat\folder").is_err());
+        assert!(fs.file_len(r"C:\compat\folder").is_err());
+        assert!(fs.list_dir(r"C:\compat\entry.txt").is_err());
+        assert!(fs
+            .write_file(r"C:\compat\folder", b"replace".to_vec())
+            .is_err());
+        assert!(fs.append_file(r"C:\compat\folder", b"append").is_err());
+        assert!(fs.delete_file(r"C:\compat\folder").is_err());
+        assert!(fs.rmdir(r"C:\compat\entry.txt").is_err());
+        assert!(fs
+            .copy_file(r"C:\compat\folder", r"C:\compat\copy", false)
+            .is_err());
+        assert!(fs
+            .copy_file(r"C:\compat\missing", r"C:\compat\copy", false)
+            .is_err());
+    }
+
+    #[test]
+    fn modern_directory_enumeration_is_immediate_case_insensitive_and_case_preserving() {
+        let mut fs = WinFs::new();
+        fs.mkdir(r"C:\compat\nested").unwrap();
+        fs.write_file(r"C:\compat\Zulu.txt", b"z".to_vec()).unwrap();
+        fs.write_file(r"C:\compat\alpha.txt", b"a".to_vec())
+            .unwrap();
+        fs.write_file(r"C:\compat\nested\hidden.txt", b"h".to_vec())
+            .unwrap();
+
+        let entries = fs.list_dir(r"c:\COMPAT").unwrap();
+        assert_eq!(entries, ["alpha.txt", "nested", "Zulu.txt"]);
+        assert!(!entries
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("hidden.txt")));
+        assert_eq!(
+            fs.list_dir(r"C:\compat\ALPHA.TXT").unwrap_err(),
+            "not a directory: C:\\compat\\ALPHA.TXT"
+        );
+        assert!(fs.list_dir(r"C:\compat\missing").is_err());
+    }
+
+    #[test]
+    fn modern_copy_delete_and_move_preserve_source_on_failed_operations() {
+        let mut fs = WinFs::new();
+        fs.mkdir(r"C:\compat").unwrap();
+        fs.mkdir(r"C:\compat\directory").unwrap();
+        fs.write_file(r"C:\compat\source.txt", b"payload".to_vec())
+            .unwrap();
+
+        assert!(fs
+            .copy_file(r"C:\compat\source.txt", r"C:\missing\copy.txt", false)
+            .is_err());
+        assert!(fs
+            .move_path(r"C:\compat\source.txt", r"C:\missing\moved.txt")
+            .is_err());
+        assert!(fs.delete_file(r"C:\compat\missing.txt").is_err());
+        assert_eq!(fs.read_file(r"C:\compat\source.txt").unwrap(), b"payload");
+
+        fs.copy_file(r"C:\compat\source.txt", r"C:\compat\directory", false)
+            .unwrap_err();
+        assert_eq!(fs.read_file(r"C:\compat\source.txt").unwrap(), b"payload");
+    }
+
+    #[test]
+    fn modern_filesystem_change_replay_preserves_ordered_mutations_and_cwd() {
+        let mut source = WinFs::new();
+        source.mkdir(r"C:\compat\tree").unwrap();
+        source
+            .write_file(r"C:\compat\tree\old.txt", b"old".to_vec())
+            .unwrap();
+        source.clear_changes();
+        let mut restored = source.clone();
+        source
+            .write_file(r"C:\compat\tree\new.txt", b"new".to_vec())
+            .unwrap();
+        source
+            .move_path(r"C:\compat\tree\new.txt", r"C:\compat\tree\moved.txt")
+            .unwrap();
+        source.delete_file(r"C:\compat\tree\old.txt").unwrap();
+        source.set_cwd(r"C:\compat\tree").unwrap();
+
+        let changes = source.changes().to_vec();
+        restored.apply_changes(&changes).unwrap();
+        assert_eq!(
+            restored.read_file(r"C:\compat\tree\moved.txt").unwrap(),
+            b"new"
+        );
+        assert!(!restored.exists(r"C:\compat\tree\new.txt"));
+        assert!(!restored.exists(r"C:\compat\tree\old.txt"));
+        assert_eq!(restored.cwd(), r"C:\compat\tree");
+    }
+
+    #[test]
     fn extended_dos_and_nt_paths_resolve_like_dos_paths() {
         let mut fs = WinFs::new();
         fs.mkdir(r"C:\Users\wincli\npm-cache\_cacache\tmp").unwrap();

@@ -25,6 +25,9 @@ All notable changes to this project will be documented in this file.
 - Added seeked range reads for synchronous, NT, and overlapped Win32 file reads.
 - Added Rust WinFS compatibility tests for `SetFilePointer`/`ReadFile`, copy,
   move, delete, enumeration, metadata, and directory cleanup.
+- Expanded modern WinFS compatibility coverage for path resolution, case-
+  insensitive enumeration, wrong-type operations, failed mutations, and
+  filesystem change replay; added a native file API import coverage inventory.
 - Expanded the native WinFS compatibility tests to cover read-only access,
   sharing conflicts, wildcard enumeration, read-only deletion, and guest file
   times.
