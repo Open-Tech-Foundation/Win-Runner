@@ -652,3 +652,108 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         _ => None,
     }
 }
+
+pub(super) extern "win64" fn native_reg_open_key_ex_w(
+    _key: u64,
+    _name: *const u16,
+    _options: u32,
+    _access: u32,
+    out: *mut u64,
+) -> u32 {
+    if !out.is_null() {
+        unsafe { out.write(0) };
+    }
+    2 // ERROR_FILE_NOT_FOUND: no registry is mounted in the guest.
+}
+pub(super) extern "win64" fn native_reg_open_key_ex_a(
+    key: u64,
+    name: *const u8,
+    options: u32,
+    access: u32,
+    out: *mut u64,
+) -> u32 {
+    if name.is_null() {
+        native_set_last_error(87);
+        return 87;
+    }
+    let mut units = Vec::new();
+    for index in 0..32768 {
+        let byte = unsafe { name.add(index).read() };
+        if byte == 0 {
+            units.push(0);
+            return native_reg_open_key_ex_w(key, units.as_ptr(), options, access, out);
+        }
+        units.push(byte as u16);
+    }
+    native_set_last_error(87);
+    87
+}
+pub(super) extern "win64" fn native_reg_create_key_ex_w(
+    _key: u64,
+    subkey: *const u16,
+    _reserved: u32,
+    _class: *mut u16,
+    _options: u32,
+    _access: u32,
+    _security: u64,
+    out: *mut u64,
+    disposition: *mut u32,
+) -> u32 {
+    if subkey.is_null() || out.is_null() {
+        return 87;
+    }
+    let handle = NATIVE_REGISTRY_HANDLE_NEXT.fetch_add(1, Ordering::Relaxed);
+    unsafe {
+        out.write_unaligned(handle);
+        if !disposition.is_null() {
+            disposition.write_unaligned(1); // REG_CREATED_NEW_KEY
+        }
+    }
+    0
+}
+pub(super) extern "win64" fn native_reg_set_value_ex_w(
+    key: u64,
+    _value_name: *const u16,
+    _reserved: u32,
+    _value_type: u32,
+    data: *const u8,
+    data_len: u32,
+) -> u32 {
+    if key == 0 || (data.is_null() && data_len != 0) {
+        return 87;
+    }
+    0
+}
+pub(super) extern "win64" fn native_reg_query_value_ex_w(
+    _key: u64,
+    _value_name: *const u16,
+    _reserved: *mut u32,
+    _value_type: *mut u32,
+    _data: *mut u8,
+    _data_len: *mut u32,
+) -> u32 {
+    2 // ERROR_FILE_NOT_FOUND
+}
+pub(super) extern "win64" fn native_reg_close_key(_key: u64) -> u32 {
+    0
+}
+
+pub(super) extern "win64" fn native_local_free(value: u64) -> u64 {
+    if value == 0 {
+        return 0;
+    }
+    let Some(process) = process_ctx() else {
+        return value;
+    };
+    if process
+        .heap_allocations
+        .lock()
+        .is_ok_and(|mut values| values.remove(&value).is_some())
+    {
+        unsafe { free(value as *mut c_void) };
+        0
+    } else {
+        native_set_last_error(6);
+        value
+    }
+}

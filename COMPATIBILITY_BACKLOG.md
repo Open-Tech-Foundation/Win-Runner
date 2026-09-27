@@ -82,7 +82,8 @@ Items remain open until implementation and relevant verification are complete.
   File path expansion, directory enumeration, timestamps, named-pipe writes,
   and `WriteFile` now live in the file I/O module. Completion-port APIs,
   directory notifications, and overlapped file
-  I/O/cancellation code now live in a dedicated module; process-scoped queue and
+  I/O/cancellation code now live in a dedicated module. Registry storage and
+  `LocalFree` APIs share the import registry module. Process-scoped queue and
   completion state remain in the backend context.
 - [x] Cache `WINCLI_NATIVE_DIAGNOSTIC` once rather than reading the environment
   from hot shims; initialize the cache before guest forks.

@@ -115,6 +115,8 @@ All notable changes to this project will be documented in this file.
   information shims into a dedicated system module.
 - Grouped Linux file path expansion, directory enumeration, timestamps, named
   pipe writes, and `WriteFile` with the existing file I/O APIs.
+- Moved the in-memory Windows registry and `LocalFree` APIs into the registry
+  module beside import registration and trampoline dispatch.
 - Added the C-locale `msvcrt!mbstowcs` shim used by Nano.
 - Added an optional native Node check proving a relative file that Node leaves
   in WinFS appears in the following shell directory listing.
