@@ -10,6 +10,9 @@ All notable changes to this project will be documented in this file.
   paths, drive prefixes, and existing symlink components.
 - Documented that native guest execution and mounted host folders are not a
   security sandbox.
+- Prepared `CreateProcessW` child state before `fork` and installed the child
+  process context in thread-local storage, avoiding inherited dispatcher and
+  pipe-table locks in that child startup path.
 - Added a guest `C:\bin\powershell.exe` shell link so native child-process
   launches run scripts through WinCLI's PowerShell-compatible interpreter.
 - Added the `KERNEL32!NeedCurrentDirectoryForExePathW` shim used by child

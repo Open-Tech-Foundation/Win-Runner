@@ -16,9 +16,14 @@ Items remain open until implementation and relevant verification are complete.
   security sandbox. Document this clearly; assess seccomp, namespaces, and
   Landlock as a separate implementation project.
 - [ ] **3. Remove unsafe fork-after-threads behavior.** `CreateProcessW` forks
-  from a multithreaded guest and executes lock-taking/allocation code in the
-  child. Move toward a fresh WinCLI worker process; prepare any interim child
-  state before fork and avoid inherited locked Rust mutexes.
+  from a multithreaded guest. `CreateProcessW` now builds the child filesystem,
+  process context, environment, TLS template, and inherited pipe table before
+  forking, then installs the process context through thread-local storage.
+  This removes the identified post-fork context/pipe/global-dispatcher locks
+  from `CreateProcessW`; it does not remove general fork-after-threads hazards.
+  The initial `wincli app.exe` launcher still forks and then creates a Rust
+  thread. Move guest execution to a fresh WinCLI worker process to close this
+  item.
 - [ ] **4. Keep the control listener alive after invalid connections.** Continue
   accepting until an authenticated WebSocket session is established, and use
   constant-time token comparison.

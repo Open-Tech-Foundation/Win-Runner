@@ -6610,6 +6610,7 @@ mod imp {
             }
         }
     }
+    #[derive(Clone)]
     struct NativeFind {
         names: Vec<String>,
         index: usize,
@@ -6744,6 +6745,9 @@ mod imp {
         let thread_suspension = Arc::clone(&suspension);
         let spawned = builder.spawn(move || {
             THREAD_NATIVE_HANDLE.set(handle);
+            THREAD_NATIVE_PROCESS.with(|active| {
+                *active.borrow_mut() = Some(Arc::clone(&thread_process));
+            });
             let (count, ready) = &*thread_suspension;
             let Ok(mut count) = count.lock() else {
                 return 1;
@@ -8764,6 +8768,24 @@ mod imp {
         next: u64,
     }
 
+    impl NativeFs {
+        fn clone_for_child(&self, current_directory: &str) -> Result<Self, String> {
+            let mut fs = self.fs.clone();
+            fs.set_cwd(current_directory)?;
+            Ok(Self {
+                fs,
+                handles: self.handles.clone(),
+                file_access: self.file_access.clone(),
+                file_shares: self.file_shares.clone(),
+                finds: self.finds.clone(),
+                file_completion_modes: self.file_completion_modes.clone(),
+                delete_on_close: self.delete_on_close.clone(),
+                file_locks: self.file_locks.clone(),
+                next: self.next,
+            })
+        }
+    }
+
     // CreateProcessW will allocate these once PE mapping is attached to the
     // registry; they are already consumed by the process-handle APIs.
     #[allow(dead_code)]
@@ -9054,6 +9076,8 @@ mod imp {
             const { std::cell::RefCell::new(Vec::new()) };
         static THREAD_WSA_ERROR: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
         static THREAD_NATIVE_HANDLE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        static THREAD_NATIVE_PROCESS: std::cell::RefCell<Option<Arc<NativeProcessContext>>> =
+            const { std::cell::RefCell::new(None) };
         static THREAD_LAST_ERROR: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
         static THREAD_TEB_BASE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
@@ -9150,6 +9174,9 @@ mod imp {
         #[cfg(test)]
         if !NATIVE_GUEST_ACTIVE.load(Ordering::Acquire) {
             return Some(Arc::clone(&TEST_PROCESS));
+        }
+        if let Some(process) = THREAD_NATIVE_PROCESS.with(|active| active.borrow().clone()) {
+            return Some(process);
         }
         if let Some(process) = NATIVE_PROCESS.lock().ok()?.as_ref().cloned() {
             return Some(process);
@@ -13025,6 +13052,99 @@ mod imp {
             native_set_last_error(8); // ERROR_NOT_ENOUGH_MEMORY
             return 0;
         }
+        let child_fs = match context.lock() {
+            Ok(parent_fs) => match parent_fs.clone_for_child(&launch.current_directory) {
+                Ok(child_fs) => Arc::new(Mutex::new(child_fs)),
+                Err(_) => {
+                    native_set_last_error(267); // ERROR_DIRECTORY
+                    return 0;
+                }
+            },
+            Err(_) => {
+                native_set_last_error(6);
+                return 0;
+            }
+        };
+        let child_pipes = match parent.named_pipes.lock() {
+            Ok(pipes) => pipes.clone_for_child(inherit_handles != 0),
+            Err(_) => {
+                native_set_last_error(6);
+                return 0;
+            }
+        };
+        let command_line_w = command_line_w(
+            &launch.application,
+            launch.arguments.get(1..).unwrap_or(&[]),
+        )
+        .unwrap_or_else(|_| vec![0]);
+        let child_context = Arc::new(NativeProcessContext {
+            image_base: image.image_base,
+            module_path: launch.application.clone(),
+            process_id: child.process_id,
+            process_handle,
+            parent_process_id: parent.process_id,
+            command_line_a: command_line_a(&command_line_w),
+            command_line_w,
+            environment_block: Mutex::new(environment_strings(&environment)),
+            environment: Mutex::new(environment),
+            std_handles: [
+                AtomicU64::new(child_std_handles[0]),
+                AtomicU64::new(child_std_handles[1]),
+                AtomicU64::new(child_std_handles[2]),
+            ],
+            crt_fds: Mutex::new(HashMap::new()),
+            crt_fd_next: AtomicI32::new(3),
+            fs: child_fs,
+            named_pipes: Mutex::new(child_pipes),
+            error_mode: AtomicU32::new(0),
+            pointer_cookie: random_pointer_cookie(),
+            heap_allocations: Mutex::new(HashMap::new()),
+            virtual_allocations: Mutex::new(HashMap::new()),
+            file_mappings: Mutex::new(HashMap::new()),
+            mapping_views: Mutex::new(HashMap::new()),
+            mapping_next: AtomicU64::new(0x9800_0000),
+            gs_base: AtomicU64::new(0),
+            tls_template: Mutex::new(tls.as_ref().map(NativeTls::clone_for_thread)),
+            dynamic_tls: Mutex::new(DynamicTlsSlots::new(tls.is_some())),
+            threads: Mutex::new(HashMap::new()),
+            thread_next: AtomicU64::new(0x8000_0000),
+            semaphores: Mutex::new(HashMap::new()),
+            semaphore_next: AtomicU64::new(0x6000_0000),
+            events: Mutex::new(HashMap::new()),
+            event_names: Mutex::new(HashMap::new()),
+            event_next: AtomicU64::new(0x6100_0000),
+            job_objects: Mutex::new(HashMap::new()),
+            wait_registrations: Mutex::new(HashMap::new()),
+            completion_ports: Mutex::new(HashMap::new()),
+            socket_completion_ports: Mutex::new(HashMap::new()),
+            socket_completion_modes: Mutex::new(HashMap::new()),
+            completion_next: AtomicU64::new(0x9000_0000),
+            io_wait: Mutex::new(()),
+            io_ready: Condvar::new(),
+            pending_file_io: AtomicU64::new(0),
+            pending_requests: Mutex::new(HashMap::new()),
+            file_io_queue: Mutex::new(None),
+            duplicate_handles: Mutex::new(HashMap::new()),
+            duplicate_next: AtomicU64::new(0xa000_0000),
+            timer_next: AtomicU64::new(0x7000_0000),
+            state_fd: AtomicU32::new(state_fds[1] as u32),
+            fls_value: AtomicU64::new(0),
+            unhandled_exception_filter: AtomicU64::new(0),
+            vectored_exception_handler: AtomicU64::new(0),
+            exit_status: AtomicU32::new(259),
+            exited: AtomicBool::new(false),
+            children: Mutex::new(NativeProcessTable::new()),
+        });
+        let mut child_tls = tls;
+        let mut fallback_teb = Box::new([0u8; 0x1000]);
+        let child_teb = child_tls
+            .as_mut()
+            .map(|tls| &mut tls.teb)
+            .unwrap_or(&mut fallback_teb);
+        // Stack discovery reads /proc and consults diagnostics, so do it in
+        // the parent before fork instead of running library code in the child.
+        set_teb_stack_bounds(child_teb);
+        let child_teb_base = child_teb.as_ptr() as u64;
         let pid = unsafe { fork() };
         if pid < 0 {
             unsafe {
@@ -13038,93 +13158,16 @@ mod imp {
             #[cfg(test)]
             NATIVE_GUEST_ACTIVE.store(true, Ordering::Release);
             unsafe { close(state_fds[0]) };
-            if let Ok(mut child_fs) = context.lock() {
-                let _ = child_fs.fs.set_cwd(&launch.current_directory);
-            }
-            let command_line_w = command_line_w(
-                &launch.application,
-                launch.arguments.get(1..).unwrap_or(&[]),
-            )
-            .unwrap_or_else(|_| vec![0]);
-            let child_context = Arc::new(NativeProcessContext {
-                image_base: image.image_base,
-                module_path: launch.application.clone(),
-                process_id: child.process_id,
-                process_handle,
-                parent_process_id: parent.process_id,
-                command_line_a: command_line_a(&command_line_w),
-                command_line_w,
-                environment_block: Mutex::new(environment_strings(&environment)),
-                environment: Mutex::new(environment),
-                std_handles: [
-                    AtomicU64::new(child_std_handles[0]),
-                    AtomicU64::new(child_std_handles[1]),
-                    AtomicU64::new(child_std_handles[2]),
-                ],
-                crt_fds: Mutex::new(HashMap::new()),
-                crt_fd_next: AtomicI32::new(3),
-                fs: Arc::clone(&context),
-                named_pipes: Mutex::new(
-                    parent
-                        .named_pipes
-                        .lock()
-                        .map(|pipes| pipes.clone_for_child(inherit_handles != 0))
-                        .unwrap_or_else(|_| NativeNamedPipeTable::new()),
-                ),
-                error_mode: AtomicU32::new(0),
-                pointer_cookie: random_pointer_cookie(),
-                heap_allocations: Mutex::new(HashMap::new()),
-                virtual_allocations: Mutex::new(HashMap::new()),
-                file_mappings: Mutex::new(HashMap::new()),
-                mapping_views: Mutex::new(HashMap::new()),
-                mapping_next: AtomicU64::new(0x9800_0000),
-                gs_base: AtomicU64::new(0),
-                tls_template: Mutex::new(tls.as_ref().map(NativeTls::clone_for_thread)),
-                dynamic_tls: Mutex::new(DynamicTlsSlots::new(tls.is_some())),
-                threads: Mutex::new(HashMap::new()),
-                thread_next: AtomicU64::new(0x8000_0000),
-                semaphores: Mutex::new(HashMap::new()),
-                semaphore_next: AtomicU64::new(0x6000_0000),
-                events: Mutex::new(HashMap::new()),
-                event_names: Mutex::new(HashMap::new()),
-                event_next: AtomicU64::new(0x6100_0000),
-                job_objects: Mutex::new(HashMap::new()),
-                wait_registrations: Mutex::new(HashMap::new()),
-                completion_ports: Mutex::new(HashMap::new()),
-                socket_completion_ports: Mutex::new(HashMap::new()),
-                socket_completion_modes: Mutex::new(HashMap::new()),
-                completion_next: AtomicU64::new(0x9000_0000),
-                io_wait: Mutex::new(()),
-                io_ready: Condvar::new(),
-                pending_file_io: AtomicU64::new(0),
-                pending_requests: Mutex::new(HashMap::new()),
-                file_io_queue: Mutex::new(None),
-                duplicate_handles: Mutex::new(HashMap::new()),
-                duplicate_next: AtomicU64::new(0xa000_0000),
-                timer_next: AtomicU64::new(0x7000_0000),
-                state_fd: AtomicU32::new(state_fds[1] as u32),
-                fls_value: AtomicU64::new(0),
-                unhandled_exception_filter: AtomicU64::new(0),
-                vectored_exception_handler: AtomicU64::new(0),
-                exit_status: AtomicU32::new(259),
-                exited: AtomicBool::new(false),
-                children: Mutex::new(NativeProcessTable::new()),
+            THREAD_NATIVE_PROCESS.with(|active| {
+                *active.borrow_mut() = Some(child_context);
             });
-            if let Ok(mut active) = NATIVE_PROCESS.lock() {
-                *active = Some(child_context);
-            }
             if protect_exec(&mapping).is_err() {
                 unsafe { _exit(127) };
             }
-            let mut tls = tls;
-            let mut fallback_teb = Box::new([0u8; 0x1000]);
-            let teb = tls
-                .as_mut()
-                .map(|tls| &mut tls.teb)
-                .unwrap_or(&mut fallback_teb);
-            if !install_thread_teb(teb) {
+            if !unsafe { set_gs(child_teb_base) } {
                 unsafe { _exit(127) };
             }
+            THREAD_TEB_BASE.set(child_teb_base);
             let guest: unsafe extern "win64" fn() -> u32 = unsafe { std::mem::transmute(entry) };
             let code = unsafe { guest() };
             native_flush_instance_state();
@@ -20698,6 +20741,9 @@ mod imp {
                 let guest_thread = std::thread::Builder::new()
                     .stack_size(16 * 1024 * 1024)
                     .spawn(move || {
+                        THREAD_NATIVE_PROCESS.with(|active| {
+                            *active.borrow_mut() = Some(Arc::clone(&guest_process));
+                        });
                         let mut tls = tls;
                         let mut fallback_teb = Box::new([0u8; 0x1000]);
                         let teb = tls
