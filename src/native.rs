@@ -15464,18 +15464,12 @@ mod imp {
             native_set_last_error(3);
             return u64::MAX;
         };
-        let path_key = path_key.display().to_lowercase();
+        let path_key = path_key.key();
         let desired = access & 0xC000_0000;
         let required_share =
             ((desired & 0x8000_0000 != 0) as u32) | (((desired & 0x4000_0000 != 0) as u32) << 1);
         let sharing_conflict = ctx.handles.iter().any(|(handle, open)| {
-            if ctx
-                .fs
-                .normalize(&open.path)
-                .ok()
-                .map(|key| key.display().to_lowercase())
-                != Some(path_key.clone())
-            {
+            if ctx.fs.normalize(&open.path).ok().map(|key| key.key()) != Some(path_key.clone()) {
                 return false;
             }
             let open_desired = ctx.file_access.get(handle).copied().unwrap_or(0);

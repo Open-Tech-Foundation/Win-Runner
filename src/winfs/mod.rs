@@ -20,6 +20,7 @@ use std::{
 };
 
 mod win_path;
+use win_path::windows_name_key;
 pub(crate) use win_path::{parse as parse_win_path, DosDevicePath, ParsedWinPath};
 
 static NEXT_DISK_ID: AtomicU64 = AtomicU64::new(1);
@@ -438,7 +439,7 @@ impl WinPath {
             &self
                 .parts
                 .iter()
-                .map(|p| p.to_lowercase())
+                .map(|p| windows_name_key(p))
                 .collect::<Vec<_>>()
                 .join("\\"),
         );
@@ -595,7 +596,7 @@ impl WinFs {
         if let Some(root) = self.drives.get(&'C') {
             visit(self, root, "C:", &mut out);
         }
-        out.sort_by(|a, b| a.path.to_lowercase().cmp(&b.path.to_lowercase()));
+        out.sort_by(|a, b| windows_name_key(&a.path).cmp(&windows_name_key(&b.path)));
         out
     }
 
@@ -622,7 +623,7 @@ impl WinFs {
         if let Some(root) = self.drives.get(&'C') {
             visit(self, root, "C:", &mut out);
         }
-        out.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+        out.sort_by(|a, b| windows_name_key(a).cmp(&windows_name_key(b)));
         out
     }
 
@@ -657,8 +658,8 @@ impl WinFs {
         if let Some(root) = self.drives.get(&'C') {
             visit(self, root, "C:", &mut out);
         }
-        out.retain(|entry| !entry.path.eq_ignore_ascii_case("C:"));
-        out.sort_by(|left, right| left.path.to_lowercase().cmp(&right.path.to_lowercase()));
+        out.retain(|entry| windows_name_key(&entry.path) != "C:");
+        out.sort_by(|left, right| windows_name_key(&left.path).cmp(&windows_name_key(&right.path)));
         out
     }
 
@@ -712,7 +713,7 @@ impl WinFs {
         };
         let leaf = p.parts.last().unwrap().clone();
         children.insert(
-            leaf.to_lowercase(),
+            windows_name_key(&leaf),
             Node::File {
                 name: leaf,
                 data: FileData::Disk {
@@ -792,7 +793,7 @@ impl WinFs {
                             length: *length,
                         };
                         children.insert(
-                            leaf.to_lowercase(),
+                            windows_name_key(&leaf),
                             Node::File {
                                 name: leaf,
                                 data: stored.clone(),
@@ -898,10 +899,8 @@ impl WinFs {
         for (index, component) in p.parts.iter().enumerate() {
             let found = std::fs::read_dir(&current).ok().and_then(|entries| {
                 entries.filter_map(Result::ok).find(|entry| {
-                    entry
-                        .file_name()
-                        .to_string_lossy()
-                        .eq_ignore_ascii_case(component)
+                    windows_name_key(&entry.file_name().to_string_lossy())
+                        == windows_name_key(component)
                 })
             });
             if let Some(entry) = found {
@@ -1059,7 +1058,7 @@ impl WinFs {
                 data: FileData::Bytes(Vec::new()),
             }
         };
-        children.insert(leaf.to_lowercase(), placeholder);
+        children.insert(windows_name_key(&leaf), placeholder);
         self.symlinks.insert(p.key(), target_path.display());
         let id = if self.is_file(&target_path.display()) {
             self.file_id(&target_path.display()).unwrap_or_default()
@@ -1189,7 +1188,7 @@ impl WinFs {
         for part in &p.parts {
             match node {
                 Node::Dir { children, .. } => {
-                    node = children.get(&part.to_lowercase())?;
+                    node = children.get(&windows_name_key(part))?;
                 }
                 Node::File { .. } => return None,
             }
@@ -1207,7 +1206,7 @@ impl WinFs {
         for part in &p.parts {
             match node {
                 Node::Dir { children, .. } => {
-                    node = children.get_mut(&part.to_lowercase())?;
+                    node = children.get_mut(&windows_name_key(part))?;
                 }
                 Node::File { .. } => return None,
             }
@@ -1377,14 +1376,14 @@ impl WinFs {
                         .map_err(|e| e.to_string())
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            names.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+            names.sort_by(|a, b| windows_name_key(a).cmp(&windows_name_key(b)));
             return Ok(names);
         }
         match self.get_node(&p) {
             Some(Node::Dir { children, .. }) => {
                 let mut names: Vec<String> =
                     children.values().map(|n| n.name().to_string()).collect();
-                names.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+                names.sort_by(|a, b| windows_name_key(a).cmp(&windows_name_key(b)));
                 Ok(names)
             }
             Some(Node::File { .. }) => Err(format!("not a directory: {}", p.display())),
@@ -1423,9 +1422,8 @@ impl WinFs {
     pub fn find_file_path_suffix(&self, suffix: &str) -> Option<String> {
         fn visit(node: &Node, path: &str, suffix: &str) -> Option<String> {
             match node {
-                Node::File { .. } => path
-                    .to_lowercase()
-                    .ends_with(&suffix.to_lowercase())
+                Node::File { .. } => windows_name_key(path)
+                    .ends_with(&windows_name_key(suffix))
                     .then(|| path.to_string()),
                 Node::Dir { children, .. } => children
                     .values()
@@ -1478,7 +1476,7 @@ impl WinFs {
             .get_mut(&p.drive)
             .ok_or_else(|| format!("unsupported drive: {}", p.drive))?;
         for part in &p.parts {
-            let key = part.to_lowercase();
+            let key = windows_name_key(part);
             let next = node;
             match next {
                 Node::Dir { children, .. } => {
@@ -1530,7 +1528,7 @@ impl WinFs {
             Node::Dir { children, .. } => {
                 let leaf = p.parts.last().unwrap().clone();
                 children.insert(
-                    leaf.to_lowercase(),
+                    windows_name_key(&leaf),
                     Node::Dir {
                         name: leaf,
                         children: HashMap::new(),
@@ -1561,7 +1559,7 @@ impl WinFs {
             let Some(Node::Dir { children, .. }) = self.get_node_mut(&parent) else {
                 return Err(format!("path not found: {}", p.display()));
             };
-            children.remove(&p.parts.last().unwrap().to_lowercase());
+            children.remove(&windows_name_key(p.parts.last().unwrap()));
             self.symlinks.remove(&p.key());
             self.file_ids.remove(&p.key());
             self.file_metadata.remove(&p.key());
@@ -1584,7 +1582,7 @@ impl WinFs {
             None => return Err(format!("path not found: {}", p.display())),
         }
         let parent = self.parent_of(&p);
-        let leaf_key = p.parts.last().unwrap().to_lowercase();
+        let leaf_key = windows_name_key(p.parts.last().unwrap());
         let parent_node = self.get_node_mut(&parent).unwrap();
         if let Node::Dir { children, .. } = parent_node {
             children.remove(&leaf_key);
@@ -1636,7 +1634,7 @@ impl WinFs {
                 Node::Dir { children, .. } => {
                     let leaf = p.parts.last().unwrap().clone();
                     children.insert(
-                        leaf.to_lowercase(),
+                        windows_name_key(&leaf),
                         Node::File {
                             name: leaf,
                             data: stored,
@@ -1744,7 +1742,7 @@ impl WinFs {
                 .get_node_mut(&parent)
                 .ok_or_else(|| format!("path not found: {}", parent.display()))?;
             if let Node::Dir { children, .. } = parent_node {
-                children.remove(&p.parts.last().unwrap().to_lowercase());
+                children.remove(&windows_name_key(p.parts.last().unwrap()));
             }
             self.symlinks.remove(&p.key());
             self.file_ids.remove(&p.key());
@@ -1763,7 +1761,7 @@ impl WinFs {
             None => return Err(format!("file not found: {}", p.display())),
         }
         let parent = self.parent_of(&p);
-        let leaf_key = p.parts.last().unwrap().to_lowercase();
+        let leaf_key = windows_name_key(p.parts.last().unwrap());
         let parent_node = self.get_node_mut(&parent).unwrap();
         if let Node::Dir { children, .. } = parent_node {
             children.remove(&leaf_key);
@@ -1822,7 +1820,7 @@ impl WinFs {
             let Some(Node::Dir { children, .. }) = self.get_node_mut(&parent) else {
                 return Err(format!("path not found: {}", p.display()));
             };
-            children.remove(&p.parts.last().unwrap().to_lowercase());
+            children.remove(&windows_name_key(p.parts.last().unwrap()));
             self.symlinks.remove(&p.key());
             self.file_ids.remove(&p.key());
             self.file_metadata.remove(&p.key());
@@ -1845,7 +1843,7 @@ impl WinFs {
                     return Err(format!("directory not empty: {}", p.display()));
                 }
                 let parent = self.parent_of(&p);
-                let leaf_key = p.parts.last().unwrap().to_lowercase();
+                let leaf_key = windows_name_key(p.parts.last().unwrap());
                 let parent_node = self.get_node_mut(&parent).unwrap();
                 if let Node::Dir { children, .. } = parent_node {
                     children.remove(&leaf_key);
@@ -1944,14 +1942,14 @@ impl WinFs {
                 })?;
                 match dp {
                     Node::Dir { children, .. } => {
-                        children.insert(leaf.to_lowercase(), moved);
+                        children.insert(windows_name_key(&leaf), moved);
                     }
                     Node::File { .. } => return Err("destination parent is a file".to_string()),
                 }
             }
             // remove src
             let sparent = self.parent_of(&s);
-            let skey = s.parts.last().unwrap().to_lowercase();
+            let skey = windows_name_key(s.parts.last().unwrap());
             let sp = self.get_node_mut(&sparent).unwrap();
             if let Node::Dir { children, .. } = sp {
                 children.remove(&skey);
@@ -2086,7 +2084,7 @@ impl WinFs {
             .ok_or_else(|| format!("destination parent not found: {}", dparent.display()))?;
         match dp {
             Node::Dir { children, .. } => {
-                children.insert(leaf.to_lowercase(), copied);
+                children.insert(windows_name_key(&leaf), copied);
                 if self.record_changes {
                     self.changes.push(FsChange::Copy {
                         source: s.display(),
@@ -2141,7 +2139,7 @@ impl WinFs {
                 parent.display()
             ));
         };
-        children.insert(leaf.to_lowercase(), linked);
+        children.insert(windows_name_key(&leaf), linked);
         let identity = self.file_id(source)?;
         self.file_ids.insert(dst.key(), identity);
         if let Some(metadata) = self.file_metadata.get(&src.key()).copied() {
@@ -2401,6 +2399,26 @@ mod tests {
             fs.normalize(r"C:\work\ lead").unwrap().key(),
             fs.normalize(r"C:\work\lead").unwrap().key()
         );
+    }
+
+    #[test]
+    fn path_name_comparison_uses_single_character_uppercase_mapping() {
+        let mut fs = WinFs::new();
+        let dotted_capital = "C:\\İ.txt";
+        let dotted_small = "C:\\i\u{307}.txt";
+        fs.write_file(dotted_capital, b"capital".to_vec()).unwrap();
+        fs.write_file(dotted_small, b"small".to_vec()).unwrap();
+
+        assert_ne!(
+            fs.normalize(dotted_capital).unwrap().key(),
+            fs.normalize(dotted_small).unwrap().key()
+        );
+        assert_ne!(
+            fs.file_id(dotted_capital).unwrap(),
+            fs.file_id(dotted_small).unwrap()
+        );
+        assert_eq!(fs.read_file(dotted_capital).unwrap(), b"capital");
+        assert_eq!(fs.read_file(dotted_small).unwrap(), b"small");
     }
 
     #[test]

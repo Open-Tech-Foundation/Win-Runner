@@ -52,6 +52,8 @@ All notable changes to this project will be documented in this file.
   preserving leading spaces.
 - Rejected invalid Windows path characters and unsupported alternate-data
   stream syntax with `ERROR_INVALID_NAME` from native `CreateFileW`.
+- Changed WinFs case-insensitive keys to use one-character uppercase mapping,
+  keeping the distinct Windows names `İ.txt` and `i` plus a combining dot apart.
 - Added the C-locale `msvcrt!mbstowcs` shim used by Nano.
 - Added an optional native Node check proving a relative file that Node leaves
   in WinFS appears in the following shell directory listing.

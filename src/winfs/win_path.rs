@@ -27,6 +27,13 @@ pub(crate) enum ParsedWinPath {
     Invalid(String),
 }
 
+pub(super) fn windows_name_key(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| character.to_uppercase().next().unwrap_or(character))
+        .collect()
+}
+
 fn device_name(name: &str) -> Option<DosDevicePath> {
     let name = name
         .split(['.', ':'])

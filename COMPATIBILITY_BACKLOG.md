@@ -143,9 +143,10 @@ Record oracle values from `GetFullPathNameW`, `CreateFileW`, and
   `C:\file.txt:stream` instead of creating an ordinary file. Native
   `CreateFileW` reports `ERROR_INVALID_NAME` (123); parser and native tests
   cover these results. Alternate data streams remain unsupported.
-- [ ] **Windows name comparison.** Compare names by uppercasing one Unicode
-  character at a time. In particular, `İ.txt` and `i\u{307}.txt` are distinct;
-  do not use whole-string full-Unicode lowercase conversion.
+- [x] **Windows name comparison.** WinFs keys now uppercase one Unicode
+  character at a time instead of applying whole-string lowercase expansion.
+  `İ.txt` and `i\u{307}.txt` stay distinct while ASCII case variants continue
+  to resolve to the same file; unit tests cover identity and contents.
 - [ ] **Optional MAX_PATH mode.** Add an opt-in strict 260-character path check
   and cover boundary and extended-path cases in the oracle table.
 - [x] **One typed path parser.** Added `win_path::parse()` returning
