@@ -89,6 +89,9 @@ All notable changes to this project will be documented in this file.
   console module.
 - Moved completion-port APIs, directory notifications, and overlapped file I/O
   queue/cancellation support into a Linux backend module.
+- Moved Linux backend file, pipe, TLS, filesystem, and per-process context data
+  types into a dedicated state module; backend initialization and state access
+  remain in the backend root.
 - Added the C-locale `msvcrt!mbstowcs` shim used by Nano.
 - Added an optional native Node check proving a relative file that Node leaves
   in WinFS appears in the following shell directory listing.
