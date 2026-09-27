@@ -3697,6 +3697,37 @@ mod imp {
         }
 
         #[test]
+        fn modern_copy_file_w_preserves_existing_destination_when_fail_set() {
+            type CopyFileW = unsafe extern "win64" fn(*const u16, *const u16, i32) -> i32;
+            let copy_file: CopyFileW =
+                unsafe { std::mem::transmute(require_kernel32_api(b"CopyFileW\0") as usize) };
+            let source = r"C:\modern_copy_w_conflict_source.txt";
+            let destination = r"C:\modern_copy_w_conflict_destination.txt";
+            let source_wide = source.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let destination_wide = destination.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            {
+                let mut ctx = context.lock().unwrap();
+                ctx.fs
+                    .write_file(source, b"source-content".to_vec())
+                    .unwrap();
+                ctx.fs
+                    .write_file(destination, b"keep-content".to_vec())
+                    .unwrap();
+            }
+
+            let result = unsafe { copy_file(source_wide.as_ptr(), destination_wide.as_ptr(), 1) };
+            let source_bytes = context.lock().unwrap().fs.read_file(source).unwrap();
+            let destination_bytes = context.lock().unwrap().fs.read_file(destination).unwrap();
+            let mut ctx = context.lock().unwrap();
+            ctx.fs.delete_file(destination).unwrap();
+            ctx.fs.delete_file(source).unwrap();
+            assert_eq!(result, 0);
+            assert_eq!(source_bytes, b"source-content");
+            assert_eq!(destination_bytes, b"keep-content");
+        }
+
+        #[test]
         fn modern_set_file_information_by_handle_renames_guest_file() {
             type SetFileInformationByHandle =
                 unsafe extern "win64" fn(u64, i32, *const std::ffi::c_void, u32) -> i32;
@@ -3771,6 +3802,39 @@ mod imp {
             assert_eq!(ctx.fs.read_file(destination).unwrap(), b"new-destination");
             drop(ctx);
             context.lock().unwrap().fs.delete_file(destination).unwrap();
+        }
+
+        #[test]
+        fn modern_move_file_ex_preserves_existing_paths_without_replace_flag() {
+            type MoveFileExW = unsafe extern "win64" fn(*const u16, *const u16, u32) -> i32;
+            let move_file: MoveFileExW =
+                unsafe { std::mem::transmute(require_kernel32_api(b"MoveFileExW\0") as usize) };
+            let source = r"C:\modern_move_ex_conflict_source.txt";
+            let destination = r"C:\modern_move_ex_conflict_destination.txt";
+            let source_wide = source.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let destination_wide = destination.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            {
+                let mut ctx = context.lock().unwrap();
+                ctx.fs
+                    .write_file(source, b"source-content".to_vec())
+                    .unwrap();
+                ctx.fs
+                    .write_file(destination, b"keep-content".to_vec())
+                    .unwrap();
+            }
+
+            let result = unsafe { move_file(source_wide.as_ptr(), destination_wide.as_ptr(), 0) };
+            let error = super::native_get_last_error();
+            let ctx = context.lock().unwrap();
+            assert_eq!(ctx.fs.read_file(source).unwrap(), b"source-content");
+            assert_eq!(ctx.fs.read_file(destination).unwrap(), b"keep-content");
+            drop(ctx);
+            let mut ctx = context.lock().unwrap();
+            ctx.fs.delete_file(destination).unwrap();
+            ctx.fs.delete_file(source).unwrap();
+            assert_eq!(result, 0);
+            assert_eq!(error, 183); // ERROR_ALREADY_EXISTS
         }
 
         #[test]

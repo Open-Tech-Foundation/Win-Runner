@@ -51,6 +51,7 @@ All notable changes to this project will be documented in this file.
   file-handle completion-port behavior fixtures.
 - Added failed-mutation coverage for overlapping locks, hard-link destination
   conflicts, and invalid handle-information classes.
+- Added destination-conflict checks for wide copy and move operations.
 - Added WinFS edge-case tests for truncating writes, recursive tree copy/move,
   and invalid directory create/remove operations.
 - Added NT file compatibility tests for EOF resizing, rename-by-handle, and
