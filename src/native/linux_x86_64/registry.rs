@@ -1,0 +1,654 @@
+//! Windows import-name registration and trampoline selection.
+
+use super::*;
+
+pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
+    let module = dll.to_ascii_uppercase();
+    let allowed = match module.as_str() {
+        "MSVCRT.DLL" | "UCRTBASE.DLL" => {
+            matches!(
+                func,
+                "__set_app_type"
+                    | "__lconv_init"
+                    | "setlocale"
+                    | "_fmode"
+                    | "_commode"
+                    | "_acmdln"
+                    | "_initterm"
+                    | "__getmainargs"
+                    | "exit"
+                    | "_exit"
+                    | "_cexit"
+                    | "_c_exit"
+                    | "_onexit"
+                    | "malloc"
+                    | "realloc"
+                    | "free"
+                    | "memcmp"
+                    | "memcpy"
+                    | "memmove"
+                    | "memset"
+                    | "strlen"
+                    | "_strdup"
+                    | "strcmp"
+                    | "strncmp"
+                    | "strchr"
+                    | "strrchr"
+                    | "_stricmp"
+                    | "_strnicmp"
+                    | "_errno"
+                    | "getenv"
+                    | "__iob_func"
+                    | "atoi"
+                    | "signal"
+                    | "tolower"
+                    | "toupper"
+                    | "strncpy"
+                    | "mbstowcs"
+                    | "wcstombs"
+                    | "_stat64"
+                    | "_access"
+                    | "calloc"
+                    | "fwrite"
+                    | "sprintf"
+                    | "wcscmp"
+                    | "wcsstr"
+                    | "fflush"
+                    | "fputs"
+                    | "fputc"
+                    | "_iob"
+                    | "__initenv"
+                    | "_isatty"
+                    | "_get_osfhandle"
+            )
+        }
+        "WINMM.DLL" => func == "timeGetTime",
+        "USERENV.DLL" => func == "GetUserProfileDirectoryW",
+        "BCRYPTPRIMITIVES.DLL" => func == "ProcessPrng",
+        "OLE32.DLL" => func == "CoInitialize",
+        "SHELL32.DLL" => func == "SHGetFolderPathW",
+        "ADVAPI32.DLL" => matches!(
+            func,
+            "CryptAcquireContextW"
+                | "CryptGenRandom"
+                | "CryptReleaseContext"
+                | "SystemFunction036"
+                | "EventRegister"
+                | "EventUnregister"
+                | "EventSetInformation"
+                | "EventWriteTransfer"
+                | "RegOpenKeyExA"
+                | "RegOpenKeyExW"
+                | "RegCreateKeyExW"
+                | "RegSetValueExW"
+                | "RegQueryValueExW"
+                | "RegCloseKey"
+                | "LookupPrivilegeValueW"
+                | "AdjustTokenPrivileges"
+                | "OpenProcessToken"
+                | "GetUserNameW"
+        ),
+        "WS2_32.DLL" => matches!(
+            func,
+            "#2" | "#3"
+                | "#4"
+                | "#13"
+                | "#19"
+                | "#22"
+                | "#5"
+                | "#6"
+                | "#21"
+                | "#7"
+                | "#11"
+                | "#10"
+                | "#8"
+                | "#9"
+                | "#14"
+                | "#15"
+                | "#23"
+                | "#57"
+                | "GetAddrInfoW"
+                | "FreeAddrInfoW"
+                | "#111"
+                | "#112"
+                | "#115"
+                | "#116"
+                | "WSAIoctl"
+                | "WSARecv"
+                | "WSASend"
+                | "listen"
+        ),
+        "USER32.DLL" => matches!(func, "GetSystemMetrics" | "MessageBeep"),
+        "IPHLPAPI.DLL" => func == "GetAdaptersAddresses",
+        "NTDLL.DLL" => matches!(
+            func,
+            "RtlCaptureContext"
+                | "RtlGetVersion"
+                | "RtlNtStatusToDosError"
+                | "NtReadFile"
+                | "NtWriteFile"
+        ),
+        "API-MS-WIN-CORE-SYNCH-L1-2-0.DLL" => {
+            matches!(
+                func,
+                "WaitOnAddress" | "WakeByAddressAll" | "WakeByAddressSingle"
+            )
+        }
+        "KERNEL32.DLL" | "KERNELBASE.DLL" => {
+            !func.starts_with('#')
+                && !matches!(
+                    func,
+                    "timeGetTime" | "GetUserProfileDirectoryW" | "ProcessPrng"
+                )
+        }
+        _ => false,
+    };
+    allowed && baseline_trampoline(func).is_some()
+}
+
+pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
+    match name {
+        "__set_app_type" => Some(native_crt_set_app_type as *const () as usize as u64),
+        "_errno" => Some(native_crt_errno as *const () as usize as u64),
+        "getenv" => Some(native_crt_getenv as *const () as usize as u64),
+        "__iob_func" => Some(native_crt_iob_func as *const () as usize as u64),
+        "__lconv_init" => Some(native_crt_lconv_init as *const () as usize as u64),
+        "setlocale" => Some(native_crt_setlocale as *const () as usize as u64),
+        "_initterm" => Some(native_crt_initterm as *const () as usize as u64),
+        "__getmainargs" => Some(native_crt_getmainargs as *const () as usize as u64),
+        "exit" | "_exit" => Some(native_exit_process as *const () as usize as u64),
+        "_cexit" | "_c_exit" => Some(native_crt_cexit as *const () as usize as u64),
+        "_onexit" => Some(native_crt_onexit as *const () as usize as u64),
+        "strlen" => Some(native_crt_strlen as *const () as usize as u64),
+        "_strdup" => Some(native_crt_strdup as *const () as usize as u64),
+        "strcmp" => Some(native_crt_strcmp as *const () as usize as u64),
+        "strncmp" => Some(native_crt_strncmp as *const () as usize as u64),
+        "strchr" => Some(native_crt_strchr as *const () as usize as u64),
+        "strrchr" => Some(native_crt_strrchr as *const () as usize as u64),
+        "_stricmp" => Some(native_crt_stricmp as *const () as usize as u64),
+        "_strnicmp" => Some(native_crt_strnicmp as *const () as usize as u64),
+        "atoi" => Some(native_crt_atoi as *const () as usize as u64),
+        "signal" => Some(native_crt_signal as *const () as usize as u64),
+        "tolower" => Some(native_crt_tolower as *const () as usize as u64),
+        "toupper" => Some(native_crt_toupper as *const () as usize as u64),
+        "strncpy" => Some(native_crt_strncpy as *const () as usize as u64),
+        "mbstowcs" => Some(native_crt_mbstowcs as *const () as usize as u64),
+        "wcstombs" => Some(native_crt_wcstombs as *const () as usize as u64),
+        "_stat64" => Some(native_crt_stat64 as *const () as usize as u64),
+        "_access" => Some(native_crt_access as *const () as usize as u64),
+        "calloc" => Some(native_crt_calloc as *const () as usize as u64),
+        "fwrite" => Some(native_crt_fwrite as *const () as usize as u64),
+        "sprintf" => Some(native_crt_sprintf as *const () as usize as u64),
+        "wcscmp" => Some(native_crt_wcscmp as *const () as usize as u64),
+        "wcsstr" => Some(native_crt_wcsstr as *const () as usize as u64),
+        "fflush" => Some(native_crt_fflush as *const () as usize as u64),
+        "fputs" => Some(native_crt_fputs as *const () as usize as u64),
+        "fputc" => Some(native_crt_fputc as *const () as usize as u64),
+        "_iob" => Some(NATIVE_CRT_IOB.as_ptr() as u64),
+        "__initenv" => Some(NATIVE_CRT_INITENV.as_ptr() as u64),
+        "malloc" => Some(native_crt_malloc as *const () as usize as u64),
+        "realloc" => Some(native_crt_realloc as *const () as usize as u64),
+        "free" => Some(native_crt_free as *const () as usize as u64),
+        "memcmp" => Some(native_crt_memcmp as *const () as usize as u64),
+        "memcpy" => Some(native_crt_memcpy as *const () as usize as u64),
+        "memmove" => Some(native_crt_memmove as *const () as usize as u64),
+        "memset" => Some(native_crt_memset as *const () as usize as u64),
+        // These MSVCRT exports are data, not callable functions. Their
+        // IAT entries must point at writable storage because CRT startup
+        // initializes them before invoking the executable entry point.
+        "_fmode" => Some(NATIVE_CRT_FMODE.as_ptr() as u64),
+        "_commode" => Some(NATIVE_CRT_COMMODE.as_ptr() as u64),
+        "_acmdln" => {
+            let empty = std::ptr::addr_of!(NATIVE_CRT_EMPTY_COMMAND_LINE) as u64;
+            NATIVE_CRT_ACMDLN.store(empty, Ordering::Release);
+            Some(NATIVE_CRT_ACMDLN.as_ptr() as u64)
+        }
+        "RtlCaptureContext" => Some(wincli_native_rtl_capture_context as *const () as usize as u64),
+        // Winsock's stable ordinal exports for byte-order conversion.
+        "#8" | "#14" => Some(native_network_u32 as *const () as usize as u64),
+        "#9" | "#15" => Some(native_network_u16 as *const () as usize as u64),
+        "#10" => Some(native_ioctlsocket as *const () as usize as u64),
+        "#11" => Some(native_wsa_inet_addr as *const () as usize as u64),
+        "#4" => Some(native_connect_socket as *const () as usize as u64),
+        "#2" => Some(native_bind_socket as *const () as usize as u64),
+        "#13" | "listen" => Some(native_listen_socket as *const () as usize as u64),
+        "#19" => Some(native_send_socket as *const () as usize as u64),
+        "#22" => Some(native_shutdown_socket as *const () as usize as u64),
+        "#5" => Some(native_getpeername as *const () as usize as u64),
+        "#6" => Some(native_getsockname as *const () as usize as u64),
+        "#21" => Some(native_setsockopt as *const () as usize as u64),
+        "#57" => Some(native_wsa_get_host_name as *const () as usize as u64),
+        "GetAddrInfoW" => Some(native_get_addr_info_w as *const () as usize as u64),
+        "FreeAddrInfoW" => Some(native_free_addr_info_w as *const () as usize as u64),
+        "#115" => Some(native_wsa_startup as *const () as usize as u64),
+        "#116" => Some(native_wsa_cleanup as *const () as usize as u64),
+        "#23" => Some(native_socket as *const () as usize as u64),
+        "#3" => Some(native_close_socket as *const () as usize as u64),
+        "#7" => Some(native_getsockopt as *const () as usize as u64),
+        "WSAIoctl" => Some(native_wsa_ioctl as *const () as usize as u64),
+        "WSARecv" => Some(native_wsa_recv as *const () as usize as u64),
+        "WSASend" => Some(native_wsa_send as *const () as usize as u64),
+        "#111" => Some(native_wsa_get_last_error as *const () as usize as u64),
+        "#112" => Some(native_wsa_set_last_error as *const () as usize as u64),
+        "GetSystemMetrics" => Some(native_get_system_metrics as *const () as usize as u64),
+        "MessageBeep" => Some(native_message_beep as *const () as usize as u64),
+        "CompareStringOrdinal" => Some(native_compare_string_ordinal as *const () as usize as u64),
+        "GetLocaleInfoEx" => Some(native_get_locale_info_ex as *const () as usize as u64),
+        "GetLongPathNameW" => Some(native_get_long_path_name_w as *const () as usize as u64),
+        // WinFS has no short-name aliases, so the normalized DOS path is
+        // the shortest spelling available for the path.
+        "GetShortPathNameW" => Some(native_get_long_path_name_w as *const () as usize as u64),
+        "ReadDirectoryChangesW" => {
+            Some(native_read_directory_changes_w as *const () as usize as u64)
+        }
+        "AreFileApisANSI" => Some(native_are_file_apis_ansi as *const () as usize as u64),
+        "LocalFree" => Some(native_local_free as *const () as usize as u64),
+        "FreeLibraryAndExitThread" => {
+            Some(native_free_library_and_exit_thread as *const () as usize as u64)
+        }
+        "GetNumberOfConsoleInputEvents" => {
+            Some(native_get_number_of_console_input_events as *const () as usize as u64)
+        }
+        "SetNamedPipeHandleState" => {
+            Some(native_set_named_pipe_handle_state as *const () as usize as u64)
+        }
+        "ConnectNamedPipe" => Some(native_connect_named_pipe as *const () as usize as u64),
+        "WaitNamedPipeW" => Some(native_wait_named_pipe_w as *const () as usize as u64),
+        "WaitNamedPipeA" => Some(native_wait_named_pipe_a as *const () as usize as u64),
+        "CreateNamedPipeW" => Some(native_create_named_pipe_w as *const () as usize as u64),
+        "CreateNamedPipeA" => Some(native_create_named_pipe_a as *const () as usize as u64),
+        "CreateFileA" => Some(native_create_file_a as *const () as usize as u64),
+        "GetTempPathA" => Some(native_get_temp_path_a as *const () as usize as u64),
+        "GetTempPathW" => Some(native_get_temp_path_w as *const () as usize as u64),
+        "GetTempFileNameA" => Some(native_get_temp_file_name_a as *const () as usize as u64),
+        "GetTempFileNameW" => Some(native_get_temp_file_name_w as *const () as usize as u64),
+        "FindFirstFileA" => Some(native_find_first_file_a as *const () as usize as u64),
+        "FindNextFileA" => Some(native_find_next_file_a as *const () as usize as u64),
+        "FindFirstFileExA" => Some(native_find_first_file_ex_a as *const () as usize as u64),
+        "CopyFileA" => Some(native_copy_file_a as *const () as usize as u64),
+        "CopyFile2" => Some(native_copy_file2 as *const () as usize as u64),
+        "CopyFileExW" => Some(native_copy_file_ex_w as *const () as usize as u64),
+        "GetNamedPipeHandleStateW" => {
+            Some(native_get_named_pipe_handle_state_w as *const () as usize as u64)
+        }
+        "GetNamedPipeHandleStateA" => {
+            Some(native_get_named_pipe_handle_state_a as *const () as usize as u64)
+        }
+        "RegOpenKeyExW" => Some(native_reg_open_key_ex_w as *const () as usize as u64),
+        "RegOpenKeyExA" => Some(native_reg_open_key_ex_a as *const () as usize as u64),
+        "RegCreateKeyExW" => Some(native_reg_create_key_ex_w as *const () as usize as u64),
+        "RegSetValueExW" => Some(native_reg_set_value_ex_w as *const () as usize as u64),
+        "RegQueryValueExW" => Some(native_reg_query_value_ex_w as *const () as usize as u64),
+        "RegCloseKey" => Some(native_reg_close_key as *const () as usize as u64),
+        "CreateFileMappingW" => Some(native_create_file_mapping_w as *const () as usize as u64),
+        "CreateFileMappingA" => Some(native_create_file_mapping_a as *const () as usize as u64),
+        "MapViewOfFile" => Some(native_map_view_of_file as *const () as usize as u64),
+        "FlushViewOfFile" => Some(native_flush_view_of_file as *const () as usize as u64),
+        "UnmapViewOfFile" => Some(native_unmap_view_of_file as *const () as usize as u64),
+        "CryptAcquireContextW" => Some(native_crypt_acquire_context_w as *const () as usize as u64),
+        "CryptGenRandom" => Some(native_crypt_gen_random as *const () as usize as u64),
+        "CryptReleaseContext" => Some(native_crypt_release_context as *const () as usize as u64),
+        "SystemFunction036" => Some(native_rtl_gen_random as *const () as usize as u64),
+        "EventRegister" => Some(native_event_register as *const () as usize as u64),
+        "EventUnregister" => Some(native_event_unregister as *const () as usize as u64),
+        "EventSetInformation" => Some(native_event_set_information as *const () as usize as u64),
+        "EventWriteTransfer" => Some(native_event_write_transfer as *const () as usize as u64),
+        "SetConsoleCtrlHandler" => {
+            Some(native_set_console_ctrl_handler as *const () as usize as u64)
+        }
+        "CreateSemaphoreA" => Some(native_create_semaphore_a as *const () as usize as u64),
+        "ReleaseSemaphore" => Some(native_release_semaphore as *const () as usize as u64),
+        "CreateJobObjectW" => Some(native_create_job_object_w as *const () as usize as u64),
+        "CreateJobObjectA" => Some(native_create_job_object_a as *const () as usize as u64),
+        "SetInformationJobObject" => {
+            Some(native_set_information_job_object as *const () as usize as u64)
+        }
+        "AssignProcessToJobObject" => {
+            Some(native_assign_process_to_job_object as *const () as usize as u64)
+        }
+        "TerminateJobObject" => Some(native_terminate_job_object as *const () as usize as u64),
+        "RegisterWaitForSingleObject" => {
+            Some(native_register_wait_for_single_object as *const () as usize as u64)
+        }
+        "UnregisterWaitEx" => Some(native_unregister_wait_ex as *const () as usize as u64),
+        "UnregisterWait" => Some(native_unregister_wait_ex as *const () as usize as u64),
+        "_get_osfhandle" => Some(native_crt_get_osfhandle as *const () as usize as u64),
+        "_open_osfhandle" => Some(native_crt_open_osfhandle as *const () as usize as u64),
+        "_close" | "close" => Some(native_crt_close as *const () as usize as u64),
+        "_read" | "read" => Some(native_crt_read as *const () as usize as u64),
+        "_write" | "write" => Some(native_crt_write as *const () as usize as u64),
+        "_isatty" | "isatty" => Some(native_crt_isatty as *const () as usize as u64),
+        "CreateIoCompletionPort" => {
+            Some(native_create_io_completion_port as *const () as usize as u64)
+        }
+        "SetFileCompletionNotificationModes" => {
+            Some(native_set_file_completion_notification_modes as *const () as usize as u64)
+        }
+        "PostQueuedCompletionStatus" => {
+            Some(native_post_queued_completion_status as *const () as usize as u64)
+        }
+        "GetQueuedCompletionStatusEx" => {
+            Some(native_get_queued_completion_status_ex as *const () as usize as u64)
+        }
+        "GetQueuedCompletionStatus" => {
+            Some(native_get_queued_completion_status as *const () as usize as u64)
+        }
+        "GetOverlappedResult" => Some(native_get_overlapped_result as *const () as usize as u64),
+        "CancelIoEx" => Some(native_cancel_io_ex as *const () as usize as u64),
+        "CancelIo" => Some(native_cancel_io as *const () as usize as u64),
+        "VerSetConditionMask" => Some(native_ver_set_condition_mask as *const () as usize as u64),
+        "VerifyVersionInfoW" => Some(native_verify_version_info_w as *const () as usize as u64),
+        "GetCommandLineW" => Some(native_get_command_line_w as *const () as usize as u64),
+        "GetCommandLineA" => Some(native_get_command_line_a as *const () as usize as u64),
+        "GetLastError" => Some(native_get_last_error as *const () as usize as u64),
+        "SetLastError" => Some(native_set_last_error as *const () as usize as u64),
+        "SetErrorMode" => Some(native_set_error_mode as *const () as usize as u64),
+        "GetStartupInfoW" => Some(native_get_startup_info_w as *const () as usize as u64),
+        "GetStartupInfoA" => Some(native_get_startup_info_a as *const () as usize as u64),
+        "GetVersion" => Some(native_get_version as *const () as usize as u64),
+        "GetSystemDirectoryW" => Some(native_get_system_directory_w as *const () as usize as u64),
+        "lstrlenW" => Some(native_lstrlen_w as *const () as usize as u64),
+        "lstrcpyW" => Some(native_lstrcpy_w as *const () as usize as u64),
+        "lstrcatW" => Some(native_lstrcat_w as *const () as usize as u64),
+        "SetDefaultDllDirectories" => {
+            Some(native_set_default_dll_directories as *const () as usize as u64)
+        }
+        "SetFileApisToOEM" => Some(native_set_file_apis_to_oem as *const () as usize as u64),
+        "CoInitialize" => Some(native_co_initialize as *const () as usize as u64),
+        "LookupPrivilegeValueW" => {
+            Some(native_lookup_privilege_value_w as *const () as usize as u64)
+        }
+        "AdjustTokenPrivileges" => {
+            Some(native_adjust_token_privileges as *const () as usize as u64)
+        }
+        "SHGetFolderPathW" => Some(native_sh_get_folder_path_w as *const () as usize as u64),
+        "GetProcessHeap" => Some(native_get_process_heap as *const () as usize as u64),
+        "GetCurrentThreadId" => Some(native_get_current_thread_id as *const () as usize as u64),
+        "GetCurrentProcessId" => Some(native_get_current_process_id as *const () as usize as u64),
+        "GetCurrentProcess" => Some(native_get_current_process as *const () as usize as u64),
+        "OpenProcessToken" => Some(native_open_process_token as *const () as usize as u64),
+        "GetUserNameW" => Some(native_get_user_name_w as *const () as usize as u64),
+        "GetExitCodeProcess" => Some(native_get_exit_code_process as *const () as usize as u64),
+        "TerminateProcess" => Some(native_terminate_process as *const () as usize as u64),
+        "GetCurrentThread" => Some(native_get_current_thread as *const () as usize as u64),
+        "GetModuleHandleA" => Some(native_get_module_handle_a as *const () as usize as u64),
+        "VirtualProtect" => Some(native_virtual_protect as *const () as usize as u64),
+        "VirtualAlloc" => Some(native_virtual_alloc as *const () as usize as u64),
+        "VirtualFree" => Some(native_virtual_free as *const () as usize as u64),
+        "LoadLibraryExW" => Some(native_load_library_ex_w as *const () as usize as u64),
+        "LoadLibraryExA" => Some(native_load_library_ex_a as *const () as usize as u64),
+        "GetProcAddress" => Some(native_get_proc_address as *const () as usize as u64),
+        "FreeLibrary" => Some(native_free_library as *const () as usize as u64),
+        "QueryPerformanceCounter" => {
+            Some(native_query_performance_counter as *const () as usize as u64)
+        }
+        "QueryPerformanceFrequency" => {
+            Some(native_query_performance_frequency as *const () as usize as u64)
+        }
+        "GetTickCount" => Some(native_get_tick_count as *const () as usize as u64),
+        "GetTickCount64" => Some(native_get_tick_count64 as *const () as usize as u64),
+        "Sleep" => Some(native_sleep as *const () as usize as u64),
+        "SwitchToThread" => Some(native_switch_to_thread as *const () as usize as u64),
+        "GetTimeZoneInformation" => {
+            Some(native_get_time_zone_information as *const () as usize as u64)
+        }
+        "GetDynamicTimeZoneInformation" => {
+            Some(native_get_dynamic_time_zone_information as *const () as usize as u64)
+        }
+        "timeGetTime" => Some(native_time_get_time as *const () as usize as u64),
+        "GlobalMemoryStatusEx" => Some(native_global_memory_status_ex as *const () as usize as u64),
+        "InitializeCriticalSectionEx" => {
+            Some(native_initialize_critical_section_ex as *const () as usize as u64)
+        }
+        "InitializeCriticalSectionAndSpinCount" => {
+            Some(native_initialize_critical_section_and_spin_count as *const () as usize as u64)
+        }
+        "InitializeCriticalSection" => {
+            Some(native_initialize_critical_section as *const () as usize as u64)
+        }
+        "InitializeSRWLock" => Some(native_initialize_srw_lock as *const () as usize as u64),
+        "AcquireSRWLockExclusive" => {
+            Some(native_acquire_srw_lock_exclusive as *const () as usize as u64)
+        }
+        "AcquireSRWLockShared" => Some(native_acquire_srw_lock_shared as *const () as usize as u64),
+        "TryAcquireSRWLockExclusive" => {
+            Some(native_try_acquire_srw_lock_exclusive as *const () as usize as u64)
+        }
+        "TryAcquireSRWLockShared" => {
+            Some(native_try_acquire_srw_lock_shared as *const () as usize as u64)
+        }
+        "ReleaseSRWLockExclusive" => {
+            Some(native_release_srw_lock_exclusive as *const () as usize as u64)
+        }
+        "ReleaseSRWLockShared" => Some(native_release_srw_lock_shared as *const () as usize as u64),
+        "InitializeConditionVariable" => {
+            Some(native_initialize_condition_variable as *const () as usize as u64)
+        }
+        "WakeConditionVariable" => {
+            Some(native_wake_condition_variable as *const () as usize as u64)
+        }
+        "WakeAllConditionVariable" => {
+            Some(native_wake_all_condition_variable as *const () as usize as u64)
+        }
+        "SleepConditionVariableSRW" => {
+            Some(native_sleep_condition_variable_srw as *const () as usize as u64)
+        }
+        "SleepConditionVariableCS" => {
+            Some(native_sleep_condition_variable_cs as *const () as usize as u64)
+        }
+        "InitOnceInitialize" => Some(native_init_once_initialize as *const () as usize as u64),
+        "InitOnceExecuteOnce" => Some(native_init_once_execute_once as *const () as usize as u64),
+        "InitOnceBeginInitialize" => {
+            Some(native_init_once_begin_initialize as *const () as usize as u64)
+        }
+        "InitOnceComplete" => Some(native_init_once_complete as *const () as usize as u64),
+        "TlsAlloc" => Some(native_tls_alloc as *const () as usize as u64),
+        "TlsFree" => Some(native_tls_free as *const () as usize as u64),
+        "TlsGetValue" => Some(native_tls_get_value as *const () as usize as u64),
+        "TlsSetValue" => Some(native_tls_set_value as *const () as usize as u64),
+        "EncodePointer" => Some(native_encode_pointer as *const () as usize as u64),
+        "DecodePointer" => Some(native_decode_pointer as *const () as usize as u64),
+        "IsProcessorFeaturePresent" => {
+            Some(native_is_processor_feature_present as *const () as usize as u64)
+        }
+        "RtlGetVersion" => Some(native_rtl_get_version as *const () as usize as u64),
+        "NtReadFile" => Some(native_nt_read_file as *const () as usize as u64),
+        "NtWriteFile" => Some(native_nt_write_file as *const () as usize as u64),
+        "RtlNtStatusToDosError" => {
+            Some(native_rtl_nt_status_to_dos_error as *const () as usize as u64)
+        }
+        "EnterCriticalSection" => Some(native_enter_critical_section as *const () as usize as u64),
+        "LeaveCriticalSection" => Some(native_leave_critical_section as *const () as usize as u64),
+        "DeleteCriticalSection" => {
+            Some(native_delete_critical_section as *const () as usize as u64)
+        }
+        "InitializeSListHead" => Some(native_initialize_slist_head as *const () as usize as u64),
+        "InterlockedPushEntrySList" => {
+            Some(native_interlocked_push_entry_slist as *const () as usize as u64)
+        }
+        "InterlockedPopEntrySList" => {
+            Some(native_interlocked_pop_entry_slist as *const () as usize as u64)
+        }
+        "InterlockedFlushSList" => {
+            Some(native_interlocked_flush_slist as *const () as usize as u64)
+        }
+        "QueryDepthSList" => Some(native_query_depth_slist as *const () as usize as u64),
+        "FlsAlloc" => Some(native_fls_alloc as *const () as usize as u64),
+        "FlsFree" => Some(native_fls_free as *const () as usize as u64),
+        "FlsGetValue" => Some(native_fls_get_value as *const () as usize as u64),
+        "FlsSetValue" => Some(native_fls_set_value as *const () as usize as u64),
+        "GetSystemTimeAsFileTime" => {
+            Some(native_get_system_time_as_file_time as *const () as usize as u64)
+        }
+        "GetSystemTime" => Some(native_get_system_time as *const () as usize as u64),
+        "SystemTimeToFileTime" => {
+            Some(native_system_time_to_file_time as *const () as usize as u64)
+        }
+        "GetSystemInfo" => Some(native_get_system_info as *const () as usize as u64),
+        "GetProcessAffinityMask" => {
+            Some(native_get_process_affinity_mask as *const () as usize as u64)
+        }
+        "GetNativeSystemInfo" => Some(native_get_native_system_info as *const () as usize as u64),
+        "GetFullPathNameW" => Some(native_get_full_path_name_w as *const () as usize as u64),
+        "FormatMessageW" => Some(native_format_message_w as *const () as usize as u64),
+        "FormatMessageA" => Some(native_format_message_a as *const () as usize as u64),
+        "GetUserProfileDirectoryW" => {
+            Some(native_get_user_profile_directory_w as *const () as usize as u64)
+        }
+        "GetStdHandle" => Some(native_get_std_handle as *const () as usize as u64),
+        "SetStdHandle" => Some(native_set_std_handle as *const () as usize as u64),
+        "SetHandleInformation" => Some(native_set_handle_information as *const () as usize as u64),
+        "DuplicateHandle" => Some(native_duplicate_handle as *const () as usize as u64),
+        "GetFileType" => Some(native_get_file_type as *const () as usize as u64),
+        "GetModuleFileNameW" => Some(native_get_module_file_name_w as *const () as usize as u64),
+        "GetModuleHandleW" => Some(native_get_module_handle_w as *const () as usize as u64),
+        "GetModuleHandleExW" => Some(native_get_module_handle_ex_w as *const () as usize as u64),
+        "GetEnvironmentStringsW" => {
+            Some(native_get_environment_strings_w as *const () as usize as u64)
+        }
+        "FreeEnvironmentStringsW" => {
+            Some(native_free_environment_strings_w as *const () as usize as u64)
+        }
+        "SetUnhandledExceptionFilter" => {
+            Some(native_set_unhandled_exception_filter as *const () as usize as u64)
+        }
+        "AddVectoredExceptionHandler" => {
+            Some(native_add_vectored_exception_handler as *const () as usize as u64)
+        }
+        "RemoveVectoredExceptionHandler" => {
+            Some(native_remove_vectored_exception_handler as *const () as usize as u64)
+        }
+        "SetThreadStackGuarantee" => {
+            Some(native_set_thread_stack_guarantee as *const () as usize as u64)
+        }
+        "GetACP" => Some(native_get_acp as *const () as usize as u64),
+        "GetOEMCP" => Some(native_get_oem_cp as *const () as usize as u64),
+        "IsValidCodePage" => Some(native_is_valid_code_page as *const () as usize as u64),
+        "GetCPInfo" => Some(native_get_cp_info as *const () as usize as u64),
+        "MultiByteToWideChar" => Some(native_multi_byte_to_wide_char as *const () as usize as u64),
+        "GetStringTypeW" => Some(native_get_string_type_w as *const () as usize as u64),
+        "LCMapStringW" => Some(native_lc_map_string_w as *const () as usize as u64),
+        "WideCharToMultiByte" => Some(native_wide_char_to_multi_byte as *const () as usize as u64),
+        "HeapAlloc" => Some(native_heap_alloc as *const () as usize as u64),
+        "HeapReAlloc" => Some(native_heap_realloc as *const () as usize as u64),
+        "HeapSize" => Some(native_heap_size as *const () as usize as u64),
+        "HeapFree" => Some(native_heap_free as *const () as usize as u64),
+        "ProcessPrng" => Some(native_process_prng as *const () as usize as u64),
+        "GetConsoleMode" => Some(native_get_console_mode as *const () as usize as u64),
+        "GetConsoleOutputCP" => Some(native_get_console_output_cp as *const () as usize as u64),
+        "GetConsoleCursorInfo" => Some(native_get_console_cursor_info as *const () as usize as u64),
+        "SetConsoleCursorInfo" => Some(native_set_console_cursor_info as *const () as usize as u64),
+        "SetConsoleCursorPosition" => {
+            Some(native_set_console_cursor_position as *const () as usize as u64)
+        }
+        "GetConsoleScreenBufferInfo" => {
+            Some(native_get_console_screen_buffer_info as *const () as usize as u64)
+        }
+        "SetConsoleScreenBufferSize" => {
+            Some(native_set_console_screen_buffer_size as *const () as usize as u64)
+        }
+        "SetConsoleWindowInfo" => Some(native_set_console_window_info as *const () as usize as u64),
+        "SetConsoleActiveScreenBuffer" => {
+            Some(native_set_console_active_screen_buffer as *const () as usize as u64)
+        }
+        "SetConsoleMode" => Some(native_set_console_mode as *const () as usize as u64),
+        "SetConsoleTitleW" => Some(native_set_console_title_w as *const () as usize as u64),
+        "GetLogicalProcessorInformation" => {
+            Some(native_get_logical_processor_information as *const () as usize as u64)
+        }
+        "GetAdaptersAddresses" => Some(native_get_adapters_addresses as *const () as usize as u64),
+        "GetEnvironmentVariableW" => {
+            Some(native_get_environment_variable_w as *const () as usize as u64)
+        }
+        "SetEnvironmentVariableW" => {
+            Some(native_set_environment_variable_w as *const () as usize as u64)
+        }
+        "NeedCurrentDirectoryForExePathW" => {
+            Some(native_need_current_directory_for_exe_path_w as *const () as usize as u64)
+        }
+        "GetCurrentDirectoryW" => Some(native_get_current_directory_w as *const () as usize as u64),
+        "GetComputerNameExW" => Some(native_get_computer_name_ex_w as *const () as usize as u64),
+        "SetFileTime" => Some(native_set_file_time as *const () as usize as u64),
+        "SetFilePointerEx" => Some(native_set_file_pointer_ex as *const () as usize as u64),
+        "SetFilePointer" => Some(native_set_file_pointer as *const () as usize as u64),
+        "WriteFile" => Some(native_write_file as *const () as usize as u64),
+        "WriteConsoleW" => Some(native_write_console_w as *const () as usize as u64),
+        "WriteConsoleOutputA" => Some(native_write_console_output_a as *const () as usize as u64),
+        "ExitProcess" => Some(native_exit_process as *const () as usize as u64),
+        "CreateProcessW" => Some(native_create_process_w as *const () as usize as u64),
+        "CreateFileW" => Some(native_create_file_w as *const () as usize as u64),
+        "CreateFile2" => Some(native_create_file2 as *const () as usize as u64),
+        "OpenFileById" => Some(native_open_file_by_id as *const () as usize as u64),
+        "SetFileValidData" => Some(native_set_file_valid_data as *const () as usize as u64),
+        "WriteFileGather" => Some(native_write_file_gather as *const () as usize as u64),
+        "LockFile" => Some(native_lock_file as *const () as usize as u64),
+        "UnlockFile" => Some(native_unlock_file as *const () as usize as u64),
+        "FindFirstStreamW" => Some(native_find_first_stream_w as *const () as usize as u64),
+        "GetFileAttributesW" => Some(native_get_file_attributes_w as *const () as usize as u64),
+        "SetFileAttributesW" => Some(native_set_file_attributes_w as *const () as usize as u64),
+        "SetFileAttributesA" => Some(native_set_file_attributes_a as *const () as usize as u64),
+        "CreateHardLinkA" => Some(native_create_hard_link_a as *const () as usize as u64),
+        "CreateHardLinkW" => Some(native_create_hard_link_w as *const () as usize as u64),
+        "CreateSymbolicLinkA" => Some(native_create_symbolic_link_a as *const () as usize as u64),
+        "CreateSymbolicLinkW" => Some(native_create_symbolic_link_w as *const () as usize as u64),
+        "ReplaceFileA" => Some(native_replace_file_a as *const () as usize as u64),
+        "ReplaceFileW" => Some(native_replace_file_w as *const () as usize as u64),
+        "GetFileAttributesExW" => {
+            Some(native_get_file_attributes_ex_w as *const () as usize as u64)
+        }
+        "GetFileInformationByHandle" => {
+            Some(native_get_file_information_by_handle as *const () as usize as u64)
+        }
+        "GetFileInformationByHandleEx" => {
+            Some(native_get_file_information_by_handle_ex as *const () as usize as u64)
+        }
+        "GetFileSizeEx" => Some(native_get_file_size_ex as *const () as usize as u64),
+        "GetOverlappedResultEx" => {
+            Some(native_get_overlapped_result_ex as *const () as usize as u64)
+        }
+        "SetFileInformationByHandle" => {
+            Some(native_set_file_information_by_handle as *const () as usize as u64)
+        }
+        "GetFinalPathNameByHandleW" => {
+            Some(native_get_final_path_name_by_handle_w as *const () as usize as u64)
+        }
+        "GetFinalPathNameByHandleA" => {
+            Some(native_get_final_path_name_by_handle_a as *const () as usize as u64)
+        }
+        "FindFirstFileExW" => Some(native_find_first_file_ex_w as *const () as usize as u64),
+        "FindFirstFileW" => Some(native_find_first_file_w as *const () as usize as u64),
+        "FindNextFileW" => Some(native_find_next_file_w as *const () as usize as u64),
+        "FindClose" => Some(native_find_close as *const () as usize as u64),
+        "CreateThread" => Some(native_create_thread as *const () as usize as u64),
+        "ResumeThread" => Some(native_resume_thread as *const () as usize as u64),
+        "WaitForSingleObject" => Some(native_wait_for_single_object as *const () as usize as u64),
+        "CreateEventW" => Some(native_create_event_w as *const () as usize as u64),
+        "CreateEventA" => Some(native_create_event_a as *const () as usize as u64),
+        "CreateEventExW" => Some(native_create_event_ex_w as *const () as usize as u64),
+        "CreateEventExA" => Some(native_create_event_ex_a as *const () as usize as u64),
+        "SetEvent" => Some(native_set_event as *const () as usize as u64),
+        "ResetEvent" => Some(native_reset_event as *const () as usize as u64),
+        "WaitOnAddress" => Some(native_wait_on_address as *const () as usize as u64),
+        "WakeByAddressAll" => Some(native_wake_by_address_all as *const () as usize as u64),
+        "WakeByAddressSingle" => Some(native_wake_by_address_single as *const () as usize as u64),
+        "CreateWaitableTimerExW" => {
+            Some(native_create_waitable_timer_ex_w as *const () as usize as u64)
+        }
+        "SetWaitableTimer" => Some(native_set_waitable_timer as *const () as usize as u64),
+        "ReadFile" => Some(native_read_file as *const () as usize as u64),
+        "CloseHandle" => Some(native_close_handle as *const () as usize as u64),
+        "CreateDirectoryW" => Some(native_create_directory_w as *const () as usize as u64),
+        "RemoveDirectoryA" => Some(native_remove_directory_a as *const () as usize as u64),
+        "RemoveDirectoryW" => Some(native_remove_directory_w as *const () as usize as u64),
+        "DeleteFileW" => Some(native_delete_file_w as *const () as usize as u64),
+        "DeleteFileA" => Some(native_delete_file_a as *const () as usize as u64),
+        "MoveFileW" => Some(native_move_file_w as *const () as usize as u64),
+        "MoveFileA" => Some(native_move_file_a as *const () as usize as u64),
+        "MoveFileExW" => Some(native_move_file_ex_w as *const () as usize as u64),
+        "CopyFileW" => Some(native_copy_file_w as *const () as usize as u64),
+        "FlushFileBuffers" => Some(native_flush_file_buffers as *const () as usize as u64),
+        "SetEndOfFile" => Some(native_set_end_of_file as *const () as usize as u64),
+        "ReOpenFile" => Some(native_reopen_file as *const () as usize as u64),
+        _ => None,
+    }
+}

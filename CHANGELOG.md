@@ -66,6 +66,8 @@ All notable changes to this project will be documented in this file.
 - Moved native execution behind a platform-neutral façade, with Linux x86-64
   and unsupported-host implementations in separate modules as the first step
   toward platform-specific native backends.
+- Separated Linux host ABI declarations and PE import/trampoline selection
+  into backend-local modules.
 - Added the C-locale `msvcrt!mbstowcs` shim used by Nano.
 - Added an optional native Node check proving a relative file that Node leaves
   in WinFS appears in the following shell directory listing.
