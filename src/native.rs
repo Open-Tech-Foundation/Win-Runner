@@ -3147,6 +3147,312 @@ mod imp {
         }
 
         #[test]
+        fn modern_open_file_by_id_opens_existing_file_identifier() {
+            type OpenFileById = unsafe extern "win64" fn(
+                u64,
+                *const std::ffi::c_void,
+                u32,
+                u32,
+                *const std::ffi::c_void,
+                u32,
+            ) -> u64;
+            let open_by_id: OpenFileById =
+                unsafe { std::mem::transmute(require_kernel32_api(b"OpenFileById\0") as usize) };
+            let path = r"C:\modern_open_by_id.txt";
+            let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(path, b"opened-by-id".to_vec())
+                .unwrap();
+            let volume = super::native_create_file_w(
+                [b'C' as u16, b':' as u16, b'\\' as u16, 0].as_ptr(),
+                0,
+                7,
+                0,
+                3,
+                0x0200_0000, // FILE_FLAG_BACKUP_SEMANTICS
+                0,
+            );
+            let file = super::native_create_file_w(wide.as_ptr(), 0x8000_0000, 7, 3, 0, 0, 0);
+            assert_ne!(volume, u64::MAX);
+            assert_ne!(file, u64::MAX);
+            let mut information = [0u8; 52];
+            assert_eq!(
+                super::native_get_file_information_by_handle(file, information.as_mut_ptr()),
+                1
+            );
+            let file_id = u64::from_le_bytes([
+                information[48],
+                information[49],
+                information[50],
+                information[51],
+                information[44],
+                information[45],
+                information[46],
+                information[47],
+            ]);
+            let mut descriptor = [0u8; 24]; // FILE_ID_DESCRIPTOR
+            descriptor[..4].copy_from_slice(&24u32.to_le_bytes());
+            descriptor[4..8].copy_from_slice(&0u32.to_le_bytes()); // FileIdType
+            descriptor[8..16].copy_from_slice(&file_id.to_le_bytes());
+
+            let opened = unsafe {
+                open_by_id(
+                    volume,
+                    descriptor.as_ptr().cast(),
+                    0x8000_0000,
+                    7,
+                    std::ptr::null(),
+                    0,
+                )
+            };
+            let mut contents = [0u8; 12];
+            let mut read = 0;
+            let read_result = if opened != u64::MAX {
+                super::native_read_file(opened, contents.as_mut_ptr(), 12, &mut read, 0)
+            } else {
+                0
+            };
+            if opened != u64::MAX {
+                assert_eq!(super::native_close_handle(opened), 1);
+            }
+            assert_eq!(super::native_close_handle(file), 1);
+            assert_eq!(super::native_close_handle(volume), 1);
+            context.lock().unwrap().fs.delete_file(path).unwrap();
+            assert_ne!(opened, u64::MAX);
+            assert_eq!(read_result, 1);
+            assert_eq!(read, 12);
+            assert_eq!(&contents, b"opened-by-id");
+        }
+
+        #[test]
+        fn modern_set_file_valid_data_reports_missing_volume_privilege() {
+            type SetFileValidData = unsafe extern "win64" fn(u64, i64) -> i32;
+            let set_valid_data: SetFileValidData = unsafe {
+                std::mem::transmute(require_kernel32_api(b"SetFileValidData\0") as usize)
+            };
+            let path = r"C:\modern_set_valid_data_privilege.txt";
+            let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(path, b"valid-data".to_vec())
+                .unwrap();
+            let handle = super::native_create_file_w(wide.as_ptr(), 0x4000_0000, 7, 0, 3, 0, 0);
+            assert_ne!(handle, u64::MAX);
+
+            let result = unsafe { set_valid_data(handle, 10) };
+            let error = super::native_get_last_error();
+            assert_eq!(super::native_close_handle(handle), 1);
+            context.lock().unwrap().fs.delete_file(path).unwrap();
+            assert_eq!(result, 0);
+            assert_eq!(error, 1314); // ERROR_PRIVILEGE_NOT_HELD
+        }
+
+        #[test]
+        fn modern_write_file_gather_writes_page_aligned_segment() {
+            type WriteFileGather = unsafe extern "win64" fn(
+                u64,
+                *const u64,
+                u32,
+                *mut u32,
+                *mut std::ffi::c_void,
+            ) -> i32;
+            let write_gather: WriteFileGather =
+                unsafe { std::mem::transmute(require_kernel32_api(b"WriteFileGather\0") as usize) };
+            let path = r"C:\modern_write_file_gather.txt";
+            let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(path, vec![0; 4096])
+                .unwrap();
+            let handle = super::native_create_file_w(
+                wide.as_ptr(),
+                0xC000_0000,
+                7,
+                0,
+                3,
+                0x6000_0000, // FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED
+                0,
+            );
+            assert_ne!(handle, u64::MAX);
+            let layout = std::alloc::Layout::from_size_align(4096, 4096).unwrap();
+            let page = unsafe { std::alloc::alloc_zeroed(layout) };
+            assert!(!page.is_null());
+            unsafe { std::ptr::write_bytes(page, b'G', 4096) };
+            let segments = [page as u64];
+            let mut overlapped = [0u64; 4];
+            let call_result = unsafe {
+                write_gather(
+                    handle,
+                    segments.as_ptr(),
+                    4096,
+                    std::ptr::null_mut(),
+                    overlapped.as_mut_ptr().cast(),
+                )
+            };
+            let call_error = super::native_get_last_error();
+            let mut transferred = 0;
+            let result = if call_result != 0 || call_error == 997 {
+                super::native_get_overlapped_result(
+                    handle,
+                    overlapped.as_ptr() as u64,
+                    &mut transferred,
+                    1,
+                )
+            } else {
+                0
+            };
+            let bytes = context
+                .lock()
+                .unwrap()
+                .fs
+                .read_file(path)
+                .unwrap_or_default();
+            unsafe { std::alloc::dealloc(page, layout) };
+            assert_eq!(super::native_close_handle(handle), 1);
+            context.lock().unwrap().fs.delete_file(path).unwrap();
+            assert!(call_result != 0 || call_error == 997);
+            assert_eq!(result, 1);
+            assert_eq!(transferred, 4096);
+            assert_eq!(bytes, vec![b'G'; 4096]);
+        }
+
+        #[test]
+        fn modern_file_handle_completion_port_delivers_overlapped_write() {
+            let path = r"C:\modern_file_handle_iocp.txt";
+            let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(path, Vec::new())
+                .unwrap();
+            let handle = super::native_create_file_w(
+                wide.as_ptr(),
+                0xC000_0000,
+                7,
+                0,
+                3,
+                0x4000_0000, // FILE_FLAG_OVERLAPPED
+                0,
+            );
+            assert_ne!(handle, u64::MAX);
+            let key = 0x4f50_435f_4649_4c45;
+            let port = super::native_create_io_completion_port(handle, 0, key, 0);
+            assert_ne!(port, 0);
+
+            let payload = vec![0x6du8; 64 * 1024];
+            let mut overlapped = [0u64; 4];
+            let pointer = overlapped.as_mut_ptr() as u64;
+            let mut written = u32::MAX;
+            let write_result = super::native_write_file(
+                handle,
+                payload.as_ptr(),
+                payload.len() as u32,
+                &mut written,
+                pointer,
+            );
+            let write_error = super::native_get_last_error();
+            let mut completion_bytes = 0;
+            let mut completion_key = 0;
+            let mut completion_overlapped = 0;
+            let completion_result = super::native_get_queued_completion_status(
+                port,
+                &mut completion_bytes,
+                &mut completion_key,
+                &mut completion_overlapped,
+                5000,
+            );
+            let mut completed_bytes = 0;
+            let result_result =
+                super::native_get_overlapped_result(handle, pointer, &mut completed_bytes, 0);
+            unsafe { std::ptr::write_bytes(pointer as *mut u8, 0, 32) };
+            let mut received = vec![0u8; payload.len()];
+            let mut read = u32::MAX;
+            let read_result = super::native_read_file(
+                handle,
+                received.as_mut_ptr(),
+                received.len() as u32,
+                &mut read,
+                pointer,
+            );
+            let read_error = super::native_get_last_error();
+            let mut read_completion_bytes = 0;
+            let mut read_completion_key = 0;
+            let mut read_completion_overlapped = 0;
+            let read_completion_result = super::native_get_queued_completion_status(
+                port,
+                &mut read_completion_bytes,
+                &mut read_completion_key,
+                &mut read_completion_overlapped,
+                5000,
+            );
+            let mut read_completed_bytes = 0;
+            let read_result_result =
+                super::native_get_overlapped_result(handle, pointer, &mut read_completed_bytes, 0);
+            let contents = context
+                .lock()
+                .unwrap()
+                .fs
+                .read_file(path)
+                .unwrap_or_default();
+            assert_eq!(super::native_close_handle(handle), 1);
+            assert_eq!(super::native_close_handle(port), 1);
+            context.lock().unwrap().fs.delete_file(path).unwrap();
+
+            assert_eq!(write_result, 0);
+            assert_eq!(write_error, 997); // ERROR_IO_PENDING
+            assert_eq!(completion_result, 1);
+            assert_eq!(completion_bytes as usize, payload.len());
+            assert_eq!(completion_key, key);
+            assert_eq!(completion_overlapped, pointer);
+            assert_eq!(result_result, 1);
+            assert_eq!(completed_bytes as usize, payload.len());
+            assert_eq!(contents, payload);
+            assert_eq!(read_result, 0);
+            assert_eq!(read_error, 997); // ERROR_IO_PENDING
+            assert_eq!(read_completion_result, 1);
+            assert_eq!(read_completion_bytes as usize, received.len());
+            assert_eq!(read_completion_key, key);
+            assert_eq!(read_completion_overlapped, pointer);
+            assert_eq!(read_result_result, 1);
+            assert_eq!(read_completed_bytes as usize, received.len());
+            assert_eq!(received, payload);
+        }
+
+        #[test]
+        fn modern_file_completion_modes_accept_overlapped_handle() {
+            let path = r"C:\modern_file_completion_modes.txt";
+            let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(path, Vec::new())
+                .unwrap();
+            let handle =
+                super::native_create_file_w(wide.as_ptr(), 0x4000_0000, 7, 0, 3, 0x4000_0000, 0);
+            assert_ne!(handle, u64::MAX);
+
+            let result = super::native_set_file_completion_notification_modes(handle, 1);
+            let error = super::native_get_last_error();
+            assert_eq!(super::native_close_handle(handle), 1);
+            context.lock().unwrap().fs.delete_file(path).unwrap();
+            assert_eq!(result, 1, "valid overlapped file handle rejected: {error}");
+        }
+
+        #[test]
         fn modern_ansi_replace_file_moves_old_data_to_backup() {
             type ReplaceFileA =
                 unsafe extern "win64" fn(*const u8, *const u8, *const u8, u32, u64, u64) -> i32;

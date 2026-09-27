@@ -47,6 +47,8 @@ All notable changes to this project will be documented in this file.
   aligned-buffer invalid-handle case for `WriteFileGather`.
 - Added wide-path copy and handle-based rename behavior fixtures.
 - Added wide-path move-with-replacement and directory create/remove cases.
+- Added deeper file-ID open, privileged valid-data, aligned gather-write, and
+  file-handle completion-port behavior fixtures.
 - Added WinFS edge-case tests for truncating writes, recursive tree copy/move,
   and invalid directory create/remove operations.
 - Added NT file compatibility tests for EOF resizing, rename-by-handle, and
