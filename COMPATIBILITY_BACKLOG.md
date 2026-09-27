@@ -122,9 +122,11 @@ Record oracle values from `GetFullPathNameW`, `CreateFileW`, and
   as a character device through `CreateFileW`; writes are discarded, reads
   return EOF, and no WinFs file entry is created. Unit and generated native PE
   guest tests cover these semantics.
-- [ ] **Console and reserved DOS device names.** Cover `CON`, `CONIN$`, and
-  `CONOUT$`; recognize reserved names including `COM1` and `LPT1`, also when
-  followed by extensions such as `nul.txt`.
+- [x] **Console and reserved DOS device names.** `CON`, `CONIN$`, and
+  `CONOUT$` open as character handles routed to the process standard handles;
+  invalid read/write directions fail. Reserved names including `COM1` and
+  `LPT1` are rejected even with extensions. Unit tests and a generated native
+  PE guest test cover these cases.
 - [ ] **Device and pipe namespace.** Parse `\\.\NUL` and
   `\\.\pipe\foo` as device/pipe paths rather than C: paths.
 - [ ] **UNC paths.** Support `\\server\share\x` and
@@ -168,7 +170,7 @@ Record oracle values from `GetFullPathNameW`, `CreateFileW`, and
 ### Suggested implementation order
 
 1. Fix relative paths on non-C: drives and per-drive cwd handling.
-2. Implement NUL and CON-family devices.
+2. [x] Implement NUL and CON-family devices, and reject reserved COM/LPT names.
 3. Add the typed parser for UNC and device paths.
 4. Normalize trailing dots/spaces and reject invalid/reserved names.
 5. Move WinFs nodes to IDs and retain relative symlink targets.

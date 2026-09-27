@@ -3380,7 +3380,7 @@ mod imp {
                 let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
                 let handle = super::native_create_file_w(wide.as_ptr(), 0xC000_0000, 7, 0, 3, 0, 0);
                 assert_ne!(handle, u64::MAX, "failed to open {path}");
-                assert_eq!(super::native_get_file_type(handle), 2); // FILE_TYPE_CHAR
+                assert_eq!(super::native_get_file_type(handle), 2, "{path}"); // FILE_TYPE_CHAR
                 let mut written = 0;
                 assert_eq!(
                     super::native_write_file(
@@ -3405,6 +3405,36 @@ mod imp {
                 assert_eq!(super::native_close_handle(handle), 1);
             }
             assert!(!context.lock().unwrap().fs.exists(r"C:\nul_device_unit\nul"));
+        }
+
+        #[test]
+        fn console_devices_open_as_character_handles_and_serial_names_are_reserved() {
+            for (path, access) in [
+                ("CON", 0xC000_0000),
+                ("CONIN$", 0x8000_0000),
+                (r"\\.\CONOUT$", 0x4000_0000),
+            ] {
+                let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+                let handle = super::native_create_file_w(wide.as_ptr(), access, 7, 0, 3, 0, 0);
+                assert_ne!(handle, u64::MAX, "failed to open {path}");
+                assert_eq!(super::native_get_file_type(handle), 2, "{path}"); // FILE_TYPE_CHAR
+                assert_eq!(super::native_close_handle(handle), 1);
+            }
+
+            for path in ["COM1", r"C:\nul_device_unit\LPT1.txt"] {
+                let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+                assert_eq!(
+                    super::native_create_file_w(wide.as_ptr(), 0xC000_0000, 7, 0, 3, 0, 0),
+                    u64::MAX
+                );
+                assert_eq!(super::native_get_last_error(), 123); // ERROR_INVALID_NAME
+            }
+            assert!(!super::fs_ctx()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .fs
+                .exists(r"C:\nul_device_unit\LPT1.txt"));
         }
 
         #[test]
@@ -8877,6 +8907,9 @@ mod imp {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum NativeDevice {
         Null,
+        Console { input: u64, output: u64 },
+        ConsoleIn(u64),
+        ConsoleOut(u64),
     }
 
     fn native_device(handle: u64) -> Option<(NativeDevice, u32)> {
@@ -9516,8 +9549,13 @@ mod imp {
         handle: u64,
         bytes: &[u8],
     ) -> bool {
-        if matches!(native_device(handle), Some((NativeDevice::Null, _))) {
-            return true;
+        if let Some((device, _)) = native_device(handle) {
+            let output = match device {
+                NativeDevice::Null => return true,
+                NativeDevice::Console { output, .. } | NativeDevice::ConsoleOut(output) => output,
+                NativeDevice::ConsoleIn(_) => return false,
+            };
+            return output != handle && native_write_to_handle(output, bytes);
         }
         if let Some(pipe) = pipe {
             let can_write = if pipe.endpoint.server {
@@ -9571,6 +9609,17 @@ mod imp {
             }
         }
         true
+    }
+
+    fn native_write_to_handle(handle: u64, bytes: &[u8]) -> bool {
+        let pipe = process_ctx().and_then(|process| {
+            process
+                .named_pipes
+                .lock()
+                .ok()
+                .and_then(|pipes| pipes.handles.get(&handle).cloned())
+        });
+        native_write_process_output(pipe.as_ref(), handle, bytes)
     }
 
     fn native_write_virtual_child_output(
@@ -10010,7 +10059,7 @@ mod imp {
     }
 
     extern "win64" fn native_get_file_type(handle: u64) -> u32 {
-        if matches!(native_device(handle), Some((NativeDevice::Null, _))) {
+        if native_device(handle).is_some() {
             native_set_last_error(0);
             return 0x0002; // FILE_TYPE_CHAR
         }
@@ -12744,16 +12793,35 @@ mod imp {
             }
             return 1;
         }
-        if let Some((NativeDevice::Null, access)) = native_device(handle) {
+        if let Some((device, access)) = native_device(handle) {
             if len != 0 && access & 0x4000_0000 == 0 {
                 native_set_last_error(5); // ERROR_ACCESS_DENIED
+                return 0;
+            }
+            let ok = match device {
+                NativeDevice::Null => true,
+                NativeDevice::Console { output, .. } | NativeDevice::ConsoleOut(output) => {
+                    let payload = if len == 0 {
+                        &[]
+                    } else {
+                        unsafe { std::slice::from_raw_parts(buf, len as usize) }
+                    };
+                    native_write_to_handle(output, payload)
+                }
+                NativeDevice::ConsoleIn(_) => {
+                    native_set_last_error(5); // ERROR_ACCESS_DENIED
+                    return 0;
+                }
+            };
+            if !ok {
+                native_set_last_error(109); // ERROR_BROKEN_PIPE
                 return 0;
             }
             if !written.is_null() {
                 unsafe { written.write(len) };
             }
             native_set_last_error(0);
-            return 1; // NUL discards all bytes written to it.
+            return 1;
         }
         if !matches!(host_standard_fd(handle), Some(1 | 2)) {
             let context = match fs_ctx() {
@@ -15312,10 +15380,42 @@ mod imp {
             Ok(value) => value,
             Err(_) => return u64::MAX,
         };
-        if crate::winfs::is_null_device_path(&path) {
+        let device = match crate::winfs::dos_device_path(&path) {
+            Some(crate::winfs::DosDevicePath::Null) => Some(NativeDevice::Null),
+            Some(crate::winfs::DosDevicePath::Console) => {
+                process_ctx().map(|process| NativeDevice::Console {
+                    input: process.std_handles[0].load(Ordering::Acquire),
+                    output: process.std_handles[1].load(Ordering::Acquire),
+                })
+            }
+            Some(crate::winfs::DosDevicePath::ConsoleIn) => {
+                if access & 0x4000_0000 != 0 {
+                    native_set_last_error(5); // ERROR_ACCESS_DENIED
+                    return u64::MAX;
+                }
+                process_ctx().map(|process| {
+                    NativeDevice::ConsoleIn(process.std_handles[0].load(Ordering::Acquire))
+                })
+            }
+            Some(crate::winfs::DosDevicePath::ConsoleOut) => {
+                if access & 0x8000_0000 != 0 {
+                    native_set_last_error(5); // ERROR_ACCESS_DENIED
+                    return u64::MAX;
+                }
+                process_ctx().map(|process| {
+                    NativeDevice::ConsoleOut(process.std_handles[1].load(Ordering::Acquire))
+                })
+            }
+            Some(crate::winfs::DosDevicePath::Reserved) => {
+                native_set_last_error(123); // ERROR_INVALID_NAME
+                return u64::MAX;
+            }
+            None => None,
+        };
+        if let Some(device) = device {
             let handle = ctx.next;
             ctx.next = ctx.next.saturating_add(1);
-            ctx.devices.insert(handle, NativeDevice::Null);
+            ctx.devices.insert(handle, device);
             ctx.file_access.insert(handle, access);
             ctx.file_shares.insert(handle, share);
             native_set_last_error(0);
@@ -16363,16 +16463,31 @@ mod imp {
             }
             return 1;
         }
-        if let Some((NativeDevice::Null, access)) = native_device(h) {
+        if let Some((device, access)) = native_device(h) {
             if n != 0 && access & 0x8000_0000 == 0 {
                 native_set_last_error(5); // ERROR_ACCESS_DENIED
                 return 0;
             }
-            if !read_count.is_null() {
-                unsafe { read_count.write(0) };
+            match device {
+                NativeDevice::Null => {
+                    if !read_count.is_null() {
+                        unsafe { read_count.write(0) };
+                    }
+                    native_set_last_error(0);
+                    return 1; // NUL reads as immediate EOF.
+                }
+                NativeDevice::Console { input, .. } | NativeDevice::ConsoleIn(input) => {
+                    if input == h {
+                        native_set_last_error(6);
+                        return 0;
+                    }
+                    return native_read_file(input, buf, n, read_count, ov);
+                }
+                NativeDevice::ConsoleOut(_) => {
+                    native_set_last_error(5); // ERROR_ACCESS_DENIED
+                    return 0;
+                }
             }
-            native_set_last_error(0);
-            return 1; // NUL reads as immediate EOF.
         }
         if let Some(fd) = host_standard_fd(h) {
             let count = unsafe { read(fd, buf.cast(), n as usize) };

@@ -39,6 +39,9 @@ All notable changes to this project will be documented in this file.
   directory for each drive, including drive-relative paths such as `C:foo`.
 - Added native `NUL` device opens with discarded writes, EOF reads, and no
   corresponding ordinary WinFs file creation.
+- Added native `CON`, `CONIN$`, and `CONOUT$` character handles routed through
+  process standard handles, and rejected reserved `COM1`–`COM9` and `LPT1`–
+  `LPT9` names instead of creating ordinary files.
 - Added the C-locale `msvcrt!mbstowcs` shim used by Nano.
 - Added an optional native Node check proving a relative file that Node leaves
   in WinFS appears in the following shell directory listing.

@@ -447,7 +447,16 @@ fn is_drive_letter(c: char) -> bool {
     c.is_ascii_alphabetic()
 }
 
-pub(crate) fn is_null_device_path(raw: &str) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DosDevicePath {
+    Null,
+    Console,
+    ConsoleIn,
+    ConsoleOut,
+    Reserved,
+}
+
+pub(crate) fn dos_device_path(raw: &str) -> Option<DosDevicePath> {
     let mut path = raw.trim().replace('/', "\\");
     if let Some(rest) = path.strip_prefix(r"\\.\") {
         path = rest.to_string();
@@ -460,7 +469,7 @@ pub(crate) fn is_null_device_path(raw: &str) -> bool {
         .get(..5)
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("pipe\\"))
     {
-        return false;
+        return None;
     }
     let leaf = path.rsplit('\\').next().unwrap_or(&path);
     let device_name = leaf
@@ -468,7 +477,22 @@ pub(crate) fn is_null_device_path(raw: &str) -> bool {
         .next()
         .unwrap_or(leaf)
         .trim_end_matches(' ');
-    device_name.eq_ignore_ascii_case("NUL")
+    if device_name.eq_ignore_ascii_case("NUL") {
+        Some(DosDevicePath::Null)
+    } else if device_name.eq_ignore_ascii_case("CON") {
+        Some(DosDevicePath::Console)
+    } else if device_name.eq_ignore_ascii_case("CONIN$") {
+        Some(DosDevicePath::ConsoleIn)
+    } else if device_name.eq_ignore_ascii_case("CONOUT$") {
+        Some(DosDevicePath::ConsoleOut)
+    } else {
+        let upper = device_name.to_ascii_uppercase();
+        let bytes = upper.as_bytes();
+        let reserved_port = bytes.len() == 4
+            && (bytes.starts_with(b"COM") || bytes.starts_with(b"LPT"))
+            && (b'1'..=b'9').contains(&bytes[3]);
+        reserved_port.then_some(DosDevicePath::Reserved)
+    }
 }
 
 impl Default for WinFs {
@@ -1122,8 +1146,8 @@ impl WinFs {
         if s.is_empty() {
             return Err("empty path".to_string());
         }
-        if is_null_device_path(s) {
-            return Err("NUL is a device, not a filesystem path".to_string());
+        if dos_device_path(s).is_some() {
+            return Err("reserved DOS device name is not a filesystem path".to_string());
         }
         // Normalize separators to backslash for parsing (but keep case).
         let mut s = s.replace('/', "\\");
@@ -2444,7 +2468,7 @@ mod tests {
             r"\\.\NUL",
             r"\\?\C:\work\NUL.txt",
         ] {
-            assert!(is_null_device_path(path), "{path}");
+            assert_eq!(dos_device_path(path), Some(DosDevicePath::Null), "{path}");
             assert!(
                 fs.normalize(path).is_err(),
                 "{path} must not be a disk path"
@@ -2452,7 +2476,22 @@ mod tests {
             assert!(fs.write_file(path, b"ordinary file".to_vec()).is_err());
         }
         assert!(!fs.exists(r"C:\work\nul"));
-        assert!(!is_null_device_path(r"\\.\pipe\NUL"));
+        for path in [
+            "CON",
+            r"C:\work\conin$.txt",
+            r"\\.\CONOUT$",
+            "COM1.txt",
+            r"C:\work\LPT1",
+        ] {
+            assert!(dos_device_path(path).is_some(), "{path}");
+            assert!(
+                fs.normalize(path).is_err(),
+                "{path} must not be a disk path"
+            );
+            assert!(fs.write_file(path, b"ordinary file".to_vec()).is_err());
+        }
+        assert_eq!(dos_device_path(r"\\.\pipe\NUL"), None);
+        assert_eq!(dos_device_path("COM1.txt"), Some(DosDevicePath::Reserved));
     }
 
     #[test]

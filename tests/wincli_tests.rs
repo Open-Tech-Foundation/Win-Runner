@@ -321,6 +321,63 @@ fn native_guest_writes_to_nul_without_creating_a_winfs_file() {
 }
 
 #[test]
+fn native_guest_writes_to_conout_through_its_standard_output() {
+    use pe::builder::{build, Asm};
+    let mut asm = Asm::new();
+    let path = asm.add_utf16("CONOUT$");
+    let payload = asm.add_data(b"console-device-output".to_vec());
+    let written = asm.add_zeroed(4);
+    let failed = asm.fresh_label();
+
+    asm.sub_rsp(0x48);
+    asm.lea_reg_rip(1, path);
+    asm.mov_edx_imm(0x4000_0000); // GENERIC_WRITE
+    asm.mov_r8d_imm(7);
+    asm.emit(&[0x45, 0x33, 0xC9]); // xor r9d, r9d
+    asm.mov_rspoff_imm32(0x20, 3); // OPEN_EXISTING
+    asm.emit(&[0x48, 0x31, 0xC0]);
+    asm.mov_rspoff_rax(0x28);
+    asm.mov_rspoff_rax(0x30);
+    asm.call_import(0); // CreateFileW
+    asm.cmp_rax_m1();
+    asm.jz(failed);
+    asm.mov_rspoff_reg(0x38, 0);
+
+    asm.mov_reg_rspoff(1, 0x38);
+    asm.lea_reg_rip(2, payload);
+    asm.mov_r8d_imm(21);
+    asm.lea_reg_rip(9, written);
+    asm.emit(&[0x48, 0x31, 0xC0]);
+    asm.mov_rspoff_rax(0x20);
+    asm.call_import(1); // WriteFile
+    asm.test_eax_eax();
+    asm.jz(failed);
+    asm.mov_reg_rspoff(1, 0x38);
+    asm.call_import(2); // CloseHandle
+    asm.mov_ecx_imm(0);
+    asm.call_import(3); // ExitProcess
+    asm.mark(failed);
+    asm.mov_ecx_imm(1);
+    asm.call_import(3);
+
+    let image = pe::load(&build(
+        asm,
+        &[
+            ("KERNEL32.dll", "CreateFileW"),
+            ("KERNEL32.dll", "WriteFile"),
+            ("KERNEL32.dll", "CloseHandle"),
+            ("KERNEL32.dll", "ExitProcess"),
+        ],
+    ))
+    .unwrap();
+    let (code, stdout, _) =
+        wincli::native::run_rust_baseline_argv_with_fs(&image, WinFs::new(), "conout.exe", &[])
+            .unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(stdout, b"console-device-output");
+}
+
+#[test]
 fn native_global_memory_status_ex_validates_and_populates_guest_buffer() {
     use pe::builder::{build, Asm};
     let mut a = Asm::new();
