@@ -318,7 +318,6 @@ pub(super) fn native_create_powershell_shell_child(
                     }
                 }
             }
-            std::thread::sleep(std::time::Duration::from_millis(20));
             if let Ok(mut state) = worker_child.state.lock() {
                 *state = Some(if stdout_ok && stderr_ok { code } else { 1 });
             }

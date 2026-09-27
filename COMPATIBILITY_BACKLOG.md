@@ -41,8 +41,12 @@ Items remain open until implementation and relevant verification are complete.
 - [ ] **8. Fix Node child-process pipe capture.** `execFileSync` launching the
   guest `powershell.exe` shim hangs when reading captured output. Reproduced
   with the official Node 24.21.0 binary seeded into a shell; it did not return
-  within 20 seconds. Trace and fix pipe inheritance/EOF and child output
-  forwarding.
+  within 20 seconds. The named-pipe server now releases its pending client
+  endpoint after connection, so buffered writes are followed by EOF; `CancelIo`
+  now tracks the issuing thread. This removes the hang, but the same Node probe
+  currently returns `spawnSync powershell.exe UNKNOWN` with empty output.
+  Continue tracing IOCP completion/cancellation and child output forwarding
+  before closing this item.
 
 ## Housekeeping
 

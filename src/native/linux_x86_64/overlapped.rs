@@ -963,10 +963,12 @@ pub(super) fn native_cancel_file_io(
             let matching: Vec<_> = pipes
                 .pending_io
                 .iter()
-                .filter(|((pipe_handle, ov), _)| {
-                    *pipe_handle == handle && (overlapped == 0 || *ov == overlapped)
+                .filter(|((pipe_handle, ov), pending)| {
+                    *pipe_handle == handle
+                        && (overlapped == 0 || *ov == overlapped)
+                        && issuer.map_or(true, |issuer| issuer == pending.issuer)
                 })
-                .map(|(_, cancelled)| Arc::clone(cancelled))
+                .map(|(_, pending)| Arc::clone(&pending.cancelled))
                 .collect();
             drop(pipes);
             if matching.is_empty() {

@@ -39,8 +39,13 @@ pub(super) struct NativeNamedPipeTable {
     pub(super) handles: HashMap<u64, NativePipeHandle>,
     pub(super) pending_clients:
         HashMap<String, std::collections::VecDeque<Arc<NativePipeEndpoint>>>,
-    pub(super) pending_io: HashMap<(u64, u64), Arc<AtomicBool>>,
+    pub(super) pending_io: HashMap<(u64, u64), NativePendingPipeIo>,
     pub(super) next: u64,
+}
+
+pub(super) struct NativePendingPipeIo {
+    pub(super) cancelled: Arc<AtomicBool>,
+    pub(super) issuer: std::thread::ThreadId,
 }
 
 impl NativeNamedPipeTable {

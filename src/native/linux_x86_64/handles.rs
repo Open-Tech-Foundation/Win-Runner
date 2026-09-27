@@ -347,7 +347,7 @@ pub(super) extern "win64" fn native_close_handle(h: u64) -> i32 {
                 .pending_io
                 .iter()
                 .filter(|((handle, _), _)| *handle == h)
-                .map(|(_, cancelled)| Arc::clone(cancelled))
+                .map(|(_, pending)| Arc::clone(&pending.cancelled))
                 .collect();
             for cancelled in pending {
                 cancelled.store(true, Ordering::Release);

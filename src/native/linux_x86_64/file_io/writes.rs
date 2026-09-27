@@ -11,14 +11,19 @@ pub(in crate::native::linux_x86_64::file_io) fn native_submit_pipe_io(
     length: usize,
 ) -> Result<(), u32> {
     let cancelled = Arc::new(AtomicBool::new(false));
+    let issuer = std::thread::current().id();
     {
         let mut pipes = process.named_pipes.lock().map_err(|_| 6u32)?;
         if !pipe.overlapped || pipes.pending_io.contains_key(&(handle, overlapped)) {
             return Err(87);
         }
-        pipes
-            .pending_io
-            .insert((handle, overlapped), cancelled.clone());
+        pipes.pending_io.insert(
+            (handle, overlapped),
+            NativePendingPipeIo {
+                cancelled: cancelled.clone(),
+                issuer,
+            },
+        );
     }
     native_set_overlapped_status(overlapped, STATUS_PENDING, 0);
     let worker_pipe = pipe.clone();
@@ -489,6 +494,48 @@ mod named_pipe_tests {
         assert_eq!(&received[..read as usize], payload);
         assert_eq!(native_get_file_type(server), 3);
         assert_eq!(native_close_handle(client), 1);
+        assert_eq!(native_close_handle(server), 1);
+    }
+
+    #[test]
+    fn connected_pipe_releases_pending_client_reference_for_eof() {
+        let name = format!("uv\\wincli-eof-{}", std::process::id());
+        let server = server(&name, 1); // Server reads; child client writes.
+        assert_ne!(server, u64::MAX);
+        let client = client(&name, 0x4000_0000, 0);
+        assert_ne!(client, u64::MAX);
+        assert_eq!(native_connect_named_pipe(server, 0), 0);
+        assert_eq!(native_get_last_error(), 535);
+        let payload = b"captured-output";
+        let mut written = 0;
+        assert_eq!(
+            native_write_file(
+                client,
+                payload.as_ptr(),
+                payload.len() as u32,
+                &mut written,
+                0
+            ),
+            1
+        );
+        assert_eq!(written, payload.len() as u32);
+        assert_eq!(native_close_handle(client), 1);
+
+        let process = process_ctx().expect("native process context");
+        let pipes = process.named_pipes.lock().unwrap();
+        let endpoint = pipes.handles.get(&server).unwrap().endpoint.fd;
+        let mut captured = [0u8; 64];
+        assert_eq!(
+            unsafe { recv(endpoint, captured.as_mut_ptr().cast(), captured.len(), 0) },
+            payload.len() as isize
+        );
+        assert_eq!(&captured[..payload.len()], payload);
+        assert_eq!(
+            unsafe { recv(endpoint, captured.as_mut_ptr().cast(), captured.len(), 0) },
+            0,
+            "closing the client write endpoint must deliver EOF after buffered output"
+        );
+        drop(pipes);
         assert_eq!(native_close_handle(server), 1);
     }
 

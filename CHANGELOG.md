@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Released the pending client endpoint after named-pipe connection so closing
+  a writer delivers EOF after buffered output. Scoped `CancelIo` to the thread
+  that issued the I/O request. Node `execFileSync` with the PowerShell shell link
+  still reports `UNKNOWN` and remains under investigation.
 - Launched CLI PE guests in a fresh exec-based WinCLI worker instead of
   forking the multithreaded launcher. Workers reopen mounted drives and
   seekable WinFS extents, and return portable filesystem journals while

@@ -232,6 +232,20 @@ pub(in crate::native::linux_x86_64) fn native_open_named_pipe(
         native_set_last_error(109); // ERROR_BROKEN_PIPE
         return u64::MAX;
     }
+    // The server stores this endpoint while it is waiting for a client so
+    // CloseHandle can remove an unconnected endpoint from the pending queue.
+    // Once accepted, that extra reference would keep the client's write side
+    // alive after the client closes, preventing readers from observing EOF.
+    if let Some(server) = pipes.handles.values_mut().find(|handle| {
+        handle.endpoint.server
+            && handle.endpoint.name == name
+            && handle
+                .pending_client
+                .as_ref()
+                .is_some_and(|candidate| Arc::ptr_eq(candidate, &endpoint))
+    }) {
+        server.pending_client = None;
+    }
     let handle = pipes.next;
     pipes.next = pipes.next.saturating_add(1);
     pipes.handles.insert(
@@ -487,14 +501,19 @@ pub(in crate::native::linux_x86_64) fn native_submit_pipe_connect(
     event: Option<Arc<NativeEvent>>,
 ) -> Result<(), u32> {
     let cancelled = Arc::new(AtomicBool::new(false));
+    let issuer = std::thread::current().id();
     {
         let mut pipes = process.named_pipes.lock().map_err(|_| 6u32)?;
         if pipes.pending_io.contains_key(&(handle, overlapped)) {
             return Err(87);
         }
-        pipes
-            .pending_io
-            .insert((handle, overlapped), cancelled.clone());
+        pipes.pending_io.insert(
+            (handle, overlapped),
+            NativePendingPipeIo {
+                cancelled: cancelled.clone(),
+                issuer,
+            },
+        );
     }
     native_set_overlapped_status(overlapped, STATUS_PENDING, 0);
     let worker_process = Arc::clone(process);
