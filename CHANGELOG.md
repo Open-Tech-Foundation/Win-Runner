@@ -60,6 +60,8 @@ All notable changes to this project will be documented in this file.
   `GetOverlappedResult` position, completion, and error checks.
 - Added completed-operation `GetOverlappedResultEx` and full
   `GetFileInformationByHandle` record checks.
+- Added ANSI file-enumeration error cases for empty searches, missing paths,
+  and invalid output arguments.
 - Added WinFS edge-case tests for truncating writes, recursive tree copy/move,
   and invalid directory create/remove operations.
 - Added NT file compatibility tests for EOF resizing, rename-by-handle, and

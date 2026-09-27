@@ -3391,6 +3391,122 @@ mod imp {
         }
 
         #[test]
+        fn modern_ansi_find_first_file_ex_reports_empty_missing_and_invalid_inputs() {
+            type FindFirstFileExA = unsafe extern "win64" fn(
+                *const u8,
+                i32,
+                *mut std::ffi::c_void,
+                i32,
+                *const std::ffi::c_void,
+                u32,
+            ) -> u64;
+            let find_first: FindFirstFileExA = unsafe {
+                std::mem::transmute(require_kernel32_api(b"FindFirstFileExA\0") as usize)
+            };
+            let directory = r"C:\modern_find_ex_ansi_failures";
+            let empty_pattern = b"C:\\modern_find_ex_ansi_failures\\*\0";
+            let missing_pattern = b"C:\\modern_find_ex_ansi_absent\\*\0";
+            let context = super::fs_ctx().unwrap();
+            context.lock().unwrap().fs.mkdir(directory).unwrap();
+            let mut data = [0u8; 320];
+
+            let empty = unsafe {
+                find_first(
+                    empty_pattern.as_ptr(),
+                    0,
+                    data.as_mut_ptr().cast(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                )
+            };
+            let empty_error = super::native_get_last_error();
+            let missing = unsafe {
+                find_first(
+                    missing_pattern.as_ptr(),
+                    0,
+                    data.as_mut_ptr().cast(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                )
+            };
+            let missing_error = super::native_get_last_error();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(r"C:\modern_find_ex_ansi_failures\one.txt", b"x".to_vec())
+                .unwrap();
+            let invalid_output = unsafe {
+                find_first(
+                    empty_pattern.as_ptr(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                )
+            };
+            let invalid_output_error = super::native_get_last_error();
+            let invalid_level = unsafe {
+                find_first(
+                    empty_pattern.as_ptr(),
+                    99,
+                    data.as_mut_ptr().cast(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                )
+            };
+            let invalid_level_error = super::native_get_last_error();
+            context.lock().unwrap().fs.remove(directory, true).unwrap();
+
+            assert_eq!(empty, u64::MAX);
+            assert_eq!(empty_error, 2); // ERROR_FILE_NOT_FOUND
+            assert_eq!(missing, u64::MAX);
+            assert_eq!(missing_error, 3); // ERROR_PATH_NOT_FOUND
+            assert_eq!(invalid_output, u64::MAX);
+            assert_eq!(invalid_output_error, 87); // ERROR_INVALID_PARAMETER
+            assert_eq!(invalid_level, u64::MAX);
+            assert_eq!(invalid_level_error, 87); // ERROR_INVALID_PARAMETER
+        }
+
+        #[test]
+        fn modern_ansi_find_first_file_reports_empty_and_invalid_output() {
+            type FindFirstFileA = unsafe extern "win64" fn(*const u8, *mut std::ffi::c_void) -> u64;
+            let find_first: FindFirstFileA =
+                unsafe { std::mem::transmute(require_kernel32_api(b"FindFirstFileA\0") as usize) };
+            let directory = r"C:\modern_find_ansi_failures";
+            let pattern = b"C:\\modern_find_ansi_failures\\*\0";
+            let missing = b"C:\\modern_find_ansi_failures\\missing.txt\0";
+            let context = super::fs_ctx().unwrap();
+            context.lock().unwrap().fs.mkdir(directory).unwrap();
+            let mut data = [0u8; 320];
+
+            let empty = unsafe { find_first(pattern.as_ptr(), data.as_mut_ptr().cast()) };
+            let empty_error = super::native_get_last_error();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(r"C:\modern_find_ansi_failures\entry.txt", b"x".to_vec())
+                .unwrap();
+            let invalid_output = unsafe { find_first(pattern.as_ptr(), std::ptr::null_mut()) };
+            let invalid_output_error = super::native_get_last_error();
+            let missing_result = unsafe { find_first(missing.as_ptr(), data.as_mut_ptr().cast()) };
+            let missing_error = super::native_get_last_error();
+            context.lock().unwrap().fs.remove(directory, true).unwrap();
+
+            assert_eq!(empty, u64::MAX);
+            assert_eq!(empty_error, 2); // ERROR_FILE_NOT_FOUND
+            assert_eq!(invalid_output, u64::MAX);
+            assert_eq!(invalid_output_error, 87); // ERROR_INVALID_PARAMETER
+            assert_eq!(missing_result, u64::MAX);
+            assert_eq!(missing_error, 2); // ERROR_FILE_NOT_FOUND
+        }
+
+        #[test]
         fn modern_ansi_symbolic_link_resolves_to_guest_target() {
             type CreateSymbolicLinkA = unsafe extern "win64" fn(*const u8, *const u8, u32) -> i32;
             let create_link: CreateSymbolicLinkA = unsafe {
