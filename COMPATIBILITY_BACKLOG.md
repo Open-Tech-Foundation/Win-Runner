@@ -70,14 +70,16 @@ Items remain open until implementation and relevant verification are complete.
   initialization and top-level launch coordination remain in the backend root.
   Guest environment-block, environment-variable, and current-directory APIs
   now live in an environment module. TEB/TLS setup and per-thread last-error
-  access now live in a thread-runtime module. C runtime shims and their
+  access, guest TLS/FLS APIs, and stack settings now live in a thread-runtime
+  module. Exception registration, crypto, event-provider, and message-format
+  shims also live in dedicated modules. C runtime shims and their
   process/thread-local state now live in a CRT module. Console screen, mode,
   output, and input-event APIs now live in a console module. Clock, time-zone,
   and FILETIME shims now live in a clock module; scheduler sleep/yield APIs are
   grouped with synchronization. NTDLL file, process, and system-information
   shims now live in a dedicated module. Heap, virtual-memory, and file-mapping
-  APIs now live in a memory module shared with loader page helpers. Other API
-  groups including locale conversion and system-information APIs now live in
+  APIs now live in a memory module shared with loader page helpers. Locale
+  conversion and system-information APIs now live in
   Windows-subsystem modules while host syscalls remain backend-local for macOS.
   File path expansion, directory enumeration, timestamps, named-pipe writes,
   handle state, and `WriteFile` now live in file I/O. Dynamic module lookup and

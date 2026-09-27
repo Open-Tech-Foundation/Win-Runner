@@ -286,3 +286,102 @@ pub(super) extern "win64" fn native_message_beep(_kind: u32) -> i32 {
     // best-effort behavior of MessageBeep without producing host audio.
     1
 }
+
+pub(super) extern "win64" fn native_encode_pointer(value: u64) -> u64 {
+    let cookie = process_ctx()
+        .map(|process| process.pointer_cookie)
+        .unwrap_or(1);
+    value.rotate_left(17) ^ cookie
+}
+pub(super) extern "win64" fn native_decode_pointer(value: u64) -> u64 {
+    let cookie = process_ctx()
+        .map(|process| process.pointer_cookie)
+        .unwrap_or(1);
+    (value ^ cookie).rotate_right(17)
+}
+
+pub(super) extern "win64" fn native_ver_set_condition_mask(
+    mask: u64,
+    types: u32,
+    condition: u8,
+) -> u64 {
+    let shift = if types & 0x80 != 0 {
+        21
+    }
+    // VER_PRODUCT_TYPE
+    else if types & 0x40 != 0 {
+        18
+    }
+    // VER_SUITENAME
+    else if types & 0x20 != 0 {
+        15
+    }
+    // VER_SERVICEPACKMAJOR
+    else if types & 0x10 != 0 {
+        12
+    }
+    // VER_SERVICEPACKMINOR
+    else if types & 0x08 != 0 {
+        9
+    }
+    // VER_PLATFORMID
+    else if types & 0x04 != 0 {
+        6
+    }
+    // VER_BUILDNUMBER
+    else if types & 0x02 != 0 {
+        3
+    }
+    // VER_MAJORVERSION
+    else if types & 0x01 != 0 {
+        0
+    }
+    // VER_MINORVERSION
+    else {
+        return mask;
+    };
+    mask | (((condition & 7) as u64) << shift)
+}
+
+pub(super) extern "win64" fn native_verify_version_info_w(
+    info: *const u8,
+    types: u32,
+    mask: u64,
+) -> i32 {
+    if info.is_null() || types == 0 {
+        native_set_last_error(87);
+        return 0;
+    }
+    let read32 = |offset| unsafe { (info.add(offset) as *const u32).read_unaligned() };
+    let read16 = |offset| unsafe { (info.add(offset) as *const u16).read_unaligned() };
+    let matches = |actual: u32, expected: u32, shift: u32| match (mask >> shift) & 7 {
+        1 => actual == expected,
+        2 => actual > expected,
+        3 => actual >= expected,
+        4 => actual < expected,
+        5 => actual <= expected,
+        _ => false,
+    };
+    let checks = [
+        (0x02, 10, read32(4), 3),
+        (0x01, 0, read32(8), 0),
+        (0x04, 19045, read32(12), 6),
+        (0x08, 2, read32(16), 9),
+        (0x20, 0, read16(276) as u32, 15),
+        (0x10, 0, read16(278) as u32, 12),
+        (0x80, 1, unsafe { *info.add(282) } as u32, 21),
+    ];
+    if checks.iter().any(|(bit, actual, expected, shift)| {
+        types & bit != 0 && !matches(*actual, *expected, *shift)
+    }) {
+        native_set_last_error(1150); // ERROR_OLD_WIN_VERSION
+        0
+    } else {
+        1
+    }
+}
+
+pub(super) struct MissingImportStubs {
+    pub(super) _code: Mapping,
+    pub(super) _messages: Vec<Vec<u8>>,
+}

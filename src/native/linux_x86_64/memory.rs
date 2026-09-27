@@ -657,3 +657,7 @@ pub(super) extern "win64" fn native_unmap_view_of_file(address: *mut c_void) -> 
     }
     (unsafe { munmap(address, view.length) } == 0) as i32
 }
+
+pub(super) extern "win64" fn native_get_process_heap() -> u64 {
+    PROCESS_HEAP_HANDLE
+}

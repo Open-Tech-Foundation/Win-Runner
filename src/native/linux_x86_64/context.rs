@@ -115,3 +115,22 @@ pub(super) fn process_ctx() -> Option<Arc<NativeProcessContext>> {
 pub(super) fn fs_ctx() -> Option<Arc<Mutex<NativeFs>>> {
     process_ctx().map(|process| Arc::clone(&process.fs))
 }
+
+pub(super) fn random_pointer_cookie() -> u64 {
+    let mut cookie = 0u64;
+    if unsafe { getrandom((&mut cookie as *mut u64).cast(), 8, 0) } != 8 {
+        cookie = 0x7f3a_5e91_c62d_b408;
+    }
+    cookie | 1
+}
+impl DynamicTlsSlots {
+    pub(super) fn new(static_tls: bool) -> Self {
+        let mut active = [false; 64];
+        active[0] = static_tls;
+        Self {
+            active,
+            generation: [0; 64],
+            reserved_static: static_tls,
+        }
+    }
+}

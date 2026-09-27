@@ -122,6 +122,9 @@ All notable changes to this project will be documented in this file.
 - Moved ordinal locale comparison and locale-information APIs into the locale
   module, network byte-order helpers into Winsock, and named-pipe state APIs
   into file I/O.
+- Grouped guest TLS/FLS and stack settings with thread runtime; separated
+  exception registration, crypto, event-provider, message-formatting, and
+  remaining profile/version APIs into subsystem modules.
 - Added the C-locale `msvcrt!mbstowcs` shim used by Nano.
 - Added an optional native Node check proving a relative file that Node leaves
   in WinFS appears in the following shell directory listing.

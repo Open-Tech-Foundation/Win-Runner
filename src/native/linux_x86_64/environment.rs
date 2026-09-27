@@ -211,3 +211,41 @@ pub(super) extern "win64" fn native_sh_get_folder_path_w(
     unsafe { output.copy_from_nonoverlapping(encoded.as_ptr(), encoded.len()) };
     0 // S_OK
 }
+
+pub(super) extern "win64" fn native_get_user_profile_directory_w(
+    _token: u64,
+    output: *mut u16,
+    len: *mut u32,
+) -> i32 {
+    const PROFILE: &[u16] = &[
+        b'C' as u16,
+        b':' as u16,
+        b'\\' as u16,
+        b'U' as u16,
+        b's' as u16,
+        b'e' as u16,
+        b'r' as u16,
+        b's' as u16,
+        b'\\' as u16,
+        b'w' as u16,
+        b'i' as u16,
+        b'n' as u16,
+        b'c' as u16,
+        b'l' as u16,
+        b'i' as u16,
+        0,
+    ];
+    if len.is_null() {
+        return 0;
+    }
+    if output.is_null() || unsafe { len.read() } < PROFILE.len() as u32 {
+        unsafe { len.write(PROFILE.len() as u32) };
+        native_set_last_error(122);
+        return 0;
+    }
+    unsafe {
+        output.copy_from_nonoverlapping(PROFILE.as_ptr(), PROFILE.len());
+        len.write((PROFILE.len() - 1) as u32)
+    };
+    1
+}
