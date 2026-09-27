@@ -48,49 +48,20 @@ Items remain open until implementation and relevant verification are complete.
 
 - [x] Ignore generated `*.snap` and `*.winfs` files so local disks are not
   accidentally staged.
-- [ ] Split `src/native.rs` by subsystem: loader, handles, file I/O, sync,
-  processes, sockets, and related Windows API groups. **Started:** the public
-  `native.rs` is now a platform-neutral façade; Linux x86-64 execution and
-  unsupported-host behavior live in separate backend modules. Linux host ABI
-  declarations, PE import/trampoline lookup, image mapping, and process launch
-  support, Winsock shims, and WinFs-backed file/directory/named-pipe APIs are
-  separate backend-local modules. Standard stream, descriptor, duplicate, file
-  type, and close shims now live in a handles module; the shared per-process
-  handle maps remain in the backend state. Critical-section, SRW-lock,
-  condition-variable, InitOnce, single-object wait, event, semaphore, SLIST,
-  address-wait, and waitable-timer shims now live in a synchronization module.
-  Remaining process waits and waitable-object types still use separate state
-  maps. Thread
-  creation, job objects, process identity, child exit, and termination shims now
-  live in the process module alongside launch support. File, pipe, TLS,
-  filesystem, and per-process context data types now live in a backend-local
-  state module. Thread-local guest state and active process/filesystem context
-  accessors now live in a context module. `CreateProcessW`, child completion,
-  and child filesystem state transfer now live in the process module; process
-  initialization and top-level launch coordination remain in the backend root.
-  Guest environment-block, environment-variable, and current-directory APIs
-  now live in an environment module. TEB/TLS setup and per-thread last-error
-  access, guest TLS/FLS APIs, and stack settings now live in a thread-runtime
-  module. Exception registration, crypto, event-provider, and message-format
-  shims also live in dedicated modules. C runtime shims and their
-  process/thread-local state now live in a CRT module. Console screen, mode,
-  output, and input-event APIs now live in a console module. Clock, time-zone,
-  and FILETIME shims now live in a clock module; scheduler sleep/yield APIs are
-  grouped with synchronization. NTDLL file, process, and system-information
-  shims now live in a dedicated module. Heap, virtual-memory, and file-mapping
-  APIs now live in a memory module shared with loader page helpers. Locale
-  conversion and system-information APIs now live in
-  Windows-subsystem modules while host syscalls remain backend-local for macOS.
-  File path expansion, directory enumeration, timestamps, named-pipe writes,
-  handle state, and `WriteFile` now live in file I/O. Dynamic module lookup and
-  load APIs now live with the PE loader; command-line, startup, and per-thread
-  exit APIs live with process support. Ordinal comparisons and locale
-  information are in the locale module, with byte-order helpers in Winsock.
-  Completion-port APIs,
-  directory notifications, and overlapped file
-  I/O/cancellation code now live in a dedicated module. Registry storage and
-  `LocalFree` APIs share the import registry module. Process-scoped queue and
-  completion state remain in the backend context.
+- [x] Split native execution by subsystem. The public `native.rs` is a
+  platform-neutral façade; Linux x86-64 execution and unsupported-host behavior
+  use separate backends. The Linux backend root is now a compact module index.
+  Host ABI declarations, import registration, PE mapping, runner orchestration,
+  x86-64 assembly, and runtime state each have dedicated modules. Win32 API
+  shims are organized by loader, process, handles, file I/O, synchronization,
+  CRT, console, sockets, memory, locale, environment, clock, NTDLL, exceptions,
+  registry, and related API groups. File I/O is further divided into open/read
+  and named-pipe setup, namespace operations, temporary/metadata operations,
+  path/search operations, and write/pipe APIs. Guest state and handle ownership
+  remain in dedicated context/state modules; host syscall bindings remain
+  backend-specific to support future macOS native backends. Wait and
+  process-scoped object maps remain follow-up architecture work, not outstanding
+  source separation.
 - [x] Cache `WINCLI_NATIVE_DIAGNOSTIC` once rather than reading the environment
   from hot shims; initialize the cache before guest forks.
 - [x] Fix Clippy's unevenly grouped hexadecimal literal warnings. A current

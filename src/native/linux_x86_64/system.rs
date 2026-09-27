@@ -380,8 +380,3 @@ pub(super) extern "win64" fn native_verify_version_info_w(
         1
     }
 }
-
-pub(super) struct MissingImportStubs {
-    pub(super) _code: Mapping,
-    pub(super) _messages: Vec<Vec<u8>>,
-}

@@ -757,3 +757,128 @@ pub(super) extern "win64" fn native_local_free(value: u64) -> u64 {
         value
     }
 }
+
+pub(super) struct MissingImportStubs {
+    pub(super) _code: Mapping,
+    pub(super) _messages: Vec<Vec<u8>>,
+}
+
+extern "win64" fn native_missing_import(message: *const u8, len: u64) -> ! {
+    let mut offset = 0;
+    while offset < len as usize {
+        let written = unsafe { write(2, message.add(offset).cast(), len as usize - offset) };
+        if written <= 0 {
+            break;
+        }
+        offset += written as usize;
+    }
+    unsafe { _exit(126) }
+}
+
+pub(super) fn patch_baseline_imports(
+    mapping: &Mapping,
+    img: &PeImage,
+    strict_imports: bool,
+) -> Result<Option<MissingImportStubs>, String> {
+    let imports: Vec<_> = img.imports.iter().chain(&img.unsupported).collect();
+    let missing = imports
+        .iter()
+        .filter(|import| !supports_import(&import.dll, &import.func))
+        .count();
+    if missing > 0 && strict_imports {
+        let import = imports
+            .iter()
+            .find(|import| !supports_import(&import.dll, &import.func))
+            .unwrap();
+        return Err(format!(
+            "unsupported native import: {}!{}",
+            import.dll, import.func
+        ));
+    }
+    let mut stubs = if missing == 0 {
+        None
+    } else {
+        let size = page_len(
+            missing
+                .checked_mul(32)
+                .ok_or("too many native import stubs")?,
+        )?;
+        let ptr = unsafe {
+            mmap(
+                ptr::null_mut(),
+                size,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if ptr == MAP_FAILED {
+            return Err(format!(
+                "native import stub allocation failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Some(MissingImportStubs {
+            _code: Mapping {
+                ptr: ptr.cast(),
+                len: size,
+            },
+            _messages: Vec::with_capacity(missing),
+        })
+    };
+    let mut stub_index = 0;
+    for import in imports {
+        let value = if supports_import(&import.dll, &import.func) {
+            baseline_trampoline(&import.func).unwrap()
+        } else {
+            let stubs = stubs.as_mut().unwrap();
+            let message = format!(
+                "unsupported native import called: {}!{}\n",
+                import.dll, import.func
+            )
+            .into_bytes();
+            let message_ptr = message.as_ptr() as u64;
+            let message_len = message.len() as u64;
+            stubs._messages.push(message);
+            let code =
+                unsafe { std::slice::from_raw_parts_mut(stubs._code.ptr.add(stub_index * 32), 32) };
+            code[0..2].copy_from_slice(&[0x48, 0xB9]); // mov rcx, message
+            code[2..10].copy_from_slice(&message_ptr.to_le_bytes());
+            code[10..12].copy_from_slice(&[0x48, 0xBA]); // mov rdx, length
+            code[12..20].copy_from_slice(&message_len.to_le_bytes());
+            code[20..22].copy_from_slice(&[0x48, 0xB8]); // mov rax, handler
+            code[22..30].copy_from_slice(
+                &(native_missing_import as *const () as usize as u64).to_le_bytes(),
+            );
+            code[30..32].copy_from_slice(&[0xFF, 0xE0]); // jmp rax
+            stub_index += 1;
+            code.as_ptr() as u64
+        };
+        let off = import.iat_rva as usize;
+        if off.checked_add(8).is_none_or(|end| end > mapping.len) {
+            return Err(format!(
+                "native IAT slot out of range: {}!{}",
+                import.dll, import.func
+            ));
+        }
+        // SAFETY: the mapping is still RW and the checked IAT slot is in it.
+        unsafe { (mapping.ptr.add(off) as *mut u64).write_unaligned(value) };
+    }
+    if let Some(stubs) = &stubs {
+        if unsafe {
+            mprotect(
+                stubs._code.ptr.cast(),
+                stubs._code.len,
+                PROT_READ | PROT_EXEC,
+            )
+        } != 0
+        {
+            return Err(format!(
+                "native import stubs could not be made executable: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    Ok(stubs)
+}

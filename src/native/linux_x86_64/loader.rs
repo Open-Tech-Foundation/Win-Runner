@@ -278,3 +278,15 @@ pub(super) extern "win64" fn native_get_proc_address(module: u64, name: *const u
 pub(super) extern "win64" fn native_free_library(module: u64) -> i32 {
     (module == API_SET_MODULE) as i32
 }
+
+pub(super) struct Mapping {
+    pub(super) ptr: *mut u8,
+    pub(super) len: usize,
+}
+
+impl Drop for Mapping {
+    fn drop(&mut self) {
+        // SAFETY: `ptr` and `len` come from a successful mmap in `map`.
+        unsafe { munmap(self.ptr.cast(), self.len) };
+    }
+}

@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Completed the Linux native backend split: launch/output orchestration, shared
+  runtime state, x86-64 assembly, and shared string helpers are in dedicated
+  modules; file I/O is divided into open/read, namespace, temporary/metadata,
+  path/search, and write/pipe modules. The native backend root now serves as a
+  compact module index and compatibility façade.
+
 - Hardened Chocolatey and npm archive extraction against traversal, absolute
   paths, drive prefixes, and existing symlink components.
 - Documented that native guest execution and mounted host folders are not a

@@ -870,7 +870,7 @@ pub(super) extern "win64" fn native_create_process_w(
             return 0;
         }
     };
-    if patch_baseline_imports(&mapping, &image, false).is_err() {
+    if registry::patch_baseline_imports(&mapping, &image, false).is_err() {
         native_set_last_error(193);
         return 0;
     }
