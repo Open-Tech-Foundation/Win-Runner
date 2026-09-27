@@ -2303,6 +2303,33 @@ mod imp {
         }
 
         #[test]
+        fn crt_mbstowcs_converts_c_locale_and_reports_unrepresentable_text() {
+            let input = b"nano\0";
+            let mut output = [u16::MAX; 5];
+            assert_eq!(
+                super::native_crt_mbstowcs(output.as_mut_ptr(), input.as_ptr(), output.len()),
+                4
+            );
+            assert_eq!(
+                &output,
+                &[b'n' as u16, b'a' as u16, b'n' as u16, b'o' as u16, 0]
+            );
+            assert_eq!(
+                super::native_crt_mbstowcs(std::ptr::null_mut(), input.as_ptr(), 0),
+                4
+            );
+            assert_eq!(
+                super::native_crt_mbstowcs(output.as_mut_ptr(), input.as_ptr(), 2),
+                2
+            );
+            assert_eq!(
+                super::native_crt_mbstowcs(output.as_mut_ptr(), b"\xe9\0".as_ptr(), output.len()),
+                usize::MAX
+            );
+            assert_eq!(super::THREAD_CRT_ERRNO.with(std::cell::Cell::get), 42);
+        }
+
+        #[test]
         fn crt_stat64_reports_winfs_file_type_and_size() {
             let context = super::fs_ctx().unwrap();
             let path = r"C:\stat64_probe.txt";
@@ -2445,6 +2472,7 @@ mod imp {
             assert!(super::supports_import("MSVCRT.dll", "tolower"));
             assert!(super::supports_import("MSVCRT.dll", "toupper"));
             assert!(super::supports_import("MSVCRT.dll", "strncpy"));
+            assert!(super::supports_import("MSVCRT.dll", "mbstowcs"));
             assert!(super::supports_import("MSVCRT.dll", "calloc"));
             assert!(super::supports_import("MSVCRT.dll", "fwrite"));
             assert!(super::supports_import("MSVCRT.dll", "sprintf"));
@@ -13106,6 +13134,40 @@ mod imp {
         THREAD_CRT_ERRNO.with(|error| error.set(22)); // EINVAL: no terminator in bounded scan.
         usize::MAX
     }
+    extern "win64" fn native_crt_mbstowcs(
+        output: *mut u16,
+        input: *const u8,
+        count: usize,
+    ) -> usize {
+        if input.is_null() {
+            return usize::MAX;
+        }
+        let mut converted = 0usize;
+        for index in 0..32768usize {
+            if !output.is_null() && converted == count {
+                return converted;
+            }
+            let byte = unsafe { input.add(index).read() };
+            if byte == 0 {
+                if !output.is_null() && converted < count {
+                    unsafe { output.add(converted).write(0) };
+                }
+                return converted;
+            }
+            // WinCLI's CRT currently uses the C locale: multibyte input is
+            // ASCII, with bytes outside that range reported as EILSEQ.
+            if byte > 0x7f {
+                THREAD_CRT_ERRNO.with(|error| error.set(42));
+                return usize::MAX;
+            }
+            if !output.is_null() && converted < count {
+                unsafe { output.add(converted).write(byte as u16) };
+            }
+            converted += 1;
+        }
+        THREAD_CRT_ERRNO.with(|error| error.set(22));
+        usize::MAX
+    }
     extern "win64" fn native_crt_stat64(path: *const u8, output: *mut u8) -> i32 {
         if path.is_null() || output.is_null() {
             THREAD_CRT_ERRNO.with(|error| error.set(22)); // EINVAL
@@ -17256,6 +17318,7 @@ mod imp {
                         | "tolower"
                         | "toupper"
                         | "strncpy"
+                        | "mbstowcs"
                         | "wcstombs"
                         | "_stat64"
                         | "_access"
@@ -17383,6 +17446,7 @@ mod imp {
             "tolower" => Some(native_crt_tolower as *const () as usize as u64),
             "toupper" => Some(native_crt_toupper as *const () as usize as u64),
             "strncpy" => Some(native_crt_strncpy as *const () as usize as u64),
+            "mbstowcs" => Some(native_crt_mbstowcs as *const () as usize as u64),
             "wcstombs" => Some(native_crt_wcstombs as *const () as usize as u64),
             "_stat64" => Some(native_crt_stat64 as *const () as usize as u64),
             "_access" => Some(native_crt_access as *const () as usize as u64),

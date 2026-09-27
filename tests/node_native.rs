@@ -171,6 +171,49 @@ fn official_windows_node_receives_winfs_directory_changes_natively() {
 }
 
 #[test]
+fn official_windows_node_relative_file_remains_visible_to_shell_dir() {
+    let Ok(node) = std::env::var("WINCLI_NODE_EXE") else {
+        return;
+    };
+    let node = Path::new(&node)
+        .canonicalize()
+        .expect("Windows node.exe exists");
+    let script = format!(
+        "\"{}\" -e 'const fs=require(\"fs\");fs.writeFileSync(\"node-test.txt\",\"Hello from Node\");console.log(fs.readdirSync(\".\").includes(\"node-test.txt\"))'\nls\nexit\n",
+        node.display()
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wincli"))
+        .arg("shell")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start native WinCLI shell");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .expect("send Node file creation and listing commands");
+    let output = child.wait_with_output().expect("read shell output");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("true"),
+        "Node did not see its file: {stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| line.trim() == "node-test.txt"),
+        "WinCLI dir did not list Node's retained file: {stdout}"
+    );
+}
+
+#[test]
 fn official_windows_node_reads_guest_file_metadata_and_contents() {
     let Ok(node) = std::env::var("WINCLI_NODE_EXE") else {
         return;

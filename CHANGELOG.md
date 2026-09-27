@@ -6,6 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Added the C-locale `msvcrt!mbstowcs` shim used by Nano.
+- Added an optional native Node check proving a relative file that Node leaves
+  in WinFS appears in the following shell directory listing.
 - Added a headless localhost WebSocket control session for a persistent shell,
   with streamed output events, text/key input, terminal resizing, and optional
   snapshot save on exit.
