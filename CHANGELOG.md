@@ -43,6 +43,7 @@ All notable changes to this project will be documented in this file.
 - Extended `SetEndOfFile` coverage to verify truncation, zero-filled extension,
   and invalid-handle errors; corrected handle setup in several pending API
   behavior fixtures.
+- Added direct wide-path `MoveFileW` and `DeleteFileW` behavior cases.
 - Added ANSI temporary-file and symbolic-link cases, all reference
   `FindFirstFileExA` option combinations, and invalid-input checks for
   `OpenFileById` and `SetFileValidData`.

@@ -2468,6 +2468,53 @@ mod imp {
         }
 
         #[test]
+        fn modern_wide_move_file_moves_guest_data_without_changing_contents() {
+            type MoveFileW = unsafe extern "win64" fn(*const u16, *const u16) -> i32;
+            let move_file: MoveFileW =
+                unsafe { std::mem::transmute(require_kernel32_api(b"MoveFileW\0") as usize) };
+            let source = r"C:\modern_move_wide_source.txt";
+            let destination = r"C:\modern_move_wide_destination.txt";
+            let source_wide = source.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let destination_wide = destination.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(source, b"wide-move-data".to_vec())
+                .unwrap();
+
+            assert_eq!(
+                unsafe { move_file(source_wide.as_ptr(), destination_wide.as_ptr()) },
+                1
+            );
+            let ctx = context.lock().unwrap();
+            assert!(!ctx.fs.exists(source));
+            assert_eq!(ctx.fs.read_file(destination).unwrap(), b"wide-move-data");
+            drop(ctx);
+            context.lock().unwrap().fs.delete_file(destination).unwrap();
+        }
+
+        #[test]
+        fn modern_wide_delete_file_removes_guest_file() {
+            type DeleteFileW = unsafe extern "win64" fn(*const u16) -> i32;
+            let delete_file: DeleteFileW =
+                unsafe { std::mem::transmute(require_kernel32_api(b"DeleteFileW\0") as usize) };
+            let path = r"C:\modern_delete_wide.txt";
+            let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(path, b"wide-delete-me".to_vec())
+                .unwrap();
+
+            assert_eq!(unsafe { delete_file(wide.as_ptr()) }, 1);
+            assert!(!context.lock().unwrap().fs.exists(path));
+        }
+
+        #[test]
         fn modern_copy_file_a_copies_data_and_honors_fail_if_exists() {
             type CopyFileA = unsafe extern "win64" fn(*const u8, *const u8, i32) -> i32;
             let copy_file: CopyFileA =
