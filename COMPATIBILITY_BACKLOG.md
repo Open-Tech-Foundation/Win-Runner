@@ -67,7 +67,8 @@ Items remain open until implementation and relevant verification are complete.
   accessors now live in a context module. `CreateProcessW`, child completion,
   and child filesystem state transfer now live in the process module; process
   initialization and top-level launch coordination remain in the backend root.
-  C runtime shims and their
+  Guest environment-block, environment-variable, and current-directory APIs
+  now live in an environment module. C runtime shims and their
   process/thread-local state now live in a CRT module. Console screen, mode,
   output, and input-event APIs now live in a console module. Other API groups
   including locale conversion now live in Windows-subsystem modules while host
