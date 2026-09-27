@@ -81,6 +81,18 @@ fn parse_runtime_options(argv: &[String]) -> (RuntimeOptions, Vec<String>) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.len() == 3 && args[1] == "__native-worker" {
+        match wincli::native::execute_worker_request(Path::new(&args[2])) {
+            Ok(code) => std::process::exit(code as i32),
+            Err(error) => {
+                eprintln!("wincli: native worker failed: {error}");
+                std::process::exit(127);
+            }
+        }
+    }
+    if let Ok(executable) = std::env::current_exe() {
+        std::env::set_var("WINCLI_NATIVE_WORKER_EXE", executable);
+    }
     if (args.len() == 4 || args.len() == 5) && args[1] == "__instance-daemon" {
         let snapshot = args.get(4).map(String::as_str);
         if let Err(e) = instance::run_daemon(&args[2], &args[3], snapshot) {

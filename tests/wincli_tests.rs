@@ -80,6 +80,115 @@ fn test1_hello_exe_prints() {
 }
 
 #[test]
+fn exec_worker_returns_guest_filesystem_changes_to_the_launcher() {
+    let binary = env!("CARGO_BIN_EXE_wincli");
+    let program_path = tmp_path("worker-writes.exe");
+    let snapshot_path = tmp_path("worker-state.winfs");
+    let image = pe::builder::write_file(r"C:\worker-result.txt", b"written in exec worker");
+    std::fs::write(&program_path, image).unwrap();
+    let output = Command::new(binary)
+        .arg(format!("--save-snapshot={}", snapshot_path.display()))
+        .arg(&program_path)
+        .output()
+        .expect("start wincli exec worker");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let fs = wincli::snapshot::load_file(snapshot_path.to_str().unwrap()).unwrap();
+    assert_eq!(
+        fs.read_file(r"C:\worker-result.txt").unwrap(),
+        b"written in exec worker"
+    );
+    std::fs::remove_file(program_path).unwrap();
+    std::fs::remove_file(snapshot_path).unwrap();
+}
+
+#[test]
+fn exec_worker_reads_files_from_an_existing_winfs_snapshot() {
+    let binary = env!("CARGO_BIN_EXE_wincli");
+    let snapshot_path = tmp_path("worker-input.winfs");
+    let program_path = tmp_path("worker-read.exe");
+    let mut fs = WinFs::ephemeral_runner();
+    fs.write_file(r"C:\worker-input.txt", b"snapshot extent".to_vec())
+        .unwrap();
+    wincli::snapshot::save_file(&mut fs, snapshot_path.to_str().unwrap()).unwrap();
+    std::fs::write(
+        &program_path,
+        pe::builder::read_file_to_stdout(r"C:\worker-input.txt"),
+    )
+    .unwrap();
+    let output = Command::new(binary)
+        .arg(format!("--snapshot={}", snapshot_path.display()))
+        .arg(format!("--save-snapshot={}", snapshot_path.display()))
+        .arg(&program_path)
+        .output()
+        .expect("start worker using an existing WinFS disk");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"snapshot extent");
+    let loaded = wincli::snapshot::load_file(snapshot_path.to_str().unwrap()).unwrap();
+    assert_eq!(
+        loaded.read_file(r"C:\worker-input.txt").unwrap(),
+        b"snapshot extent"
+    );
+    std::fs::remove_file(program_path).unwrap();
+    std::fs::remove_file(snapshot_path).unwrap();
+}
+
+#[test]
+fn exec_worker_preserves_guest_exit_codes() {
+    let program_path = tmp_path("worker-exit.exe");
+    std::fs::write(&program_path, pe::builder::exit_code(37)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_wincli"))
+        .arg(&program_path)
+        .output()
+        .expect("start wincli guest with a nonzero exit code");
+    assert_eq!(
+        output.status.code(),
+        Some(37),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::remove_file(program_path).unwrap();
+}
+
+#[test]
+fn exec_worker_reopens_mounted_host_drives() {
+    let binary = env!("CARGO_BIN_EXE_wincli");
+    let host_dir = tmp_path("worker-mount");
+    std::fs::create_dir(&host_dir).unwrap();
+    let program_path = tmp_path("worker-mount.exe");
+    let image = pe::builder::write_file(r"Z:\worker-mounted.txt", b"mounted write");
+    std::fs::write(&program_path, image).unwrap();
+    let mount = format!("--mount=Z:{}", host_dir.display());
+    let output = Command::new(binary)
+        .arg(mount)
+        .arg(&program_path)
+        .output()
+        .expect("start wincli with mounted drive");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read(host_dir.join("worker-mounted.txt")).unwrap(),
+        b"mounted write"
+    );
+    std::fs::remove_file(program_path).unwrap();
+    std::fs::remove_file(host_dir.join("worker-mounted.txt")).unwrap();
+    std::fs::remove_dir(host_dir).unwrap();
+}
+
+#[test]
 fn native_backend_runs_rust_hello_guest() {
     let bin = env!("CARGO_BIN_EXE_wincli");
     let exe = concat!(
@@ -1007,17 +1116,9 @@ fn native_timing_reports_load_execution_and_state_stages() {
     for stage in [
         "host_read=",
         "pe_load=",
-        "lock=",
-        "entry=",
-        "map=",
-        "imports=",
-        "tls=",
-        "context=",
-        "fork=",
-        "first_output=",
+        "worker_start=",
         "guest_until_output_eof=",
-        "state_transfer=",
-        "state_decode=",
+        "state_apply=",
         "total=",
     ] {
         assert!(stderr.contains(stage), "missing {stage} in {stderr}");

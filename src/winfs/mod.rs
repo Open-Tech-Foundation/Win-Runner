@@ -236,6 +236,10 @@ pub(crate) struct SnapshotMetadata {
 }
 
 impl SnapshotFile {
+    pub(crate) fn read_bytes(&self) -> Result<Vec<u8>, String> {
+        self.data.read()
+    }
+
     pub(crate) fn disk_location(&self) -> Option<(Arc<DiskStore>, u64, u64)> {
         match &self.data {
             FileData::Bytes(_) => None,
@@ -626,6 +630,26 @@ impl WinFs {
             parts: self.cwd_parts.clone(),
         }
         .display()
+    }
+
+    /// Return the remembered Windows current directory for each drive.
+    pub(crate) fn drive_current_directories(&self) -> Vec<(char, String)> {
+        let mut directories = self
+            .drive_cwds
+            .iter()
+            .map(|(drive, parts)| {
+                (
+                    *drive,
+                    WinPath {
+                        drive: *drive,
+                        parts: parts.clone(),
+                    }
+                    .display(),
+                )
+            })
+            .collect::<Vec<_>>();
+        directories.sort_by_key(|(drive, _)| *drive);
+        directories
     }
 
     /// Enable Win32's traditional MAX_PATH limit for non-extended paths.

@@ -7,13 +7,16 @@
 //! personality around that code (DLL loading, import trampolines, TEB/PEB,
 //! exceptions, threads, and isolation).
 //!
-//! PE instructions execute in a forked Linux child. This is a process boundary
-//! for implementation, not a security sandbox: guest code can issue host
-//! syscalls with the WinCLI process's privileges. Windows APIs require explicit
-//! native trampolines; unsupported imports fail if guest code calls them.
-//! Strict pre-entry validation is optional.
+//! CLI guests execute in a freshly exec'd worker process; the library API can
+//! also run a forked child when no worker executable is configured. Neither is
+//! a security sandbox: guest code can issue host syscalls with WinCLI's
+//! privileges. Windows APIs require explicit native trampolines; unsupported
+//! imports fail if guest code calls them. Strict pre-entry validation is optional.
 
 use crate::pe::PeImage;
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod worker;
 
 const COMMAND_LINE_BYTES: usize = 0x10000;
 
@@ -51,6 +54,26 @@ fn quote_arg(arg: &str) -> String {
     out.push('"');
     out
 }
+
+/// Execute the private request used by the exec-based native worker process.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn execute_worker_request(path: &std::path::Path) -> Result<u32, String> {
+    worker::execute_request(path)
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+pub fn execute_worker_request(_path: &std::path::Path) -> Result<u32, String> {
+    Err("exec-based native workers are supported only on Linux x86-64".to_string())
+}
+
+/// Configure the result channel for the private Linux worker process.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn set_worker_result_fd(fd: i32) {
+    platform_backend::set_worker_result_fd(fd);
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+pub fn set_worker_result_fd(_fd: i32) {}
 
 /// True when this build can execute the initial native backend.
 pub const AVAILABLE: bool = cfg!(all(target_os = "linux", target_arch = "x86_64"));

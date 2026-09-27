@@ -754,6 +754,15 @@ pub(super) fn finish_native_child(
 }
 
 pub(super) extern "win64" fn native_exit_process(code: u32) -> ! {
+    if std::env::var_os("WINCLI_NATIVE_WORKER").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        if process_ctx().is_some_and(|process| process.parent_process_id == 0) {
+            let fd = NATIVE_WORKER_RESULT_FD.load(Ordering::Acquire);
+            if fd >= 0 {
+                let result = code.to_le_bytes();
+                unsafe { write(fd, result.as_ptr().cast(), result.len()) };
+            }
+        }
+    }
     if native_diagnostic_enabled() {
         eprintln!("native ExitProcess code={code:#x}");
     }
@@ -761,7 +770,7 @@ pub(super) extern "win64" fn native_exit_process(code: u32) -> ! {
     // snapshot pipe can block on a large guest disk image.
     unsafe { close(1) };
     native_flush_instance_state();
-    // SAFETY: this runs only in the forked guest child.
+    // SAFETY: this terminates the isolated guest worker or forked child.
     unsafe { _exit(code as i32) }
 }
 pub(super) extern "win64" fn native_create_process_w(
@@ -1069,7 +1078,13 @@ pub(super) fn native_flush_instance_state() {
     let Ok(ctx) = context.lock() else {
         return;
     };
-    let Ok(encoded) = crate::snapshot::encode_changes(&ctx.fs) else {
+    let encoded =
+        if std::env::var_os("WINCLI_NATIVE_WORKER").as_deref() == Some(std::ffi::OsStr::new("1")) {
+            crate::snapshot::encode_portable_changes(&ctx.fs)
+        } else {
+            crate::snapshot::encode_changes(&ctx.fs)
+        };
+    let Ok(encoded) = encoded else {
         return;
     };
     let mut written = 0;

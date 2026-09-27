@@ -107,6 +107,164 @@ pub fn save_file(fs: &mut WinFs, output: &str) -> Result<usize, String> {
     Ok(file_records.len())
 }
 
+/// Write a small worker manifest that references existing seekable WinFS
+/// extents directly. The backing stores must remain alive until the worker exits.
+pub(crate) fn save_worker_manifest(fs: &WinFs, directory: &Path) -> Result<PathBuf, String> {
+    use std::io::Write;
+    let mut inline = File::create(directory.join("inline.bin"))
+        .map_err(|error| format!("cannot create worker inline store: {error}"))?;
+    let mut inline_offset = 0u64;
+    let mut files = Vec::new();
+    for file in fs.snapshot_files() {
+        let (store, offset, length) = if let Some((store, offset, length)) = file.disk_location() {
+            (store.path().to_string_lossy().into_owned(), offset, length)
+        } else {
+            let bytes = file.read_bytes()?;
+            let offset = inline_offset;
+            inline
+                .write_all(&bytes)
+                .map_err(|error| format!("cannot write worker inline store: {error}"))?;
+            inline_offset = inline_offset
+                .checked_add(bytes.len() as u64)
+                .ok_or("worker inline store is too large")?;
+            (
+                directory.join("inline.bin").to_string_lossy().into_owned(),
+                offset,
+                bytes.len() as u64,
+            )
+        };
+        files.push(serde_json::json!({
+            "path": file.path,
+            "store": store,
+            "offset": offset,
+            "length": length,
+        }));
+    }
+    let metadata = fs
+        .snapshot_metadata()
+        .into_iter()
+        .map(|entry| {
+            serde_json::json!({
+                "path": entry.path,
+                "file_id": entry.file_id,
+                "attributes": entry.metadata.attributes,
+                "creation_time": entry.metadata.creation_time,
+                "access_time": entry.metadata.access_time,
+                "write_time": entry.metadata.write_time,
+            })
+        })
+        .collect::<Vec<_>>();
+    let links = fs.snapshot_symlinks();
+    let manifest = serde_json::json!({
+        "directories": fs.snapshot_directories(),
+        "files": files,
+        "metadata": metadata,
+        "symlinks": links,
+    });
+    let path = directory.join("winfs-manifest.json");
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&manifest)
+            .map_err(|error| format!("cannot encode worker filesystem manifest: {error}"))?,
+    )
+    .map_err(|error| format!("cannot write worker filesystem manifest: {error}"))?;
+    Ok(path)
+}
+
+/// Reopen the extents in a worker manifest without copying file payloads.
+pub(crate) fn load_worker_manifest(path: &Path) -> Result<WinFs, String> {
+    use crate::winfs::{DiskStore, SnapshotMetadata, WinFileMetadata};
+    use std::collections::HashMap;
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(path)
+            .map_err(|error| format!("cannot read worker filesystem manifest: {error}"))?,
+    )
+    .map_err(|error| format!("invalid worker filesystem manifest: {error}"))?;
+    let mut fs = WinFs::new();
+    for directory in manifest["directories"]
+        .as_array()
+        .ok_or("invalid worker directories")?
+    {
+        let directory = directory.as_str().ok_or("invalid worker directory entry")?;
+        if !fs.is_dir(directory) {
+            fs.mkdir(directory)?;
+        }
+    }
+    let mut stores = HashMap::<String, Arc<DiskStore>>::new();
+    for entry in manifest["files"].as_array().ok_or("invalid worker files")? {
+        let guest = entry["path"].as_str().ok_or("invalid worker file path")?;
+        let source = entry["store"]
+            .as_str()
+            .ok_or("invalid worker disk path")?
+            .to_owned();
+        let offset = entry["offset"]
+            .as_u64()
+            .ok_or("invalid worker file offset")?;
+        let length = entry["length"]
+            .as_u64()
+            .ok_or("invalid worker file length")?;
+        let store = if let Some(store) = stores.get(&source) {
+            Arc::clone(store)
+        } else {
+            let store = DiskStore::open(Path::new(&source))?;
+            stores.insert(source, Arc::clone(&store));
+            store
+        };
+        let Some(end) = offset.checked_add(length) else {
+            return Err(format!("worker file extent is out of bounds: {guest}"));
+        };
+        if end > store.len()? {
+            return Err(format!("worker file extent is out of bounds: {guest}"));
+        }
+        let parent = guest
+            .rsplit_once('\\')
+            .map(|(parent, _)| parent)
+            .unwrap_or("C:");
+        fs.mkdir(parent)?;
+        fs.open_snapshot_file(guest, store, offset, length)?;
+    }
+    let metadata = manifest["metadata"]
+        .as_array()
+        .ok_or("invalid worker metadata")?
+        .iter()
+        .map(|entry| {
+            Ok(SnapshotMetadata {
+                path: entry["path"]
+                    .as_str()
+                    .ok_or("invalid worker metadata path")?
+                    .to_owned(),
+                file_id: entry["file_id"].as_u64().ok_or("invalid worker file ID")?,
+                metadata: WinFileMetadata {
+                    attributes: entry["attributes"]
+                        .as_u64()
+                        .ok_or("invalid worker attributes")? as u32,
+                    creation_time: entry["creation_time"]
+                        .as_u64()
+                        .ok_or("invalid worker creation time")?,
+                    access_time: entry["access_time"]
+                        .as_u64()
+                        .ok_or("invalid worker access time")?,
+                    write_time: entry["write_time"]
+                        .as_u64()
+                        .ok_or("invalid worker write time")?,
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    fs.restore_snapshot_metadata(&metadata)?;
+    for entry in manifest["symlinks"]
+        .as_array()
+        .ok_or("invalid worker symlinks")?
+    {
+        let path = entry[0].as_str().ok_or("invalid worker symlink path")?;
+        let target = entry[1].as_str().ok_or("invalid worker symlink target")?;
+        let directory = entry[2].as_bool().ok_or("invalid worker symlink kind")?;
+        fs.create_symlink(path, target, directory)?;
+    }
+    fs.clear_changes();
+    Ok(fs)
+}
+
 fn temporary_output_path(output: &Path) -> PathBuf {
     let parent = output.parent().unwrap_or_else(|| Path::new("."));
     let name = output.file_name().unwrap_or_default().to_string_lossy();
@@ -362,13 +520,42 @@ fn take_index_path(bytes: &[u8], cursor: &mut usize) -> Result<String, String> {
 /// File writes point at extents in the shared temporary disk; bytes are not
 /// copied through the parent/child state pipe.
 pub(crate) fn encode_changes(fs: &WinFs) -> Result<Vec<u8>, String> {
+    encode_change_records(fs, false)
+}
+
+/// Encode a self-contained journal for a process with an independent disk
+/// overlay. Disk offsets are local to one WinFS process and cannot be replayed
+/// by an exec worker, so materialize those writes as bytes.
+pub(crate) fn encode_portable_changes(fs: &WinFs) -> Result<Vec<u8>, String> {
+    encode_change_records(fs, true)
+}
+
+fn encode_change_records(fs: &WinFs, portable: bool) -> Result<Vec<u8>, String> {
     use crate::winfs::FsChange;
-    let changes = fs.changes();
+    let changes = if portable {
+        fs.changes()
+            .iter()
+            .map(|change| match change {
+                FsChange::Write {
+                    path,
+                    offset: Some(_),
+                    ..
+                } => Ok(FsChange::Write {
+                    path: path.clone(),
+                    offset: None,
+                    bytes: fs.read_file(path)?,
+                }),
+                other => Ok(other.clone()),
+            })
+            .collect::<Result<Vec<_>, String>>()?
+    } else {
+        fs.changes().to_vec()
+    };
     let count = u32::try_from(changes.len()).map_err(|_| "too many WinFS changes")?;
     let mut out = Vec::new();
     out.extend_from_slice(CHANGE_MAGIC);
     out.extend_from_slice(&count.to_le_bytes());
-    for change in changes {
+    for change in &changes {
         match change {
             FsChange::Mkdir(path) => {
                 out.push(0);

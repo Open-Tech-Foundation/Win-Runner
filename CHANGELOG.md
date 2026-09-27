@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Launched CLI PE guests in a fresh exec-based WinCLI worker instead of
+  forking the multithreaded launcher. Workers reopen mounted drives and
+  seekable WinFS extents, and return portable filesystem journals while
+  preserving guest stdout, stderr, and exit codes.
 - Completed the Linux native backend split: launch/output orchestration, shared
   runtime state, x86-64 assembly, and shared string helpers are in dedicated
   modules; file I/O is divided into open/read, namespace, temporary/metadata,

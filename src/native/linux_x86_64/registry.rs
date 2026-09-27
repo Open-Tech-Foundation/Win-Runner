@@ -772,6 +772,13 @@ extern "win64" fn native_missing_import(message: *const u8, len: u64) -> ! {
         }
         offset += written as usize;
     }
+    if std::env::var_os("WINCLI_NATIVE_WORKER").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        let fd = NATIVE_WORKER_RESULT_FD.load(Ordering::Acquire);
+        if fd >= 0 {
+            let code = 126u32.to_le_bytes();
+            unsafe { write(fd, code.as_ptr().cast(), code.len()) };
+        }
+    }
     unsafe { _exit(126) }
 }
 

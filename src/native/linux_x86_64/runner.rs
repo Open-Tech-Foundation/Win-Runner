@@ -86,6 +86,196 @@ pub fn run_rust_baseline_argv_with_fs(
         .map_err(|failure| failure.message)
 }
 
+static NEXT_WORKER_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+
+struct WorkerDirectory(std::path::PathBuf);
+
+impl Drop for WorkerDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn run_exec_worker(
+    executable: std::path::PathBuf,
+    image: &PeImage,
+    mut fs: WinFs,
+    program: &str,
+    args: &[String],
+    environment: &[(String, String)],
+    output: Option<&dyn Fn(bool, &[u8])>,
+) -> Result<(u32, Vec<u8>, WinFs), super::super::NativeExecutionFailure> {
+    use std::process::{Command, Stdio};
+    let total_started = std::time::Instant::now();
+    let failed = |message: String, fs: WinFs| super::super::NativeExecutionFailure { message, fs };
+    let id = NEXT_WORKER_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+    let directory = std::env::temp_dir().join(format!("wincli-worker-{}-{id}", std::process::id()));
+    if let Err(error) = std::fs::create_dir(&directory) {
+        return Err(failed(
+            format!("cannot create native worker directory: {error}"),
+            fs,
+        ));
+    }
+    let _directory = WorkerDirectory(directory.clone());
+    let image_path = match super::super::worker::write_image(image, &directory) {
+        Ok(path) => path,
+        Err(error) => return Err(failed(error, fs)),
+    };
+    let snapshot_path = match crate::snapshot::save_worker_manifest(&fs, &directory) {
+        Ok(path) => path,
+        Err(error) => {
+            return Err(failed(
+                format!("cannot prepare native worker filesystem: {error}"),
+                fs,
+            ));
+        }
+    };
+    let state_path = directory.join("state.bin");
+    let result_path = directory.join("result.bin");
+    let request_path = directory.join("request.json");
+    let request = serde_json::json!({
+        "image_path": image_path,
+        "snapshot_path": snapshot_path,
+        "state_path": state_path,
+        "result_path": result_path,
+        "program": program,
+        "args": args,
+        "environment": environment,
+        "mounts": fs.host_mounts(),
+        "drive_cwds": fs.drive_current_directories(),
+        "cwd": fs.cwd(),
+    });
+    let request_bytes = match serde_json::to_vec(&request) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return Err(failed(
+                format!("cannot encode native worker request: {error}"),
+                fs,
+            ))
+        }
+    };
+    if let Err(error) = std::fs::write(&request_path, request_bytes) {
+        return Err(failed(
+            format!("cannot write native worker request: {error}"),
+            fs,
+        ));
+    }
+    let worker_start = std::time::Instant::now();
+    let mut child = match Command::new(executable)
+        .arg("__native-worker")
+        .arg(&request_path)
+        .env_remove("WINCLI_NATIVE_WORKER")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => return Err(failed(format!("cannot start native worker: {error}"), fs)),
+    };
+    let worker_start_ms = worker_start.elapsed().as_secs_f64() * 1000.0;
+    let guest_started = std::time::Instant::now();
+    let stdout = child.stdout.take().expect("piped worker stdout");
+    let stderr = child.stderr.take().expect("piped worker stderr");
+    fn forward_output<R: std::io::Read + Send + 'static>(
+        is_stderr: bool,
+        mut stream: R,
+        sender: std::sync::mpsc::Sender<(bool, Vec<u8>)>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let mut buffer = [0u8; 4096];
+            loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if sender.send((is_stderr, buffer[..n].to_vec())).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+        })
+    }
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let readers = vec![
+        forward_output(false, stdout, sender.clone()),
+        forward_output(true, stderr, sender.clone()),
+    ];
+    drop(sender);
+    let mut stdout_bytes = Vec::new();
+    for (is_stderr, bytes) in receiver {
+        if !is_stderr {
+            stdout_bytes.extend_from_slice(&bytes);
+        }
+        if let Some(output) = output {
+            output(is_stderr, &bytes);
+        } else if is_stderr {
+            write_host_stderr(&bytes);
+        }
+    }
+    for reader in readers {
+        let _ = reader.join();
+    }
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(error) => {
+            return Err(failed(
+                format!("cannot wait for native worker: {error}"),
+                fs,
+            ))
+        }
+    };
+    let guest_ms = guest_started.elapsed().as_secs_f64() * 1000.0;
+    let guest_code = match std::fs::read(&result_path) {
+        Ok(bytes) if bytes.len() == 4 => u32::from_le_bytes(bytes.try_into().unwrap()),
+        _ if !status.success() => {
+            return Err(failed(
+                format!(
+                    "native worker exited with status {status} before reporting a guest exit code"
+                ),
+                fs,
+            ));
+        }
+        _ => {
+            return Err(failed(
+                "native worker did not report a guest exit code".to_string(),
+                fs,
+            ))
+        }
+    };
+    let state_started = std::time::Instant::now();
+    match std::fs::read(&state_path) {
+        Ok(state) if !state.is_empty() => {
+            if let Err(error) = crate::snapshot::apply_changes(&state, &mut fs) {
+                return Err(failed(
+                    format!("native worker returned invalid filesystem changes: {error}"),
+                    fs,
+                ));
+            }
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(failed(
+                format!("cannot read native worker state: {error}"),
+                fs,
+            ))
+        }
+    }
+    if std::env::var_os("WINCLI_TIMINGS").is_some() {
+        let state_bytes = std::fs::metadata(&state_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        eprintln!(
+            "wincli timing: {program}: worker_start={worker_start_ms:.3}ms guest_until_output_eof={guest_ms:.3}ms state_apply={:.3}ms state_bytes={state_bytes} total={:.3}ms",
+            state_started.elapsed().as_secs_f64() * 1000.0,
+            total_started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    Ok((guest_code, stdout_bytes, fs))
+}
+
 fn write_host_stderr(bytes: &[u8]) {
     use std::io::Write;
     let _ = std::io::stderr().lock().write_all(bytes);
@@ -210,6 +400,19 @@ fn run_rust_baseline_argv_with_fs_impl(
     environment: &[(String, String)],
     output: Option<&dyn Fn(bool, &[u8])>,
 ) -> Result<(u32, Vec<u8>, WinFs), super::super::NativeExecutionFailure> {
+    if std::env::var_os("WINCLI_NATIVE_WORKER").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        if let Some(executable) = std::env::var_os("WINCLI_NATIVE_WORKER_EXE") {
+            return run_exec_worker(
+                executable.into(),
+                img,
+                instance_fs,
+                prog,
+                args,
+                environment,
+                output,
+            );
+        }
+    }
     let mut recovery_fs = Some(instance_fs);
     let mut recovery_process: Option<Arc<NativeProcessContext>> = None;
     let result = (|| -> Result<(u32, Vec<u8>, WinFs), String> {
@@ -317,6 +520,57 @@ fn run_rust_baseline_argv_with_fs_impl(
         if let Ok(mut context) = NATIVE_PROCESS.lock() {
             *context = Some(Arc::clone(&process));
         }
+        let context_ms = context_started.elapsed().as_secs_f64() * 1000.0;
+        if std::env::var_os("WINCLI_NATIVE_WORKER").as_deref() == Some(std::ffi::OsStr::new("1")) {
+            let state_fd = std::env::var("WINCLI_NATIVE_STATE_FD")
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok())
+                .ok_or("native worker has no state journal descriptor")?;
+            process.state_fd.store(state_fd, Ordering::Release);
+            protect_exec(&mapping)?;
+            let guest_process = Arc::clone(&process);
+            let code = std::thread::Builder::new()
+                .name("wincli-native-guest".to_string())
+                .stack_size(16 * 1024 * 1024)
+                .spawn(move || {
+                    THREAD_NATIVE_PROCESS.with(|active| {
+                        *active.borrow_mut() = Some(Arc::clone(&guest_process));
+                    });
+                    let mut tls = tls;
+                    let mut fallback_teb = Box::new([0u8; 0x1000]);
+                    let teb = tls
+                        .as_mut()
+                        .map(|tls| &mut tls.teb)
+                        .unwrap_or(&mut fallback_teb);
+                    if !install_thread_teb(teb) {
+                        return 127;
+                    }
+                    guest_process
+                        .gs_base
+                        .store(teb.as_ptr() as u64, Ordering::Release);
+                    let guest: unsafe extern "win64" fn() -> u32 =
+                        unsafe { std::mem::transmute(entry) };
+                    let code = unsafe { guest() as i32 };
+                    native_wait_file_io(&guest_process);
+                    code
+                })
+                .map_err(|error| format!("cannot start native guest thread: {error}"))?
+                .join()
+                .unwrap_or(127);
+            native_flush_instance_state();
+            process.exit_status.store(code as u32, Ordering::Release);
+            process.exited.store(true, Ordering::Release);
+            if let Ok(mut context) = NATIVE_PROCESS.lock() {
+                *context = None;
+            }
+            let fs = process
+                .fs
+                .lock()
+                .map_err(|_| "native backend filesystem lock is poisoned".to_string())?
+                .fs
+                .clone();
+            return Ok((code as u32, Vec::new(), fs));
+        }
         let mut fds = [-1, -1];
         if unsafe { pipe(fds.as_mut_ptr()) } != 0 {
             return Err(format!(
@@ -348,7 +602,6 @@ fn run_rust_baseline_argv_with_fs_impl(
                 std::io::Error::last_os_error()
             ));
         }
-        let context_ms = context_started.elapsed().as_secs_f64() * 1000.0;
         let fork_started = std::time::Instant::now();
         let pid = unsafe { fork() };
         let fork_ms = fork_started.elapsed().as_secs_f64() * 1000.0;

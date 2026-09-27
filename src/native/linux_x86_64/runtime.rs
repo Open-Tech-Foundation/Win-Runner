@@ -1,5 +1,6 @@
 //! Linux backend process-wide runtime state and synthetic handle values.
 
+use std::sync::atomic::AtomicI32;
 use std::sync::{LazyLock, Mutex};
 
 pub(super) static NATIVE_DIAGNOSTIC_ENABLED: LazyLock<bool> = LazyLock::new(|| {
@@ -23,3 +24,5 @@ pub(super) static EMPTY_ENVIRONMENT_BLOCK: [u16; 2] = [0, 0];
 // Preferred-base PE mappings collide by design. Serialize native runs until
 // relocations allow independent address-space layouts.
 pub(super) static NATIVE_RUN_LOCK: Mutex<()> = Mutex::new(());
+
+pub(super) static NATIVE_WORKER_RESULT_FD: AtomicI32 = AtomicI32::new(-1);

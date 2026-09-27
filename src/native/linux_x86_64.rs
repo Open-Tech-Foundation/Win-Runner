@@ -113,3 +113,8 @@ use arch::*;
 #[cfg(test)]
 #[path = "linux_x86_64/tests.rs"]
 mod tests;
+
+/// Set the private result descriptor used by an exec-based guest worker.
+pub(super) fn set_worker_result_fd(fd: i32) {
+    NATIVE_WORKER_RESULT_FD.store(fd, Ordering::Release);
+}
