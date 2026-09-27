@@ -196,6 +196,15 @@ mod imp {
     use std::ptr;
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
     use std::sync::LazyLock;
+
+    static NATIVE_DIAGNOSTIC_ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var_os("WINCLI_NATIVE_DIAGNOSTIC").is_some_and(|value| value == "1")
+    });
+
+    #[inline]
+    fn native_diagnostic_enabled() -> bool {
+        *NATIVE_DIAGNOSTIC_ENABLED
+    }
     use std::sync::{Arc, Condvar, Mutex, Weak};
 
     const PROT_READ: i32 = 0x1;
@@ -6695,7 +6704,7 @@ mod imp {
                     };
                     put64(teb, 0x08, end as u64); // NT_TIB.StackBase
                     put64(teb, 0x10, limit as u64); // NT_TIB.StackLimit
-                    if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+                    if native_diagnostic_enabled() {
                         eprintln!("native TEB stack base={end:#x} limit={limit:#x} rsp={stack_pointer:#x}");
                     }
                     return;
@@ -6824,7 +6833,7 @@ mod imp {
                 0
             }
         };
-        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+        if native_diagnostic_enabled() {
             eprintln!("native CreateThread start={start:#x} handle={result:#x}");
         }
         result
@@ -6854,7 +6863,7 @@ mod imp {
         previous
     }
     extern "win64" fn native_wait_for_single_object(handle: u64, milliseconds: u32) -> u32 {
-        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+        if native_diagnostic_enabled() {
             eprintln!("native WaitForSingleObject handle={handle:#x} timeout={milliseconds}");
         }
         let process = process_ctx();
@@ -7451,7 +7460,7 @@ mod imp {
         completion_key: u64,
         _concurrent_threads: u32,
     ) -> u64 {
-        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+        if native_diagnostic_enabled() {
             eprintln!("native CreateIoCompletionPort file={file:#x} existing={existing_port:#x} key={completion_key:#x}");
         }
         let Some(process) = process_ctx() else {
@@ -7943,7 +7952,7 @@ mod imp {
         overlapped: u64,
         _completion_routine: u64,
     ) -> i32 {
-        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+        if native_diagnostic_enabled() {
             eprintln!("native ReadDirectoryChangesW handle={handle:#x} length={length} subtree={subtree} filter={filter:#x} overlapped={overlapped:#x}");
         }
         const VALID_FILTER: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x100;
@@ -7954,7 +7963,7 @@ mod imp {
             || filter == 0
             || filter & !VALID_FILTER != 0
         {
-            if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+            if native_diagnostic_enabled() {
                 eprintln!("native ReadDirectoryChangesW invalid args");
             }
             native_set_last_error(87);
@@ -7974,7 +7983,7 @@ mod imp {
                 return 0;
             };
             if !fs.fs.is_dir(&file.path) {
-                if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+                if native_diagnostic_enabled() {
                     eprintln!(
                         "native ReadDirectoryChangesW not directory path={}",
                         file.path
@@ -7984,7 +7993,7 @@ mod imp {
                 return 0;
             }
             if !file.overlapped || native_overlapped_status(overlapped) == STATUS_PENDING {
-                if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+                if native_diagnostic_enabled() {
                     eprintln!("native ReadDirectoryChangesW invalid handle mode overlapped={} status={:#x}", file.overlapped, native_overlapped_status(overlapped));
                 }
                 native_set_last_error(87);
@@ -7996,7 +8005,7 @@ mod imp {
         let event = match native_prepare_overlapped_event(overlapped) {
             Ok(event) => event,
             Err(error) => {
-                if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+                if native_diagnostic_enabled() {
                     eprintln!("native ReadDirectoryChangesW event error={error}");
                 }
                 native_set_last_error(error);
@@ -8468,7 +8477,7 @@ mod imp {
         key: u64,
         overlapped: u64,
     ) -> i32 {
-        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+        if native_diagnostic_enabled() {
             eprintln!("native PostQueuedCompletionStatus key={key:#x} overlap={overlapped:#x}");
         }
         let Some(port) = process_ctx().and_then(|process| {
@@ -8509,7 +8518,7 @@ mod imp {
         timeout: u32,
         _alertable: i32,
     ) -> i32 {
-        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+        if native_diagnostic_enabled() {
             eprintln!("native GetQueuedCompletionStatusEx timeout={timeout} count={count}");
         }
         if entries.is_null() || removed.is_null() || count == 0 {
@@ -9611,7 +9620,7 @@ mod imp {
     fn load_native_child_image(fs: &WinFs, launch: &NativeLaunchSpec) -> Result<PeImage, u32> {
         let bytes = fs.read_file(&launch.application).map_err(|_| 2u32)?; // ERROR_FILE_NOT_FOUND
         crate::pe::load_lenient(&bytes).map_err(|error| {
-            if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+            if native_diagnostic_enabled() {
                 eprintln!(
                     "native child PE parse failed path={} len={} error={error}",
                     launch.application,
@@ -9646,7 +9655,7 @@ mod imp {
         let handle = process_ctx()
             .map(|process| process.std_handles[index].load(Ordering::Acquire))
             .unwrap_or(u64::MAX);
-        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+        if native_diagnostic_enabled() {
             eprintln!("native GetStdHandle which={which:#x} handle={handle:#x}");
         }
         handle
@@ -9665,7 +9674,7 @@ mod imp {
                 .and_then(|fds| fds.get(&fd).copied())
                 .unwrap_or(u64::MAX)
         };
-        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+        if native_diagnostic_enabled() {
             eprintln!("native CRT _get_osfhandle fd={fd} handle={handle:#x}");
         }
         handle
@@ -9693,7 +9702,7 @@ mod imp {
             fds.insert(fd, handle);
             true
         }) {
-            if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+            if native_diagnostic_enabled() {
                 eprintln!("native CRT _open_osfhandle handle={handle:#x} fd={fd}");
             }
             fd
@@ -9764,7 +9773,7 @@ mod imp {
     }
 
     extern "win64" fn native_set_std_handle(which: u32, handle: u64) -> i32 {
-        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+        if native_diagnostic_enabled() {
             eprintln!(
                 "native SetStdHandle which={} handle={handle:#x}",
                 which as i32
@@ -9845,7 +9854,7 @@ mod imp {
         inherit: i32,
         options: u32,
     ) -> i32 {
-        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+        if native_diagnostic_enabled() {
             eprintln!("native DuplicateHandle source_process={source_process:#x} source={source_handle:#x} target_process={target_process:#x} desired={desired_access:#x} inherit={inherit} options={options:#x}");
         }
         if target_handle.is_null() {
@@ -11448,7 +11457,7 @@ mod imp {
         }
     }
     extern "win64" fn native_process_prng(out: *mut u8, len: usize) -> i32 {
-        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+        if native_diagnostic_enabled() {
             eprintln!("native ProcessPrng length={len}");
         }
         if out.is_null() && len != 0 {
@@ -12392,7 +12401,7 @@ mod imp {
         head: *mut u8,
         entry: *mut u8,
     ) -> *mut u8 {
-        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+        if native_diagnostic_enabled() {
             eprintln!("native InterlockedPushEntrySList head={head:p} entry={entry:p}");
         }
         if head.is_null()
@@ -12417,7 +12426,7 @@ mod imp {
     }
 
     extern "win64" fn native_interlocked_pop_entry_slist(head: *mut u8) -> *mut u8 {
-        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+        if native_diagnostic_enabled() {
             eprintln!("native InterlockedPopEntrySList head={head:p}");
         }
         if head.is_null() || (head as usize) & 15 != 0 {
@@ -12440,7 +12449,7 @@ mod imp {
     }
 
     extern "win64" fn native_interlocked_flush_slist(head: *mut u8) -> *mut u8 {
-        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+        if native_diagnostic_enabled() {
             eprintln!("native InterlockedFlushSList head={head:p}");
         }
         if head.is_null() || (head as usize) & 15 != 0 {
@@ -12460,7 +12469,7 @@ mod imp {
     }
 
     extern "win64" fn native_query_depth_slist(head: *const u8) -> u16 {
-        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+        if native_diagnostic_enabled() {
             eprintln!("native QueryDepthSList head={head:p}");
         }
         if head.is_null() || (head as usize) & 15 != 0 {
@@ -12536,7 +12545,7 @@ mod imp {
                     }
                     break (0, count as u32);
                 };
-                if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+                if native_diagnostic_enabled() {
                     eprintln!("native named-pipe completion handle={handle:#x} overlap={overlapped:#x} status={status:#x} bytes={bytes}");
                 }
                 if let Ok(mut pipes) = worker_process.named_pipes.lock() {
@@ -12562,7 +12571,7 @@ mod imp {
         written: *mut u32,
         overlapped: u64,
     ) -> i32 {
-        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+        if native_diagnostic_enabled() {
             eprintln!("native WriteFile handle={handle:#x} len={len} overlap={overlapped:#x}");
         }
         if (buf.is_null() && len != 0) || len > 16 * 1024 * 1024 {
@@ -12927,7 +12936,7 @@ mod imp {
     }
 
     extern "win64" fn native_exit_process(code: u32) -> ! {
-        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+        if native_diagnostic_enabled() {
             eprintln!("native ExitProcess code={code:#x}");
         }
         // Closing stdout lets the parent drain console output before the
@@ -13024,7 +13033,7 @@ mod imp {
         let image = match load_native_child_image(&fs.fs, &launch) {
             Ok(image) => image,
             Err(error) => {
-                if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+                if native_diagnostic_enabled() {
                     eprintln!(
                         "native CreateProcessW could not load {} (exists={}): error={error}",
                         launch.application,
@@ -14263,7 +14272,7 @@ mod imp {
                 native_nt_query_information_process as *const () as usize as u64
             }
             Some(function) => baseline_trampoline(function).unwrap_or_else(|| {
-                if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+                if native_diagnostic_enabled() {
                     let message = format!("unsupported native dynamic import: {function}\n");
                     unsafe { write(2, message.as_ptr().cast(), message.len()) };
                 }
@@ -15015,7 +15024,7 @@ mod imp {
         allocation_type: u32,
         protection: u32,
     ) -> *mut u8 {
-        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+        if native_diagnostic_enabled() {
             eprintln!("native VirtualAlloc address={address:p} size={size:#x} type={allocation_type:#x} protection={protection:#x}");
         }
         const MEM_COMMIT: u32 = 0x1000;
@@ -15261,7 +15270,7 @@ mod imp {
                 (3 | 4 | 5, false) => 2, // ERROR_FILE_NOT_FOUND
                 _ => 87,                 // ERROR_INVALID_PARAMETER
             });
-            if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+            if native_diagnostic_enabled() {
                 eprintln!("native CreateFileW failed path={path}");
             }
             return u64::MAX;
@@ -15271,7 +15280,7 @@ mod imp {
         }
         let h = ctx.next;
         ctx.next += 1;
-        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+        if native_diagnostic_enabled() {
             eprintln!("native CreateFileW opened path={path} handle={h:#x} flags={flags:#x} access={access:#x}");
         }
         ctx.handles.insert(
@@ -16164,7 +16173,7 @@ mod imp {
         read_count: *mut u32,
         ov: u64,
     ) -> i32 {
-        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+        if native_diagnostic_enabled() {
             eprintln!("native ReadFile handle={h:#x} len={n} buf={buf:p} overlap={ov:#x}");
         }
         if buf.is_null() && n != 0 {
@@ -16330,7 +16339,7 @@ mod imp {
             Ok(length) => length,
             Err(_) => return 0,
         };
-        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+        if native_diagnostic_enabled() {
             eprintln!(
                 "native ReadFile path={path} offset={offset} length={file_length} image_base={:#x}",
                 process_ctx().map_or(0, |p| p.image_base)
@@ -16356,7 +16365,7 @@ mod imp {
                 break;
             }
         }
-        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+        if native_diagnostic_enabled() {
             eprintln!("native ReadFile copied={k}");
         }
         if let Some(file) = ctx.handles.get_mut(&h) {
@@ -18445,7 +18454,7 @@ mod imp {
         output: *mut u16,
         capacity: i32,
     ) -> i32 {
-        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+        if native_diagnostic_enabled() {
             eprintln!(
                 "native GetLocaleInfoEx locale={:?} kind={kind:#x}",
                 wide(locale)
@@ -18898,7 +18907,7 @@ mod imp {
         }
     }
     extern "win64" fn native_free_library_and_exit_thread(_module: u64, _code: u32) -> ! {
-        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+        if native_diagnostic_enabled() {
             eprintln!("native FreeLibraryAndExitThread");
         }
         let handle = THREAD_NATIVE_HANDLE.get();
@@ -19337,7 +19346,7 @@ mod imp {
     }
 
     extern "win64" fn native_listen_socket(socket: u64, backlog: i32) -> i32 {
-        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+        if native_diagnostic_enabled() {
             eprintln!("native listen socket={socket:#x} backlog={backlog}");
         }
         if socket & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG {
@@ -19434,7 +19443,7 @@ mod imp {
                 + remote_address_length as usize
                 - 16,
         );
-        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+        if native_diagnostic_enabled() {
             eprintln!("native AcceptEx listen={listen_socket:#x} accept={accept_socket:#x} overlapped={overlapped:#x}");
         }
         if std::thread::Builder::new()
@@ -19456,7 +19465,7 @@ mod imp {
                 if result == 0 {
                     continue;
                 }
-                if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+                if native_diagnostic_enabled() {
                     eprintln!("native AcceptEx listener became readable");
                 }
                 let mut peer = [0u8; 128];
@@ -19469,7 +19478,7 @@ mod imp {
                     }
                     return;
                 }
-                if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+                if native_diagnostic_enabled() {
                     eprintln!("native AcceptEx accepted fd={connection}");
                 }
                 if unsafe { dup2(connection, accepted) } < 0 {
@@ -19499,7 +19508,7 @@ mod imp {
                     );
                 }
                 native_post_pending_socket_completion(listen_socket, overlapped, 0);
-                if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+                if native_diagnostic_enabled() {
                     eprintln!("native AcceptEx completion posted");
                 }
                 break;
@@ -20071,7 +20080,7 @@ mod imp {
             node.as_ref().map_or(ptr::null(), |value| value.as_ptr()),
             service.as_ref().map_or(ptr::null(), |value| value.as_ptr()),
         );
-        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+        if native_diagnostic_enabled() {
             eprintln!(
                 "native GetAddrInfoW node={:?} service={:?}",
                 node.as_ref().map(|value| value.to_string_lossy()),
@@ -20161,14 +20170,14 @@ mod imp {
             return 10055; // WSAENOBUFS
         }
         unsafe { result.write(first) };
-        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+        if native_diagnostic_enabled() {
             eprintln!("native GetAddrInfoW status=0 result={first:p}");
         }
         0
     }
 
     extern "win64" fn native_free_addr_info_w(mut result: *mut u8) {
-        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+        if native_diagnostic_enabled() {
             eprintln!("native FreeAddrInfoW result={result:p}");
         }
         while !result.is_null() {
@@ -20176,7 +20185,7 @@ mod imp {
                 let next = (result.add(40) as *mut *mut u8).read_unaligned();
                 let address = (result.add(32) as *mut *mut u8).read_unaligned();
                 let canonical = (result.add(24) as *mut *mut u16).read_unaligned();
-                if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+                if native_diagnostic_enabled() {
                     eprintln!("native FreeAddrInfoW entry={result:p} address={address:p} canonical={canonical:p} next={next:p}");
                 }
                 if !address.is_null() {
@@ -20242,7 +20251,7 @@ mod imp {
         value: *mut c_void,
         length: *mut u32,
     ) -> i32 {
-        if std::env::var("WINCLI_NATIVE_DIAGNOSTIC").as_deref() == Ok("1") {
+        if native_diagnostic_enabled() {
             eprintln!("native getsockopt level={level:#x} option={option:#x}");
         }
         if handle & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG
@@ -20677,6 +20686,9 @@ mod imp {
         let mut recovery_process: Option<Arc<NativeProcessContext>> = None;
         let result = (|| -> Result<(u32, Vec<u8>, WinFs), String> {
             let total_started = std::time::Instant::now();
+            // Initialize this cache before any guest fork; shims read it in
+            // potentially multithreaded children.
+            let _ = native_diagnostic_enabled();
             let timing = std::env::var_os("WINCLI_TIMINGS").is_some();
             let lock_started = std::time::Instant::now();
             let _run = NATIVE_RUN_LOCK

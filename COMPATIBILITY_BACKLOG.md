@@ -49,8 +49,8 @@ Items remain open until implementation and relevant verification are complete.
   accidentally staged.
 - [ ] Split `src/native.rs` by subsystem: loader, handles, file I/O, sync,
   processes, sockets, and related Windows API groups.
-- [ ] Cache `WINCLI_NATIVE_DIAGNOSTIC` once rather than reading the environment
-  from hot shims.
+- [x] Cache `WINCLI_NATIVE_DIAGNOSTIC` once rather than reading the environment
+  from hot shims; initialize the cache before guest forks.
 - [ ] Fix Clippy's unevenly grouped hexadecimal literal warnings.
 
 ## Compatibility coverage priorities
