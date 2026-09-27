@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Simplified the README, aligned its opening with the organization project format,
+  and removed program-specific package examples.
 - Renamed the Cargo package to `win-runner` and both the Rust library crate
   and command-line executable to `winrun` (project name: Win-Runner).
 - Kept interactive shell history exclusively in guest
