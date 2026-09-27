@@ -107,6 +107,8 @@ All notable changes to this project will be documented in this file.
 - Grouped Linux performance counters, monotonic tick counts, time-zone data,
   and UTC-to-FILETIME conversions in a clock module; moved sleep/yield shims
   into synchronization.
+- Moved Linux NTDLL file, process, and system-information shims into a dedicated
+  backend module.
 - Added the C-locale `msvcrt!mbstowcs` shim used by Nano.
 - Added an optional native Node check proving a relative file that Node leaves
   in WinFS appears in the following shell directory listing.
