@@ -153,6 +153,40 @@ fn exec_worker_reads_files_from_an_existing_winfs_snapshot() {
 }
 
 #[test]
+fn save_flag_updates_the_loaded_snapshot_on_exit() {
+    let binary = env!("CARGO_BIN_EXE_winrun");
+    let snapshot_path = tmp_path("save-flag.winfs");
+    let program_path = tmp_path("save-flag.exe");
+    let mut fs = WinFs::ephemeral_runner();
+    fs.write_file(r"C:\before.txt", b"before".to_vec()).unwrap();
+    winrun::snapshot::save_file(&mut fs, snapshot_path.to_str().unwrap()).unwrap();
+    std::fs::write(
+        &program_path,
+        pe::builder::write_file(r"C:\after.txt", b"saved on exit"),
+    )
+    .unwrap();
+
+    let output = Command::new(binary)
+        .arg(format!("--snapshot={}", snapshot_path.display()))
+        .arg("--save")
+        .arg(&program_path)
+        .output()
+        .expect("run guest and save loaded snapshot on exit");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let loaded = winrun::snapshot::load_file(snapshot_path.to_str().unwrap()).unwrap();
+    assert_eq!(loaded.read_file(r"C:\before.txt").unwrap(), b"before");
+    assert_eq!(loaded.read_file(r"C:\after.txt").unwrap(), b"saved on exit");
+
+    std::fs::remove_file(program_path).unwrap();
+    std::fs::remove_file(snapshot_path).unwrap();
+}
+
+#[test]
 fn exec_worker_preserves_guest_exit_codes() {
     let program_path = tmp_path("worker-exit.exe");
     std::fs::write(&program_path, pe::builder::exit_code(37)).unwrap();

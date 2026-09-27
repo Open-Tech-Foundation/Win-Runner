@@ -16,7 +16,12 @@ fn usage() -> ! {
     eprintln!("  winrun runner                   run host-controlled job commands from stdin");
     eprintln!("  winrun --headless --control=127.0.0.1:0 shell  run a remotely controlled shell");
     eprintln!("  winrun --snapshot=os.disk shell|runner  boot an indexed C: disk image");
-    eprintln!("  winrun --save-snapshot=disk.winfs shell|runner|app.exe  persist C: on exit");
+    eprintln!(
+        "  winrun --snapshot=os.disk --save shell|runner|app.exe  save changes to os.disk on exit"
+    );
+    eprintln!(
+        "  winrun --save-snapshot=disk.winfs shell|runner|app.exe  save a new C: disk on exit"
+    );
     eprintln!("  winrun --snapshot=os.disk <app.exe> [args...]  run headless with streamed stdio");
     eprintln!("  winrun --mount=Z:/host/folder shell  mount a writable host folder");
     eprintln!("  winrun --mount-ro=Z:/host/folder shell  mount a read-only host folder");
@@ -33,6 +38,7 @@ fn usage() -> ! {
 struct RuntimeOptions {
     snapshot_path: Option<String>,
     save_snapshot_path: Option<String>,
+    save_on_exit: bool,
     mount_specs: Vec<String>,
     read_only_mount_specs: Vec<String>,
     control_bind: Option<String>,
@@ -60,6 +66,8 @@ fn parse_runtime_options(argv: &[String]) -> (RuntimeOptions, Vec<String>) {
             options
                 .save_snapshot_path
                 .get_or_insert_with(|| value.to_string());
+        } else if arg == "--save" {
+            options.save_on_exit = true;
         } else if let Some(value) = arg.strip_prefix("--mount=") {
             options.mount_specs.push(value.to_string());
         } else if let Some(value) = arg.strip_prefix("--mount-ro=") {
@@ -104,7 +112,17 @@ fn main() {
     install::prepare_process_cache();
     let (options, args) = parse_runtime_options(&args);
     let snapshot_path = options.snapshot_path.as_deref();
-    let save_snapshot_path = options.save_snapshot_path.as_deref();
+    let save_snapshot_path = options.save_snapshot_path.as_deref().or_else(|| {
+        if options.save_on_exit {
+            snapshot_path
+        } else {
+            None
+        }
+    });
+    if options.save_on_exit && save_snapshot_path.is_none() {
+        eprintln!("winrun: --save requires --snapshot=<file> or --save-snapshot=<file>");
+        exit(2);
+    }
     let mount_specs = options.mount_specs;
     let read_only_mount_specs = options.read_only_mount_specs;
     let control_bind = options.control_bind;
@@ -251,7 +269,7 @@ fn main() {
         || !mount_specs.is_empty()
         || !read_only_mount_specs.is_empty()
     {
-        eprintln!("winrun: --snapshot/--save-snapshot/--mount require shell, runner, or an executable target");
+        eprintln!("winrun: --snapshot/--save/--save-snapshot/--mount require shell, runner, or an executable target");
         exit(2);
     }
     if args.len() < 2 {
@@ -372,6 +390,15 @@ mod tests {
             args,
             argv(&["winrun", "C:\\bin\\tool.exe", "--mount=guest-value"])
         );
+    }
+
+    #[test]
+    fn runtime_save_flag_reuses_the_loaded_snapshot_path() {
+        let input = argv(&["winrun", "--snapshot=disk.winfs", "--save", "shell"]);
+        let (options, args) = parse_runtime_options(&input);
+        assert_eq!(options.snapshot_path.as_deref(), Some("disk.winfs"));
+        assert!(options.save_on_exit);
+        assert_eq!(args, argv(&["winrun", "shell"]));
     }
 }
 

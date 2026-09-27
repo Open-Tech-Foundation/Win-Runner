@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Added `--save` to write changes back to the loaded snapshot on exit, without
+  repeating the snapshot path.
 - Simplified the README, aligned its opening with the organization project format,
   and removed program-specific package examples.
 - Renamed the Cargo package to `win-runner` and both the Rust library crate

@@ -1,12 +1,25 @@
+<div align="center">
+
 # Win-Runner
 
-Run Windows command-line programs outside Windows.
+***Run Windows command-line programs outside Windows.***
 
-An [Open Tech Foundation](https://opentechf.org) project.
+</div>
+
+<div align="right">
+
+*An [Open Tech Foundation](https://opentechf.org/) project*
+
+</div>
 
 > Win-Runner (`winrun`) runs Windows x86-64 programs on Linux through native Windows API shims, with a disposable C: drive, snapshots, a scriptable shell, package installs, host folder mounts, and a WebSocket control API. No Wine or VM is required.
 
-**Supported today:** Linux x86-64. Win-Runner is a compatibility runtime, not a security sandbox.
+- ✅ **Supported today:** Linux x86-64 native execution.
+- ⏳ **Planned:** Additional platform backends.
+- ⏳ **In progress:** Built-in security sandbox.
+
+> [!WARNING]
+> Win-Runner is a compatibility runtime, not a security sandbox. Native guest programs can make Linux system calls with Win-Runner's privileges. The built-in sandbox is a work in progress; use an OS sandbox for untrusted programs.
 
 ## Quick start
 
@@ -28,12 +41,12 @@ winrun inspect app.exe
 Each new run gets a disposable C: drive. Use a WinFS snapshot to keep its files and installed programs between runs.
 
 ```bash
-winrun --snapshot=tools.winfs shell
-winrun --snapshot=tools.winfs --save-snapshot=tools.winfs shell
+winrun --snapshot=tools.winfs --save shell
 ```
 
-Snapshots are indexed, seekable WinFS disk files; loading reads file data on demand, and saving records filesystem changes.
-Snapshots contain C: only. Explicitly mounted host directories appear as separate guest drives (for example, Z:).
+`--save` writes changes back to the loaded snapshot when the shell exits; run `snapshot save` inside the shell to save sooner.
+Snapshots are indexed, seekable WinFS disks and contain C: only.
+Explicitly mounted host directories appear as separate guest drives (for example, Z:).
 
 ## Shell and packages
 
@@ -63,11 +76,6 @@ winrun --mount-ro=Z:/path/to/folder shell
 
 Win-Runner implements Windows APIs needed by supported programs incrementally; unsupported imports are reported by name when called.
 `winrun inspect app.exe` reports static imports, and `WINRUN_NATIVE_STRICT_IMPORTS=1` rejects missing imports before execution.
-
-## Security
-
-Win-Runner is a compatibility runtime, not a security sandbox: native guest code can make Linux system calls with Win-Runner's host privileges.
-Use an OS sandbox, container, or VM for untrusted programs; guest filesystem separation alone does not isolate the host.
 
 ## Development
 
