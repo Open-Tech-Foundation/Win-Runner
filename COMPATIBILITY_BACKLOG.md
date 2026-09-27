@@ -115,6 +115,8 @@ Items remain open until implementation and relevant verification are complete.
   - [ ] Load guest DLLs from WinFS: map PE sections, resolve imports
     recursively, handle forwarded exports, invoke `DllMain` and TLS callbacks,
     and implement `LoadLibrary`/`GetProcAddress` against real modules.
+    - [x] Parse bounded PE export tables, including names, ordinals, and
+      forwarder strings, as input to runtime export resolution.
   - [ ] Host `hostfxr.dll`, `hostpolicy.dll`, and `coreclr.dll` using the
     supported native hosting interfaces; cover shared, app-local, and
     self-contained runtime layouts, then add single-file apps.

@@ -11,6 +11,8 @@ All notable changes to this project will be documented in this file.
 - Replaced the PS1 interpreter's proposed install-script .NET API expansion
   with a CoreCLR hosting roadmap for modern .NET executables; no custom IL
   runtime is planned.
+- Parse PE export tables into named, ordinal-only, and forwarded export records
+  as the first implementation step toward loading guest DLLs.
 
 - Added an Apache 2.0 `NOTICE` file and linked it from the README.
 - Added `--save` to write changes back to the loaded snapshot on exit, without

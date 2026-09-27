@@ -93,6 +93,7 @@ mod relocated_map_tests {
             size_of_image: 16,
             image: bytes,
             imports: vec![],
+            exports: vec![],
             unsupported: vec![],
             tls: None,
             code_ranges: vec![],

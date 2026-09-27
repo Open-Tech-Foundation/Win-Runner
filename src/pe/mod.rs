@@ -3,12 +3,25 @@
 
 pub mod builder;
 
+use std::collections::HashMap;
+
 #[derive(Debug, Clone)]
 pub struct Import {
     /// RVA of the IAT slot that will hold the resolved address
     pub iat_rva: u32,
     pub dll: String,
     pub func: String,
+}
+
+/// One entry from a PE export table. A function may have several names; such
+/// aliases are represented as separate entries with the same ordinal/RVA.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Export {
+    pub ordinal: u32,
+    pub name: Option<String>,
+    pub target_rva: u32,
+    /// Set when `target_rva` points back into the export directory.
+    pub forwarder: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -20,6 +33,8 @@ pub struct PeImage {
     /// `image[rva] == byte at image_base + rva`.
     pub image: Vec<u8>,
     pub imports: Vec<Import>,
+    /// Parsed PE exports, including ordinal-only exports and forwarders.
+    pub exports: Vec<Export>,
     /// Imports without native platform trampolines. Empty from strict `load`;
     /// populated by `load_lenient` for diagnostics and rejected before entry.
     pub unsupported: Vec<Import>,
@@ -212,6 +227,11 @@ fn load_inner(data: &[u8], strict: bool) -> Result<PeImage, String> {
     }
     let import_rva = u32le(data, opt + 112 + 8)?;
     let import_size = u32le(data, opt + 112 + 12)?;
+    let (export_rva, export_size) = if num_rva_sizes > 0 {
+        (u32le(data, opt + 112)?, u32le(data, opt + 112 + 4)?)
+    } else {
+        (0, 0)
+    };
     let (reloc_rva, reloc_size) = if num_rva_sizes > 5 {
         (
             u32le(data, opt + 112 + 5 * 8)?,
@@ -292,6 +312,7 @@ fn load_inner(data: &[u8], strict: bool) -> Result<PeImage, String> {
     }
 
     let relocations = parse_base_relocations(&image, reloc_rva, reloc_size)?;
+    let exports = parse_exports(&image, export_rva, export_size)?;
 
     // Parse imports (from file offsets via RVA->file mapping)
     let mut imports: Vec<Import> = Vec::new();
@@ -461,6 +482,7 @@ fn load_inner(data: &[u8], strict: bool) -> Result<PeImage, String> {
         size_of_image,
         image,
         imports,
+        exports,
         unsupported,
         tls,
         code_ranges,
@@ -512,6 +534,181 @@ fn parse_base_relocations(image: &[u8], rva: u32, size: u32) -> Result<Vec<u32>,
         at += block;
     }
     Ok(out)
+}
+
+fn parse_exports(image: &[u8], rva: u32, size: u32) -> Result<Vec<Export>, String> {
+    if rva == 0 && size == 0 {
+        return Ok(Vec::new());
+    }
+    if rva == 0 || size < 40 {
+        return Err("invalid export directory".to_string());
+    }
+    let directory_end = rva
+        .checked_add(size)
+        .ok_or_else(|| "export directory range overflows".to_string())?;
+    let directory = rva as usize;
+    if directory_end as usize > image.len() {
+        return Err("export directory out of image bounds".to_string());
+    }
+    let ordinal_base = u32le(image, directory + 16)?;
+    let function_count = u32le(image, directory + 20)? as usize;
+    let name_count = u32le(image, directory + 24)? as usize;
+    let functions_rva = u32le(image, directory + 28)?;
+    let names_rva = u32le(image, directory + 32)?;
+    let ordinals_rva = u32le(image, directory + 36)?;
+    const MAX_EXPORTS: usize = 1 << 20;
+    if function_count > MAX_EXPORTS || name_count > function_count || name_count > MAX_EXPORTS {
+        return Err("invalid export table counts".to_string());
+    }
+    let table_range = |table_rva: u32, count: usize, item_size: usize| {
+        if count == 0 {
+            return Some(0..0);
+        }
+        let start = table_rva as usize;
+        let length = count.checked_mul(item_size)?;
+        let end = start.checked_add(length)?;
+        (table_rva != 0 && end <= image.len()).then_some(start..end)
+    };
+    let function_table = table_range(functions_rva, function_count, 4)
+        .ok_or_else(|| "export address table out of bounds".to_string())?;
+    let names_table = if name_count == 0 {
+        0..0
+    } else {
+        table_range(names_rva, name_count, 4)
+            .ok_or_else(|| "export name table out of bounds".to_string())?
+    };
+    let ordinals_table = if name_count == 0 {
+        0..0
+    } else {
+        table_range(ordinals_rva, name_count, 2)
+            .ok_or_else(|| "export ordinal table out of bounds".to_string())?
+    };
+
+    let mut names_by_index: HashMap<usize, Vec<String>> = HashMap::new();
+    for i in 0..name_count {
+        let name_rva = u32le(image, names_table.start + i * 4)?;
+        let function_index = u16le(image, ordinals_table.start + i * 2)? as usize;
+        if function_index >= function_count {
+            return Err("export name ordinal is outside address table".to_string());
+        }
+        let name = cstr_ascii(image, name_rva as usize)
+            .map_err(|_| "invalid export name string".to_string())?;
+        names_by_index.entry(function_index).or_default().push(name);
+    }
+
+    let mut exports = Vec::with_capacity(function_count.max(name_count));
+    for i in 0..function_count {
+        let target_rva = u32le(image, function_table.start + i * 4)?;
+        if target_rva == 0 {
+            continue;
+        }
+        let forwarder = if (rva..directory_end).contains(&target_rva) {
+            Some(
+                cstr_ascii(image, target_rva as usize)
+                    .map_err(|_| "invalid export forwarder string".to_string())?,
+            )
+        } else {
+            if target_rva as usize >= image.len() {
+                return Err("export target is outside image".to_string());
+            }
+            None
+        };
+        let ordinal = ordinal_base
+            .checked_add(i as u32)
+            .ok_or_else(|| "export ordinal overflows".to_string())?;
+        let names = names_by_index.remove(&i).unwrap_or_default();
+        if names.is_empty() {
+            exports.push(Export {
+                ordinal,
+                name: None,
+                target_rva,
+                forwarder,
+            });
+        } else {
+            for name in names {
+                exports.push(Export {
+                    ordinal,
+                    name: Some(name),
+                    target_rva,
+                    forwarder: forwarder.clone(),
+                });
+            }
+        }
+    }
+    Ok(exports)
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::{parse_exports, Export};
+
+    fn write_u16(image: &mut [u8], offset: usize, value: u16) {
+        image[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_u32(image: &mut [u8], offset: usize, value: u32) {
+        image[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn fixture() -> Vec<u8> {
+        let mut image = vec![0; 0x300];
+        // IMAGE_EXPORT_DIRECTORY at RVA 0x100.
+        write_u32(&mut image, 0x110, 10); // Ordinal base
+        write_u32(&mut image, 0x114, 2); // NumberOfFunctions
+        write_u32(&mut image, 0x118, 1); // NumberOfNames
+        write_u32(&mut image, 0x11c, 0x150); // AddressOfFunctions
+        write_u32(&mut image, 0x120, 0x158); // AddressOfNames
+        write_u32(&mut image, 0x124, 0x15c); // AddressOfNameOrdinals
+        write_u32(&mut image, 0x150, 0x200); // Native function RVA
+        write_u32(&mut image, 0x154, 0x130); // Forwarder RVA
+        write_u32(&mut image, 0x158, 0x180); // Name RVA
+        write_u16(&mut image, 0x15c, 0); // Name maps to first function
+        image[0x130..0x13d].copy_from_slice(b"other.Target\0");
+        image[0x180..0x186].copy_from_slice(b"Entry\0");
+        image
+    }
+
+    #[test]
+    fn parses_named_and_ordinal_only_forwarded_exports() {
+        let exports = parse_exports(&fixture(), 0x100, 0x40).unwrap();
+        assert_eq!(
+            exports,
+            vec![
+                Export {
+                    ordinal: 10,
+                    name: Some("Entry".to_string()),
+                    target_rva: 0x200,
+                    forwarder: None,
+                },
+                Export {
+                    ordinal: 11,
+                    name: None,
+                    target_rva: 0x130,
+                    forwarder: Some("other.Target".to_string()),
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_export_name_ordinal_outside_function_table() {
+        let mut image = fixture();
+        write_u16(&mut image, 0x15c, 2);
+        assert!(parse_exports(&image, 0x100, 0x40)
+            .unwrap_err()
+            .contains("ordinal is outside"));
+    }
+
+    #[test]
+    fn empty_export_table_is_valid() {
+        let mut image = fixture();
+        write_u32(&mut image, 0x114, 0);
+        write_u32(&mut image, 0x118, 0);
+        write_u32(&mut image, 0x11c, 0);
+        write_u32(&mut image, 0x120, 0);
+        write_u32(&mut image, 0x124, 0);
+        assert!(parse_exports(&image, 0x100, 0x40).unwrap().is_empty());
+    }
 }
 
 #[cfg(test)]

@@ -121,6 +121,7 @@ pub(crate) fn read_image(directory: &Path) -> Result<PeImage, String> {
         image: std::fs::read(directory.join("image.bin"))
             .map_err(|error| format!("cannot read native worker image: {error}"))?,
         imports: imports("imports")?,
+        exports: vec![],
         unsupported: imports("unsupported")?,
         tls,
         code_ranges,
