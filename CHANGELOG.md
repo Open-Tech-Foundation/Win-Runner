@@ -23,16 +23,14 @@ All notable changes to this project will be documented in this file.
   loads the C: path index and reads file extents on demand; native process
   state now transfers filesystem changes instead of a full disk image.
 - Added seeked range reads for synchronous, NT, and overlapped Win32 file reads.
-  Coverage follows the `SetFilePointer`/`ReadFile` cases in Wine's
-  `dlls/kernel32/tests/file.c`.
-- Added Rust tests modeled on modern file-operation cases from Wine's
-  `file.c`, covering copy, move, delete, enumeration, metadata, and directory
-  cleanup through WinFS and the native Win32 shims.
-- Expanded the Wine-inspired native tests to cover read-only access, sharing
-  conflicts, wildcard enumeration, read-only deletion, and guest file times.
+- Added Rust WinFS compatibility tests for `SetFilePointer`/`ReadFile`, copy,
+  move, delete, enumeration, metadata, and directory cleanup.
+- Expanded the native WinFS compatibility tests to cover read-only access,
+  sharing conflicts, wildcard enumeration, read-only deletion, and guest file
+  times.
 - Added WinFS edge-case tests for truncating writes, recursive tree copy/move,
   and invalid directory create/remove operations.
-- Added Wine-inspired NT file tests for EOF resizing, rename-by-handle, and
+- Added NT file compatibility tests for EOF resizing, rename-by-handle, and
   resizing files with active mapped views.
 - Failed native launches keep the current C: filesystem in memory and discard
   only changes from the failed child process.

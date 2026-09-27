@@ -1731,10 +1731,10 @@ mod tests {
     #[test]
     fn modern_file_mutations_copy_move_and_delete_like_file_api_cases() {
         let mut fs = WinFs::new();
-        fs.mkdir(r"C:\wine_file_cases").unwrap();
-        let source = r"C:\wine_file_cases\source.bin";
-        let copy = r"C:\wine_file_cases\copy.bin";
-        let moved = r"C:\wine_file_cases\moved.bin";
+        fs.mkdir(r"C:\winfs_compat_cases").unwrap();
+        let source = r"C:\winfs_compat_cases\source.bin";
+        let copy = r"C:\winfs_compat_cases\copy.bin";
+        let moved = r"C:\winfs_compat_cases\moved.bin";
 
         fs.write_file(source, b"first".to_vec()).unwrap();
         fs.append_file(source, b"-second").unwrap();
@@ -1754,46 +1754,47 @@ mod tests {
 
         fs.delete_file(source).unwrap();
         fs.delete_file(moved).unwrap();
-        assert!(fs.list_dir(r"C:\wine_file_cases").unwrap().is_empty());
-        fs.rmdir(r"C:\wine_file_cases").unwrap();
-        assert!(!fs.exists(r"C:\wine_file_cases"));
+        assert!(fs.list_dir(r"C:\winfs_compat_cases").unwrap().is_empty());
+        fs.rmdir(r"C:\winfs_compat_cases").unwrap();
+        assert!(!fs.exists(r"C:\winfs_compat_cases"));
     }
 
     #[test]
     fn modern_directory_listing_and_metadata_follow_case_insensitive_paths() {
         let mut fs = WinFs::new();
-        fs.mkdir(r"C:\wine_file_cases\nested").unwrap();
-        fs.write_file(r"C:\wine_file_cases\Alpha.txt", b"abc".to_vec())
+        fs.mkdir(r"C:\winfs_compat_cases\nested").unwrap();
+        fs.write_file(r"C:\winfs_compat_cases\Alpha.txt", b"abc".to_vec())
             .unwrap();
-        fs.write_file(r"C:\wine_file_cases\nested\Beta.txt", b"12345".to_vec())
+        fs.write_file(r"C:\winfs_compat_cases\nested\Beta.txt", b"12345".to_vec())
             .unwrap();
 
-        let mut entries = fs.list_dir(r"c:\WINE_FILE_CASES").unwrap();
+        let mut entries = fs.list_dir(r"c:\WINFS_COMPAT_CASES").unwrap();
         entries.sort();
         assert_eq!(entries, ["Alpha.txt", "nested"]);
-        assert!(fs.is_dir(r"C:\wine_file_cases\NESTED"));
-        assert!(fs.is_file(r"c:\wine_file_cases\alpha.TXT"));
-        assert_eq!(fs.file_len(r"C:\WINE_FILE_CASES\ALPHA.TXT").unwrap(), 3);
+        assert!(fs.is_dir(r"C:\winfs_compat_cases\NESTED"));
+        assert!(fs.is_file(r"c:\winfs_compat_cases\alpha.TXT"));
+        assert_eq!(fs.file_len(r"C:\WINFS_COMPAT_CASES\ALPHA.TXT").unwrap(), 3);
         assert_eq!(
-            fs.read_file_range(r"C:\wine_file_cases\nested\beta.txt", 2, 8)
+            fs.read_file_range(r"C:\winfs_compat_cases\nested\beta.txt", 2, 8)
                 .unwrap(),
             b"345"
         );
         assert_ne!(
-            fs.file_id(r"C:\wine_file_cases\Alpha.txt").unwrap(),
-            fs.file_id(r"C:\wine_file_cases\nested\Beta.txt").unwrap()
+            fs.file_id(r"C:\winfs_compat_cases\Alpha.txt").unwrap(),
+            fs.file_id(r"C:\winfs_compat_cases\nested\Beta.txt")
+                .unwrap()
         );
 
-        assert!(fs.rmdir(r"C:\wine_file_cases").is_err());
-        fs.remove(r"C:\wine_file_cases", true).unwrap();
-        assert!(!fs.exists(r"C:\wine_file_cases"));
+        assert!(fs.rmdir(r"C:\winfs_compat_cases").is_err());
+        fs.remove(r"C:\winfs_compat_cases", true).unwrap();
+        assert!(!fs.exists(r"C:\winfs_compat_cases"));
     }
 
     #[test]
     fn modern_create_always_style_write_truncates_existing_file() {
         let mut fs = WinFs::new();
-        let path = r"C:\wine_file_cases\truncate.txt";
-        fs.mkdir(r"C:\wine_file_cases").unwrap();
+        let path = r"C:\winfs_compat_cases\truncate.txt";
+        fs.mkdir(r"C:\winfs_compat_cases").unwrap();
         fs.write_file(path, b"old contents with a longer tail".to_vec())
             .unwrap();
         fs.write_file(path, b"new".to_vec()).unwrap();
@@ -1804,9 +1805,9 @@ mod tests {
     #[test]
     fn modern_copy_and_move_directory_tree_preserve_nested_files() {
         let mut fs = WinFs::new();
-        let source = r"C:\wine_file_cases\source";
-        let copied = r"C:\wine_file_cases\copied";
-        let moved = r"C:\wine_file_cases\moved";
+        let source = r"C:\winfs_compat_cases\source";
+        let copied = r"C:\winfs_compat_cases\copied";
+        let moved = r"C:\winfs_compat_cases\moved";
         fs.mkdir(&format!(r"{source}\nested")).unwrap();
         fs.write_file(&format!(r"{source}\root.txt"), b"root".to_vec())
             .unwrap();
@@ -1836,8 +1837,8 @@ mod tests {
     #[test]
     fn modern_directory_create_and_remove_report_invalid_states() {
         let mut fs = WinFs::new();
-        let parent = r"C:\wine_file_cases";
-        let child = r"C:\wine_file_cases\child";
+        let parent = r"C:\winfs_compat_cases";
+        let child = r"C:\winfs_compat_cases\child";
         assert!(fs.mkdir_one(child).is_err(), "parent must exist first");
         fs.mkdir_one(parent).unwrap();
         assert!(

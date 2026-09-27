@@ -904,10 +904,10 @@ mod imp {
 
         #[test]
         fn win32_file_copy_move_enumerate_and_delete_roundtrip() {
-            let directory = r"C:\wine_file_api_cases";
-            let source = r"C:\wine_file_api_cases\source.txt";
-            let copy = r"C:\wine_file_api_cases\copy.txt";
-            let moved = r"C:\wine_file_api_cases\moved.txt";
+            let directory = r"C:\winfs_compat_file_api_cases";
+            let source = r"C:\winfs_compat_file_api_cases\source.txt";
+            let copy = r"C:\winfs_compat_file_api_cases\copy.txt";
+            let moved = r"C:\winfs_compat_file_api_cases\moved.txt";
             let wide = |value: &str| value.encode_utf16().chain([0]).collect::<Vec<_>>();
             let directory_wide = wide(directory);
             let source_wide = wide(source);
@@ -927,7 +927,7 @@ mod imp {
             let file =
                 super::native_create_file_w(source_wide.as_ptr(), 0xC000_0000, 0, 0, 1, 0, 0);
             assert_ne!(file, u64::MAX);
-            let payload = b"wine-file-api";
+            let payload = b"winfs-file-api";
             let mut written = 0;
             assert_eq!(
                 super::native_write_file(
@@ -978,7 +978,7 @@ mod imp {
             );
             assert!(!context.lock().unwrap().fs.exists(copy));
 
-            let pattern = wide(r"C:\wine_file_api_cases\*");
+            let pattern = wide(r"C:\winfs_compat_file_api_cases\*");
             let mut find_data = [0u8; 592];
             let find = super::native_find_first_file_ex_w(
                 pattern.as_ptr(),
@@ -1015,7 +1015,7 @@ mod imp {
 
         #[test]
         fn win32_read_only_handle_rejects_write() {
-            let path = r"C:\wine_readonly_access.txt";
+            let path = r"C:\winfs_compat_readonly_access.txt";
             let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
             let context = super::fs_ctx().unwrap();
             context
@@ -1037,7 +1037,7 @@ mod imp {
 
         #[test]
         fn win32_share_mode_rejects_conflicting_open() {
-            let path = r"C:\wine_sharing.txt";
+            let path = r"C:\winfs_compat_sharing.txt";
             let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
             let context = super::fs_ctx().unwrap();
             context
@@ -1059,9 +1059,9 @@ mod imp {
 
         #[test]
         fn win32_find_first_file_filters_the_requested_name_pattern() {
-            let directory = r"C:\wine_find_pattern";
+            let directory = r"C:\winfs_compat_find_pattern";
             let directory_wide = directory.encode_utf16().chain([0]).collect::<Vec<_>>();
-            let pattern = r"C:\wine_find_pattern\*.txt"
+            let pattern = r"C:\winfs_compat_find_pattern\*.txt"
                 .encode_utf16()
                 .chain([0])
                 .collect::<Vec<_>>();
@@ -1070,10 +1070,10 @@ mod imp {
                 let mut ctx = context.lock().unwrap();
                 ctx.fs.mkdir(directory).unwrap();
                 ctx.fs
-                    .write_file(r"C:\wine_find_pattern\match.txt", b"x".to_vec())
+                    .write_file(r"C:\winfs_compat_find_pattern\match.txt", b"x".to_vec())
                     .unwrap();
                 ctx.fs
-                    .write_file(r"C:\wine_find_pattern\ignore.bin", b"y".to_vec())
+                    .write_file(r"C:\winfs_compat_find_pattern\ignore.bin", b"y".to_vec())
                     .unwrap();
             }
 
@@ -1104,10 +1104,10 @@ mod imp {
 
             let mut ctx = context.lock().unwrap();
             ctx.fs
-                .delete_file(r"C:\wine_find_patternmatch.txt")
+                .delete_file(r"C:\winfs_compat_find_patternmatch.txt")
                 .unwrap();
             ctx.fs
-                .delete_file(r"C:\wine_find_patternignore.bin")
+                .delete_file(r"C:\winfs_compat_find_patternignore.bin")
                 .unwrap();
             drop(ctx);
             assert_eq!(super::native_remove_directory_w(directory_wide.as_ptr()), 1);
@@ -1115,7 +1115,7 @@ mod imp {
 
         #[test]
         fn win32_set_file_time_accepts_a_guest_file_handle() {
-            let path = r"C:\wine_set_time.txt";
+            let path = r"C:\winfs_compat_set_time.txt";
             let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
             let context = super::fs_ctx().unwrap();
             context
@@ -1137,7 +1137,7 @@ mod imp {
 
         #[test]
         fn win32_readonly_attribute_blocks_delete_file() {
-            let path = r"C:\wine_readonly_delete.txt";
+            let path = r"C:\winfs_compat_readonly_delete.txt";
             let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
             let context = super::fs_ctx().unwrap();
             context
@@ -1157,7 +1157,7 @@ mod imp {
 
         #[test]
         fn win32_get_final_path_supports_size_query_and_extended_path() {
-            let path = r"C:\wine_final_path.txt";
+            let path = r"C:\winfs_compat_final_path.txt";
             let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
             let context = super::fs_ctx().unwrap();
             context
@@ -1173,7 +1173,7 @@ mod imp {
                 super::native_get_final_path_name_by_handle_w(handle, std::ptr::null_mut(), 0, 0);
             assert_eq!(
                 required as usize,
-                r"\\?\C:\wine_final_path.txt".encode_utf16().count() + 1
+                r"\\?\C:\winfs_compat_final_path.txt".encode_utf16().count() + 1
             );
             let mut output = vec![0u16; required as usize];
             let written = super::native_get_final_path_name_by_handle_w(
@@ -1185,7 +1185,7 @@ mod imp {
             assert_eq!(written + 1, required);
             assert_eq!(
                 String::from_utf16(&output[..written as usize]).unwrap(),
-                r"\\?\C:\wine_final_path.txt"
+                r"\\?\C:\winfs_compat_final_path.txt"
             );
 
             assert_eq!(super::native_close_handle(handle), 1);
@@ -1194,7 +1194,7 @@ mod imp {
 
         #[test]
         fn nt_set_end_of_file_truncates_and_extends_guest_files() {
-            let path = r"C:\wine_eof_resize.txt";
+            let path = r"C:\winfs_compat_eof_resize.txt";
             let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
             let context = super::fs_ctx().unwrap();
             context
@@ -1236,8 +1236,8 @@ mod imp {
 
         #[test]
         fn nt_set_file_rename_information_renames_by_open_handle() {
-            let source = r"C:\wine_rename_source.txt";
-            let destination = r"C:\wine_rename_destination.txt";
+            let source = r"C:\winfs_compat_rename_source.txt";
+            let destination = r"C:\winfs_compat_rename_destination.txt";
             let source_wide = source.encode_utf16().chain([0]).collect::<Vec<_>>();
             let context = super::fs_ctx().unwrap();
             context
@@ -1277,7 +1277,7 @@ mod imp {
 
         #[test]
         fn nt_set_end_of_file_rejects_shrinking_an_active_mapped_view() {
-            let path = r"C:\wine_eof_mapped.txt";
+            let path = r"C:\winfs_compat_eof_mapped.txt";
             let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
             let context = super::fs_ctx().unwrap();
             context
@@ -15021,8 +15021,8 @@ mod tests {
 
     #[test]
     fn native_guest_reads_only_a_seeked_file_range() {
-        // Wine's dlls/kernel32/tests/file.c exercises repeated seeks followed
-        // by reads, including requests that reach or pass EOF.
+        // Exercise repeated seek/read operations, including requests that
+        // reach or pass EOF.
         for (offset, length, expected) in [
             (0, 10, &b"0123456789"[..]),
             (4, 3, &b"456"[..]),
