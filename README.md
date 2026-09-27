@@ -113,8 +113,9 @@ works. Use `help` to list the built-in commands.
 Errors print as
 `wincli: ...` without ending the session; `exit`/`quit` (or Ctrl-D) ends it
 with the last guest exit code. Interactive input supports cursor movement,
-insertion, deletion, and history navigation. The prompt goes to stderr,
-keeping stdout clean for pipes. Interactive command history lives at
+insertion, deletion, history navigation, and Tab completion for built-in
+commands, PATH executables, and entries in the current guest directory. The
+prompt goes to stderr, keeping stdout clean for pipes. Interactive command history lives at
 `C:\.system\shell-history` in WinFS and is carried by saved C: snapshots.
 Use Windows-style `set NAME=value` or `path C:\tools;%PATH%` to update the
 session environment and guest executable search path.

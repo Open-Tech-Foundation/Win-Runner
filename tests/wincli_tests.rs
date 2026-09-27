@@ -1222,7 +1222,7 @@ fn failed_guest_execution_preserves_unsaved_c_drive_changes() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn interactive_shell_inserts_text_at_the_cursor() {
+fn interactive_shell_completes_commands_and_inserts_text_at_the_cursor() {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::time::{Duration, Instant};
 
@@ -1283,9 +1283,31 @@ fn interactive_shell_inserts_text_at_the_cursor() {
         "interactive prompt did not appear: {}",
         String::from_utf8_lossy(&output)
     );
+    master.write_all(b"wi\t --version\r").unwrap();
+    assert!(
+        read_until(&mut master, &mut output, &|bytes| bytes
+            .windows(b"wincli-winget".len())
+            .any(|window| window == b"wincli-winget")),
+        "Tab did not complete the winget command: {}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(
+        read_until(&mut master, &mut output, &|bytes| {
+            bytes
+                .windows(prompt.len())
+                .filter(|window| *window == prompt)
+                .count()
+                >= 3
+        }),
+        "shell did not return to the prompt after the completed command: {}",
+        String::from_utf8_lossy(&output)
+    );
+    let before_exit = output.len();
     master.write_all(b"exit 3\x1b[D1\r").unwrap();
     let exited = read_until(&mut master, &mut output, &|bytes| {
-        bytes.windows(8).any(|window| window == b"\x1b[?2004l")
+        bytes[before_exit..]
+            .windows(8)
+            .any(|window| window == b"\x1b[?2004l")
     });
     if !exited {
         let _ = child.kill();

@@ -11,13 +11,223 @@
 //! the session (code = argument, else the last guest code).
 
 use crate::{backend, choco, inspect, install, pe, ps1, winfs::WinFs};
-use rustyline::{error::ReadlineError, DefaultEditor};
-use std::collections::BTreeMap;
+use rustyline::{
+    completion::{Completer, Pair},
+    error::ReadlineError,
+    highlight::Highlighter,
+    hint::Hinter,
+    validate::Validator,
+    Context, Editor, Helper,
+};
+use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, Write};
 use std::sync::Arc;
 
 const SHELL_HISTORY_PATH: &str = r"C:\.system\shell-history";
 const MAX_SHELL_HISTORY_ENTRIES: usize = 1000;
+
+const SHELL_COMMANDS: &[&str] = &[
+    "cd",
+    "chdir",
+    "pwd",
+    "cwd",
+    "dir",
+    "ls",
+    "type",
+    "cat",
+    "copy",
+    "cp",
+    "move",
+    "mv",
+    "ren",
+    "rename",
+    "del",
+    "erase",
+    "rm",
+    "mkdir",
+    "md",
+    "rmdir",
+    "rd",
+    "cls",
+    "clear",
+    "help",
+    "set",
+    "path",
+    "mount",
+    "install",
+    "snapshot",
+    "choco",
+    "winget",
+    "powershell",
+    "inspect",
+    "exit",
+    "quit",
+];
+
+#[derive(Default)]
+struct ShellHelper {
+    cwd: String,
+    directories: HashMap<String, Vec<(String, bool)>>,
+    commands: Vec<String>,
+}
+
+impl ShellHelper {
+    fn refresh(&mut self, fs: &WinFs, environment: &[(String, String)]) {
+        self.cwd = fs.cwd();
+        self.directories.clear();
+        self.commands = SHELL_COMMANDS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+
+        let mut search_dirs = vec![self.cwd.clone(), r"C:\".to_string()];
+        search_dirs.extend(
+            fs.host_mounts()
+                .into_iter()
+                .map(|(drive, _, _)| format!("{drive}:\\")),
+        );
+        if let Some((_, path)) = environment
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("PATH"))
+        {
+            search_dirs.extend(
+                path.split(';')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
+            );
+        }
+        search_dirs.sort_by_key(|path| path.to_ascii_lowercase());
+        search_dirs.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+
+        for directory in search_dirs {
+            let Ok(normalized) = fs.normalize(&directory) else {
+                continue;
+            };
+            let key = normalized.display().to_ascii_lowercase();
+            let Ok(names) = fs.list_dir(&normalized.display()) else {
+                continue;
+            };
+            let entries = names
+                .into_iter()
+                .map(|name| {
+                    let child = format!(
+                        "{}\\{}",
+                        normalized.display().trim_end_matches(['\\', '/']),
+                        name
+                    );
+                    let is_dir = fs.is_dir(&child);
+                    if !is_dir && name.to_ascii_lowercase().ends_with(".exe") {
+                        self.commands.push(name.clone());
+                        self.commands.push(name[..name.len() - 4].to_string());
+                    }
+                    (name, is_dir)
+                })
+                .collect();
+            self.directories.insert(key, entries);
+        }
+        self.commands.sort_by_key(|name| name.to_ascii_lowercase());
+        self.commands.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    }
+
+    fn complete_line(&self, line: &str, pos: usize) -> (usize, Vec<Pair>) {
+        let prefix = &line[..pos.min(line.len())];
+        let start = prefix
+            .char_indices()
+            .rev()
+            .find(|(_, ch)| ch.is_whitespace())
+            .map(|(index, ch)| index + ch.len_utf8())
+            .unwrap_or(0);
+        let partial = &prefix[start..];
+        if !prefix[..start].trim().is_empty() {
+            return (start, self.complete_path(partial));
+        }
+
+        let mut candidates = self
+            .commands
+            .iter()
+            .filter(|command| {
+                command
+                    .to_ascii_lowercase()
+                    .starts_with(&partial.to_ascii_lowercase())
+            })
+            .map(|command| Pair {
+                display: command.clone(),
+                replacement: command.clone(),
+            })
+            .collect::<Vec<_>>();
+        if partial.contains(['\\', '/', ':']) {
+            candidates.extend(self.complete_path(partial));
+        }
+        (start, candidates)
+    }
+
+    fn complete_path(&self, partial: &str) -> Vec<Pair> {
+        let split = partial.rfind(['\\', '/']);
+        let (directory_prefix, leaf_prefix) = match split {
+            Some(index) => (&partial[..=index], &partial[index + 1..]),
+            None => ("", partial),
+        };
+        let directory = if directory_prefix.is_empty() {
+            self.cwd.to_ascii_lowercase()
+        } else if directory_prefix.as_bytes().get(1) == Some(&b':')
+            || directory_prefix.starts_with(['\\', '/'])
+        {
+            let mut directory = directory_prefix.trim_end_matches(['\\', '/']).to_string();
+            if directory.len() == 2 && directory.as_bytes().get(1) == Some(&b':') {
+                directory.push('\\');
+            } else if directory.is_empty() {
+                directory = format!("{}\\", &self.cwd[..2]);
+            }
+            directory.to_ascii_lowercase()
+        } else {
+            format!(
+                "{}\\{}",
+                self.cwd.trim_end_matches(['\\', '/']),
+                directory_prefix.trim_end_matches(['\\', '/'])
+            )
+            .to_ascii_lowercase()
+        };
+        self.directories
+            .get(&directory)
+            .into_iter()
+            .flatten()
+            .filter(|(name, _)| {
+                name.to_ascii_lowercase()
+                    .starts_with(&leaf_prefix.to_ascii_lowercase())
+            })
+            .map(|(name, is_dir)| {
+                let suffix = if *is_dir { "\\" } else { "" };
+                let replacement = format!("{directory_prefix}{name}{suffix}");
+                Pair {
+                    display: replacement.clone(),
+                    replacement,
+                }
+            })
+            .collect()
+    }
+}
+
+impl Completer for ShellHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
+        Ok(self.complete_line(line, pos))
+    }
+}
+
+impl Hinter for ShellHelper {
+    type Hint = String;
+}
+
+impl Highlighter for ShellHelper {}
+impl Validator for ShellHelper {}
+impl Helper for ShellHelper {}
 
 fn default_environment() -> Vec<(String, String)> {
     BTreeMap::from([
@@ -1115,18 +1325,22 @@ fn run_session(
     let tty = prompt_enabled && std::io::IsTerminal::is_terminal(&stdin);
     let mut shell = Shell::with_snapshot_path(fs, snapshot_path);
     if tty {
-        let mut editor = match DefaultEditor::new() {
+        let mut editor = match Editor::<ShellHelper, rustyline::history::DefaultHistory>::new() {
             Ok(editor) => editor,
             Err(error) => {
                 eprintln!("wincli: cannot initialize terminal input: {error}");
                 return (1, shell.fs);
             }
         };
+        editor.set_helper(Some(ShellHelper::default()));
         let mut history = shell.shell_history();
         for entry in &history {
             let _ = editor.add_history_entry(entry.as_str());
         }
         loop {
+            if let Some(helper) = editor.helper_mut() {
+                helper.refresh(&shell.fs, &shell.environment);
+            }
             let prompt = format!("PS {}> ", shell.cwd());
             match editor.readline(&prompt) {
                 Ok(line) => {
@@ -1484,6 +1698,42 @@ mod tests {
             .exec_line("cd missing", &mut out)
             .unwrap_err()
             .contains("cd:"));
+    }
+
+    #[test]
+    fn tab_completion_offers_commands_and_current_directory_paths() {
+        let mut shell = Shell::new();
+        let initial_cwd = shell.cwd();
+        shell.fs.mkdir("Documents").unwrap();
+        shell.fs.write_file("notes.txt", b"hello".to_vec()).unwrap();
+        let mut helper = ShellHelper::default();
+        helper.refresh(&shell.fs, &shell.environment);
+
+        let (_, command_candidates) = helper.complete_line("wi", 2);
+        assert!(command_candidates
+            .iter()
+            .any(|candidate| candidate.replacement == "winget"));
+
+        let (_, path_candidates) = helper.complete_line("cd Doc", 6);
+        assert!(path_candidates
+            .iter()
+            .any(|candidate| candidate.replacement == "Documents\\"));
+        let (_, file_candidates) = helper.complete_line("type not", 8);
+        assert!(file_candidates
+            .iter()
+            .any(|candidate| candidate.replacement == "notes.txt"));
+
+        shell.fs.set_cwd("Documents").unwrap();
+        shell
+            .fs
+            .write_file("inside.txt", b"inside".to_vec())
+            .unwrap();
+        helper.refresh(&shell.fs, &shell.environment);
+        let (_, nested_candidates) = helper.complete_line("type ins", 8);
+        assert!(nested_candidates
+            .iter()
+            .any(|candidate| candidate.replacement == "inside.txt"));
+        assert_eq!(shell.cwd(), format!("{initial_cwd}\\Documents"));
     }
 
     #[test]
