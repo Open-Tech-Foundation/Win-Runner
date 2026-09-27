@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Added the `KERNEL32!NeedCurrentDirectoryForExePathW` shim used by child
+  process executable lookup.
 - Added the C-locale `msvcrt!mbstowcs` shim used by Nano.
 - Added an optional native Node check proving a relative file that Node leaves
   in WinFS appears in the following shell directory listing.

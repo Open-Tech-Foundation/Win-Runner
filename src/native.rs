@@ -441,7 +441,8 @@ mod imp {
             native_interlocked_pop_entry_slist, native_interlocked_push_entry_slist,
             native_ioctlsocket, native_is_processor_feature_present, native_is_valid_code_page,
             native_launch_spec, native_lc_map_string_w, native_leave_critical_section,
-            native_listen_socket, native_multi_byte_to_wide_char, native_process_prng,
+            native_listen_socket, native_multi_byte_to_wide_char,
+            native_need_current_directory_for_exe_path_w, native_process_prng,
             native_query_depth_slist, native_query_performance_frequency,
             native_release_srw_lock_exclusive, native_release_srw_lock_shared,
             native_resolve_code_page, native_rtl_get_version, native_rtl_nt_status_to_dos_error,
@@ -2487,6 +2488,10 @@ mod imp {
             ));
             assert!(super::supports_import("KERNEL32.dll", "GetTickCount"));
             assert!(super::supports_import("KERNEL32.dll", "GetTickCount64"));
+            assert!(super::supports_import(
+                "KERNEL32.dll",
+                "NeedCurrentDirectoryForExePathW"
+            ));
             assert!(super::supports_import("WINMM.dll", "timeGetTime"));
             assert!(!super::supports_import("USER32.dll", "ExitProcess"));
             assert!(!super::supports_import("KERNEL32.dll", "timeGetTime"));
@@ -5418,6 +5423,52 @@ mod imp {
                 0
             );
             assert_eq!(native_get_last_error(), 203);
+        }
+
+        #[test]
+        fn executable_search_current_directory_policy_matches_windows() {
+            let executable: Vec<u16> = "powershell.exe"
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let path_executable: Vec<u16> = "tools\\powershell.exe"
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let policy_name: Vec<u16> = "NoDefaultCurrentDirectoryInExePath"
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let empty_value = [0u16];
+
+            assert_eq!(
+                native_set_environment_variable_w(policy_name.as_ptr(), std::ptr::null()),
+                1
+            );
+            assert_eq!(
+                native_need_current_directory_for_exe_path_w(executable.as_ptr()),
+                1
+            );
+            assert_eq!(
+                native_set_environment_variable_w(policy_name.as_ptr(), empty_value.as_ptr()),
+                1
+            );
+            assert_eq!(
+                native_need_current_directory_for_exe_path_w(executable.as_ptr()),
+                0
+            );
+            assert_eq!(
+                native_need_current_directory_for_exe_path_w(path_executable.as_ptr()),
+                1
+            );
+            assert_eq!(
+                native_need_current_directory_for_exe_path_w(std::ptr::null()),
+                0
+            );
+            assert_eq!(
+                native_set_environment_variable_w(policy_name.as_ptr(), std::ptr::null()),
+                1
+            );
         }
 
         #[test]
@@ -11484,6 +11535,22 @@ mod imp {
             *block = environment_strings(&environment);
         }
         1
+    }
+    extern "win64" fn native_need_current_directory_for_exe_path_w(exe_name: *const u16) -> i32 {
+        let Some(exe_name) = wide(exe_name) else {
+            native_set_last_error(87); // ERROR_INVALID_PARAMETER
+            return 0;
+        };
+        if exe_name.contains('\\') {
+            return 1;
+        }
+        i32::from(!process_ctx().is_some_and(|process| {
+            process.environment.lock().is_ok_and(|environment| {
+                environment.iter().any(|(name, _)| {
+                    name.eq_ignore_ascii_case("NoDefaultCurrentDirectoryInExePath")
+                })
+            })
+        }))
     }
     extern "win64" fn native_get_current_directory_w(output_len: u32, output: *mut u16) -> u32 {
         let cwd = fs_ctx()
@@ -17888,6 +17955,9 @@ mod imp {
             }
             "SetEnvironmentVariableW" => {
                 Some(native_set_environment_variable_w as *const () as usize as u64)
+            }
+            "NeedCurrentDirectoryForExePathW" => {
+                Some(native_need_current_directory_for_exe_path_w as *const () as usize as u64)
             }
             "GetCurrentDirectoryW" => {
                 Some(native_get_current_directory_w as *const () as usize as u64)
