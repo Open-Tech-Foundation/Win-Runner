@@ -162,9 +162,10 @@ Record oracle values from `GetFullPathNameW`, `CreateFileW`, and
   metadata attached; directory entries map names to IDs. Make rename update
   directory entries rather than rewriting path-keyed metadata, and support
   hard links through shared IDs.
-- [ ] **Relative symlink targets.** Store the target exactly as supplied and
-  resolve relative targets from the link's parent directory, so moving a
-  containing directory preserves the link.
+- [x] **Relative symlink targets.** WinFs stores the target exactly as
+  supplied and resolves relative targets from the link's parent directory, so
+  moving a containing directory preserves the link. Unit tests cover moves
+  and filesystem change replay.
 - [ ] **Indexed mounted directories.** Cache mounted host directory listings
   with a case-folded index, refresh when directory modification time changes,
   and report case collisions such as simultaneous `Foo` and `foo` explicitly.

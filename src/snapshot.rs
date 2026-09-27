@@ -276,7 +276,7 @@ fn load_disk_file(path: &Path) -> Result<WinFs, String> {
             let target = take_index_path(&index, &mut cursor)?;
             let directory = take_u8(&index, &mut cursor)? != 0;
             validate_guest_absolute(&link)?;
-            validate_guest_absolute(&target)?;
+            validate_symlink_target(&target)?;
             fs.create_symlink(&link, &target, directory)?;
         }
         fs.restore_snapshot_metadata(&metadata)?;
@@ -297,6 +297,21 @@ fn validate_guest_absolute(path: &str) -> Result<(), String> {
         return Err(format!("unsafe WinFS disk path: {path}"));
     }
     Ok(())
+}
+
+fn validate_symlink_target(target: &str) -> Result<(), String> {
+    match crate::winfs::parse_win_path(target) {
+        crate::winfs::ParsedWinPath::Dos { drive: None, .. } => Ok(()),
+        crate::winfs::ParsedWinPath::Dos {
+            drive: Some(drive), ..
+        } if drive.eq_ignore_ascii_case(&'C') => Ok(()),
+        crate::winfs::ParsedWinPath::Device(_) | crate::winfs::ParsedWinPath::Unc { .. } => {
+            Err(format!("unsafe WinFS symlink target: {target}"))
+        }
+        crate::winfs::ParsedWinPath::Dos { .. } | crate::winfs::ParsedWinPath::Invalid(_) => {
+            validate_guest_absolute(target)
+        }
+    }
 }
 
 fn take_u8(bytes: &[u8], cursor: &mut usize) -> Result<u8, String> {

@@ -1035,13 +1035,7 @@ impl WinFs {
         if self.get_node_raw(&p).is_some() {
             return Err(format!("destination exists: {}", p.display()));
         }
-        let target_path =
-            if target.contains(':') || target.starts_with('\\') || target.starts_with('/') {
-                self.normalize(target)?
-            } else {
-                let parent = self.parent_of(&p);
-                self.normalize(&format!("{}\\{target}", parent.display()))?
-            };
+        let target_path = self.normalize_symlink_target(&p, target)?;
         let parent = self.parent_of(&p);
         let Some(Node::Dir { children, .. }) = self.get_node_mut(&parent) else {
             return Err(format!("link parent not found: {}", parent.display()));
@@ -1059,7 +1053,7 @@ impl WinFs {
             }
         };
         children.insert(windows_name_key(&leaf), placeholder);
-        self.symlinks.insert(p.key(), target_path.display());
+        self.symlinks.insert(p.key(), target.to_string());
         let id = if self.is_file(&target_path.display()) {
             self.file_id(&target_path.display()).unwrap_or_default()
         } else {
@@ -1078,11 +1072,28 @@ impl WinFs {
         if self.record_changes {
             self.changes.push(FsChange::Symlink {
                 path: p.display(),
-                target: target_path.display(),
+                target: target.to_string(),
                 directory,
             });
         }
         Ok(())
+    }
+
+    fn normalize_symlink_target(&self, link: &WinPath, target: &str) -> Result<WinPath, String> {
+        if matches!(
+            parse_win_path(target),
+            ParsedWinPath::Dos {
+                drive: None,
+                absolute: false,
+                ..
+            }
+        ) {
+            let mut parent = link.clone();
+            parent.parts.pop();
+            self.normalize(&format!("{}\\{target}", parent.display()))
+        } else {
+            self.normalize(target)
+        }
     }
 
     pub fn set_cwd(&mut self, path: &str) -> Result<(), String> {
@@ -1161,7 +1172,7 @@ impl WinFs {
                     continue;
                 };
                 let suffix = resolved.parts[index..].to_vec();
-                let target = self.normalize(target).ok()?;
+                let target = self.normalize_symlink_target(&prefix, target).ok()?;
                 let joined = if suffix.is_empty() {
                     target.display()
                 } else {
@@ -2634,6 +2645,37 @@ mod tests {
         fs.delete_file(r"C:\compat\link.txt").unwrap();
         assert!(fs.exists(r"C:\compat\target.txt"));
         assert!(!fs.exists(r"C:\compat\link.txt"));
+    }
+
+    #[test]
+    fn relative_symlink_target_survives_parent_directory_move_and_replay() {
+        let mut fs = WinFs::new();
+        fs.mkdir(r"C:\compat\before").unwrap();
+        fs.write_file(r"C:\compat\before\target.txt", b"target".to_vec())
+            .unwrap();
+        fs.clear_changes();
+        let mut restored = fs.clone();
+        fs.create_symlink(r"C:\compat\before\link.txt", "target.txt", false)
+            .unwrap();
+        assert_eq!(
+            fs.symlinks
+                .get(&fs.normalize(r"C:\compat\before\link.txt").unwrap().key()),
+            Some(&"target.txt".to_string())
+        );
+
+        fs.move_path(r"C:\compat\before", r"C:\compat\after")
+            .unwrap();
+        assert_eq!(
+            fs.read_file(r"C:\compat\after\link.txt").unwrap(),
+            b"target"
+        );
+
+        let changes = fs.changes().to_vec();
+        restored.apply_changes(&changes).unwrap();
+        assert_eq!(
+            restored.read_file(r"C:\compat\after\link.txt").unwrap(),
+            b"target"
+        );
     }
 
     #[test]
