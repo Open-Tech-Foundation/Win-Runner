@@ -28,8 +28,8 @@ All notable changes to this project will be documented in this file.
 - Expanded modern WinFS compatibility coverage for path resolution, case-
   insensitive enumeration, wrong-type operations, failed mutations, and
   filesystem change replay; added copy-overwrite and rename-identity checks,
-  coverage for all `FindFirstFileEx` option combinations, and explicit tests
-  for pending native file API bindings.
+  all `FindFirstFileEx` option combinations and failure paths, expanded file
+  handle metadata classes, and explicit tests for pending native API bindings.
 - Expanded the native WinFS compatibility tests to cover read-only access,
   sharing conflicts, wildcard enumeration, read-only deletion, and guest file
   times.

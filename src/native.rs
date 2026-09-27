@@ -789,6 +789,67 @@ mod imp {
                 0
             );
             assert_eq!(super::native_get_last_error(), 122);
+
+            let mut basic = [0u8; 40];
+            assert_eq!(
+                super::native_get_file_information_by_handle_ex(
+                    handle,
+                    0,
+                    basic.as_mut_ptr(),
+                    basic.len() as u32,
+                ),
+                1
+            );
+            assert_eq!(u32::from_le_bytes(basic[32..36].try_into().unwrap()), 0x80);
+
+            let mut file_id = [0u8; 24];
+            assert_eq!(
+                super::native_get_file_information_by_handle_ex(
+                    handle,
+                    18,
+                    file_id.as_mut_ptr(),
+                    file_id.len() as u32,
+                ),
+                1
+            );
+            assert_eq!(
+                u64::from_le_bytes(file_id[..8].try_into().unwrap()),
+                0x5743_4C49
+            );
+            assert_eq!(
+                u64::from_le_bytes(file_id[8..16].try_into().unwrap()),
+                context.lock().unwrap().fs.file_id(path).unwrap()
+            );
+            assert_eq!(
+                super::native_get_file_information_by_handle_ex(
+                    handle,
+                    18,
+                    file_id.as_mut_ptr(),
+                    8,
+                ),
+                0
+            );
+            assert_eq!(super::native_get_last_error(), 122);
+            assert_eq!(
+                super::native_get_file_information_by_handle_ex(
+                    handle,
+                    2,
+                    standard.as_mut_ptr(),
+                    standard.len() as u32,
+                ),
+                0
+            );
+            assert_eq!(super::native_get_last_error(), 87);
+            assert_eq!(
+                super::native_get_file_information_by_handle_ex(
+                    handle,
+                    1,
+                    std::ptr::null_mut(),
+                    standard.len() as u32,
+                ),
+                0
+            );
+            assert_eq!(super::native_get_last_error(), 998);
             assert_eq!(
                 super::native_get_file_information_by_handle_ex(
                     u64::MAX,
@@ -799,6 +860,57 @@ mod imp {
                 0
             );
             assert_eq!(super::native_get_last_error(), 6);
+        }
+
+        #[test]
+        fn get_file_information_by_handle_ex_reports_directory_metadata() {
+            let path = r"C:\handle_ex_directory_unit";
+            let context = super::fs_ctx().unwrap();
+            let handle = {
+                let mut fs = context.lock().unwrap();
+                fs.fs.mkdir(path).unwrap();
+                let handle = fs.next;
+                fs.next += 1;
+                fs.handles.insert(
+                    handle,
+                    super::NativeFile {
+                        path: path.into(),
+                        offset: 0,
+                        overlapped: false,
+                        completion: None,
+                    },
+                );
+                handle
+            };
+
+            let mut standard = [0u8; 24];
+            assert_eq!(
+                super::native_get_file_information_by_handle_ex(
+                    handle,
+                    1,
+                    standard.as_mut_ptr(),
+                    standard.len() as u32,
+                ),
+                1
+            );
+            assert_eq!(i64::from_le_bytes(standard[8..16].try_into().unwrap()), 0);
+            assert_eq!(standard[21], 1);
+
+            let mut attrs = [0u8; 8];
+            assert_eq!(
+                super::native_get_file_information_by_handle_ex(
+                    handle,
+                    9,
+                    attrs.as_mut_ptr(),
+                    attrs.len() as u32,
+                ),
+                1
+            );
+            assert_eq!(u32::from_le_bytes(attrs[..4].try_into().unwrap()), 0x10);
+
+            let mut fs = context.lock().unwrap();
+            fs.handles.remove(&handle);
+            fs.fs.rmdir(path).unwrap();
         }
 
         #[test]
@@ -968,6 +1080,81 @@ mod imp {
             let mut fs = context.lock().unwrap();
             fs.fs.remove(directory, true).unwrap();
             drop(fs);
+        }
+
+        #[test]
+        fn modern_find_first_file_ex_reports_empty_missing_and_invalid_outputs() {
+            let empty = r"C:\modern_find_ex_empty";
+            let missing_pattern = r"C:\modern_find_ex_missing\*";
+            let empty_pattern = format!(r"{empty}\*");
+            let wide = |value: &str| value.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let empty_wide = wide(&empty_pattern);
+            let missing_wide = wide(missing_pattern);
+            let context = super::fs_ctx().unwrap();
+            context.lock().unwrap().fs.mkdir(empty).unwrap();
+            let mut data = [0u8; 592];
+
+            assert_eq!(
+                super::native_find_first_file_ex_w(
+                    empty_wide.as_ptr(),
+                    0,
+                    data.as_mut_ptr(),
+                    0,
+                    0,
+                    0,
+                ),
+                u64::MAX
+            );
+            assert_eq!(super::native_get_last_error(), 2); // ERROR_FILE_NOT_FOUND
+            assert_eq!(
+                super::native_find_first_file_ex_w(
+                    missing_wide.as_ptr(),
+                    0,
+                    data.as_mut_ptr(),
+                    0,
+                    0,
+                    0,
+                ),
+                u64::MAX
+            );
+            assert_eq!(super::native_get_last_error(), 3); // ERROR_PATH_NOT_FOUND
+
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(&format!(r"{empty}\entry.txt"), b"x".to_vec())
+                .unwrap();
+            assert_eq!(
+                super::native_find_first_file_ex_w(
+                    empty_wide.as_ptr(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    0,
+                ),
+                u64::MAX
+            );
+            assert_eq!(super::native_get_last_error(), 87); // ERROR_INVALID_PARAMETER
+
+            let find = super::native_find_first_file_ex_w(
+                empty_wide.as_ptr(),
+                0,
+                data.as_mut_ptr(),
+                0,
+                0,
+                0,
+            );
+            assert_ne!(find, u64::MAX);
+            assert_eq!(
+                super::native_find_next_file_w(u64::MAX, data.as_mut_ptr()),
+                0
+            );
+            assert_eq!(super::native_find_close(find), 1);
+            assert_eq!(super::native_find_close(find), 0);
+
+            context.lock().unwrap().fs.remove(empty, true).unwrap();
         }
 
         #[test]
@@ -1366,6 +1553,17 @@ mod imp {
                 required as usize,
                 r"\\?\C:\winfs_compat_final_path.txt".encode_utf16().count() + 1
             );
+            let mut short = vec![0xaaaa; required as usize - 1];
+            assert_eq!(
+                super::native_get_final_path_name_by_handle_w(
+                    handle,
+                    short.as_mut_ptr(),
+                    short.len() as u32,
+                    0,
+                ),
+                required
+            );
+            assert!(short.iter().all(|unit| *unit == 0xaaaa));
             let mut output = vec![0u16; required as usize];
             let written = super::native_get_final_path_name_by_handle_w(
                 handle,
@@ -1377,6 +1575,27 @@ mod imp {
             assert_eq!(
                 String::from_utf16(&output[..written as usize]).unwrap(),
                 r"\\?\C:\winfs_compat_final_path.txt"
+            );
+            let mut dos_path = vec![0u16; required as usize];
+            let dos_written = super::native_get_final_path_name_by_handle_w(
+                handle,
+                dos_path.as_mut_ptr(),
+                dos_path.len() as u32,
+                1,
+            );
+            assert_eq!(dos_written, written);
+            assert_eq!(
+                &dos_path[..dos_written as usize],
+                &output[..written as usize]
+            );
+            assert_eq!(
+                super::native_get_final_path_name_by_handle_w(
+                    u64::MAX,
+                    output.as_mut_ptr(),
+                    output.len() as u32,
+                    0,
+                ),
+                0
             );
 
             assert_eq!(super::native_close_handle(handle), 1);
