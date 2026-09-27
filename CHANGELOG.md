@@ -98,6 +98,8 @@ All notable changes to this project will be documented in this file.
   with the synchronization APIs.
 - Moved Windows code-page conversion and character classification shims into a
   dedicated Linux backend locale module.
+- Grouped Linux `CreateProcessW`, child exit/state transfer, and process-table
+  management with the existing process APIs.
 - Added the C-locale `msvcrt!mbstowcs` shim used by Nano.
 - Added an optional native Node check proving a relative file that Node leaves
   in WinFS appears in the following shell directory listing.

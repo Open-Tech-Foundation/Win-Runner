@@ -64,8 +64,10 @@ Items remain open until implementation and relevant verification are complete.
   live in the process module alongside launch support. File, pipe, TLS,
   filesystem, and per-process context data types now live in a backend-local
   state module. Thread-local guest state and active process/filesystem context
-  accessors now live in a context module; child lifecycle plumbing and process
-  initialization remain in the backend root. C runtime shims and their
+  accessors now live in a context module. `CreateProcessW`, child completion,
+  and child filesystem state transfer now live in the process module; process
+  initialization and top-level launch coordination remain in the backend root.
+  C runtime shims and their
   process/thread-local state now live in a CRT module. Console screen, mode,
   output, and input-event APIs now live in a console module. Other API groups
   including locale conversion now live in Windows-subsystem modules while host

@@ -285,3 +285,59 @@ pub(super) struct DynamicTlsSlots {
     pub(super) generation: [u64; 64],
     pub(super) reserved_static: bool,
 }
+
+// CreateProcessW will allocate these once PE mapping is attached to the
+// registry; they are already consumed by the process-handle APIs.
+#[allow(dead_code)]
+pub(super) struct NativeChildProcess {
+    pub(super) process_id: u32,
+    pub(super) parent_process_id: u32,
+    pub(super) host_pid: AtomicI32,
+    pub(super) termination_code: Mutex<Option<u32>>,
+    pub(super) state: Mutex<Option<u32>>,
+    pub(super) exited: Condvar,
+}
+
+pub(super) struct NativeProcessTable {
+    pub(super) next_handle: u64,
+    pub(super) next_thread_handle: u64,
+    pub(super) next_process_id: u32,
+    pub(super) children: HashMap<u64, Arc<NativeChildProcess>>,
+    pub(super) primary_threads: HashMap<u64, Arc<NativeChildProcess>>,
+}
+
+#[allow(dead_code)]
+impl NativeProcessTable {
+    pub(super) fn new() -> Self {
+        Self {
+            next_handle: 0x6000_0000,
+            next_thread_handle: 0x6100_0000,
+            next_process_id: 2,
+            children: HashMap::new(),
+            primary_threads: HashMap::new(),
+        }
+    }
+
+    pub(super) fn allocate(
+        &mut self,
+        parent_process_id: u32,
+    ) -> (u64, u64, Arc<NativeChildProcess>) {
+        let handle = self.next_handle;
+        self.next_handle += 1;
+        let thread_handle = self.next_thread_handle;
+        self.next_thread_handle += 1;
+        let child = Arc::new(NativeChildProcess {
+            process_id: self.next_process_id,
+            parent_process_id,
+            host_pid: AtomicI32::new(0),
+            termination_code: Mutex::new(None),
+            state: Mutex::new(None),
+            exited: Condvar::new(),
+        });
+        self.next_process_id += 1;
+        self.children.insert(handle, Arc::clone(&child));
+        self.primary_threads
+            .insert(thread_handle, Arc::clone(&child));
+        (handle, thread_handle, child)
+    }
+}
