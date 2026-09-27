@@ -133,6 +133,19 @@ pub(crate) fn execute_request(path: &Path) -> Result<u32, String> {
         .map_err(|error| format!("cannot read native worker request: {error}"))?;
     let request: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|error| format!("invalid native worker request: {error}"))?;
+    if let Some(handles) = request
+        .get("socket_handles_to_close")
+        .and_then(serde_json::Value::as_array)
+    {
+        for handle in handles {
+            let handle = handle
+                .as_i64()
+                .ok_or("worker request has an invalid socket handle to close")?;
+            if handle > 2 && handle <= i32::MAX as i64 {
+                unsafe { libc::close(handle as i32) };
+            }
+        }
+    }
     let descriptor_count = match request.get("pipe_transfer_fd_count") {
         None => 0,
         Some(value) => value
@@ -241,6 +254,17 @@ pub(crate) fn execute_request(path: &Path) -> Result<u32, String> {
         "WINRUN_NATIVE_PARENT_PROCESS_ID",
         parent_process_id.to_string(),
     );
+    if let Some(std_handles) = request.get("std_handles") {
+        let std_handles: [u64; 3] = serde_json::from_value(std_handles.clone())
+            .map_err(|error| format!("invalid native worker standard handles: {error}"))?;
+        std::env::set_var(
+            "WINRUN_NATIVE_STD_HANDLES",
+            serde_json::to_string(&std_handles)
+                .map_err(|error| format!("cannot encode worker standard handles: {error}"))?,
+        );
+    } else {
+        std::env::remove_var("WINRUN_NATIVE_STD_HANDLES");
+    }
     std::env::set_var(
         "WINRUN_NATIVE_STATE_FD",
         state_file.into_raw_fd().to_string(),

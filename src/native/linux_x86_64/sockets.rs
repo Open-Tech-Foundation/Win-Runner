@@ -1018,12 +1018,21 @@ pub(super) extern "win64" fn native_socket(domain: i32, kind: i32, protocol: i32
             return u64::MAX;
         }
     };
-    let fd = unsafe { socket(host_domain, kind, protocol) };
+    // New WinSock handles are non-inheritable by default. Set CLOEXEC
+    // atomically; SetHandleInformation can opt a socket into inheritance.
+    const SOCK_CLOEXEC: i32 = 0x0008_0000;
+    let fd = unsafe { socket(host_domain, kind | SOCK_CLOEXEC, protocol) };
     if fd < 0 {
         native_wsa_set_last_error(10047);
         u64::MAX
     } else {
-        SOCKET_HANDLE_TAG | fd as u64
+        let handle = SOCKET_HANDLE_TAG | fd as u64;
+        if let Some(process) = process_ctx() {
+            if let Ok(mut sockets) = process.socket_handles.lock() {
+                sockets.insert(handle);
+            }
+        }
+        handle
     }
 }
 
@@ -1033,6 +1042,9 @@ pub(super) extern "win64" fn native_close_socket(handle: u64) -> i32 {
         return -1;
     }
     if let Some(process) = process_ctx() {
+        if let Ok(mut sockets) = process.socket_handles.lock() {
+            sockets.remove(&handle);
+        }
         if let Ok(mut associations) = process.socket_completion_ports.lock() {
             associations.remove(&handle);
         }

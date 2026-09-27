@@ -57,23 +57,6 @@ impl NativeNamedPipeTable {
             next: 0xb000_0000,
         }
     }
-
-    pub(super) fn clone_for_child(&self, inherit_handles: bool) -> Self {
-        Self {
-            handles: if inherit_handles {
-                self.handles
-                    .iter()
-                    .filter(|(_, handle)| handle.inheritable)
-                    .map(|(handle, value)| (*handle, value.clone()))
-                    .collect()
-            } else {
-                HashMap::new()
-            },
-            pending_clients: HashMap::new(),
-            pending_io: HashMap::new(),
-            next: self.next,
-        }
-    }
 }
 #[derive(Clone)]
 pub(super) struct NativeFind {
@@ -180,6 +163,7 @@ pub(super) struct NativeProcessContext {
     pub(super) job_objects: Mutex<HashMap<u64, NativeJobObject>>,
     pub(super) wait_registrations: Mutex<HashMap<u64, Arc<NativeWaitRegistration>>>,
     pub(super) completion_ports: Mutex<HashMap<u64, Arc<NativeCompletionPort>>>,
+    pub(super) socket_handles: Mutex<std::collections::HashSet<u64>>,
     pub(super) socket_completion_ports: Mutex<HashMap<u64, (Arc<NativeCompletionPort>, u64)>>,
     pub(super) socket_completion_modes: Mutex<HashMap<u64, u8>>,
     pub(super) completion_next: AtomicU64,

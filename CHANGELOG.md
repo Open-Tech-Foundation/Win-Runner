@@ -33,14 +33,11 @@ All notable changes to this project will be documented in this file.
   forking the multithreaded launcher. Workers reopen mounted drives and
   seekable WinFS extents, and return portable filesystem journals while
   preserving guest stdout, stderr, and exit codes.
-- Started eligible `CreateProcessW` children in fresh exec workers too. The
-  worker protocol carries child identity, cwd, environment, WinFS state, and
-  inherited standard streams; a real Node 24 nested-process check covers the
-  route. Worker requests also preserve open WinFS file-handle offsets and
-  metadata. Connected inherited non-standard pipes cross the worker boundary
-  through Unix descriptor passing, including a pending client endpoint.
-  Completion-port-associated handles and pipes with active I/O still use the
-  fork path.
+- Routed every `CreateProcessW` child through a fresh exec worker and removed
+  its in-process fork fallback. Workers preserve child identity, cwd,
+  environment, WinFS state, standard handles, open-file metadata, inheritable
+  sockets, named-pipe endpoints, and completion-port associations. Nested-child
+  E2E tests cover output and child working-directory filesystem changes.
 - Completed the Linux native backend split: launch/output orchestration, shared
   runtime state, x86-64 assembly, and shared string helpers are in dedicated
   modules; file I/O is divided into open/read, namespace, temporary/metadata,

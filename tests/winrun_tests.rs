@@ -153,6 +153,84 @@ fn exec_worker_reads_files_from_an_existing_winfs_snapshot() {
 }
 
 #[test]
+fn create_process_child_runs_in_an_exec_worker_and_returns_output() {
+    let binary = env!("CARGO_BIN_EXE_winrun");
+    let snapshot_path = tmp_path("create-process-child.winfs");
+    let parent_path = tmp_path("create-process-parent.exe");
+    let mut fs = WinFs::ephemeral_runner();
+    fs.write_file(r"C:\child.exe", pe::builder::hello("child worker\n"))
+        .unwrap();
+    winrun::snapshot::save_file(&mut fs, snapshot_path.to_str().unwrap()).unwrap();
+    std::fs::write(
+        &parent_path,
+        pe::builder::create_process_wait(r"C:\child.exe", None),
+    )
+    .unwrap();
+
+    let output = Command::new(binary)
+        .arg(format!("--snapshot={}", snapshot_path.display()))
+        .arg("--save")
+        .arg(&parent_path)
+        .output()
+        .expect("run a parent guest that creates a child guest");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        b"child worker\n",
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    std::fs::remove_file(parent_path).unwrap();
+    std::fs::remove_file(snapshot_path).unwrap();
+}
+
+#[test]
+fn create_process_child_keeps_its_working_directory_in_winfs() {
+    let binary = env!("CARGO_BIN_EXE_winrun");
+    let snapshot_path = tmp_path("create-process-cwd.winfs");
+    let parent_path = tmp_path("create-process-cwd-parent.exe");
+    let mut fs = WinFs::ephemeral_runner();
+    fs.mkdir(r"C:\work").unwrap();
+    let parent_cwd = fs.cwd();
+    fs.write_file(
+        r"C:\child.exe",
+        pe::builder::write_file("child.txt", b"cwd"),
+    )
+    .unwrap();
+    winrun::snapshot::save_file(&mut fs, snapshot_path.to_str().unwrap()).unwrap();
+    std::fs::write(
+        &parent_path,
+        pe::builder::create_process_wait(r"C:\child.exe", Some(r"C:\work")),
+    )
+    .unwrap();
+
+    let output = Command::new(binary)
+        .arg(format!("--snapshot={}", snapshot_path.display()))
+        .arg("--save")
+        .arg(&parent_path)
+        .output()
+        .expect("run a child guest with its requested working directory");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let loaded = winrun::snapshot::load_file(snapshot_path.to_str().unwrap()).unwrap();
+    assert_eq!(loaded.read_file(r"C:\work\child.txt").unwrap(), b"cwd");
+    assert_eq!(loaded.cwd(), parent_cwd);
+
+    std::fs::remove_file(parent_path).unwrap();
+    std::fs::remove_file(snapshot_path).unwrap();
+}
+
+#[test]
 fn save_flag_updates_the_loaded_snapshot_on_exit() {
     let binary = env!("CARGO_BIN_EXE_winrun");
     let snapshot_path = tmp_path("save-flag.winfs");

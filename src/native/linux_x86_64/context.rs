@@ -74,6 +74,7 @@ pub(super) static TEST_PROCESS: LazyLock<Arc<NativeProcessContext>> = LazyLock::
         job_objects: Mutex::new(HashMap::new()),
         wait_registrations: Mutex::new(HashMap::new()),
         completion_ports: Mutex::new(HashMap::new()),
+        socket_handles: Mutex::new(std::collections::HashSet::new()),
         socket_completion_ports: Mutex::new(HashMap::new()),
         socket_completion_modes: Mutex::new(HashMap::new()),
         completion_next: AtomicU64::new(0x9000_0000),

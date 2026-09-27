@@ -704,54 +704,6 @@ pub(super) fn write_process_information(
     true
 }
 
-pub(super) fn finish_native_child(
-    child: Arc<NativeChildProcess>,
-    fs: Arc<Mutex<NativeFs>>,
-    state_fd: i32,
-    pid: i32,
-) {
-    let mut encoded = Vec::new();
-    let mut buffer = [0u8; 4096];
-    loop {
-        let read_count = unsafe { read(state_fd, buffer.as_mut_ptr().cast(), buffer.len()) };
-        if read_count <= 0 {
-            break;
-        }
-        encoded.extend_from_slice(&buffer[..read_count as usize]);
-    }
-    unsafe { close(state_fd) };
-    let mut status = 0;
-    let reaped = unsafe { waitpid(pid, &mut status, 0) } == pid;
-    if reaped && !encoded.is_empty() {
-        if let Ok(mut native_fs) = fs.lock() {
-            // A child process owns its working directory. Preserve the
-            // parent's directory while applying the child's file journal.
-            let parent_cwd = native_fs.fs.cwd();
-            match crate::snapshot::apply_changes(&encoded, &mut native_fs.fs) {
-                Ok(()) => {
-                    let _ = native_fs.fs.set_cwd(&parent_cwd);
-                }
-                Err(error) => {
-                    eprintln!("winrun: cannot apply child filesystem changes: {error}")
-                }
-            }
-        }
-    }
-    if let Ok(mut state) = child.state.lock() {
-        if state.is_none() {
-            let terminated = child.termination_code.lock().ok().and_then(|code| *code);
-            *state = Some(terminated.unwrap_or_else(|| {
-                if reaped && status & 0x7f == 0 {
-                    (status >> 8) as u32
-                } else {
-                    1
-                }
-            }));
-        }
-        child.exited.notify_all();
-    }
-}
-
 struct ChildWorkerDirectory(std::path::PathBuf);
 
 static NEXT_EXEC_CHILD_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -765,6 +717,7 @@ impl Drop for ChildWorkerDirectory {
 fn worker_stdio_for_handle(
     handle: u64,
     pipes: &NativeNamedPipeTable,
+    native_fs: &NativeFs,
 ) -> Result<std::process::Stdio, u32> {
     use std::os::fd::FromRawFd;
     use std::process::Stdio;
@@ -776,11 +729,23 @@ fn worker_stdio_for_handle(
             | NativeDevice::ConsoleOut(_) => Ok(Stdio::inherit()),
         };
     }
+    if handle & 0xffff_ffff_0000_0000 == SOCKET_HANDLE_TAG {
+        let fd = unsafe { dup(handle as i32) };
+        if fd < 0 {
+            return Err(6);
+        }
+        // SAFETY: dup returned a new descriptor whose ownership moves into Stdio.
+        let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+        return Ok(Stdio::from(owned));
+    }
     if matches!(handle, 0..=2 | STD_HANDLE_BASE..=0x5000_0002) {
         return Ok(Stdio::inherit());
     }
     let Some(pipe) = pipes.handles.get(&handle) else {
-        return Err(6); // ERROR_INVALID_HANDLE
+        if native_fs.handles.contains_key(&handle) {
+            return Ok(Stdio::null());
+        }
+        return Ok(Stdio::null());
     };
     let fd = unsafe { dup(pipe.endpoint.fd) };
     if fd < 0 {
@@ -792,54 +757,14 @@ fn worker_stdio_for_handle(
 }
 
 fn can_exec_worker_child(
-    child_fs: &NativeFs,
+    _child_fs: &NativeFs,
     parent: &NativeProcessContext,
-    std_handles: [u64; 3],
-    inherit_handles: bool,
+    _std_handles: [u64; 3],
+    _inherit_handles: bool,
 ) -> bool {
-    // File and inheritable pipe associations are serialized with worker
-    // completion channels. Standard pipe handles remain excluded because
-    // worker stdio is remapped separately.
-    if child_fs
-        .devices
-        .keys()
-        .any(|handle| !std_handles.contains(handle))
-    {
-        return false;
-    }
-    if inherit_handles
-        && parent
-            .socket_completion_ports
-            .lock()
-            .is_ok_and(|associations| !associations.is_empty())
-    {
-        // Winsock handles are not yet serialized into exec workers.
-        return false;
-    }
-    let Ok(pipes) = parent.named_pipes.lock() else {
-        return false;
-    };
-    for (handle, pipe) in &pipes.handles {
-        if std_handles.contains(handle)
-            && (pipe.pending_client.is_some() || pipe.completion.is_some())
-        {
-            return false;
-        }
-    }
-    // Pending overlapped requests remain owned by this process context. The
-    // worker receives a duplicate of each inheritable endpoint, so it can
-    // issue its own requests without taking ownership of the parent's I/O.
-    std_handles.iter().all(|handle| {
-        if matches!(handle, 0..=2 | STD_HANDLE_BASE..=0x5000_0002)
-            || native_device(*handle).is_some()
-        {
-            return true;
-        }
-        if pipes.handles.contains_key(handle) {
-            return inherit_handles;
-        }
-        host_standard_fd(*handle).is_some()
-    })
+    // All supported handle state is serialized or transferred to workers.
+    // A poisoned pipe table is the only state that prevents safe setup.
+    parent.named_pipes.lock().is_ok()
 }
 
 fn encode_worker_native_fs(
@@ -1021,7 +946,72 @@ pub(super) fn restore_worker_native_fs(
         .map_err(|_| "worker filesystem lock is poisoned".to_string())?;
     apply_worker_native_fs(&mut fs, encoded, &completion_ports)?;
     drop(fs);
-    restore_worker_pipe_handles(process, &request, &completion_ports)
+    restore_worker_pipe_handles(process, &request, &completion_ports)?;
+    restore_worker_socket_handles(process, &request, &completion_ports)
+}
+
+fn restore_worker_socket_handles(
+    process: &NativeProcessContext,
+    request: &serde_json::Value,
+    completion_ports: &HashMap<u64, Arc<NativeCompletionPort>>,
+) -> Result<(), String> {
+    let Some(items) = request
+        .get("inherited_sockets")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Ok(());
+    };
+    let mut sockets = process
+        .socket_handles
+        .lock()
+        .map_err(|_| "worker socket table is poisoned".to_string())?;
+    let mut associations = process
+        .socket_completion_ports
+        .lock()
+        .map_err(|_| "worker socket completion table is poisoned".to_string())?;
+    let mut modes = process
+        .socket_completion_modes
+        .lock()
+        .map_err(|_| "worker socket completion modes are poisoned".to_string())?;
+    for item in items {
+        let handle = item
+            .get("handle")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or("worker socket has invalid handle")?;
+        if handle & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG
+            || unsafe { fcntl(handle as i32, 1) } < 0
+        {
+            return Err("worker socket descriptor was not inherited".to_string());
+        }
+        sockets.insert(handle);
+        let completion = item
+            .get("completion")
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                let port_id = value
+                    .get("port")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or("worker socket has invalid completion port")?;
+                let key = value
+                    .get("key")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or("worker socket has invalid completion key")?;
+                let port = completion_ports
+                    .get(&port_id)
+                    .ok_or("worker socket completion port was not restored")?;
+                Ok::<_, String>((Arc::clone(port), key))
+            })
+            .transpose()?;
+        if let Some(completion) = completion {
+            associations.insert(handle, completion);
+        }
+        let completion_modes =
+            item.get("completion_modes")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or("worker socket has invalid completion modes")? as u8;
+        modes.insert(handle, completion_modes);
+    }
+    Ok(())
 }
 
 fn restore_worker_pipe_handles(
@@ -1178,6 +1168,7 @@ fn restore_worker_completion_ports(
     let Some(items) = request
         .get("completion_ports")
         .and_then(serde_json::Value::as_array)
+        .filter(|items| !items.is_empty())
     else {
         return Ok(HashMap::new());
     };
@@ -1505,6 +1496,110 @@ mod worker_native_fs_tests {
     }
 
     #[test]
+    fn standard_pipe_with_pending_io_and_iocp_can_use_exec_worker() {
+        use std::os::fd::{AsRawFd, IntoRawFd};
+
+        let (endpoint, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let handle = STD_HANDLE_BASE + 1;
+        let parent = Arc::clone(&super::TEST_PROCESS);
+        let port = Arc::new(NativeCompletionPort::new());
+        let pending_client_fd = unsafe { dup(peer.as_raw_fd()) };
+        assert!(pending_client_fd >= 0);
+        {
+            let mut pipes = parent.named_pipes.lock().unwrap();
+            pipes.handles.insert(
+                handle,
+                NativePipeHandle {
+                    endpoint: Arc::new(NativePipeEndpoint {
+                        fd: endpoint.into_raw_fd(),
+                        name: r"\\.\pipe\worker-stdio-iocp".to_string(),
+                        server: false,
+                        access: 3,
+                    }),
+                    pending_client: Some(Arc::new(NativePipeEndpoint {
+                        fd: pending_client_fd,
+                        name: r"\\.\pipe\worker-stdio-iocp".to_string(),
+                        server: true,
+                        access: 3,
+                    })),
+                    overlapped: true,
+                    inheritable: true,
+                    access: 3,
+                    mode: 0,
+                    completion: Some((port, 0x5678)),
+                    completion_modes: 0,
+                },
+            );
+        }
+        assert!(can_exec_worker_child(
+            &empty_fs(),
+            &parent,
+            [STD_HANDLE_BASE, handle, STD_HANDLE_BASE + 2],
+            true,
+        ));
+        parent.named_pipes.lock().unwrap().handles.remove(&handle);
+        drop(peer);
+    }
+
+    #[test]
+    fn worker_restores_inherited_socket_completion_association() {
+        use std::os::fd::IntoRawFd;
+
+        let (socket, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let handle = SOCKET_HANDLE_TAG | socket.into_raw_fd() as u64;
+        let process = Arc::clone(&super::TEST_PROCESS);
+        let port_id = 0x9876;
+        let port = Arc::new(NativeCompletionPort::new());
+        let request = serde_json::json!({
+            "inherited_sockets": [{
+                "handle": handle,
+                "completion": {"port": port_id, "key": 0x1234},
+                "completion_modes": 2,
+            }],
+        });
+        let ports = HashMap::from([(port_id, Arc::clone(&port))]);
+
+        restore_worker_socket_handles(&process, &request, &ports).unwrap();
+
+        assert!(process.socket_handles.lock().unwrap().contains(&handle));
+        let (associated_port, key) =
+            process.socket_completion_ports.lock().unwrap()[&handle].clone();
+        assert!(Arc::ptr_eq(&associated_port, &port));
+        assert_eq!(key, 0x1234);
+        assert_eq!(process.socket_completion_modes.lock().unwrap()[&handle], 2);
+
+        process.socket_handles.lock().unwrap().remove(&handle);
+        process
+            .socket_completion_ports
+            .lock()
+            .unwrap()
+            .remove(&handle);
+        process
+            .socket_completion_modes
+            .lock()
+            .unwrap()
+            .remove(&handle);
+        unsafe { close(handle as i32) };
+        drop(peer);
+    }
+
+    #[test]
+    fn winsock_handles_are_noninheritable_until_requested() {
+        let parent = Arc::clone(&super::TEST_PROCESS);
+        let handle = native_socket(2, 1, 0);
+        assert_ne!(handle, u64::MAX);
+        let flags = unsafe { fcntl(handle as i32, 1) };
+        assert!(flags >= 0 && flags & 1 != 0, "SOCK_CLOEXEC should be set");
+        assert!(parent.socket_handles.lock().unwrap().contains(&handle));
+        assert_eq!(native_set_handle_information(handle, 1, 1), 1);
+        assert_eq!(unsafe { fcntl(handle as i32, 1) } & 1, 0);
+        assert_eq!(native_set_handle_information(handle, 1, 0), 1);
+        assert_eq!(unsafe { fcntl(handle as i32, 1) } & 1, 1);
+        assert_eq!(native_close_socket(handle), 0);
+        assert!(!parent.socket_handles.lock().unwrap().contains(&handle));
+    }
+
+    #[test]
     fn worker_pipe_transfer_passes_live_file_descriptors() {
         let mut pipe_fds = [-1; 2];
         assert_eq!(unsafe { pipe(pipe_fds.as_mut_ptr()) }, 0);
@@ -1552,26 +1647,46 @@ fn create_exec_worker_child(
     let executable = std::env::var_os("WINRUN_NATIVE_WORKER_EXE").ok_or(120u32)?;
     let pipes = parent.named_pipes.lock().map_err(|_| 6u32)?;
     let stdio = child_std_handles
-        .map(|handle| worker_stdio_for_handle(handle, &pipes))
+        .map(|handle| worker_stdio_for_handle(handle, &pipes, &child_fs))
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?;
     let std_set = child_std_handles
         .iter()
         .copied()
         .collect::<std::collections::HashSet<_>>();
-    let transferable_pipes = if inherit_handles {
-        pipes
-            .handles
-            .iter()
-            .filter(|(handle, pipe)| pipe.inheritable && !std_set.contains(handle))
-            .map(|(handle, pipe)| (*handle, pipe.clone()))
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
+    let transferable_pipes = pipes
+        .handles
+        .iter()
+        .filter(|(handle, pipe)| std_set.contains(handle) || (inherit_handles && pipe.inheritable))
+        .map(|(handle, pipe)| (*handle, pipe.clone()))
+        .collect::<Vec<_>>();
     drop(pipes);
 
     let registered_ports = parent.completion_ports.lock().map_err(|_| 6u32)?.clone();
+    let all_socket_handles = parent
+        .socket_handles
+        .lock()
+        .map_err(|_| 6u32)?
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    let inherited_socket_handles = all_socket_handles
+        .iter()
+        .copied()
+        .filter(|handle| {
+            let flags = unsafe { fcntl(*handle as i32, 1) };
+            inherit_handles && flags >= 0 && flags & 1 == 0
+        })
+        .collect::<Vec<_>>();
+    let socket_handles_to_close = all_socket_handles
+        .iter()
+        .copied()
+        .filter(|handle| {
+            let flags = unsafe { fcntl(*handle as i32, 1) };
+            !inherited_socket_handles.contains(handle) && flags >= 0 && flags & 1 == 0
+        })
+        .map(|handle| handle as i32)
+        .collect::<Vec<_>>();
     let mut completion_port_ids = HashMap::<usize, u64>::new();
     let mut completion_port_objects = HashMap::<u64, Arc<NativeCompletionPort>>::new();
     let mut register_port = |port: &Arc<NativeCompletionPort>| -> Result<(), u32> {
@@ -1595,6 +1710,45 @@ fn create_exec_worker_child(
             register_port(port)?;
         }
     }
+    let socket_associations = parent
+        .socket_completion_ports
+        .lock()
+        .map_err(|_| 6u32)?
+        .clone();
+    for handle in &inherited_socket_handles {
+        if let Some((port, _)) = socket_associations.get(handle) {
+            register_port(port)?;
+        }
+    }
+    let socket_modes = parent
+        .socket_completion_modes
+        .lock()
+        .map_err(|_| 6u32)?
+        .clone();
+    let inherited_socket_metadata = inherited_socket_handles
+        .iter()
+        .map(|handle| {
+            let completion = socket_associations.get(handle).map(|(port, key)| {
+                serde_json::json!({
+                    "port": completion_port_ids[&(Arc::as_ptr(port) as usize)],
+                    "key": key,
+                })
+            });
+            serde_json::json!({
+                "handle": handle,
+                "completion": completion,
+                "completion_modes": socket_modes.get(handle).copied().unwrap_or(0),
+            })
+        })
+        .collect::<Vec<_>>();
+    let worker_std_handles: [u64; 3] = std::array::from_fn(|index| {
+        let handle = child_std_handles[index];
+        if handle & 0xffff_ffff_0000_0000 == SOCKET_HANDLE_TAG {
+            STD_HANDLE_BASE + index as u64
+        } else {
+            handle
+        }
+    });
 
     let id = NEXT_EXEC_CHILD_DIRECTORY.fetch_add(1, Ordering::Relaxed);
     let directory =
@@ -1676,8 +1830,11 @@ fn create_exec_worker_child(
         "environment": environment,
         "process_id": child.process_id,
         "parent_process_id": parent.process_id,
+        "std_handles": worker_std_handles,
         "native_fs": encode_worker_native_fs(&child_fs, &completion_port_ids).map_err(|_| 8u32)?,
         "inherited_pipes": inherited_pipe_metadata,
+        "inherited_sockets": inherited_socket_metadata,
+        "socket_handles_to_close": socket_handles_to_close,
         "completion_ports": completion_port_metadata,
         "pipe_endpoint_fd_count": inherited_pipe_fds.len() - completion_port_fds.len(),
         "pipe_transfer_fd_count": inherited_pipe_fds.len(),
@@ -1897,82 +2054,9 @@ pub(super) extern "win64" fn native_create_process_w(
             .map(|environment| environment.clone())
             .unwrap_or_default()
     });
-    if std::env::var_os("WINRUN_NATIVE_WORKER_EXE").is_some() {
-        let child_fs = match context.lock() {
-            Ok(parent_fs) => match parent_fs.clone_for_child(&launch.current_directory) {
-                Ok(child_fs) => child_fs,
-                Err(_) => {
-                    native_set_last_error(267); // ERROR_DIRECTORY
-                    return 0;
-                }
-            },
-            Err(_) => {
-                native_set_last_error(6);
-                return 0;
-            }
-        };
-        if can_exec_worker_child(&child_fs, &parent, child_std_handles, inherit_handles != 0) {
-            match create_exec_worker_child(
-                &parent,
-                &launch,
-                &image,
-                child_fs,
-                child_std_handles,
-                inherit_handles != 0,
-                &environment,
-                process_information,
-            ) {
-                Ok(()) => {
-                    native_set_last_error(0);
-                    return 1;
-                }
-                Err(error) => {
-                    native_set_last_error(error);
-                    return 0;
-                }
-            }
-        }
-    }
-    let (mapping, image) = match map_relocated(&image) {
-        Ok(value) => value,
-        Err(_) => {
-            native_set_last_error(193); // ERROR_BAD_EXE_FORMAT
-            return 0;
-        }
-    };
-    if registry::patch_baseline_imports(&mapping, &image, false).is_err() {
-        native_set_last_error(193);
-        return 0;
-    }
-    let tls = match setup_tls(&mapping, &image) {
-        Ok(value) => value,
-        Err(_) => {
-            native_set_last_error(193);
-            return 0;
-        }
-    };
-    let entry = match entry(&image) {
-        Ok(value) => value,
-        Err(_) => {
-            native_set_last_error(193);
-            return 0;
-        }
-    };
-    let (process_handle, thread_handle, child) = match parent.children.lock() {
-        Ok(mut children) => children.allocate(parent.process_id),
-        Err(_) => {
-            native_set_last_error(6);
-            return 0;
-        }
-    };
-    let mut state_fds = [-1, -1];
-    if unsafe { pipe(state_fds.as_mut_ptr()) } != 0 {
-        native_set_last_error(8); // ERROR_NOT_ENOUGH_MEMORY
-        return 0;
-    }
     let child_fs = match context.lock() {
         Ok(parent_fs) => match parent_fs.clone_for_child(&launch.current_directory) {
-            Ok(child_fs) => Arc::new(Mutex::new(child_fs)),
+            Ok(child_fs) => child_fs,
             Err(_) => {
                 native_set_last_error(267); // ERROR_DIRECTORY
                 return 0;
@@ -1983,138 +2067,29 @@ pub(super) extern "win64" fn native_create_process_w(
             return 0;
         }
     };
-    let child_pipes = match parent.named_pipes.lock() {
-        Ok(pipes) => pipes.clone_for_child(inherit_handles != 0),
-        Err(_) => {
-            native_set_last_error(6);
-            return 0;
-        }
-    };
-    let command_line_w = command_line_w(
-        &launch.application,
-        launch.arguments.get(1..).unwrap_or(&[]),
-    )
-    .unwrap_or_else(|_| vec![0]);
-    let child_context = Arc::new(NativeProcessContext {
-        image_base: image.image_base,
-        module_path: launch.application.clone(),
-        process_id: child.process_id,
-        process_handle,
-        parent_process_id: parent.process_id,
-        command_line_a: command_line_a(&command_line_w),
-        command_line_w,
-        environment_block: Mutex::new(environment_strings(&environment)),
-        environment: Mutex::new(environment),
-        std_handles: [
-            AtomicU64::new(child_std_handles[0]),
-            AtomicU64::new(child_std_handles[1]),
-            AtomicU64::new(child_std_handles[2]),
-        ],
-        crt_fds: Mutex::new(HashMap::new()),
-        crt_fd_next: AtomicI32::new(3),
-        fs: child_fs,
-        named_pipes: Mutex::new(child_pipes),
-        error_mode: AtomicU32::new(0),
-        pointer_cookie: random_pointer_cookie(),
-        heap_allocations: Mutex::new(HashMap::new()),
-        virtual_allocations: Mutex::new(HashMap::new()),
-        file_mappings: Mutex::new(HashMap::new()),
-        mapping_views: Mutex::new(HashMap::new()),
-        mapping_next: AtomicU64::new(0x9800_0000),
-        gs_base: AtomicU64::new(0),
-        tls_template: Mutex::new(tls.as_ref().map(NativeTls::clone_for_thread)),
-        dynamic_tls: Mutex::new(DynamicTlsSlots::new(tls.is_some())),
-        threads: Mutex::new(HashMap::new()),
-        thread_next: AtomicU64::new(0x8000_0000),
-        semaphores: Mutex::new(HashMap::new()),
-        semaphore_next: AtomicU64::new(0x6000_0000),
-        events: Mutex::new(HashMap::new()),
-        event_names: Mutex::new(HashMap::new()),
-        event_next: AtomicU64::new(0x6100_0000),
-        job_objects: Mutex::new(HashMap::new()),
-        wait_registrations: Mutex::new(HashMap::new()),
-        completion_ports: Mutex::new(HashMap::new()),
-        socket_completion_ports: Mutex::new(HashMap::new()),
-        socket_completion_modes: Mutex::new(HashMap::new()),
-        completion_next: AtomicU64::new(0x9000_0000),
-        io_wait: Mutex::new(()),
-        io_ready: Condvar::new(),
-        pending_file_io: AtomicU64::new(0),
-        pending_requests: Mutex::new(HashMap::new()),
-        file_io_queue: Mutex::new(None),
-        duplicate_handles: Mutex::new(HashMap::new()),
-        duplicate_next: AtomicU64::new(0xa000_0000),
-        timer_next: AtomicU64::new(0x7000_0000),
-        state_fd: AtomicU32::new(state_fds[1] as u32),
-        fls_value: AtomicU64::new(0),
-        unhandled_exception_filter: AtomicU64::new(0),
-        vectored_exception_handler: AtomicU64::new(0),
-        exit_status: AtomicU32::new(259),
-        exited: AtomicBool::new(false),
-        children: Mutex::new(NativeProcessTable::new()),
-    });
-    let mut child_tls = tls;
-    let mut fallback_teb = Box::new([0u8; 0x1000]);
-    let child_teb = child_tls
-        .as_mut()
-        .map(|tls| &mut tls.teb)
-        .unwrap_or(&mut fallback_teb);
-    // Stack discovery reads /proc and consults diagnostics, so do it in
-    // the parent before fork instead of running library code in the child.
-    set_teb_stack_bounds(child_teb);
-    let child_teb_base = child_teb.as_ptr() as u64;
-    let pid = unsafe { fork() };
-    if pid < 0 {
-        unsafe {
-            close(state_fds[0]);
-            close(state_fds[1]);
-        }
-        native_set_last_error(8);
+    if !can_exec_worker_child(&child_fs, &parent, child_std_handles, inherit_handles != 0) {
+        native_set_last_error(6);
         return 0;
     }
-    if pid == 0 {
-        #[cfg(test)]
-        NATIVE_GUEST_ACTIVE.store(true, Ordering::Release);
-        unsafe { close(state_fds[0]) };
-        THREAD_NATIVE_PROCESS.with(|active| {
-            *active.borrow_mut() = Some(child_context);
-        });
-        if protect_exec(&mapping).is_err() {
-            unsafe { _exit(127) };
-        }
-        if !unsafe { set_gs(child_teb_base) } {
-            unsafe { _exit(127) };
-        }
-        THREAD_TEB_BASE.set(child_teb_base);
-        let guest: unsafe extern "win64" fn() -> u32 = unsafe { std::mem::transmute(entry) };
-        let code = unsafe { guest() };
-        native_flush_instance_state();
-        unsafe { _exit(code as i32) };
-    }
-    child.host_pid.store(pid, Ordering::Release);
-    unsafe { close(state_fds[1]) };
-    let monitor_child = Arc::clone(&child);
-    let monitor_fs = Arc::clone(&context);
-    if std::thread::Builder::new()
-        .name("winrun-native-child".to_string())
-        .spawn(move || finish_native_child(monitor_child, monitor_fs, state_fds[0], pid))
-        .is_err()
-    {
-        unsafe { close(state_fds[0]) };
-        native_set_last_error(8);
-        return 0;
-    }
-    if !write_process_information(
+    match create_exec_worker_child(
+        &parent,
+        &launch,
+        &image,
+        child_fs,
+        child_std_handles,
+        inherit_handles != 0,
+        &environment,
         process_information,
-        process_handle,
-        thread_handle,
-        child.process_id,
     ) {
-        native_set_last_error(87);
-        return 0;
+        Ok(()) => {
+            native_set_last_error(0);
+            1
+        }
+        Err(error) => {
+            native_set_last_error(error);
+            0
+        }
     }
-    native_set_last_error(0);
-    1
 }
 
 pub(super) fn native_flush_instance_state() {

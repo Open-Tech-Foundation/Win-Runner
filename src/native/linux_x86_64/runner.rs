@@ -458,6 +458,10 @@ fn run_rust_baseline_argv_with_fs_impl(
         }));
         let command_line_w = command_line_w(prog, args)?;
         let command_line_a = command_line_a(&command_line_w);
+        let std_handles = std::env::var("WINRUN_NATIVE_STD_HANDLES")
+            .ok()
+            .and_then(|value| serde_json::from_str::<[u64; 3]>(&value).ok())
+            .unwrap_or([STD_HANDLE_BASE, STD_HANDLE_BASE + 1, STD_HANDLE_BASE + 2]);
         let process = Arc::new(NativeProcessContext {
             image_base: img.image_base,
             module_path: prog.to_string(),
@@ -474,11 +478,7 @@ fn run_rust_baseline_argv_with_fs_impl(
             command_line_a,
             environment: Mutex::new(environment.to_vec()),
             environment_block: Mutex::new(environment_strings(environment)),
-            std_handles: [
-                AtomicU64::new(STD_HANDLE_BASE),
-                AtomicU64::new(STD_HANDLE_BASE + 1),
-                AtomicU64::new(STD_HANDLE_BASE + 2),
-            ],
+            std_handles: std_handles.map(AtomicU64::new),
             crt_fds: Mutex::new(HashMap::new()),
             crt_fd_next: AtomicI32::new(3),
             fs,
@@ -503,6 +503,7 @@ fn run_rust_baseline_argv_with_fs_impl(
             job_objects: Mutex::new(HashMap::new()),
             wait_registrations: Mutex::new(HashMap::new()),
             completion_ports: Mutex::new(HashMap::new()),
+            socket_handles: Mutex::new(std::collections::HashSet::new()),
             socket_completion_ports: Mutex::new(HashMap::new()),
             socket_completion_modes: Mutex::new(HashMap::new()),
             completion_next: AtomicU64::new(0x9000_0000),

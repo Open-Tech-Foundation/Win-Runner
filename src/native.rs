@@ -390,39 +390,4 @@ mod tests {
             assert_eq!(output, expected, "offset={offset}, length={length}");
         }
     }
-
-    #[test]
-    fn native_guest_can_create_wait_for_and_reap_a_relocated_child() {
-        let child = crate::pe::builder::hello("child\n");
-        let parent = load(&crate::pe::builder::create_process_wait(
-            r"C:\child.exe",
-            None,
-        ))
-        .expect("parent loads");
-        let mut fs = WinFs::ephemeral_runner();
-        fs.write_file(r"C:\child.exe", child).unwrap();
-        let (code, output, _) = run_rust_baseline_argv_with_fs(&parent, fs, "parent.exe", &[])
-            .expect("native parent runs");
-        assert_eq!(code, 0);
-        assert_eq!(output, b"child\n");
-    }
-
-    #[test]
-    fn native_child_uses_its_requested_working_directory() {
-        let child = crate::pe::builder::write_file("child.txt", b"cwd");
-        let parent = load(&crate::pe::builder::create_process_wait(
-            r"C:\child.exe",
-            Some(r"C:\work"),
-        ))
-        .expect("parent loads");
-        let mut fs = WinFs::ephemeral_runner();
-        fs.mkdir(r"C:\work").unwrap();
-        let parent_cwd = fs.cwd();
-        fs.write_file(r"C:\child.exe", child).unwrap();
-        let (code, _, fs) = run_rust_baseline_argv_with_fs(&parent, fs, "parent.exe", &[])
-            .expect("native parent runs");
-        assert_eq!(code, 0);
-        assert_eq!(fs.read_file(r"C:\work\child.txt").unwrap(), b"cwd");
-        assert_eq!(fs.cwd(), parent_cwd);
-    }
 }

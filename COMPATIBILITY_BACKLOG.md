@@ -15,17 +15,15 @@ Items remain open until implementation and relevant verification are complete.
   and can issue Linux syscalls, so WinFS and read-only mounts are not a
   security sandbox. Document this clearly; assess seccomp, namespaces, and
   Landlock as a separate implementation project.
-- [ ] **3. Remove unsafe fork-after-threads behavior.** `CreateProcessW` still
-  has a fork fallback. CLI guests and eligible Windows children now run in
-  fresh exec workers. Child workers receive their Windows process IDs, cwd,
-  environment, WinFS state, inherited standard streams, and ordinary open WinFS
-  file-handle metadata; a real Node 24 nested-process check covers this route.
-  Connected inherited non-standard pipe handles now cross exec through Unix
-  descriptor passing, including a pending client endpoint. Active overlapped
-  requests remain owned by the parent while inherited endpoints are duplicated
-  to the worker, so they no longer force a fork. Completion-port-associated
-  handles still use the fork path; transfer their completion notifications and
-  remove the remaining fallback before considering this item complete.
+- [x] **3. Remove the `CreateProcessW` fork fallback.** Every Windows child now
+  starts in a fresh exec worker. Workers receive process identity, cwd,
+  environment, WinFS state, standard handles, and open-file metadata. Inheritable
+  pipe endpoints (including standard pipes, pending clients, and completion
+  associations) cross through descriptor passing; inheritable Winsock handles
+  and completion associations are restored in the worker. Generic native parent
+  and child E2E tests cover output, cwd, and filesystem changes. The direct Rust
+  library runner retains its separate fork path when invoked without a worker
+  executable; normal CLI runs use exec workers.
 - [x] **4. Keep the control listener alive after invalid connections.** Continue
   accepting until an authenticated WebSocket session is established, and use
   constant-time token comparison.
@@ -71,6 +69,8 @@ Items remain open until implementation and relevant verification are complete.
   all-targets Clippy run still reports unrelated warnings across the codebase.
 - [ ] Triage remaining Clippy warnings. Current toolchain reports 81 library
   warnings and 14 binary warnings, plus repeated warnings in test targets.
+- [ ] Remove or explicitly constrain the direct library runner's fork path,
+  which remains available when callers invoke it without a worker executable.
 
 ## Compatibility coverage priorities
 
@@ -105,6 +105,36 @@ Items remain open until implementation and relevant verification are complete.
 - [ ] Cover Winsock imports by name: `WSAStartup`, `socket`, `connect`,
   `send`, `recv`, `closesocket`, `select`, `getaddrinfo`, `setsockopt`, and
   `ioctlsocket`.
+- [ ] **PowerShell install-script .NET surface.** Add `Int`, `Bool`, `Bytes`,
+  and `Object` values, then use one registry for type names, static methods,
+  constructors, instance methods, and properties. Keep unsupported calls strict
+  and identify both the type and method in the error.
+  - `System.IO`: `Path.Combine`, `GetFileName`, `GetFileNameWithoutExtension`,
+    `GetExtension`, `GetDirectoryName`, `GetFullPath`, `GetTempPath`,
+    `GetTempFileName`, `IsPathRooted`, and `ChangeExtension`; `File.Exists`,
+    `ReadAllText/Lines/Bytes`, `WriteAllText/Lines/Bytes`, `AppendAllText`,
+    `Copy`, `Move`, and `Delete`; `Directory.Exists`, `CreateDirectory`,
+    `Delete`, `GetFiles`, and `GetDirectories`. Reuse WinFS.
+  - Networking: `(New-Object System.Net.WebClient).DownloadFile/DownloadString`,
+    `[Uri]` construction and its `Host`, `AbsolutePath`, and `Segments`,
+    `Invoke-WebRequest -OutFile`, and accepted no-op
+    `[Net.ServicePointManager]::SecurityProtocol = 'Tls12'` settings.
+    Route downloads through `fetch_url` so a future network-off option applies
+    consistently.
+  - Environment and values: `Environment.GetFolderPath` (`ProgramData`,
+    `LocalApplicationData`), `Is64BitOperatingSystem`, `NewLine`, `MachineName`,
+    `ProcessorCount`, and `CurrentDirectory`; `[Text.Encoding]::UTF8.GetBytes`/
+    `GetString`, `[Convert]::ToBase64String`/`FromBase64String`,
+    `[DateTime]::Now/UtcNow`, `[Math]::Max/Min`, and `[int]`/`[string]`/`[bool]`
+    casts.
+  - Archives and hashes: `[IO.Compression.ZipFile]::ExtractToDirectory`, no-op
+    `Add-Type -AssemblyName System.IO.Compression.FileSystem`, and
+    `[Security.Cryptography.SHA256]::Create().ComputeHash(...)`. Reuse existing
+    archive and hash implementations.
+  - Later: `Start-Process`, `Diagnostics.Process`, `HttpClient`, POST
+    `Invoke-RestMethod`, and clear unsupported errors for COM objects.
+  - Use the Chocolatey community `install.ps1` as the first end-to-end target;
+    then sample 10–20 common CI/install scripts and rank API demand by frequency.
 
 ### P2: broader APIs
 
