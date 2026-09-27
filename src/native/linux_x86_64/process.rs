@@ -817,7 +817,14 @@ fn can_exec_worker_child(
         return false;
     };
     for (handle, pipe) in &pipes.handles {
-        if (std_handles.contains(handle) || (inherit_handles && pipe.inheritable))
+        if std_handles.contains(handle)
+            && (pipe.pending_client.is_some() || pipe.completion.is_some())
+        {
+            return false;
+        }
+        if inherit_handles
+            && pipe.inheritable
+            && !std_handles.contains(handle)
             && pipe.completion.is_some()
         {
             return false;
