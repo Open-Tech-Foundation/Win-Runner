@@ -1963,6 +1963,59 @@ mod tests {
     }
 
     #[test]
+    fn modern_copy_overwrite_preserves_destination_name_and_source_contents() {
+        let mut fs = WinFs::new();
+        fs.mkdir(r"C:\compat").unwrap();
+        fs.write_file(r"C:\compat\source.txt", b"new bytes".to_vec())
+            .unwrap();
+        fs.write_file(
+            r"C:\compat\Target.TXT",
+            b"old bytes that are longer".to_vec(),
+        )
+        .unwrap();
+
+        assert!(fs
+            .copy_file(r"C:\compat\source.txt", r"C:\compat\target.txt", true)
+            .is_err());
+        assert_eq!(
+            fs.read_file(r"C:\compat\Target.TXT").unwrap(),
+            b"old bytes that are longer"
+        );
+
+        fs.copy_file(r"C:\compat\source.txt", r"C:\compat\target.txt", false)
+            .unwrap();
+        assert_eq!(fs.read_file(r"C:\compat\Target.TXT").unwrap(), b"new bytes");
+        assert_eq!(fs.read_file(r"C:\compat\source.txt").unwrap(), b"new bytes");
+        assert_ne!(
+            fs.file_id(r"C:\compat\source.txt").unwrap(),
+            fs.file_id(r"C:\compat\Target.TXT").unwrap()
+        );
+        assert_eq!(
+            fs.list_dir(r"C:\compat").unwrap(),
+            ["source.txt", "Target.TXT"]
+        );
+    }
+
+    #[test]
+    fn modern_move_preserves_file_identity_across_a_rename() {
+        let mut fs = WinFs::new();
+        fs.mkdir(r"C:\compat").unwrap();
+        fs.write_file(r"C:\compat\before.txt", b"stable identity".to_vec())
+            .unwrap();
+        let before = fs.file_id(r"C:\compat\before.txt").unwrap();
+
+        fs.move_path(r"C:\compat\before.txt", r"C:\compat\After.TXT")
+            .unwrap();
+
+        assert_eq!(fs.file_id(r"C:\compat\After.TXT").unwrap(), before);
+        assert_eq!(
+            fs.read_file(r"C:\compat\After.TXT").unwrap(),
+            b"stable identity"
+        );
+        assert!(!fs.exists(r"C:\compat\before.txt"));
+    }
+
+    #[test]
     fn modern_filesystem_change_replay_preserves_ordered_mutations_and_cwd() {
         let mut source = WinFs::new();
         source.mkdir(r"C:\compat\tree").unwrap();
