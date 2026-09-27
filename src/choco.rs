@@ -298,6 +298,56 @@ pub struct CommunityPkg {
     pub sha512: [u8; 64],
 }
 
+/// Validate an archive member name and return its normalized relative path.
+/// Both separator styles are treated as path separators so Windows paths are
+/// rejected consistently when extraction runs on Linux.
+fn safe_archive_relative_path(path: &str) -> Result<String, String> {
+    let normalized = path.replace('\\', "/");
+    let trimmed = normalized.strip_suffix('/').unwrap_or(&normalized);
+    if trimmed.is_empty()
+        || trimmed.starts_with('/')
+        || trimmed.as_bytes().contains(&0)
+        || trimmed.contains(':')
+    {
+        return Err(format!("choco: unsafe archive path '{path}'"));
+    }
+    let components = trimmed.split('/').collect::<Vec<_>>();
+    if components
+        .iter()
+        .any(|part| matches!(*part, "" | "." | ".."))
+    {
+        return Err(format!("choco: unsafe archive path '{path}'"));
+    }
+    Ok(components.join("/"))
+}
+
+/// Join a validated archive member beneath an existing extraction root.
+/// Existing symlink components are rejected to prevent an earlier cache entry
+/// from redirecting a later package write outside the extraction tree.
+fn safe_archive_join(root: &Path, member: &str) -> Result<PathBuf, String> {
+    let relative = safe_archive_relative_path(member)?;
+    let root = root
+        .canonicalize()
+        .map_err(|e| format!("choco: cannot resolve extraction root: {e}"))?;
+    let mut output = root;
+    for component in relative.split('/') {
+        output.push(component);
+        match std::fs::symlink_metadata(&output) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!("choco: archive path traverses a symlink: {member}"));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "choco: cannot inspect archive path {member}: {error}"
+                ));
+            }
+        }
+    }
+    Ok(output)
+}
+
 /// Download a feed package and verify its nupkg against the feed SHA-512.
 /// The returned bytes can be installed directly into WinFS without staging
 /// the package contents in temporary host staging.
@@ -342,14 +392,7 @@ pub fn extract_nupkg_tools_to_guest(
         if rel.is_empty() {
             continue;
         }
-        if rel.contains('\\')
-            || rel.starts_with('/')
-            || rel
-                .split('/')
-                .any(|part| matches!(part, "" | "." | "..") || part.contains(':'))
-        {
-            return Err(format!("choco: unsafe package path '{}'", entry.name));
-        }
+        let rel = safe_archive_relative_path(rel)?;
         let guest = format!(
             r"{}\{}",
             guest_tools.trim_end_matches('\\'),
@@ -561,7 +604,7 @@ pub fn find_choco_app(cache: &Path, target: &str) -> Option<ChocoApp> {
 /// Extract a nupkg's `tools/` tree into `dest` (prefix stripped).
 fn extract_nupkg_tools(blob: &[u8], dest: &Path) -> Result<(), String> {
     let entries = crate::install::zip_entries(blob)?;
-    let sep = std::path::MAIN_SEPARATOR.to_string();
+    std::fs::create_dir_all(dest).map_err(|e| format!("cannot create cache: {e}"))?;
     let mut have_tools = false;
     for entry in &entries {
         if !entry.name.to_lowercase().starts_with("tools/") {
@@ -572,7 +615,7 @@ fn extract_nupkg_tools(blob: &[u8], dest: &Path) -> Result<(), String> {
             continue;
         }
         have_tools = true;
-        let out = dest.join(rel.replace('/', &sep));
+        let out = safe_archive_join(dest, &rel)?;
         if entry.is_dir {
             std::fs::create_dir_all(&out).map_err(|e| format!("cannot write cache: {e}"))?;
             continue;
@@ -672,15 +715,15 @@ fn unpack_archive_payload(payload: &Path, dest: &Path) -> Result<(), String> {
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
-    let sep = std::path::MAIN_SEPARATOR.to_string();
     if ext == "zip" {
         let blob =
             std::fs::read(payload).map_err(|e| format!("choco: cannot read payload: {e}"))?;
         for entry in crate::install::zip_entries(&blob).map_err(|e| format!("choco: {e}"))? {
+            let out = safe_archive_join(dest, &entry.name)?;
             if entry.is_dir {
+                std::fs::create_dir_all(&out).map_err(|e| format!("cannot write cache: {e}"))?;
                 continue;
             }
-            let out = dest.join(entry.name.replace('/', &sep));
             if let Some(parent) = out.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| format!("cannot write cache: {e}"))?;
             }
@@ -689,6 +732,7 @@ fn unpack_archive_payload(payload: &Path, dest: &Path) -> Result<(), String> {
             std::fs::write(&out, bytes).map_err(|e| format!("cannot write cache: {e}"))?;
         }
     } else {
+        validate_7z_archive_paths(payload, dest)?;
         let status = std::process::Command::new("7z")
             .args([
                 "x".to_string(),
@@ -709,6 +753,46 @@ fn unpack_archive_payload(payload: &Path, dest: &Path) -> Result<(), String> {
         }
     }
     std::fs::remove_file(payload).map_err(|e| format!("cannot write cache: {e}"))?;
+    Ok(())
+}
+
+/// Inspect external 7-Zip payload names before invoking its extractor. Links
+/// are rejected because they could redirect a subsequent member outside the
+/// extraction tree.
+fn validate_7z_archive_paths(payload: &Path, dest: &Path) -> Result<(), String> {
+    let listing = std::process::Command::new("7z")
+        .args(["l", "-slt"])
+        .arg(payload)
+        .output()
+        .map_err(|_| "choco: need host 7-Zip (`7z`) to inspect this package payload".to_string())?;
+    if !listing.status.success() {
+        return Err(format!(
+            "choco: cannot inspect {}: {}",
+            payload.display(),
+            String::from_utf8_lossy(&listing.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&listing.stdout);
+    let mut in_entries = false;
+    let mut count = 0usize;
+    for line in text.lines() {
+        if line.trim() == "----------" {
+            in_entries = true;
+            continue;
+        }
+        if !in_entries {
+            continue;
+        }
+        if let Some(member) = line.strip_prefix("Path = ") {
+            let _ = safe_archive_join(dest, member)?;
+            count += 1;
+        } else if line.starts_with("Symbolic Link = ") || line.starts_with("Hard Link = ") {
+            return Err("choco: package archives may not contain links".to_string());
+        }
+    }
+    if count == 0 {
+        return Err("choco: package archive has no files".to_string());
+    }
     Ok(())
 }
 
@@ -847,6 +931,7 @@ fn parse_shasums(doc: &str, name: &str) -> Option<String> {
 fn extract_npm_tree(blob: &[u8], root: &str, dest: &Path) -> Result<(), String> {
     let prefix = format!("{root}/node_modules/npm/");
     let entries = crate::install::zip_entries(blob)?;
+    std::fs::create_dir_all(dest).map_err(|e| format!("cannot create cache: {e}"))?;
     let mut count = 0;
     for entry in &entries {
         let Some(rel) = entry.name.strip_prefix(&prefix) else {
@@ -855,11 +940,8 @@ fn extract_npm_tree(blob: &[u8], root: &str, dest: &Path) -> Result<(), String> 
         if rel.is_empty() || entry.is_dir {
             continue;
         }
-        if rel.contains("..") {
-            return Err(format!("choco: unsafe zip entry '{}'", entry.name));
-        }
+        let out = safe_archive_join(dest, rel)?;
         let bytes = crate::install::extract_bytes(blob, entry)?;
-        let out = dest.join(rel.replace('/', &std::path::MAIN_SEPARATOR.to_string()));
         if let Some(parent) = out.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("cannot write cache: {e}"))?;
         }
@@ -940,6 +1022,84 @@ mod tests {
                 .contains("unknown option")
         );
         assert!(parse_args(&argv(&["frob"])).unwrap_err().contains("usage"));
+    }
+
+    #[test]
+    fn safe_archive_paths_reject_host_and_windows_escape_forms() {
+        let root = std::env::temp_dir().join(format!("wincli-archive-path-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        for path in [
+            "../../../.bashrc",
+            "tools/../../outside",
+            "/etc/passwd",
+            "//etc/passwd",
+            r"\etc\passwd",
+            r"C:\Windows\win.ini",
+            "C:relative.txt",
+            "folder//file",
+            "folder/./file",
+            "folder/../file",
+            "file.txt:stream",
+        ] {
+            assert!(safe_archive_join(&root, path).is_err(), "accepted {path:?}");
+        }
+        assert_eq!(
+            safe_archive_relative_path(r"tools\bin\app.exe").unwrap(),
+            "tools/bin/app.exe"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn nupkg_extraction_rejects_traversal_before_host_write() {
+        let root = std::env::temp_dir().join(format!("wincli-nupkg-slip-{}", std::process::id()));
+        let dest = root.join("cache");
+        std::fs::create_dir_all(&root).unwrap();
+        let blob = zip_stored(&[("tools/../../../outside.txt", b"owned")]);
+        let error = extract_nupkg_tools(&blob, &dest).unwrap_err();
+        assert!(error.contains("unsafe archive path"), "{error}");
+        assert!(!root.join("outside.txt").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn nested_zip_extraction_rejects_absolute_and_traversal_paths() {
+        let root = std::env::temp_dir().join(format!("wincli-nested-slip-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let payload = root.join("payload.zip");
+        std::fs::write(&payload, zip_stored(&[(r"C:\outside.txt", b"owned")])).unwrap();
+        let error = unpack_archive_payload(&payload, &root).unwrap_err();
+        assert!(error.contains("unsafe archive path"), "{error}");
+        assert!(!root.join("outside.txt").exists());
+        assert!(payload.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn npm_tree_extraction_rejects_drive_prefixed_members() {
+        let root = std::env::temp_dir().join(format!("wincli-npm-slip-{}", std::process::id()));
+        let dest = root.join("npm");
+        std::fs::create_dir_all(&root).unwrap();
+        let blob = zip_stored(&[("node/node_modules/npm/C:/outside.txt", b"owned")]);
+        let error = extract_npm_tree(&blob, "node", &dest).unwrap_err();
+        assert!(error.contains("unsafe archive path"), "{error}");
+        assert!(!root.join("outside.txt").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safe_archive_join_rejects_existing_symlink_components() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("wincli-archive-link-{}", std::process::id()));
+        let outside = root.join("outside");
+        let dest = root.join("dest");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        symlink(&outside, dest.join("redirect")).unwrap();
+        assert!(safe_archive_join(&dest, "redirect/owned.txt").is_err());
+        assert!(!outside.join("owned.txt").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
