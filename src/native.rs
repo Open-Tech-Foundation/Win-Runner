@@ -3147,6 +3147,119 @@ mod imp {
         }
 
         #[test]
+        fn modern_ansi_replace_file_moves_old_data_to_backup() {
+            type ReplaceFileA =
+                unsafe extern "win64" fn(*const u8, *const u8, *const u8, u32, u64, u64) -> i32;
+            let replace: ReplaceFileA =
+                unsafe { std::mem::transmute(require_kernel32_api(b"ReplaceFileA\0") as usize) };
+            let destination = b"C:\\modern_replace_ansi_destination.txt\0";
+            let replacement = b"C:\\modern_replace_ansi_new.txt\0";
+            let backup = b"C:\\modern_replace_ansi_backup.txt\0";
+            let context = super::fs_ctx().unwrap();
+            {
+                let mut ctx = context.lock().unwrap();
+                ctx.fs
+                    .write_file(
+                        "C:\\modern_replace_ansi_destination.txt",
+                        b"old-ansi".to_vec(),
+                    )
+                    .unwrap();
+                ctx.fs
+                    .write_file("C:\\modern_replace_ansi_new.txt", b"new-ansi".to_vec())
+                    .unwrap();
+            }
+
+            assert_eq!(
+                unsafe {
+                    replace(
+                        destination.as_ptr(),
+                        replacement.as_ptr(),
+                        backup.as_ptr(),
+                        0,
+                        0,
+                        0,
+                    )
+                },
+                1
+            );
+            let ctx = context.lock().unwrap();
+            assert_eq!(
+                ctx.fs
+                    .read_file("C:\\modern_replace_ansi_destination.txt")
+                    .unwrap(),
+                b"new-ansi"
+            );
+            assert_eq!(
+                ctx.fs
+                    .read_file("C:\\modern_replace_ansi_backup.txt")
+                    .unwrap(),
+                b"old-ansi"
+            );
+            assert!(!ctx.fs.exists("C:\\modern_replace_ansi_new.txt"));
+            drop(ctx);
+            let mut ctx = context.lock().unwrap();
+            ctx.fs
+                .delete_file("C:\\modern_replace_ansi_backup.txt")
+                .unwrap();
+            ctx.fs
+                .delete_file("C:\\modern_replace_ansi_destination.txt")
+                .unwrap();
+        }
+
+        #[test]
+        fn modern_ansi_remove_directory_removes_empty_guest_directory() {
+            type RemoveDirectoryA = unsafe extern "win64" fn(*const u8) -> i32;
+            let remove_directory: RemoveDirectoryA = unsafe {
+                std::mem::transmute(require_kernel32_api(b"RemoveDirectoryA\0") as usize)
+            };
+            let path = b"C:\\modern_remove_directory_ansi\0";
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .mkdir("C:\\modern_remove_directory_ansi")
+                .unwrap();
+
+            assert_eq!(unsafe { remove_directory(path.as_ptr()) }, 1);
+            assert!(!context
+                .lock()
+                .unwrap()
+                .fs
+                .exists("C:\\modern_remove_directory_ansi"));
+        }
+
+        #[test]
+        fn modern_write_file_gather_rejects_invalid_handle() {
+            type WriteFileGather = unsafe extern "win64" fn(
+                u64,
+                *const u64,
+                u32,
+                *mut u32,
+                *mut std::ffi::c_void,
+            ) -> i32;
+            let write_gather: WriteFileGather =
+                unsafe { std::mem::transmute(require_kernel32_api(b"WriteFileGather\0") as usize) };
+            let layout = std::alloc::Layout::from_size_align(4096, 4096).unwrap();
+            let page = unsafe { std::alloc::alloc_zeroed(layout) };
+            assert!(!page.is_null());
+            let segments = [page as u64];
+            let mut overlapped = [0u8; 32];
+            let result = unsafe {
+                write_gather(
+                    u64::MAX,
+                    segments.as_ptr(),
+                    4096,
+                    std::ptr::null_mut(),
+                    overlapped.as_mut_ptr().cast(),
+                )
+            };
+            unsafe { std::alloc::dealloc(page, layout) };
+            assert_eq!(result, 0);
+            assert_eq!(super::native_get_last_error(), 6);
+        }
+
+        #[test]
         fn initializes_critical_section_with_spin_count() {
             let mut section = [0x5au8; 40];
             assert_eq!(
