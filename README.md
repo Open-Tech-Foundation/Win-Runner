@@ -8,6 +8,7 @@ when the session ends. No Wine, VM, or host Windows installation is required.
 wincli app.exe [args...]  # minimal x86_64 PE execution (PE32+, native console apps)
 wincli --snapshot=tools.winfs shell # boot a saved C: guest disk
 wincli --snapshot=tools.winfs C:\bin\app.exe [args...] # run a guest PE headlessly
+wincli --headless --control=127.0.0.1:0 shell # externally controlled shell
 wincli --mount=Z:/host/folder shell # expose a host folder as a live drive
 wincli script.ps1         # minimal PowerShell-like script execution
 wincli shell              # interactive shell: one ephemeral WinFS per session
@@ -129,6 +130,43 @@ on the host, so it survives fresh ephemeral shells. A copy also lives at
 Set `WINCLI_HISTORY_FILE` to choose a different host history file.
 Use Windows-style `set NAME=value` or `path C:\tools;%PATH%` to update the
 session environment and guest executable search path.
+
+### Headless agent control
+
+Start one persistent shell with a localhost WebSocket control endpoint:
+
+```bash
+wincli --headless --control=127.0.0.1:0 shell
+wincli --headless --control=127.0.0.1:0 --snapshot=tools.winfs \
+  --save-snapshot=tools.winfs shell
+```
+
+WinCLI prints one JSON `ready` line on stdout with the endpoint URL. Connect
+using any WebSocket client (TypeScript, Python, Rust, or another language),
+then send JSON messages. The URL includes a random per-session token and the
+listener binds only to loopback.
+
+```json
+{"op":"write","id":1,"text":"nano a.txt\r"}
+{"op":"write","id":2,"text":"hello from the agent"}
+{"op":"key","id":3,"key":"ENTER"}
+{"op":"key","id":4,"key":"CTRL_X"}
+{"op":"resize","id":5,"columns":100,"rows":30}
+```
+
+`write` sends UTF-8 input bytes. `key` accepts `ENTER`, `TAB`, `ESC`,
+`BACKSPACE`, `CTRL_C`, `CTRL_D`, `CTRL_S`, `CTRL_X`, and the arrow keys.
+`write_bytes` accepts a `data_base64` field for arbitrary input bytes. The
+server streams `output` events as the shell or guest program writes them; each
+event includes a readable `text` field and exact `data_base64` bytes. `prompt`
+events report the current guest working directory, and `exit` reports the
+session status after the shell exits. Send `{"op":"close"}` to close the
+controller input side and let the shell finish. A loaded snapshot is updated
+on exit when `--save-snapshot` is supplied.
+
+This control endpoint is transport-level and does not require an MCP client.
+An MCP adapter could expose the same session operations as discoverable tools
+for MCP hosts later.
 
 Mount a host folder on a separate guest drive with the `mount` command or at
 startup. Mounted files read and write through to the host folder. Use
@@ -291,12 +329,13 @@ missing even when these tested paths run successfully.
 
 ## Console contract
 
-Guest output is a transparent byte pipe to the host terminal — same content,
-no console emulation (no conpty): programs emitting ANSI escapes render via
-the host terminal, and pipes (`wincli rg … | head`) behave identically.
+Guest output is byte-oriented. Normal CLI runs write to host stdout/stderr;
+controlled sessions stream output bytes as WebSocket events. ANSI escape
+sequences are passed through, so a controller that needs the current rendered
+screen should interpret them with a terminal emulator.
 
 - Console writes are forwarded to host stdout (buffered per run;
-  streamed live in CLI runs via a sink).
+  streamed live in CLI runs via a sink), or streamed in control-mode events.
 - `WriteFile` bytes pass through bit-identical; `WriteConsoleW` transcodes
   UTF-16→UTF-8 (invalid sequences → U+FFFD); `GetConsoleOutputCP`
   reports UTF-8. `GetConsoleMode` currently reports a basic console mode for
@@ -305,3 +344,6 @@ the host terminal, and pipes (`wincli rg … | head`) behave identically.
   deletion, and history navigation. `GetConsoleCursorInfo` reports a visible
   cursor; screen-buffer APIs beyond the basic dimensions and Ctrl-C handling
   remain unsupported.
+- Controlled sessions provide a byte-input console bridge with named common
+  keys and adjustable screen dimensions. Full Win32 console input-record
+  semantics are not implemented yet.

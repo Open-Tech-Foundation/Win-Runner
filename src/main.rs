@@ -14,6 +14,7 @@ fn usage() -> ! {
     eprintln!("  wincli <script.ps1>             run a script (no args yet)");
     eprintln!("  wincli shell                    interactive ephemeral runner shell");
     eprintln!("  wincli runner                   run host-controlled job commands from stdin");
+    eprintln!("  wincli --headless --control=127.0.0.1:0 shell  run a remotely controlled shell");
     eprintln!("  wincli --snapshot=os.disk shell|runner  boot an indexed C: disk image");
     eprintln!("  wincli --save-snapshot=disk.winfs shell|runner|app.exe  persist C: on exit");
     eprintln!("  wincli --snapshot=os.disk <app.exe> [args...]  run headless with streamed stdio");
@@ -40,8 +41,8 @@ fn main() {
     }
     install::prepare_process_cache();
     let snapshot_path = args
-        .get(1)
-        .and_then(|arg| arg.strip_prefix("--snapshot="))
+        .iter()
+        .find_map(|arg| arg.strip_prefix("--snapshot="))
         .map(str::to_string);
     let save_snapshot_path = args
         .iter()
@@ -55,9 +56,14 @@ fn main() {
         .iter()
         .filter_map(|arg| arg.strip_prefix("--mount-ro=").map(str::to_string))
         .collect();
-    if snapshot_path.is_some() {
-        args.remove(1);
-    }
+    let control_bind = args
+        .iter()
+        .find_map(|arg| arg.strip_prefix("--control="))
+        .map(str::to_string);
+    let headless = args.iter().any(|arg| arg == "--headless");
+    args.retain(|arg| {
+        !arg.starts_with("--snapshot=") && !arg.starts_with("--control=") && arg != "--headless"
+    });
     if let Some(path) = save_snapshot_path.as_deref() {
         if let Some(index) = args
             .iter()
@@ -67,6 +73,39 @@ fn main() {
         }
     }
     args.retain(|arg| !arg.starts_with("--mount=") && !arg.starts_with("--mount-ro="));
+    if let Some(bind) = control_bind.as_deref() {
+        if !headless || args.len() != 2 || args[1] != "shell" {
+            eprintln!("wincli: --control requires --headless and the shell target");
+            exit(2);
+        }
+        let mut fs = match snapshot_path.as_deref() {
+            Some(path) => load_snapshot(path),
+            None => WinFs::ephemeral_runner(),
+        };
+        fs = mount_host_dirs(fs, &mount_specs, &read_only_mount_specs);
+        let active_snapshot = save_snapshot_path.as_deref().or(snapshot_path.as_deref());
+        let control = match wincli::control::ControlHandle::start(bind) {
+            Ok(control) => control,
+            Err(error) => {
+                eprintln!("wincli: cannot start control session: {error}");
+                exit(1);
+            }
+        };
+        println!(
+            "{}",
+            serde_json::json!({"event": "ready", "protocol": 1, "url": control.endpoint()})
+        );
+        let _ = std::io::stdout().flush();
+        let (code, mut fs) =
+            wincli::shell::run_controlled_shell_with_snapshot(fs, active_snapshot, &control);
+        save_snapshot_if_requested(save_snapshot_path.as_deref(), &mut fs);
+        control.finish(code);
+        exit(code);
+    }
+    if headless {
+        eprintln!("wincli: --headless requires --control=<loopback-address> shell");
+        exit(2);
+    }
     if args.len() == 3 && args[1] == "inspect" {
         inspect_target(&args[2]);
     }

@@ -9518,6 +9518,9 @@ mod imp {
     }
 
     extern "win64" fn native_get_file_type(handle: u64) -> u32 {
+        if crate::control::is_control_session() && host_standard_fd(handle).is_some() {
+            return 0x0002; // FILE_TYPE_CHAR for the controlled virtual console.
+        }
         let kind = match host_standard_fd(handle) {
             Some(fd) if unsafe { isatty(fd) } != 0 => 0x0002,
             Some(_) => 0x0003, // anonymous launcher pipes
@@ -11173,7 +11176,10 @@ mod imp {
         };
         let x = position as u16 as i16;
         let y = (position >> 16) as u16 as i16;
-        if !(0..80).contains(&x) || !(0..25).contains(&y) {
+        let (columns, rows) = crate::control::terminal_size();
+        if !(0..columns.min(i16::MAX as usize) as i16).contains(&x)
+            || !(0..rows.min(i16::MAX as usize) as i16).contains(&y)
+        {
             native_set_last_error(87);
             return 0;
         }
@@ -11190,15 +11196,18 @@ mod imp {
         if host_standard_fd(handle).is_none() || output.is_null() {
             return 0;
         }
+        let (columns, rows) = crate::control::terminal_size();
+        let columns = columns.min(i16::MAX as usize) as i16;
+        let rows = rows.min(i16::MAX as usize) as i16;
         unsafe {
             std::ptr::write_bytes(output, 0, 22);
-            (output as *mut i16).write_unaligned(80);
-            (output.add(2) as *mut i16).write_unaligned(25);
+            (output as *mut i16).write_unaligned(columns);
+            (output.add(2) as *mut i16).write_unaligned(rows);
             (output.add(8) as *mut u16).write_unaligned(7);
-            (output.add(14) as *mut i16).write_unaligned(79);
-            (output.add(16) as *mut i16).write_unaligned(24);
-            (output.add(18) as *mut i16).write_unaligned(80);
-            (output.add(20) as *mut i16).write_unaligned(25);
+            (output.add(14) as *mut i16).write_unaligned(columns - 1);
+            (output.add(16) as *mut i16).write_unaligned(rows - 1);
+            (output.add(18) as *mut i16).write_unaligned(columns);
+            (output.add(20) as *mut i16).write_unaligned(rows);
         }
         1
     }

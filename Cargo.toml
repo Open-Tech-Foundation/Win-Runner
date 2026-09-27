@@ -6,10 +6,11 @@ description = "WinCLI: Linux-native PE32+ execution with in-memory WinFS and PS1
 license = "Apache-2.0"
 
 [dependencies]
-rustyline = { version = "15", default-features = false }
-
-[dev-dependencies]
+base64 = "0.22"
 libc = "0.2"
+rustyline = { version = "15", default-features = false }
+serde_json = "1"
+tungstenite = "=0.26.2"
 
 [[bin]]
 name = "wincli"

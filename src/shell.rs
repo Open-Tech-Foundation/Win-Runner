@@ -1392,9 +1392,22 @@ fn run_session(
     prompt_enabled: bool,
     snapshot_path: Option<std::path::PathBuf>,
 ) -> (i32, WinFs) {
+    run_session_controlled(fs, prompt_enabled, snapshot_path, None, None)
+}
+
+fn run_session_controlled(
+    fs: WinFs,
+    prompt_enabled: bool,
+    snapshot_path: Option<std::path::PathBuf>,
+    output_sink: Option<backend::OutputSink>,
+    control: Option<&crate::control::ControlHandle>,
+) -> (i32, WinFs) {
     let stdin = std::io::stdin();
     let tty = prompt_enabled && std::io::IsTerminal::is_terminal(&stdin);
     let mut shell = Shell::with_snapshot_path(fs, snapshot_path);
+    if let Some(control) = control {
+        control.emit_prompt(&shell.cwd());
+    }
     if tty {
         let mut editor = match Editor::<ShellHelper, rustyline::history::DefaultHistory>::new() {
             Ok(editor) => editor,
@@ -1429,8 +1442,11 @@ fn run_session(
                             }
                         }
                     }
-                    if let Some(code) = execute_input_line(&mut shell, &line) {
+                    if let Some(code) = execute_input_line(&mut shell, &line, output_sink.clone()) {
                         return (code, shell.fs);
+                    }
+                    if let Some(control) = control {
+                        control.emit_prompt(&shell.cwd());
                     }
                 }
                 Err(ReadlineError::Eof) => break,
@@ -1442,44 +1458,113 @@ fn run_session(
             }
         }
     } else {
-        for line in stdin.lock().lines() {
-            let Ok(line) = line else { break };
-            if let Some(code) = execute_input_line(&mut shell, &line) {
-                return (code, shell.fs);
+        if control.is_some() {
+            // Read one byte at a time so commands queued behind a shell line
+            // remain available to the next native program on shared stdin.
+            let mut line = Vec::new();
+            loop {
+                let mut byte = [0u8; 1];
+                let count = unsafe { libc::read(libc::STDIN_FILENO, byte.as_mut_ptr().cast(), 1) };
+                match count {
+                    0 => {
+                        if !line.is_empty() {
+                            if let Some(code) = execute_control_line(
+                                &mut shell,
+                                &line,
+                                output_sink.clone(),
+                                control,
+                            ) {
+                                return (code, shell.fs);
+                            }
+                        }
+                        break;
+                    }
+                    1 if matches!(byte[0], b'\n' | b'\r') => {
+                        if let Some(code) =
+                            execute_control_line(&mut shell, &line, output_sink.clone(), control)
+                        {
+                            return (code, shell.fs);
+                        }
+                        line.clear();
+                    }
+                    1 if byte[0] == 3 => {
+                        line.clear();
+                        if let Some(sink) = &output_sink {
+                            sink(backend::OutputChannel::Stderr, b"^C\n");
+                        }
+                        if let Some(control) = control {
+                            control.emit_prompt(&shell.cwd());
+                        }
+                    }
+                    1 => line.push(byte[0]),
+                    _ => break,
+                }
+            }
+        } else {
+            for line in stdin.lock().lines() {
+                let Ok(line) = line else { break };
+                if let Some(code) = execute_input_line(&mut shell, &line, output_sink.clone()) {
+                    return (code, shell.fs);
+                }
             }
         }
     }
     (shell.last_code, shell.fs)
 }
 
-fn execute_input_line(shell: &mut Shell, line: &str) -> Option<i32> {
+fn execute_input_line(
+    shell: &mut Shell,
+    line: &str,
+    output_sink: Option<backend::OutputSink>,
+) -> Option<i32> {
     let mut out = Vec::new();
-    let sink: backend::OutputSink = Arc::new(|channel, chunk| match channel {
-        backend::OutputChannel::Stdout => {
-            let mut stdout = std::io::stdout().lock();
-            let _ = stdout.write_all(chunk);
-            let _ = stdout.flush();
-        }
-        backend::OutputChannel::Stderr => {
-            let mut stderr = std::io::stderr().lock();
-            let _ = stderr.write_all(chunk);
-            let _ = stderr.flush();
-        }
+    let sink = output_sink.unwrap_or_else(|| {
+        Arc::new(|channel, chunk| match channel {
+            backend::OutputChannel::Stdout => {
+                let mut stdout = std::io::stdout().lock();
+                let _ = stdout.write_all(chunk);
+                let _ = stdout.flush();
+            }
+            backend::OutputChannel::Stderr => {
+                let mut stderr = std::io::stderr().lock();
+                let _ = stderr.write_all(chunk);
+                let _ = stderr.flush();
+            }
+        })
     });
-    match shell.exec_line_streaming(line, &mut out, sink) {
+    match shell.exec_line_streaming(line, &mut out, sink.clone()) {
         Ok(ShellFlow::Continue) => {
-            let _ = std::io::stdout().write_all(&out);
+            sink(backend::OutputChannel::Stdout, &out);
         }
         Ok(ShellFlow::Exit(code)) => {
-            let _ = std::io::stdout().write_all(&out);
+            sink(backend::OutputChannel::Stdout, &out);
             return Some(code);
         }
         Err(error) => {
-            let _ = std::io::stdout().write_all(&out);
-            eprintln!("wincli: {error}");
+            sink(backend::OutputChannel::Stdout, &out);
+            sink(
+                backend::OutputChannel::Stderr,
+                format!("wincli: {error}\n").as_bytes(),
+            );
         }
     }
     None
+}
+
+fn execute_control_line(
+    shell: &mut Shell,
+    bytes: &[u8],
+    output_sink: Option<backend::OutputSink>,
+    control: Option<&crate::control::ControlHandle>,
+) -> Option<i32> {
+    let line = String::from_utf8_lossy(bytes);
+    let exit = execute_input_line(shell, &line, output_sink);
+    if let Some(control) = control {
+        if exit.is_none() {
+            control.emit_prompt(&shell.cwd());
+        }
+    }
+    exit
 }
 
 /// Interactive loop. Returns the process exit code. EOF ends with the last
@@ -1496,6 +1581,24 @@ pub fn run_shell_with_fs(fs: WinFs) -> (i32, WinFs) {
 /// Run an interactive shell and remember the snapshot file to save back to.
 pub fn run_shell_with_snapshot(fs: WinFs, snapshot_path: Option<&str>) -> (i32, WinFs) {
     run_session(fs, true, snapshot_path.map(std::path::PathBuf::from))
+}
+
+/// Run the line-oriented shell under an external control transport. The
+/// transport sink streams guest and builtin output while the control bridge
+/// supplies input through standard input.
+pub fn run_controlled_shell_with_snapshot(
+    fs: WinFs,
+    snapshot_path: Option<&str>,
+    control: &crate::control::ControlHandle,
+) -> (i32, WinFs) {
+    let sink = control.output_sink();
+    run_session_controlled(
+        fs,
+        false,
+        snapshot_path.map(std::path::PathBuf::from),
+        Some(sink),
+        Some(control),
+    )
 }
 
 /// Host-controlled runner loop. It consumes job commands from standard input

@@ -10,7 +10,7 @@
 //! 8. Unknown PE imports fail clearly.
 //! 9. EXE and PS1 execution use the exact same WinFS API.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::process::{Command, Stdio};
 use wincli::pe;
 use wincli::winfs::WinFs;
@@ -1466,6 +1466,114 @@ fn headless_snapshot_program_accepts_controlled_stdin_and_streams_output() {
         .unwrap();
     std::fs::remove_file(snapshot).ok();
     assert_eq!(status.code(), Some(0), "stderr: {stderr}");
+}
+
+#[test]
+fn headless_control_session_streams_shell_output_and_exits_cleanly() {
+    let snapshot = tmp_path("controlled-shell.winfs");
+    let mut fs = WinFs::new();
+    fs.mkdir(r"C:\bin").unwrap();
+    fs.write_file(r"C:\bin\stdin-echo.exe", pe::builder::stdin_echo())
+        .unwrap();
+    wincli::snapshot::save_file(&mut fs, snapshot.to_str().unwrap()).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wincli"))
+        .args([
+            "--headless".to_string(),
+            "--control=127.0.0.1:0".to_string(),
+            format!("--snapshot={}", snapshot.display()),
+            "shell".to_string(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn controlled WinCLI shell");
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut ready_line = String::new();
+    stdout
+        .read_line(&mut ready_line)
+        .expect("read control endpoint announcement");
+    let ready: serde_json::Value = serde_json::from_str(&ready_line).unwrap();
+    assert_eq!(ready["event"], "ready");
+    let endpoint = ready["url"].as_str().expect("WebSocket endpoint");
+    let (mut socket, _) = tungstenite::connect(endpoint).expect("connect control socket");
+
+    let connected: serde_json::Value = match socket.read().unwrap() {
+        tungstenite::Message::Text(message) => serde_json::from_str(&message).unwrap(),
+        message => panic!("expected JSON control event, got {message:?}"),
+    };
+    assert_eq!(connected["event"], "connected");
+
+    socket
+        .send(tungstenite::Message::Text(
+            r#"{"op":"write","id":1,"text":"pwd\r"}"#.to_string().into(),
+        ))
+        .unwrap();
+    let mut saw_pwd = false;
+    while !saw_pwd {
+        let event: serde_json::Value = match socket.read().unwrap() {
+            tungstenite::Message::Text(message) => serde_json::from_str(&message).unwrap(),
+            message => panic!("expected JSON control event, got {message:?}"),
+        };
+        saw_pwd = event["event"] == "output"
+            && event["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("C:\\"));
+    }
+
+    socket
+        .send(tungstenite::Message::Text(
+            r#"{"op":"write","id":2,"text":"C:\\bin\\stdin-echo.exe\r"}"#
+                .to_string()
+                .into(),
+        ))
+        .unwrap();
+    let mut saw_ready = false;
+    while !saw_ready {
+        let event: serde_json::Value = match socket.read().unwrap() {
+            tungstenite::Message::Text(message) => serde_json::from_str(&message).unwrap(),
+            message => panic!("expected JSON control event, got {message:?}"),
+        };
+        saw_ready = event["event"] == "output"
+            && event["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("READY"));
+    }
+    socket
+        .send(tungstenite::Message::Text(
+            r#"{"op":"write","id":3,"text":"ping"}"#.to_string().into(),
+        ))
+        .unwrap();
+    let mut saw_echo = false;
+    while !saw_echo {
+        let event: serde_json::Value = match socket.read().unwrap() {
+            tungstenite::Message::Text(message) => serde_json::from_str(&message).unwrap(),
+            message => panic!("expected JSON control event, got {message:?}"),
+        };
+        saw_echo = event["event"] == "output"
+            && event["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("ping"));
+    }
+    socket
+        .send(tungstenite::Message::Text(
+            r#"{"op":"write","id":4,"text":"exit\r"}"#.to_string().into(),
+        ))
+        .unwrap();
+    loop {
+        let event: serde_json::Value = match socket.read().unwrap() {
+            tungstenite::Message::Text(message) => serde_json::from_str(&message).unwrap(),
+            message => panic!("expected JSON control event, got {message:?}"),
+        };
+        if event["event"] == "exit" {
+            assert_eq!(event["code"], 0);
+            break;
+        }
+    }
+    let status = child.wait().expect("wait for controlled shell");
+    assert_eq!(status.code(), Some(0));
+    std::fs::remove_file(snapshot).ok();
 }
 
 #[test]

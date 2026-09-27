@@ -6,6 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Added a headless localhost WebSocket control session for a persistent shell,
+  with streamed output events, text/key input, terminal resizing, and optional
+  snapshot save on exit.
 - Added common WinFS-backed shell commands for navigation, directory listing,
   file display/copy/move/deletion, directory creation/removal, and screen clear.
 - Added interactive Tab completion for shell commands, PATH executables, and
