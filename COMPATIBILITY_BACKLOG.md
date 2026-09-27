@@ -24,7 +24,7 @@ Items remain open until implementation and relevant verification are complete.
   The initial `wincli app.exe` launcher still forks and then creates a Rust
   thread. Move guest execution to a fresh WinCLI worker process to close this
   item.
-- [ ] **4. Keep the control listener alive after invalid connections.** Continue
+- [x] **4. Keep the control listener alive after invalid connections.** Continue
   accepting until an authenticated WebSocket session is established, and use
   constant-time token comparison.
 - [ ] **5. Define child filesystem visibility and crash semantics.** Current

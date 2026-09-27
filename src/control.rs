@@ -171,30 +171,50 @@ fn serve(
     receiver: mpsc::Receiver<Value>,
     expected_path: String,
 ) {
-    let (stream, _) = match listener.accept() {
-        Ok(connection) => connection,
-        Err(error) => {
-            eprintln!("wincli: control accept failed: {error}");
-            return;
-        }
-    };
-    let mut socket = match accept_hdr(
-        stream,
-        move |request: &tungstenite::handshake::server::Request, response| {
-            if request.uri().path() == expected_path {
-                Ok(response)
-            } else {
-                Err(tungstenite::http::Response::builder()
-                    .status(401)
-                    .body(Some("invalid control token".to_string()))
-                    .expect("valid unauthorized response"))
+    if let Err(error) = listener.set_nonblocking(true) {
+        eprintln!("wincli: cannot configure control listener: {error}");
+        return;
+    }
+    let mut pending = Vec::new();
+    let mut socket = loop {
+        loop {
+            match receiver.try_recv() {
+                Ok(event) => {
+                    if event.get("event").and_then(Value::as_str) == Some("exit") {
+                        return;
+                    }
+                    pending.push(event);
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return,
             }
-        },
-    ) {
-        Ok(socket) => socket,
-        Err(error) => {
-            eprintln!("wincli: WebSocket handshake failed: {error}");
-            return;
+        }
+        match listener.accept() {
+            Ok((stream, _)) => match accept_hdr(
+                stream,
+                |request: &tungstenite::handshake::server::Request, response| {
+                    if constant_time_eq(request.uri().path().as_bytes(), expected_path.as_bytes()) {
+                        Ok(response)
+                    } else {
+                        Err(tungstenite::http::Response::builder()
+                            .status(401)
+                            .body(Some("invalid control token".to_string()))
+                            .expect("valid unauthorized response"))
+                    }
+                },
+            ) {
+                Ok(socket) => break socket,
+                Err(error) => {
+                    eprintln!("wincli: rejected control connection: {error}");
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => {
+                eprintln!("wincli: control accept failed: {error}");
+                thread::sleep(Duration::from_millis(20));
+            }
         }
     };
     let _ = socket
@@ -202,6 +222,16 @@ fn serve(
         .set_read_timeout(Some(Duration::from_millis(20)));
     if send_json(&mut socket, &json!({"event": "connected", "protocol": 1})).is_err() {
         return;
+    }
+    for event in pending {
+        let is_exit = event.get("event").and_then(Value::as_str) == Some("exit");
+        if send_json(&mut socket, &event).is_err() {
+            return;
+        }
+        if is_exit {
+            let _ = socket.close(None);
+            return;
+        }
     }
     loop {
         loop {
@@ -274,6 +304,16 @@ fn serve(
             }
         }
     }
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0u8, |difference, (a, b)| difference | (a ^ b))
+        == 0
 }
 
 fn send_json(socket: &mut WebSocket<TcpStream>, value: &Value) -> Result<(), WsError> {
@@ -351,5 +391,17 @@ fn handle_request(request: &Value, input: &mut UnixStream) -> Result<(), String>
         Some("close") => Ok(()),
         Some(operation) => Err(format!("unknown operation: {operation}")),
         None => Err("request requires string `op`".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::constant_time_eq;
+
+    #[test]
+    fn control_token_comparison_checks_all_equal_length_bytes() {
+        assert!(constant_time_eq(b"/control/secret", b"/control/secret"));
+        assert!(!constant_time_eq(b"/control/secret", b"/control/secrex"));
+        assert!(!constant_time_eq(b"/control/secret", b"/control/short"));
     }
 }

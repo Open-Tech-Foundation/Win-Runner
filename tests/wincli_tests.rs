@@ -1497,6 +1497,14 @@ fn headless_control_session_streams_shell_output_and_exits_cleanly() {
     let ready: serde_json::Value = serde_json::from_str(&ready_line).unwrap();
     assert_eq!(ready["event"], "ready");
     let endpoint = ready["url"].as_str().expect("WebSocket endpoint");
+    let (origin, _) = endpoint.rsplit_once("/control/").unwrap();
+    let address = origin.strip_prefix("ws://").unwrap();
+    let mut scan = std::net::TcpStream::connect(address).expect("connect scanner socket");
+    scan.write_all(b"not a websocket handshake\r\n\r\n")
+        .unwrap();
+    drop(scan);
+    let invalid_token = format!("{origin}/control/not-the-session-token");
+    assert!(tungstenite::connect(invalid_token).is_err());
     let (mut socket, _) = tungstenite::connect(endpoint).expect("connect control socket");
 
     let connected: serde_json::Value = match socket.read().unwrap() {
