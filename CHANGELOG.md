@@ -45,6 +45,7 @@ All notable changes to this project will be documented in this file.
   `OpenFileById` and `SetFileValidData`.
 - Added ANSI replacement and empty-directory removal behavior cases, plus an
   aligned-buffer invalid-handle case for `WriteFileGather`.
+- Added wide-path copy and handle-based rename behavior fixtures.
 - Added WinFS edge-case tests for truncating writes, recursive tree copy/move,
   and invalid directory create/remove operations.
 - Added NT file compatibility tests for EOF resizing, rename-by-handle, and

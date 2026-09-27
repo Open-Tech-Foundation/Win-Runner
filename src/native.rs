@@ -3260,6 +3260,82 @@ mod imp {
         }
 
         #[test]
+        fn modern_copy_file_w_copies_guest_data_and_preserves_source() {
+            type CopyFileW = unsafe extern "win64" fn(*const u16, *const u16, i32) -> i32;
+            let copy_file: CopyFileW =
+                unsafe { std::mem::transmute(require_kernel32_api(b"CopyFileW\0") as usize) };
+            let source = r"C:\modern_copy_w_source.txt";
+            let destination = r"C:\modern_copy_w_destination.txt";
+            let source_wide = source.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let destination_wide = destination.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(source, b"wide-copy-data".to_vec())
+                .unwrap();
+
+            assert_eq!(
+                unsafe { copy_file(source_wide.as_ptr(), destination_wide.as_ptr(), 1) },
+                1
+            );
+            let ctx = context.lock().unwrap();
+            assert_eq!(ctx.fs.read_file(destination).unwrap(), b"wide-copy-data");
+            assert_eq!(ctx.fs.read_file(source).unwrap(), b"wide-copy-data");
+            drop(ctx);
+            let mut ctx = context.lock().unwrap();
+            ctx.fs.delete_file(destination).unwrap();
+            ctx.fs.delete_file(source).unwrap();
+        }
+
+        #[test]
+        fn modern_set_file_information_by_handle_renames_guest_file() {
+            type SetFileInformationByHandle =
+                unsafe extern "win64" fn(u64, i32, *const std::ffi::c_void, u32) -> i32;
+            let set_information: SetFileInformationByHandle = unsafe {
+                std::mem::transmute(require_kernel32_api(b"SetFileInformationByHandle\0") as usize)
+            };
+            let source = r"C:\modern_rename_by_handle_source.txt";
+            let destination = r"C:\modern_rename_by_handle_destination.txt";
+            let source_wide = source.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(source, b"rename-by-handle".to_vec())
+                .unwrap();
+            let handle =
+                super::native_create_file_w(source_wide.as_ptr(), 0xC001_0000, 7, 3, 0, 0, 0);
+            assert_ne!(handle, u64::MAX);
+
+            let encoded = destination.encode_utf16().collect::<Vec<_>>();
+            let mut information = vec![0u8; 20 + encoded.len() * 2];
+            information[16..20].copy_from_slice(&((encoded.len() * 2) as u32).to_le_bytes());
+            for (index, unit) in encoded.iter().enumerate() {
+                information[20 + index * 2..22 + index * 2].copy_from_slice(&unit.to_le_bytes());
+            }
+            assert_eq!(
+                unsafe {
+                    set_information(
+                        handle,
+                        3, // FileRenameInfo
+                        information.as_ptr().cast(),
+                        information.len() as u32,
+                    )
+                },
+                1
+            );
+            assert_eq!(
+                context.lock().unwrap().fs.read_file(destination).unwrap(),
+                b"rename-by-handle"
+            );
+            assert!(!context.lock().unwrap().fs.exists(source));
+            assert_eq!(super::native_close_handle(handle), 1);
+        }
+
+        #[test]
         fn initializes_critical_section_with_spin_count() {
             let mut section = [0x5au8; 40];
             assert_eq!(
