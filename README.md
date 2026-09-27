@@ -116,7 +116,10 @@ with the last guest exit code. Interactive input supports cursor movement,
 insertion, deletion, history navigation, and Tab completion for built-in
 commands, PATH executables, and entries in the current guest directory. The
 prompt goes to stderr, keeping stdout clean for pipes. Interactive command history lives at
+`$XDG_STATE_HOME/wincli/shell-history` (or `~/.local/state/wincli/shell-history`)
+on the host, so it survives fresh ephemeral shells. A copy also lives at
 `C:\.system\shell-history` in WinFS and is carried by saved C: snapshots.
+Set `WINCLI_HISTORY_FILE` to choose a different host history file.
 Use Windows-style `set NAME=value` or `path C:\tools;%PATH%` to update the
 session environment and guest executable search path.
 

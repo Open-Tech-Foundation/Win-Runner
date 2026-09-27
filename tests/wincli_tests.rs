@@ -1242,8 +1242,10 @@ fn interactive_shell_completes_commands_and_inserts_text_at_the_cursor() {
     );
     let mut master = unsafe { std::fs::File::from_raw_fd(master_fd) };
     let slave = unsafe { std::fs::File::from_raw_fd(slave_fd) };
+    let history_file = tmp_path("interactive-shell-history");
     let mut child = Command::new(env!("CARGO_BIN_EXE_wincli"))
         .arg("shell")
+        .env("WINCLI_HISTORY_FILE", &history_file)
         .stdin(Stdio::from(slave.try_clone().unwrap()))
         .stdout(Stdio::from(slave.try_clone().unwrap()))
         .stderr(Stdio::from(slave.try_clone().unwrap()))
@@ -1319,6 +1321,16 @@ fn interactive_shell_completes_commands_and_inserts_text_at_the_cursor() {
         String::from_utf8_lossy(&output)
     );
     let status = child.wait().expect("wait for interactive shell");
+    let saved_history = std::fs::read_to_string(&history_file).expect("read saved shell history");
+    assert!(
+        saved_history.contains("winget --version"),
+        "history: {saved_history}"
+    );
+    assert!(
+        saved_history.contains("exit 13"),
+        "history: {saved_history}"
+    );
+    std::fs::remove_file(history_file).ok();
     assert!(
         output
             .windows(b"exit 13".len())

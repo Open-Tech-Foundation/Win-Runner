@@ -27,8 +27,9 @@ All notable changes to this project will be documented in this file.
 - Added rectangular `WriteConsoleOutputA` cell rendering through host ANSI
   cursor positioning and console colors.
 - Added host ANSI cursor positioning for console applications.
-- Persisted interactive shell history in `C:\.system\shell-history`, so it
-  travels with C: snapshots and stays ephemeral in unsaved sessions.
+- Persisted interactive shell history in the host user-state directory, so it
+  survives fresh ephemeral shells, and mirrored it to `C:\.system\shell-history`
+  so history also travels with C: snapshots.
 - Added Windows-style `set` and `path` commands, `%NAME%` expansion in values,
   guest PATH executable lookup, and environment inheritance by native programs.
 - Added a `winget install` shell builtin alongside `choco`, with package ID

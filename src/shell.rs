@@ -25,6 +25,66 @@ use std::sync::Arc;
 
 const SHELL_HISTORY_PATH: &str = r"C:\.system\shell-history";
 const MAX_SHELL_HISTORY_ENTRIES: usize = 1000;
+const SHELL_HISTORY_FILE_ENV: &str = "WINCLI_HISTORY_FILE";
+
+fn external_history_path() -> Option<std::path::PathBuf> {
+    if let Some(path) = std::env::var_os(SHELL_HISTORY_FILE_ENV) {
+        return if path.is_empty() {
+            None
+        } else {
+            Some(std::path::PathBuf::from(path))
+        };
+    }
+    if let Some(state_home) = std::env::var_os("XDG_STATE_HOME") {
+        if !state_home.is_empty() {
+            return Some(std::path::PathBuf::from(state_home).join("wincli/shell-history"));
+        }
+    }
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .map(|home| home.join(".local/state/wincli/shell-history"))
+}
+
+fn read_history_file(path: &std::path::Path) -> Vec<String> {
+    std::fs::read(path)
+        .ok()
+        .map(|bytes| {
+            String::from_utf8_lossy(&bytes)
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn merge_history(host: &[String], guest: &[String]) -> Vec<String> {
+    let common_prefix = host
+        .iter()
+        .zip(guest)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut merged = host.to_vec();
+    merged.extend_from_slice(&guest[common_prefix..]);
+    let start = merged.len().saturating_sub(MAX_SHELL_HISTORY_ENTRIES);
+    merged.drain(..start);
+    merged
+}
+
+fn write_history_file(path: &std::path::Path, entries: &[String]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+    let start = entries.len().saturating_sub(MAX_SHELL_HISTORY_ENTRIES);
+    let mut contents = entries[start..].join("\n");
+    if !contents.is_empty() {
+        contents.push('\n');
+    }
+    std::fs::write(path, contents)
+        .map_err(|error| format!("cannot write {}: {error}", path.display()))
+}
 
 const SHELL_COMMANDS: &[&str] = &[
     "cd",
@@ -330,6 +390,17 @@ impl Shell {
             .into_iter()
             .rev()
             .collect()
+    }
+
+    fn interactive_shell_history(&self) -> Vec<String> {
+        self.interactive_shell_history_at(external_history_path().as_deref())
+    }
+
+    fn interactive_shell_history_at(&self, path: Option<&std::path::Path>) -> Vec<String> {
+        let guest = self.shell_history();
+        path.filter(|path| path.is_file())
+            .map(|path| merge_history(&read_history_file(path), &guest))
+            .unwrap_or(guest)
     }
 
     fn persist_shell_history(&mut self, entries: &[String]) -> Result<(), String> {
@@ -1333,7 +1404,7 @@ fn run_session(
             }
         };
         editor.set_helper(Some(ShellHelper::default()));
-        let mut history = shell.shell_history();
+        let mut history = shell.interactive_shell_history();
         for entry in &history {
             let _ = editor.add_history_entry(entry.as_str());
         }
@@ -1351,6 +1422,11 @@ fn run_session(
                         }
                         if let Err(error) = shell.persist_shell_history(&history) {
                             eprintln!("wincli: cannot save shell history to {SHELL_HISTORY_PATH}: {error}");
+                        }
+                        if let Some(path) = external_history_path() {
+                            if let Err(error) = write_history_file(&path, &history) {
+                                eprintln!("wincli: cannot save interactive history: {error}");
+                            }
                         }
                     }
                     if let Some(code) = execute_input_line(&mut shell, &line) {
@@ -1486,6 +1562,24 @@ mod tests {
         let restored = crate::snapshot::load_file(snapshot.to_str().unwrap()).unwrap();
         std::fs::remove_file(snapshot).unwrap();
         assert_eq!(Shell::with_fs(restored).shell_history(), entries);
+    }
+
+    #[test]
+    fn interactive_history_survives_a_fresh_ephemeral_shell() {
+        let path = std::env::temp_dir().join(format!(
+            "wincli-history-host-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let entries = vec!["cd C:\\".to_string(), "dir".to_string()];
+        write_history_file(&path, &entries).unwrap();
+
+        let reopened = Shell::new();
+        assert_eq!(reopened.interactive_shell_history_at(Some(&path)), entries);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
