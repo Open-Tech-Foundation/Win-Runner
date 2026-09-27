@@ -21,10 +21,11 @@ Items remain open until implementation and relevant verification are complete.
   environment, WinFS state, inherited standard streams, and ordinary open WinFS
   file-handle metadata; a real Node 24 nested-process check covers this route.
   Connected inherited non-standard pipe handles now cross exec through Unix
-  descriptor passing, including a pending client endpoint. The fork path
-  remains for pipes with active I/O and completion-port-associated handles.
-  Finish transfer for those states and remove the fallback before considering
-  this item complete.
+  descriptor passing, including a pending client endpoint. Active overlapped
+  requests remain owned by the parent while inherited endpoints are duplicated
+  to the worker, so they no longer force a fork. Completion-port-associated
+  handles still use the fork path; transfer their completion notifications and
+  remove the remaining fallback before considering this item complete.
 - [x] **4. Keep the control listener alive after invalid connections.** Continue
   accepting until an authenticated WebSocket session is established, and use
   constant-time token comparison.

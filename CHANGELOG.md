@@ -13,6 +13,8 @@ All notable changes to this project will be documented in this file.
   no longer writes to host state directories.
 - Changed the synthetic guest user and profile name to Win-Runner, and made
   `GetUserNameW` read the guest process environment instead of the host.
+- Allowed exec workers to inherit named-pipe endpoints while the parent has
+  active overlapped I/O; pending requests remain owned by the parent context.
 
 - Released the pending client endpoint after named-pipe connection so closing
   a writer delivers EOF after buffered output. Scoped `CancelIo` to the thread

@@ -133,21 +133,18 @@ pub(crate) fn execute_request(path: &Path) -> Result<u32, String> {
         .map_err(|error| format!("cannot read native worker request: {error}"))?;
     let request: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|error| format!("invalid native worker request: {error}"))?;
-    let inherited_pipes = request
-        .get("inherited_pipes")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    if !inherited_pipes.is_empty() {
+    let descriptor_count = match request.get("pipe_transfer_fd_count") {
+        None => 0,
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| "worker request has invalid descriptor count".to_string())?
+            as usize,
+    };
+    if descriptor_count > 0 {
         let socket_path = request
             .get("pipe_transfer_socket")
             .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| "worker request has no pipe transfer socket".to_string())?;
-        let descriptor_count = request
-            .get("pipe_transfer_fd_count")
-            .and_then(serde_json::Value::as_u64)
-            .ok_or_else(|| "worker request has invalid pipe descriptor count".to_string())?
-            as usize;
+            .ok_or_else(|| "worker request has no descriptor transfer socket".to_string())?;
         let descriptors =
             crate::native::receive_worker_pipe_descriptors(socket_path, descriptor_count)?;
         std::env::set_var(

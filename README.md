@@ -1,8 +1,21 @@
 # Win-Runner
 
-Minimal Linux tool for running Windows console programs and filesystem scripts
-against an indexed WinFS disk. Its default C: disk is temporary and discarded
-when the session ends. No Wine, VM, or host Windows installation is required.
+**Win-Runner: run Windows command-line programs on any host, fast, isolated and
+scriptable.**
+
+Win-Runner (`winrun`) runs Windows x86-64 command-line programs outside
+Windows, using built-in Windows API compatibility shims and pluggable platform
+backends. You don't need Wine, a VM or a Windows license. Each run gets a clean,
+disposable C: drive (or a saved snapshot), with PowerShell-style scripts,
+package installs (`choco`/`winget`) and host folder mounts. A JSON/WebSocket
+control API lets coding agents and CI pipelines build, run and check Windows
+programs on any machine.
+
+**Supported today:** Linux x86-64 (native execution). More platform backends
+are planned.
+
+Runs have separate guest filesystems, but native guest programs are not isolated
+from host system calls; see [Security boundary](#security-boundary).
 
 ```bash
 winrun app.exe [args...]  # minimal x86_64 PE execution (PE32+, native console apps)

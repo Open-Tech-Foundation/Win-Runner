@@ -797,20 +797,23 @@ fn can_exec_worker_child(
     std_handles: [u64; 3],
     inherit_handles: bool,
 ) -> bool {
-    // File handles are serialized into the worker request. Handles attached
-    // to completion ports still need a process-wide completion protocol.
-    if child_fs
-        .handles
-        .values()
-        .any(|file| file.completion.is_some())
-    {
-        return false;
-    }
+    // File and inheritable pipe associations are serialized with worker
+    // completion channels. Standard pipe handles remain excluded because
+    // worker stdio is remapped separately.
     if child_fs
         .devices
         .keys()
         .any(|handle| !std_handles.contains(handle))
     {
+        return false;
+    }
+    if inherit_handles
+        && parent
+            .socket_completion_ports
+            .lock()
+            .is_ok_and(|associations| !associations.is_empty())
+    {
+        // Winsock handles are not yet serialized into exec workers.
         return false;
     }
     let Ok(pipes) = parent.named_pipes.lock() else {
@@ -822,24 +825,10 @@ fn can_exec_worker_child(
         {
             return false;
         }
-        if inherit_handles
-            && pipe.inheritable
-            && !std_handles.contains(handle)
-            && pipe.completion.is_some()
-        {
-            return false;
-        }
     }
-    if pipes.pending_io.keys().any(|(handle, _)| {
-        std_handles.contains(handle)
-            || (inherit_handles
-                && pipes
-                    .handles
-                    .get(handle)
-                    .is_some_and(|pipe| pipe.inheritable))
-    }) {
-        return false;
-    }
+    // Pending overlapped requests remain owned by this process context. The
+    // worker receives a duplicate of each inheritable endpoint, so it can
+    // issue its own requests without taking ownership of the parent's I/O.
     std_handles.iter().all(|handle| {
         if matches!(handle, 0..=2 | STD_HANDLE_BASE..=0x5000_0002)
             || native_device(*handle).is_some()
@@ -853,21 +842,30 @@ fn can_exec_worker_child(
     })
 }
 
-fn encode_worker_native_fs(native_fs: &NativeFs) -> Result<serde_json::Value, String> {
+fn encode_worker_native_fs(
+    native_fs: &NativeFs,
+    completion_port_ids: &HashMap<usize, u64>,
+) -> Result<serde_json::Value, String> {
     let files = native_fs
         .handles
         .iter()
         .map(|(handle, file)| {
-            if file.completion.is_some() {
-                return Err(
-                    "file handle completion ports cannot cross a worker boundary".to_string(),
-                );
-            }
-            Ok(serde_json::json!({
+            let completion = file
+                .completion
+                .as_ref()
+                .map(|(port, key)| {
+                    let id = completion_port_ids
+                        .get(&(Arc::as_ptr(port) as usize))
+                        .ok_or_else(|| "file completion port is not transferable".to_string())?;
+                    Ok::<serde_json::Value, String>(serde_json::json!({"port": id, "key": key}))
+                })
+                .transpose()?;
+            Ok::<serde_json::Value, String>(serde_json::json!({
                 "handle": handle,
                 "path": file.path,
                 "offset": file.offset,
                 "overlapped": file.overlapped,
+                "completion": completion,
             }))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1016,18 +1014,20 @@ pub(super) fn restore_worker_native_fs(
     let encoded = request
         .get("native_fs")
         .ok_or_else(|| "worker request has no native filesystem state".to_string())?;
+    let completion_ports = restore_worker_completion_ports(process, &request)?;
     let mut fs = process
         .fs
         .lock()
         .map_err(|_| "worker filesystem lock is poisoned".to_string())?;
-    apply_worker_native_fs(&mut fs, encoded)?;
+    apply_worker_native_fs(&mut fs, encoded, &completion_ports)?;
     drop(fs);
-    restore_worker_pipe_handles(process, &request)
+    restore_worker_pipe_handles(process, &request, &completion_ports)
 }
 
 fn restore_worker_pipe_handles(
     process: &NativeProcessContext,
     request: &serde_json::Value,
+    completion_ports: &HashMap<u64, Arc<NativeCompletionPort>>,
 ) -> Result<(), String> {
     let Some(items) = request
         .get("inherited_pipes")
@@ -1048,6 +1048,8 @@ fn restore_worker_pipe_handles(
         access: u32,
         mode: u32,
         completion_modes: u8,
+        completion_port: Option<u64>,
+        completion_key: u64,
     }
     let number = |value: &serde_json::Value, key: &str| {
         value
@@ -1086,6 +1088,15 @@ fn restore_worker_pipe_handles(
                 access: number(item, "access")? as u32,
                 mode: number(item, "mode")? as u32,
                 completion_modes: number(item, "completion_modes")? as u8,
+                completion_port: item
+                    .get("completion")
+                    .and_then(|completion| completion.get("port"))
+                    .and_then(serde_json::Value::as_u64),
+                completion_key: item
+                    .get("completion")
+                    .and_then(|completion| completion.get("key"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1095,10 +1106,10 @@ fn restore_worker_pipe_handles(
         .map(|value| value.parse::<i32>().map_err(|error| error.to_string()))
         .collect::<Result<Vec<_>, _>>()?;
     let expected_fds = request
-        .get("pipe_transfer_fd_count")
+        .get("pipe_endpoint_fd_count")
         .and_then(serde_json::Value::as_u64)
         .ok_or("worker request has invalid pipe descriptor count")? as usize;
-    if fds.len() != expected_fds {
+    if fds.len() < expected_fds {
         for fd in fds {
             unsafe { close(fd) };
         }
@@ -1140,7 +1151,18 @@ fn restore_worker_pipe_handles(
                 inheritable: info.inheritable,
                 access: info.access,
                 mode: info.mode,
-                completion: None,
+                completion: info
+                    .completion_port
+                    .map(|port_id| {
+                        completion_ports
+                            .get(&port_id)
+                            .cloned()
+                            .map(|port| (port, info.completion_key))
+                            .ok_or_else(|| {
+                                format!("inherited pipe completion port {port_id} is missing")
+                            })
+                    })
+                    .transpose()?,
                 completion_modes: info.completion_modes,
             },
         );
@@ -1149,7 +1171,54 @@ fn restore_worker_pipe_handles(
     Ok(())
 }
 
-fn apply_worker_native_fs(fs: &mut NativeFs, encoded: &serde_json::Value) -> Result<(), String> {
+fn restore_worker_completion_ports(
+    process: &NativeProcessContext,
+    request: &serde_json::Value,
+) -> Result<HashMap<u64, Arc<NativeCompletionPort>>, String> {
+    let Some(items) = request
+        .get("completion_ports")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Ok(HashMap::new());
+    };
+    let fds = std::env::var("WINRUN_NATIVE_PIPE_FDS")
+        .map_err(|_| "worker did not receive completion-port descriptors".to_string())?
+        .split(',')
+        .map(|value| value.parse::<i32>().map_err(|error| error.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut restored = HashMap::new();
+    let mut process_ports = process
+        .completion_ports
+        .lock()
+        .map_err(|_| "worker completion-port table is poisoned".to_string())?;
+    for item in items {
+        let port_id = item
+            .get("handle")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or("worker completion port has invalid handle")?;
+        let fd_index =
+            item.get("fd_index")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or("worker completion port has invalid descriptor index")? as usize;
+        let fd = *fds
+            .get(fd_index)
+            .ok_or("worker completion port descriptor is missing")?;
+        let port = Arc::new(NativeCompletionPort::new());
+        port.attach_worker_sender(fd)?;
+        process_ports.insert(port_id, Arc::clone(&port));
+        process
+            .completion_next
+            .fetch_max(port_id.saturating_add(1), Ordering::AcqRel);
+        restored.insert(port_id, port);
+    }
+    Ok(restored)
+}
+
+fn apply_worker_native_fs(
+    fs: &mut NativeFs,
+    encoded: &serde_json::Value,
+    completion_ports: &HashMap<u64, Arc<NativeCompletionPort>>,
+) -> Result<(), String> {
     let number = |value: &serde_json::Value, key: &str| {
         value
             .get(key)
@@ -1172,13 +1241,25 @@ fn apply_worker_native_fs(fs: &mut NativeFs, encoded: &serde_json::Value) -> Res
             .get("overlapped")
             .and_then(serde_json::Value::as_bool)
             .ok_or("worker file handle has invalid overlapped flag")?;
+        let completion = item
+            .get("completion")
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                let port_id = number(value, "port")?;
+                let key = number(value, "key")?;
+                let port = completion_ports
+                    .get(&port_id)
+                    .ok_or("worker file completion port was not restored")?;
+                Ok::<_, String>((Arc::clone(port), key))
+            })
+            .transpose()?;
         fs.handles.insert(
             handle,
             NativeFile {
                 path,
                 offset,
                 overlapped,
-                completion: None,
+                completion,
             },
         );
     }
@@ -1302,9 +1383,9 @@ mod worker_native_fs_tests {
             .push((r"C:\data.txt".to_string(), 4, 8, 0x123));
         original.next = 0x125;
 
-        let encoded = encode_worker_native_fs(&original).unwrap();
+        let encoded = encode_worker_native_fs(&original, &HashMap::new()).unwrap();
         let mut restored = empty_fs();
-        apply_worker_native_fs(&mut restored, &encoded).unwrap();
+        apply_worker_native_fs(&mut restored, &encoded, &HashMap::new()).unwrap();
 
         let file = restored.handles.get(&0x123).unwrap();
         assert_eq!(file.path, r"C:\data.txt");
@@ -1321,24 +1402,106 @@ mod worker_native_fs_tests {
     }
 
     #[test]
-    fn worker_native_fs_rejects_completion_port_handles() {
+    fn worker_native_fs_preserves_completion_port_associations() {
         let mut original = empty_fs();
+        let port = Arc::new(NativeCompletionPort::new());
         original.handles.insert(
             0x123,
             NativeFile {
                 path: r"C:\data.txt".to_string(),
                 offset: 0,
                 overlapped: true,
-                completion: Some((
-                    Arc::new(NativeCompletionPort {
-                        queue: Mutex::new(std::collections::VecDeque::new()),
-                        ready: Condvar::new(),
-                    }),
-                    0,
-                )),
+                completion: Some((Arc::clone(&port), 0x456)),
             },
         );
-        assert!(encode_worker_native_fs(&original).is_err());
+        let ids = HashMap::from([(Arc::as_ptr(&port) as usize, 0x789)]);
+        let ports = HashMap::from([(0x789, port)]);
+        let encoded = encode_worker_native_fs(&original, &ids).unwrap();
+        let mut restored = empty_fs();
+        apply_worker_native_fs(&mut restored, &encoded, &ports).unwrap();
+        let (restored_port, key) = restored.handles[&0x123].completion.as_ref().unwrap();
+        assert!(Arc::ptr_eq(restored_port, &ports[&0x789]));
+        assert_eq!(*key, 0x456);
+    }
+
+    #[test]
+    fn completion_port_worker_channel_forwards_packets() {
+        use std::os::fd::IntoRawFd;
+
+        let parent = Arc::new(NativeCompletionPort::new());
+        let child_fd = parent.create_worker_sender().unwrap();
+        let child = NativeCompletionPort::new();
+        child.attach_worker_sender(child_fd.into_raw_fd()).unwrap();
+        assert!(child.post(NativeCompletion {
+            key: 0x1234,
+            overlapped: 0x5678,
+            bytes: 9,
+            status: 0xc000_0001,
+        }));
+        let mut queue = parent.queue.lock().unwrap();
+        if queue.is_empty() {
+            let (ready, timeout) = parent
+                .ready
+                .wait_timeout(queue, std::time::Duration::from_secs(1))
+                .unwrap();
+            queue = ready;
+            assert!(!timeout.timed_out(), "completion channel did not forward");
+        }
+        let completion = queue.pop_front().unwrap();
+        assert_eq!(completion.key, 0x1234);
+        assert_eq!(completion.overlapped, 0x5678);
+        assert_eq!(completion.bytes, 9);
+        assert_eq!(completion.status, 0xc000_0001);
+    }
+
+    #[test]
+    fn active_overlapped_io_does_not_block_inheritable_pipe_worker_transfer() {
+        use std::os::fd::IntoRawFd;
+
+        let (endpoint, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let handle = 0xbad;
+        let parent = Arc::clone(&super::TEST_PROCESS);
+        {
+            let mut pipes = parent.named_pipes.lock().unwrap();
+            pipes.handles.insert(
+                handle,
+                NativePipeHandle {
+                    endpoint: Arc::new(NativePipeEndpoint {
+                        fd: endpoint.into_raw_fd(),
+                        name: r"\\.\pipe\worker-active-io".to_string(),
+                        server: false,
+                        access: 3,
+                    }),
+                    pending_client: None,
+                    overlapped: true,
+                    inheritable: true,
+                    access: 3,
+                    mode: 0,
+                    completion: None,
+                    completion_modes: 0,
+                },
+            );
+            pipes.pending_io.insert(
+                (handle, 0x1234),
+                NativePendingPipeIo {
+                    cancelled: Arc::new(AtomicBool::new(false)),
+                    issuer: std::thread::current().id(),
+                },
+            );
+        }
+        let child_fs = empty_fs();
+        assert!(can_exec_worker_child(
+            &child_fs,
+            &parent,
+            [STD_HANDLE_BASE, STD_HANDLE_BASE + 1, STD_HANDLE_BASE + 2],
+            true,
+        ));
+        {
+            let mut pipes = parent.named_pipes.lock().unwrap();
+            pipes.pending_io.remove(&(handle, 0x1234));
+            pipes.handles.remove(&handle);
+        }
+        drop(peer);
     }
 
     #[test]
@@ -1406,13 +1569,32 @@ fn create_exec_worker_child(
     } else {
         Vec::new()
     };
-    if transferable_pipes
-        .iter()
-        .any(|(_, pipe)| pipe.completion.is_some())
-    {
-        return Err(120); // ERROR_CALL_NOT_IMPLEMENTED for completion-associated pipe handles.
-    }
     drop(pipes);
+
+    let registered_ports = parent.completion_ports.lock().map_err(|_| 6u32)?.clone();
+    let mut completion_port_ids = HashMap::<usize, u64>::new();
+    let mut completion_port_objects = HashMap::<u64, Arc<NativeCompletionPort>>::new();
+    let mut register_port = |port: &Arc<NativeCompletionPort>| -> Result<(), u32> {
+        let Some((handle, _)) = registered_ports
+            .iter()
+            .find(|(_, registered)| Arc::ptr_eq(registered, port))
+        else {
+            return Err(120);
+        };
+        completion_port_ids.insert(Arc::as_ptr(port) as usize, *handle);
+        completion_port_objects.insert(*handle, Arc::clone(port));
+        Ok(())
+    };
+    for file in child_fs.handles.values() {
+        if let Some((port, _)) = &file.completion {
+            register_port(port)?;
+        }
+    }
+    for (_, pipe) in &transferable_pipes {
+        if let Some((port, _)) = &pipe.completion {
+            register_port(port)?;
+        }
+    }
 
     let id = NEXT_EXEC_CHILD_DIRECTORY.fetch_add(1, Ordering::Relaxed);
     let directory =
@@ -1421,14 +1603,15 @@ fn create_exec_worker_child(
     let _ = std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700));
     let directory_guard = ChildWorkerDirectory(directory.clone());
     let pipe_transfer_path = directory.join("inherited-pipes.sock");
-    let pipe_listener = if transferable_pipes.is_empty() {
-        None
-    } else {
-        Some(std::os::unix::net::UnixListener::bind(&pipe_transfer_path).map_err(|_| 8u32)?)
-    };
     let mut inherited_pipe_metadata = Vec::new();
     let mut inherited_pipe_fds = Vec::new();
     for (handle, pipe) in &transferable_pipes {
+        let completion = pipe.completion.as_ref().map(|(port, key)| {
+            serde_json::json!({
+                "port": completion_port_ids[&(Arc::as_ptr(port) as usize)],
+                "key": key,
+            })
+        });
         inherited_pipe_metadata.push(serde_json::json!({
                 "handle": handle,
                 "name": pipe.endpoint.name,
@@ -1441,12 +1624,31 @@ fn create_exec_worker_child(
                 "access": pipe.access,
                 "mode": pipe.mode,
                 "completion_modes": pipe.completion_modes,
+                "completion": completion,
             }));
         inherited_pipe_fds.push(pipe.endpoint.fd);
         if let Some(pending_client) = &pipe.pending_client {
             inherited_pipe_fds.push(pending_client.fd);
         }
     }
+    use std::os::fd::AsRawFd;
+    let mut completion_port_fds = Vec::new();
+    let mut completion_port_metadata = Vec::new();
+    for (port_id, port) in &completion_port_objects {
+        let fd = port.create_worker_sender().map_err(|_| 8u32)?;
+        let fd_index = inherited_pipe_fds.len() + completion_port_fds.len();
+        completion_port_metadata.push(serde_json::json!({
+            "handle": port_id,
+            "fd_index": fd_index,
+        }));
+        inherited_pipe_fds.push(fd.as_raw_fd());
+        completion_port_fds.push(fd);
+    }
+    let pipe_listener = if inherited_pipe_fds.is_empty() {
+        None
+    } else {
+        Some(std::os::unix::net::UnixListener::bind(&pipe_transfer_path).map_err(|_| 8u32)?)
+    };
     let image_path = match super::super::worker::write_image(image, &directory) {
         Ok(path) => path,
         Err(_) => return Err(8),
@@ -1474,8 +1676,10 @@ fn create_exec_worker_child(
         "environment": environment,
         "process_id": child.process_id,
         "parent_process_id": parent.process_id,
-        "native_fs": encode_worker_native_fs(&child_fs).map_err(|_| 8u32)?,
+        "native_fs": encode_worker_native_fs(&child_fs, &completion_port_ids).map_err(|_| 8u32)?,
         "inherited_pipes": inherited_pipe_metadata,
+        "completion_ports": completion_port_metadata,
+        "pipe_endpoint_fd_count": inherited_pipe_fds.len() - completion_port_fds.len(),
         "pipe_transfer_fd_count": inherited_pipe_fds.len(),
         "pipe_transfer_socket": pipe_listener.as_ref().map(|_| pipe_transfer_path),
         "mounts": child_fs.fs.host_mounts(),

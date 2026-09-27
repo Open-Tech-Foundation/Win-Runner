@@ -589,15 +589,12 @@ pub(super) extern "win64" fn native_wsa_recv(
                 }
             }
             native_set_overlapped_status(overlapped, 0, 0);
-            if let Ok(mut queue) = port.queue.lock() {
-                queue.push_back(NativeCompletion {
-                    key,
-                    overlapped,
-                    bytes: 0,
-                    status: 0,
-                });
-                port.ready.notify_one();
-            }
+            port.post(NativeCompletion {
+                key,
+                overlapped,
+                bytes: 0,
+                status: 0,
+            });
         });
         native_wsa_set_last_error(997); // WSA_IO_PENDING
         native_set_last_error(997); // libuv checks GetLastError for ERROR_IO_PENDING

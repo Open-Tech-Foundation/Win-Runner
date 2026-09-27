@@ -1512,10 +1512,7 @@ mod protection_tests {
     #[test]
     fn queued_file_io_cancellation_signals_event_and_posts_failure() {
         let process = super::process_ctx().unwrap();
-        let port = std::sync::Arc::new(super::NativeCompletionPort {
-            queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
-            ready: std::sync::Condvar::new(),
-        });
+        let port = std::sync::Arc::new(super::NativeCompletionPort::new());
         let file = super::NativeFile {
             path: r"C:\cancel_unit.txt".into(),
             offset: 0,

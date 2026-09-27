@@ -45,10 +45,7 @@ pub(super) extern "win64" fn native_create_io_completion_port(
             (existing_port, port)
         } else {
             let handle = process.completion_next.fetch_add(1, Ordering::AcqRel);
-            let port = Arc::new(NativeCompletionPort {
-                queue: Mutex::new(std::collections::VecDeque::new()),
-                ready: Condvar::new(),
-            });
+            let port = Arc::new(NativeCompletionPort::new());
             if let Ok(mut ports) = process.completion_ports.lock() {
                 ports.insert(handle, port.clone());
             } else {
@@ -77,10 +74,7 @@ pub(super) extern "win64" fn native_create_io_completion_port(
             (existing_port, port)
         } else {
             let handle = process.completion_next.fetch_add(1, Ordering::AcqRel);
-            let port = Arc::new(NativeCompletionPort {
-                queue: Mutex::new(std::collections::VecDeque::new()),
-                ready: Condvar::new(),
-            });
+            let port = Arc::new(NativeCompletionPort::new());
             if let Ok(mut ports) = process.completion_ports.lock() {
                 ports.insert(handle, port.clone());
             } else {
@@ -125,10 +119,7 @@ pub(super) extern "win64" fn native_create_io_completion_port(
         (existing_port, port)
     } else {
         let handle = process.completion_next.fetch_add(1, Ordering::AcqRel);
-        let port = Arc::new(NativeCompletionPort {
-            queue: Mutex::new(std::collections::VecDeque::new()),
-            ready: Condvar::new(),
-        });
+        let port = Arc::new(NativeCompletionPort::new());
         let Ok(mut ports) = process.completion_ports.lock() else {
             return 0;
         };
@@ -214,15 +205,12 @@ fn native_post_socket_completion_inner(socket: u64, overlapped: u64, bytes: u32,
         .and_then(|associations| associations.get(&socket).cloned());
     if let Some((port, key)) = association {
         native_set_overlapped_status(overlapped, 0, bytes);
-        if let Ok(mut queue) = port.queue.lock() {
-            queue.push_back(NativeCompletion {
-                key,
-                overlapped,
-                bytes,
-                status: 0,
-            });
-            port.ready.notify_one();
-        }
+        port.post(NativeCompletion {
+            key,
+            overlapped,
+            bytes,
+            status: 0,
+        });
     }
 }
 pub(super) fn native_prepare_overlapped_event(
@@ -267,15 +255,12 @@ pub(super) fn native_complete_file_io(
         // The low bit of hEvent suppresses completion-port notification.
         let event = unsafe { ((overlapped + 24) as *const u64).read_unaligned() };
         if event & 1 == 0 {
-            if let Ok(mut queue) = port.queue.lock() {
-                queue.push_back(NativeCompletion {
-                    key: *key,
-                    overlapped,
-                    bytes,
-                    status: 0,
-                });
-                port.ready.notify_one();
-            }
+            port.post(NativeCompletion {
+                key: *key,
+                overlapped,
+                bytes,
+                status: 0,
+            });
         }
     }
 }
@@ -303,15 +288,12 @@ pub(super) fn native_complete_pipe_io(
         // completes before returning from the API. This helper is used
         // only after an operation was queued as pending.
         if event_handle & 1 == 0 {
-            if let Ok(mut queue) = port.queue.lock() {
-                queue.push_back(NativeCompletion {
-                    key: *key,
-                    overlapped,
-                    bytes,
-                    status: status as u64,
-                });
-                port.ready.notify_one();
-            }
+            port.post(NativeCompletion {
+                key: *key,
+                overlapped,
+                bytes,
+                status: status as u64,
+            });
         }
     }
 }
@@ -589,15 +571,12 @@ pub(super) extern "win64" fn native_read_directory_changes_w(
                 if let Some((port, key)) = &file.completion {
                     let event_value = unsafe { ((overlapped + 24) as *const u64).read_unaligned() };
                     if event_value & 1 == 0 {
-                        if let Ok(mut queue) = port.queue.lock() {
-                            queue.push_back(NativeCompletion {
-                                key: *key,
-                                overlapped,
-                                bytes: 0,
-                                status: 0x8000_0005,
-                            });
-                            port.ready.notify_one();
-                        }
+                        port.post(NativeCompletion {
+                            key: *key,
+                            overlapped,
+                            bytes: 0,
+                            status: 0x8000_0005,
+                        });
                     }
                 }
                 return;
@@ -675,15 +654,12 @@ fn native_finish_pending_file_io(
     if let Some((port, key)) = &file.completion {
         let event = unsafe { ((overlapped + 24) as *const u64).read_unaligned() };
         if event & 1 == 0 {
-            if let Ok(mut queue) = port.queue.lock() {
-                queue.push_back(NativeCompletion {
-                    key: *key,
-                    overlapped,
-                    bytes,
-                    status,
-                });
-                port.ready.notify_one();
-            }
+            port.post(NativeCompletion {
+                key: *key,
+                overlapped,
+                bytes,
+                status,
+            });
         }
     }
     if let Ok(_guard) = process.io_wait.lock() {
@@ -1033,16 +1009,15 @@ pub(super) extern "win64" fn native_post_queued_completion_status(
         native_set_last_error(6);
         return 0;
     };
-    let Ok(mut queue) = port.queue.lock() else {
-        return 0;
-    };
-    queue.push_back(NativeCompletion {
+    if !port.post(NativeCompletion {
         key,
         overlapped,
         bytes,
         status: 0,
-    });
-    port.ready.notify_one();
+    }) {
+        native_set_last_error(6);
+        return 0;
+    }
     1
 }
 #[repr(C)]

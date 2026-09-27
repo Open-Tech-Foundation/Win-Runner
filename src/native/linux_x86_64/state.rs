@@ -277,12 +277,102 @@ pub(super) struct NativeMappingView {
 pub(super) struct NativeCompletionPort {
     pub(super) queue: Mutex<std::collections::VecDeque<NativeCompletion>>,
     pub(super) ready: Condvar,
+    worker_sender: Mutex<Option<std::os::unix::net::UnixStream>>,
 }
 pub(super) struct NativeCompletion {
     pub(super) key: u64,
     pub(super) overlapped: u64,
     pub(super) bytes: u32,
     pub(super) status: u64,
+}
+
+impl NativeCompletionPort {
+    pub(super) fn new() -> Self {
+        Self {
+            queue: Mutex::new(std::collections::VecDeque::new()),
+            ready: Condvar::new(),
+            worker_sender: Mutex::new(None),
+        }
+    }
+
+    pub(super) fn create_worker_sender(self: &Arc<Self>) -> Result<std::os::fd::OwnedFd, String> {
+        use std::os::fd::{FromRawFd, IntoRawFd};
+
+        let (mut receiver, sender) = std::os::unix::net::UnixStream::pair()
+            .map_err(|error| format!("cannot create completion-port worker channel: {error}"))?;
+        let port = Arc::downgrade(self);
+        std::thread::Builder::new()
+            .name("winrun-iocp-worker-forward".to_string())
+            .spawn(move || {
+                use std::io::Read;
+
+                let mut packet = [0u8; 28];
+                loop {
+                    match receiver.read_exact(&mut packet) {
+                        Ok(()) => {
+                            let Some(port) = port.upgrade() else {
+                                break;
+                            };
+                            if let Some(completion) = NativeCompletion::decode(&packet) {
+                                port.post(completion);
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+            .map_err(|error| format!("cannot start completion-port forwarder: {error}"))?;
+        // SAFETY: sender owns its descriptor and ownership transfers to OwnedFd.
+        Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(sender.into_raw_fd()) })
+    }
+
+    pub(super) fn attach_worker_sender(&self, fd: i32) -> Result<(), String> {
+        use std::os::fd::FromRawFd;
+
+        // SAFETY: fd is received from the parent with SCM_RIGHTS and ownership
+        // transfers to the UnixDatagram stored on this worker-side proxy.
+        let sender = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+        *self
+            .worker_sender
+            .lock()
+            .map_err(|_| "completion-port sender lock is poisoned".to_string())? = Some(sender);
+        Ok(())
+    }
+
+    pub(super) fn post(&self, completion: NativeCompletion) -> bool {
+        if let Ok(mut sender) = self.worker_sender.lock() {
+            if let Some(sender) = sender.as_mut() {
+                use std::io::Write;
+                return sender.write_all(&completion.encode()).is_ok();
+            }
+        }
+        let Ok(mut queue) = self.queue.lock() else {
+            return false;
+        };
+        queue.push_back(completion);
+        self.ready.notify_one();
+        true
+    }
+}
+
+impl NativeCompletion {
+    fn encode(&self) -> [u8; 28] {
+        let mut packet = [0; 28];
+        packet[0..8].copy_from_slice(&self.key.to_le_bytes());
+        packet[8..16].copy_from_slice(&self.overlapped.to_le_bytes());
+        packet[16..20].copy_from_slice(&self.bytes.to_le_bytes());
+        packet[20..28].copy_from_slice(&self.status.to_le_bytes());
+        packet
+    }
+
+    fn decode(packet: &[u8; 28]) -> Option<Self> {
+        Some(Self {
+            key: u64::from_le_bytes(packet[0..8].try_into().ok()?),
+            overlapped: u64::from_le_bytes(packet[8..16].try_into().ok()?),
+            bytes: u32::from_le_bytes(packet[16..20].try_into().ok()?),
+            status: u64::from_le_bytes(packet[20..28].try_into().ok()?),
+        })
+    }
 }
 
 pub(super) struct DynamicTlsSlots {
