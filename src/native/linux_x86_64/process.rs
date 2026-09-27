@@ -817,18 +817,21 @@ fn can_exec_worker_child(
         return false;
     };
     for (handle, pipe) in &pipes.handles {
-        if std_handles.contains(handle)
-            && (pipe.pending_client.is_some() || pipe.completion.is_some())
+        if (std_handles.contains(handle) || (inherit_handles && pipe.inheritable))
+            && pipe.completion.is_some()
         {
             return false;
         }
-        if inherit_handles
-            && pipe.inheritable
-            && !std_handles.contains(handle)
-            && (pipe.pending_client.is_some() || pipe.completion.is_some())
-        {
-            return false;
-        }
+    }
+    if pipes.pending_io.keys().any(|(handle, _)| {
+        std_handles.contains(handle)
+            || (inherit_handles
+                && pipes
+                    .handles
+                    .get(handle)
+                    .is_some_and(|pipe| pipe.inheritable))
+    }) {
+        return false;
     }
     std_handles.iter().all(|handle| {
         if matches!(handle, 0..=2 | STD_HANDLE_BASE..=0x5000_0002)
@@ -1031,6 +1034,8 @@ fn restore_worker_pipe_handles(
         name: String,
         server: bool,
         endpoint_access: u32,
+        has_pending_client: bool,
+        pending_client_access: u32,
         overlapped: bool,
         inheritable: bool,
         access: u32,
@@ -1058,6 +1063,11 @@ fn restore_worker_pipe_handles(
                     .and_then(serde_json::Value::as_bool)
                     .ok_or("inherited pipe has invalid endpoint role")?,
                 endpoint_access: number(item, "endpoint_access")? as u32,
+                has_pending_client: item
+                    .get("has_pending_client")
+                    .and_then(serde_json::Value::as_bool)
+                    .ok_or("inherited pipe has invalid pending-client state")?,
+                pending_client_access: number(item, "pending_client_access")? as u32,
                 overlapped: item
                     .get("overlapped")
                     .and_then(serde_json::Value::as_bool)
@@ -1077,7 +1087,11 @@ fn restore_worker_pipe_handles(
         .split(',')
         .map(|value| value.parse::<i32>().map_err(|error| error.to_string()))
         .collect::<Result<Vec<_>, _>>()?;
-    if fds.len() != infos.len() {
+    let expected_fds = request
+        .get("pipe_transfer_fd_count")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("worker request has invalid pipe descriptor count")? as usize;
+    if fds.len() != expected_fds {
         for fd in fds {
             unsafe { close(fd) };
         }
@@ -1087,18 +1101,34 @@ fn restore_worker_pipe_handles(
         .named_pipes
         .lock()
         .map_err(|_| "worker pipe table is poisoned".to_string())?;
-    for (info, fd) in infos.into_iter().zip(fds) {
+    let mut fds = fds.into_iter();
+    for info in infos {
+        let fd = fds
+            .next()
+            .ok_or("worker is missing an inherited pipe endpoint")?;
         let endpoint = Arc::new(NativePipeEndpoint {
             fd,
             name: info.name,
             server: info.server,
             access: info.endpoint_access,
         });
+        let pending_client = if info.has_pending_client {
+            Some(Arc::new(NativePipeEndpoint {
+                fd: fds
+                    .next()
+                    .ok_or("worker is missing a pending named-pipe client endpoint")?,
+                name: endpoint.name.clone(),
+                server: false,
+                access: info.pending_client_access,
+            }))
+        } else {
+            None
+        };
         pipes.handles.insert(
             info.handle,
             NativePipeHandle {
                 endpoint,
-                pending_client: None,
+                pending_client,
                 overlapped: info.overlapped,
                 inheritable: info.inheritable,
                 access: info.access,
@@ -1310,25 +1340,28 @@ mod worker_native_fs_tests {
         assert_eq!(unsafe { pipe(pipe_fds.as_mut_ptr()) }, 0);
         let (sender, receiver) = std::os::unix::net::UnixStream::pair().unwrap();
         let sender_thread = std::thread::spawn(move || {
-            send_worker_pipe_fds(&sender, &[pipe_fds[1]]).unwrap();
-            unsafe { close(pipe_fds[1]) };
+            send_worker_pipe_fds(&sender, &pipe_fds).unwrap();
+            unsafe {
+                close(pipe_fds[0]);
+                close(pipe_fds[1]);
+            }
         });
-        let received = receive_worker_pipe_fds(&receiver, 1).unwrap();
+        let received = receive_worker_pipe_fds(&receiver, 2).unwrap();
         sender_thread.join().unwrap();
         let byte = [b'x'];
         assert_eq!(
-            unsafe { write(received[0], byte.as_ptr().cast(), byte.len()) },
+            unsafe { write(received[1], byte.as_ptr().cast(), byte.len()) },
             1
         );
         let mut read_byte = [0u8];
         assert_eq!(
-            unsafe { read(pipe_fds[0], read_byte.as_mut_ptr().cast(), 1) },
+            unsafe { read(received[0], read_byte.as_mut_ptr().cast(), 1) },
             1
         );
         assert_eq!(read_byte, byte);
         unsafe {
             close(received[0]);
-            close(pipe_fds[0]);
+            close(received[1]);
         }
     }
 }
@@ -1368,9 +1401,9 @@ fn create_exec_worker_child(
     };
     if transferable_pipes
         .iter()
-        .any(|(_, pipe)| pipe.pending_client.is_some() || pipe.completion.is_some())
+        .any(|(_, pipe)| pipe.completion.is_some())
     {
-        return Err(120); // ERROR_CALL_NOT_IMPLEMENTED for pending/completion-associated pipe handles.
+        return Err(120); // ERROR_CALL_NOT_IMPLEMENTED for completion-associated pipe handles.
     }
     drop(pipes);
 
@@ -1386,26 +1419,27 @@ fn create_exec_worker_child(
     } else {
         Some(std::os::unix::net::UnixListener::bind(&pipe_transfer_path).map_err(|_| 8u32)?)
     };
-    let inherited_pipe_metadata = transferable_pipes
-        .iter()
-        .map(|(handle, pipe)| {
-            serde_json::json!({
+    let mut inherited_pipe_metadata = Vec::new();
+    let mut inherited_pipe_fds = Vec::new();
+    for (handle, pipe) in &transferable_pipes {
+        inherited_pipe_metadata.push(serde_json::json!({
                 "handle": handle,
                 "name": pipe.endpoint.name,
                 "server": pipe.endpoint.server,
                 "endpoint_access": pipe.endpoint.access,
+                "has_pending_client": pipe.pending_client.is_some(),
+                "pending_client_access": pipe.pending_client.as_ref().map_or(0, |endpoint| endpoint.access),
                 "overlapped": pipe.overlapped,
                 "inheritable": pipe.inheritable,
                 "access": pipe.access,
                 "mode": pipe.mode,
                 "completion_modes": pipe.completion_modes,
-            })
-        })
-        .collect::<Vec<_>>();
-    let inherited_pipe_fds = transferable_pipes
-        .iter()
-        .map(|(_, pipe)| pipe.endpoint.fd)
-        .collect::<Vec<_>>();
+            }));
+        inherited_pipe_fds.push(pipe.endpoint.fd);
+        if let Some(pending_client) = &pipe.pending_client {
+            inherited_pipe_fds.push(pending_client.fd);
+        }
+    }
     let image_path = match super::super::worker::write_image(image, &directory) {
         Ok(path) => path,
         Err(_) => return Err(8),
@@ -1435,6 +1469,7 @@ fn create_exec_worker_child(
         "parent_process_id": parent.process_id,
         "native_fs": encode_worker_native_fs(&child_fs).map_err(|_| 8u32)?,
         "inherited_pipes": inherited_pipe_metadata,
+        "pipe_transfer_fd_count": inherited_pipe_fds.len(),
         "pipe_transfer_socket": pipe_listener.as_ref().map(|_| pipe_transfer_path),
         "mounts": child_fs.fs.host_mounts(),
         "drive_cwds": child_fs.fs.drive_current_directories(),

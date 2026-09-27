@@ -143,8 +143,13 @@ pub(crate) fn execute_request(path: &Path) -> Result<u32, String> {
             .get("pipe_transfer_socket")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| "worker request has no pipe transfer socket".to_string())?;
+        let descriptor_count = request
+            .get("pipe_transfer_fd_count")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| "worker request has invalid pipe descriptor count".to_string())?
+            as usize;
         let descriptors =
-            crate::native::receive_worker_pipe_descriptors(socket_path, inherited_pipes.len())?;
+            crate::native::receive_worker_pipe_descriptors(socket_path, descriptor_count)?;
         std::env::set_var(
             "WINCLI_NATIVE_PIPE_FDS",
             descriptors
