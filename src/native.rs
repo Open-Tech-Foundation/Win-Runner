@@ -1193,6 +1193,123 @@ mod imp {
         }
 
         #[test]
+        fn nt_set_end_of_file_truncates_and_extends_guest_files() {
+            let path = r"C:\wine_eof_resize.txt";
+            let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(path, b"abcdef".to_vec())
+                .unwrap();
+            let handle = super::native_create_file_w(wide.as_ptr(), 0xC000_0000, 0, 0, 3, 0, 0);
+            assert_ne!(handle, u64::MAX);
+
+            let mut io_status = [0u8; 16];
+            let mut eof = 3i64;
+            let truncated = super::native_nt_set_information_file(
+                handle,
+                io_status.as_mut_ptr(),
+                (&mut eof as *mut i64).cast(),
+                8,
+                20, // FileEndOfFileInformation
+            );
+            assert_eq!(truncated, 0);
+            assert_eq!(context.lock().unwrap().fs.read_file(path).unwrap(), b"abc");
+
+            eof = 6;
+            let extended = super::native_nt_set_information_file(
+                handle,
+                io_status.as_mut_ptr(),
+                (&mut eof as *mut i64).cast(),
+                8,
+                20,
+            );
+            assert_eq!(extended, 0);
+            assert_eq!(
+                context.lock().unwrap().fs.read_file(path).unwrap(),
+                b"abc\0\0\0"
+            );
+            assert_eq!(super::native_close_handle(handle), 1);
+        }
+
+        #[test]
+        fn nt_set_file_rename_information_renames_by_open_handle() {
+            let source = r"C:\wine_rename_source.txt";
+            let destination = r"C:\wine_rename_destination.txt";
+            let source_wide = source.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(source, b"rename-me".to_vec())
+                .unwrap();
+            let handle =
+                super::native_create_file_w(source_wide.as_ptr(), 0xC000_0000, 0, 0, 3, 0, 0);
+            assert_ne!(handle, u64::MAX);
+
+            // FILE_RENAME_INFORMATION: ReplaceIfExists, RootDirectory,
+            // FileNameLength, then the UTF-16 destination path.
+            let encoded = destination.encode_utf16().collect::<Vec<_>>();
+            let mut information = vec![0u8; 20 + encoded.len() * 2];
+            information[16..20].copy_from_slice(&((encoded.len() * 2) as u32).to_le_bytes());
+            for (index, unit) in encoded.iter().enumerate() {
+                information[20 + index * 2..22 + index * 2].copy_from_slice(&unit.to_le_bytes());
+            }
+            let mut io_status = [0u8; 16];
+            let status = super::native_nt_set_information_file(
+                handle,
+                io_status.as_mut_ptr(),
+                information.as_ptr(),
+                information.len() as u32,
+                10, // FileRenameInformation
+            );
+            assert_eq!(status, 0);
+            assert_eq!(
+                context.lock().unwrap().fs.read_file(destination).unwrap(),
+                b"rename-me"
+            );
+            assert!(!context.lock().unwrap().fs.exists(source));
+            assert_eq!(super::native_close_handle(handle), 1);
+        }
+
+        #[test]
+        fn nt_set_end_of_file_rejects_shrinking_an_active_mapped_view() {
+            let path = r"C:\wine_eof_mapped.txt";
+            let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(path, b"12345678".to_vec())
+                .unwrap();
+            let handle = super::native_create_file_w(wide.as_ptr(), 0xC000_0000, 0, 0, 3, 0, 0);
+            assert_ne!(handle, u64::MAX);
+            let mapping =
+                super::native_create_file_mapping_w(handle, 0, 0x04, 0, 8, std::ptr::null());
+            assert_ne!(mapping, 0);
+            let view = super::native_map_view_of_file(mapping, 0x2, 0, 0, 8);
+            assert!(!view.is_null());
+
+            let mut io_status = [0u8; 16];
+            let mut eof = 4i64;
+            let status = super::native_nt_set_information_file(
+                handle,
+                io_status.as_mut_ptr(),
+                (&mut eof as *mut i64).cast(),
+                8,
+                20,
+            );
+            assert_eq!(super::native_unmap_view_of_file(view.cast()), 1);
+            assert_eq!(super::native_close_handle(mapping), 1);
+            assert_eq!(super::native_close_handle(handle), 1);
+            assert_eq!(status, 0xC000_0022); // STATUS_ACCESS_DENIED while mapped
+        }
+
+        #[test]
         fn file_mapping_views_read_and_commit_guest_file_bytes() {
             let path = r"C:\file_mapping_unit.txt";
             let context = super::fs_ctx().unwrap();

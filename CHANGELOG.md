@@ -32,6 +32,8 @@ All notable changes to this project will be documented in this file.
   conflicts, wildcard enumeration, read-only deletion, and guest file times.
 - Added WinFS edge-case tests for truncating writes, recursive tree copy/move,
   and invalid directory create/remove operations.
+- Added Wine-inspired NT file tests for EOF resizing, rename-by-handle, and
+  resizing files with active mapped views.
 - Failed native launches keep the current C: filesystem in memory and discard
   only changes from the failed child process.
 - Added live host-folder mounts as guest drives (`mount Z: <host-directory>` or
