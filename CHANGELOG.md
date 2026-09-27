@@ -38,6 +38,8 @@ All notable changes to this project will be documented in this file.
   API support has explicit WinFS expectations.
 - Added modern WinFS behavior fixtures for temporary files, `CreateFile2`,
   `CopyFile2`/`CopyFileExW`, stream enumeration, and handle-based deletion.
+- Added behavior fixtures for symbolic and hard links, ANSI attributes and
+  enumeration, `SetEndOfFile`, buffer flushing, and extended overlapped results.
 - Added WinFS edge-case tests for truncating writes, recursive tree copy/move,
   and invalid directory create/remove operations.
 - Added NT file compatibility tests for EOF resizing, rename-by-handle, and

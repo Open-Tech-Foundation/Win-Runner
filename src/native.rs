@@ -2698,6 +2698,250 @@ mod imp {
         }
 
         #[test]
+        fn modern_ansi_hard_link_shares_source_contents() {
+            type CreateHardLinkA = unsafe extern "win64" fn(*const u8, *const u8, u64) -> i32;
+            let create_link: CreateHardLinkA =
+                unsafe { std::mem::transmute(require_kernel32_api(b"CreateHardLinkA\0") as usize) };
+            let source = b"C:\\modern_hard_link_ansi_source.txt\0";
+            let link = b"C:\\modern_hard_link_ansi_alias.txt\0";
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(
+                    "C:\\modern_hard_link_ansi_source.txt",
+                    b"alias-data".to_vec(),
+                )
+                .unwrap();
+
+            assert_eq!(unsafe { create_link(link.as_ptr(), source.as_ptr(), 0) }, 1);
+            assert_eq!(
+                context
+                    .lock()
+                    .unwrap()
+                    .fs
+                    .read_file("C:\\modern_hard_link_ansi_alias.txt")
+                    .unwrap(),
+                b"alias-data"
+            );
+            let mut ctx = context.lock().unwrap();
+            ctx.fs
+                .delete_file("C:\\modern_hard_link_ansi_alias.txt")
+                .unwrap();
+            ctx.fs
+                .delete_file("C:\\modern_hard_link_ansi_source.txt")
+                .unwrap();
+        }
+
+        #[test]
+        fn modern_symbolic_link_resolves_to_guest_target() {
+            type CreateSymbolicLinkW = unsafe extern "win64" fn(*const u16, *const u16, u32) -> i32;
+            let create_link: CreateSymbolicLinkW = unsafe {
+                std::mem::transmute(require_kernel32_api(b"CreateSymbolicLinkW\0") as usize)
+            };
+            let target = r"C:\modern_symlink_target.txt";
+            let link = r"C:\modern_symlink_alias.txt";
+            let target_wide = target.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let link_wide = link.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(target, b"symlink-target".to_vec())
+                .unwrap();
+
+            assert_eq!(
+                unsafe { create_link(link_wide.as_ptr(), target_wide.as_ptr(), 2) },
+                1
+            );
+            assert_ne!(
+                super::native_get_file_attributes_w(link_wide.as_ptr()) & 0x400,
+                0
+            );
+            let handle =
+                super::native_create_file_w(link_wide.as_ptr(), 0x8000_0000, 7, 3, 0, 0, 0);
+            assert_ne!(handle, u64::MAX);
+            let mut bytes = [0u8; 14];
+            let mut read = 0;
+            assert_eq!(
+                super::native_read_file(handle, bytes.as_mut_ptr(), 14, &mut read, 0),
+                1
+            );
+            assert_eq!(&bytes, b"symlink-target");
+            assert_eq!(super::native_close_handle(handle), 1);
+            let mut ctx = context.lock().unwrap();
+            ctx.fs.delete_file(link).unwrap();
+            ctx.fs.delete_file(target).unwrap();
+        }
+
+        #[test]
+        fn modern_ansi_file_attributes_toggle_readonly_state() {
+            type SetFileAttributesA = unsafe extern "win64" fn(*const u8, u32) -> i32;
+            let set_attributes: SetFileAttributesA = unsafe {
+                std::mem::transmute(require_kernel32_api(b"SetFileAttributesA\0") as usize)
+            };
+            let path = b"C:\\modern_attributes_ansi.txt\0";
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file("C:\\modern_attributes_ansi.txt", b"attributes".to_vec())
+                .unwrap();
+
+            assert_eq!(unsafe { set_attributes(path.as_ptr(), 1) }, 1);
+            let wide = "C:\\modern_attributes_ansi.txt"
+                .encode_utf16()
+                .chain([0])
+                .collect::<Vec<_>>();
+            assert_ne!(super::native_get_file_attributes_w(wide.as_ptr()) & 1, 0);
+            assert_eq!(unsafe { set_attributes(path.as_ptr(), 0x80) }, 1);
+            assert_eq!(super::native_delete_file_w(wide.as_ptr()), 1);
+            assert!(!context
+                .lock()
+                .unwrap()
+                .fs
+                .exists("C:\\modern_attributes_ansi.txt"));
+        }
+
+        #[test]
+        fn modern_ansi_find_first_file_returns_matching_name() {
+            type FindFirstFileA = unsafe extern "win64" fn(*const u8, *mut std::ffi::c_void) -> u64;
+            let find_first: FindFirstFileA =
+                unsafe { std::mem::transmute(require_kernel32_api(b"FindFirstFileA\0") as usize) };
+            let pattern = b"C:\\modern_find_ansi\\*.txt\0";
+            let directory = r"C:\modern_find_ansi";
+            let context = super::fs_ctx().unwrap();
+            {
+                let mut ctx = context.lock().unwrap();
+                ctx.fs.mkdir(directory).unwrap();
+                ctx.fs
+                    .write_file(r"C:\modern_find_ansi\wanted.txt", b"yes".to_vec())
+                    .unwrap();
+                ctx.fs
+                    .write_file(r"C:\modern_find_ansi\ignored.bin", b"no".to_vec())
+                    .unwrap();
+            }
+
+            let mut data = [0u8; 320];
+            let find = unsafe { find_first(pattern.as_ptr(), data.as_mut_ptr().cast()) };
+            assert_ne!(find, u64::MAX);
+            let name = unsafe {
+                std::slice::from_raw_parts(data.as_ptr().add(44), 260)
+                    .iter()
+                    .copied()
+                    .take_while(|byte| *byte != 0)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(name, b"wanted.txt");
+            assert_eq!(super::native_find_close(find), 1);
+            let mut ctx = context.lock().unwrap();
+            ctx.fs
+                .delete_file(r"C:\modern_find_ansi\wanted.txt")
+                .unwrap();
+            ctx.fs
+                .delete_file(r"C:\modern_find_ansi\ignored.bin")
+                .unwrap();
+            ctx.fs.rmdir(directory).unwrap();
+        }
+
+        #[test]
+        fn modern_set_end_of_file_truncates_at_the_current_pointer() {
+            type SetEndOfFile = unsafe extern "win64" fn(u64) -> i32;
+            let set_end_of_file: SetEndOfFile =
+                unsafe { std::mem::transmute(require_kernel32_api(b"SetEndOfFile\0") as usize) };
+            let path = r"C:\modern_set_end_of_file.txt";
+            let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(path, b"truncate-here".to_vec())
+                .unwrap();
+            let handle = super::native_create_file_w(wide.as_ptr(), 0xC000_0000, 7, 3, 0, 0, 0);
+            assert_ne!(handle, u64::MAX);
+            let offset = 8i64;
+            assert_eq!(
+                super::native_set_file_pointer_ex(handle, offset, std::ptr::null_mut(), 0),
+                1
+            );
+
+            assert_eq!(unsafe { set_end_of_file(handle) }, 1);
+            assert_eq!(
+                context.lock().unwrap().fs.read_file(path).unwrap(),
+                b"truncate"
+            );
+            assert_eq!(super::native_close_handle(handle), 1);
+            context.lock().unwrap().fs.delete_file(path).unwrap();
+        }
+
+        #[test]
+        fn modern_flush_file_buffers_keeps_written_guest_bytes() {
+            type FlushFileBuffers = unsafe extern "win64" fn(u64) -> i32;
+            let flush: FlushFileBuffers = unsafe {
+                std::mem::transmute(require_kernel32_api(b"FlushFileBuffers\0") as usize)
+            };
+            let path = r"C:\modern_flush_file_buffers.txt";
+            let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let context = super::fs_ctx().unwrap();
+            context
+                .lock()
+                .unwrap()
+                .fs
+                .write_file(path, b"before-flush".to_vec())
+                .unwrap();
+            let handle = super::native_create_file_w(wide.as_ptr(), 0xC000_0000, 7, 3, 0, 0, 0);
+            assert_ne!(handle, u64::MAX);
+            let replacement = b"after-flush";
+            let mut written = 0;
+            assert_eq!(
+                super::native_write_file(
+                    handle,
+                    replacement.as_ptr(),
+                    replacement.len() as u32,
+                    &mut written,
+                    0,
+                ),
+                1
+            );
+            assert_eq!(written as usize, replacement.len());
+            assert_eq!(unsafe { flush(handle) }, 1);
+            assert_eq!(
+                context.lock().unwrap().fs.read_file(path).unwrap(),
+                replacement
+            );
+            assert_eq!(super::native_close_handle(handle), 1);
+            context.lock().unwrap().fs.delete_file(path).unwrap();
+        }
+
+        #[test]
+        fn modern_get_overlapped_result_ex_rejects_invalid_file_handle() {
+            type GetOverlappedResultEx =
+                unsafe extern "win64" fn(u64, *mut std::ffi::c_void, *mut u32, u32, i32) -> i32;
+            let get_result: GetOverlappedResultEx = unsafe {
+                std::mem::transmute(require_kernel32_api(b"GetOverlappedResultEx\0") as usize)
+            };
+            let mut overlapped = [0u8; 32];
+            let mut transferred = 0;
+            assert_eq!(
+                unsafe {
+                    get_result(
+                        u64::MAX,
+                        overlapped.as_mut_ptr().cast(),
+                        &mut transferred,
+                        0,
+                        0,
+                    )
+                },
+                0
+            );
+            assert_eq!(super::native_get_last_error(), 6);
+        }
+
+        #[test]
         fn initializes_critical_section_with_spin_count() {
             let mut section = [0x5au8; 40];
             assert_eq!(
