@@ -130,6 +130,8 @@ Items remain open until implementation and relevant verification are complete.
   - [x] Walk mapped guest x64 frames during exception dispatch, call language
     handlers returned by `RtlVirtualUnwind`, and honor continue-execution and
     continue-search dispositions.
+  - [x] Expose `ntdll!RtlDispatchException` to guest imports and route it through
+    the same vectored, frame-based, and unhandled-filter dispatcher.
   - [ ] Implement complete nested/collided unwind behavior, language-specific
     handler semantics such as `__C_specific_handler`, and `RtlUnwindEx`.
 

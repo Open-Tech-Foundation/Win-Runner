@@ -612,6 +612,22 @@ pub(super) extern "win64" fn native_rtl_raise_exception(record: *mut NativeExcep
     }
 }
 
+pub(super) extern "win64" fn native_rtl_dispatch_exception(
+    record: *mut NativeExceptionRecord,
+    context: *mut NativeExceptionContext,
+) -> u8 {
+    if record.is_null() || context.is_null() {
+        native_set_last_error(87); // ERROR_INVALID_PARAMETER
+        return 0;
+    }
+    let record = unsafe { &mut *record };
+    if record.parameter_count > 15 {
+        native_set_last_error(87);
+        return 0;
+    }
+    dispatch_exception(record, unsafe { &mut *context }) as u8
+}
+
 /// Find the x64 RUNTIME_FUNCTION covering ControlPc in a loaded guest image.
 /// The returned pointer refers to the image's mapped exception directory.
 pub(super) extern "win64" fn native_rtl_lookup_function_entry(

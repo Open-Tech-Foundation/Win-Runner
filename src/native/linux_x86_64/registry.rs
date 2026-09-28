@@ -136,6 +136,7 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
             "RtlAddFunctionTable"
                 | "RtlCaptureContext"
                 | "RtlDeleteFunctionTable"
+                | "RtlDispatchException"
                 | "RtlLookupFunctionEntry"
                 | "RtlRaiseException"
                 | "RtlVirtualUnwind"
@@ -218,6 +219,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "RtlDeleteFunctionTable" => {
             Some(native_rtl_delete_function_table as *const () as usize as u64)
         }
+        "RtlDispatchException" => Some(native_rtl_dispatch_exception as *const () as usize as u64),
         "RtlLookupFunctionEntry" => {
             Some(native_rtl_lookup_function_entry as *const () as usize as u64)
         }
