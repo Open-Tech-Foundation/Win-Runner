@@ -26,6 +26,8 @@ All notable changes to this project will be documented in this file.
 - Add `__p__fmode` and `__p__commode` accessors for the existing CRT mode slots.
 - Add `_wgetenv` with case-insensitive guest environment lookup and per-thread
   UTF-16 result storage.
+- Keep current CRT `environ`/`_wenviron` arrays separate from initial arrays and
+  refresh them after guest `SetEnvironmentVariableW` changes.
 - Add stable UTF-16 CRT startup arrays and accessors for wide arguments and
   environment variables, including `_configure_wide_argv`, `__p___wargv`, and
   the initial/environment pointer APIs.

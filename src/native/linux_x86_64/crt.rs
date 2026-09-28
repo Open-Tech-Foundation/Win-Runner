@@ -263,18 +263,36 @@ fn build_crt_startup(
         .iter()
         .map(|(name, value)| nul_terminated_wide(&format!("{name}={value}")))
         .collect::<Vec<_>>();
-    let mut environment = environment_storage
+    let mut initial_environment = environment_storage
         .iter()
         .map(|entry| entry.as_ptr() as usize)
         .collect::<Vec<_>>();
-    environment.push(0);
-    let environment_value = environment.as_mut_ptr() as usize;
-    let mut wide_environment = wide_environment_storage
+    initial_environment.push(0);
+    let mut initial_wide_environment = wide_environment_storage
         .iter()
         .map(|entry| entry.as_ptr() as usize)
         .collect::<Vec<_>>();
-    wide_environment.push(0);
-    let wide_environment_value = wide_environment.as_mut_ptr() as usize;
+    initial_wide_environment.push(0);
+    let current_environment_storage = environment
+        .iter()
+        .map(|(name, value)| nul_terminated_bytes(&format!("{name}={value}")))
+        .collect::<Vec<_>>();
+    let mut current_environment = current_environment_storage
+        .iter()
+        .map(|entry| entry.as_ptr() as usize)
+        .collect::<Vec<_>>();
+    current_environment.push(0);
+    let current_environment_value = current_environment.as_mut_ptr() as usize;
+    let current_wide_environment_storage = environment
+        .iter()
+        .map(|(name, value)| nul_terminated_wide(&format!("{name}={value}")))
+        .collect::<Vec<_>>();
+    let mut current_wide_environment = current_wide_environment_storage
+        .iter()
+        .map(|entry| entry.as_ptr() as usize)
+        .collect::<Vec<_>>();
+    current_wide_environment.push(0);
+    let current_wide_environment_value = current_wide_environment.as_mut_ptr() as usize;
     let program_name_w_storage = nul_terminated_wide(module_path);
     let program_name_a_storage = command_line_a(&program_name_w_storage).into_boxed_slice();
     NativeCrtStartup {
@@ -286,11 +304,15 @@ fn build_crt_startup(
         wide_argv,
         wide_argv_value,
         _environment_storage: environment_storage,
-        environment,
-        environment_value,
+        environment: initial_environment,
         _wide_environment_storage: wide_environment_storage,
-        wide_environment,
-        wide_environment_value,
+        wide_environment: initial_wide_environment,
+        _current_environment_storage: current_environment_storage,
+        current_environment,
+        current_environment_value,
+        _current_wide_environment_storage: current_wide_environment_storage,
+        current_wide_environment,
+        current_wide_environment_value,
         _program_name_a_storage: program_name_a_storage,
         _program_name_w_storage: program_name_w_storage,
     }
@@ -334,6 +356,51 @@ fn ensure_crt_startup(process: &NativeProcessContext) {
             );
         }
     }
+}
+
+pub(super) fn native_crt_refresh_environment(process: &NativeProcessContext) {
+    let Ok(environment) = process
+        .environment
+        .lock()
+        .map(|environment| environment.clone())
+    else {
+        return;
+    };
+    let Ok(mut startup) = process.crt_startup.lock() else {
+        return;
+    };
+    let Some(startup) = startup.as_mut() else {
+        return;
+    };
+
+    let current_environment_storage = environment
+        .iter()
+        .map(|(name, value)| nul_terminated_bytes(&format!("{name}={value}")))
+        .collect::<Vec<_>>();
+    let mut current_environment = current_environment_storage
+        .iter()
+        .map(|entry| entry.as_ptr() as usize)
+        .collect::<Vec<_>>();
+    current_environment.push(0);
+    let current_environment_value = current_environment.as_mut_ptr() as usize;
+
+    let current_wide_environment_storage = environment
+        .iter()
+        .map(|(name, value)| nul_terminated_wide(&format!("{name}={value}")))
+        .collect::<Vec<_>>();
+    let mut current_wide_environment = current_wide_environment_storage
+        .iter()
+        .map(|entry| entry.as_ptr() as usize)
+        .collect::<Vec<_>>();
+    current_wide_environment.push(0);
+    let current_wide_environment_value = current_wide_environment.as_mut_ptr() as usize;
+
+    startup._current_environment_storage = current_environment_storage;
+    startup.current_environment = current_environment;
+    startup.current_environment_value = current_environment_value;
+    startup._current_wide_environment_storage = current_wide_environment_storage;
+    startup.current_wide_environment = current_wide_environment;
+    startup.current_wide_environment_value = current_wide_environment_value;
 }
 
 pub(super) extern "win64" fn native_crt_configure_narrow_argv(_mode: i32) -> i32 {
@@ -482,7 +549,7 @@ pub(super) extern "win64" fn native_crt_p_environ() -> *mut *mut *mut i8 {
         .ok()
         .and_then(|mut startup| {
             startup.as_mut().map(|startup| {
-                std::ptr::addr_of_mut!(startup.environment_value).cast::<*mut *mut i8>()
+                std::ptr::addr_of_mut!(startup.current_environment_value).cast::<*mut *mut i8>()
             })
         })
         .unwrap_or(std::ptr::null_mut())
@@ -499,7 +566,8 @@ pub(super) extern "win64" fn native_crt_p_wenviron() -> *mut *mut *mut u16 {
         .ok()
         .and_then(|mut startup| {
             startup.as_mut().map(|startup| {
-                std::ptr::addr_of_mut!(startup.wide_environment_value).cast::<*mut *mut u16>()
+                std::ptr::addr_of_mut!(startup.current_wide_environment_value)
+                    .cast::<*mut *mut u16>()
             })
         })
         .unwrap_or(std::ptr::null_mut())
@@ -3060,10 +3128,6 @@ mod startup_tests {
         assert_eq!(
             startup.wide_argv_value,
             startup.wide_argv.as_mut_ptr() as usize
-        );
-        assert_eq!(
-            startup.wide_environment_value,
-            startup.wide_environment.as_mut_ptr() as usize
         );
         assert_eq!(
             std::ffi::CStr::from_bytes_with_nul(&startup._program_name_a_storage)

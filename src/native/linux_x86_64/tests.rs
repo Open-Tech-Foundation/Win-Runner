@@ -2892,6 +2892,65 @@ mod protection_tests {
     }
 
     #[test]
+    fn crt_current_environment_tracks_updates_without_changing_initial_arrays() {
+        let child = unsafe { super::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            let Some(process) = super::process_ctx() else {
+                unsafe { _exit(127) };
+            };
+            let key = "WINRUN_CRT_ENV_SNAPSHOT";
+            *process.environment.lock().unwrap() = vec![(key.to_string(), "before".to_string())];
+            *process.crt_startup.lock().unwrap() = None;
+            super::native_crt_initialize_narrow_environment();
+
+            let initial_narrow = unsafe { super::native_crt_p_initenv().read() };
+            let current_narrow_slot = super::native_crt_p_environ();
+            let initial_wide = unsafe { super::native_crt_p_winitenv().read() };
+            let current_wide_slot = super::native_crt_p_wenviron();
+            if initial_narrow.is_null()
+                || current_narrow_slot.is_null()
+                || initial_wide.is_null()
+                || current_wide_slot.is_null()
+            {
+                unsafe { _exit(126) };
+            }
+
+            let key_wide: Vec<u16> = key.encode_utf16().chain([0]).collect();
+            let after: Vec<u16> = "after ☀".encode_utf16().chain([0]).collect();
+            if super::native_set_environment_variable_w(key_wide.as_ptr(), after.as_ptr()) != 1 {
+                unsafe { _exit(125) };
+            }
+            let current_narrow = unsafe { current_narrow_slot.read() };
+            let current_wide = unsafe { current_wide_slot.read() };
+            if unsafe { std::ffi::CStr::from_ptr(*initial_narrow) }.to_bytes()
+                != b"WINRUN_CRT_ENV_SNAPSHOT=before"
+                || unsafe { std::ffi::CStr::from_ptr(*current_narrow) }.to_bytes()
+                    != b"WINRUN_CRT_ENV_SNAPSHOT=after \xe2\x98\x80"
+            {
+                unsafe { _exit(124) };
+            }
+            let read_wide = |entry: *mut u16| unsafe {
+                let mut length = 0;
+                while *entry.add(length) != 0 {
+                    length += 1;
+                }
+                String::from_utf16(std::slice::from_raw_parts(entry, length)).unwrap()
+            };
+            if read_wide(unsafe { initial_wide.read() }) != "WINRUN_CRT_ENV_SNAPSHOT=before"
+                || read_wide(unsafe { current_wide.read() }) != "WINRUN_CRT_ENV_SNAPSHOT=after ☀"
+            {
+                unsafe { _exit(123) };
+            }
+            unsafe { _exit(0) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { waitpid(child, &mut status, 0) }, child);
+        assert_eq!(status & 0x7f, 0);
+        assert_eq!((status >> 8) & 0xff, 0);
+    }
+
+    #[test]
     fn import_binding_checks_the_dll_as_well_as_the_function() {
         for export in [
             "_wgetenv",

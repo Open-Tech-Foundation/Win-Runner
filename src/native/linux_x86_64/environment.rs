@@ -140,6 +140,8 @@ pub(super) extern "win64" fn native_set_environment_variable_w(
     if let Ok(mut block) = process.environment_block.lock() {
         *block = environment_strings(&environment);
     }
+    drop(environment);
+    native_crt_refresh_environment(&process);
     1
 }
 pub(super) extern "win64" fn native_need_current_directory_for_exe_path_w(

@@ -93,6 +93,8 @@ Items remain open until implementation and relevant verification are complete.
     `__p___argc`, `__p___argv`, and `__getmainargs`.
   - [x] Provide stable UTF-16 `wargv` and environment arrays through
     `_configure_wide_argv`, `__p___wargv`, and the initial/environment accessors.
+  - [x] Keep current `environ` arrays synchronized with Windows environment
+    updates while preserving the initial environment arrays.
   - [x] Populate `_acmdln`/`_wcmdln` and `__initenv`/`__winitenv` data imports,
     with `__p__acmdln` and `__p__wcmdln` accessors, from process startup state.
   - [x] Populate `__p__pgmptr` and `__p__wpgmptr` with the process executable
