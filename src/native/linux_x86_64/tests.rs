@@ -2141,6 +2141,81 @@ mod protection_tests {
     }
 
     #[test]
+    fn ucrt_acrt_iob_func_returns_only_the_three_standard_streams() {
+        let base = super::NATIVE_CRT_IOB.as_ptr() as usize;
+        for index in 0..3 {
+            assert_eq!(
+                super::native_crt_acrt_iob_func(index) as usize,
+                base + index as usize * 64
+            );
+        }
+        assert!(super::native_crt_acrt_iob_func(3).is_null());
+        assert!(super::supports_import("UCRTBASE.DLL", "__acrt_iob_func"));
+        assert!(!super::supports_import("MSVCRT.DLL", "__acrt_iob_func"));
+    }
+
+    #[test]
+    fn ucrt_common_vsprintf_formats_narrow_va_list_arguments() {
+        let text = b"world\0";
+        let format = b"hello %s %d %#x %I64x%%\0";
+        let mut arguments = [
+            text.as_ptr() as u64,
+            0xa5a5_5a5a_ffff_fff9u64,
+            0xfeed_face_0000_002au64,
+            0x1234_5678_9abc_def0u64,
+        ];
+        let mut output = [0xa5; 64];
+        let written = super::native_crt_stdio_common_vsprintf(
+            0,
+            output.as_mut_ptr(),
+            output.len(),
+            format.as_ptr(),
+            std::ptr::null_mut(),
+            arguments.as_mut_ptr().cast(),
+        );
+        assert_eq!(written, 37);
+        assert_eq!(
+            &output[..written as usize],
+            b"hello world -7 0x2a 123456789abcdef0%"
+        );
+        assert_eq!(output[written as usize], 0);
+        assert!(super::supports_import(
+            "UCRTBASE.DLL",
+            "__stdio_common_vfprintf"
+        ));
+        assert!(super::supports_import(
+            "UCRTBASE.DLL",
+            "__stdio_common_vsprintf"
+        ));
+        assert!(super::supports_import(
+            "api-ms-win-crt-stdio-l1-1-0.dll",
+            "__stdio_common_vsprintf"
+        ));
+        assert!(!super::supports_import(
+            "MSVCRT.DLL",
+            "__stdio_common_vfprintf"
+        ));
+    }
+
+    #[test]
+    fn ucrt_common_vfprintf_rejects_the_input_stream() {
+        let format = b"input is not writable\n\0";
+        let stream = super::native_crt_acrt_iob_func(0);
+        assert_eq!(
+            super::native_crt_stdio_common_vfprintf(
+                0,
+                stream,
+                format.as_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ),
+            -1
+        );
+        assert_eq!(unsafe { super::native_crt_errno().read() }, 9);
+        unsafe { super::native_crt_errno().write(0) };
+    }
+
+    #[test]
     fn crt_getenv_reads_guest_environment_case_insensitively() {
         let key: Vec<u16> = "WINRUN_TEST_CRT_GETENV"
             .encode_utf16()

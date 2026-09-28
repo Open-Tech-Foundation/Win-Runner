@@ -51,8 +51,10 @@ All notable changes to this project will be documented in this file.
 - Add UCRT narrow startup state for stable `argc`/`argv` and environment arrays,
   plus `_crt_atexit`/on-exit registration and reverse-order callback execution.
   Implement `_configure_narrow_argv`, `_initialize_narrow_environment`,
-  `_set_new_mode`, and `_configthreadlocale`; UCRT stdio, `_seh_filter_exe`,
-  and remaining startup exports are still pending.
+  `_set_new_mode`, and `_configthreadlocale`. Add the UCRT standard stream table
+  and narrow `__stdio_common_vfprintf`/`__stdio_common_vsprintf` formatting
+  subset; wide formatting, file-backed streams, and `_seh_filter_exe` remain
+  pending.
 - Detect .NET Framework `_CorExeMain`/`_CorDllMain` images and report the clear
   unsupported-runtime limitation in `winrun inspect` and native execution.
 - Replaced the PS1 interpreter's proposed install-script .NET API expansion

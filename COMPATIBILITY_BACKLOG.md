@@ -95,6 +95,10 @@ Items remain open until implementation and relevant verification are complete.
     `_set_new_mode`, and `_configthreadlocale`.
   - [x] Register `_crt_atexit`, `_register_onexit_function`, and `_onexit`
     callbacks and execute them in reverse registration order on CRT exit.
+  - [x] Add the standard UCRT stream table and a narrow formatting subset for
+    `__acrt_iob_func`, `__stdio_common_vfprintf`, and
+    `__stdio_common_vsprintf`; wide formatting and file-backed `FILE` streams
+    remain unsupported.
   - [ ] Add `_seh_filter_exe` and remaining startup exports.
 - [ ] Add basic `msvcrt.dll` output and file I/O, including `printf` and `fopen`.
 - [ ] Add VCRUNTIME140 exception handlers, `_CxxThrowException`, and memory
