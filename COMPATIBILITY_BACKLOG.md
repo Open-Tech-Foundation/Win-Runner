@@ -99,7 +99,9 @@ Items remain open until implementation and relevant verification are complete.
     `__acrt_iob_func`, `__stdio_common_vfprintf`, and
     `__stdio_common_vsprintf`; wide formatting remains unsupported.
   - [x] Add unbuffered WinFS-backed `fopen`, `fread`, `fwrite`, and `fclose`;
-    buffering, seek, EOF/error state, and wide file modes remain unsupported.
+    buffering, EOF/error state, and wide file modes remain unsupported.
+  - [x] Add `fseek`/`ftell`, `_fseeki64`/`_ftelli64`, and `rewind` for these
+    file-backed streams.
   - [x] Add `strtol`, `strtod`, and `strstr` with Windows `long` width,
     end-pointer reporting, radix parsing, and common decimal input handling.
   - [x] Add in-place `qsort` and `_time64`; CRT `fopen`/`fread`/`fclose` and

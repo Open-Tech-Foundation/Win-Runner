@@ -55,8 +55,10 @@ All notable changes to this project will be documented in this file.
   and narrow `__stdio_common_vfprintf`/`__stdio_common_vsprintf` formatting
   subset. Wide formatting and `_seh_filter_exe` remain pending.
 - Add unbuffered CRT `fopen`, `fread`, `fwrite`, and `fclose` streams backed by
-  WinFS file handles, including append-mode writes; buffered state and seeking
-  APIs remain pending.
+  WinFS file handles, including append-mode writes; buffered state remains
+  pending.
+- Add CRT `fseek`/`ftell`, `_fseeki64`/`_ftelli64`, and `rewind` over WinFS file
+  handles.
 - Add CRT `strtol`, `strtod`, and `strstr` shims with radix parsing, end-pointer
   reporting, common decimal/special floating-point input, and range errors.
 - Add in-place CRT `qsort` using the guest comparator and `_time64` using the

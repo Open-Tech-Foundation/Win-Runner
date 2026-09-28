@@ -2103,6 +2103,17 @@ mod protection_tests {
         assert_eq!(super::native_crt_fread(output.as_mut_ptr(), 2, 4, file), 4);
         assert_eq!(&output[..8], b"abcdefgh");
         assert_eq!(super::native_crt_fread(output.as_mut_ptr(), 1, 1, file), 0);
+        assert_eq!(super::native_crt_ftell(file), 8);
+        assert_eq!(super::native_crt_fseek(file, 2, 0), 0);
+        assert_eq!(super::native_crt_ftell(file), 2);
+        assert_eq!(super::native_crt_fseeki64(file, -2, 2), 0);
+        assert_eq!(super::native_crt_ftelli64(file), 6);
+        super::native_crt_rewind(file);
+        assert_eq!(super::native_crt_ftell(file), 0);
+        assert!(super::supports_import(
+            "api-ms-win-crt-stdio-l1-1-0.dll",
+            "_fseeki64"
+        ));
         assert_eq!(super::native_crt_fclose(file), 0);
 
         let file = super::native_crt_fopen(path.as_ptr(), read_mode.as_ptr());

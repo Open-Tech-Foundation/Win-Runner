@@ -1640,6 +1640,63 @@ pub(super) extern "win64" fn native_crt_fclose(stream: *mut u8) -> i32 {
         -1
     }
 }
+
+fn native_crt_file_handle_for_seek(stream: *mut u8) -> Option<u64> {
+    let file = native_crt_file(stream)?;
+    Some(unsafe { (*file).handle })
+}
+
+pub(super) extern "win64" fn native_crt_fseeki64(stream: *mut u8, offset: i64, origin: i32) -> i32 {
+    let Some(handle) = native_crt_file_handle_for_seek(stream) else {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(9));
+        return -1;
+    };
+    if !(0..=2).contains(&origin)
+        || native_set_file_pointer_ex(handle, offset, std::ptr::null_mut(), origin as u32) == 0
+    {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+        return -1;
+    }
+    0
+}
+
+pub(super) extern "win64" fn native_crt_fseek(stream: *mut u8, offset: i32, origin: i32) -> i32 {
+    native_crt_fseeki64(stream, i64::from(offset), origin)
+}
+
+pub(super) extern "win64" fn native_crt_ftelli64(stream: *mut u8) -> i64 {
+    let Some(handle) = native_crt_file_handle_for_seek(stream) else {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(9));
+        return -1;
+    };
+    let mut position = 0i64;
+    if native_set_file_pointer_ex(handle, 0, &mut position, 1) == 0 {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+        -1
+    } else {
+        position
+    }
+}
+
+pub(super) extern "win64" fn native_crt_ftell(stream: *mut u8) -> i32 {
+    let position = native_crt_ftelli64(stream);
+    if position < 0 {
+        return -1;
+    }
+    match i32::try_from(position) {
+        Ok(position) => position,
+        Err(_) => {
+            THREAD_CRT_ERRNO.with(|errno| errno.set(75)); // EOVERFLOW
+            -1
+        }
+    }
+}
+
+pub(super) extern "win64" fn native_crt_rewind(stream: *mut u8) {
+    if native_crt_fseeki64(stream, 0, 0) == 0 {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(0));
+    }
+}
 pub(super) extern "win64" fn native_crt_malloc(size: usize) -> *mut c_void {
     unsafe { malloc(size.max(1)) }
 }
