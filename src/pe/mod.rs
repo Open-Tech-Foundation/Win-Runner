@@ -69,6 +69,8 @@ impl PeImage {
 pub struct TlsDir {
     /// Template bytes (raw data) to copy into each thread's TLS block.
     pub raw_data: Vec<u8>,
+    /// RVA of the template in the mapped image, after base relocations.
+    pub raw_data_rva: u32,
     /// Extra zero bytes after the template.
     pub zero_fill: u32,
     /// RVA of the slot-index DWORD (loader writes the assigned index).
@@ -471,6 +473,7 @@ fn load_inner(data: &[u8], strict: bool) -> Result<PeImage, String> {
         }
         Some(TlsDir {
             raw_data: image[start..end].to_vec(),
+            raw_data_rva: start as u32,
             zero_fill,
             index_rva,
             callbacks,

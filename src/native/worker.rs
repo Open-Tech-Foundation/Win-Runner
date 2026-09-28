@@ -22,6 +22,7 @@ pub(crate) fn write_image(image: &PeImage, directory: &Path) -> Result<PathBuf, 
     let tls = image.tls.as_ref().map(|tls| {
         serde_json::json!({
             "raw_data": tls.raw_data,
+            "raw_data_rva": tls.raw_data_rva,
             "zero_fill": tls.zero_fill,
             "index_rva": tls.index_rva,
             "callbacks": tls.callbacks,
@@ -108,6 +109,9 @@ pub(crate) fn read_image(directory: &Path) -> Result<PeImage, String> {
             Ok::<_, String>(TlsDir {
                 raw_data: serde_json::from_value(value["raw_data"].clone())
                     .map_err(|error| format!("invalid native worker TLS bytes: {error}"))?,
+                raw_data_rva: value["raw_data_rva"]
+                    .as_u64()
+                    .ok_or("invalid TLS data RVA")? as u32,
                 zero_fill: value["zero_fill"].as_u64().ok_or("invalid TLS zero-fill")? as u32,
                 index_rva: value["index_rva"].as_u64().ok_or("invalid TLS index RVA")? as u32,
                 callbacks: serde_json::from_value(value["callbacks"].clone())

@@ -2,6 +2,11 @@
 
 use super::*;
 
+thread_local! {
+    static THREAD_ADDITIONAL_TLS_DATA: std::cell::RefCell<Vec<(u32, Box<[u8]>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 pub(super) fn put64(dst: &mut [u8], off: usize, value: u64) {
     dst[off..off + 8].copy_from_slice(&value.to_le_bytes());
 }
@@ -41,6 +46,7 @@ pub(super) fn set_teb_stack_bounds(teb: &mut [u8; 0x1000]) {
     }
 }
 pub(super) fn install_thread_teb(teb: &mut [u8; 0x1000]) -> bool {
+    THREAD_ADDITIONAL_TLS_DATA.with(|data| data.borrow_mut().clear());
     set_teb_stack_bounds(teb);
     let base = teb.as_ptr() as u64;
     if !unsafe { set_gs(base) } {
@@ -50,29 +56,78 @@ pub(super) fn install_thread_teb(teb: &mut [u8; 0x1000]) -> bool {
     true
 }
 pub(super) fn setup_tls(mapping: &Mapping, img: &PeImage) -> Result<Option<NativeTls>, String> {
-    let Some(tls) = &img.tls else { return Ok(None) };
-    let mut data = tls.raw_data.clone();
-    data.resize(data.len() + tls.zero_fill as usize, 0);
-    let mut out = NativeTls {
-        teb: Box::new([0; 0x1000]),
-        slots: Box::new([0; 64]),
-        _data: data,
-        _ldr: Box::new([0; 64]),
-    };
-    out.slots[0] = out._data.as_ptr() as u64;
-    let teb = out.teb.as_ptr() as u64;
-    let peb = teb + 0x800;
-    put64(&mut out.teb[..], 0x30, teb);
-    put64(&mut out.teb[..], 0x58, out.slots.as_ptr() as u64);
-    put64(&mut out.teb[..], 0x60, peb);
-    put64(&mut out.teb[..], 0x800 + 0x10, img.image_base);
-    put64(&mut out.teb[..], 0x800 + 0x20, out._ldr.as_ptr() as u64);
-    let off = tls.index_rva as usize;
-    if off.checked_add(4).is_none_or(|end| end > mapping.len) {
-        return Err("native TLS index lies outside image".to_string());
+    let mut out = NativeTls::new(img.image_base);
+    if let Some(tls) = &img.tls {
+        let data = tls_template_from_mapping(mapping, tls)
+            .ok_or_else(|| "native TLS template lies outside image".to_string())?;
+        if !out.set_static_tls(0, data) {
+            return Err("native TLS index is outside the supported slot table".to_string());
+        }
+        let off = tls.index_rva as usize;
+        if off.checked_add(4).is_none_or(|end| end > mapping.len) {
+            return Err("native TLS index lies outside image".to_string());
+        }
+        unsafe { (mapping.ptr.add(off) as *mut u32).write_unaligned(0) };
     }
-    unsafe { (mapping.ptr.add(off) as *mut u32).write_unaligned(0) };
     Ok(Some(out))
+}
+
+pub(super) fn tls_template_from_mapping(
+    mapping: &Mapping,
+    tls: &crate::pe::TlsDir,
+) -> Option<Vec<u8>> {
+    let start = tls.raw_data_rva as usize;
+    let end = start.checked_add(tls.raw_data.len())?;
+    if end > mapping.len {
+        return None;
+    }
+    let mut data =
+        unsafe { std::slice::from_raw_parts(mapping.ptr.add(start), end - start) }.to_vec();
+    data.resize(data.len().checked_add(tls.zero_fill as usize)?, 0);
+    Some(data)
+}
+
+pub(super) fn install_current_thread_static_tls(index: u32, template: &[u8]) -> bool {
+    let Some(end) = (index as usize).checked_add(1) else {
+        return false;
+    };
+    if end > 64 {
+        return false;
+    }
+    let teb = THREAD_TEB_BASE.get();
+    if teb == 0 {
+        return false;
+    }
+    let slots = unsafe { ((teb + 0x58) as *const u64).read_unaligned() };
+    if slots == 0 {
+        return false;
+    }
+    let mut data = template.to_vec().into_boxed_slice();
+    let address = data.as_mut_ptr() as u64;
+    unsafe { ((slots as *mut u64).add(index as usize)).write_unaligned(address) };
+    THREAD_ADDITIONAL_TLS_DATA.with(|extra| {
+        let mut extra = extra.borrow_mut();
+        extra.retain(|(existing, _)| *existing != index);
+        extra.push((index, data));
+    });
+    true
+}
+
+pub(super) fn clear_current_thread_static_tls(index: u32) {
+    if index < 64 {
+        let teb = THREAD_TEB_BASE.get();
+        if teb != 0 {
+            let slots = unsafe { ((teb + 0x58) as *const u64).read_unaligned() };
+            if slots != 0 {
+                unsafe { ((slots as *mut u64).add(index as usize)).write_unaligned(0) };
+            }
+        }
+    }
+    THREAD_ADDITIONAL_TLS_DATA.with(|extra| {
+        extra
+            .borrow_mut()
+            .retain(|(existing, _)| *existing != index)
+    });
 }
 pub(super) unsafe fn set_gs(base: u64) -> bool {
     let result: u64;
@@ -217,6 +272,30 @@ pub(super) fn notify_guest_thread_modules(process: &NativeProcessContext, attach
         }
     }
 }
+
+pub(super) fn initialize_module_static_tls(
+    process: &NativeProcessContext,
+    tls: &mut NativeTls,
+) -> bool {
+    let Ok(modules) = process.loaded_modules.lock() else {
+        return false;
+    };
+    let mut templates: Vec<_> = modules
+        .values()
+        .filter_map(|module| {
+            Some((
+                module.load_order,
+                module.static_tls_index?,
+                module.static_tls_template.as_ref()?.clone(),
+            ))
+        })
+        .collect();
+    templates.sort_by_key(|module| module.0);
+    drop(modules);
+    templates
+        .into_iter()
+        .all(|(_, index, template)| tls.set_static_tls(index, template))
+}
 pub(super) extern "win64" fn native_tls_get_value(index: u32) -> u64 {
     let Some(process) = process_ctx() else {
         return 0;
@@ -293,7 +372,7 @@ pub(super) extern "win64" fn native_fls_set_value(index: u32, value: u64) -> i32
 #[cfg(test)]
 mod tls_callback_tests {
     use super::{invoke_tls_callbacks, notify_guest_thread_modules};
-    use crate::native::linux_x86_64::state::NativeLoadedModule;
+    use crate::native::linux_x86_64::state::{NativeLoadedModule, NativeTls};
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Mutex;
 
@@ -343,6 +422,8 @@ mod tls_callback_tests {
             exports: Vec::new(),
             entry_point: Some(record_dll_thread_event as *const () as usize as u64),
             tls_callbacks: vec![0],
+            static_tls_index: None,
+            static_tls_template: None,
             load_order: 1,
         };
         THREAD_EVENTS.lock().unwrap().clear();
@@ -353,5 +434,48 @@ mod tls_callback_tests {
 
         assert_eq!(*THREAD_EVENTS.lock().unwrap(), vec![12, 22, 23, 13]);
         process.loaded_modules.lock().unwrap().remove(&base);
+    }
+
+    #[test]
+    fn clones_per_thread_static_tls_templates_into_independent_slots() {
+        let mut template = NativeTls::new(0x1400_0000);
+        assert!(template.set_static_tls(0, vec![1, 2, 3, 4]));
+        assert!(template.set_static_tls(3, vec![5, 6, 0, 0]));
+        let thread_tls = template.clone_for_thread();
+
+        assert_ne!(template.slots[0], thread_tls.slots[0]);
+        assert_ne!(template.slots[3], thread_tls.slots[3]);
+        unsafe {
+            assert_eq!(
+                std::slice::from_raw_parts(thread_tls.slots[0] as *const u8, 4),
+                [1, 2, 3, 4]
+            );
+            assert_eq!(
+                std::slice::from_raw_parts(thread_tls.slots[3] as *const u8, 4),
+                [5, 6, 0, 0]
+            );
+            (thread_tls.slots[3] as *mut u8).write(9);
+            assert_eq!(
+                std::slice::from_raw_parts(template.slots[3] as *const u8, 4),
+                [5, 6, 0, 0]
+            );
+        }
+    }
+
+    #[test]
+    fn installs_and_clears_tls_for_the_current_guest_thread() {
+        let mut tls = NativeTls::new(0x1400_0000);
+        assert!(super::install_thread_teb(&mut tls.teb));
+        assert!(super::install_current_thread_static_tls(2, &[7, 8, 0, 0]));
+        let address = tls.slots[2];
+        assert_ne!(address, 0);
+        unsafe {
+            assert_eq!(
+                std::slice::from_raw_parts(address as *const u8, 4),
+                [7, 8, 0, 0]
+            );
+        }
+        super::clear_current_thread_static_tls(2);
+        assert_eq!(tls.slots[2], 0);
     }
 }

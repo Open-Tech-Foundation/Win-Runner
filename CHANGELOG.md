@@ -18,13 +18,14 @@ All notable changes to this project will be documented in this file.
   ordinal, and shim-forwarded exports.
 - Resolve acyclic guest-DLL dependency graphs recursively and map common
   Kernel32, UCRT, and Advapi32 API-set names onto existing shim registrations.
-- Invoke process-attach TLS callbacks for the main image and DLLs; reject DLL
-  TLS templates that need per-thread static storage until that storage is
-  implemented.
+- Invoke process-attach TLS callbacks for the main image and DLLs, with static
+  TLS storage initialized from mapped template bytes and zero-fill.
 - Send DLL/TLS thread-attach and thread-detach notifications around guest
   `CreateThread` start routines using modules captured in load order.
 - Resolve cyclic guest-DLL import references by publishing mapped exports while
   their dependency imports are patched.
+- Allocate DLL static TLS templates and zero-fill for the loading thread and
+  for later guest threads cloned from the process TLS template.
 
 - Added a "Why Win-Runner?" section to the README explaining the project's focus
   and how it differs from Wine, VMs, and Windows CI runners.

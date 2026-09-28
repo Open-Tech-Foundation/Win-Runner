@@ -126,16 +126,18 @@ Items remain open until implementation and relevant verification are complete.
       recursively resolve guest-DLL dependencies and shim-backed imports,
       invoke process-attach `DllMain`, and resolve named/ordinal exports plus
       forwarders to shim-backed system modules.
-    - [x] Invoke main-image and DLL TLS process-attach callbacks. DLL TLS
-      directories with non-empty templates or zero-fill remain unsupported.
+    - [x] Invoke main-image and DLL TLS process-attach callbacks. DLL static
+      TLS templates are allocated for the loading thread and future threads;
+      already-running sibling threads are not retrofitted yet.
     - [x] Send TLS and `DllMain` thread-attach/detach notifications around
       guest `CreateThread` routines, ordered by module load sequence.
     - [x] Resolve cyclic guest-DLL import references using provisional module
       records so each side can resolve the other's exports.
+    - [x] Allocate DLL static TLS from its template and zero-fill for the
+      loading thread and subsequently created threads.
     - [ ] Match Windows initialization order for cyclic dependency graphs,
-      support per-thread static TLS and notifications for already-running
-      threads when a DLL is loaded, and implement FreeLibrary reference-count
-      and unload semantics.
+      retrofit already-running sibling threads when a DLL is loaded, and
+      implement FreeLibrary reference-count and unload semantics.
   - [ ] Host `hostfxr.dll`, `hostpolicy.dll`, and `coreclr.dll` using the
     supported native hosting interfaces; cover shared, app-local, and
     self-contained runtime layouts, then add single-file apps.

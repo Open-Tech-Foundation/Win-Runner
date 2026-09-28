@@ -504,7 +504,7 @@ fn run_rust_baseline_argv_with_fs_impl(
             mapping_next: AtomicU64::new(0x9800_0000),
             gs_base: AtomicU64::new(0),
             tls_template: Mutex::new(tls.as_ref().map(NativeTls::clone_for_thread)),
-            dynamic_tls: Mutex::new(DynamicTlsSlots::new(tls.is_some())),
+            dynamic_tls: Mutex::new(DynamicTlsSlots::new(img.tls.is_some())),
             threads: Mutex::new(HashMap::new()),
             thread_next: AtomicU64::new(0x8000_0000),
             semaphores: Mutex::new(HashMap::new()),
@@ -548,6 +548,12 @@ fn run_rust_baseline_argv_with_fs_impl(
                         .as_ref()
                         .map(|tls| tls.callbacks.clone())
                         .unwrap_or_default(),
+                    static_tls_index: img.tls.as_ref().map(|_| 0),
+                    static_tls_template: img.tls.as_ref().map(|tls| {
+                        let mut data = tls.raw_data.clone();
+                        data.resize(data.len() + tls.zero_fill as usize, 0);
+                        data
+                    }),
                     load_order: 0,
                 },
             )])),

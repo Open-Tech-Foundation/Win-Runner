@@ -66,22 +66,61 @@ pub(super) struct NativeFind {
 pub(super) struct NativeTls {
     pub(super) teb: Box<[u8; 0x1000]>,
     pub(super) slots: Box<[u64; 64]>,
-    pub(super) _data: Vec<u8>,
+    pub(super) static_tls_data: Vec<Option<Box<[u8]>>>,
     pub(super) _ldr: Box<[u8; 64]>,
 }
 impl NativeTls {
+    pub(super) fn new(image_base: u64) -> Self {
+        let mut out = Self {
+            teb: Box::new([0; 0x1000]),
+            slots: Box::new([0; 64]),
+            static_tls_data: (0..64).map(|_| None).collect(),
+            _ldr: Box::new([0; 64]),
+        };
+        let teb = out.teb.as_ptr() as u64;
+        super::thread_runtime::put64(&mut out.teb[..], 0x30, teb);
+        super::thread_runtime::put64(&mut out.teb[..], 0x58, out.slots.as_ptr() as u64);
+        super::thread_runtime::put64(&mut out.teb[..], 0x60, teb + 0x800);
+        super::thread_runtime::put64(&mut out.teb[..], 0x800 + 0x10, image_base);
+        super::thread_runtime::put64(&mut out.teb[..], 0x800 + 0x20, out._ldr.as_ptr() as u64);
+        out
+    }
+
+    pub(super) fn set_static_tls(&mut self, index: u32, data: Vec<u8>) -> bool {
+        let Some(slot_data) = self.static_tls_data.get_mut(index as usize) else {
+            return false;
+        };
+        *slot_data = Some(data.into_boxed_slice());
+        self.slots[index as usize] = self.static_tls_data[index as usize]
+            .as_ref()
+            .map(|data| data.as_ptr() as u64)
+            .unwrap_or(0);
+        true
+    }
+
+    pub(super) fn clear_static_tls(&mut self, index: u32) -> bool {
+        let Some(slot_data) = self.static_tls_data.get_mut(index as usize) else {
+            return false;
+        };
+        *slot_data = None;
+        self.slots[index as usize] = 0;
+        true
+    }
+
     pub(super) fn clone_for_thread(&self) -> Self {
         let mut out = Self {
             teb: self.teb.clone(),
-            slots: self.slots.clone(),
-            _data: self._data.clone(),
+            slots: Box::new([0; 64]),
+            static_tls_data: self.static_tls_data.clone(),
             _ldr: self._ldr.clone(),
         };
         let teb = out.teb.as_ptr() as u64;
         put64(&mut out.teb[..], 0x30, teb);
         put64(&mut out.teb[..], 0x58, out.slots.as_ptr() as u64);
         put64(&mut out.teb[..], 0x60, teb + 0x800);
-        out.slots[0] = out._data.as_ptr() as u64;
+        for (index, data) in out.static_tls_data.iter().enumerate() {
+            out.slots[index] = data.as_ref().map(|data| data.as_ptr() as u64).unwrap_or(0);
+        }
         put64(&mut out.teb[..], 0x800 + 0x20, out._ldr.as_ptr() as u64);
         out
     }
@@ -196,6 +235,8 @@ pub(super) struct NativeLoadedModule {
     pub(super) exports: Vec<crate::pe::Export>,
     pub(super) entry_point: Option<u64>,
     pub(super) tls_callbacks: Vec<u32>,
+    pub(super) static_tls_index: Option<u32>,
+    pub(super) static_tls_template: Option<Vec<u8>>,
     pub(super) load_order: u64,
 }
 

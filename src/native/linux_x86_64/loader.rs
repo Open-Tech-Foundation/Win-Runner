@@ -201,6 +201,40 @@ mod module_export_tests {
         bytes
     }
 
+    fn add_static_tls(mut bytes: Vec<u8>, initial: &[u8], zero_fill: u32) -> Vec<u8> {
+        let pe = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
+        let coff = pe + 4;
+        let opt = coff + 20;
+        let section = opt + 0xf0;
+        let base = u64::from_le_bytes(bytes[opt + 24..opt + 32].try_into().unwrap());
+        let section_rva = u32::from_le_bytes(bytes[section + 12..section + 16].try_into().unwrap());
+        let raw_size = u32::from_le_bytes(bytes[section + 16..section + 20].try_into().unwrap());
+        let raw_offset = u32::from_le_bytes(bytes[section + 20..section + 24].try_into().unwrap());
+        let tls_rva = section_rva + raw_size;
+        let tls_file_offset = raw_offset as usize + raw_size as usize;
+        let data_rva = tls_rva + 40;
+        let index_rva = data_rva + initial.len() as u32;
+        let needed = 40 + initial.len() + 4;
+        let added_raw_size = (needed as u32 + 0x1ff) & !0x1ff;
+        bytes.resize(tls_file_offset + added_raw_size as usize, 0);
+        let tls = &mut bytes[tls_file_offset..tls_file_offset + 40];
+        tls[0..8].copy_from_slice(&(base + data_rva as u64).to_le_bytes());
+        tls[8..16].copy_from_slice(&(base + data_rva as u64 + initial.len() as u64).to_le_bytes());
+        tls[16..24].copy_from_slice(&(base + index_rva as u64).to_le_bytes());
+        tls[32..36].copy_from_slice(&zero_fill.to_le_bytes());
+        bytes[tls_file_offset + 40..tls_file_offset + 40 + initial.len()].copy_from_slice(initial);
+        let tls_dir = opt + 112 + 9 * 8;
+        bytes[tls_dir..tls_dir + 4].copy_from_slice(&tls_rva.to_le_bytes());
+        bytes[tls_dir + 4..tls_dir + 8].copy_from_slice(&40u32.to_le_bytes());
+        let new_raw_size = raw_size + added_raw_size;
+        bytes[section + 8..section + 12]
+            .copy_from_slice(&(raw_size + added_raw_size).to_le_bytes());
+        bytes[section + 16..section + 20].copy_from_slice(&new_raw_size.to_le_bytes());
+        let size_of_image = (section_rva + new_raw_size + 0xfff) & !0xfff;
+        bytes[opt + 56..opt + 60].copy_from_slice(&size_of_image.to_le_bytes());
+        bytes
+    }
+
     #[test]
     fn get_proc_address_resolves_named_and_ordinal_dll_exports() {
         let handle = 0x7a00_0000;
@@ -217,6 +251,8 @@ mod module_export_tests {
             }],
             entry_point: None,
             tls_callbacks: Vec::new(),
+            static_tls_index: None,
+            static_tls_template: None,
             load_order: 1,
         };
         let process = &*super::TEST_PROCESS;
@@ -253,6 +289,8 @@ mod module_export_tests {
             }],
             entry_point: None,
             tls_callbacks: Vec::new(),
+            static_tls_index: None,
+            static_tls_template: None,
             load_order: 1,
         };
         let process = &*super::TEST_PROCESS;
@@ -404,6 +442,88 @@ mod module_export_tests {
         let mut native_fs = process.fs.lock().unwrap();
         native_fs.fs.delete_file(path_a).unwrap();
         native_fs.fs.delete_file(path_b).unwrap();
+    }
+
+    #[test]
+    fn load_library_installs_static_tls_template_and_zero_fill() {
+        use crate::native::linux_x86_64::state::DynamicTlsSlots;
+        use crate::native::linux_x86_64::state::NativeTls;
+
+        let process = &*super::TEST_PROCESS;
+        let path = r"C:\loader-tests\static-tls.dll";
+        let bytes = add_static_tls(
+            dll_fixture(&[], None, 0x0000_5003_0000_0000),
+            &[0x31, 0x42, 0x53],
+            2,
+        );
+        let image = crate::pe::load_lenient(&bytes).unwrap();
+        let tls_index_rva = image.tls.as_ref().unwrap().index_rva;
+        let old_template = process
+            .tls_template
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(NativeTls::clone_for_thread);
+        let old_slots = {
+            let slots = process.dynamic_tls.lock().unwrap();
+            DynamicTlsSlots {
+                active: slots.active,
+                generation: slots.generation,
+                reserved: slots.reserved,
+                reserved_static: slots.reserved_static,
+            }
+        };
+        let mut current_tls = NativeTls::new(0x1400_0000);
+        assert!(super::thread_runtime::install_thread_teb(
+            &mut current_tls.teb
+        ));
+        *process.tls_template.lock().unwrap() = Some(current_tls.clone_for_thread());
+        *process.dynamic_tls.lock().unwrap() = DynamicTlsSlots::new(false);
+        {
+            let mut native_fs = process.fs.lock().unwrap();
+            native_fs.fs.mkdir(r"C:\loader-tests").unwrap();
+            native_fs.fs.write_file(path, bytes.clone()).unwrap();
+        }
+
+        let name: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+        let handle = native_load_library_ex_w(name.as_ptr(), 0, 0);
+        assert_ne!(handle, 0, "TLS DLL loads");
+        let assigned_index =
+            unsafe { std::ptr::read_unaligned((handle + u64::from(tls_index_rva)) as *const u32) };
+        assert_eq!(assigned_index, 0);
+        let address = current_tls.slots[assigned_index as usize];
+        assert_ne!(address, 0);
+        unsafe {
+            assert_eq!(
+                std::slice::from_raw_parts(address as *const u8, 5),
+                [0x31, 0x42, 0x53, 0, 0]
+            );
+        }
+        let next_thread = process
+            .tls_template
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .clone_for_thread();
+        assert_ne!(address, next_thread.slots[assigned_index as usize]);
+        unsafe {
+            assert_eq!(
+                std::slice::from_raw_parts(
+                    next_thread.slots[assigned_index as usize] as *const u8,
+                    5
+                ),
+                [0x31, 0x42, 0x53, 0, 0]
+            );
+        }
+
+        process.loaded_modules.lock().unwrap().remove(&handle);
+        super::thread_runtime::clear_current_thread_static_tls(assigned_index);
+        *process.dynamic_tls.lock().unwrap() = old_slots;
+        *process.tls_template.lock().unwrap() = old_template;
+        process.fs.lock().unwrap().fs.delete_file(path).unwrap();
+        super::context::THREAD_TEB_BASE.set(0);
+        unsafe { super::thread_runtime::set_gs(0) };
     }
 }
 
@@ -648,12 +768,7 @@ fn load_guest_module_inner(
     let mut provisional_module = None;
     let result = (|| {
         let image = crate::pe::load_lenient(&bytes).ok()?;
-        if !image.is_dll
-            || image
-                .tls
-                .as_ref()
-                .is_some_and(|tls| !tls.raw_data.is_empty() || tls.zero_fill != 0)
-        {
+        if !image.is_dll {
             return None;
         }
         let tls_callbacks = image
@@ -670,6 +785,12 @@ fn load_guest_module_inner(
         };
         protect_exec(&mapping).ok()?;
         let base = mapping.ptr as u64;
+        let static_tls_template = match image.tls.as_ref() {
+            Some(tls) => Some(super::thread_runtime::tls_template_from_mapping(
+                &mapping, tls,
+            )?),
+            None => None,
+        };
         let process = process_ctx()?;
         let tls_index = if tls_index_rva.is_some() {
             Some(super::thread_runtime::reserve_module_tls_slot(&process)?)
@@ -695,6 +816,8 @@ fn load_guest_module_inner(
                 .then(|| base.checked_add(u64::from(image.entry_rva)))
                 .flatten(),
             tls_callbacks: tls_callbacks.clone(),
+            static_tls_index: tls_index,
+            static_tls_template: static_tls_template.clone(),
             load_order: process.module_next.fetch_add(1, Ordering::AcqRel),
         };
         let handle = module.base;
@@ -746,6 +869,16 @@ fn load_guest_module_inner(
                 ptr::write_unaligned(mapping.ptr.add(offset).cast::<u64>(), target);
             }
         }
+        if let (Some(index), Some(template)) = (tls_index, static_tls_template.as_ref()) {
+            if !super::thread_runtime::install_current_thread_static_tls(index, template) {
+                return None;
+            }
+            let mut tls_template = process.tls_template.lock().ok()?;
+            let tls_template = tls_template.as_mut()?;
+            if !tls_template.set_static_tls(index, template.clone()) {
+                return None;
+            }
+        }
         super::thread_runtime::invoke_tls_callbacks(base, &tls_callbacks, 1);
         if image.entry_rva != 0 {
             let entry = base.checked_add(image.entry_rva as u64)?;
@@ -771,6 +904,12 @@ fn load_guest_module_inner(
                 modules.remove(&handle);
             }
             if let Some(index) = tls_index {
+                if let Ok(mut tls_template) = process.tls_template.lock() {
+                    if let Some(tls_template) = tls_template.as_mut() {
+                        tls_template.clear_static_tls(index);
+                    }
+                }
+                super::thread_runtime::clear_current_thread_static_tls(index);
                 super::thread_runtime::release_module_tls_slot(&process, index);
             }
         }

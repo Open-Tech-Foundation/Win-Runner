@@ -414,6 +414,11 @@ pub(super) extern "win64" fn native_create_thread(
         drop(count);
         let mut _tls = tls;
         if let Some(tls) = _tls.as_mut() {
+            if !thread_runtime::initialize_module_static_tls(&thread_process, tls) {
+                return 1;
+            }
+        }
+        if let Some(tls) = _tls.as_mut() {
             set_teb_stack_bounds(&mut tls.teb);
             if !unsafe { set_gs(tls.teb.as_ptr() as u64) } {
                 return 1;
