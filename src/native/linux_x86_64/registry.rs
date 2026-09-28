@@ -65,6 +65,8 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                     | "atoi"
                     | "strtol"
                     | "strtod"
+                    | "qsort"
+                    | "_time64"
                     | "signal"
                     | "tolower"
                     | "toupper"
@@ -225,6 +227,8 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "atoi" => Some(native_crt_atoi as *const () as usize as u64),
         "strtol" => Some(native_crt_strtol as *const () as usize as u64),
         "strtod" => Some(native_crt_strtod as *const () as usize as u64),
+        "qsort" => Some(native_crt_qsort as *const () as usize as u64),
+        "_time64" => Some(native_crt_time64 as *const () as usize as u64),
         "signal" => Some(native_crt_signal as *const () as usize as u64),
         "tolower" => Some(native_crt_tolower as *const () as usize as u64),
         "toupper" => Some(native_crt_toupper as *const () as usize as u64),

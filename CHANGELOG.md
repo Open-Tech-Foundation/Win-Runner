@@ -57,6 +57,8 @@ All notable changes to this project will be documented in this file.
   pending.
 - Add CRT `strtol`, `strtod`, and `strstr` shims with radix parsing, end-pointer
   reporting, common decimal/special floating-point input, and range errors.
+- Add in-place CRT `qsort` using the guest comparator and `_time64` using the
+  host system clock; file-backed CRT streams remain pending.
 - Detect .NET Framework `_CorExeMain`/`_CorDllMain` images and report the clear
   unsupported-runtime limitation in `winrun inspect` and native execution.
 - Replaced the PS1 interpreter's proposed install-script .NET API expansion

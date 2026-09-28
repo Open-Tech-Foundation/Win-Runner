@@ -1972,6 +1972,48 @@ mod protection_tests {
         unsafe { super::native_crt_errno().write(0) };
     }
 
+    extern "win64" fn crt_compare_i32(
+        left: *const std::ffi::c_void,
+        right: *const std::ffi::c_void,
+    ) -> i32 {
+        let left = unsafe { left.cast::<i32>().read_unaligned() };
+        let right = unsafe { right.cast::<i32>().read_unaligned() };
+        match left.cmp(&right) {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        }
+    }
+
+    #[test]
+    fn crt_qsort_orders_guest_elements_through_the_guest_comparator() {
+        let mut values = [7i32, -2, 4, 4, 0, 1];
+        super::native_crt_qsort(
+            values.as_mut_ptr().cast(),
+            values.len(),
+            std::mem::size_of::<i32>(),
+            crt_compare_i32 as *const () as usize as u64,
+        );
+        assert_eq!(values, [-2, 0, 1, 4, 4, 7]);
+        assert!(super::supports_import("UCRTBASE.DLL", "qsort"));
+
+        super::native_crt_qsort(std::ptr::null_mut(), 5, 4, 0);
+        super::native_crt_qsort(values.as_mut_ptr().cast(), usize::MAX, 2, 1);
+    }
+
+    #[test]
+    fn crt_time64_returns_and_optionally_stores_unix_seconds() {
+        let mut stored = 0i64;
+        let returned = super::native_crt_time64(&mut stored);
+        assert_eq!(stored, returned);
+        assert!(returned > 1_700_000_000);
+        assert!(super::native_crt_time64(std::ptr::null_mut()) >= returned);
+        assert!(super::supports_import(
+            "api-ms-win-crt-time-l1-1-0.dll",
+            "_time64"
+        ));
+    }
+
     #[test]
     fn crt_case_insensitive_string_comparisons_fold_ascii() {
         let upper = b"NaNo\0";

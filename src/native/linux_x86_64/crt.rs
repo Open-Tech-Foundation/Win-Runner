@@ -640,6 +640,85 @@ pub(super) extern "win64" fn native_crt_strtod(input: *const u8, end: *mut *mut 
         None => 0.0,
     }
 }
+
+pub(super) extern "win64" fn native_crt_time64(destination: *mut i64) -> i64 {
+    let now = std::time::SystemTime::now();
+    let seconds = match now.duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs().min(i64::MAX as u64) as i64,
+        Err(error) => -(error.duration().as_secs().min(i64::MAX as u64) as i64),
+    };
+    if !destination.is_null() {
+        unsafe { destination.write_unaligned(seconds) };
+    }
+    seconds
+}
+
+unsafe fn crt_compare_qsort_elements(
+    base: *mut u8,
+    element_size: usize,
+    compare: unsafe extern "win64" fn(*const c_void, *const c_void) -> i32,
+    left: usize,
+    right: usize,
+) -> i32 {
+    let left = unsafe { base.add(left * element_size).cast() };
+    let right = unsafe { base.add(right * element_size).cast() };
+    unsafe { compare(left, right) }
+}
+
+pub(super) extern "win64" fn native_crt_qsort(
+    base: *mut c_void,
+    count: usize,
+    element_size: usize,
+    compare: u64,
+) {
+    if base.is_null() || count < 2 || element_size == 0 || compare == 0 {
+        return;
+    }
+    let Some(total_size) = count.checked_mul(element_size) else {
+        return;
+    };
+    if total_size > isize::MAX as usize {
+        return;
+    }
+    let compare: unsafe extern "win64" fn(*const c_void, *const c_void) -> i32 =
+        unsafe { std::mem::transmute(compare as usize) };
+    let base = base.cast::<u8>();
+
+    let sift_down = |mut root: usize, end: usize| loop {
+        let Some(left) = root.checked_mul(2).and_then(|value| value.checked_add(1)) else {
+            break;
+        };
+        if left >= end {
+            break;
+        }
+        let mut larger = left;
+        let right = left + 1;
+        if right < end
+            && unsafe { crt_compare_qsort_elements(base, element_size, compare, left, right) } < 0
+        {
+            larger = right;
+        }
+        if unsafe { crt_compare_qsort_elements(base, element_size, compare, root, larger) } >= 0 {
+            break;
+        }
+        unsafe {
+            std::ptr::swap_nonoverlapping(
+                base.add(root * element_size),
+                base.add(larger * element_size),
+                element_size,
+            );
+        }
+        root = larger;
+    };
+
+    for start in (0..count / 2).rev() {
+        sift_down(start, count);
+    }
+    for end in (1..count).rev() {
+        unsafe { std::ptr::swap_nonoverlapping(base, base.add(end * element_size), element_size) };
+        sift_down(0, end);
+    }
+}
 pub(super) extern "win64" fn native_crt_tolower(value: i32) -> i32 {
     if (b'A' as i32..=b'Z' as i32).contains(&value) {
         value + (b'a' - b'A') as i32

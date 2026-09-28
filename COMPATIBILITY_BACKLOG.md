@@ -101,6 +101,8 @@ Items remain open until implementation and relevant verification are complete.
     remain unsupported.
   - [x] Add `strtol`, `strtod`, and `strstr` with Windows `long` width,
     end-pointer reporting, radix parsing, and common decimal input handling.
+  - [x] Add in-place `qsort` and `_time64`; CRT `fopen`/`fread`/`fclose` and
+    other file-backed `FILE` operations remain pending.
   - [ ] Add `_seh_filter_exe` and remaining startup exports.
 - [ ] Add basic `msvcrt.dll` output and file I/O, including `printf` and `fopen`.
 - [ ] Add VCRUNTIME140 exception handlers, `_CxxThrowException`, and memory
