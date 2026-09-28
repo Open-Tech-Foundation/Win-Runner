@@ -21,6 +21,8 @@ All notable changes to this project will be documented in this file.
 - Invoke process-attach TLS callbacks for the main image and DLLs; reject DLL
   TLS templates that need per-thread static storage until that storage is
   implemented.
+- Send DLL/TLS thread-attach and thread-detach notifications around guest
+  `CreateThread` start routines using modules captured in load order.
 
 - Added a "Why Win-Runner?" section to the README explaining the project's focus
   and how it differs from Wine, VMs, and Windows CI runners.

@@ -95,6 +95,7 @@ pub(super) static TEST_PROCESS: LazyLock<Arc<NativeProcessContext>> = LazyLock::
         exited: AtomicBool::new(false),
         children: Mutex::new(NativeProcessTable::new()),
         loaded_modules: Mutex::new(HashMap::new()),
+        module_next: AtomicU64::new(1),
     })
 });
 

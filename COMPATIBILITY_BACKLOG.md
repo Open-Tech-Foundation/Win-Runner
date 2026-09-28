@@ -128,9 +128,11 @@ Items remain open until implementation and relevant verification are complete.
       forwarders to shim-backed system modules.
     - [x] Invoke main-image and DLL TLS process-attach callbacks. DLL TLS
       directories with non-empty templates or zero-fill remain unsupported.
+    - [x] Send TLS and `DllMain` thread-attach/detach notifications around
+      guest `CreateThread` routines, ordered by module load sequence.
     - [ ] Support circular dependency initialization, per-thread static TLS,
-      DLL TLS thread notifications, and FreeLibrary reference-count/unload
-      semantics.
+      notifications for already-running threads when a DLL is loaded, and
+      FreeLibrary reference-count/unload semantics.
   - [ ] Host `hostfxr.dll`, `hostpolicy.dll`, and `coreclr.dll` using the
     supported native hosting interfaces; cover shared, app-local, and
     self-contained runtime layouts, then add single-file apps.

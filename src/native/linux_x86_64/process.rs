@@ -422,8 +422,11 @@ pub(super) extern "win64" fn native_create_thread(
         } else if thread_process.gs_base.load(Ordering::Acquire) != 0 {
             return 1;
         }
+        thread_runtime::notify_guest_thread_modules(&thread_process, true);
         let entry: unsafe extern "win64" fn(u64) -> u32 = unsafe { std::mem::transmute(start) };
-        unsafe { entry(parameter) }
+        let exit_code = unsafe { entry(parameter) };
+        thread_runtime::notify_guest_thread_modules(&thread_process, false);
+        exit_code
     });
     let Ok(join) = spawned else {
         native_set_last_error(8);

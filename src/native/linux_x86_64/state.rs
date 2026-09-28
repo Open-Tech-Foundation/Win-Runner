@@ -185,6 +185,7 @@ pub(super) struct NativeProcessContext {
     pub(super) children: Mutex<NativeProcessTable>,
     /// Real PE DLLs loaded through LoadLibrary in this guest process.
     pub(super) loaded_modules: Mutex<HashMap<u64, NativeLoadedModule>>,
+    pub(super) module_next: AtomicU64,
 }
 
 pub(super) struct NativeLoadedModule {
@@ -193,6 +194,9 @@ pub(super) struct NativeLoadedModule {
     pub(super) base: u64,
     pub(super) size_of_image: u32,
     pub(super) exports: Vec<crate::pe::Export>,
+    pub(super) entry_point: Option<u64>,
+    pub(super) tls_callbacks: Vec<u32>,
+    pub(super) load_order: u64,
 }
 
 pub(super) struct NativeThread {

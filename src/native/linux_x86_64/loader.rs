@@ -215,6 +215,9 @@ mod module_export_tests {
                 target_rva: 0x1234,
                 forwarder: None,
             }],
+            entry_point: None,
+            tls_callbacks: Vec::new(),
+            load_order: 1,
         };
         let process = &*super::TEST_PROCESS;
         process
@@ -248,6 +251,9 @@ mod module_export_tests {
                 target_rva: 0x200,
                 forwarder: Some("kernel32.GetTickCount".to_string()),
             }],
+            entry_point: None,
+            tls_callbacks: Vec::new(),
+            load_order: 1,
         };
         let process = &*super::TEST_PROCESS;
         process
@@ -649,6 +655,11 @@ fn load_guest_module_inner(
             base,
             size_of_image: image.size_of_image,
             exports: image.exports,
+            entry_point: (image.entry_rva != 0)
+                .then(|| base.checked_add(u64::from(image.entry_rva)))
+                .flatten(),
+            tls_callbacks: tls_callbacks.clone(),
+            load_order: process.module_next.fetch_add(1, Ordering::AcqRel),
         };
         let handle = module.base;
         {

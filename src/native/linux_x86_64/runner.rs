@@ -542,8 +542,16 @@ fn run_rust_baseline_argv_with_fs_impl(
                     base: img.image_base,
                     size_of_image: img.size_of_image,
                     exports: img.exports.clone(),
+                    entry_point: None,
+                    tls_callbacks: img
+                        .tls
+                        .as_ref()
+                        .map(|tls| tls.callbacks.clone())
+                        .unwrap_or_default(),
+                    load_order: 0,
                 },
             )])),
+            module_next: AtomicU64::new(1),
         });
         recovery_process = Some(Arc::clone(&process));
         if let Ok(mut context) = NATIVE_PROCESS.lock() {

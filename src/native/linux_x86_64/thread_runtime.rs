@@ -171,6 +171,52 @@ pub(super) fn invoke_tls_callbacks(base: u64, callbacks: &[u32], reason: u32) {
         unsafe { callback(base, reason, 0) };
     }
 }
+
+/// Send DLL/TLS thread notifications from a stable module snapshot. Guest code
+/// runs only after releasing the module table lock, so callbacks can load DLLs.
+pub(super) fn notify_guest_thread_modules(process: &NativeProcessContext, attach: bool) {
+    let mut notifications = {
+        let Ok(modules) = process.loaded_modules.lock() else {
+            return;
+        };
+        let mut notifications: Vec<_> = modules
+            .values()
+            .map(|module| {
+                (
+                    module.load_order,
+                    module.base,
+                    module.entry_point,
+                    module.tls_callbacks.clone(),
+                )
+            })
+            .collect();
+        notifications.sort_by_key(|module| module.0);
+        notifications
+    };
+    if !attach {
+        notifications.reverse();
+    }
+    let reason = if attach { 2 } else { 3 };
+    for (_, base, entry_point, callbacks) in notifications {
+        if attach {
+            invoke_tls_callbacks(base, &callbacks, reason);
+            if let Some(entry_point) = entry_point {
+                // SAFETY: DLL entry points were validated by the PE loader.
+                let dll_main: unsafe extern "win64" fn(u64, u32, u64) -> i32 =
+                    unsafe { std::mem::transmute(entry_point as usize) };
+                let _ = unsafe { dll_main(base, reason, 0) };
+            }
+        } else {
+            if let Some(entry_point) = entry_point {
+                // SAFETY: DLL entry points were validated by the PE loader.
+                let dll_main: unsafe extern "win64" fn(u64, u32, u64) -> i32 =
+                    unsafe { std::mem::transmute(entry_point as usize) };
+                let _ = unsafe { dll_main(base, reason, 0) };
+            }
+            invoke_tls_callbacks(base, &callbacks, reason);
+        }
+    }
+}
 pub(super) extern "win64" fn native_tls_get_value(index: u32) -> u64 {
     let Some(process) = process_ctx() else {
         return 0;
@@ -246,15 +292,31 @@ pub(super) extern "win64" fn native_fls_set_value(index: u32, value: u64) -> i32
 
 #[cfg(test)]
 mod tls_callback_tests {
-    use super::invoke_tls_callbacks;
+    use super::{invoke_tls_callbacks, notify_guest_thread_modules};
+    use crate::native::linux_x86_64::state::NativeLoadedModule;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Mutex;
 
     static CALLBACK_REASON: AtomicU32 = AtomicU32::new(0);
     static CALLBACK_BASE: AtomicU32 = AtomicU32::new(0);
+    static THREAD_EVENTS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
     unsafe extern "win64" fn record_callback(base: u64, reason: u32, _reserved: u64) {
         CALLBACK_BASE.store(base as u32, Ordering::SeqCst);
         CALLBACK_REASON.store(reason, Ordering::SeqCst);
+    }
+
+    unsafe extern "win64" fn record_tls_thread_event(_base: u64, reason: u32, _reserved: u64) {
+        THREAD_EVENTS.lock().unwrap().push(10 + reason);
+    }
+
+    unsafe extern "win64" fn record_dll_thread_event(
+        _base: u64,
+        reason: u32,
+        _reserved: u64,
+    ) -> i32 {
+        THREAD_EVENTS.lock().unwrap().push(20 + reason);
+        1
     }
 
     #[test]
@@ -267,5 +329,29 @@ mod tls_callback_tests {
 
         assert_eq!(CALLBACK_BASE.load(Ordering::SeqCst), callback as u32);
         assert_eq!(CALLBACK_REASON.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn sends_dll_thread_notifications_in_loader_order() {
+        let process = &*super::TEST_PROCESS;
+        let base = record_tls_thread_event as *const () as usize as u64;
+        let module = NativeLoadedModule {
+            path: r"C:\bin\notify.dll".to_string(),
+            name: "notify.dll".to_string(),
+            base,
+            size_of_image: 0x1000,
+            exports: Vec::new(),
+            entry_point: Some(record_dll_thread_event as *const () as usize as u64),
+            tls_callbacks: vec![0],
+            load_order: 1,
+        };
+        THREAD_EVENTS.lock().unwrap().clear();
+        process.loaded_modules.lock().unwrap().insert(base, module);
+
+        notify_guest_thread_modules(process, true);
+        notify_guest_thread_modules(process, false);
+
+        assert_eq!(*THREAD_EVENTS.lock().unwrap(), vec![12, 22, 23, 13]);
+        process.loaded_modules.lock().unwrap().remove(&base);
     }
 }
