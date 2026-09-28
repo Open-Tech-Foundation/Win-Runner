@@ -15,6 +15,8 @@ All notable changes to this project will be documented in this file.
 - Add a bounded UTF-16 `__stdio_common_vswprintf` formatter for wide/narrow
   strings, characters, common numeric conversions, field width, and precision;
   wide stream output and the full UCRT formatting set remain unsupported.
+- Initialize the MSVCRT `_acmdln` and `__initenv` data slots from the active
+  guest process instead of leaving them pointed at empty or null state.
 - Add stable UTF-16 CRT startup arrays and accessors for wide arguments and
   environment variables, including `_configure_wide_argv`, `__p___wargv`, and
   the initial/environment pointer APIs.

@@ -354,11 +354,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         // initializes them before invoking the executable entry point.
         "_fmode" => Some(NATIVE_CRT_FMODE.as_ptr() as u64),
         "_commode" => Some(NATIVE_CRT_COMMODE.as_ptr() as u64),
-        "_acmdln" => {
-            let empty = std::ptr::addr_of!(NATIVE_CRT_EMPTY_COMMAND_LINE) as u64;
-            NATIVE_CRT_ACMDLN.store(empty, Ordering::Release);
-            Some(NATIVE_CRT_ACMDLN.as_ptr() as u64)
-        }
+        "_acmdln" => Some(NATIVE_CRT_ACMDLN.as_ptr() as u64),
         "RtlAddFunctionTable" => Some(native_rtl_add_function_table as *const () as usize as u64),
         "RtlCaptureContext" => Some(winrun_native_rtl_capture_context as *const () as usize as u64),
         "RtlDeleteFunctionTable" => {

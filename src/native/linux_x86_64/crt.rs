@@ -15,7 +15,6 @@ pub(super) static NATIVE_CRT_FMODE: AtomicI32 = AtomicI32::new(0);
 pub(super) static NATIVE_CRT_COMMODE: AtomicI32 = AtomicI32::new(0);
 pub(super) static NATIVE_CRT_C_LOCALE: [u8; 2] = *b"C\0";
 pub(super) static NATIVE_CRT_ACMDLN: AtomicU64 = AtomicU64::new(0);
-pub(super) static NATIVE_CRT_EMPTY_COMMAND_LINE: [u8; 1] = [0];
 pub(super) static NATIVE_CRT_INITENV: AtomicU64 = AtomicU64::new(0);
 pub(super) static NATIVE_CRT_IOB: [AtomicU64; 24] = [const { AtomicU64::new(0) }; 24];
 const NATIVE_CRT_FILE_SIGNATURE: u64 = 0x5749_4e52_554e_4649;
@@ -261,6 +260,10 @@ fn ensure_crt_startup(process: &NativeProcessContext) {
                 &process.command_line_a,
                 environment.as_deref().unwrap_or_default(),
             ));
+        }
+        if let Some(startup) = startup.as_mut() {
+            NATIVE_CRT_ACMDLN.store(process.command_line_a.as_ptr() as u64, Ordering::Release);
+            NATIVE_CRT_INITENV.store(startup.environment.as_mut_ptr() as u64, Ordering::Release);
         }
     }
 }

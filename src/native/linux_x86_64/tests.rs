@@ -1873,6 +1873,8 @@ mod protection_tests {
 
             if !super::supports_import("UCRTBASE.dll", "__p___argc")
                 || !super::supports_import("UCRTBASE.dll", "__p___argv")
+                || !super::supports_import("MSVCRT.dll", "_acmdln")
+                || !super::supports_import("MSVCRT.dll", "__initenv")
                 || !super::supports_import("UCRTBASE.dll", "_crt_atexit")
                 || !super::supports_import("UCRTBASE.dll", "_register_onexit_function")
                 || !super::supports_import("UCRTBASE.dll", "_initialize_onexit_table")
@@ -1911,6 +1913,13 @@ mod protection_tests {
                     != b"PATH=C:\\bin"
             {
                 unsafe { _exit(123) };
+            }
+            if super::NATIVE_CRT_ACMDLN.load(std::sync::atomic::Ordering::Acquire)
+                != process.command_line_a.as_ptr() as u64
+                || super::NATIVE_CRT_INITENV.load(std::sync::atomic::Ordering::Acquire)
+                    != out_environment as u64
+            {
+                unsafe { _exit(119) };
             }
 
             if super::native_crt_atexit(crt_exit_first as *const () as usize as u64) != 0
