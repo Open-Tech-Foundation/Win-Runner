@@ -346,6 +346,30 @@ pub(super) extern "win64" fn native_rtl_virtual_unwind(
     let Some(prologue_offset) = control_pc.checked_sub(function_start) else {
         return 0;
     };
+    let mut epilogue_context = context;
+    let mut epilogue_pointers = [0u64; 32];
+    if simulate_epilogue(
+        image_base,
+        function,
+        control_pc,
+        &mut epilogue_context,
+        &mut epilogue_pointers,
+    ) {
+        unsafe { context_record.write_unaligned(epilogue_context) };
+        if !establisher_frame.is_null() {
+            unsafe { establisher_frame.write(original_rsp) };
+        }
+        if !context_pointers.is_null() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    epilogue_pointers.as_ptr(),
+                    context_pointers.cast::<u64>(),
+                    epilogue_pointers.len(),
+                );
+            }
+        }
+        return 0;
+    }
     let Some(plan) = decode_unwind_plan(
         image_base,
         function,
@@ -585,6 +609,188 @@ fn set_context_pointer(context_pointers: *mut c_void, slot: usize, address: u64)
                 .write_unaligned(address);
         }
     }
+}
+
+fn simulate_epilogue(
+    image_base: u64,
+    function: NativeRuntimeFunction,
+    control_pc: u64,
+    context: &mut NativeExceptionContext,
+    context_pointers: &mut [u64; 32],
+) -> bool {
+    let Some(control_rva) = control_pc.checked_sub(image_base) else {
+        return false;
+    };
+    if control_rva < u64::from(function.begin_address)
+        || control_rva >= u64::from(function.end_address)
+    {
+        return false;
+    }
+    let available = (u64::from(function.end_address) - control_rva).min(64) as usize;
+    let bytes = unsafe { std::slice::from_raw_parts(control_pc as *const u8, available) };
+    let mut cursor = 0usize;
+    let mut can_adjust_stack = true;
+    loop {
+        let remaining = &bytes[cursor..];
+        if remaining.first() == Some(&0xc3) || remaining.starts_with(&[0xf3, 0xc3]) {
+            if !simulate_epilogue_return(context, 0) {
+                return false;
+            }
+            return true;
+        }
+        if remaining.starts_with(&[0xc2]) && remaining.len() >= 3 {
+            let extra = u16::from_le_bytes([remaining[1], remaining[2]]) as u64;
+            return simulate_epilogue_return(context, extra);
+        }
+        if can_adjust_stack {
+            if let Some((instruction_len, adjustment)) = decode_epilogue_stack_adjust(remaining) {
+                let Some(rsp) =
+                    context_register(context, 4).and_then(|rsp| rsp.checked_add(adjustment))
+                else {
+                    return false;
+                };
+                context_set_register(context, 4, rsp);
+                cursor += instruction_len;
+                can_adjust_stack = false;
+                continue;
+            }
+            if let Some((instruction_len, base_register, displacement)) =
+                decode_epilogue_lea(remaining)
+            {
+                let Some(base) = context_register(context, base_register) else {
+                    return false;
+                };
+                let rsp = if displacement >= 0 {
+                    base.checked_add(displacement as u64)
+                } else {
+                    base.checked_sub(displacement.unsigned_abs())
+                };
+                let Some(rsp) = rsp else {
+                    return false;
+                };
+                context_set_register(context, 4, rsp);
+                cursor += instruction_len;
+                can_adjust_stack = false;
+                continue;
+            }
+        }
+        if let Some((instruction_len, register)) = decode_epilogue_pop(remaining) {
+            let Some(rsp) = context_register(context, 4) else {
+                return false;
+            };
+            let Some(value) = stack_u64(rsp) else {
+                return false;
+            };
+            context_set_register(context, register, value);
+            context_pointers[16 + usize::from(register)] = rsp;
+            let Some(next_rsp) = rsp.checked_add(8) else {
+                return false;
+            };
+            context_set_register(context, 4, next_rsp);
+            cursor += instruction_len;
+            can_adjust_stack = false;
+            continue;
+        }
+        return false;
+    }
+}
+
+fn decode_epilogue_stack_adjust(bytes: &[u8]) -> Option<(usize, u64)> {
+    if bytes.starts_with(&[0x48, 0x83, 0xc4]) && bytes.len() >= 4 {
+        let adjustment = i8::from_le_bytes([bytes[3]]);
+        return (adjustment >= 0).then_some((4, adjustment as u64));
+    }
+    if bytes.starts_with(&[0x48, 0x81, 0xc4]) && bytes.len() >= 7 {
+        let adjustment = i32::from_le_bytes(bytes[3..7].try_into().ok()?);
+        return (adjustment >= 0).then_some((7, adjustment as u64));
+    }
+    None
+}
+
+fn decode_epilogue_lea(bytes: &[u8]) -> Option<(usize, u8, i64)> {
+    let rex = *bytes.first()?;
+    if !(0x48..=0x4f).contains(&rex) || bytes.get(1) != Some(&0x8d) {
+        return None;
+    }
+    let modrm = *bytes.get(2)?;
+    let mode = modrm >> 6;
+    let destination = ((modrm >> 3) & 7) | (((rex >> 2) & 1) << 3);
+    if mode == 0 || destination != 4 {
+        return None;
+    }
+    let rm = modrm & 7;
+    let mut cursor = 3;
+    let base = if rm == 4 {
+        let sib = *bytes.get(cursor)?;
+        cursor += 1;
+        if (sib >> 3) & 7 != 4 || (sib >> 6) != 0 || rex & 2 != 0 {
+            return None;
+        }
+        (sib & 7) | ((rex & 1) << 3)
+    } else {
+        rm | ((rex & 1) << 3)
+    };
+    if !is_nonvolatile_register(base) {
+        return None;
+    }
+    let displacement = match mode {
+        1 => {
+            let value = i8::from_le_bytes([*bytes.get(cursor)?]) as i64;
+            cursor += 1;
+            value
+        }
+        2 => {
+            let value = i32::from_le_bytes(bytes.get(cursor..cursor + 4)?.try_into().ok()?) as i64;
+            cursor += 4;
+            value
+        }
+        _ => return None,
+    };
+    Some((cursor, base, displacement))
+}
+
+fn decode_epilogue_pop(bytes: &[u8]) -> Option<(usize, u8)> {
+    let (instruction_len, opcode) = if bytes.first() == Some(&0x41) {
+        (2, *bytes.get(1)?)
+    } else {
+        (1, *bytes.first()?)
+    };
+    let register = if instruction_len == 2 {
+        match opcode {
+            0x5c => 12,
+            0x5d => 13,
+            0x5e => 14,
+            0x5f => 15,
+            _ => return None,
+        }
+    } else {
+        match opcode {
+            0x5b => 3,
+            0x5d => 5,
+            0x5e => 6,
+            0x5f => 7,
+            _ => return None,
+        }
+    };
+    Some((instruction_len, register))
+}
+
+fn simulate_epilogue_return(context: &mut NativeExceptionContext, extra_stack_bytes: u64) -> bool {
+    let Some(rsp) = context_register(context, 4) else {
+        return false;
+    };
+    let Some(return_address) = stack_u64(rsp) else {
+        return false;
+    };
+    let Some(next_rsp) = rsp
+        .checked_add(8)
+        .and_then(|rsp| rsp.checked_add(extra_stack_bytes))
+    else {
+        return false;
+    };
+    context_set_register(context, 16, return_address);
+    context_set_register(context, 4, next_rsp);
+    true
 }
 
 fn context_register(context: &NativeExceptionContext, register: u8) -> Option<u64> {

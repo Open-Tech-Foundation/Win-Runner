@@ -6206,6 +6206,118 @@ mod protection_tests {
     }
 
     #[test]
+    fn rtl_virtual_unwind_simulates_remaining_epilogue_instructions() {
+        let mut image = vec![0u8; 0x1000];
+        let base = image.as_mut_ptr() as u64;
+        image[0x800..0x804].copy_from_slice(&[9, 4, 1, 0]);
+        image[0x804..0x806].copy_from_slice(&[1, 0x32]);
+        // add rsp, 16; pop r12; ret 8
+        image[0x150..0x159].copy_from_slice(&[0x48, 0x83, 0xc4, 0x10, 0x41, 0x5c, 0xc2, 8, 0]);
+        // lea rsp, -32[r13]; pop r12; ret
+        image[0x160..0x167].copy_from_slice(&[0x49, 0x8d, 0x65, 0xe0, 0x41, 0x5c, 0xc3]);
+        let function = super::NativeRuntimeFunction {
+            begin_address: 0x100,
+            end_address: 0x200,
+            unwind_data: 0x800,
+        };
+        let mut stack = [0u64; 8];
+        stack[2] = 0x1234_5678_9abc_def0;
+        stack[3] = 0x0000_7fff_1111_2222;
+        let original_rsp = stack.as_ptr() as u64;
+        let mut context = super::NativeExceptionContext { bytes: [0; 1232] };
+        context.bytes[48..52].copy_from_slice(&0x0010_001fu32.to_le_bytes());
+        context.bytes[152..160].copy_from_slice(&original_rsp.to_le_bytes());
+        let mut context_pointers = [0u64; 32];
+
+        assert_eq!(
+            native_rtl_virtual_unwind(
+                1,
+                base,
+                base + 0x150,
+                &function,
+                &mut context,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                context_pointers.as_mut_ptr().cast(),
+            ),
+            0
+        );
+        assert_eq!(
+            u64::from_le_bytes(context.bytes[216..224].try_into().unwrap()),
+            0x1234_5678_9abc_def0
+        );
+        assert_eq!(
+            u64::from_le_bytes(context.bytes[248..256].try_into().unwrap()),
+            0x0000_7fff_1111_2222
+        );
+        assert_eq!(
+            u64::from_le_bytes(context.bytes[152..160].try_into().unwrap()),
+            original_rsp + 40
+        );
+        assert_eq!(context_pointers[28], original_rsp + 16);
+
+        // If control left the function after the stack adjustment, only the
+        // remaining pop and return are simulated.
+        context.bytes[152..160].copy_from_slice(&(original_rsp + 16).to_le_bytes());
+        context.bytes[216..224].fill(0);
+        context.bytes[248..256].fill(0);
+        assert_eq!(
+            native_rtl_virtual_unwind(
+                1,
+                base,
+                base + 0x154,
+                &function,
+                &mut context,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                context_pointers.as_mut_ptr().cast(),
+            ),
+            0
+        );
+        assert_eq!(
+            u64::from_le_bytes(context.bytes[216..224].try_into().unwrap()),
+            0x1234_5678_9abc_def0
+        );
+        assert_eq!(
+            u64::from_le_bytes(context.bytes[152..160].try_into().unwrap()),
+            original_rsp + 40
+        );
+
+        // Frame-pointer epilogs may replace the RSP adjustment with LEA.
+        stack[0] = 0xfeed_face_cafe_beef;
+        stack[1] = 0x0000_7fff_2222_3333;
+        assert_eq!(stack[1], 0x0000_7fff_2222_3333);
+        context.bytes[152..160].copy_from_slice(&0x7777_0000u64.to_le_bytes());
+        context.bytes[224..232].copy_from_slice(&(original_rsp + 32).to_le_bytes());
+        assert_eq!(
+            native_rtl_virtual_unwind(
+                1,
+                base,
+                base + 0x160,
+                &function,
+                &mut context,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                context_pointers.as_mut_ptr().cast(),
+            ),
+            0
+        );
+        assert_eq!(
+            u64::from_le_bytes(context.bytes[216..224].try_into().unwrap()),
+            0xfeed_face_cafe_beef
+        );
+        assert_eq!(
+            u64::from_le_bytes(context.bytes[248..256].try_into().unwrap()),
+            0x0000_7fff_2222_3333
+        );
+        assert_eq!(
+            u64::from_le_bytes(context.bytes[152..160].try_into().unwrap()),
+            original_rsp + 16
+        );
+        assert_eq!(context_pointers[28], original_rsp);
+    }
+
+    #[test]
     fn rtl_virtual_unwind_follows_chained_runtime_function_records() {
         let mut image = vec![0u8; 0x1000];
         let base = image.as_mut_ptr() as u64;
