@@ -187,6 +187,7 @@ pub(super) struct NativeProcessContext {
     pub(super) pointer_cookie: u64,
     pub(super) heap_allocations: Mutex<HashMap<u64, usize>>,
     pub(super) virtual_allocations: Mutex<HashMap<u64, NativeVirtualAllocation>>,
+    pub(super) image_page_protections: Mutex<HashMap<u64, Vec<u32>>>,
     pub(super) file_mappings: Mutex<HashMap<u64, NativeFileMapping>>,
     pub(super) mapping_views: Mutex<HashMap<u64, NativeMappingView>>,
     pub(super) mapping_next: AtomicU64,

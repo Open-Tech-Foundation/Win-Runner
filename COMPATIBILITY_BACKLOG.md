@@ -193,8 +193,10 @@ Items remain open until implementation and relevant verification are complete.
       allocations and mapped PE images.
     - [x] Deliver one-shot `PAGE_GUARD` faults for tracked private allocations,
       clear the guard modifier, and restore the requested protection.
-    - [ ] Track per-page protections and guard state for PE image mappings used
-      by JIT/runtime code.
+    - [x] Track per-page `VirtualProtect` changes and guard flags for mapped PE
+      images, and return split protection regions from `VirtualQuery`.
+    - [ ] Apply PE section characteristics when initially mapping images;
+      current mappings still start RWX for CRT initialization.
   - [ ] Implement GC thread suspension/context APIs (`SuspendThread`,
     `GetThreadContext`, `SetThreadContext`, `FlushProcessWriteBuffers`) with a
     Linux signal-based stop/resume protocol.

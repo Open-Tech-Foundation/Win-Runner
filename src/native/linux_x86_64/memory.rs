@@ -28,30 +28,62 @@ pub(super) fn consume_guard_page_fault(address: u64) -> bool {
     let Some(process) = process_ctx() else {
         return false;
     };
-    let Ok(mut allocations) = process.virtual_allocations.lock() else {
+    if let Ok(mut allocations) = process.virtual_allocations.lock() {
+        if let Some((&base, allocation)) = allocations.iter_mut().find(|(&base, allocation)| {
+            address >= base && address < base.saturating_add(allocation.length as u64)
+        }) {
+            let page_index = (address - base) as usize / 4096;
+            let Some(page) = allocation.pages.get_mut(page_index) else {
+                return false;
+            };
+            if !page.committed {
+                return false;
+            }
+            return consume_guard_page(base, page_index, &mut page.protection);
+        }
+    }
+
+    let module = process.loaded_modules.lock().ok().and_then(|modules| {
+        modules
+            .values()
+            .find(|module| {
+                address >= module.base
+                    && address < module.base.saturating_add(u64::from(module.size_of_image))
+            })
+            .map(|module| (module.base, module.size_of_image))
+    });
+    let Some((base, image_size)) = module else {
         return false;
     };
-    let Some((&base, allocation)) = allocations.iter_mut().find(|(&base, allocation)| {
-        address >= base && address < base.saturating_add(allocation.length as u64)
-    }) else {
+    let Ok(page_count) = page_len(image_size as usize) else {
         return false;
     };
     let page_index = (address - base) as usize / 4096;
-    let Some(page) = allocation.pages.get_mut(page_index) else {
+    let Ok(mut image_pages) = process.image_page_protections.lock() else {
         return false;
     };
-    if !page.committed || page.protection & 0x100 == 0 {
+    let protections = image_pages
+        .entry(base)
+        .or_insert_with(|| vec![0x40; page_count / 4096]);
+    let Some(protection) = protections.get_mut(page_index) else {
+        return false;
+    };
+    consume_guard_page(base, page_index, protection)
+}
+
+fn consume_guard_page(base: u64, page_index: usize, protection: &mut u32) -> bool {
+    if *protection & 0x100 == 0 {
         return false;
     }
-    let protection = page.protection & !0x100;
-    let Some(host_protection) = linux_protection(protection) else {
+    let restored_protection = *protection & !0x100;
+    let Some(host_protection) = linux_protection(restored_protection) else {
         return false;
     };
     let page_address = base + page_index as u64 * 4096;
     if unsafe { mprotect(page_address as *mut c_void, 4096, host_protection) } != 0 {
         return false;
     }
-    page.protection = protection;
+    *protection = restored_protection;
     true
 }
 
@@ -172,14 +204,40 @@ pub(super) extern "win64" fn native_virtual_query(
             query >= module.base
                 && query < module.base.saturating_add(u64::from(module.size_of_image))
         }) {
+            let page_count = page_len(module.size_of_image as usize).unwrap_or(0) / 4096;
+            let image_pages =
+                process
+                    .image_page_protections
+                    .lock()
+                    .ok()
+                    .and_then(|mut protections| {
+                        Some(
+                            protections
+                                .entry(module.base)
+                                .or_insert_with(|| vec![0x40; page_count])
+                                .clone(),
+                        )
+                    });
+            let pages = image_pages.unwrap_or_else(|| vec![0x40; page_count]);
+            let page_index =
+                ((query - module.base) as usize / 4096).min(page_count.saturating_sub(1));
+            let protection = pages.get(page_index).copied().unwrap_or(0x40);
+            let mut first = page_index;
+            while first > 0 && pages[first - 1] == protection {
+                first -= 1;
+            }
+            let mut end = page_index + 1;
+            while pages.get(end) == Some(&protection) {
+                end += 1;
+            }
             let result = NativeMemoryBasicInformation {
-                base_address: module.base,
+                base_address: module.base + first as u64 * 4096,
                 allocation_base: module.base,
                 allocation_protection: 0x40, // initial mapped-image protection is RWX
                 partition_id: 0,
-                region_size: u64::from(module.size_of_image),
+                region_size: ((end - first) * 4096) as u64,
                 state: 0x1000, // MEM_COMMIT
-                protection: 0x40,
+                protection,
                 kind: 0x1000000, // MEM_IMAGE
             };
             unsafe { information.write_unaligned(result) };
@@ -359,13 +417,48 @@ pub(super) extern "win64" fn native_virtual_protect(
             native_set_last_error(487);
             return 0;
         }
-        // PE and other native mappings are not yet represented in the
-        // VirtualAlloc region table; preserve their prior RWX baseline.
-        // SAFETY: mprotect receives a checked, page-aligned guest range.
-        if unsafe { mprotect(start as *mut c_void, end - start, protection) } != 0 {
-            return 0;
+        let image = process.loaded_modules.lock().ok().and_then(|modules| {
+            modules
+                .values()
+                .find(|module| {
+                    (start as u64) >= module.base
+                        && (end as u64)
+                            <= module.base.saturating_add(u64::from(module.size_of_image))
+                })
+                .map(|module| (module.base, module.size_of_image))
+        });
+        if let Some((base, image_size)) = image {
+            let Ok(page_count) = page_len(image_size as usize) else {
+                native_set_last_error(487);
+                return 0;
+            };
+            let mut image_pages = match process.image_page_protections.lock() {
+                Ok(pages) => pages,
+                Err(_) => return 0,
+            };
+            let pages = image_pages
+                .entry(base)
+                .or_insert_with(|| vec![0x40; page_count / 4096]);
+            let first_page = (start as u64 - base) as usize / 4096;
+            let page_len = (end - start) / 4096;
+            let Some(pages) = pages.get_mut(first_page..first_page + page_len) else {
+                native_set_last_error(487);
+                return 0;
+            };
+            if unsafe { mprotect(start as *mut c_void, end - start, protection) } != 0 {
+                return 0;
+            }
+            let old = pages.first().copied().unwrap_or(0x40);
+            pages.fill(page_protection);
+            old
+        } else {
+            // Untracked native mappings preserve the prior RWX baseline.
+            // SAFETY: mprotect receives a checked, page-aligned guest range.
+            if unsafe { mprotect(start as *mut c_void, end - start, protection) } != 0 {
+                return 0;
+            }
+            0x40
         }
-        0x40
     };
     if !old_page_protection.is_null() {
         unsafe { old_page_protection.write(old_protection) };

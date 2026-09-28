@@ -499,6 +499,7 @@ fn run_rust_baseline_argv_with_fs_impl(
             pointer_cookie: random_pointer_cookie(),
             heap_allocations: Mutex::new(HashMap::new()),
             virtual_allocations: Mutex::new(HashMap::new()),
+            image_page_protections: Mutex::new(HashMap::new()),
             file_mappings: Mutex::new(HashMap::new()),
             mapping_views: Mutex::new(HashMap::new()),
             mapping_next: AtomicU64::new(0x9800_0000),

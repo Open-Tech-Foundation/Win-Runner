@@ -45,6 +45,9 @@ All notable changes to this project will be documented in this file.
 - Implement one-shot `PAGE_GUARD` faults for tracked private virtual-memory
   allocations: deliver `STATUS_GUARD_PAGE_VIOLATION`, clear the modifier, and
   restore access so a continuing handler can retry the instruction.
+- Track per-page `VirtualProtect` changes and guard flags for loaded PE images;
+  `VirtualQuery` now reports the resulting protection regions rather than one
+  coarse RWX range.
 - Detect .NET Framework `_CorExeMain`/`_CorDllMain` images and report the clear
   unsupported-runtime limitation in `winrun inspect` and native execution.
 - Replaced the PS1 interpreter's proposed install-script .NET API expansion

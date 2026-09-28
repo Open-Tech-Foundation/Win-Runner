@@ -6415,6 +6415,95 @@ mod protection_tests {
     }
 
     #[test]
+    fn virtual_protect_tracks_and_queries_per_page_pe_image_protections() {
+        let length = 0x2000;
+        let image = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                length,
+                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(image, libc::MAP_FAILED);
+        let base = image as u64;
+        let process = process_ctx().unwrap();
+        let previous = process.loaded_modules.lock().unwrap().insert(
+            base,
+            crate::native::linux_x86_64::state::NativeLoadedModule {
+                path: r"C:\memory-test.dll".to_string(),
+                name: "memory-test.dll".to_string(),
+                base,
+                size_of_image: length as u32,
+                exports: Vec::new(),
+                entry_point: None,
+                tls_callbacks: Vec::new(),
+                static_tls_index: None,
+                static_tls_template: None,
+                load_order: 0,
+                load_references: 0,
+                dependencies: Vec::new(),
+                mapping: None,
+                initialized: true,
+            },
+        );
+        assert!(previous.is_none());
+
+        let mut old_protection = 0;
+        assert_eq!(
+            super::native_virtual_protect(
+                (base + 4096) as *mut std::ffi::c_void,
+                4096,
+                0x02, // PAGE_READONLY
+                &mut old_protection,
+            ),
+            1
+        );
+        assert_eq!(old_protection, 0x40);
+        let mut information = super::NativeMemoryBasicInformation::default();
+        assert_eq!(
+            super::native_virtual_query(
+                (base + 4096) as *const std::ffi::c_void,
+                &mut information,
+                std::mem::size_of_val(&information),
+            ),
+            std::mem::size_of::<super::NativeMemoryBasicInformation>()
+        );
+        assert_eq!(information.base_address, base + 4096);
+        assert_eq!(information.allocation_base, base);
+        assert_eq!(information.region_size, 4096);
+        assert_eq!(information.protection, 0x02);
+        assert_eq!(information.kind, 0x1000000); // MEM_IMAGE
+        assert_eq!(
+            super::native_virtual_protect(
+                (base + 4096) as *mut std::ffi::c_void,
+                4096,
+                0x102, // PAGE_GUARD | PAGE_READONLY
+                &mut old_protection,
+            ),
+            1
+        );
+        assert_eq!(old_protection, 0x02);
+        assert!(super::memory::consume_guard_page_fault(base + 4096));
+        information = super::NativeMemoryBasicInformation::default();
+        assert_ne!(
+            super::native_virtual_query(
+                (base + 4096) as *const std::ffi::c_void,
+                &mut information,
+                std::mem::size_of_val(&information),
+            ),
+            0
+        );
+        assert_eq!(information.protection, 0x02);
+
+        process.loaded_modules.lock().unwrap().remove(&base);
+        process.image_page_protections.lock().unwrap().remove(&base);
+        assert_eq!(unsafe { libc::munmap(image, length) }, 0);
+    }
+
+    #[test]
     fn rtl_virtual_unwind_restores_a_pushed_register_and_small_frame() {
         let mut image = vec![0u8; 0x1000];
         let base = image.as_mut_ptr() as u64;

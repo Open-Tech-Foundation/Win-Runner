@@ -1450,6 +1450,9 @@ fn dispose_loaded_module(process: &NativeProcessContext, loaded: NativeLoadedMod
         super::thread_runtime::clear_module_static_tls(process, index);
         super::thread_runtime::release_module_tls_slot(process, index);
     }
+    if let Ok(mut image_pages) = process.image_page_protections.lock() {
+        image_pages.remove(&loaded.base);
+    }
     drop(loaded);
 }
 
