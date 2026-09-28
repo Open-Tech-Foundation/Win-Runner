@@ -95,6 +95,8 @@ Items remain open until implementation and relevant verification are complete.
     `_configure_wide_argv`, `__p___wargv`, and the initial/environment accessors.
   - [x] Populate `_acmdln`/`_wcmdln` and `__initenv`/`__winitenv` data imports,
     with `__p__acmdln` and `__p__wcmdln` accessors, from process startup state.
+  - [x] Populate `__p__pgmptr` and `__p__wpgmptr` with the process executable
+    path using narrow and UTF-16 startup storage.
   - [x] Implement `_configure_narrow_argv`, `_initialize_narrow_environment`,
     `_set_new_mode`, and `_configthreadlocale`.
   - [x] Register `_crt_atexit`, `_register_onexit_function`, and `_onexit`

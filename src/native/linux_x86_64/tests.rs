@@ -1879,6 +1879,8 @@ mod protection_tests {
                 || !super::supports_import("MSVCRT.dll", "__winitenv")
                 || !super::supports_import("UCRTBASE.dll", "__p__acmdln")
                 || !super::supports_import("UCRTBASE.dll", "__p__wcmdln")
+                || !super::supports_import("UCRTBASE.dll", "__p__pgmptr")
+                || !super::supports_import("UCRTBASE.dll", "__p__wpgmptr")
                 || !super::supports_import("UCRTBASE.dll", "_crt_atexit")
                 || !super::supports_import("UCRTBASE.dll", "_register_onexit_function")
                 || !super::supports_import("UCRTBASE.dll", "_initialize_onexit_table")
@@ -1932,6 +1934,28 @@ mod protection_tests {
                     != process.command_line_w.as_ptr() as *mut u16
             {
                 unsafe { _exit(119) };
+            }
+            let program_a = super::NATIVE_CRT_PGMPTR.load(std::sync::atomic::Ordering::Acquire);
+            let program_w = super::NATIVE_CRT_WPGMPTR.load(std::sync::atomic::Ordering::Acquire);
+            if program_a == 0
+                || program_w == 0
+                || unsafe { super::native_crt_p_pgmptr().read() as u64 } != program_a
+                || unsafe { super::native_crt_p_wpgmptr().read() as u64 } != program_w
+                || unsafe { std::ffi::CStr::from_ptr(program_a as *const i8) }.to_bytes()
+                    != process.module_path.as_bytes()
+            {
+                unsafe { _exit(118) };
+            }
+            let program_w = program_w as *const u16;
+            let mut program_w_len = 0;
+            while unsafe { program_w.add(program_w_len).read() } != 0 {
+                program_w_len += 1;
+            }
+            if unsafe {
+                String::from_utf16(std::slice::from_raw_parts(program_w, program_w_len)).unwrap()
+            } != process.module_path
+            {
+                unsafe { _exit(117) };
             }
 
             if super::native_crt_atexit(crt_exit_first as *const () as usize as u64) != 0

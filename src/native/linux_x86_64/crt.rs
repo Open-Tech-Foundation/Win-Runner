@@ -18,6 +18,8 @@ pub(super) static NATIVE_CRT_ACMDLN: AtomicU64 = AtomicU64::new(0);
 pub(super) static NATIVE_CRT_WCMDLN: AtomicU64 = AtomicU64::new(0);
 pub(super) static NATIVE_CRT_INITENV: AtomicU64 = AtomicU64::new(0);
 pub(super) static NATIVE_CRT_WINITENV: AtomicU64 = AtomicU64::new(0);
+pub(super) static NATIVE_CRT_PGMPTR: AtomicU64 = AtomicU64::new(0);
+pub(super) static NATIVE_CRT_WPGMPTR: AtomicU64 = AtomicU64::new(0);
 pub(super) static NATIVE_CRT_IOB: [AtomicU64; 24] = [const { AtomicU64::new(0) }; 24];
 const NATIVE_CRT_FILE_SIGNATURE: u64 = 0x5749_4e52_554e_4649;
 
@@ -184,7 +186,11 @@ pub(super) extern "win64" fn native_crt_setlocale(category: i32, locale: *const 
     }
     NATIVE_CRT_C_LOCALE.as_ptr()
 }
-fn build_crt_startup(command_line: &[u8], environment: &[(String, String)]) -> NativeCrtStartup {
+fn build_crt_startup(
+    command_line: &[u8],
+    environment: &[(String, String)],
+    module_path: &str,
+) -> NativeCrtStartup {
     let line = String::from_utf8_lossy(command_line);
     let args = parse_windows_command_line(line.trim_end_matches('\0')).unwrap_or_default();
     let argv_storage = args
@@ -227,6 +233,8 @@ fn build_crt_startup(command_line: &[u8], environment: &[(String, String)]) -> N
         .collect::<Vec<_>>();
     wide_environment.push(0);
     let wide_environment_value = wide_environment.as_mut_ptr() as usize;
+    let program_name_w_storage = nul_terminated_wide(module_path);
+    let program_name_a_storage = command_line_a(&program_name_w_storage).into_boxed_slice();
     NativeCrtStartup {
         argc: argv.len().saturating_sub(1) as i32,
         _argv_storage: argv_storage,
@@ -241,6 +249,8 @@ fn build_crt_startup(command_line: &[u8], environment: &[(String, String)]) -> N
         _wide_environment_storage: wide_environment_storage,
         wide_environment,
         wide_environment_value,
+        _program_name_a_storage: program_name_a_storage,
+        _program_name_w_storage: program_name_w_storage,
     }
 }
 
@@ -261,6 +271,7 @@ fn ensure_crt_startup(process: &NativeProcessContext) {
             *startup = Some(build_crt_startup(
                 &process.command_line_a,
                 environment.as_deref().unwrap_or_default(),
+                &process.module_path,
             ));
         }
         if let Some(startup) = startup.as_mut() {
@@ -269,6 +280,14 @@ fn ensure_crt_startup(process: &NativeProcessContext) {
             NATIVE_CRT_INITENV.store(startup.environment.as_mut_ptr() as u64, Ordering::Release);
             NATIVE_CRT_WINITENV.store(
                 startup.wide_environment.as_mut_ptr() as u64,
+                Ordering::Release,
+            );
+            NATIVE_CRT_PGMPTR.store(
+                startup._program_name_a_storage.as_ptr() as u64,
+                Ordering::Release,
+            );
+            NATIVE_CRT_WPGMPTR.store(
+                startup._program_name_w_storage.as_ptr() as u64,
                 Ordering::Release,
             );
         }
@@ -360,6 +379,20 @@ pub(super) extern "win64" fn native_crt_p_wcmdln() -> *mut *mut u16 {
         ensure_crt_startup(&process);
     }
     NATIVE_CRT_WCMDLN.as_ptr().cast()
+}
+
+pub(super) extern "win64" fn native_crt_p_pgmptr() -> *mut *mut u8 {
+    if let Some(process) = process_ctx() {
+        ensure_crt_startup(&process);
+    }
+    NATIVE_CRT_PGMPTR.as_ptr().cast()
+}
+
+pub(super) extern "win64" fn native_crt_p_wpgmptr() -> *mut *mut u16 {
+    if let Some(process) = process_ctx() {
+        ensure_crt_startup(&process);
+    }
+    NATIVE_CRT_WPGMPTR.as_ptr().cast()
 }
 
 pub(super) extern "win64" fn native_crt_get_initial_narrow_environment() -> *mut *mut i8 {
@@ -2914,7 +2947,11 @@ mod startup_tests {
     #[test]
     fn narrow_startup_arrays_keep_windows_arguments_and_environment_alive() {
         let environment = vec![("PATH".to_string(), "C:\\bin".to_string())];
-        let mut startup = build_crt_startup(b"tool.exe \"hello world\" arg\0", &environment);
+        let mut startup = build_crt_startup(
+            b"tool.exe \"hello world\" arg\0",
+            &environment,
+            r"C:\tools\tool.exe",
+        );
         assert_eq!(startup.argc, 3);
         let argv = startup.argv.as_mut_ptr().cast::<*mut i8>();
         let read_arg = |index| unsafe { std::ffi::CStr::from_ptr(*argv.add(index)) };
@@ -2934,8 +2971,11 @@ mod startup_tests {
     #[test]
     fn wide_startup_arrays_keep_utf16_arguments_and_environment_alive() {
         let environment = vec![("GREETING".to_string(), "héllo 🌍".to_string())];
-        let mut startup =
-            build_crt_startup("tool.exe \"héllo 世界\" arg\0".as_bytes(), &environment);
+        let mut startup = build_crt_startup(
+            "tool.exe \"héllo 世界\" arg\0".as_bytes(),
+            &environment,
+            r"C:\工具\run.exe",
+        );
         assert_eq!(startup.argc, 3);
 
         let argv = startup.wide_argv.as_mut_ptr().cast::<*mut u16>();
@@ -2968,6 +3008,19 @@ mod startup_tests {
         assert_eq!(
             startup.wide_environment_value,
             startup.wide_environment.as_mut_ptr() as usize
+        );
+        assert_eq!(
+            std::ffi::CStr::from_bytes_with_nul(&startup._program_name_a_storage)
+                .unwrap()
+                .to_bytes(),
+            r"C:\??\run.exe".as_bytes()
+        );
+        assert_eq!(
+            String::from_utf16(
+                &startup._program_name_w_storage[..startup._program_name_w_storage.len() - 1]
+            )
+            .unwrap(),
+            r"C:\工具\run.exe"
         );
     }
 }

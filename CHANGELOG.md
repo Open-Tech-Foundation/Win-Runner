@@ -19,6 +19,8 @@ All notable changes to this project will be documented in this file.
   guest process instead of leaving them pointed at empty or null state.
 - Add the wide CRT `_wcmdln` and `__winitenv` startup slots, plus
   `__p__acmdln` and `__p__wcmdln` accessors backed by the guest command line.
+- Populate CRT `__p__pgmptr` and `__p__wpgmptr` accessors with the guest
+  executable path in narrow and UTF-16 forms.
 - Add stable UTF-16 CRT startup arrays and accessors for wide arguments and
   environment variables, including `_configure_wide_argv`, `__p___wargv`, and
   the initial/environment pointer APIs.

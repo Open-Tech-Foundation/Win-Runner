@@ -341,6 +341,8 @@ pub(super) struct NativeCrtStartup {
     pub(super) _wide_environment_storage: Vec<Box<[u16]>>,
     pub(super) wide_environment: Vec<usize>,
     pub(super) wide_environment_value: usize,
+    pub(super) _program_name_a_storage: Box<[u8]>,
+    pub(super) _program_name_w_storage: Box<[u16]>,
 }
 
 pub(super) struct NativeVectoredExceptionHandler {
