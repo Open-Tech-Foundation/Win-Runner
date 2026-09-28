@@ -311,6 +311,7 @@ pub(super) enum NativeFileIoOperation {
 
 pub(super) struct NativeVirtualAllocation {
     pub(super) length: usize,
+    pub(super) allocation_protection: u32,
     pub(super) pages: Vec<NativeVirtualPage>,
 }
 

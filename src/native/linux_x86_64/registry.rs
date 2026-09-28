@@ -380,6 +380,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "VirtualProtect" => Some(native_virtual_protect as *const () as usize as u64),
         "VirtualAlloc" => Some(native_virtual_alloc as *const () as usize as u64),
         "VirtualFree" => Some(native_virtual_free as *const () as usize as u64),
+        "VirtualQuery" => Some(native_virtual_query as *const () as usize as u64),
         "LoadLibraryExW" => Some(native_load_library_ex_w as *const () as usize as u64),
         "LoadLibraryExA" => Some(native_load_library_ex_a as *const () as usize as u64),
         "GetProcAddress" => Some(native_get_proc_address as *const () as usize as u64),

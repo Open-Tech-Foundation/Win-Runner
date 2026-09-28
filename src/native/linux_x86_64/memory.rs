@@ -34,6 +34,20 @@ pub(super) struct NativeMemoryStatus {
     pub(super) available_virtual: u64,
     pub(super) available_extended_virtual: u64,
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct NativeMemoryBasicInformation {
+    pub(super) base_address: u64,
+    pub(super) allocation_base: u64,
+    pub(super) allocation_protection: u32,
+    pub(super) partition_id: u16,
+    pub(super) region_size: u64,
+    pub(super) state: u32,
+    pub(super) protection: u32,
+    pub(super) kind: u32,
+}
+
 pub(super) extern "win64" fn native_global_memory_status_ex(
     status: *mut NativeMemoryStatus,
 ) -> i32 {
@@ -62,6 +76,85 @@ pub(super) extern "win64" fn native_global_memory_status_ex(
     };
     unsafe { status.write_unaligned(value) };
     1
+}
+
+pub(super) extern "win64" fn native_virtual_query(
+    address: *const c_void,
+    information: *mut NativeMemoryBasicInformation,
+    information_length: usize,
+) -> usize {
+    let information_size = std::mem::size_of::<NativeMemoryBasicInformation>();
+    if information.is_null() || information_length < information_size {
+        native_set_last_error(87); // ERROR_INVALID_PARAMETER
+        return 0;
+    }
+    let Some(process) = process_ctx() else {
+        return 0;
+    };
+    let query = address as u64;
+    if let Ok(allocations) = process.virtual_allocations.lock() {
+        if let Some((&allocation_base, allocation)) = allocations.iter().find(|(&base, alloc)| {
+            query >= base && query < base.saturating_add(alloc.length as u64)
+        }) {
+            let page_index = (query - allocation_base) as usize / 4096;
+            let Some(page) = allocation.pages.get(page_index) else {
+                native_set_last_error(487);
+                return 0;
+            };
+            let committed = page.committed;
+            let protection = if committed { page.protection } else { 0 };
+            let mut first = page_index;
+            while first > 0 {
+                let previous = &allocation.pages[first - 1];
+                if previous.committed != committed
+                    || (committed && previous.protection != protection)
+                {
+                    break;
+                }
+                first -= 1;
+            }
+            let mut end = page_index + 1;
+            while let Some(next) = allocation.pages.get(end) {
+                if next.committed != committed || (committed && next.protection != protection) {
+                    break;
+                }
+                end += 1;
+            }
+            let result = NativeMemoryBasicInformation {
+                base_address: allocation_base + (first as u64 * 4096),
+                allocation_base,
+                allocation_protection: allocation.allocation_protection,
+                partition_id: 0,
+                region_size: ((end - first) * 4096) as u64,
+                state: if committed { 0x1000 } else { 0x2000 }, // MEM_COMMIT / MEM_RESERVE
+                protection,
+                kind: 0x20000, // MEM_PRIVATE
+            };
+            unsafe { information.write_unaligned(result) };
+            return information_size;
+        }
+    }
+    if let Ok(modules) = process.loaded_modules.lock() {
+        if let Some(module) = modules.values().find(|module| {
+            query >= module.base
+                && query < module.base.saturating_add(u64::from(module.size_of_image))
+        }) {
+            let result = NativeMemoryBasicInformation {
+                base_address: module.base,
+                allocation_base: module.base,
+                allocation_protection: 0x40, // initial mapped-image protection is RWX
+                partition_id: 0,
+                region_size: u64::from(module.size_of_image),
+                state: 0x1000, // MEM_COMMIT
+                protection: 0x40,
+                kind: 0x1000000, // MEM_IMAGE
+            };
+            unsafe { information.write_unaligned(result) };
+            return information_size;
+        }
+    }
+    native_set_last_error(487); // ERROR_INVALID_ADDRESS
+    0
 }
 
 pub(super) extern "win64" fn native_heap_alloc(heap: u64, flags: u32, size: usize) -> u64 {
@@ -383,6 +476,7 @@ pub(super) extern "win64" fn native_virtual_alloc(
             result as u64,
             NativeVirtualAllocation {
                 length,
+                allocation_protection: protection,
                 pages: (0..length / 4096)
                     .map(|_| NativeVirtualPage {
                         committed,
@@ -761,7 +855,10 @@ pub(super) extern "win64" fn native_get_process_heap() -> u64 {
 
 #[cfg(test)]
 mod virtual_memory_tests {
-    use super::{native_virtual_alloc, native_virtual_free, native_virtual_protect};
+    use super::{
+        native_virtual_alloc, native_virtual_free, native_virtual_protect, native_virtual_query,
+        NativeMemoryBasicInformation,
+    };
     use std::ffi::c_void;
 
     #[test]
@@ -776,8 +873,25 @@ mod virtual_memory_tests {
 
         let base = native_virtual_alloc(std::ptr::null_mut(), 0x2000, MEM_RESERVE, PAGE_NOACCESS);
         assert!(!base.is_null());
+        assert_eq!(std::mem::size_of::<NativeMemoryBasicInformation>(), 48);
 
         let mut old_protection = 0;
+        let mut information = NativeMemoryBasicInformation::default();
+        assert_eq!(
+            native_virtual_query(
+                base.cast::<c_void>(),
+                &mut information,
+                std::mem::size_of_val(&information),
+            ),
+            48
+        );
+        assert_eq!(information.base_address, base as u64);
+        assert_eq!(information.allocation_base, base as u64);
+        assert_eq!(information.allocation_protection, PAGE_NOACCESS);
+        assert_eq!(information.region_size, 0x2000);
+        assert_eq!(information.state, 0x2000); // MEM_RESERVE
+        assert_eq!(information.protection, 0);
+        assert_eq!(information.kind, 0x20000); // MEM_PRIVATE
         assert_eq!(
             native_virtual_protect(
                 base.cast::<c_void>(),
@@ -804,6 +918,27 @@ mod virtual_memory_tests {
         assert_eq!(old_protection, PAGE_READWRITE);
         let second_page = unsafe { base.add(0x1000) };
         assert_eq!(
+            native_virtual_query(
+                base.cast::<c_void>(),
+                &mut information,
+                std::mem::size_of_val(&information),
+            ),
+            48
+        );
+        assert_eq!(information.state, 0x1000); // MEM_COMMIT
+        assert_eq!(information.protection, PAGE_READONLY);
+        assert_eq!(information.region_size, 0x1000);
+        assert_eq!(
+            native_virtual_query(
+                second_page.cast::<c_void>(),
+                &mut information,
+                std::mem::size_of_val(&information),
+            ),
+            48
+        );
+        assert_eq!(information.state, 0x2000);
+        assert_eq!(information.region_size, 0x1000);
+        assert_eq!(
             native_virtual_protect(
                 second_page.cast::<c_void>(),
                 0x1000,
@@ -815,6 +950,16 @@ mod virtual_memory_tests {
         );
         assert_eq!(native_virtual_free(base, 0x1000, MEM_DECOMMIT), 1);
         assert_eq!(
+            native_virtual_query(
+                base.cast::<c_void>(),
+                &mut information,
+                std::mem::size_of_val(&information),
+            ),
+            48
+        );
+        assert_eq!(information.state, 0x2000);
+        assert_eq!(information.region_size, 0x2000);
+        assert_eq!(
             native_virtual_protect(
                 base.cast::<c_void>(),
                 0x1000,
@@ -825,5 +970,19 @@ mod virtual_memory_tests {
             "a decommitted page cannot be protected"
         );
         assert_eq!(native_virtual_free(base, 0, MEM_RELEASE), 1);
+        assert_eq!(
+            native_virtual_query(
+                base.cast::<c_void>(),
+                &mut information,
+                std::mem::size_of_val(&information),
+            ),
+            0,
+            "released memory no longer has a queryable region"
+        );
+        assert_eq!(
+            native_virtual_query(base.cast::<c_void>(), &mut information, 47),
+            0,
+            "a short MEMORY_BASIC_INFORMATION buffer is rejected"
+        );
     }
 }

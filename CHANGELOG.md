@@ -34,6 +34,8 @@ All notable changes to this project will be documented in this file.
   order dependency components before importers and cycle members by load order.
 - Track reserved and committed virtual-memory pages so commit, decommit, and
   `VirtualProtect` validate page state and return the actual prior protection.
+- Implement `VirtualQuery` for managed allocations and mapped PE images,
+  reporting committed/reserved regions and current tracked protections.
 
 - Added a "Why Win-Runner?" section to the README explaining the project's focus
   and how it differs from Wine, VMs, and Windows CI runners.

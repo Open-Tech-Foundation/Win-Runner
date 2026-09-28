@@ -152,6 +152,8 @@ Items remain open until implementation and relevant verification are complete.
     - [x] Track committed pages inside reserved allocations; reject
       `VirtualProtect` on reserved/decommitted pages and return the prior
       protection for tracked pages.
+    - [x] Implement `VirtualQuery` region results for tracked private
+      allocations and mapped PE images.
     - [ ] Add guard-page fault behavior and track protections for PE image
       mappings used by JIT/runtime code.
   - [ ] Implement GC thread suspension/context APIs (`SuspendThread`,
