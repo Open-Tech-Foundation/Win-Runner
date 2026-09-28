@@ -23,6 +23,7 @@ All notable changes to this project will be documented in this file.
   executable path in narrow and UTF-16 forms.
 - Add `__p___initenv` and `__p___winitenv` accessors for the initial narrow and
   UTF-16 process environment arrays.
+- Add `__p__fmode` and `__p__commode` accessors for the existing CRT mode slots.
 - Add stable UTF-16 CRT startup arrays and accessors for wide arguments and
   environment variables, including `_configure_wide_argv`, `__p___wargv`, and
   the initial/environment pointer APIs.

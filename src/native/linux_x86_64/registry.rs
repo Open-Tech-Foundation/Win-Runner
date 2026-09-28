@@ -24,6 +24,8 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                     | "setlocale"
                     | "_fmode"
                     | "_commode"
+                    | "__p__fmode"
+                    | "__p__commode"
                     | "_acmdln"
                     | "_wcmdln"
                     | "_initterm"
@@ -235,6 +237,8 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
 pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
     match name {
         "__set_app_type" => Some(native_crt_set_app_type as *const () as usize as u64),
+        "__p__fmode" => Some(native_crt_p_fmode as *const () as usize as u64),
+        "__p__commode" => Some(native_crt_p_commode as *const () as usize as u64),
         "_errno" => Some(native_crt_errno as *const () as usize as u64),
         "getenv" => Some(native_crt_getenv as *const () as usize as u64),
         "__iob_func" => Some(native_crt_iob_func as *const () as usize as u64),

@@ -99,6 +99,8 @@ Items remain open until implementation and relevant verification are complete.
     path using narrow and UTF-16 startup storage.
   - [x] Expose the initial narrow and UTF-16 environment slots through
     `__p___initenv` and `__p___winitenv`.
+  - [x] Expose existing file/commit mode storage through `__p__fmode` and
+    `__p__commode`.
   - [x] Implement `_configure_narrow_argv`, `_initialize_narrow_environment`,
     `_set_new_mode`, and `_configthreadlocale`.
   - [x] Register `_crt_atexit`, `_register_onexit_function`, and `_onexit`

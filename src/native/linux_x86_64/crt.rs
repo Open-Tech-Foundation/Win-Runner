@@ -34,6 +34,12 @@ struct NativeCrtFile {
 }
 
 pub(super) extern "win64" fn native_crt_set_app_type(_app_type: i32) {}
+pub(super) extern "win64" fn native_crt_p_fmode() -> *mut i32 {
+    NATIVE_CRT_FMODE.as_ptr()
+}
+pub(super) extern "win64" fn native_crt_p_commode() -> *mut i32 {
+    NATIVE_CRT_COMMODE.as_ptr()
+}
 pub(super) extern "win64" fn native_crt_iob_func() -> *mut u8 {
     NATIVE_CRT_IOB.as_ptr().cast_mut().cast()
 }

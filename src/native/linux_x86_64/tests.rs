@@ -2854,6 +2854,8 @@ mod protection_tests {
     #[test]
     fn import_binding_checks_the_dll_as_well_as_the_function() {
         for export in [
+            "__p__fmode",
+            "__p__commode",
             "_configure_wide_argv",
             "_initialize_wide_environment",
             "__p___wargv",
@@ -2868,6 +2870,14 @@ mod protection_tests {
                 "{export} has no trampoline"
             );
         }
+        assert_eq!(
+            super::native_crt_p_fmode(),
+            super::NATIVE_CRT_FMODE.as_ptr()
+        );
+        assert_eq!(
+            super::native_crt_p_commode(),
+            super::NATIVE_CRT_COMMODE.as_ptr()
+        );
         for export in ["memcmp", "memcpy", "memmove", "memset", "strlen"] {
             assert!(
                 super::supports_import("VCRUNTIME140.dll", export),
