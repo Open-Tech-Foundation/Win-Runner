@@ -184,17 +184,65 @@ pub(super) extern "win64" fn native_virtual_protect(
     if end <= start {
         return 0;
     }
-    // SAFETY: `mprotect` receives a page-aligned range derived from the
-    // guest's requested range. Invalid guest ranges fail without harming
-    // the parent because the PE runs in its forked child.
-    if unsafe { mprotect(start as *mut c_void, end - start, protection) } != 0 {
+    let Some(process) = process_ctx() else {
         return 0;
-    }
+    };
+    let Ok(mut allocations) = process.virtual_allocations.lock() else {
+        return 0;
+    };
+    let tracked_base = allocations
+        .iter()
+        .find(|(&base, allocation)| {
+            start as u64 >= base && (end as u64) <= base.saturating_add(allocation.length as u64)
+        })
+        .map(|(&base, _)| base);
+    let old_protection = if let Some(base) = tracked_base {
+        let Some(allocation) = allocations.get_mut(&base) else {
+            native_set_last_error(487);
+            return 0;
+        };
+        let first_page = (start as u64 - base) as usize / 4096;
+        let page_count = (end - start) / 4096;
+        let Some(pages) = allocation
+            .pages
+            .get_mut(first_page..first_page + page_count)
+        else {
+            native_set_last_error(487); // ERROR_INVALID_ADDRESS
+            return 0;
+        };
+        if pages.iter().any(|page| !page.committed) {
+            native_set_last_error(487);
+            return 0;
+        }
+        let old = pages.first().map(|page| page.protection).unwrap_or(0x01);
+        // SAFETY: the requested range is page-aligned, belongs to this
+        // reservation, and every page is committed.
+        if unsafe { mprotect(start as *mut c_void, end - start, protection) } != 0 {
+            return 0;
+        }
+        for page in pages {
+            page.protection = page_protection;
+        }
+        old
+    } else {
+        let overlaps_reservation = allocations.iter().any(|(&base, allocation)| {
+            let allocation_end = base.saturating_add(allocation.length as u64);
+            (start as u64) < allocation_end && (end as u64) > base
+        });
+        if overlaps_reservation {
+            native_set_last_error(487);
+            return 0;
+        }
+        // PE and other native mappings are not yet represented in the
+        // VirtualAlloc region table; preserve their prior RWX baseline.
+        // SAFETY: mprotect receives a checked, page-aligned guest range.
+        if unsafe { mprotect(start as *mut c_void, end - start, protection) } != 0 {
+            return 0;
+        }
+        0x40
+    };
     if !old_page_protection.is_null() {
-        // The loader initially maps native PE images RWX. This is the
-        // accurate old protection until section-aware initial mapping is
-        // introduced.
-        unsafe { old_page_protection.write(0x40) };
+        unsafe { old_page_protection.write(old_protection) };
     }
     1
 }
@@ -242,18 +290,34 @@ pub(super) extern "win64" fn native_virtual_alloc(
             native_set_last_error(487); // ERROR_INVALID_ADDRESS
             return ptr::null_mut();
         }
-        let inside_reservation = process.virtual_allocations.lock().is_ok_and(|allocations| {
-            allocations.iter().any(|(&base, allocation)| {
-                (address as u64) >= base
-                    && (address as u64)
-                        .checked_add(length as u64)
-                        .is_some_and(|end| end <= base + allocation.length as u64)
-            })
-        });
-        if !inside_reservation || unsafe { mprotect(address.cast(), length, host_protection) } != 0
-        {
+        let Ok(mut allocations) = process.virtual_allocations.lock() else {
+            return ptr::null_mut();
+        };
+        let Some((&base, allocation)) = allocations.iter_mut().find(|(&base, allocation)| {
+            (address as u64) >= base
+                && (address as u64)
+                    .checked_add(length as u64)
+                    .is_some_and(|end| end <= base.saturating_add(allocation.length as u64))
+        }) else {
             native_set_last_error(487);
             return ptr::null_mut();
+        };
+        let first_page = (address as u64 - base) as usize / 4096;
+        let page_count = length / 4096;
+        let Some(pages) = allocation
+            .pages
+            .get_mut(first_page..first_page + page_count)
+        else {
+            native_set_last_error(487);
+            return ptr::null_mut();
+        };
+        if unsafe { mprotect(address.cast(), length, host_protection) } != 0 {
+            native_set_last_error(487);
+            return ptr::null_mut();
+        }
+        for page in pages {
+            page.committed = true;
+            page.protection = protection;
         }
         return address;
     }
@@ -314,7 +378,19 @@ pub(super) extern "win64" fn native_virtual_alloc(
         raw.cast()
     };
     if let Ok(mut allocations) = process.virtual_allocations.lock() {
-        allocations.insert(result as u64, NativeVirtualAllocation { length });
+        let committed = allocation_type & MEM_COMMIT != 0;
+        allocations.insert(
+            result as u64,
+            NativeVirtualAllocation {
+                length,
+                pages: (0..length / 4096)
+                    .map(|_| NativeVirtualPage {
+                        committed,
+                        protection: if committed { protection } else { 0x01 },
+                    })
+                    .collect(),
+            },
+        );
     }
     result
 }
@@ -354,19 +430,40 @@ pub(super) extern "win64" fn native_virtual_free(
             native_set_last_error(87);
             return 0;
         };
-        let inside_reservation = process.virtual_allocations.lock().is_ok_and(|values| {
-            values.iter().any(|(&base, allocation)| {
-                (address as u64) >= base
-                    && (address as u64)
-                        .checked_add(length as u64)
-                        .is_some_and(|end| end <= base + allocation.length as u64)
-            })
-        });
-        if !inside_reservation || unsafe { mprotect(address.cast(), length, 0) } != 0 {
+        if (address as usize) & 4095 != 0 || length == 0 {
+            native_set_last_error(487);
+            return 0;
+        }
+        let Ok(mut allocations) = process.virtual_allocations.lock() else {
+            return 0;
+        };
+        let Some((&base, allocation)) = allocations.iter_mut().find(|(&base, allocation)| {
+            (address as u64) >= base
+                && (address as u64)
+                    .checked_add(length as u64)
+                    .is_some_and(|end| end <= base.saturating_add(allocation.length as u64))
+        }) else {
+            native_set_last_error(487);
+            return 0;
+        };
+        let first_page = (address as u64 - base) as usize / 4096;
+        let page_count = length / 4096;
+        let Some(pages) = allocation
+            .pages
+            .get_mut(first_page..first_page + page_count)
+        else {
+            native_set_last_error(487);
+            return 0;
+        };
+        if unsafe { mprotect(address.cast(), length, 0) } != 0 {
             native_set_last_error(487);
             return 0;
         }
         unsafe { madvise(address.cast(), length, 4) }; // MADV_DONTNEED
+        for page in pages {
+            page.committed = false;
+            page.protection = 0x01;
+        }
         return 1;
     }
     native_set_last_error(87);
@@ -660,4 +757,73 @@ pub(super) extern "win64" fn native_unmap_view_of_file(address: *mut c_void) -> 
 
 pub(super) extern "win64" fn native_get_process_heap() -> u64 {
     PROCESS_HEAP_HANDLE
+}
+
+#[cfg(test)]
+mod virtual_memory_tests {
+    use super::{native_virtual_alloc, native_virtual_free, native_virtual_protect};
+    use std::ffi::c_void;
+
+    #[test]
+    fn reserve_commit_protect_and_decommit_track_page_state() {
+        const MEM_COMMIT: u32 = 0x1000;
+        const MEM_RESERVE: u32 = 0x2000;
+        const MEM_DECOMMIT: u32 = 0x4000;
+        const MEM_RELEASE: u32 = 0x8000;
+        const PAGE_NOACCESS: u32 = 0x01;
+        const PAGE_READONLY: u32 = 0x02;
+        const PAGE_READWRITE: u32 = 0x04;
+
+        let base = native_virtual_alloc(std::ptr::null_mut(), 0x2000, MEM_RESERVE, PAGE_NOACCESS);
+        assert!(!base.is_null());
+
+        let mut old_protection = 0;
+        assert_eq!(
+            native_virtual_protect(
+                base.cast::<c_void>(),
+                0x1000,
+                PAGE_READWRITE,
+                &mut old_protection,
+            ),
+            0,
+            "a reserved but uncommitted page cannot be protected"
+        );
+        assert_eq!(
+            native_virtual_alloc(base, 0x1000, MEM_COMMIT, PAGE_READWRITE),
+            base
+        );
+        assert_eq!(
+            native_virtual_protect(
+                base.cast::<c_void>(),
+                0x1000,
+                PAGE_READONLY,
+                &mut old_protection,
+            ),
+            1
+        );
+        assert_eq!(old_protection, PAGE_READWRITE);
+        let second_page = unsafe { base.add(0x1000) };
+        assert_eq!(
+            native_virtual_protect(
+                second_page.cast::<c_void>(),
+                0x1000,
+                PAGE_READWRITE,
+                &mut old_protection,
+            ),
+            0,
+            "protection cannot cross into an uncommitted page"
+        );
+        assert_eq!(native_virtual_free(base, 0x1000, MEM_DECOMMIT), 1);
+        assert_eq!(
+            native_virtual_protect(
+                base.cast::<c_void>(),
+                0x1000,
+                PAGE_READWRITE,
+                &mut old_protection,
+            ),
+            0,
+            "a decommitted page cannot be protected"
+        );
+        assert_eq!(native_virtual_free(base, 0, MEM_RELEASE), 1);
+    }
 }

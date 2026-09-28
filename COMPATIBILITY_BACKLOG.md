@@ -149,6 +149,11 @@ Items remain open until implementation and relevant verification are complete.
     translation required by CoreCLR.
   - [ ] Complete virtual memory semantics used by the GC/JIT: reserve versus
     commit, guard pages, and writable/executable protection transitions.
+    - [x] Track committed pages inside reserved allocations; reject
+      `VirtualProtect` on reserved/decommitted pages and return the prior
+      protection for tracked pages.
+    - [ ] Add guard-page fault behavior and track protections for PE image
+      mappings used by JIT/runtime code.
   - [ ] Implement GC thread suspension/context APIs (`SuspendThread`,
     `GetThreadContext`, `SetThreadContext`, `FlushProcessWriteBuffers`) with a
     Linux signal-based stop/resume protocol.

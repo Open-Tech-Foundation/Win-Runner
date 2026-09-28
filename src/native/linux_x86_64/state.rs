@@ -311,6 +311,12 @@ pub(super) enum NativeFileIoOperation {
 
 pub(super) struct NativeVirtualAllocation {
     pub(super) length: usize,
+    pub(super) pages: Vec<NativeVirtualPage>,
+}
+
+pub(super) struct NativeVirtualPage {
+    pub(super) committed: bool,
+    pub(super) protection: u32,
 }
 #[derive(Clone)]
 pub(super) struct NativeFileMapping {
