@@ -122,7 +122,15 @@ mod module_export_tests {
     use crate::native::linux_x86_64::state::NativeLoadedModule;
     use crate::pe::Export;
     use std::ffi::CString;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
+
+    static DLL_PROCESS_DETACH_REASON: AtomicU32 = AtomicU32::new(u32::MAX);
+
+    unsafe extern "win64" fn record_process_detach(_base: u64, reason: u32, _reserved: u64) -> i32 {
+        DLL_PROCESS_DETACH_REASON.store(reason, Ordering::SeqCst);
+        1
+    }
 
     fn dll_fixture(
         imports: &[(&str, &str)],
@@ -256,8 +264,8 @@ mod module_export_tests {
             static_tls_template: None,
             load_order: 1,
             load_references: 0,
-            dependency_references: 0,
             dependencies: Vec::new(),
+            mapping: None,
         };
         let process = &*super::TEST_PROCESS;
         process
@@ -297,8 +305,8 @@ mod module_export_tests {
             static_tls_template: None,
             load_order: 1,
             load_references: 0,
-            dependency_references: 0,
             dependencies: Vec::new(),
+            mapping: None,
         };
         let process = &*super::TEST_PROCESS;
         process
@@ -347,6 +355,37 @@ mod module_export_tests {
         );
         assert_eq!(native_get_module_handle_w(name.as_ptr()), 0);
         process.fs.lock().unwrap().fs.delete_file(path).unwrap();
+    }
+
+    #[test]
+    fn final_free_library_runs_process_detach_and_unmaps_the_image() {
+        let process = &*super::TEST_PROCESS;
+        let image =
+            crate::pe::load_lenient(&dll_fixture(&[], None, 0x0000_5004_0000_0000)).unwrap();
+        let mapping = super::map(&image).expect("test image maps");
+        let base = mapping.ptr as u64;
+        let module = NativeLoadedModule {
+            path: r"C:\loader-tests\detach.dll".to_string(),
+            name: "detach.dll".to_string(),
+            base,
+            size_of_image: image.size_of_image,
+            exports: Vec::new(),
+            entry_point: Some(record_process_detach as *const () as usize as u64),
+            tls_callbacks: Vec::new(),
+            static_tls_index: None,
+            static_tls_template: None,
+            load_order: 1,
+            load_references: 0,
+            dependencies: Vec::new(),
+            mapping: Some(mapping),
+        };
+        DLL_PROCESS_DETACH_REASON.store(u32::MAX, Ordering::SeqCst);
+        super::dispose_loaded_module(process, module);
+        assert_eq!(DLL_PROCESS_DETACH_REASON.load(Ordering::SeqCst), 0);
+
+        let remapped = super::map(&image).expect("disposed image mapping was released");
+        assert_eq!(remapped.ptr as u64, base);
+        drop(remapped);
     }
 
     #[test]
@@ -467,14 +506,16 @@ mod module_export_tests {
 
         native_free_library(handle_a);
         native_free_library(handle_b);
-        // Dependency cycles currently remain loaded until process teardown.
-        {
-            let mut modules = process.loaded_modules.lock().unwrap();
-            assert!(modules.contains_key(&handle_a));
-            assert!(modules.contains_key(&handle_b));
-            modules.remove(&handle_a);
-            modules.remove(&handle_b);
-        }
+        assert!(!process
+            .loaded_modules
+            .lock()
+            .unwrap()
+            .contains_key(&handle_a));
+        assert!(!process
+            .loaded_modules
+            .lock()
+            .unwrap()
+            .contains_key(&handle_b));
         let mut native_fs = process.fs.lock().unwrap();
         native_fs.fs.delete_file(path_a).unwrap();
         native_fs.fs.delete_file(path_b).unwrap();
@@ -910,8 +951,8 @@ fn load_guest_module_inner(
             static_tls_template: static_tls_template.clone(),
             load_order: process.module_next.fetch_add(1, Ordering::AcqRel),
             load_references: 0,
-            dependency_references: 0,
             dependencies: Vec::new(),
+            mapping: None,
         };
         let handle = module.base;
         {
@@ -982,28 +1023,13 @@ fn load_guest_module_inner(
         }
         {
             let mut modules = process.loaded_modules.lock().ok()?;
-            if modules.get(&handle).is_none()
-                || dependencies.iter().any(|dependency| {
-                    modules
-                        .get(dependency)
-                        .and_then(|module| module.dependency_references.checked_add(1))
-                        .is_none()
-                })
-            {
-                return None;
-            }
-            for dependency in &dependencies {
-                modules.get_mut(dependency)?.dependency_references += 1;
-            }
-            modules.get_mut(&handle)?.dependencies = dependencies.clone();
+            let loaded = modules.get_mut(&handle)?;
+            loaded.dependencies = dependencies.clone();
+            loaded.mapping = Some(mapping);
         }
         if let Some(stubs) = stubs {
             std::mem::forget(stubs);
         }
-        // The loader record retains dependency references. Mapping ownership
-        // and process-detach callbacks are completed in a separate lifecycle
-        // step.
-        std::mem::forget(mapping);
         provisional_module = None;
         Some(handle)
     })();
@@ -1129,7 +1155,7 @@ pub(super) extern "win64" fn native_free_library(module: u64) -> i32 {
     let Some(process) = process_ctx() else {
         return 0;
     };
-    let removed = {
+    {
         let Ok(mut modules) = process.loaded_modules.lock() else {
             return 0;
         };
@@ -1140,51 +1166,72 @@ pub(super) extern "win64" fn native_free_library(module: u64) -> i32 {
             return 0;
         }
         loaded.load_references -= 1;
-        (loaded.load_references == 0 && loaded.dependency_references == 0)
-            .then(|| modules.remove(&module))
-            .flatten()
-    };
-    if let Some(loaded) = removed {
-        dispose_loaded_module(&process, loaded);
     }
+    collect_unreferenced_modules(&process);
     1
 }
 
-fn release_module_dependency(process: &NativeProcessContext, module: u64) {
+fn collect_unreferenced_modules(process: &NativeProcessContext) {
     let removed = {
         let Ok(mut modules) = process.loaded_modules.lock() else {
             return;
         };
-        let Some(loaded) = modules.get_mut(&module) else {
-            return;
-        };
-        if loaded.dependency_references == 0 {
-            return;
+        let mut reachable: std::collections::HashSet<u64> = modules
+            .values()
+            .filter(|module| module.load_references != 0 || module.base == process.image_base)
+            .map(|module| module.base)
+            .collect();
+        let mut pending: Vec<u64> = reachable.iter().copied().collect();
+        while let Some(module) = pending.pop() {
+            if let Some(module) = modules.get(&module) {
+                for dependency in &module.dependencies {
+                    if reachable.insert(*dependency) {
+                        pending.push(*dependency);
+                    }
+                }
+            }
         }
-        loaded.dependency_references -= 1;
-        (loaded.load_references == 0 && loaded.dependency_references == 0)
-            .then(|| modules.remove(&module))
-            .flatten()
+        let unreferenced: Vec<_> = modules
+            .keys()
+            .copied()
+            .filter(|module| !reachable.contains(module))
+            .collect();
+        let mut unreferenced = unreferenced
+            .into_iter()
+            .filter_map(|module| modules.remove(&module))
+            .collect::<Vec<_>>();
+        unreferenced.sort_by_key(|module| module.load_order);
+        unreferenced
     };
-    if let Some(loaded) = removed {
-        dispose_loaded_module(process, loaded);
+    for module in removed {
+        dispose_loaded_module(process, module);
     }
 }
 
 fn dispose_loaded_module(process: &NativeProcessContext, loaded: NativeLoadedModule) {
+    if let Some(entry_point) = loaded.entry_point {
+        // SAFETY: the entry point was validated against the mapped PE image
+        // before it was published to the loader table.
+        let dll_main: unsafe extern "win64" fn(u64, u32, u64) -> i32 =
+            unsafe { std::mem::transmute(entry_point as usize) };
+        let _ = unsafe { dll_main(loaded.base, 0, 0) };
+    }
+    super::thread_runtime::invoke_tls_callbacks(loaded.base, &loaded.tls_callbacks, 0);
     if let Some(index) = loaded.static_tls_index {
         super::thread_runtime::clear_module_static_tls(process, index);
         super::thread_runtime::release_module_tls_slot(process, index);
     }
-    for dependency in loaded.dependencies {
-        release_module_dependency(process, dependency);
-    }
+    drop(loaded);
 }
 
 pub(super) struct Mapping {
     pub(super) ptr: *mut u8,
     pub(super) len: usize,
 }
+
+// A mapping is owned by one loader record and can be moved between host
+// threads. Guest access uses the mapped address directly, not Rust references.
+unsafe impl Send for Mapping {}
 
 impl Drop for Mapping {
     fn drop(&mut self) {

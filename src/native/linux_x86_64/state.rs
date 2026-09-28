@@ -243,9 +243,9 @@ pub(super) struct NativeLoadedModule {
     pub(super) load_order: u64,
     /// References acquired through LoadLibrary; GetModuleHandle does not add one.
     pub(super) load_references: u32,
-    /// References held by other loaded guest DLLs through their import tables.
-    pub(super) dependency_references: u32,
     pub(super) dependencies: Vec<u64>,
+    /// Mapping ownership is attached after imports and initialization succeed.
+    pub(super) mapping: Option<super::loader::Mapping>,
 }
 
 pub(super) struct NativeThread {

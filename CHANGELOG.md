@@ -28,6 +28,8 @@ All notable changes to this project will be documented in this file.
   later-created threads cloned from the process TLS template.
 - Count repeated `LoadLibrary` calls and import-dependency references; release
   dependencies when their importing module reaches zero references.
+- Retain DLL mappings while loaded, collect unreachable dependency cycles, and
+  run process-detach callbacks before clearing TLS and unmapping the images.
 
 - Added a "Why Win-Runner?" section to the README explaining the project's focus
   and how it differs from Wine, VMs, and Windows CI runners.
