@@ -33,6 +33,118 @@ impl NativeExceptionContext {
     }
 }
 
+/// Convert the interrupted Linux x86-64 register state into the Windows
+/// CONTEXT layout consumed by the native exception APIs.
+#[allow(dead_code)] // Wired into the fault trampoline in the next SEH step.
+pub(super) fn context_from_linux_ucontext(source: &libc::ucontext_t) -> NativeExceptionContext {
+    let registers = &source.uc_mcontext.gregs;
+    let mut context = NativeExceptionContext::software_exception();
+    for (windows_register, linux_register) in [
+        (0, libc::REG_RAX),
+        (1, libc::REG_RCX),
+        (2, libc::REG_RDX),
+        (3, libc::REG_RBX),
+        (4, libc::REG_RSP),
+        (5, libc::REG_RBP),
+        (6, libc::REG_RSI),
+        (7, libc::REG_RDI),
+        (8, libc::REG_R8),
+        (9, libc::REG_R9),
+        (10, libc::REG_R10),
+        (11, libc::REG_R11),
+        (12, libc::REG_R12),
+        (13, libc::REG_R13),
+        (14, libc::REG_R14),
+        (15, libc::REG_R15),
+        (16, libc::REG_RIP),
+    ] {
+        context_set_register(
+            &mut context,
+            windows_register,
+            registers[linux_register as usize] as u64,
+        );
+    }
+    context.bytes[68..72]
+        .copy_from_slice(&(registers[libc::REG_EFL as usize] as u32).to_le_bytes());
+    let selectors = registers[libc::REG_CSGSFS as usize] as u64;
+    context.bytes[56..58].copy_from_slice(&(selectors as u16).to_le_bytes());
+    context.bytes[64..66].copy_from_slice(&((selectors >> 16) as u16).to_le_bytes());
+    context.bytes[62..64].copy_from_slice(&((selectors >> 32) as u16).to_le_bytes());
+    context.bytes[66..68].copy_from_slice(&((selectors >> 48) as u16).to_le_bytes());
+
+    if !source.uc_mcontext.fpregs.is_null() {
+        // Linux x86-64 signal frames begin with the architectural 512-byte
+        // FXSAVE image, which shares the Windows CONTEXT FltSave layout.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                source.uc_mcontext.fpregs.cast::<u8>(),
+                context.bytes.as_mut_ptr().add(256),
+                512,
+            );
+        }
+    }
+    context
+}
+
+/// Map a synchronous Linux x86-64 fault signal into its Windows status code
+/// and exception parameters. Asynchronous/user-generated signals are ignored.
+#[allow(dead_code)] // Wired into the fault trampoline in the next SEH step.
+pub(super) fn exception_record_from_linux_signal(
+    signal: i32,
+    signal_code: i32,
+    fault_address: u64,
+    instruction_pointer: u64,
+    page_fault_error: u64,
+) -> Option<NativeExceptionRecord> {
+    let (code, information) = match signal {
+        libc::SIGSEGV | libc::SIGBUS if signal_code > 0 => {
+            let operation = if page_fault_error & (1 << 4) != 0 {
+                8 // EXCEPTION_EXECUTE_FAULT
+            } else if page_fault_error & (1 << 1) != 0 {
+                1 // write
+            } else {
+                0 // read
+            };
+            (0xc000_0005, [operation, fault_address]) // STATUS_ACCESS_VIOLATION
+        }
+        libc::SIGILL if signal_code > 0 => (0xc000_001d, [0, 0]), // STATUS_ILLEGAL_INSTRUCTION
+        libc::SIGFPE if signal_code > 0 => {
+            const LINUX_FPE_INTDIV: i32 = 1;
+            const LINUX_FPE_INTOVF: i32 = 2;
+            const LINUX_FPE_FLTDIV: i32 = 3;
+            const LINUX_FPE_FLTOVF: i32 = 4;
+            const LINUX_FPE_FLTUND: i32 = 5;
+            const LINUX_FPE_FLTRES: i32 = 6;
+            const LINUX_FPE_FLTINV: i32 = 7;
+            const LINUX_FPE_FLTSUB: i32 = 8;
+            let status = match signal_code {
+                LINUX_FPE_INTDIV => 0xc000_0094,
+                LINUX_FPE_INTOVF => 0xc000_0095,
+                LINUX_FPE_FLTDIV => 0xc000_008e,
+                LINUX_FPE_FLTOVF => 0xc000_0091,
+                LINUX_FPE_FLTUND => 0xc000_0093,
+                LINUX_FPE_FLTRES => 0xc000_008f,
+                LINUX_FPE_FLTINV => 0xc000_0090,
+                LINUX_FPE_FLTSUB => 0xc000_008c,
+                _ => return None,
+            };
+            (status, [0, 0])
+        }
+        _ => return None,
+    };
+    let parameter_count = if code == 0xc000_0005 { 2 } else { 0 };
+    let mut record = NativeExceptionRecord {
+        code,
+        flags: 0,
+        nested_record: 0,
+        address: instruction_pointer,
+        parameter_count,
+        information: [0; 15],
+    };
+    record.information[..2].copy_from_slice(&information);
+    Some(record)
+}
+
 pub(super) extern "win64" fn native_set_unhandled_exception_filter(filter: u64) -> u64 {
     process_ctx()
         .map(|process| {

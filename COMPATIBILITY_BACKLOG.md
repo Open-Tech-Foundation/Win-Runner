@@ -120,9 +120,11 @@ Items remain open until implementation and relevant verification are complete.
     edge cases.
   - [x] Capture current x64 control, integer, segment, and floating-point
     state through the native `RtlCaptureContext` entry point.
-  - [ ] Capture Linux fault contexts, continue execution from a modified guest
-    `CONTEXT`, and implement native SEH frame lookup/unwinding and fault
-    translation. Explicit raises still use a synthetic context.
+  - [x] Convert Linux x86-64 `ucontext_t` state and synchronous `SIGSEGV`,
+    `SIGBUS`, `SIGILL`, and `SIGFPE` details into Windows-shaped records.
+  - [ ] Install the signal capture trampoline, dispatch native SEH handlers,
+    and resume execution from a modified guest `CONTEXT`; explicit raises still
+    use a synthetic context.
 
 ### P1: common command-line tools
 

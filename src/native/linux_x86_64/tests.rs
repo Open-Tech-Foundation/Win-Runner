@@ -3,7 +3,8 @@ use super::*;
 #[cfg(test)]
 mod protection_tests {
     use super::{
-        _exit, command_line_a, environment_block, linux_protection, load_native_child_image,
+        _exit, command_line_a, context_from_linux_ucontext, environment_block,
+        exception_record_from_linux_signal, linux_protection, load_native_child_image,
         native_acquire_srw_lock_exclusive, native_add_vectored_exception_handler,
         native_close_handle, native_connect_socket, native_create_process_w,
         native_create_waitable_timer_ex_w, native_decode_pointer, native_delete_critical_section,
@@ -5998,6 +5999,102 @@ mod protection_tests {
         // FXSAVE's MXCSR field is at byte 24 in the floating save area.
         let mxcsr = u32::from_le_bytes(context.bytes[280..284].try_into().unwrap());
         assert_ne!(mxcsr, 0);
+    }
+
+    #[test]
+    fn linux_ucontext_maps_into_windows_context_registers_and_fxsave() {
+        #[repr(align(16))]
+        struct AlignedFxState([u8; 512]);
+
+        let mut linux: libc::ucontext_t = unsafe { std::mem::zeroed() };
+        let mut fxstate = AlignedFxState([0x5a; 512]);
+        for (register, value) in [
+            (libc::REG_RAX, 0x1111),
+            (libc::REG_RBX, 0x2222),
+            (libc::REG_RSP, 0x3330),
+            (libc::REG_RIP, 0x4444),
+            (libc::REG_EFL, 0x202),
+            (libc::REG_CSGSFS, 0x002b_0053_0063_0033),
+        ] {
+            linux.uc_mcontext.gregs[register as usize] = value;
+        }
+        linux.uc_mcontext.fpregs = fxstate.0.as_mut_ptr().cast();
+
+        let context = context_from_linux_ucontext(&linux);
+
+        assert_eq!(
+            u32::from_le_bytes(context.bytes[48..52].try_into().unwrap()),
+            0x0010_001f
+        );
+        assert_eq!(
+            u64::from_le_bytes(context.bytes[120..128].try_into().unwrap()),
+            0x1111
+        );
+        assert_eq!(
+            u64::from_le_bytes(context.bytes[144..152].try_into().unwrap()),
+            0x2222
+        );
+        assert_eq!(
+            u64::from_le_bytes(context.bytes[152..160].try_into().unwrap()),
+            0x3330
+        );
+        assert_eq!(
+            u64::from_le_bytes(context.bytes[248..256].try_into().unwrap()),
+            0x4444
+        );
+        assert_eq!(
+            u32::from_le_bytes(context.bytes[68..72].try_into().unwrap()),
+            0x202
+        );
+        assert_eq!(
+            u16::from_le_bytes(context.bytes[56..58].try_into().unwrap()),
+            0x33
+        );
+        assert_eq!(
+            u16::from_le_bytes(context.bytes[64..66].try_into().unwrap()),
+            0x63
+        );
+        assert_eq!(
+            u16::from_le_bytes(context.bytes[62..64].try_into().unwrap()),
+            0x53
+        );
+        assert_eq!(
+            u16::from_le_bytes(context.bytes[66..68].try_into().unwrap()),
+            0x2b
+        );
+        assert_eq!(&context.bytes[256..768], &[0x5a; 512]);
+    }
+
+    #[test]
+    fn linux_fault_signals_map_to_windows_exception_records() {
+        let write_fault = exception_record_from_linux_signal(
+            libc::SIGSEGV,
+            2, // Linux SEGV_ACCERR
+            0xdead_beef,
+            0x1400_1234,
+            1 << 1,
+        )
+        .unwrap();
+        assert_eq!(write_fault.code, 0xc000_0005);
+        assert_eq!(write_fault.address, 0x1400_1234);
+        assert_eq!(write_fault.parameter_count, 2);
+        assert_eq!(&write_fault.information[..2], &[1, 0xdead_beef]);
+
+        let execute_fault = exception_record_from_linux_signal(
+            libc::SIGBUS,
+            2, // Linux BUS_ADRERR
+            0xfeed_0000,
+            0x1400_5678,
+            1 << 4,
+        )
+        .unwrap();
+        assert_eq!(&execute_fault.information[..2], &[8, 0xfeed_0000]);
+
+        let integer_divide =
+            exception_record_from_linux_signal(libc::SIGFPE, 1, 0, 0x1400_9999, 0).unwrap();
+        assert_eq!(integer_divide.code, 0xc000_0094);
+        assert_eq!(integer_divide.parameter_count, 0);
+        assert!(exception_record_from_linux_signal(libc::SIGTERM, 0, 0, 0, 0).is_none());
     }
 
     #[test]
