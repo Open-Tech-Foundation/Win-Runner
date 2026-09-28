@@ -99,15 +99,15 @@ Items remain open until implementation and relevant verification are complete.
     `__acrt_iob_func`, `__stdio_common_vfprintf`, and
     `__stdio_common_vsprintf`; wide formatting remains unsupported.
   - [x] Add unbuffered WinFS-backed `fopen`, `fread`, `fwrite`, and `fclose`;
-    buffering, EOF/error state, and wide file modes remain unsupported.
+    buffering and wide file modes remain unsupported.
   - [x] Add `fseek`/`ftell`, `_fseeki64`/`_ftelli64`, and `rewind` for these
     file-backed streams.
   - [x] Track EOF/error state and add `feof`, `ferror`, `clearerr`, `fgetc`,
     `fgets`, and one-byte `ungetc` for CRT file streams.
+  - [x] Add standard-stream `getchar`, `putchar`, and `puts`.
   - [x] Add `strtol`, `strtod`, and `strstr` with Windows `long` width,
     end-pointer reporting, radix parsing, and common decimal input handling.
-  - [x] Add in-place `qsort` and `_time64`; CRT `fopen`/`fread`/`fclose` and
-    other file-backed `FILE` operations remain pending.
+  - [x] Add in-place `qsort` and `_time64`.
   - [ ] Add `_seh_filter_exe` and remaining startup exports.
 - [ ] Add basic `msvcrt.dll` output and remaining file I/O, including `printf`.
   - [x] Share the unbuffered `fopen`/`fread`/`fwrite`/`fclose` subset with MSVCRT.

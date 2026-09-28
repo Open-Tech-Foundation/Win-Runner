@@ -1464,6 +1464,20 @@ pub(super) extern "win64" fn native_crt_fputc(byte: i32, file: *mut u8) -> i32 {
         -1
     }
 }
+pub(super) extern "win64" fn native_crt_putchar(byte: i32) -> i32 {
+    native_crt_fputc(byte, native_crt_acrt_iob_func(1))
+}
+pub(super) extern "win64" fn native_crt_getchar() -> i32 {
+    native_crt_fgetc(native_crt_acrt_iob_func(0))
+}
+pub(super) extern "win64" fn native_crt_puts(input: *const u8) -> i32 {
+    let output = native_crt_acrt_iob_func(1);
+    if native_crt_fputs(input, output) < 0 || native_crt_fputc(b'\n' as i32, output) < 0 {
+        -1
+    } else {
+        0
+    }
+}
 pub(super) extern "win64" fn native_crt_fopen(path: *const u8, mode: *const u8) -> *mut u8 {
     if path.is_null() || mode.is_null() {
         THREAD_CRT_ERRNO.with(|errno| errno.set(22));

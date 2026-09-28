@@ -61,6 +61,8 @@ All notable changes to this project will be documented in this file.
   handles.
 - Track EOF/error state for CRT file streams and add `feof`, `ferror`,
   `clearerr`, `fgetc`, `fgets`, and one-byte `ungetc` pushback.
+- Add standard-stream `getchar`, `putchar`, and `puts` using the guest's current
+  Windows standard handles.
 - Add CRT `strtol`, `strtod`, and `strstr` shims with radix parsing, end-pointer
   reporting, common decimal/special floating-point input, and range errors.
 - Add in-place CRT `qsort` using the guest comparator and `_time64` using the

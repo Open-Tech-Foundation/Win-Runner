@@ -2487,6 +2487,9 @@ mod protection_tests {
         assert!(super::supports_import("MSVCRT.dll", "strncpy"));
         assert!(super::supports_import("MSVCRT.dll", "mbstowcs"));
         assert!(super::supports_import("MSVCRT.dll", "calloc"));
+        assert!(super::supports_import("MSVCRT.dll", "getchar"));
+        assert!(super::supports_import("MSVCRT.dll", "putchar"));
+        assert!(super::supports_import("MSVCRT.dll", "puts"));
         assert!(super::supports_import("MSVCRT.dll", "fwrite"));
         assert!(super::supports_import("MSVCRT.dll", "sprintf"));
         assert!(super::supports_import("MSVCRT.dll", "_errno"));
