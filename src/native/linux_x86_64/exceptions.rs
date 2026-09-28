@@ -12,9 +12,10 @@ pub(super) struct NativeExceptionRecord {
     pub(super) information: [u64; 15],
 }
 
+#[derive(Clone, Copy)]
 #[repr(C, align(16))]
 pub(super) struct NativeExceptionContext {
-    bytes: [u8; 1232],
+    pub(super) bytes: [u8; 1232],
 }
 
 #[repr(C)]
@@ -296,6 +297,394 @@ pub(super) extern "win64" fn native_rtl_delete_function_table(
     };
     tables.remove(index);
     1
+}
+
+/// Apply the common x64 UNWIND_INFO operations to a Windows CONTEXT.
+pub(super) extern "win64" fn native_rtl_virtual_unwind(
+    handler_type: u32,
+    image_base: u64,
+    control_pc: u64,
+    function_entry: *const NativeRuntimeFunction,
+    context_record: *mut NativeExceptionContext,
+    handler_data: *mut *mut c_void,
+    establisher_frame: *mut u64,
+    _context_pointers: *mut c_void,
+) -> u64 {
+    if context_record.is_null() || handler_type > 2 {
+        native_set_last_error(87); // ERROR_INVALID_PARAMETER
+        return 0;
+    }
+    if !handler_data.is_null() {
+        unsafe { handler_data.write(std::ptr::null_mut()) };
+    }
+    let mut context = unsafe { context_record.read_unaligned() };
+    let original_rsp = context_register(&context, 4).unwrap_or(0);
+    if original_rsp == 0 {
+        return 0;
+    }
+    if function_entry.is_null() {
+        let Some(return_address) = stack_u64(original_rsp) else {
+            return 0;
+        };
+        let Some(restored_rsp) = original_rsp.checked_add(8) else {
+            return 0;
+        };
+        context_set_register(&mut context, 16, return_address);
+        context_set_register(&mut context, 4, restored_rsp);
+        if !establisher_frame.is_null() {
+            unsafe { establisher_frame.write(original_rsp) };
+        }
+        unsafe { context_record.write_unaligned(context) };
+        return 0;
+    }
+
+    let function = unsafe { function_entry.read_unaligned() };
+    if function.begin_address >= function.end_address {
+        return 0;
+    }
+    let Some(function_start) = image_base.checked_add(u64::from(function.begin_address)) else {
+        return 0;
+    };
+    let Some(prologue_offset) = control_pc.checked_sub(function_start) else {
+        return 0;
+    };
+    if prologue_offset >= u64::from(function.end_address - function.begin_address) {
+        return 0;
+    }
+    let Some(unwind_address) = image_base.checked_add(u64::from(function.unwind_data)) else {
+        return 0;
+    };
+    let header = unsafe { std::slice::from_raw_parts(unwind_address as *const u8, 4) };
+    let version = header[0] & 7;
+    let flags = header[0] >> 3;
+    let prologue_size = header[1];
+    let code_count = header[2] as usize;
+    let frame_register = header[3] & 0x0f;
+    let frame_offset = header[3] >> 4;
+    if version != 1 || flags & !7 != 0 || flags & 4 != 0 {
+        return 0;
+    }
+    let code_bytes = code_count * 2;
+    let codes =
+        unsafe { std::slice::from_raw_parts((unwind_address + 4) as *const u8, code_bytes) };
+    let mut operations = Vec::new();
+    let mut slot = 0usize;
+    let mut previous_code_offset = u8::MAX;
+    while slot < code_count {
+        let code_offset = codes[slot * 2];
+        if code_offset > previous_code_offset {
+            return 0;
+        }
+        previous_code_offset = code_offset;
+        let op_and_info = codes[slot * 2 + 1];
+        let op = op_and_info & 0x0f;
+        let info = op_and_info >> 4;
+        if code_offset > prologue_size {
+            return 0;
+        }
+        let slots = match op {
+            0 | 2 | 3 | 10 => 1,
+            1 if info == 0 => 2,
+            1 if info == 1 => 3,
+            4 | 8 => 2,
+            5 | 9 => 3,
+            _ => return 0,
+        };
+        if slot + slots > code_count {
+            return 0;
+        }
+        let operand = match slots {
+            2 => u64::from(u16::from_le_bytes([
+                codes[(slot + 1) * 2],
+                codes[(slot + 1) * 2 + 1],
+            ])),
+            3 => {
+                let low = u16::from_le_bytes([codes[(slot + 1) * 2], codes[(slot + 1) * 2 + 1]]);
+                let high = u16::from_le_bytes([codes[(slot + 2) * 2], codes[(slot + 2) * 2 + 1]]);
+                u64::from(low) | (u64::from(high) << 16)
+            }
+            _ => 0,
+        };
+        if u64::from(code_offset) <= prologue_offset {
+            operations.push((op, info, operand));
+        }
+        slot += slots;
+    }
+    if frame_register == 0 && frame_offset != 0 {
+        return 0;
+    }
+    let frame_register_active =
+        frame_register != 0 && operations.iter().any(|operation| operation.0 == 3);
+    let establisher = if frame_register_active {
+        let Some(frame_value) = context_register(&context, frame_register) else {
+            return 0;
+        };
+        let Some(frame) = frame_value.checked_sub(u64::from(frame_offset) * 16) else {
+            return 0;
+        };
+        frame
+    } else {
+        original_rsp
+    };
+    let mut rsp = original_rsp;
+    let mut machine_frame = false;
+    for (op, info, operand) in operations {
+        match op {
+            0 => {
+                if !is_nonvolatile_register(info) {
+                    return 0;
+                }
+                let Some(value) = stack_u64(rsp) else {
+                    return 0;
+                };
+                context_set_register(&mut context, info, value);
+                let Some(next_rsp) = rsp.checked_add(8) else {
+                    return 0;
+                };
+                rsp = next_rsp;
+            }
+            1 => {
+                let allocation = match info {
+                    0 => operand.checked_mul(8),
+                    1 => Some(operand),
+                    _ => None,
+                };
+                let Some(allocation) = allocation else {
+                    return 0;
+                };
+                let Some(next_rsp) = rsp.checked_add(allocation) else {
+                    return 0;
+                };
+                rsp = next_rsp;
+            }
+            2 => {
+                let Some(next_rsp) = rsp.checked_add(u64::from(info) * 8 + 8) else {
+                    return 0;
+                };
+                rsp = next_rsp;
+            }
+            3 => {
+                if info != 0 || frame_register == 0 {
+                    return 0;
+                }
+                let Some(frame_value) = context_register(&context, frame_register) else {
+                    return 0;
+                };
+                let Some(frame) = frame_value.checked_sub(u64::from(frame_offset) * 16) else {
+                    return 0;
+                };
+                rsp = frame;
+            }
+            4 | 5 => {
+                if !is_nonvolatile_register(info) {
+                    return 0;
+                }
+                let offset = if op == 4 {
+                    operand.checked_mul(8)
+                } else {
+                    Some(operand)
+                };
+                let Some(offset) = offset else {
+                    return 0;
+                };
+                let frame_base = if !frame_register_active {
+                    rsp
+                } else {
+                    let Some(frame_value) = context_register(&context, frame_register) else {
+                        return 0;
+                    };
+                    let Some(frame) = frame_value.checked_sub(u64::from(frame_offset) * 16) else {
+                        return 0;
+                    };
+                    frame
+                };
+                let Some(address) = frame_base.checked_add(offset) else {
+                    return 0;
+                };
+                let Some(value) = stack_u64(address) else {
+                    return 0;
+                };
+                context_set_register(&mut context, info, value);
+            }
+            8 | 9 => {
+                if !(6..=15).contains(&info) {
+                    return 0;
+                }
+                let offset = if op == 8 {
+                    operand.checked_mul(16)
+                } else {
+                    Some(operand)
+                };
+                let Some(offset) = offset else {
+                    return 0;
+                };
+                let frame_base = if !frame_register_active {
+                    rsp
+                } else {
+                    let Some(frame_value) = context_register(&context, frame_register) else {
+                        return 0;
+                    };
+                    let Some(frame) = frame_value.checked_sub(u64::from(frame_offset) * 16) else {
+                        return 0;
+                    };
+                    frame
+                };
+                let Some(address) = frame_base.checked_add(offset) else {
+                    return 0;
+                };
+                let xmm_offset = 416 + usize::from(info) * 16;
+                let saved = unsafe { std::slice::from_raw_parts(address as *const u8, 16) };
+                context.bytes[xmm_offset..xmm_offset + 16].copy_from_slice(saved);
+            }
+            10 => {
+                if info > 1 {
+                    return 0;
+                }
+                let Some(frame) = rsp.checked_add(u64::from(info) * 8) else {
+                    return 0;
+                };
+                let Some(rip) = stack_u64(frame) else {
+                    return 0;
+                };
+                let Some(cs_address) = frame.checked_add(8) else {
+                    return 0;
+                };
+                let Some(flags_address) = frame.checked_add(16) else {
+                    return 0;
+                };
+                let Some(rsp_address) = frame.checked_add(24) else {
+                    return 0;
+                };
+                let Some(restored_rsp) = stack_u64(rsp_address) else {
+                    return 0;
+                };
+                let Some(ss_address) = frame.checked_add(32) else {
+                    return 0;
+                };
+                let Some(cs) = stack_u16(cs_address) else {
+                    return 0;
+                };
+                let Some(eflags) = stack_u32(flags_address) else {
+                    return 0;
+                };
+                let Some(ss) = stack_u16(ss_address) else {
+                    return 0;
+                };
+                context_set_register(&mut context, 16, rip);
+                context_set_register(&mut context, 4, restored_rsp);
+                context.bytes[56..58].copy_from_slice(&cs.to_le_bytes());
+                context.bytes[66..68].copy_from_slice(&ss.to_le_bytes());
+                context.bytes[68..72].copy_from_slice(&eflags.to_le_bytes());
+                machine_frame = true;
+            }
+            _ => return 0,
+        }
+    }
+    if !machine_frame {
+        let Some(return_address) = stack_u64(rsp) else {
+            return 0;
+        };
+        context_set_register(&mut context, 16, return_address);
+        let Some(restored_rsp) = rsp.checked_add(8) else {
+            return 0;
+        };
+        context_set_register(&mut context, 4, restored_rsp);
+    }
+
+    let handler_flags = flags & 3;
+    let handler_flag = match handler_type {
+        1 => 1,
+        2 => 2,
+        _ => 0,
+    };
+    let mut handler = 0;
+    if handler_flag != 0 && handler_flags & handler_flag != 0 {
+        let padded_code_count = (code_count + 1) & !1;
+        let handler_rva_address = unwind_address + 4 + (padded_code_count * 2) as u64;
+        let handler_rva = unsafe { (handler_rva_address as *const u32).read_unaligned() };
+        if handler_rva == 0 {
+            return 0;
+        }
+        if !handler_data.is_null() {
+            unsafe {
+                handler_data.write((handler_rva_address + 4) as *mut c_void);
+            }
+        }
+        let Some(handler_address) = image_base.checked_add(u64::from(handler_rva)) else {
+            return 0;
+        };
+        handler = handler_address;
+    }
+    unsafe { context_record.write_unaligned(context) };
+    if !establisher_frame.is_null() {
+        unsafe { establisher_frame.write(establisher) };
+    }
+    handler
+}
+
+fn context_register(context: &NativeExceptionContext, register: u8) -> Option<u64> {
+    let offset = match register {
+        0 => 120,  // RAX
+        1 => 128,  // RCX
+        2 => 136,  // RDX
+        3 => 144,  // RBX
+        4 => 152,  // RSP
+        5 => 160,  // RBP
+        6 => 168,  // RSI
+        7 => 176,  // RDI
+        8 => 184,  // R8
+        9 => 192,  // R9
+        10 => 200, // R10
+        11 => 208, // R11
+        12 => 216, // R12
+        13 => 224, // R13
+        14 => 232, // R14
+        15 => 240, // R15
+        _ => return None,
+    };
+    Some(u64::from_le_bytes(
+        context.bytes[offset..offset + 8].try_into().ok()?,
+    ))
+}
+
+fn context_set_register(context: &mut NativeExceptionContext, register: u8, value: u64) {
+    let offset = match register {
+        0 => 120,
+        1 => 128,
+        2 => 136,
+        3 => 144,
+        4 => 152,
+        5 => 160,
+        6 => 168,
+        7 => 176,
+        8 => 184,
+        9 => 192,
+        10 => 200,
+        11 => 208,
+        12 => 216,
+        13 => 224,
+        14 => 232,
+        15 => 240,
+        16 => 248, // RIP
+        _ => return,
+    };
+    context.bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn is_nonvolatile_register(register: u8) -> bool {
+    matches!(register, 3 | 5 | 6 | 7 | 12 | 13 | 14 | 15)
+}
+
+fn stack_u64(address: u64) -> Option<u64> {
+    (address != 0).then(|| unsafe { (address as *const u64).read_unaligned() })
+}
+
+fn stack_u32(address: u64) -> Option<u32> {
+    (address != 0).then(|| unsafe { (address as *const u32).read_unaligned() })
+}
+
+fn stack_u16(address: u64) -> Option<u16> {
+    (address != 0).then(|| unsafe { (address as *const u16).read_unaligned() })
 }
 
 fn mapped_exception_directory(module: &NativeLoadedModule) -> Option<(u32, u32)> {

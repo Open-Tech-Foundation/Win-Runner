@@ -33,18 +33,19 @@ mod protection_tests {
         native_remove_vectored_exception_handler, native_resolve_code_page,
         native_rtl_add_function_table, native_rtl_delete_function_table, native_rtl_get_version,
         native_rtl_lookup_function_entry, native_rtl_nt_status_to_dos_error,
-        native_set_console_active_screen_buffer, native_set_console_cursor_info,
-        native_set_console_cursor_position, native_set_console_mode,
-        native_set_console_screen_buffer_size, native_set_console_window_info,
-        native_set_environment_variable_w, native_set_file_time, native_set_last_error,
-        native_set_thread_stack_guarantee, native_set_unhandled_exception_filter,
-        native_set_waitable_timer, native_shutdown_socket, native_sleep_condition_variable_srw,
-        native_terminate_process, native_try_acquire_srw_lock_shared,
-        native_wait_for_single_object, native_wait_on_address, native_wake_all_condition_variable,
-        native_wake_by_address_all, native_wide_char_to_multi_byte, native_write_console_w,
-        native_wsa_get_last_error, native_wsa_inet_addr, parse_windows_command_line, process_ctx,
-        uppercase_ascii_utf16, waitpid, write_process_information, NativeLaunchSpec,
-        NativeMemoryStatus, API_SET_MODULE, PROT_EXEC, PROT_READ, PROT_WRITE, THREAD_NATIVE_HANDLE,
+        native_rtl_virtual_unwind, native_set_console_active_screen_buffer,
+        native_set_console_cursor_info, native_set_console_cursor_position,
+        native_set_console_mode, native_set_console_screen_buffer_size,
+        native_set_console_window_info, native_set_environment_variable_w, native_set_file_time,
+        native_set_last_error, native_set_thread_stack_guarantee,
+        native_set_unhandled_exception_filter, native_set_waitable_timer, native_shutdown_socket,
+        native_sleep_condition_variable_srw, native_terminate_process,
+        native_try_acquire_srw_lock_shared, native_wait_for_single_object, native_wait_on_address,
+        native_wake_all_condition_variable, native_wake_by_address_all,
+        native_wide_char_to_multi_byte, native_write_console_w, native_wsa_get_last_error,
+        native_wsa_inet_addr, parse_windows_command_line, process_ctx, uppercase_ascii_utf16,
+        waitpid, write_process_information, NativeLaunchSpec, NativeMemoryStatus, API_SET_MODULE,
+        PROT_EXEC, PROT_READ, PROT_WRITE, THREAD_NATIVE_HANDLE,
     };
     use crate::winfs::WinFs;
 
@@ -2052,6 +2053,7 @@ mod protection_tests {
             "NTDLL.dll",
             "RtlLookupFunctionEntry"
         ));
+        assert!(super::supports_import("NTDLL.dll", "RtlVirtualUnwind"));
         assert!(super::supports_import(
             "api-ms-win-core-file-l1-1-0.dll",
             "CreateFileW"
@@ -5976,6 +5978,221 @@ mod protection_tests {
 
         functions.swap(0, 1);
         assert_eq!(native_rtl_add_function_table(table, 2, base), 0);
+    }
+
+    #[test]
+    fn rtl_virtual_unwind_restores_a_pushed_register_and_small_frame() {
+        let mut image = vec![0u8; 0x1000];
+        let base = image.as_mut_ptr() as u64;
+        // Version 1, exception handler present, 4-byte prologue, two unwind
+        // slots: 32-byte allocation followed by a saved RBX push.
+        image[0x800..0x804].copy_from_slice(&[9, 4, 2, 0]);
+        image[0x804..0x808].copy_from_slice(&[4, 0x32, 1, 0x30]);
+        image[0x808..0x80c].copy_from_slice(&0x900u32.to_le_bytes());
+        let function = super::NativeRuntimeFunction {
+            begin_address: 0x100,
+            end_address: 0x200,
+            unwind_data: 0x800,
+        };
+        let mut stack = [0u64; 8];
+        stack[4] = 0x1234_5678_9abc_def0;
+        stack[5] = 0x0000_7fff_1111_2222;
+        let original_rsp = stack.as_ptr() as u64;
+        let mut context = super::NativeExceptionContext { bytes: [0; 1232] };
+        context.bytes[48..52].copy_from_slice(&0x0010_001fu32.to_le_bytes());
+        context.bytes[152..160].copy_from_slice(&original_rsp.to_le_bytes());
+        let mut handler_data = std::ptr::null_mut();
+        let mut establisher = 0;
+
+        let handler = native_rtl_virtual_unwind(
+            1,
+            base,
+            base + 0x150,
+            &function,
+            &mut context,
+            &mut handler_data,
+            &mut establisher,
+            std::ptr::null_mut(),
+        );
+        assert_eq!(handler, base + 0x900);
+        assert_eq!(handler_data, (base + 0x80c) as *mut std::ffi::c_void);
+        assert_eq!(establisher, original_rsp);
+        assert_eq!(
+            u64::from_le_bytes(context.bytes[144..152].try_into().unwrap()),
+            0x1234_5678_9abc_def0
+        );
+        assert_eq!(
+            u64::from_le_bytes(context.bytes[248..256].try_into().unwrap()),
+            0x0000_7fff_1111_2222
+        );
+        assert_eq!(
+            u64::from_le_bytes(context.bytes[152..160].try_into().unwrap()),
+            original_rsp + 48
+        );
+    }
+
+    #[test]
+    fn rtl_virtual_unwind_handles_large_allocations_xmm_and_machine_frames() {
+        let mut image = vec![0u8; 0x1000];
+        let base = image.as_mut_ptr() as u64;
+        let function = super::NativeRuntimeFunction {
+            begin_address: 0x100,
+            end_address: 0x200,
+            unwind_data: 0x800,
+        };
+
+        // UWOP_ALLOC_LARGE info=0 takes one following slot, scaled by 8.
+        image[0x800..0x804].copy_from_slice(&[1, 3, 2, 0]);
+        image[0x804..0x808].copy_from_slice(&[3, 1, 4, 0]);
+        let mut large_stack = [0u64; 8];
+        large_stack[4] = 0x0000_7fff_2222_3333;
+        let large_rsp = large_stack.as_ptr() as u64;
+        let mut large_context = super::NativeExceptionContext { bytes: [0; 1232] };
+        large_context.bytes[152..160].copy_from_slice(&large_rsp.to_le_bytes());
+        assert_eq!(
+            native_rtl_virtual_unwind(
+                0,
+                base,
+                base + 0x150,
+                &function,
+                &mut large_context,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ),
+            0
+        );
+        assert_eq!(
+            u64::from_le_bytes(large_context.bytes[248..256].try_into().unwrap()),
+            0x0000_7fff_2222_3333
+        );
+
+        // Save XMM6 at RSP, allocate 24 bytes, then restore the caller frame.
+        image[0x800..0x804].copy_from_slice(&[1, 4, 3, 0]);
+        image[0x804..0x80a].copy_from_slice(&[4, 0x68, 0, 0, 2, 0x22]);
+        let mut xmm_stack = [0u64; 8];
+        let xmm_bytes =
+            unsafe { std::slice::from_raw_parts_mut(xmm_stack.as_mut_ptr().cast::<u8>(), 16) };
+        xmm_bytes.copy_from_slice(&[0xa5; 16]);
+        xmm_stack[3] = 0x0000_7fff_3333_4444;
+        let xmm_rsp = xmm_stack.as_ptr() as u64;
+        let mut xmm_context = super::NativeExceptionContext { bytes: [0; 1232] };
+        xmm_context.bytes[152..160].copy_from_slice(&xmm_rsp.to_le_bytes());
+        assert_eq!(
+            native_rtl_virtual_unwind(
+                0,
+                base,
+                base + 0x150,
+                &function,
+                &mut xmm_context,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ),
+            0
+        );
+        assert_eq!(&xmm_context.bytes[512..528], &[0xa5; 16]);
+        assert_eq!(
+            u64::from_le_bytes(xmm_context.bytes[248..256].try_into().unwrap()),
+            0x0000_7fff_3333_4444
+        );
+
+        // UWOP_PUSH_MACHFRAME restores RIP, CS, EFLAGS, RSP, and SS.
+        image[0x800..0x804].copy_from_slice(&[1, 1, 1, 0]);
+        image[0x804..0x806].copy_from_slice(&[1, 10]);
+        let mut machine_stack = [0u64; 8];
+        machine_stack[0] = 0x0000_7fff_4444_5555;
+        machine_stack[1] = 0x33;
+        machine_stack[2] = 0x202;
+        machine_stack[3] = 0x0000_7fff_5555_6666;
+        machine_stack[4] = 0x2b;
+        let machine_rsp = machine_stack.as_ptr() as u64;
+        let mut machine_context = super::NativeExceptionContext { bytes: [0; 1232] };
+        machine_context.bytes[152..160].copy_from_slice(&machine_rsp.to_le_bytes());
+        assert_eq!(
+            native_rtl_virtual_unwind(
+                0,
+                base,
+                base + 0x150,
+                &function,
+                &mut machine_context,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ),
+            0
+        );
+        assert_eq!(
+            u64::from_le_bytes(machine_context.bytes[248..256].try_into().unwrap()),
+            0x0000_7fff_4444_5555
+        );
+        assert_eq!(
+            u64::from_le_bytes(machine_context.bytes[152..160].try_into().unwrap()),
+            0x0000_7fff_5555_6666
+        );
+        assert_eq!(
+            u32::from_le_bytes(machine_context.bytes[68..72].try_into().unwrap()),
+            0x202
+        );
+        assert_eq!(
+            u16::from_le_bytes(machine_context.bytes[56..58].try_into().unwrap()),
+            0x33
+        );
+        assert_eq!(
+            u16::from_le_bytes(machine_context.bytes[66..68].try_into().unwrap()),
+            0x2b
+        );
+    }
+
+    #[test]
+    fn rtl_virtual_unwind_restores_frame_pointer_saved_registers() {
+        let mut image = vec![0u8; 0x1000];
+        let base = image.as_mut_ptr() as u64;
+        // Save R12 at RBP-16+16, establish RBP=RSP+16, then allocate 32.
+        image[0x800..0x804].copy_from_slice(&[1, 4, 4, 0x15]);
+        image[0x804..0x80c].copy_from_slice(&[
+            4, 0xc4, 2, 0, // UWOP_SAVE_NONVOL R12, offset 16
+            2, 0x03, // UWOP_SET_FPREG
+            1, 0x32, // UWOP_ALLOC_SMALL, 32 bytes
+        ]);
+        let function = super::NativeRuntimeFunction {
+            begin_address: 0x100,
+            end_address: 0x200,
+            unwind_data: 0x800,
+        };
+        let mut stack = [0u64; 8];
+        stack[2] = 0x1234_5678_9abc_def0;
+        stack[4] = 0x0000_7fff_6666_7777;
+        let original_rsp = stack.as_ptr() as u64;
+        let mut context = super::NativeExceptionContext { bytes: [0; 1232] };
+        context.bytes[152..160].copy_from_slice(&original_rsp.to_le_bytes());
+        context.bytes[160..168].copy_from_slice(&(original_rsp + 16).to_le_bytes());
+
+        assert_eq!(
+            native_rtl_virtual_unwind(
+                0,
+                base,
+                base + 0x150,
+                &function,
+                &mut context,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ),
+            0
+        );
+        assert_eq!(
+            u64::from_le_bytes(context.bytes[216..224].try_into().unwrap()),
+            0x1234_5678_9abc_def0
+        );
+        assert_eq!(
+            u64::from_le_bytes(context.bytes[248..256].try_into().unwrap()),
+            0x0000_7fff_6666_7777
+        );
+        assert_eq!(
+            u64::from_le_bytes(context.bytes[152..160].try_into().unwrap()),
+            original_rsp + 40
+        );
     }
 
     #[test]

@@ -138,6 +138,7 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                 | "RtlDeleteFunctionTable"
                 | "RtlLookupFunctionEntry"
                 | "RtlRaiseException"
+                | "RtlVirtualUnwind"
                 | "RtlGetVersion"
                 | "RtlNtStatusToDosError"
                 | "NtReadFile"
@@ -220,6 +221,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "RtlLookupFunctionEntry" => {
             Some(native_rtl_lookup_function_entry as *const () as usize as u64)
         }
+        "RtlVirtualUnwind" => Some(native_rtl_virtual_unwind as *const () as usize as u64),
         "RaiseException" => Some(native_raise_exception as *const () as usize as u64),
         "RtlRaiseException" => Some(native_rtl_raise_exception as *const () as usize as u64),
         // Winsock's stable ordinal exports for byte-order conversion.

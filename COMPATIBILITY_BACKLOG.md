@@ -106,6 +106,10 @@ Items remain open until implementation and relevant verification are complete.
   - [x] Register and remove sorted dynamic function tables for generated code
     with `RtlAddFunctionTable` and `RtlDeleteFunctionTable`, and search them
     during `RtlLookupFunctionEntry`.
+  - [x] Implement common version-1 `RtlVirtualUnwind` operations, leaf-frame
+    unwinding, saved-register restoration, and handler-data lookup.
+  - [ ] Complete chained unwind records, epilogue simulation, every unwind
+    opcode, context-pointer output, and guest/native fault integration.
   - [ ] Capture the live guest CPU context, continue execution from a modified
     context, and implement native SEH frame lookup/unwinding and Linux fault
     translation. The current explicit-raise path supplies a synthetic context
