@@ -68,6 +68,9 @@ All notable changes to this project will be documented in this file.
 - Add UCRT `_seh_filter_exe` mapping for documented access-violation,
   illegal-instruction, and floating-point statuses to registered CRT signal
   handlers.
+- Implement `_initialize_onexit_table`, `_register_onexit_function`, and
+  `_execute_onexit_table` with growable guest on-exit tables and reverse-order
+  execution.
 - Add CRT `strtol`, `strtod`, and `strstr` shims with radix parsing, end-pointer
   reporting, common decimal/special floating-point input, and range errors.
 - Add in-place CRT `qsort` using the guest comparator and `_time64` using the

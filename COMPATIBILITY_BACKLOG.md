@@ -95,6 +95,8 @@ Items remain open until implementation and relevant verification are complete.
     `_set_new_mode`, and `_configthreadlocale`.
   - [x] Register `_crt_atexit`, `_register_onexit_function`, and `_onexit`
     callbacks and execute them in reverse registration order on CRT exit.
+  - [x] Implement `_initialize_onexit_table` and `_execute_onexit_table` with
+    growable tables, callback registration, and reverse-order execution.
   - [x] Add the standard UCRT stream table and a narrow formatting subset for
     `__acrt_iob_func`, `__stdio_common_vfprintf`, and
     `__stdio_common_vsprintf`; wide formatting remains unsupported.

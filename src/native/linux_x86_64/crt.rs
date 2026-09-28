@@ -316,10 +316,163 @@ pub(super) extern "win64" fn native_crt_atexit(callback: u64) -> i32 {
 }
 
 pub(super) extern "win64" fn native_crt_register_onexit_function(
-    _table: *mut c_void,
+    table: *mut c_void,
     callback: u64,
 ) -> i32 {
-    native_crt_atexit(callback)
+    if table.is_null() || callback == 0 {
+        return -1;
+    }
+    let Some((mut first, mut last, mut end)) = native_crt_onexit_fields(table) else {
+        return -1;
+    };
+    if first == NATIVE_CRT_ONEXIT_EMPTY
+        && last == NATIVE_CRT_ONEXIT_EMPTY
+        && end == NATIVE_CRT_ONEXIT_EMPTY
+    {
+        let initial_count = 32usize;
+        let Some(bytes) = initial_count.checked_mul(std::mem::size_of::<u64>()) else {
+            return -1;
+        };
+        first = unsafe { malloc(bytes) } as usize;
+        if first == 0 {
+            return -1;
+        }
+        last = first;
+        end = first + bytes;
+    } else if first == 0
+        || last < first
+        || end < last
+        || (last - first) % 8 != 0
+        || (end - first) % 8 != 0
+    {
+        return -1;
+    }
+    if last == end {
+        let old_capacity = (end - first) / 8;
+        let new_capacity = old_capacity.saturating_mul(2).max(32);
+        let Some(bytes) = new_capacity.checked_mul(8) else {
+            return -1;
+        };
+        let grown = unsafe { realloc(first as *mut c_void, bytes) } as usize;
+        if grown == 0 {
+            return -1;
+        }
+        first = grown;
+        last = grown + old_capacity * 8;
+        end = grown + bytes;
+    }
+    unsafe {
+        (last as *mut u64).write_unaligned(callback);
+        let fields = table.cast::<u64>();
+        fields.write_unaligned(first as u64);
+        fields.add(1).write_unaligned(last as u64 + 8);
+        fields.add(2).write_unaligned(end as u64);
+    }
+    0
+}
+
+const NATIVE_CRT_ONEXIT_EMPTY: usize = 1;
+
+fn native_crt_onexit_fields(table: *mut c_void) -> Option<(usize, usize, usize)> {
+    if table.is_null() {
+        return None;
+    }
+    let fields = table.cast::<u64>();
+    Some(unsafe {
+        (
+            fields.read_unaligned() as usize,
+            fields.add(1).read_unaligned() as usize,
+            fields.add(2).read_unaligned() as usize,
+        )
+    })
+}
+
+pub(super) extern "win64" fn native_crt_initialize_onexit_table(table: *mut c_void) -> i32 {
+    let Some((first, last, end)) = native_crt_onexit_fields(table) else {
+        return -1;
+    };
+    let initialized_empty = first == NATIVE_CRT_ONEXIT_EMPTY
+        && last == NATIVE_CRT_ONEXIT_EMPTY
+        && end == NATIVE_CRT_ONEXIT_EMPTY;
+    let initialized_storage = first != 0
+        && first != NATIVE_CRT_ONEXIT_EMPTY
+        && first <= last
+        && last <= end
+        && (last - first) % 8 == 0
+        && (end - first) % 8 == 0;
+    if !initialized_empty && !initialized_storage {
+        let fields = table.cast::<u64>();
+        unsafe {
+            fields.write_unaligned(NATIVE_CRT_ONEXIT_EMPTY as u64);
+            fields
+                .add(1)
+                .write_unaligned(NATIVE_CRT_ONEXIT_EMPTY as u64);
+            fields
+                .add(2)
+                .write_unaligned(NATIVE_CRT_ONEXIT_EMPTY as u64);
+        }
+    }
+    0
+}
+
+pub(super) extern "win64" fn native_crt_execute_onexit_table(table: *mut c_void) -> i32 {
+    let Some((mut first, mut last, _end)) = native_crt_onexit_fields(table) else {
+        return -1;
+    };
+    if first == 0 {
+        return 0;
+    }
+    if first == NATIVE_CRT_ONEXIT_EMPTY {
+        let fields = table.cast::<u64>();
+        unsafe {
+            fields.write_unaligned(0);
+            fields.add(1).write_unaligned(0);
+            fields.add(2).write_unaligned(0);
+        }
+        return 0;
+    }
+    if first == 0 || last < first || (last - first) % 8 != 0 {
+        return -1;
+    }
+    let mut scan_first = first;
+    let mut scan_last = last;
+    loop {
+        while scan_last > scan_first {
+            scan_last -= 8;
+            let slot = scan_last as *mut u64;
+            let callback = unsafe { slot.read_unaligned() };
+            unsafe { slot.write_unaligned(0) };
+            if callback != 0 {
+                let callback: extern "win64" fn() =
+                    unsafe { std::mem::transmute(callback as usize) };
+                callback();
+                if let Some((new_first, new_last, _)) = native_crt_onexit_fields(table) {
+                    if new_first != scan_first || new_last != last {
+                        first = new_first;
+                        scan_first = new_first;
+                        scan_last = new_last;
+                        last = new_last;
+                        break;
+                    }
+                } else {
+                    return -1;
+                }
+            }
+        }
+        if scan_last <= scan_first {
+            break;
+        }
+    }
+    if first != NATIVE_CRT_ONEXIT_EMPTY {
+        unsafe { free(first as *mut c_void) };
+    }
+    let fields = table.cast::<u64>();
+    unsafe {
+        fields.write_unaligned(0);
+        fields.add(1).write_unaligned(0);
+        fields.add(2).write_unaligned(0);
+    }
+    0
 }
 
 pub(super) fn native_crt_run_exit_handlers() {

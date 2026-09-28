@@ -1747,6 +1747,8 @@ mod protection_tests {
     }
 
     static CRT_EXIT_ORDER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    static CRT_ONEXIT_TABLE_ORDER: std::sync::atomic::AtomicU32 =
+        std::sync::atomic::AtomicU32::new(0);
 
     extern "win64" fn crt_exit_first() {
         let _ = CRT_EXIT_ORDER.compare_exchange(
@@ -1766,6 +1768,93 @@ mod protection_tests {
         );
     }
 
+    extern "win64" fn crt_onexit_table_first() {
+        CRT_ONEXIT_TABLE_ORDER
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |value| Some(value * 10 + 1),
+            )
+            .unwrap();
+    }
+
+    extern "win64" fn crt_onexit_table_second() {
+        CRT_ONEXIT_TABLE_ORDER
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |value| Some(value * 10 + 2),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn ucrt_onexit_tables_initialize_register_execute_and_reset() {
+        let mut table = [0u64; 3];
+        assert_eq!(
+            super::native_crt_initialize_onexit_table(std::ptr::null_mut()),
+            -1
+        );
+        assert_eq!(
+            super::native_crt_register_onexit_function(
+                table.as_mut_ptr().cast(),
+                crt_onexit_table_first as *const () as usize as u64,
+            ),
+            -1
+        );
+        assert_eq!(
+            super::native_crt_initialize_onexit_table(table.as_mut_ptr().cast()),
+            0
+        );
+        assert_eq!(
+            super::native_crt_register_onexit_function(
+                table.as_mut_ptr().cast(),
+                crt_onexit_table_first as *const () as usize as u64,
+            ),
+            0
+        );
+        assert_eq!(
+            super::native_crt_register_onexit_function(
+                table.as_mut_ptr().cast(),
+                crt_onexit_table_second as *const () as usize as u64,
+            ),
+            0
+        );
+        CRT_ONEXIT_TABLE_ORDER.store(0, std::sync::atomic::Ordering::Release);
+        assert_eq!(
+            super::native_crt_execute_onexit_table(table.as_mut_ptr().cast()),
+            0
+        );
+        assert_eq!(
+            CRT_ONEXIT_TABLE_ORDER.load(std::sync::atomic::Ordering::Acquire),
+            21
+        );
+        assert_eq!(table, [0; 3]);
+        assert_eq!(
+            super::native_crt_execute_onexit_table(table.as_mut_ptr().cast()),
+            0
+        );
+        assert_eq!(
+            super::native_crt_register_onexit_function(
+                table.as_mut_ptr().cast(),
+                crt_onexit_table_first as *const () as usize as u64,
+            ),
+            -1
+        );
+        assert_eq!(
+            super::native_crt_initialize_onexit_table(table.as_mut_ptr().cast()),
+            0
+        );
+        assert!(super::supports_import(
+            "UCRTBASE.DLL",
+            "_initialize_onexit_table"
+        ));
+        assert!(super::supports_import(
+            "UCRTBASE.DLL",
+            "_execute_onexit_table"
+        ));
+    }
+
     #[test]
     fn ucrt_startup_exposes_stable_narrow_argv_environment_and_exit_handlers() {
         let child = unsafe { super::fork() };
@@ -1780,11 +1869,14 @@ mod protection_tests {
             ];
             *process.crt_startup.lock().unwrap() = None;
             CRT_EXIT_ORDER.store(0, std::sync::atomic::Ordering::Release);
+            let mut onexit_table = [0u64; 3];
 
             if !super::supports_import("UCRTBASE.dll", "__p___argc")
                 || !super::supports_import("UCRTBASE.dll", "__p___argv")
                 || !super::supports_import("UCRTBASE.dll", "_crt_atexit")
                 || !super::supports_import("UCRTBASE.dll", "_register_onexit_function")
+                || !super::supports_import("UCRTBASE.dll", "_initialize_onexit_table")
+                || !super::supports_import("UCRTBASE.dll", "_execute_onexit_table")
                 || !super::supports_import("UCRTBASE.dll", "_set_new_mode")
                 || !super::supports_import("UCRTBASE.dll", "_configthreadlocale")
                 || super::native_crt_configure_narrow_argv(1) != 0
@@ -1822,8 +1914,9 @@ mod protection_tests {
             }
 
             if super::native_crt_atexit(crt_exit_first as *const () as usize as u64) != 0
+                || super::native_crt_initialize_onexit_table(onexit_table.as_mut_ptr().cast()) != 0
                 || super::native_crt_register_onexit_function(
-                    std::ptr::null_mut(),
+                    onexit_table.as_mut_ptr().cast(),
                     crt_exit_second as *const () as usize as u64,
                 ) != 0
                 || super::native_crt_set_new_mode(1) != 0
@@ -1833,6 +1926,9 @@ mod protection_tests {
                 || super::native_crt_config_thread_locale(0) != 1
             {
                 unsafe { _exit(122) };
+            }
+            if super::native_crt_execute_onexit_table(onexit_table.as_mut_ptr().cast()) != 0 {
+                unsafe { _exit(120) };
             }
             super::native_crt_run_exit_handlers();
             let result = CRT_EXIT_ORDER.load(std::sync::atomic::Ordering::Acquire);
