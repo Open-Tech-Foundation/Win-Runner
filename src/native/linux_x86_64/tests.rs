@@ -2344,6 +2344,36 @@ mod protection_tests {
     }
 
     #[test]
+    fn vcruntime_memory_imports_use_the_existing_c_runtime_primitives() {
+        let source = *b"abcdef";
+        let mut output = [0u8; 8];
+        assert_eq!(
+            super::native_crt_memcpy(output.as_mut_ptr().cast(), source.as_ptr().cast(), 6),
+            output.as_mut_ptr().cast()
+        );
+        assert_eq!(&output[..6], b"abcdef");
+        assert_eq!(
+            super::native_crt_memcmp(output.as_ptr(), source.as_ptr(), source.len()),
+            0
+        );
+        assert_eq!(
+            super::native_crt_memset(output.as_mut_ptr().cast(), 0x5a, 2),
+            output.as_mut_ptr().cast()
+        );
+        assert_eq!(&output[..6], b"ZZcdef");
+
+        let overlapping = *b"abcdef";
+        let mut moved = overlapping;
+        let destination = unsafe { moved.as_mut_ptr().add(1) };
+        assert_eq!(
+            super::native_crt_memmove(destination.cast(), moved.as_ptr().cast(), 5),
+            destination.cast()
+        );
+        assert_eq!(&moved, b"aabcde");
+        assert_eq!(super::native_crt_strlen(b"vcruntime\0".as_ptr()), 9);
+    }
+
+    #[test]
     fn crt_wcstombs_converts_c_locale_and_reports_unrepresentable_text() {
         let input = [b'n' as u16, b'a' as u16, b'n' as u16, b'o' as u16, 0];
         let mut output = [0xff; 5];
@@ -2684,6 +2714,20 @@ mod protection_tests {
                 "{export} has no trampoline"
             );
         }
+        for export in ["memcmp", "memcpy", "memmove", "memset", "strlen"] {
+            assert!(
+                super::supports_import("VCRUNTIME140.dll", export),
+                "{export}"
+            );
+            assert!(
+                super::baseline_trampoline(export).is_some(),
+                "{export} has no trampoline"
+            );
+        }
+        assert!(!super::supports_import(
+            "VCRUNTIME140.dll",
+            "__CxxFrameHandler3"
+        ));
         assert!(super::supports_import("MSVCRT.dll", "__lconv_init"));
         assert!(super::supports_import("MSVCRT.dll", "strncmp"));
         assert!(super::supports_import("MSVCRT.dll", "setlocale"));

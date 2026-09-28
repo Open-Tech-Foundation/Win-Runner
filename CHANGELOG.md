@@ -6,6 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Route the existing `memcmp`, `memcpy`, `memmove`, `memset`, and `strlen`
+  shims for `VCRUNTIME140.dll` imports; C++ exception runtime exports remain
+  unsupported.
 - Add stable UTF-16 CRT startup arrays and accessors for wide arguments and
   environment variables, including `_configure_wide_argv`, `__p___wargv`, and
   the initial/environment pointer APIs.

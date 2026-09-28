@@ -122,8 +122,10 @@ Items remain open until implementation and relevant verification are complete.
   - [x] Add narrow `printf`/`fprintf` through the shared formatter; the current
     ABI bridge captures at most ten vararg slots and supports only the listed
     narrow conversions.
-- [ ] Add VCRUNTIME140 exception handlers, `_CxxThrowException`, and memory
-  functions needed by C++ and default Rust MSVC binaries.
+- [ ] Add VCRUNTIME140 exception handlers and `_CxxThrowException` needed by
+  C++ and default Rust MSVC binaries.
+  - [x] Bind the existing `memcmp`, `memcpy`, `memmove`, `memset`, and `strlen`
+    implementations for `VCRUNTIME140.dll` imports.
 - [ ] Implement structured exception lookup/unwind/raise APIs and translate
   Linux fault signals into guest Windows exceptions.
   - [x] Store multiple vectored exception handlers with Windows first-handler

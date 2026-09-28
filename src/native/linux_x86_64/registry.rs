@@ -119,6 +119,9 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                     | "_get_osfhandle"
             )
         }
+        "VCRUNTIME140.DLL" => {
+            matches!(func, "memcmp" | "memcpy" | "memmove" | "memset" | "strlen")
+        }
         "WINMM.DLL" => func == "timeGetTime",
         "USERENV.DLL" => func == "GetUserProfileDirectoryW",
         "BCRYPTPRIMITIVES.DLL" => func == "ProcessPrng",
