@@ -72,6 +72,7 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                     | "__acrt_iob_func"
                     | "__stdio_common_vfprintf"
                     | "__stdio_common_vsprintf"
+                    | "__stdio_common_vswprintf"
                     | "atoi"
                     | "strtol"
                     | "strtod"
@@ -215,7 +216,10 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
         && !(module == "MSVCRT.DLL"
             && matches!(
                 func,
-                "__acrt_iob_func" | "__stdio_common_vfprintf" | "__stdio_common_vsprintf"
+                "__acrt_iob_func"
+                    | "__stdio_common_vfprintf"
+                    | "__stdio_common_vsprintf"
+                    | "__stdio_common_vswprintf"
             ))
         && baseline_trampoline(func).is_some()
 }
@@ -232,6 +236,9 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         }
         "__stdio_common_vsprintf" => {
             Some(native_crt_stdio_common_vsprintf as *const () as usize as u64)
+        }
+        "__stdio_common_vswprintf" => {
+            Some(native_crt_stdio_common_vswprintf as *const () as usize as u64)
         }
         "__lconv_init" => Some(native_crt_lconv_init as *const () as usize as u64),
         "setlocale" => Some(native_crt_setlocale as *const () as usize as u64),

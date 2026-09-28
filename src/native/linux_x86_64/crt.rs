@@ -1858,6 +1858,306 @@ fn crt_format_narrow_limited(
     None
 }
 
+fn crt_read_argument_wide_string(pointer: u64, limit: usize) -> Option<Vec<u16>> {
+    if pointer == 0 {
+        return Some("(null)".encode_utf16().collect());
+    }
+    let pointer = pointer as *const u16;
+    let mut output = Vec::new();
+    for index in 0..limit.min(1_048_576) {
+        let unit = unsafe { pointer.add(index).read() };
+        if unit == 0 {
+            return Some(output);
+        }
+        output.push(unit);
+    }
+    None
+}
+
+fn crt_format_wide(format: *const u16, arguments: *mut c_void) -> Option<Vec<u16>> {
+    const MAX_FORMAT_UNITS: usize = 1_048_576;
+    const MAX_OUTPUT_UNITS: usize = 1_048_576;
+    if format.is_null() {
+        return None;
+    }
+    let mut output = Vec::new();
+    let mut arg_index = 0usize;
+    let mut cursor = 0usize;
+    let read_format = |offset: usize| {
+        if offset >= MAX_FORMAT_UNITS {
+            0
+        } else {
+            unsafe { format.add(offset).read() }
+        }
+    };
+    while cursor < MAX_FORMAT_UNITS {
+        let unit = read_format(cursor);
+        if unit == 0 {
+            return Some(output);
+        }
+        cursor += 1;
+        if unit != b'%' as u16 {
+            output.push(unit);
+            continue;
+        }
+        if read_format(cursor) == b'%' as u16 {
+            cursor += 1;
+            output.push(b'%' as u16);
+            continue;
+        }
+
+        let mut left = false;
+        let mut plus = false;
+        let mut space = false;
+        let mut zero = false;
+        let mut alternate = false;
+        loop {
+            match read_format(cursor) {
+                value if value == b'-' as u16 => left = true,
+                value if value == b'+' as u16 => plus = true,
+                value if value == b' ' as u16 => space = true,
+                value if value == b'0' as u16 => zero = true,
+                value if value == b'#' as u16 => alternate = true,
+                _ => break,
+            }
+            cursor += 1;
+        }
+
+        let mut width = 0usize;
+        if read_format(cursor) == b'*' as u16 {
+            let value = crt_read_argument(arguments, &mut arg_index, 256)? as i32;
+            cursor += 1;
+            if value < 0 {
+                left = true;
+                width = value.unsigned_abs() as usize;
+            } else {
+                width = value as usize;
+            }
+        } else {
+            while (b'0' as u16..=b'9' as u16).contains(&read_format(cursor)) {
+                width = width
+                    .saturating_mul(10)
+                    .saturating_add(usize::from(read_format(cursor) - b'0' as u16))
+                    .min(MAX_OUTPUT_UNITS);
+                cursor += 1;
+            }
+        }
+        width = width.min(MAX_OUTPUT_UNITS);
+        let mut precision = None;
+        if read_format(cursor) == b'.' as u16 {
+            cursor += 1;
+            if read_format(cursor) == b'*' as u16 {
+                let value = crt_read_argument(arguments, &mut arg_index, 256)? as i32;
+                cursor += 1;
+                if value >= 0 {
+                    precision = Some((value as usize).min(MAX_OUTPUT_UNITS));
+                }
+            } else {
+                let mut value = 0usize;
+                while (b'0' as u16..=b'9' as u16).contains(&read_format(cursor)) {
+                    value = value
+                        .saturating_mul(10)
+                        .saturating_add(usize::from(read_format(cursor) - b'0' as u16))
+                        .min(MAX_OUTPUT_UNITS);
+                    cursor += 1;
+                }
+                precision = Some(value);
+            }
+        }
+
+        let mut integer_bits = 32u32;
+        let mut narrow_string = false;
+        match read_format(cursor) {
+            value
+                if value == b'I' as u16
+                    && read_format(cursor + 1) == b'6' as u16
+                    && read_format(cursor + 2) == b'4' as u16 =>
+            {
+                cursor += 3;
+                integer_bits = 64;
+            }
+            value if value == b'h' as u16 => {
+                cursor += 1;
+                if read_format(cursor) == b'h' as u16 {
+                    cursor += 1;
+                    integer_bits = 8;
+                } else {
+                    integer_bits = 16;
+                }
+                narrow_string = true;
+            }
+            value if value == b'l' as u16 => {
+                cursor += 1;
+                if read_format(cursor) == b'l' as u16 {
+                    cursor += 1;
+                    integer_bits = 64;
+                } else if matches!(read_format(cursor), value if value == b'd' as u16 || value == b'i' as u16 || value == b'u' as u16 || value == b'x' as u16 || value == b'X' as u16 || value == b'o' as u16)
+                {
+                    integer_bits = 64;
+                }
+            }
+            value if matches!(value, value if value == b'z' as u16 || value == b't' as u16) => {
+                cursor += 1;
+                integer_bits = 64;
+            }
+            value if value == b'w' as u16 => {
+                cursor += 1;
+            }
+            _ => {}
+        }
+        let specifier_unit = read_format(cursor);
+        if specifier_unit == 0 || specifier_unit > u8::MAX as u16 {
+            return None;
+        }
+        let specifier = specifier_unit as u8;
+        cursor += 1;
+        if specifier == b'n' {
+            let pointer = crt_read_argument(arguments, &mut arg_index, 256)? as *mut i32;
+            unsafe { pointer.write_unaligned(output.len().min(i32::MAX as usize) as i32) };
+            continue;
+        }
+
+        let mut field = match specifier {
+            b's' => {
+                let pointer = crt_read_argument(arguments, &mut arg_index, 256)?;
+                let mut text = if narrow_string {
+                    crt_read_argument_string(pointer)
+                        .into_iter()
+                        .map(u16::from)
+                        .collect::<Vec<_>>()
+                } else {
+                    crt_read_argument_wide_string(pointer, MAX_OUTPUT_UNITS)?
+                };
+                if let Some(limit) = precision {
+                    text.truncate(limit);
+                }
+                if text.len() < width {
+                    let pad = width - text.len();
+                    if left {
+                        text.resize(text.len() + pad, b' ' as u16);
+                        output.extend(text);
+                    } else {
+                        output.resize(output.len() + pad, b' ' as u16);
+                        output.extend(text);
+                    }
+                } else {
+                    output.extend(text);
+                }
+                if output.len() > MAX_OUTPUT_UNITS {
+                    return None;
+                }
+                continue;
+            }
+            b'c' => {
+                let value = crt_read_argument(arguments, &mut arg_index, 256)?;
+                vec![if narrow_string {
+                    value as u8 as u16
+                } else {
+                    value as u16
+                }]
+            }
+            b'd' | b'i' => {
+                let raw = crt_read_argument(arguments, &mut arg_index, 256)?;
+                let value = match integer_bits {
+                    8 => raw as i8 as i64,
+                    16 => raw as i16 as i64,
+                    32 => raw as i32 as i64,
+                    _ => raw as i64,
+                };
+                let mut rendered = value.unsigned_abs().to_string();
+                if let Some(precision) = precision {
+                    if rendered.len() < precision {
+                        rendered.insert_str(0, &"0".repeat(precision - rendered.len()));
+                    }
+                }
+                if value < 0 {
+                    rendered.insert(0, '-');
+                } else if plus {
+                    rendered.insert(0, '+');
+                } else if space {
+                    rendered.insert(0, ' ');
+                }
+                rendered.encode_utf16().collect()
+            }
+            b'u' | b'x' | b'X' | b'o' => {
+                let raw = crt_read_argument(arguments, &mut arg_index, 256)?;
+                let value = match integer_bits {
+                    8 => raw as u8 as u64,
+                    16 => raw as u16 as u64,
+                    32 => raw as u32 as u64,
+                    _ => raw,
+                };
+                let mut rendered = match specifier {
+                    b'x' => format!("{value:x}"),
+                    b'X' => format!("{value:X}"),
+                    b'o' => format!("{value:o}"),
+                    _ => value.to_string(),
+                };
+                if let Some(precision) = precision {
+                    if rendered.len() < precision {
+                        rendered.insert_str(0, &"0".repeat(precision - rendered.len()));
+                    }
+                }
+                if alternate && specifier == b'x' {
+                    rendered.insert_str(0, "0x");
+                } else if alternate && specifier == b'X' {
+                    rendered.insert_str(0, "0X");
+                } else if alternate && specifier == b'o' && !rendered.starts_with('0') {
+                    rendered.insert(0, '0');
+                }
+                rendered.encode_utf16().collect()
+            }
+            b'p' => format!("0x{:x}", crt_read_argument(arguments, &mut arg_index, 256)?)
+                .encode_utf16()
+                .collect(),
+            b'f' | b'F' | b'e' | b'E' | b'g' | b'G' => {
+                let value = f64::from_bits(crt_read_argument(arguments, &mut arg_index, 256)?);
+                let mut rendered = match (specifier, precision) {
+                    (b'e' | b'E', Some(precision)) => format!("{value:.precision$e}"),
+                    (_, Some(precision)) => format!("{value:.precision$}"),
+                    (b'e' | b'E', None) => format!("{value:e}"),
+                    _ => value.to_string(),
+                };
+                if specifier.is_ascii_uppercase() {
+                    rendered.make_ascii_uppercase();
+                }
+                rendered.encode_utf16().collect()
+            }
+            _ => return None,
+        };
+
+        if precision.is_some() && matches!(specifier, b'd' | b'i' | b'u' | b'x' | b'X' | b'o') {
+            zero = false;
+        }
+
+        if width > field.len() {
+            let padding = width - field.len();
+            let pad = if zero && !left {
+                b'0' as u16
+            } else {
+                b' ' as u16
+            };
+            if left {
+                field.resize(field.len() + padding, b' ' as u16);
+            } else if zero {
+                let sign = usize::from(
+                    field
+                        .first()
+                        .is_some_and(|unit| matches!(*unit, 45 | 43 | 32)),
+                );
+                field.splice(sign..sign, std::iter::repeat_n(pad, padding));
+            } else {
+                field.splice(0..0, std::iter::repeat_n(pad, padding));
+            }
+        }
+        output.extend(field);
+        if output.len() > MAX_OUTPUT_UNITS {
+            return None;
+        }
+    }
+    None
+}
+
 pub(super) extern "win64" fn native_crt_stdio_common_vfprintf(
     _options: u64,
     stream: *mut u8,
@@ -1904,6 +2204,30 @@ pub(super) extern "win64" fn native_crt_stdio_common_vsprintf(
         output.add(copied).write(0);
     }
     bytes.len().min(i32::MAX as usize) as i32
+}
+
+pub(super) extern "win64" fn native_crt_stdio_common_vswprintf(
+    _options: u64,
+    output: *mut u16,
+    output_count: usize,
+    format: *const u16,
+    _locale: *mut c_void,
+    arguments: *mut c_void,
+) -> i32 {
+    if output.is_null() || output_count == 0 {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+        return -1;
+    }
+    let Some(units) = crt_format_wide(format, arguments) else {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+        return -1;
+    };
+    let copied = units.len().min(output_count - 1);
+    unsafe {
+        std::ptr::copy_nonoverlapping(units.as_ptr(), output, copied);
+        output.add(copied).write(0);
+    }
+    units.len().min(i32::MAX as usize) as i32
 }
 
 fn native_crt_format_to_stream(stream: *mut u8, format: *const u8, arguments: &[u64]) -> i32 {

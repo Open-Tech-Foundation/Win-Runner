@@ -2698,6 +2698,63 @@ mod protection_tests {
     }
 
     #[test]
+    fn ucrt_common_vswprintf_formats_wide_strings_and_common_values() {
+        let wide_text = "snow ☃".encode_utf16().chain([0]).collect::<Vec<_>>();
+        let narrow_text = b"ansi\0";
+        let format = "wide=%ls %hs %04d %#x %%"
+            .encode_utf16()
+            .chain([0])
+            .collect::<Vec<_>>();
+        let mut arguments = [
+            wide_text.as_ptr() as u64,
+            narrow_text.as_ptr() as u64,
+            (-7i32 as i64) as u64,
+            42,
+        ];
+        let expected = "wide=snow ☃ ansi -007 0x2a %";
+        let expected_wide = expected.encode_utf16().collect::<Vec<_>>();
+        let mut output = [0xaaaa; 64];
+        let written = super::native_crt_stdio_common_vswprintf(
+            0,
+            output.as_mut_ptr(),
+            output.len(),
+            format.as_ptr(),
+            std::ptr::null_mut(),
+            arguments.as_mut_ptr().cast(),
+        );
+        assert_eq!(written as usize, expected_wide.len());
+        assert_eq!(&output[..written as usize], expected_wide);
+        assert_eq!(output[written as usize], 0);
+        assert!(super::supports_import(
+            "UCRTBASE.dll",
+            "__stdio_common_vswprintf"
+        ));
+        assert!(super::supports_import(
+            "api-ms-win-crt-stdio-l1-1-0.dll",
+            "__stdio_common_vswprintf"
+        ));
+        assert!(!super::supports_import(
+            "MSVCRT.dll",
+            "__stdio_common_vswprintf"
+        ));
+
+        let mut short = [0xaaaa; 5];
+        let truncated = super::native_crt_stdio_common_vswprintf(
+            0,
+            short.as_mut_ptr(),
+            short.len(),
+            format.as_ptr(),
+            std::ptr::null_mut(),
+            arguments.as_mut_ptr().cast(),
+        );
+        assert_eq!(truncated, written);
+        assert_eq!(
+            &short,
+            &[b'w' as u16, b'i' as u16, b'd' as u16, b'e' as u16, 0]
+        );
+    }
+
+    #[test]
     fn ucrt_common_vfprintf_rejects_the_input_stream() {
         let format = b"input is not writable\n\0";
         let stream = super::native_crt_acrt_iob_func(0);

@@ -101,7 +101,9 @@ Items remain open until implementation and relevant verification are complete.
     growable tables, callback registration, and reverse-order execution.
   - [x] Add the standard UCRT stream table and a narrow formatting subset for
     `__acrt_iob_func`, `__stdio_common_vfprintf`, and
-    `__stdio_common_vsprintf`; wide formatting remains unsupported.
+    `__stdio_common_vsprintf`; add a bounded wide buffer-formatting subset for
+    `__stdio_common_vswprintf`. Wide stream formatting and full conversion
+    compatibility remain unsupported.
   - [x] Add unbuffered WinFS-backed `fopen`, `fread`, `fwrite`, and `fclose`;
     buffering and wide file modes remain unsupported.
   - [x] Add `fseek`/`ftell`, `_fseeki64`/`_ftelli64`, and `rewind` for these
