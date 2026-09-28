@@ -2099,6 +2099,12 @@ mod protection_tests {
         let read_mode = b"rb\0";
         let file = super::native_crt_fopen(path.as_ptr(), read_mode.as_ptr());
         assert!(!file.is_null());
+        assert_eq!(super::native_crt_fgetc(file), b'a' as i32);
+        assert_eq!(super::native_crt_ungetc(b'Z' as i32, file), b'Z' as i32);
+        assert_eq!(super::native_crt_ungetc(b'Y' as i32, file), -1);
+        assert_eq!(super::native_crt_fgetc(file), b'Z' as i32);
+        assert_eq!(super::native_crt_fgetc(file), b'b' as i32);
+        super::native_crt_rewind(file);
         let mut line = [0u8; 8];
         assert_eq!(
             super::native_crt_fgets(line.as_mut_ptr(), 4, file),
@@ -2113,6 +2119,11 @@ mod protection_tests {
         assert_eq!(super::native_crt_fread(output.as_mut_ptr(), 1, 1, file), 0);
         assert_eq!(super::native_crt_feof(file), 1);
         assert_eq!(super::native_crt_ferror(file), 0);
+        assert_eq!(super::native_crt_ungetc(b'!' as i32, file), b'!' as i32);
+        assert_eq!(super::native_crt_feof(file), 0);
+        assert_eq!(super::native_crt_fgetc(file), b'!' as i32);
+        assert_eq!(super::native_crt_fgetc(file), -1);
+        assert_eq!(super::native_crt_feof(file), 1);
         super::native_crt_clearerr(file);
         assert_eq!(super::native_crt_feof(file), 0);
         assert_eq!(super::native_crt_ftell(file), 8);
@@ -2147,6 +2158,7 @@ mod protection_tests {
         assert!(super::supports_import("UCRTBASE.DLL", "fclose"));
         assert!(super::supports_import("UCRTBASE.DLL", "fgets"));
         assert!(super::supports_import("UCRTBASE.DLL", "feof"));
+        assert!(super::supports_import("UCRTBASE.DLL", "ungetc"));
     }
 
     #[test]

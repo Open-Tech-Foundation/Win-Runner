@@ -102,8 +102,8 @@ Items remain open until implementation and relevant verification are complete.
     buffering, EOF/error state, and wide file modes remain unsupported.
   - [x] Add `fseek`/`ftell`, `_fseeki64`/`_ftelli64`, and `rewind` for these
     file-backed streams.
-  - [x] Track EOF/error state and add `feof`, `ferror`, `clearerr`, `fgetc`, and
-    `fgets` for CRT file streams.
+  - [x] Track EOF/error state and add `feof`, `ferror`, `clearerr`, `fgetc`,
+    `fgets`, and one-byte `ungetc` for CRT file streams.
   - [x] Add `strtol`, `strtod`, and `strstr` with Windows `long` width,
     end-pointer reporting, radix parsing, and common decimal input handling.
   - [x] Add in-place `qsort` and `_time64`; CRT `fopen`/`fread`/`fclose` and

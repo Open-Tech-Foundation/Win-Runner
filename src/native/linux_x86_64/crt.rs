@@ -1605,6 +1605,15 @@ pub(super) extern "win64" fn native_crt_fread(
         return 0;
     }
     let mut total = 0usize;
+    if let Some(file) = file_state {
+        unsafe {
+            if (*file).reserved[2] != 0 {
+                buffer.write((*file).reserved[3]);
+                (*file).reserved[2] = 0;
+                total = 1;
+            }
+        }
+    }
     while total < length {
         let chunk = (length - total).min(16 * 1024 * 1024) as u32;
         let mut received = 0u32;
@@ -1698,6 +1707,25 @@ pub(super) extern "win64" fn native_crt_fgetc(stream: *mut u8) -> i32 {
     }
 }
 
+pub(super) extern "win64" fn native_crt_ungetc(byte: i32, stream: *mut u8) -> i32 {
+    if byte == -1 {
+        return -1;
+    }
+    let Some(file) = native_crt_file(stream) else {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(9));
+        return -1;
+    };
+    unsafe {
+        if (*file).readable == 0 || (*file).reserved[2] != 0 {
+            return -1;
+        }
+        (*file).reserved[2] = 1;
+        (*file).reserved[3] = byte as u8;
+        (*file).reserved[0] = 0;
+    }
+    byte as u8 as i32
+}
+
 pub(super) extern "win64" fn native_crt_fgets(
     output: *mut u8,
     capacity: i32,
@@ -1747,7 +1775,10 @@ pub(super) extern "win64" fn native_crt_fseeki64(stream: *mut u8, offset: i64, o
         return -1;
     }
     if let Some(file) = native_crt_file(stream) {
-        unsafe { (*file).reserved[0] = 0 };
+        unsafe {
+            (*file).reserved[0] = 0;
+            (*file).reserved[2] = 0;
+        }
     }
     0
 }

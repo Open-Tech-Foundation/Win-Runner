@@ -60,7 +60,7 @@ All notable changes to this project will be documented in this file.
 - Add CRT `fseek`/`ftell`, `_fseeki64`/`_ftelli64`, and `rewind` over WinFS file
   handles.
 - Track EOF/error state for CRT file streams and add `feof`, `ferror`,
-  `clearerr`, `fgetc`, and `fgets`.
+  `clearerr`, `fgetc`, `fgets`, and one-byte `ungetc` pushback.
 - Add CRT `strtol`, `strtod`, and `strstr` shims with radix parsing, end-pointer
   reporting, common decimal/special floating-point input, and range errors.
 - Add in-place CRT `qsort` using the guest comparator and `_time64` using the
