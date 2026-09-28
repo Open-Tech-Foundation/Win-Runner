@@ -108,7 +108,10 @@ Items remain open until implementation and relevant verification are complete.
   - [x] Add `strtol`, `strtod`, and `strstr` with Windows `long` width,
     end-pointer reporting, radix parsing, and common decimal input handling.
   - [x] Add in-place `qsort` and `_time64`.
-  - [ ] Add `_seh_filter_exe` and remaining startup exports.
+  - [x] Add `_seh_filter_exe` dispatch for documented access-violation,
+    illegal-instruction, and floating-point exception statuses through the
+    existing CRT `signal()` registrations.
+  - [ ] Add remaining UCRT startup exports and exception cases.
 - [ ] Add basic `msvcrt.dll` output and remaining file I/O, including `printf`.
   - [x] Share the unbuffered `fopen`/`fread`/`fwrite`/`fclose` subset with MSVCRT.
   - [x] Add narrow `printf`/`fprintf` through the shared formatter; the current

@@ -2376,6 +2376,73 @@ mod protection_tests {
             .remove(&(process_id, 2));
     }
 
+    static CRT_SEH_SIGNAL_RESULT: std::sync::atomic::AtomicI32 =
+        std::sync::atomic::AtomicI32::new(0);
+
+    extern "win64" fn crt_seh_signal_handler(signal: i32) {
+        CRT_SEH_SIGNAL_RESULT.store(signal, std::sync::atomic::Ordering::Release);
+    }
+
+    extern "win64" fn crt_seh_fpe_handler(signal: i32, code: i32) {
+        CRT_SEH_SIGNAL_RESULT.store((signal << 16) | code, std::sync::atomic::Ordering::Release);
+    }
+
+    #[test]
+    fn ucrt_seh_filter_maps_exceptions_to_registered_crt_signals() {
+        let process_id = super::process_ctx().unwrap().process_id;
+        CRT_SEH_SIGNAL_RESULT.store(0, std::sync::atomic::Ordering::Release);
+
+        assert_eq!(
+            super::native_crt_signal(11, crt_seh_signal_handler as *const () as usize as u64),
+            0
+        );
+        assert_eq!(
+            super::native_crt_seh_filter_exe(0xc000_0005, std::ptr::null()),
+            -1
+        );
+        assert_eq!(
+            CRT_SEH_SIGNAL_RESULT.load(std::sync::atomic::Ordering::Acquire),
+            11
+        );
+        assert_eq!(
+            super::native_crt_seh_filter_exe(0xc000_0005, std::ptr::null()),
+            0
+        );
+
+        assert_eq!(super::native_crt_signal(4, 1), 0);
+        assert_eq!(
+            super::native_crt_seh_filter_exe(0xc000_001d, std::ptr::null()),
+            -1
+        );
+        assert_eq!(
+            super::native_crt_seh_filter_exe(0xdead_beef, std::ptr::null()),
+            0
+        );
+
+        assert_eq!(
+            super::native_crt_signal(8, crt_seh_fpe_handler as *const () as usize as u64),
+            0
+        );
+        assert_eq!(
+            super::native_crt_seh_filter_exe(0xc000_008e, std::ptr::null()),
+            -1
+        );
+        assert_eq!(
+            CRT_SEH_SIGNAL_RESULT.load(std::sync::atomic::Ordering::Acquire),
+            (8 << 16) | 0x83
+        );
+        assert_eq!(
+            super::native_crt_seh_filter_exe(0xc000_008e, std::ptr::null()),
+            0
+        );
+        assert!(super::supports_import("UCRTBASE.DLL", "_seh_filter_exe"));
+
+        let mut handlers = super::NATIVE_CRT_SIGNAL_HANDLERS.lock().unwrap();
+        handlers.remove(&(process_id, 4));
+        handlers.remove(&(process_id, 8));
+        handlers.remove(&(process_id, 11));
+    }
+
     #[test]
     fn crt_errno_returns_thread_local_storage() {
         let errno = super::native_crt_errno();

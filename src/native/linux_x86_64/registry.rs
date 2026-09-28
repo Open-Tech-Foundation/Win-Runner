@@ -35,6 +35,7 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                     | "_register_onexit_function"
                     | "_set_new_mode"
                     | "_configthreadlocale"
+                    | "_seh_filter_exe"
                     | "exit"
                     | "_exit"
                     | "_cexit"
@@ -230,6 +231,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         }
         "_set_new_mode" => Some(native_crt_set_new_mode as *const () as usize as u64),
         "_configthreadlocale" => Some(native_crt_config_thread_locale as *const () as usize as u64),
+        "_seh_filter_exe" => Some(native_crt_seh_filter_exe as *const () as usize as u64),
         "exit" => Some(native_crt_exit as *const () as usize as u64),
         "_exit" => Some(native_exit_process as *const () as usize as u64),
         "_cexit" => Some(native_crt_cexit as *const () as usize as u64),

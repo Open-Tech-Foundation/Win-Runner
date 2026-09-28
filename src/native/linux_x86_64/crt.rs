@@ -72,6 +72,61 @@ pub(super) extern "win64" fn native_crt_signal(signal: i32, handler: u64) -> u64
         .insert((process.process_id, signal), handler)
         .unwrap_or(0)
 }
+
+fn native_crt_exception_signal(exception: u32) -> Option<(i32, Option<i32>)> {
+    Some(match exception {
+        0xc000_0005 => (11, None), // STATUS_ACCESS_VIOLATION -> SIGSEGV
+        0xc000_001d | 0xc000_0096 => (4, None), // illegal/privileged -> SIGILL
+        0xc000_008d => (8, Some(0x82)), // _FPE_DENORMAL
+        0xc000_008e => (8, Some(0x83)), // _FPE_ZERODIVIDE
+        0xc000_008f => (8, Some(0x86)), // _FPE_INEXACT
+        0xc000_0090 => (8, Some(0x81)), // _FPE_INVALID
+        0xc000_0091 => (8, Some(0x84)), // _FPE_OVERFLOW
+        0xc000_0092 => (8, Some(0x8a)), // _FPE_STACKOVERFLOW
+        0xc000_0093 => (8, Some(0x85)), // _FPE_UNDERFLOW
+        _ => return None,
+    })
+}
+
+pub(super) extern "win64" fn native_crt_seh_filter_exe(
+    exception: u32,
+    _exception_pointers: *const c_void,
+) -> i32 {
+    let Some((signal, fpe_code)) = native_crt_exception_signal(exception) else {
+        return 0; // EXCEPTION_CONTINUE_SEARCH
+    };
+    let Some(process) = process_ctx() else {
+        return 0;
+    };
+    let key = (process.process_id, signal);
+    let handler = match NATIVE_CRT_SIGNAL_HANDLERS.lock() {
+        Ok(handlers) => handlers.get(&key).copied().unwrap_or(0),
+        Err(_) => return 0,
+    };
+    match handler {
+        0 => 0,  // SIG_DFL: leave the exception for the next handler.
+        1 => -1, // SIG_IGN: continue execution.
+        handler => {
+            if let Ok(mut handlers) = NATIVE_CRT_SIGNAL_HANDLERS.lock() {
+                // The CRT resets a caught exception signal to SIG_DFL before
+                // invoking its handler, so recursive faults continue search.
+                handlers.insert(key, 0);
+            }
+            unsafe {
+                if let Some(fpe_code) = fpe_code {
+                    let callback: unsafe extern "win64" fn(i32, i32) =
+                        std::mem::transmute(handler as usize);
+                    callback(signal, fpe_code);
+                } else {
+                    let callback: unsafe extern "win64" fn(i32) =
+                        std::mem::transmute(handler as usize);
+                    callback(signal);
+                }
+            }
+            -1 // EXCEPTION_CONTINUE_EXECUTION
+        }
+    }
+}
 pub(super) extern "win64" fn native_crt_getenv(name: *const u8) -> *mut u8 {
     if name.is_null() {
         return std::ptr::null_mut();
