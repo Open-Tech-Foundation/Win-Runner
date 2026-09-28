@@ -135,8 +135,11 @@ Items remain open until implementation and relevant verification are complete.
       records so each side can resolve the other's exports.
     - [x] Allocate DLL static TLS from its template and zero-fill for the
       loading thread, other live guest threads, and later-created threads.
+    - [x] Count repeated `LoadLibrary` references and keep imported DLLs alive
+      until the importing module is released.
     - [ ] Match Windows initialization order for cyclic dependency graphs,
-      and implement FreeLibrary reference-count and unload semantics.
+      collect cyclic dependency graphs after their external references reach
+      zero, invoke detach callbacks, and unmap DLL images on final release.
   - [ ] Host `hostfxr.dll`, `hostpolicy.dll`, and `coreclr.dll` using the
     supported native hosting interfaces; cover shared, app-local, and
     self-contained runtime layouts, then add single-file apps.

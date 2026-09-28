@@ -26,6 +26,8 @@ All notable changes to this project will be documented in this file.
   their dependency imports are patched.
 - Allocate DLL static TLS templates and zero-fill for live guest threads and
   later-created threads cloned from the process TLS template.
+- Count repeated `LoadLibrary` calls and import-dependency references; release
+  dependencies when their importing module reaches zero references.
 
 - Added a "Why Win-Runner?" section to the README explaining the project's focus
   and how it differs from Wine, VMs, and Windows CI runners.

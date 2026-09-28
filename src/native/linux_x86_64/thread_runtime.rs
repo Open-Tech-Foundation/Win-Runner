@@ -443,6 +443,9 @@ mod tls_callback_tests {
             static_tls_index: None,
             static_tls_template: None,
             load_order: 1,
+            load_references: 0,
+            dependency_references: 0,
+            dependencies: Vec::new(),
         };
         THREAD_EVENTS.lock().unwrap().clear();
         process.loaded_modules.lock().unwrap().insert(base, module);

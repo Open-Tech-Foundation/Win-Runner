@@ -241,6 +241,11 @@ pub(super) struct NativeLoadedModule {
     pub(super) static_tls_index: Option<u32>,
     pub(super) static_tls_template: Option<Vec<u8>>,
     pub(super) load_order: u64,
+    /// References acquired through LoadLibrary; GetModuleHandle does not add one.
+    pub(super) load_references: u32,
+    /// References held by other loaded guest DLLs through their import tables.
+    pub(super) dependency_references: u32,
+    pub(super) dependencies: Vec<u64>,
 }
 
 pub(super) struct NativeThread {

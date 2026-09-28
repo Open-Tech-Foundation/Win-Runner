@@ -556,6 +556,9 @@ fn run_rust_baseline_argv_with_fs_impl(
                         data
                     }),
                     load_order: 0,
+                    load_references: 0,
+                    dependency_references: 0,
+                    dependencies: Vec::new(),
                 },
             )])),
             module_next: AtomicU64::new(1),

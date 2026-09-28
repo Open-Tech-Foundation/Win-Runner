@@ -255,6 +255,9 @@ mod module_export_tests {
             static_tls_index: None,
             static_tls_template: None,
             load_order: 1,
+            load_references: 0,
+            dependency_references: 0,
+            dependencies: Vec::new(),
         };
         let process = &*super::TEST_PROCESS;
         process
@@ -293,6 +296,9 @@ mod module_export_tests {
             static_tls_index: None,
             static_tls_template: None,
             load_order: 1,
+            load_references: 0,
+            dependency_references: 0,
+            dependencies: Vec::new(),
         };
         let process = &*super::TEST_PROCESS;
         process
@@ -322,7 +328,24 @@ mod module_export_tests {
         assert_ne!(handle, 0, "WinFS DLL loads");
         assert_ne!(handle, API_SET_MODULE);
         assert_eq!(handle, native_get_module_handle_w(name.as_ptr()));
+        let second_handle = native_load_library_ex_w(name.as_ptr(), 0, 0);
+        assert_eq!(
+            second_handle, handle,
+            "repeated LoadLibrary reuses the module"
+        );
         assert_eq!(native_free_library(handle), 1);
+        assert_eq!(
+            native_get_module_handle_w(name.as_ptr()),
+            handle,
+            "one remaining load reference keeps the module registered"
+        );
+        assert_eq!(native_free_library(handle), 1);
+        assert_eq!(
+            native_free_library(handle),
+            0,
+            "unbalanced FreeLibrary fails"
+        );
+        assert_eq!(native_get_module_handle_w(name.as_ptr()), 0);
         process.fs.lock().unwrap().fs.delete_file(path).unwrap();
     }
 
@@ -380,7 +403,11 @@ mod module_export_tests {
             dependency + crate::pe::builder::SECTION_RVA as u64
         );
         native_free_library(consumer);
-        native_free_library(dependency);
+        assert_eq!(
+            super::native_get_module_handle_a(dependency_name.as_ptr().cast()),
+            0,
+            "releasing the consumer releases its import dependency"
+        );
         let mut native_fs = process.fs.lock().unwrap();
         native_fs.fs.delete_file(consumer_path).unwrap();
         native_fs.fs.delete_file(dependency_path).unwrap();
@@ -440,6 +467,14 @@ mod module_export_tests {
 
         native_free_library(handle_a);
         native_free_library(handle_b);
+        // Dependency cycles currently remain loaded until process teardown.
+        {
+            let mut modules = process.loaded_modules.lock().unwrap();
+            assert!(modules.contains_key(&handle_a));
+            assert!(modules.contains_key(&handle_b));
+            modules.remove(&handle_a);
+            modules.remove(&handle_b);
+        }
         let mut native_fs = process.fs.lock().unwrap();
         native_fs.fs.delete_file(path_a).unwrap();
         native_fs.fs.delete_file(path_b).unwrap();
@@ -767,7 +802,28 @@ fn guest_module_path(name: &str) -> Option<(String, Vec<u8>)> {
 }
 
 fn load_guest_module(name: &str) -> Option<u64> {
-    load_guest_module_inner(name, &mut std::collections::HashSet::new(), 0)
+    let module = load_guest_module_inner(name, &mut std::collections::HashSet::new(), 0)?;
+    if module != API_SET_MODULE && !retain_module_load_reference(module) {
+        return None;
+    }
+    Some(module)
+}
+
+fn retain_module_load_reference(module: u64) -> bool {
+    let Some(process) = process_ctx() else {
+        return false;
+    };
+    let Ok(mut modules) = process.loaded_modules.lock() else {
+        return false;
+    };
+    let Some(module) = modules.get_mut(&module) else {
+        return false;
+    };
+    let Some(references) = module.load_references.checked_add(1) else {
+        return false;
+    };
+    module.load_references = references;
+    true
 }
 
 fn load_guest_module_inner(
@@ -799,6 +855,7 @@ fn load_guest_module_inner(
             .map(|module| module.base);
     }
     let mut provisional_module = None;
+    let mut dependencies = Vec::new();
     let result = (|| {
         let image = crate::pe::load_lenient(&bytes).ok()?;
         if !image.is_dll {
@@ -852,6 +909,9 @@ fn load_guest_module_inner(
             static_tls_index: tls_index,
             static_tls_template: static_tls_template.clone(),
             load_order: process.module_next.fetch_add(1, Ordering::AcqRel),
+            load_references: 0,
+            dependency_references: 0,
+            dependencies: Vec::new(),
         };
         let handle = module.base;
         {
@@ -882,6 +942,9 @@ fn load_guest_module_inner(
             let dependency = load_guest_module_inner(&import.dll, loading, depth + 1)?;
             if dependency == API_SET_MODULE {
                 return None;
+            }
+            if !dependencies.contains(&dependency) {
+                dependencies.push(dependency);
             }
             let target = resolve_module_export(dependency, &import.func, 0)?;
             guest_imports.push((import.iat_rva, target));
@@ -917,11 +980,29 @@ fn load_guest_module_inner(
                 return None;
             }
         }
+        {
+            let mut modules = process.loaded_modules.lock().ok()?;
+            if modules.get(&handle).is_none()
+                || dependencies.iter().any(|dependency| {
+                    modules
+                        .get(dependency)
+                        .and_then(|module| module.dependency_references.checked_add(1))
+                        .is_none()
+                })
+            {
+                return None;
+            }
+            for dependency in &dependencies {
+                modules.get_mut(dependency)?.dependency_references += 1;
+            }
+            modules.get_mut(&handle)?.dependencies = dependencies.clone();
+        }
         if let Some(stubs) = stubs {
             std::mem::forget(stubs);
         }
-        // DLL mappings remain live until the guest worker exits. Complete
-        // FreeLibrary reference counting/unmapping is tracked separately.
+        // The loader record retains dependency references. Mapping ownership
+        // and process-detach callbacks are completed in a separate lifecycle
+        // step.
         std::mem::forget(mapping);
         provisional_module = None;
         Some(handle)
@@ -1045,15 +1126,59 @@ pub(super) extern "win64" fn native_free_library(module: u64) -> i32 {
     if module == API_SET_MODULE {
         return 1;
     }
-    process_ctx()
-        .and_then(|process| {
-            process
-                .loaded_modules
-                .lock()
-                .ok()
-                .map(|mut modules| modules.remove(&module).is_some() as i32)
-        })
-        .unwrap_or(0)
+    let Some(process) = process_ctx() else {
+        return 0;
+    };
+    let removed = {
+        let Ok(mut modules) = process.loaded_modules.lock() else {
+            return 0;
+        };
+        let Some(loaded) = modules.get_mut(&module) else {
+            return 0;
+        };
+        if loaded.load_references == 0 {
+            return 0;
+        }
+        loaded.load_references -= 1;
+        (loaded.load_references == 0 && loaded.dependency_references == 0)
+            .then(|| modules.remove(&module))
+            .flatten()
+    };
+    if let Some(loaded) = removed {
+        dispose_loaded_module(&process, loaded);
+    }
+    1
+}
+
+fn release_module_dependency(process: &NativeProcessContext, module: u64) {
+    let removed = {
+        let Ok(mut modules) = process.loaded_modules.lock() else {
+            return;
+        };
+        let Some(loaded) = modules.get_mut(&module) else {
+            return;
+        };
+        if loaded.dependency_references == 0 {
+            return;
+        }
+        loaded.dependency_references -= 1;
+        (loaded.load_references == 0 && loaded.dependency_references == 0)
+            .then(|| modules.remove(&module))
+            .flatten()
+    };
+    if let Some(loaded) = removed {
+        dispose_loaded_module(process, loaded);
+    }
+}
+
+fn dispose_loaded_module(process: &NativeProcessContext, loaded: NativeLoadedModule) {
+    if let Some(index) = loaded.static_tls_index {
+        super::thread_runtime::clear_module_static_tls(process, index);
+        super::thread_runtime::release_module_tls_slot(process, index);
+    }
+    for dependency in loaded.dependencies {
+        release_module_dependency(process, dependency);
+    }
 }
 
 pub(super) struct Mapping {
