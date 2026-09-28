@@ -1425,6 +1425,23 @@ pub(super) extern "win64" fn native_crt_stat64(path: *const u8, output: *mut u8)
     };
     let path =
         String::from_utf16_lossy(wide_path.strip_suffix(&[0]).unwrap_or(wide_path.as_slice()));
+    native_crt_stat64_path(&path, output)
+}
+
+pub(super) extern "win64" fn native_crt_wstat64(path: *const u16, output: *mut u8) -> i32 {
+    if output.is_null() {
+        THREAD_CRT_ERRNO.with(|error| error.set(22));
+        return -1;
+    }
+    let Some(wide_path) = native_crt_read_wide_path(path) else {
+        THREAD_CRT_ERRNO.with(|error| error.set(2));
+        return -1;
+    };
+    let path = String::from_utf16_lossy(wide_path.strip_suffix(&[0]).unwrap_or(&wide_path));
+    native_crt_stat64_path(&path, output)
+}
+
+fn native_crt_stat64_path(path: &str, output: *mut u8) -> i32 {
     let Some(context) = fs_ctx() else {
         THREAD_CRT_ERRNO.with(|error| error.set(2));
         return -1;
@@ -1433,8 +1450,8 @@ pub(super) extern "win64" fn native_crt_stat64(path: *const u8, output: *mut u8)
         THREAD_CRT_ERRNO.with(|error| error.set(22));
         return -1;
     };
-    let is_directory = ctx.fs.is_dir(&path);
-    let is_file = ctx.fs.is_file(&path);
+    let is_directory = ctx.fs.is_dir(path);
+    let is_file = ctx.fs.is_file(path);
     if !is_directory && !is_file {
         THREAD_CRT_ERRNO.with(|error| error.set(2));
         return -1;
@@ -1449,7 +1466,7 @@ pub(super) extern "win64" fn native_crt_stat64(path: *const u8, output: *mut u8)
         .filter(|_| path.as_bytes().get(1) == Some(&b':'))
         .map(|letter| letter.to_ascii_uppercase().saturating_sub(b'A'))
         .unwrap_or(2) as u32;
-    let inode = ctx.fs.file_id(&path).unwrap_or_default() as u16;
+    let inode = ctx.fs.file_id(path).unwrap_or_default() as u16;
     let mode = if is_directory {
         0x4000u16
     } else {
@@ -1462,12 +1479,12 @@ pub(super) extern "win64" fn native_crt_stat64(path: *const u8, output: *mut u8)
         output.add(8).cast::<u16>().write_unaligned(1);
         output.add(14).cast::<u32>().write_unaligned(device);
         output.add(24).cast::<i64>().write_unaligned(if is_file {
-            ctx.fs.file_len(&path).unwrap_or_default() as i64
+            ctx.fs.file_len(path).unwrap_or_default() as i64
         } else {
             0
         });
     }
-    let metadata = ctx.fs.file_metadata(&path);
+    let metadata = ctx.fs.file_metadata(path);
     let to_unix_seconds = |filetime: u64| (filetime / 10_000_000) as i64 - 11_644_473_600i64;
     unsafe {
         output

@@ -2623,6 +2623,39 @@ mod protection_tests {
     }
 
     #[test]
+    fn crt_wstat64_reads_unicode_winfs_metadata() {
+        let path = r"C:\stat64-☀-probe.txt";
+        let context = super::fs_ctx().unwrap();
+        context
+            .lock()
+            .unwrap()
+            .fs
+            .write_file(path, b"wide".to_vec())
+            .unwrap();
+        let path_wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+        let mut status = [0u8; 56];
+        assert_eq!(
+            super::native_crt_wstat64(path_wide.as_ptr(), status.as_mut_ptr()),
+            0
+        );
+        assert_eq!(i64::from_ne_bytes(status[24..32].try_into().unwrap()), 4);
+        assert!(super::supports_import("UCRTBASE.DLL", "_wstat64"));
+        assert_eq!(
+            super::native_crt_wstat64(
+                "C:\\missing-☀-stat.txt\0"
+                    .encode_utf16()
+                    .collect::<Vec<_>>()
+                    .as_ptr(),
+                status.as_mut_ptr()
+            ),
+            -1
+        );
+        assert_eq!(unsafe { super::native_crt_errno().read() }, 2);
+        unsafe { super::native_crt_errno().write(0) };
+        context.lock().unwrap().fs.delete_file(path).unwrap();
+    }
+
+    #[test]
     fn crt_access_checks_winfs_paths_and_validates_modes() {
         let context = super::fs_ctx().unwrap();
         context

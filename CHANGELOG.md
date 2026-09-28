@@ -35,6 +35,8 @@ All notable changes to this project will be documented in this file.
   existing WinFS-backed file stream behavior.
 - Add CRT `_waccess`, `_wrename`, and `_wremove` over UTF-16 WinFS paths with
   errno mapping for missing and denied files.
+- Add `_wstat64` metadata lookup for Unicode WinFS paths using the existing
+  MSVC x64 `__stat64` layout.
 - Add stable UTF-16 CRT startup arrays and accessors for wide arguments and
   environment variables, including `_configure_wide_argv`, `__p___wargv`, and
   the initial/environment pointer APIs.
