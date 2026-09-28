@@ -122,6 +122,7 @@ Items remain open until implementation and relevant verification are complete.
     buffering and wide file modes remain unsupported.
   - [x] Add `_wfopen` with UTF-16 paths using the same unbuffered WinFS stream
     implementation.
+  - [x] Add UTF-16 `_waccess`, `_wrename`, and `_wremove` wrappers over WinFS.
   - [x] Add `fseek`/`ftell`, `_fseeki64`/`_ftelli64`, and `rewind` for these
     file-backed streams.
   - [x] Track EOF/error state and add `feof`, `ferror`, `clearerr`, `fgetc`,

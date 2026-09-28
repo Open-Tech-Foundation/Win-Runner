@@ -2324,6 +2324,59 @@ mod protection_tests {
     }
 
     #[test]
+    fn crt_wide_access_rename_and_remove_use_utf16_winfs_paths() {
+        let old = r"C:\crt-wide-old-☀.txt";
+        let new = r"C:\crt-wide-new-☀.txt";
+        let old_wide = old.encode_utf16().chain([0]).collect::<Vec<_>>();
+        let new_wide = new.encode_utf16().chain([0]).collect::<Vec<_>>();
+        let context = super::fs_ctx().unwrap();
+        context
+            .lock()
+            .unwrap()
+            .fs
+            .write_file(old, b"source".to_vec())
+            .unwrap();
+        assert_eq!(super::native_crt_waccess(old_wide.as_ptr(), 0), 0);
+        assert_eq!(
+            super::native_crt_wrename(old_wide.as_ptr(), new_wide.as_ptr()),
+            0
+        );
+        assert_eq!(
+            context.lock().unwrap().fs.read_file(new).unwrap(),
+            b"source"
+        );
+
+        context
+            .lock()
+            .unwrap()
+            .fs
+            .write_file(old, b"destination".to_vec())
+            .unwrap();
+        assert_eq!(
+            super::native_crt_wrename(new_wide.as_ptr(), old_wide.as_ptr()),
+            -1
+        );
+        assert_eq!(
+            context.lock().unwrap().fs.read_file(new).unwrap(),
+            b"source"
+        );
+        assert_eq!(
+            context.lock().unwrap().fs.read_file(old).unwrap(),
+            b"destination"
+        );
+        assert_eq!(super::native_crt_wremove(new_wide.as_ptr()), 0);
+        assert_eq!(super::native_crt_waccess(new_wide.as_ptr(), 0), -1);
+        assert_eq!(unsafe { super::native_crt_errno().read() }, 2);
+        unsafe { super::native_crt_errno().write(0) };
+        assert_eq!(super::native_crt_wremove(new_wide.as_ptr()), -1);
+        assert_eq!(unsafe { super::native_crt_errno().read() }, 2);
+        unsafe { super::native_crt_errno().write(0) };
+        assert!(super::supports_import("UCRTBASE.DLL", "_waccess"));
+        assert!(super::supports_import("UCRTBASE.DLL", "_wrename"));
+        assert!(super::supports_import("UCRTBASE.DLL", "_wremove"));
+    }
+
+    #[test]
     fn crt_fprintf_formats_into_a_winfs_file_stream() {
         let path = b"C:\\crt-fprintf-roundtrip.txt\0";
         let mode = b"w+b\0";

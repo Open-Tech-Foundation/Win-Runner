@@ -98,6 +98,9 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                     | "wcstombs"
                     | "_stat64"
                     | "_access"
+                    | "_waccess"
+                    | "_wremove"
+                    | "_wrename"
                     | "calloc"
                     | "fopen"
                     | "_wfopen"
@@ -330,6 +333,9 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "wcstombs" => Some(native_crt_wcstombs as *const () as usize as u64),
         "_stat64" => Some(native_crt_stat64 as *const () as usize as u64),
         "_access" => Some(native_crt_access as *const () as usize as u64),
+        "_waccess" => Some(native_crt_waccess as *const () as usize as u64),
+        "_wremove" => Some(native_crt_wremove as *const () as usize as u64),
+        "_wrename" => Some(native_crt_wrename as *const () as usize as u64),
         "calloc" => Some(native_crt_calloc as *const () as usize as u64),
         "fopen" => Some(native_crt_fopen as *const () as usize as u64),
         "_wfopen" => Some(native_crt_wfopen as *const () as usize as u64),

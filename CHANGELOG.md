@@ -33,6 +33,8 @@ All notable changes to this project will be documented in this file.
   current CRT arrays.
 - Add UCRT/MSVCRT `_wfopen` support with direct UTF-16 path handling and the
   existing WinFS-backed file stream behavior.
+- Add CRT `_waccess`, `_wrename`, and `_wremove` over UTF-16 WinFS paths with
+  errno mapping for missing and denied files.
 - Add stable UTF-16 CRT startup arrays and accessors for wide arguments and
   environment variables, including `_configure_wide_argv`, `__p___wargv`, and
   the initial/environment pointer APIs.

@@ -1508,6 +1508,57 @@ pub(super) extern "win64" fn native_crt_access(path: *const u8, mode: i32) -> i3
         -1
     }
 }
+
+pub(super) extern "win64" fn native_crt_waccess(path: *const u16, mode: i32) -> i32 {
+    if !(0..=6).contains(&mode) || mode & !6 != 0 {
+        THREAD_CRT_ERRNO.with(|error| error.set(22));
+        return -1;
+    }
+    let Some(path) = native_crt_read_wide_path(path) else {
+        THREAD_CRT_ERRNO.with(|error| error.set(22));
+        return -1;
+    };
+    let path = String::from_utf16_lossy(path.strip_suffix(&[0]).unwrap_or(&path));
+    let exists = fs_ctx().is_some_and(|context| {
+        context
+            .lock()
+            .is_ok_and(|ctx| ctx.fs.is_file(&path) || ctx.fs.is_dir(&path))
+    });
+    if exists {
+        0
+    } else {
+        THREAD_CRT_ERRNO.with(|error| error.set(2));
+        -1
+    }
+}
+
+pub(super) extern "win64" fn native_crt_wremove(path: *const u16) -> i32 {
+    if native_delete_file_w(path) != 0 {
+        return 0;
+    }
+    THREAD_CRT_ERRNO.with(|error| {
+        error.set(match native_get_last_error() {
+            2 | 3 => 2, // ENOENT
+            5 => 13,    // EACCES
+            _ => 22,    // EINVAL
+        })
+    });
+    -1
+}
+
+pub(super) extern "win64" fn native_crt_wrename(old: *const u16, new: *const u16) -> i32 {
+    if native_move_file_w(old, new) != 0 {
+        return 0;
+    }
+    THREAD_CRT_ERRNO.with(|error| {
+        error.set(match native_get_last_error() {
+            2 | 3 => 2, // ENOENT
+            5 => 13,    // EACCES
+            _ => 22,    // EINVAL
+        })
+    });
+    -1
+}
 pub(super) extern "win64" fn native_crt_sprintf(
     output: *mut u8,
     format: *const u8,
