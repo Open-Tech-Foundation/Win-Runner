@@ -55,6 +55,8 @@ All notable changes to this project will be documented in this file.
   and narrow `__stdio_common_vfprintf`/`__stdio_common_vsprintf` formatting
   subset; wide formatting, file-backed streams, and `_seh_filter_exe` remain
   pending.
+- Add CRT `strtol`, `strtod`, and `strstr` shims with radix parsing, end-pointer
+  reporting, common decimal/special floating-point input, and range errors.
 - Detect .NET Framework `_CorExeMain`/`_CorDllMain` images and report the clear
   unsupported-runtime limitation in `winrun inspect` and native execution.
 - Replaced the PS1 interpreter's proposed install-script .NET API expansion

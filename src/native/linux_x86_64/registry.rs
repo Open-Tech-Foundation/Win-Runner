@@ -53,6 +53,7 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                     | "strncmp"
                     | "strchr"
                     | "strrchr"
+                    | "strstr"
                     | "_stricmp"
                     | "_strnicmp"
                     | "_errno"
@@ -62,6 +63,8 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                     | "__stdio_common_vfprintf"
                     | "__stdio_common_vsprintf"
                     | "atoi"
+                    | "strtol"
+                    | "strtod"
                     | "signal"
                     | "tolower"
                     | "toupper"
@@ -216,9 +219,12 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "strncmp" => Some(native_crt_strncmp as *const () as usize as u64),
         "strchr" => Some(native_crt_strchr as *const () as usize as u64),
         "strrchr" => Some(native_crt_strrchr as *const () as usize as u64),
+        "strstr" => Some(native_crt_strstr as *const () as usize as u64),
         "_stricmp" => Some(native_crt_stricmp as *const () as usize as u64),
         "_strnicmp" => Some(native_crt_strnicmp as *const () as usize as u64),
         "atoi" => Some(native_crt_atoi as *const () as usize as u64),
+        "strtol" => Some(native_crt_strtol as *const () as usize as u64),
+        "strtod" => Some(native_crt_strtod as *const () as usize as u64),
         "signal" => Some(native_crt_signal as *const () as usize as u64),
         "tolower" => Some(native_crt_tolower as *const () as usize as u64),
         "toupper" => Some(native_crt_toupper as *const () as usize as u64),

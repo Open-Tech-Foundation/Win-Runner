@@ -1870,6 +1870,109 @@ mod protection_tests {
     }
 
     #[test]
+    fn crt_strstr_handles_empty_and_matching_needles() {
+        let haystack = b"native runtime support\0";
+        let needle = b"runtime\0";
+        assert_eq!(
+            super::native_crt_strstr(haystack.as_ptr(), needle.as_ptr()),
+            unsafe { haystack.as_ptr().add(7) as *mut u8 }
+        );
+        assert_eq!(
+            super::native_crt_strstr(haystack.as_ptr(), b"\0".as_ptr()),
+            haystack.as_ptr() as *mut u8
+        );
+        assert!(super::native_crt_strstr(haystack.as_ptr(), b"missing\0".as_ptr()).is_null());
+        assert!(super::native_crt_strstr(std::ptr::null(), needle.as_ptr()).is_null());
+    }
+
+    #[test]
+    fn crt_strtol_parses_bases_end_pointers_and_overflow() {
+        let hexadecimal = b"  -0x2aTail\0";
+        let mut end = std::ptr::null_mut();
+        assert_eq!(
+            super::native_crt_strtol(hexadecimal.as_ptr(), &mut end, 0),
+            -42
+        );
+        assert_eq!(end, unsafe { hexadecimal.as_ptr().add(7) as *mut u8 });
+
+        let octal = b"077z\0";
+        assert_eq!(super::native_crt_strtol(octal.as_ptr(), &mut end, 0), 63);
+        assert_eq!(end, unsafe { octal.as_ptr().add(3) as *mut u8 });
+        let binary = b"101z\0";
+        assert_eq!(super::native_crt_strtol(binary.as_ptr(), &mut end, 2), 5);
+        assert_eq!(end, unsafe { binary.as_ptr().add(3) as *mut u8 });
+
+        let overflow = b"2147483648!\0";
+        assert_eq!(
+            super::native_crt_strtol(overflow.as_ptr(), &mut end, 10),
+            i32::MAX
+        );
+        assert_eq!(unsafe { super::native_crt_errno().read() }, 34);
+        assert_eq!(end, unsafe { overflow.as_ptr().add(10) as *mut u8 });
+        unsafe { super::native_crt_errno().write(0) };
+
+        let invalid = b"12\0";
+        assert_eq!(super::native_crt_strtol(invalid.as_ptr(), &mut end, 1), 0);
+        assert_eq!(end, invalid.as_ptr() as *mut u8);
+        assert_eq!(unsafe { super::native_crt_errno().read() }, 22);
+        unsafe { super::native_crt_errno().write(0) };
+    }
+
+    #[test]
+    fn crt_strtod_parses_decimal_special_and_invalid_exponents() {
+        let decimal = b" -12.5e2tail\0";
+        let mut end = std::ptr::null_mut();
+        assert_eq!(
+            super::native_crt_strtod(decimal.as_ptr(), &mut end),
+            -1250.0
+        );
+        assert_eq!(end, unsafe { decimal.as_ptr().add(8) as *mut u8 });
+
+        let fraction = b".5x\0";
+        assert_eq!(super::native_crt_strtod(fraction.as_ptr(), &mut end), 0.5);
+        assert_eq!(end, unsafe { fraction.as_ptr().add(2) as *mut u8 });
+
+        let invalid_exponent = b"1e+x\0";
+        assert_eq!(
+            super::native_crt_strtod(invalid_exponent.as_ptr(), &mut end),
+            1.0
+        );
+        assert_eq!(end, unsafe { invalid_exponent.as_ptr().add(1) as *mut u8 });
+
+        let infinity = b"-INF!\0";
+        assert_eq!(
+            super::native_crt_strtod(infinity.as_ptr(), &mut end),
+            f64::NEG_INFINITY
+        );
+        assert_eq!(end, unsafe { infinity.as_ptr().add(4) as *mut u8 });
+
+        let nan = b"NaN(payload)!\0";
+        assert!(super::native_crt_strtod(nan.as_ptr(), &mut end).is_nan());
+        assert_eq!(end, unsafe { nan.as_ptr().add(12) as *mut u8 });
+
+        let no_conversion = b"word\0";
+        assert_eq!(
+            super::native_crt_strtod(no_conversion.as_ptr(), &mut end),
+            0.0
+        );
+        assert_eq!(end, no_conversion.as_ptr() as *mut u8);
+
+        let overflow = b"1e9999!\0";
+        assert_eq!(
+            super::native_crt_strtod(overflow.as_ptr(), &mut end),
+            f64::INFINITY
+        );
+        assert_eq!(end, unsafe { overflow.as_ptr().add(6) as *mut u8 });
+        assert_eq!(unsafe { super::native_crt_errno().read() }, 34);
+        unsafe { super::native_crt_errno().write(0) };
+
+        let underflow = b"1e-9999!\0";
+        assert_eq!(super::native_crt_strtod(underflow.as_ptr(), &mut end), 0.0);
+        assert_eq!(unsafe { super::native_crt_errno().read() }, 34);
+        unsafe { super::native_crt_errno().write(0) };
+    }
+
+    #[test]
     fn crt_case_insensitive_string_comparisons_fold_ascii() {
         let upper = b"NaNo\0";
         let lower = b"nano\0";
@@ -2250,9 +2353,12 @@ mod protection_tests {
         assert!(super::supports_import("MSVCRT.dll", "setlocale"));
         assert!(super::supports_import("MSVCRT.dll", "strchr"));
         assert!(super::supports_import("MSVCRT.dll", "strrchr"));
+        assert!(super::supports_import("MSVCRT.dll", "strstr"));
         assert!(super::supports_import("MSVCRT.dll", "_stricmp"));
         assert!(super::supports_import("MSVCRT.dll", "_strnicmp"));
         assert!(super::supports_import("MSVCRT.dll", "atoi"));
+        assert!(super::supports_import("MSVCRT.dll", "strtol"));
+        assert!(super::supports_import("UCRTBASE.dll", "strtod"));
         assert!(super::supports_import("MSVCRT.dll", "tolower"));
         assert!(super::supports_import("MSVCRT.dll", "toupper"));
         assert!(super::supports_import("MSVCRT.dll", "strncpy"));

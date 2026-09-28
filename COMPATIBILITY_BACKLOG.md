@@ -99,6 +99,8 @@ Items remain open until implementation and relevant verification are complete.
     `__acrt_iob_func`, `__stdio_common_vfprintf`, and
     `__stdio_common_vsprintf`; wide formatting and file-backed `FILE` streams
     remain unsupported.
+  - [x] Add `strtol`, `strtod`, and `strstr` with Windows `long` width,
+    end-pointer reporting, radix parsing, and common decimal input handling.
   - [ ] Add `_seh_filter_exe` and remaining startup exports.
 - [ ] Add basic `msvcrt.dll` output and file I/O, including `printf` and `fopen`.
 - [ ] Add VCRUNTIME140 exception handlers, `_CxxThrowException`, and memory

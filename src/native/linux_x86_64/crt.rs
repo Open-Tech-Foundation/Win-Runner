@@ -339,6 +339,36 @@ pub(super) extern "win64" fn native_crt_strrchr(input: *const u8, value: i32) ->
     }
     found
 }
+pub(super) extern "win64" fn native_crt_strstr(haystack: *const u8, needle: *const u8) -> *mut u8 {
+    if haystack.is_null() || needle.is_null() {
+        return std::ptr::null_mut();
+    }
+    if unsafe { needle.read() } == 0 {
+        return haystack as *mut u8;
+    }
+    for start in 0..1_048_576usize {
+        if unsafe { haystack.add(start).read() } == 0 {
+            return std::ptr::null_mut();
+        }
+        let mut offset = 0usize;
+        while offset < 1_048_576 {
+            let (left, right) = unsafe {
+                (
+                    haystack.add(start + offset).read(),
+                    needle.add(offset).read(),
+                )
+            };
+            if right == 0 {
+                return unsafe { haystack.add(start) as *mut u8 };
+            }
+            if left == 0 || left != right {
+                break;
+            }
+            offset += 1;
+        }
+    }
+    std::ptr::null_mut()
+}
 fn native_crt_fold_ascii(byte: u8) -> u8 {
     if byte.is_ascii_uppercase() {
         byte + (b'a' - b'A')
@@ -406,6 +436,208 @@ pub(super) extern "win64" fn native_crt_atoi(input: *const u8) -> i32 {
         value.wrapping_neg()
     } else {
         value
+    }
+}
+
+pub(super) extern "win64" fn native_crt_strtol(
+    input: *const u8,
+    end: *mut *mut u8,
+    base: i32,
+) -> i32 {
+    if input.is_null() || !(base == 0 || (2..=36).contains(&base)) {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+        if !end.is_null() && !input.is_null() {
+            unsafe { end.write_unaligned(input as *mut u8) };
+        }
+        return 0;
+    }
+    let mut index = 0usize;
+    while index < 1_048_576 && unsafe { input.add(index).read() }.is_ascii_whitespace() {
+        index += 1;
+    }
+    let negative = match unsafe { input.add(index).read() } {
+        b'-' => {
+            index += 1;
+            true
+        }
+        b'+' => {
+            index += 1;
+            false
+        }
+        _ => false,
+    };
+    let mut radix = base as u32;
+    if (radix == 0 || radix == 16)
+        && unsafe { input.add(index).read() } == b'0'
+        && matches!(unsafe { input.add(index + 1).read() }, b'x' | b'X')
+        && unsafe { input.add(index + 2).read() }.is_ascii_hexdigit()
+    {
+        radix = 16;
+        index += 2;
+    } else if radix == 0 {
+        radix = if unsafe { input.add(index).read() } == b'0' {
+            8
+        } else {
+            10
+        };
+    }
+    let digits_start = index;
+    let mut magnitude = 0u64;
+    let limit = if negative {
+        (i32::MAX as u64) + 1
+    } else {
+        i32::MAX as u64
+    };
+    let mut overflow = false;
+    while index < 1_048_576 {
+        let byte = unsafe { input.add(index).read() };
+        let digit = match byte {
+            b'0'..=b'9' => u32::from(byte - b'0'),
+            b'a'..=b'z' => u32::from(byte - b'a') + 10,
+            b'A'..=b'Z' => u32::from(byte - b'A') + 10,
+            _ => break,
+        };
+        if digit >= radix {
+            break;
+        }
+        if magnitude > (limit.saturating_sub(u64::from(digit))) / u64::from(radix) {
+            overflow = true;
+            magnitude = limit;
+        } else if !overflow {
+            magnitude = magnitude * u64::from(radix) + u64::from(digit);
+        }
+        index += 1;
+    }
+    if index == digits_start {
+        if !end.is_null() {
+            unsafe { end.write_unaligned(input as *mut u8) };
+        }
+        return 0;
+    }
+    if !end.is_null() {
+        unsafe { end.write_unaligned(input.add(index) as *mut u8) };
+    }
+    if overflow {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(34)); // ERANGE
+    }
+    if negative {
+        if magnitude == (i32::MAX as u64) + 1 {
+            i32::MIN
+        } else {
+            -(magnitude as i32)
+        }
+    } else {
+        magnitude as i32
+    }
+}
+
+pub(super) extern "win64" fn native_crt_strtod(input: *const u8, end: *mut *mut u8) -> f64 {
+    if input.is_null() {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+        if !end.is_null() {
+            unsafe { end.write_unaligned(input as *mut u8) };
+        }
+        return 0.0;
+    }
+    let mut start = 0usize;
+    while start < 1_048_576 && unsafe { input.add(start).read() }.is_ascii_whitespace() {
+        start += 1;
+    }
+    let mut number_start = start;
+    if matches!(unsafe { input.add(number_start).read() }, b'+' | b'-') {
+        number_start += 1;
+    }
+    let special = [b"infinity".as_slice(), b"inf".as_slice(), b"nan".as_slice()]
+        .into_iter()
+        .find(|word| {
+            word.iter().enumerate().all(|(offset, expected)| {
+                unsafe { input.add(number_start + offset).read() }.eq_ignore_ascii_case(expected)
+            })
+        });
+    if let Some(word) = special {
+        let mut end_index = number_start + word.len();
+        let is_nan = word == b"nan";
+        if is_nan && unsafe { input.add(end_index).read() } == b'(' {
+            end_index += 1;
+            while end_index < 1_048_576
+                && unsafe { input.add(end_index).read() } != 0
+                && unsafe { input.add(end_index).read() } != b')'
+            {
+                end_index += 1;
+            }
+            if unsafe { input.add(end_index).read() } == b')' {
+                end_index += 1;
+            } else {
+                end_index = number_start + word.len();
+            }
+        }
+        if !end.is_null() {
+            unsafe { end.write_unaligned(input.add(end_index) as *mut u8) };
+        }
+        let negative = unsafe { input.add(start).read() } == b'-';
+        return if is_nan {
+            f64::NAN
+        } else if negative {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        };
+    }
+
+    let mut index = number_start;
+    let mut digits = 0usize;
+    while index < 1_048_576 && unsafe { input.add(index).read() }.is_ascii_digit() {
+        index += 1;
+        digits += 1;
+    }
+    if index < 1_048_576 && unsafe { input.add(index).read() } == b'.' {
+        index += 1;
+        while index < 1_048_576 && unsafe { input.add(index).read() }.is_ascii_digit() {
+            index += 1;
+            digits += 1;
+        }
+    }
+    if digits == 0 {
+        if !end.is_null() {
+            unsafe { end.write_unaligned(input as *mut u8) };
+        }
+        return 0.0;
+    }
+    let mantissa_end = index;
+    if index < 1_048_576 && matches!(unsafe { input.add(index).read() }, b'e' | b'E') {
+        let mut exponent = index + 1;
+        if matches!(unsafe { input.add(exponent).read() }, b'+' | b'-') {
+            exponent += 1;
+        }
+        let exponent_digits = exponent;
+        while exponent < 1_048_576 && unsafe { input.add(exponent).read() }.is_ascii_digit() {
+            exponent += 1;
+        }
+        if exponent > exponent_digits {
+            index = exponent;
+        } else {
+            index = mantissa_end;
+        }
+    }
+    if !end.is_null() {
+        unsafe { end.write_unaligned(input.add(index) as *mut u8) };
+    }
+    let text = unsafe { std::slice::from_raw_parts(input.add(start), index - start) };
+    match std::str::from_utf8(text)
+        .ok()
+        .and_then(|text| text.parse::<f64>().ok())
+    {
+        Some(value) => {
+            let mantissa_has_nonzero_digit = text
+                .split(|byte| matches!(*byte, b'e' | b'E'))
+                .next()
+                .is_some_and(|mantissa| mantissa.iter().any(|byte| matches!(*byte, b'1'..=b'9')));
+            if value.is_infinite() || (value == 0.0 && mantissa_has_nonzero_digit) {
+                THREAD_CRT_ERRNO.with(|errno| errno.set(34)); // ERANGE
+            }
+            value
+        }
+        None => 0.0,
     }
 }
 pub(super) extern "win64" fn native_crt_tolower(value: i32) -> i32 {
