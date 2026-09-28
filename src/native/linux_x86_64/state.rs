@@ -221,7 +221,8 @@ pub(super) struct NativeProcessContext {
     pub(super) state_fd: AtomicU32,
     pub(super) fls_value: AtomicU64,
     pub(super) unhandled_exception_filter: AtomicU64,
-    pub(super) vectored_exception_handler: AtomicU64,
+    pub(super) vectored_exception_handlers: Mutex<Vec<NativeVectoredExceptionHandler>>,
+    pub(super) vectored_exception_handler_next: AtomicU64,
     pub(super) exit_status: AtomicU32,
     pub(super) exited: AtomicBool,
     pub(super) children: Mutex<NativeProcessTable>,
@@ -318,6 +319,11 @@ pub(super) struct NativeVirtualAllocation {
 pub(super) struct NativeVirtualPage {
     pub(super) committed: bool,
     pub(super) protection: u32,
+}
+
+pub(super) struct NativeVectoredExceptionHandler {
+    pub(super) handle: u64,
+    pub(super) callback: u64,
 }
 #[derive(Clone)]
 pub(super) struct NativeFileMapping {

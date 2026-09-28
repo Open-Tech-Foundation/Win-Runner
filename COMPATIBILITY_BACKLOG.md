@@ -97,6 +97,14 @@ Items remain open until implementation and relevant verification are complete.
   functions needed by C++ and default Rust MSVC binaries.
 - [ ] Implement structured exception lookup/unwind/raise APIs and translate
   Linux fault signals into guest Windows exceptions.
+  - [x] Store multiple vectored exception handlers with Windows first-handler
+    ordering and opaque removable handles; dispatch explicit
+    `RaiseException`/`RtlRaiseException` records through registered handlers
+    and the unhandled exception filter.
+  - [ ] Capture the live guest CPU context, continue execution from a modified
+    context, and implement native SEH frame lookup/unwinding and Linux fault
+    translation. The current explicit-raise path supplies a synthetic context
+    and is not a complete SEH implementation.
 
 ### P1: common command-line tools
 

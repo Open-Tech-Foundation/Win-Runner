@@ -28,21 +28,22 @@ mod protection_tests {
         native_launch_spec, native_lc_map_string_w, native_leave_critical_section,
         native_listen_socket, native_multi_byte_to_wide_char,
         native_need_current_directory_for_exe_path_w, native_process_prng,
-        native_query_depth_slist, native_query_performance_frequency,
+        native_query_depth_slist, native_query_performance_frequency, native_raise_exception,
         native_release_srw_lock_exclusive, native_release_srw_lock_shared,
-        native_resolve_code_page, native_rtl_get_version, native_rtl_nt_status_to_dos_error,
-        native_set_console_active_screen_buffer, native_set_console_cursor_info,
-        native_set_console_cursor_position, native_set_console_mode,
-        native_set_console_screen_buffer_size, native_set_console_window_info,
-        native_set_environment_variable_w, native_set_file_time, native_set_last_error,
-        native_set_thread_stack_guarantee, native_set_unhandled_exception_filter,
-        native_set_waitable_timer, native_shutdown_socket, native_sleep_condition_variable_srw,
-        native_terminate_process, native_try_acquire_srw_lock_shared,
-        native_wait_for_single_object, native_wait_on_address, native_wake_all_condition_variable,
-        native_wake_by_address_all, native_wide_char_to_multi_byte, native_write_console_w,
-        native_wsa_get_last_error, native_wsa_inet_addr, parse_windows_command_line, process_ctx,
-        uppercase_ascii_utf16, waitpid, write_process_information, NativeLaunchSpec,
-        NativeMemoryStatus, API_SET_MODULE, PROT_EXEC, PROT_READ, PROT_WRITE, THREAD_NATIVE_HANDLE,
+        native_remove_vectored_exception_handler, native_resolve_code_page, native_rtl_get_version,
+        native_rtl_nt_status_to_dos_error, native_set_console_active_screen_buffer,
+        native_set_console_cursor_info, native_set_console_cursor_position,
+        native_set_console_mode, native_set_console_screen_buffer_size,
+        native_set_console_window_info, native_set_environment_variable_w, native_set_file_time,
+        native_set_last_error, native_set_thread_stack_guarantee,
+        native_set_unhandled_exception_filter, native_set_waitable_timer, native_shutdown_socket,
+        native_sleep_condition_variable_srw, native_terminate_process,
+        native_try_acquire_srw_lock_shared, native_wait_for_single_object, native_wait_on_address,
+        native_wake_all_condition_variable, native_wake_by_address_all,
+        native_wide_char_to_multi_byte, native_write_console_w, native_wsa_get_last_error,
+        native_wsa_inet_addr, parse_windows_command_line, process_ctx, uppercase_ascii_utf16,
+        waitpid, write_process_information, NativeLaunchSpec, NativeMemoryStatus, API_SET_MODULE,
+        PROT_EXEC, PROT_READ, PROT_WRITE, THREAD_NATIVE_HANDLE,
     };
     use crate::winfs::WinFs;
 
@@ -2039,6 +2040,8 @@ mod protection_tests {
         ));
         assert!(super::supports_import("KERNEL32.dll", "GetTickCount"));
         assert!(super::supports_import("KERNEL32.dll", "GetTickCount64"));
+        assert!(super::supports_import("KERNEL32.dll", "RaiseException"));
+        assert!(super::supports_import("NTDLL.dll", "RtlRaiseException"));
         assert!(super::supports_import(
             "api-ms-win-core-file-l1-1-0.dll",
             "CreateFileW"
@@ -5811,9 +5814,44 @@ mod protection_tests {
     }
 
     #[test]
-    fn registers_a_non_null_vectored_exception_handler() {
+    fn registers_multiple_vectored_exception_handlers_with_opaque_handles() {
         assert_eq!(native_add_vectored_exception_handler(1, 0), 0);
-        assert_eq!(native_add_vectored_exception_handler(1, 0x1234), 0x1235);
+        assert_eq!(native_add_vectored_exception_handler(0, 0), 0);
+        let first = native_add_vectored_exception_handler(1, 0x1234);
+        let second = native_add_vectored_exception_handler(2, 0x5678);
+        assert_ne!(first, 0);
+        assert_ne!(second, 0);
+        assert_ne!(first, second);
+        assert_eq!(native_remove_vectored_exception_handler(first), 1);
+        assert_eq!(native_remove_vectored_exception_handler(first), 0);
+        assert_eq!(native_remove_vectored_exception_handler(second), 1);
+    }
+
+    static RAISED_EXCEPTION_CODE: std::sync::atomic::AtomicU32 =
+        std::sync::atomic::AtomicU32::new(0);
+
+    extern "win64" fn handle_raised_exception(
+        pointers: *mut super::NativeExceptionPointers,
+    ) -> i32 {
+        let record = unsafe { &*(*pointers).record };
+        RAISED_EXCEPTION_CODE.store(record.code, std::sync::atomic::Ordering::Release);
+        -1 // EXCEPTION_CONTINUE_EXECUTION
+    }
+
+    #[test]
+    fn dispatches_raise_exception_to_a_vectored_handler() {
+        RAISED_EXCEPTION_CODE.store(0, std::sync::atomic::Ordering::Release);
+        let handle = native_add_vectored_exception_handler(
+            1,
+            handle_raised_exception as *const () as usize as u64,
+        );
+        assert_ne!(handle, 0);
+        native_raise_exception(0xe123_4567, 0, 0, std::ptr::null());
+        assert_eq!(
+            RAISED_EXCEPTION_CODE.load(std::sync::atomic::Ordering::Acquire),
+            0xe123_4567
+        );
+        assert_eq!(native_remove_vectored_exception_handler(handle), 1);
     }
 
     #[test]

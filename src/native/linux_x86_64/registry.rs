@@ -134,6 +134,7 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
         "NTDLL.DLL" => matches!(
             func,
             "RtlCaptureContext"
+                | "RtlRaiseException"
                 | "RtlGetVersion"
                 | "RtlNtStatusToDosError"
                 | "NtReadFile"
@@ -209,6 +210,8 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
             Some(NATIVE_CRT_ACMDLN.as_ptr() as u64)
         }
         "RtlCaptureContext" => Some(winrun_native_rtl_capture_context as *const () as usize as u64),
+        "RaiseException" => Some(native_raise_exception as *const () as usize as u64),
+        "RtlRaiseException" => Some(native_rtl_raise_exception as *const () as usize as u64),
         // Winsock's stable ordinal exports for byte-order conversion.
         "#8" | "#14" => Some(native_network_u32 as *const () as usize as u64),
         "#9" | "#15" => Some(native_network_u16 as *const () as usize as u64),

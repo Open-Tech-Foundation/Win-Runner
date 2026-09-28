@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Support multiple ordered vectored exception handlers and dispatch explicit
+  `RaiseException`/`RtlRaiseException` calls with Windows-shaped exception
+  records. Native fault translation, real guest CPU context capture, and SEH
+  stack unwinding remain unimplemented.
 - Detect .NET Framework `_CorExeMain`/`_CorDllMain` images and report the clear
   unsupported-runtime limitation in `winrun inspect` and native execution.
 - Replaced the PS1 interpreter's proposed install-script .NET API expansion

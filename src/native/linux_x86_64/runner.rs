@@ -531,7 +531,8 @@ fn run_rust_baseline_argv_with_fs_impl(
             state_fd: AtomicU32::new(u32::MAX),
             fls_value: AtomicU64::new(0),
             unhandled_exception_filter: AtomicU64::new(0),
-            vectored_exception_handler: AtomicU64::new(0),
+            vectored_exception_handlers: Mutex::new(Vec::new()),
+            vectored_exception_handler_next: AtomicU64::new(0xe100_0000),
             exit_status: AtomicU32::new(259), // STILL_ACTIVE
             exited: AtomicBool::new(false),
             children: Mutex::new(NativeProcessTable::new()),
