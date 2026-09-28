@@ -187,12 +187,8 @@ fn build_crt_startup(command_line: &[u8], environment: &[(String, String)]) -> N
     let line = String::from_utf8_lossy(command_line);
     let args = parse_windows_command_line(line.trim_end_matches('\0')).unwrap_or_default();
     let argv_storage = args
-        .into_iter()
-        .map(|arg| {
-            let mut bytes = arg.into_bytes();
-            bytes.push(0);
-            bytes.into_boxed_slice()
-        })
+        .iter()
+        .map(|arg| nul_terminated_bytes(arg))
         .collect::<Vec<_>>();
     let mut argv = argv_storage
         .iter()
@@ -200,27 +196,61 @@ fn build_crt_startup(command_line: &[u8], environment: &[(String, String)]) -> N
         .collect::<Vec<_>>();
     argv.push(0);
     let argv_value = argv.as_mut_ptr() as usize;
+    let wide_argv_storage = args
+        .iter()
+        .map(|arg| nul_terminated_wide(arg))
+        .collect::<Vec<_>>();
+    let mut wide_argv = wide_argv_storage
+        .iter()
+        .map(|arg| arg.as_ptr() as usize)
+        .collect::<Vec<_>>();
+    wide_argv.push(0);
+    let wide_argv_value = wide_argv.as_mut_ptr() as usize;
     let environment_storage = environment
         .iter()
-        .map(|(name, value)| {
-            let mut bytes = format!("{name}={value}").into_bytes();
-            bytes.push(0);
-            bytes.into_boxed_slice()
-        })
+        .map(|(name, value)| nul_terminated_bytes(&format!("{name}={value}")))
+        .collect::<Vec<_>>();
+    let wide_environment_storage = environment
+        .iter()
+        .map(|(name, value)| nul_terminated_wide(&format!("{name}={value}")))
         .collect::<Vec<_>>();
     let mut environment = environment_storage
         .iter()
         .map(|entry| entry.as_ptr() as usize)
         .collect::<Vec<_>>();
     environment.push(0);
+    let environment_value = environment.as_mut_ptr() as usize;
+    let mut wide_environment = wide_environment_storage
+        .iter()
+        .map(|entry| entry.as_ptr() as usize)
+        .collect::<Vec<_>>();
+    wide_environment.push(0);
+    let wide_environment_value = wide_environment.as_mut_ptr() as usize;
     NativeCrtStartup {
         argc: argv.len().saturating_sub(1) as i32,
         _argv_storage: argv_storage,
         argv,
         argv_value,
+        _wide_argv_storage: wide_argv_storage,
+        wide_argv,
+        wide_argv_value,
         _environment_storage: environment_storage,
         environment,
+        environment_value,
+        _wide_environment_storage: wide_environment_storage,
+        wide_environment,
+        wide_environment_value,
     }
+}
+
+fn nul_terminated_bytes(value: &str) -> Box<[u8]> {
+    let mut bytes = value.as_bytes().to_vec();
+    bytes.push(0);
+    bytes.into_boxed_slice()
+}
+
+fn nul_terminated_wide(value: &str) -> Box<[u16]> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 fn ensure_crt_startup(process: &NativeProcessContext) {
@@ -243,10 +273,18 @@ pub(super) extern "win64" fn native_crt_configure_narrow_argv(_mode: i32) -> i32
     }
 }
 
+pub(super) extern "win64" fn native_crt_configure_wide_argv(mode: i32) -> i32 {
+    native_crt_configure_narrow_argv(mode)
+}
+
 pub(super) extern "win64" fn native_crt_initialize_narrow_environment() {
     if let Some(process) = process_ctx() {
         ensure_crt_startup(&process);
     }
+}
+
+pub(super) extern "win64" fn native_crt_initialize_wide_environment() {
+    native_crt_initialize_narrow_environment();
 }
 
 pub(super) extern "win64" fn native_crt_p_argc() -> *mut i32 {
@@ -279,6 +317,91 @@ pub(super) extern "win64" fn native_crt_p_argv() -> *mut *mut *mut i8 {
             startup
                 .as_mut()
                 .map(|startup| std::ptr::addr_of_mut!(startup.argv_value).cast::<*mut *mut i8>())
+        })
+        .unwrap_or(std::ptr::null_mut())
+}
+
+pub(super) extern "win64" fn native_crt_p_wargv() -> *mut *mut *mut u16 {
+    let Some(process) = process_ctx() else {
+        return std::ptr::null_mut();
+    };
+    ensure_crt_startup(&process);
+    process
+        .crt_startup
+        .lock()
+        .ok()
+        .and_then(|mut startup| {
+            startup.as_mut().map(|startup| {
+                std::ptr::addr_of_mut!(startup.wide_argv_value).cast::<*mut *mut u16>()
+            })
+        })
+        .unwrap_or(std::ptr::null_mut())
+}
+
+pub(super) extern "win64" fn native_crt_get_initial_narrow_environment() -> *mut *mut i8 {
+    let Some(process) = process_ctx() else {
+        return std::ptr::null_mut();
+    };
+    ensure_crt_startup(&process);
+    process
+        .crt_startup
+        .lock()
+        .ok()
+        .and_then(|mut startup| {
+            startup
+                .as_mut()
+                .map(|startup| startup.environment.as_mut_ptr().cast::<*mut i8>())
+        })
+        .unwrap_or(std::ptr::null_mut())
+}
+
+pub(super) extern "win64" fn native_crt_get_initial_wide_environment() -> *mut *mut u16 {
+    let Some(process) = process_ctx() else {
+        return std::ptr::null_mut();
+    };
+    ensure_crt_startup(&process);
+    process
+        .crt_startup
+        .lock()
+        .ok()
+        .and_then(|mut startup| {
+            startup
+                .as_mut()
+                .map(|startup| startup.wide_environment.as_mut_ptr().cast::<*mut u16>())
+        })
+        .unwrap_or(std::ptr::null_mut())
+}
+
+pub(super) extern "win64" fn native_crt_p_environ() -> *mut *mut *mut i8 {
+    let Some(process) = process_ctx() else {
+        return std::ptr::null_mut();
+    };
+    ensure_crt_startup(&process);
+    process
+        .crt_startup
+        .lock()
+        .ok()
+        .and_then(|mut startup| {
+            startup.as_mut().map(|startup| {
+                std::ptr::addr_of_mut!(startup.environment_value).cast::<*mut *mut i8>()
+            })
+        })
+        .unwrap_or(std::ptr::null_mut())
+}
+
+pub(super) extern "win64" fn native_crt_p_wenviron() -> *mut *mut *mut u16 {
+    let Some(process) = process_ctx() else {
+        return std::ptr::null_mut();
+    };
+    ensure_crt_startup(&process);
+    process
+        .crt_startup
+        .lock()
+        .ok()
+        .and_then(|mut startup| {
+            startup.as_mut().map(|startup| {
+                std::ptr::addr_of_mut!(startup.wide_environment_value).cast::<*mut *mut u16>()
+            })
         })
         .unwrap_or(std::ptr::null_mut())
 }
@@ -2348,5 +2471,45 @@ mod startup_tests {
         );
         assert!(unsafe { (*env.add(1)).is_null() });
         assert_eq!(startup.argv_value, startup.argv.as_mut_ptr() as usize);
+    }
+
+    #[test]
+    fn wide_startup_arrays_keep_utf16_arguments_and_environment_alive() {
+        let environment = vec![("GREETING".to_string(), "héllo 🌍".to_string())];
+        let mut startup =
+            build_crt_startup("tool.exe \"héllo 世界\" arg\0".as_bytes(), &environment);
+        assert_eq!(startup.argc, 3);
+
+        let argv = startup.wide_argv.as_mut_ptr().cast::<*mut u16>();
+        let read_wide = |index| unsafe {
+            let mut length = 0;
+            while *(*argv.add(index)).add(length) != 0 {
+                length += 1;
+            }
+            String::from_utf16(std::slice::from_raw_parts(*argv.add(index), length)).unwrap()
+        };
+        assert_eq!(read_wide(0), "tool.exe");
+        assert_eq!(read_wide(1), "héllo 世界");
+        assert_eq!(read_wide(2), "arg");
+        assert!(unsafe { (*argv.add(3)).is_null() });
+
+        let env = startup.wide_environment.as_mut_ptr().cast::<*mut u16>();
+        let mut length = 0;
+        while unsafe { *(*env).add(length) != 0 } {
+            length += 1;
+        }
+        assert_eq!(
+            unsafe { String::from_utf16(std::slice::from_raw_parts(*env, length)).unwrap() },
+            "GREETING=héllo 🌍"
+        );
+        assert!(unsafe { (*env.add(1)).is_null() });
+        assert_eq!(
+            startup.wide_argv_value,
+            startup.wide_argv.as_mut_ptr() as usize
+        );
+        assert_eq!(
+            startup.wide_environment_value,
+            startup.wide_environment.as_mut_ptr() as usize
+        );
     }
 }

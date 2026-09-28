@@ -6,6 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Add stable UTF-16 CRT startup arrays and accessors for wide arguments and
+  environment variables, including `_configure_wide_argv`, `__p___wargv`, and
+  the initial/environment pointer APIs.
 - Support multiple ordered vectored exception handlers and dispatch explicit
   `RaiseException`/`RtlRaiseException` calls with Windows-shaped exception
   records. The native x86-64 entry path now translates synchronous Linux

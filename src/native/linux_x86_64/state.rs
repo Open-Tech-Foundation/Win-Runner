@@ -331,8 +331,16 @@ pub(super) struct NativeCrtStartup {
     pub(super) _argv_storage: Vec<Box<[u8]>>,
     pub(super) argv: Vec<usize>,
     pub(super) argv_value: usize,
+    pub(super) _wide_argv_storage: Vec<Box<[u16]>>,
+    #[allow(dead_code)] // Kept alive because wide_argv_value points into this array.
+    pub(super) wide_argv: Vec<usize>,
+    pub(super) wide_argv_value: usize,
     pub(super) _environment_storage: Vec<Box<[u8]>>,
     pub(super) environment: Vec<usize>,
+    pub(super) environment_value: usize,
+    pub(super) _wide_environment_storage: Vec<Box<[u16]>>,
+    pub(super) wide_environment: Vec<usize>,
+    pub(super) wide_environment_value: usize,
 }
 
 pub(super) struct NativeVectoredExceptionHandler {

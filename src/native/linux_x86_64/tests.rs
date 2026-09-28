@@ -2669,6 +2669,21 @@ mod protection_tests {
 
     #[test]
     fn import_binding_checks_the_dll_as_well_as_the_function() {
+        for export in [
+            "_configure_wide_argv",
+            "_initialize_wide_environment",
+            "__p___wargv",
+            "_get_initial_narrow_environment",
+            "_get_initial_wide_environment",
+            "__p__environ",
+            "__p__wenviron",
+        ] {
+            assert!(super::supports_import("UCRTBASE.dll", export), "{export}");
+            assert!(
+                super::baseline_trampoline(export).is_some(),
+                "{export} has no trampoline"
+            );
+        }
         assert!(super::supports_import("MSVCRT.dll", "__lconv_init"));
         assert!(super::supports_import("MSVCRT.dll", "strncmp"));
         assert!(super::supports_import("MSVCRT.dll", "setlocale"));

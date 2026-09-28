@@ -28,9 +28,16 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                     | "_initterm"
                     | "__getmainargs"
                     | "_configure_narrow_argv"
+                    | "_configure_wide_argv"
                     | "_initialize_narrow_environment"
+                    | "_initialize_wide_environment"
                     | "__p___argc"
                     | "__p___argv"
+                    | "__p___wargv"
+                    | "_get_initial_narrow_environment"
+                    | "_get_initial_wide_environment"
+                    | "__p__environ"
+                    | "__p__wenviron"
                     | "_crt_atexit"
                     | "_register_onexit_function"
                     | "_initialize_onexit_table"
@@ -222,11 +229,24 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "_configure_narrow_argv" => {
             Some(native_crt_configure_narrow_argv as *const () as usize as u64)
         }
+        "_configure_wide_argv" => Some(native_crt_configure_wide_argv as *const () as usize as u64),
         "_initialize_narrow_environment" => {
             Some(native_crt_initialize_narrow_environment as *const () as usize as u64)
         }
+        "_initialize_wide_environment" => {
+            Some(native_crt_initialize_wide_environment as *const () as usize as u64)
+        }
         "__p___argc" => Some(native_crt_p_argc as *const () as usize as u64),
         "__p___argv" => Some(native_crt_p_argv as *const () as usize as u64),
+        "__p___wargv" => Some(native_crt_p_wargv as *const () as usize as u64),
+        "_get_initial_narrow_environment" => {
+            Some(native_crt_get_initial_narrow_environment as *const () as usize as u64)
+        }
+        "_get_initial_wide_environment" => {
+            Some(native_crt_get_initial_wide_environment as *const () as usize as u64)
+        }
+        "__p__environ" => Some(native_crt_p_environ as *const () as usize as u64),
+        "__p__wenviron" => Some(native_crt_p_wenviron as *const () as usize as u64),
         "_crt_atexit" => Some(native_crt_atexit as *const () as usize as u64),
         "_register_onexit_function" => {
             Some(native_crt_register_onexit_function as *const () as usize as u64)

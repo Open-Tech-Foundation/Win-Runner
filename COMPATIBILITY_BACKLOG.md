@@ -91,6 +91,8 @@ Items remain open until implementation and relevant verification are complete.
   `strtod`, `qsort`, `_time64`, `strstr`).
   - [x] Provide stable narrow `argc`/`argv` and environment arrays through
     `__p___argc`, `__p___argv`, and `__getmainargs`.
+  - [x] Provide stable UTF-16 `wargv` and environment arrays through
+    `_configure_wide_argv`, `__p___wargv`, and the initial/environment accessors.
   - [x] Implement `_configure_narrow_argv`, `_initialize_narrow_environment`,
     `_set_new_mode`, and `_configthreadlocale`.
   - [x] Register `_crt_atexit`, `_register_onexit_function`, and `_onexit`
@@ -113,7 +115,8 @@ Items remain open until implementation and relevant verification are complete.
   - [x] Add `_seh_filter_exe` dispatch for documented access-violation,
     illegal-instruction, and floating-point exception statuses through the
     existing CRT `signal()` registrations.
-  - [ ] Add remaining UCRT startup exports and exception cases.
+  - [ ] Add remaining UCRT startup exports and exception cases; startup data
+    mutation, wide formatting, and complete locale/argv policies remain open.
 - [ ] Add basic `msvcrt.dll` output and remaining file I/O, including `printf`.
   - [x] Share the unbuffered `fopen`/`fread`/`fwrite`/`fclose` subset with MSVCRT.
   - [x] Add narrow `printf`/`fprintf` through the shared formatter; the current
