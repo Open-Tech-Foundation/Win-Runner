@@ -205,6 +205,66 @@ pub(super) extern "win64" fn native_crt_wgetenv(name: *const u16) -> *mut u16 {
         buffer.as_mut_ptr()
     })
 }
+
+fn native_crt_putenv_wide_units(input: &[u16]) -> i32 {
+    if input.is_empty() {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+        return -1;
+    }
+    let Some(separator) = input.iter().position(|unit| *unit == b'=' as u16) else {
+        let mut name = input.to_vec();
+        name.push(0);
+        return if native_set_environment_variable_w(name.as_ptr(), std::ptr::null()) != 0 {
+            0
+        } else {
+            THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+            -1
+        };
+    };
+    if separator == 0 {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+        return -1;
+    }
+    let mut name = input[..separator].to_vec();
+    name.push(0);
+    let mut value = input[separator + 1..].to_vec();
+    value.push(0);
+    if native_set_environment_variable_w(name.as_ptr(), value.as_ptr()) != 0 {
+        0
+    } else {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+        -1
+    }
+}
+
+pub(super) extern "win64" fn native_crt_wputenv(input: *const u16) -> i32 {
+    if input.is_null() {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+        return -1;
+    }
+    let mut units = Vec::new();
+    for index in 0..32768usize {
+        let unit = unsafe { input.add(index).read() };
+        if unit == 0 {
+            return native_crt_putenv_wide_units(&units);
+        }
+        units.push(unit);
+    }
+    THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+    -1
+}
+
+pub(super) extern "win64" fn native_crt_putenv(input: *const u8) -> i32 {
+    let Some(wide) = native_ansi_path(input) else {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+        return -1;
+    };
+    let Some(input) = wide.strip_suffix(&[0]) else {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+        return -1;
+    };
+    native_crt_putenv_wide_units(input)
+}
 // The native runtime starts in the C locale, whose initial locale
 // conversion data is zero-initialized. MinGW CRTs call this initializer
 // during startup; no additional setup is needed for that default locale.

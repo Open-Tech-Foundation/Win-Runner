@@ -95,6 +95,8 @@ Items remain open until implementation and relevant verification are complete.
     `_configure_wide_argv`, `__p___wargv`, and the initial/environment accessors.
   - [x] Keep current `environ` arrays synchronized with Windows environment
     updates while preserving the initial environment arrays.
+  - [x] Add `_putenv` and `_wputenv` assignment/removal forms over the guest
+    environment table.
   - [x] Populate `_acmdln`/`_wcmdln` and `__initenv`/`__winitenv` data imports,
     with `__p__acmdln` and `__p__wcmdln` accessors, from process startup state.
   - [x] Populate `__p__pgmptr` and `__p__wpgmptr` with the process executable

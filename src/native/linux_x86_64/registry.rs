@@ -78,6 +78,8 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                     | "_errno"
                     | "getenv"
                     | "_wgetenv"
+                    | "_putenv"
+                    | "_wputenv"
                     | "__iob_func"
                     | "__acrt_iob_func"
                     | "__stdio_common_vfprintf"
@@ -243,6 +245,8 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "_errno" => Some(native_crt_errno as *const () as usize as u64),
         "getenv" => Some(native_crt_getenv as *const () as usize as u64),
         "_wgetenv" => Some(native_crt_wgetenv as *const () as usize as u64),
+        "_putenv" => Some(native_crt_putenv as *const () as usize as u64),
+        "_wputenv" => Some(native_crt_wputenv as *const () as usize as u64),
         "__iob_func" => Some(native_crt_iob_func as *const () as usize as u64),
         "__acrt_iob_func" => Some(native_crt_acrt_iob_func as *const () as usize as u64),
         "__stdio_common_vfprintf" => {

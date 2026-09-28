@@ -2915,10 +2915,18 @@ mod protection_tests {
             {
                 unsafe { _exit(126) };
             }
+            if super::native_crt_wputenv(std::ptr::null()) != -1
+                || unsafe { super::native_crt_errno().read() } != 22
+            {
+                unsafe { _exit(120) };
+            }
+            unsafe { super::native_crt_errno().write(0) };
 
-            let key_wide: Vec<u16> = key.encode_utf16().chain([0]).collect();
-            let after: Vec<u16> = "after ☀".encode_utf16().chain([0]).collect();
-            if super::native_set_environment_variable_w(key_wide.as_ptr(), after.as_ptr()) != 1 {
+            let assignment: Vec<u16> = "WINRUN_CRT_ENV_SNAPSHOT=after ☀"
+                .encode_utf16()
+                .chain([0])
+                .collect();
+            if super::native_crt_wputenv(assignment.as_ptr()) != 0 {
                 unsafe { _exit(125) };
             }
             let current_narrow = unsafe { current_narrow_slot.read() };
@@ -2942,6 +2950,27 @@ mod protection_tests {
             {
                 unsafe { _exit(123) };
             }
+            if super::native_crt_putenv(b"WINRUN_CRT_ENV_SNAPSHOT=again\0".as_ptr()) != 0
+                || unsafe { std::ffi::CStr::from_ptr(*current_narrow_slot.read()) }.to_bytes()
+                    != b"WINRUN_CRT_ENV_SNAPSHOT=again"
+                || read_wide(unsafe { *current_wide_slot.read() })
+                    != "WINRUN_CRT_ENV_SNAPSHOT=again"
+            {
+                unsafe { _exit(122) };
+            }
+            let key: Vec<u16> = "WINRUN_CRT_ENV_SNAPSHOT"
+                .encode_utf16()
+                .chain([0])
+                .collect();
+            if super::native_crt_wputenv(key.as_ptr()) != 0
+                || !unsafe { (*current_narrow_slot.read()).is_null() }
+                || !unsafe { (*current_wide_slot.read()).is_null() }
+                || unsafe { std::ffi::CStr::from_ptr(*initial_narrow) }.to_bytes()
+                    != b"WINRUN_CRT_ENV_SNAPSHOT=before"
+                || read_wide(unsafe { initial_wide.read() }) != "WINRUN_CRT_ENV_SNAPSHOT=before"
+            {
+                unsafe { _exit(121) };
+            }
             unsafe { _exit(0) };
         }
         let mut status = 0;
@@ -2954,6 +2983,8 @@ mod protection_tests {
     fn import_binding_checks_the_dll_as_well_as_the_function() {
         for export in [
             "_wgetenv",
+            "_putenv",
+            "_wputenv",
             "__p__fmode",
             "__p__commode",
             "_configure_wide_argv",

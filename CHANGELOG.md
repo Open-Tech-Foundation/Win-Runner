@@ -28,6 +28,9 @@ All notable changes to this project will be documented in this file.
   UTF-16 result storage.
 - Keep current CRT `environ`/`_wenviron` arrays separate from initial arrays and
   refresh them after guest `SetEnvironmentVariableW` changes.
+- Add CRT `_putenv` and `_wputenv` parsing for environment assignment and
+  deletion; updates flow through the Windows environment API and refresh the
+  current CRT arrays.
 - Add stable UTF-16 CRT startup arrays and accessors for wide arguments and
   environment variables, including `_configure_wide_argv`, `__p___wargv`, and
   the initial/environment pointer APIs.
