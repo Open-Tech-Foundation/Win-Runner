@@ -1874,7 +1874,11 @@ mod protection_tests {
             if !super::supports_import("UCRTBASE.dll", "__p___argc")
                 || !super::supports_import("UCRTBASE.dll", "__p___argv")
                 || !super::supports_import("MSVCRT.dll", "_acmdln")
+                || !super::supports_import("MSVCRT.dll", "_wcmdln")
                 || !super::supports_import("MSVCRT.dll", "__initenv")
+                || !super::supports_import("MSVCRT.dll", "__winitenv")
+                || !super::supports_import("UCRTBASE.dll", "__p__acmdln")
+                || !super::supports_import("UCRTBASE.dll", "__p__wcmdln")
                 || !super::supports_import("UCRTBASE.dll", "_crt_atexit")
                 || !super::supports_import("UCRTBASE.dll", "_register_onexit_function")
                 || !super::supports_import("UCRTBASE.dll", "_initialize_onexit_table")
@@ -1916,8 +1920,16 @@ mod protection_tests {
             }
             if super::NATIVE_CRT_ACMDLN.load(std::sync::atomic::Ordering::Acquire)
                 != process.command_line_a.as_ptr() as u64
+                || super::NATIVE_CRT_WCMDLN.load(std::sync::atomic::Ordering::Acquire)
+                    != process.command_line_w.as_ptr() as u64
                 || super::NATIVE_CRT_INITENV.load(std::sync::atomic::Ordering::Acquire)
                     != out_environment as u64
+                || super::NATIVE_CRT_WINITENV.load(std::sync::atomic::Ordering::Acquire)
+                    != super::native_crt_get_initial_wide_environment() as u64
+                || unsafe { super::native_crt_p_acmdln().read() }
+                    != process.command_line_a.as_ptr() as *mut u8
+                || unsafe { super::native_crt_p_wcmdln().read() }
+                    != process.command_line_w.as_ptr() as *mut u16
             {
                 unsafe { _exit(119) };
             }

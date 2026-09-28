@@ -15,7 +15,9 @@ pub(super) static NATIVE_CRT_FMODE: AtomicI32 = AtomicI32::new(0);
 pub(super) static NATIVE_CRT_COMMODE: AtomicI32 = AtomicI32::new(0);
 pub(super) static NATIVE_CRT_C_LOCALE: [u8; 2] = *b"C\0";
 pub(super) static NATIVE_CRT_ACMDLN: AtomicU64 = AtomicU64::new(0);
+pub(super) static NATIVE_CRT_WCMDLN: AtomicU64 = AtomicU64::new(0);
 pub(super) static NATIVE_CRT_INITENV: AtomicU64 = AtomicU64::new(0);
+pub(super) static NATIVE_CRT_WINITENV: AtomicU64 = AtomicU64::new(0);
 pub(super) static NATIVE_CRT_IOB: [AtomicU64; 24] = [const { AtomicU64::new(0) }; 24];
 const NATIVE_CRT_FILE_SIGNATURE: u64 = 0x5749_4e52_554e_4649;
 
@@ -263,7 +265,12 @@ fn ensure_crt_startup(process: &NativeProcessContext) {
         }
         if let Some(startup) = startup.as_mut() {
             NATIVE_CRT_ACMDLN.store(process.command_line_a.as_ptr() as u64, Ordering::Release);
+            NATIVE_CRT_WCMDLN.store(process.command_line_w.as_ptr() as u64, Ordering::Release);
             NATIVE_CRT_INITENV.store(startup.environment.as_mut_ptr() as u64, Ordering::Release);
+            NATIVE_CRT_WINITENV.store(
+                startup.wide_environment.as_mut_ptr() as u64,
+                Ordering::Release,
+            );
         }
     }
 }
@@ -339,6 +346,20 @@ pub(super) extern "win64" fn native_crt_p_wargv() -> *mut *mut *mut u16 {
             })
         })
         .unwrap_or(std::ptr::null_mut())
+}
+
+pub(super) extern "win64" fn native_crt_p_acmdln() -> *mut *mut u8 {
+    if let Some(process) = process_ctx() {
+        ensure_crt_startup(&process);
+    }
+    NATIVE_CRT_ACMDLN.as_ptr().cast()
+}
+
+pub(super) extern "win64" fn native_crt_p_wcmdln() -> *mut *mut u16 {
+    if let Some(process) = process_ctx() {
+        ensure_crt_startup(&process);
+    }
+    NATIVE_CRT_WCMDLN.as_ptr().cast()
 }
 
 pub(super) extern "win64" fn native_crt_get_initial_narrow_environment() -> *mut *mut i8 {

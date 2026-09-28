@@ -17,6 +17,8 @@ All notable changes to this project will be documented in this file.
   wide stream output and the full UCRT formatting set remain unsupported.
 - Initialize the MSVCRT `_acmdln` and `__initenv` data slots from the active
   guest process instead of leaving them pointed at empty or null state.
+- Add the wide CRT `_wcmdln` and `__winitenv` startup slots, plus
+  `__p__acmdln` and `__p__wcmdln` accessors backed by the guest command line.
 - Add stable UTF-16 CRT startup arrays and accessors for wide arguments and
   environment variables, including `_configure_wide_argv`, `__p___wargv`, and
   the initial/environment pointer APIs.

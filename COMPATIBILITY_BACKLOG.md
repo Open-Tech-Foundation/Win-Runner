@@ -93,8 +93,8 @@ Items remain open until implementation and relevant verification are complete.
     `__p___argc`, `__p___argv`, and `__getmainargs`.
   - [x] Provide stable UTF-16 `wargv` and environment arrays through
     `_configure_wide_argv`, `__p___wargv`, and the initial/environment accessors.
-  - [x] Populate `_acmdln` and `__initenv` data imports from the process startup
-    command line and initial environment.
+  - [x] Populate `_acmdln`/`_wcmdln` and `__initenv`/`__winitenv` data imports,
+    with `__p__acmdln` and `__p__wcmdln` accessors, from process startup state.
   - [x] Implement `_configure_narrow_argv`, `_initialize_narrow_environment`,
     `_set_new_mode`, and `_configthreadlocale`.
   - [x] Register `_crt_atexit`, `_register_onexit_function`, and `_onexit`

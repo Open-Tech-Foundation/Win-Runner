@@ -25,6 +25,7 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                     | "_fmode"
                     | "_commode"
                     | "_acmdln"
+                    | "_wcmdln"
                     | "_initterm"
                     | "__getmainargs"
                     | "_configure_narrow_argv"
@@ -34,6 +35,8 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                     | "__p___argc"
                     | "__p___argv"
                     | "__p___wargv"
+                    | "__p__acmdln"
+                    | "__p__wcmdln"
                     | "_get_initial_narrow_environment"
                     | "_get_initial_wide_environment"
                     | "__p__environ"
@@ -124,6 +127,7 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                     | "fputc"
                     | "_iob"
                     | "__initenv"
+                    | "__winitenv"
                     | "_isatty"
                     | "_get_osfhandle"
             )
@@ -257,6 +261,8 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "__p___argc" => Some(native_crt_p_argc as *const () as usize as u64),
         "__p___argv" => Some(native_crt_p_argv as *const () as usize as u64),
         "__p___wargv" => Some(native_crt_p_wargv as *const () as usize as u64),
+        "__p__acmdln" => Some(native_crt_p_acmdln as *const () as usize as u64),
+        "__p__wcmdln" => Some(native_crt_p_wcmdln as *const () as usize as u64),
         "_get_initial_narrow_environment" => {
             Some(native_crt_get_initial_narrow_environment as *const () as usize as u64)
         }
@@ -342,6 +348,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "fputc" => Some(native_crt_fputc as *const () as usize as u64),
         "_iob" => Some(NATIVE_CRT_IOB.as_ptr() as u64),
         "__initenv" => Some(NATIVE_CRT_INITENV.as_ptr() as u64),
+        "__winitenv" => Some(NATIVE_CRT_WINITENV.as_ptr() as u64),
         "malloc" => Some(native_crt_malloc as *const () as usize as u64),
         "realloc" => Some(native_crt_realloc as *const () as usize as u64),
         "free" => Some(native_crt_free as *const () as usize as u64),
@@ -355,6 +362,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "_fmode" => Some(NATIVE_CRT_FMODE.as_ptr() as u64),
         "_commode" => Some(NATIVE_CRT_COMMODE.as_ptr() as u64),
         "_acmdln" => Some(NATIVE_CRT_ACMDLN.as_ptr() as u64),
+        "_wcmdln" => Some(NATIVE_CRT_WCMDLN.as_ptr() as u64),
         "RtlAddFunctionTable" => Some(native_rtl_add_function_table as *const () as usize as u64),
         "RtlCaptureContext" => Some(winrun_native_rtl_capture_context as *const () as usize as u64),
         "RtlDeleteFunctionTable" => {
