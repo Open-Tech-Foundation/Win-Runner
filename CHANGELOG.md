@@ -30,6 +30,8 @@ All notable changes to this project will be documented in this file.
   dependencies when their importing module reaches zero references.
 - Retain DLL mappings while loaded, collect unreachable dependency cycles, and
   run process-detach callbacks before clearing TLS and unmapping the images.
+- Defer DLL process-attach callbacks until dependency resolution completes;
+  order dependency components before importers and cycle members by load order.
 
 - Added a "Why Win-Runner?" section to the README explaining the project's focus
   and how it differs from Wine, VMs, and Windows CI runners.

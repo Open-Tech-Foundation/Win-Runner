@@ -2,6 +2,10 @@
 
 use super::*;
 
+thread_local! {
+    static GUEST_DLL_LOAD_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 pub(super) fn map(img: &PeImage) -> Result<Mapping, String> {
     if img.image_base & 4095 != 0 {
         return Err(format!(
@@ -130,6 +134,40 @@ mod module_export_tests {
     unsafe extern "win64" fn record_process_detach(_base: u64, reason: u32, _reserved: u64) -> i32 {
         DLL_PROCESS_DETACH_REASON.store(reason, Ordering::SeqCst);
         1
+    }
+
+    fn pending_module(base: u64, load_order: u64, dependencies: Vec<u64>) -> NativeLoadedModule {
+        NativeLoadedModule {
+            path: format!(r"C:\bin\{base:x}.dll"),
+            name: format!("{base:x}.dll"),
+            base,
+            size_of_image: 0x1000,
+            exports: Vec::new(),
+            entry_point: None,
+            tls_callbacks: Vec::new(),
+            static_tls_index: None,
+            static_tls_template: None,
+            load_order,
+            load_references: 0,
+            dependencies,
+            mapping: None,
+            initialized: false,
+        }
+    }
+
+    #[test]
+    fn module_initialization_orders_dependencies_and_groups_cycles_by_load_order() {
+        let modules = std::collections::HashMap::from([
+            (0x1000, pending_module(0x1000, 1, vec![0x2000])),
+            (0x2000, pending_module(0x2000, 2, vec![0x1000])),
+            (0x3000, pending_module(0x3000, 3, vec![0x1000])),
+            (0x4000, pending_module(0x4000, 0, vec![])),
+        ]);
+
+        assert_eq!(
+            super::module_initialization_order(&modules),
+            vec![0x4000, 0x1000, 0x2000, 0x3000]
+        );
     }
 
     fn dll_fixture(
@@ -266,6 +304,7 @@ mod module_export_tests {
             load_references: 0,
             dependencies: Vec::new(),
             mapping: None,
+            initialized: true,
         };
         let process = &*super::TEST_PROCESS;
         process
@@ -307,6 +346,7 @@ mod module_export_tests {
             load_references: 0,
             dependencies: Vec::new(),
             mapping: None,
+            initialized: true,
         };
         let process = &*super::TEST_PROCESS;
         process
@@ -378,6 +418,7 @@ mod module_export_tests {
             load_references: 0,
             dependencies: Vec::new(),
             mapping: Some(mapping),
+            initialized: true,
         };
         DLL_PROCESS_DETACH_REASON.store(u32::MAX, Ordering::SeqCst);
         super::dispose_loaded_module(process, module);
@@ -843,9 +884,23 @@ fn guest_module_path(name: &str) -> Option<(String, Vec<u8>)> {
 }
 
 fn load_guest_module(name: &str) -> Option<u64> {
-    let module = load_guest_module_inner(name, &mut std::collections::HashSet::new(), 0)?;
-    if module != API_SET_MODULE && !retain_module_load_reference(module) {
-        return None;
+    let outermost = GUEST_DLL_LOAD_DEPTH.with(|depth| {
+        let current = depth.get();
+        depth.set(current.saturating_add(1));
+        current == 0
+    });
+    let result = load_guest_module_inner(name, &mut std::collections::HashSet::new(), 0);
+    GUEST_DLL_LOAD_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    let module = result?;
+    if module != API_SET_MODULE {
+        let process = process_ctx()?;
+        if outermost && !initialize_pending_modules(&process) {
+            collect_unreferenced_modules(&process);
+            return None;
+        }
+        if !retain_module_load_reference(module) {
+            return None;
+        }
     }
     Some(module)
 }
@@ -865,6 +920,187 @@ fn retain_module_load_reference(module: u64) -> bool {
     };
     module.load_references = references;
     true
+}
+
+fn module_initialization_order(modules: &HashMap<u64, NativeLoadedModule>) -> Vec<u64> {
+    fn finish_order(
+        module: u64,
+        modules: &HashMap<u64, NativeLoadedModule>,
+        pending: &std::collections::HashSet<u64>,
+        seen: &mut std::collections::HashSet<u64>,
+        finished: &mut Vec<u64>,
+    ) {
+        if !seen.insert(module) {
+            return;
+        }
+        if let Some(loaded) = modules.get(&module) {
+            for dependency in &loaded.dependencies {
+                if pending.contains(dependency) {
+                    finish_order(*dependency, modules, pending, seen, finished);
+                }
+            }
+        }
+        finished.push(module);
+    }
+
+    fn collect_component(
+        module: u64,
+        reverse: &HashMap<u64, Vec<u64>>,
+        seen: &mut std::collections::HashSet<u64>,
+        component: &mut Vec<u64>,
+    ) {
+        if !seen.insert(module) {
+            return;
+        }
+        component.push(module);
+        if let Some(importers) = reverse.get(&module) {
+            for importer in importers {
+                collect_component(*importer, reverse, seen, component);
+            }
+        }
+    }
+
+    fn visit_component(
+        component: usize,
+        component_dependencies: &[std::collections::HashSet<usize>],
+        seen: &mut std::collections::HashSet<usize>,
+        order: &mut Vec<usize>,
+    ) {
+        if !seen.insert(component) {
+            return;
+        }
+        let mut dependencies: Vec<_> = component_dependencies[component].iter().copied().collect();
+        dependencies.sort_unstable();
+        for dependency in dependencies {
+            visit_component(dependency, component_dependencies, seen, order);
+        }
+        order.push(component);
+    }
+
+    let pending: std::collections::HashSet<_> = modules
+        .values()
+        .filter(|module| !module.initialized)
+        .map(|module| module.base)
+        .collect();
+    if pending.is_empty() {
+        return Vec::new();
+    }
+    let mut nodes: Vec<_> = pending.iter().copied().collect();
+    nodes.sort_by_key(|node| modules.get(node).map(|module| module.load_order));
+    let mut finished = Vec::with_capacity(nodes.len());
+    let mut seen = std::collections::HashSet::new();
+    for node in &nodes {
+        finish_order(*node, modules, &pending, &mut seen, &mut finished);
+    }
+
+    let mut reverse: HashMap<u64, Vec<u64>> = HashMap::new();
+    for node in &nodes {
+        if let Some(module) = modules.get(node) {
+            for dependency in &module.dependencies {
+                if pending.contains(dependency) {
+                    reverse.entry(*dependency).or_default().push(*node);
+                }
+            }
+        }
+    }
+    for importers in reverse.values_mut() {
+        importers.sort_by_key(|node| modules.get(node).map(|module| module.load_order));
+    }
+    let mut components = Vec::new();
+    seen.clear();
+    for node in finished.into_iter().rev() {
+        let mut component = Vec::new();
+        collect_component(node, &reverse, &mut seen, &mut component);
+        if !component.is_empty() {
+            component.sort_by_key(|node| modules.get(node).map(|module| module.load_order));
+            components.push(component);
+        }
+    }
+    let component_by_module: HashMap<_, _> = components
+        .iter()
+        .enumerate()
+        .flat_map(|(index, members)| members.iter().map(move |module| (*module, index)))
+        .collect();
+    let mut component_dependencies = vec![std::collections::HashSet::new(); components.len()];
+    for (component_index, members) in components.iter().enumerate() {
+        for member in members {
+            if let Some(module) = modules.get(member) {
+                for dependency in &module.dependencies {
+                    if let Some(dependency_component) = component_by_module.get(dependency) {
+                        if *dependency_component != component_index {
+                            component_dependencies[component_index].insert(*dependency_component);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut component_roots: Vec<_> = (0..components.len()).collect();
+    component_roots.sort_by_key(|index| {
+        components[*index]
+            .first()
+            .and_then(|module| modules.get(module))
+            .map(|module| module.load_order)
+    });
+    let mut component_order = Vec::new();
+    let mut seen_components = std::collections::HashSet::new();
+    for component in component_roots {
+        visit_component(
+            component,
+            &component_dependencies,
+            &mut seen_components,
+            &mut component_order,
+        );
+    }
+    component_order
+        .into_iter()
+        .flat_map(|component| components[component].iter().copied())
+        .collect()
+}
+
+fn initialize_pending_modules(process: &NativeProcessContext) -> bool {
+    loop {
+        let order = {
+            let Ok(modules) = process.loaded_modules.lock() else {
+                return false;
+            };
+            module_initialization_order(&modules)
+        };
+        if order.is_empty() {
+            return true;
+        }
+        for base in order {
+            let (callbacks, entry_point) = {
+                let Ok(mut modules) = process.loaded_modules.lock() else {
+                    return false;
+                };
+                let Some(module) = modules.get_mut(&base) else {
+                    continue;
+                };
+                if module.initialized {
+                    continue;
+                }
+                module.initialized = true;
+                (module.tls_callbacks.clone(), module.entry_point)
+            };
+            super::thread_runtime::invoke_tls_callbacks(base, &callbacks, 1);
+            if let Some(entry_point) = entry_point {
+                // SAFETY: the PE entry point was range-checked before module
+                // publication and the mapping remains owned by its record.
+                let dll_main: unsafe extern "win64" fn(u64, u32, u64) -> i32 =
+                    unsafe { std::mem::transmute(entry_point as usize) };
+                if unsafe { dll_main(base, 1, 0) } == 0 {
+                    if let Ok(mut modules) = process.loaded_modules.lock() {
+                        if let Some(module) = modules.get_mut(&base) {
+                            module.initialized = false;
+                        }
+                    }
+                    super::thread_runtime::invoke_tls_callbacks(base, &callbacks, 0);
+                    return false;
+                }
+            }
+        }
+    }
 }
 
 fn load_guest_module_inner(
@@ -953,6 +1189,7 @@ fn load_guest_module_inner(
             load_references: 0,
             dependencies: Vec::new(),
             mapping: None,
+            initialized: false,
         };
         let handle = module.base;
         {
@@ -1008,16 +1245,6 @@ fn load_guest_module_inner(
         }
         if let (Some(index), Some(template)) = (tls_index, static_tls_template.as_ref()) {
             if !super::thread_runtime::install_module_static_tls(&process, index, template) {
-                return None;
-            }
-        }
-        super::thread_runtime::invoke_tls_callbacks(base, &tls_callbacks, 1);
-        if image.entry_rva != 0 {
-            let entry = base.checked_add(image.entry_rva as u64)?;
-            // SAFETY: the validated PE entry RVA is inside the executable mapping.
-            let dll_main: unsafe extern "win64" fn(u64, u32, u64) -> i32 =
-                unsafe { std::mem::transmute(entry as usize) };
-            if unsafe { dll_main(base, 1, 0) } == 0 {
                 return None;
             }
         }
@@ -1209,14 +1436,16 @@ fn collect_unreferenced_modules(process: &NativeProcessContext) {
 }
 
 fn dispose_loaded_module(process: &NativeProcessContext, loaded: NativeLoadedModule) {
-    if let Some(entry_point) = loaded.entry_point {
-        // SAFETY: the entry point was validated against the mapped PE image
-        // before it was published to the loader table.
-        let dll_main: unsafe extern "win64" fn(u64, u32, u64) -> i32 =
-            unsafe { std::mem::transmute(entry_point as usize) };
-        let _ = unsafe { dll_main(loaded.base, 0, 0) };
+    if loaded.initialized {
+        if let Some(entry_point) = loaded.entry_point {
+            // SAFETY: the entry point was validated against the mapped PE
+            // image before it was published to the loader table.
+            let dll_main: unsafe extern "win64" fn(u64, u32, u64) -> i32 =
+                unsafe { std::mem::transmute(entry_point as usize) };
+            let _ = unsafe { dll_main(loaded.base, 0, 0) };
+        }
+        super::thread_runtime::invoke_tls_callbacks(loaded.base, &loaded.tls_callbacks, 0);
     }
-    super::thread_runtime::invoke_tls_callbacks(loaded.base, &loaded.tls_callbacks, 0);
     if let Some(index) = loaded.static_tls_index {
         super::thread_runtime::clear_module_static_tls(process, index);
         super::thread_runtime::release_module_tls_slot(process, index);

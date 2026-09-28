@@ -559,6 +559,7 @@ fn run_rust_baseline_argv_with_fs_impl(
                     load_references: 0,
                     dependencies: Vec::new(),
                     mapping: None,
+                    initialized: true,
                 },
             )])),
             module_next: AtomicU64::new(1),

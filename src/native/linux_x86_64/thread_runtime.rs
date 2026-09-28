@@ -446,6 +446,7 @@ mod tls_callback_tests {
             load_references: 0,
             dependencies: Vec::new(),
             mapping: None,
+            initialized: true,
         };
         THREAD_EVENTS.lock().unwrap().clear();
         process.loaded_modules.lock().unwrap().insert(base, module);

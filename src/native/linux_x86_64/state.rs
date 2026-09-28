@@ -246,6 +246,8 @@ pub(super) struct NativeLoadedModule {
     pub(super) dependencies: Vec<u64>,
     /// Mapping ownership is attached after imports and initialization succeed.
     pub(super) mapping: Option<super::loader::Mapping>,
+    /// Set before calling attach callbacks to prevent recursive duplicate attach.
+    pub(super) initialized: bool,
 }
 
 pub(super) struct NativeThread {

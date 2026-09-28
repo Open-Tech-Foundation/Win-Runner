@@ -138,8 +138,10 @@ Items remain open until implementation and relevant verification are complete.
     - [x] Count repeated `LoadLibrary` references, retain import dependencies,
       collect unreachable cyclic module graphs, run process-detach callbacks,
       and release DLL mappings after detach.
-    - [ ] Match Windows initialization order for cyclic dependency graphs,
-      including deterministic attach and detach ordering within cycles.
+    - [x] Defer DLL attach until dependency resolution completes; initialize
+      dependencies before importers and order cycle members by module load order.
+    - [ ] Verify the exact attach/detach order Windows uses inside dependency
+      cycles against a Windows oracle.
   - [ ] Host `hostfxr.dll`, `hostpolicy.dll`, and `coreclr.dll` using the
     supported native hosting interfaces; cover shared, app-local, and
     self-contained runtime layouts, then add single-file apps.
