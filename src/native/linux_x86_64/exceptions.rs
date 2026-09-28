@@ -73,8 +73,22 @@ pub(super) struct NativeExceptionPointers {
     pub(super) context: *mut NativeExceptionContext,
 }
 
+#[repr(C)]
+struct NativeDispatcherContext {
+    control_pc: u64,
+    image_base: u64,
+    function_entry: *const NativeRuntimeFunction,
+    establisher_frame: u64,
+    target_ip: u64,
+    context_record: *mut NativeExceptionContext,
+    language_handler: u64,
+    handler_data: *mut c_void,
+    history_table: *mut c_void,
+    scope_index: u32,
+}
+
 impl NativeExceptionContext {
-    fn software_exception() -> Self {
+    pub(super) fn software_exception() -> Self {
         // CONTEXT_AMD64 | CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | CONTEXT_FLOATING_POINT
         let mut context = Self { bytes: [0; 1232] };
         context.bytes[48..52].copy_from_slice(&0x0010_001fu32.to_le_bytes());
@@ -450,6 +464,11 @@ fn dispatch_exception(
             _ => {}                     // VEH does not accept EXECUTE_HANDLER.
         }
     }
+    if context_register(context, 16).is_some_and(|control_pc| control_pc != 0)
+        && dispatch_frame_exception_handlers(record, context)
+    {
+        return true;
+    }
     let filter = process.unhandled_exception_filter.load(Ordering::Acquire);
     if filter != 0 {
         let filter: extern "win64" fn(*mut NativeExceptionPointers) -> i32 =
@@ -457,6 +476,89 @@ fn dispatch_exception(
         return filter(&mut pointers) as u32 == 0xffff_ffff;
     }
     false
+}
+
+pub(super) fn dispatch_frame_exception_handlers(
+    record: &mut NativeExceptionRecord,
+    context: &mut NativeExceptionContext,
+) -> bool {
+    const MAX_EXCEPTION_FRAMES: usize = 128;
+    let mut walk_context = *context;
+    for _ in 0..MAX_EXCEPTION_FRAMES {
+        let control_pc = context_register(&walk_context, 16).unwrap_or(0);
+        let stack_pointer = context_register(&walk_context, 4).unwrap_or(0);
+        if control_pc == 0 || stack_pointer == 0 {
+            break;
+        }
+
+        let mut image_base = 0;
+        let function_entry =
+            native_rtl_lookup_function_entry(control_pc, &mut image_base, std::ptr::null_mut())
+                as *const NativeRuntimeFunction;
+        if function_entry.is_null() && !is_guest_image_address(control_pc) {
+            break;
+        }
+        let mut frame_context = walk_context;
+        let mut handler_data = std::ptr::null_mut();
+        let mut establisher_frame = 0;
+        let language_handler = native_rtl_virtual_unwind(
+            1, // UNW_FLAG_EHANDLER
+            image_base,
+            control_pc,
+            function_entry,
+            &mut frame_context,
+            &mut handler_data,
+            &mut establisher_frame,
+            std::ptr::null_mut(),
+        );
+
+        if language_handler != 0 {
+            let mut dispatcher_context = NativeDispatcherContext {
+                control_pc,
+                image_base,
+                function_entry,
+                establisher_frame,
+                target_ip: 0,
+                context_record: context,
+                language_handler,
+                handler_data,
+                history_table: std::ptr::null_mut(),
+                scope_index: 0,
+            };
+            let handler: extern "win64" fn(
+                *mut NativeExceptionRecord,
+                u64,
+                *mut NativeExceptionContext,
+                *mut NativeDispatcherContext,
+            ) -> u32 = unsafe { std::mem::transmute(language_handler as usize) };
+            match handler(record, establisher_frame, context, &mut dispatcher_context) {
+                0 if record.flags & 1 == 0 => return true, // ExceptionContinueExecution
+                0 => return false, // Noncontinuable exceptions cannot resume.
+                1 => {}            // ExceptionContinueSearch
+                2 => record.flags |= 0x10, // EXCEPTION_NESTED_CALL
+                _ => {}            // Invalid dispositions do not stop the search.
+            }
+        }
+
+        let next_pc = context_register(&frame_context, 16).unwrap_or(0);
+        let next_stack = context_register(&frame_context, 4).unwrap_or(0);
+        if next_pc == 0 || next_stack <= stack_pointer {
+            break;
+        }
+        walk_context = frame_context;
+    }
+    false
+}
+
+fn is_guest_image_address(address: u64) -> bool {
+    process_ctx().is_some_and(|process| {
+        process.loaded_modules.lock().is_ok_and(|modules| {
+            modules.values().any(|module| {
+                address >= module.base
+                    && address < module.base.saturating_add(u64::from(module.size_of_image))
+            })
+        })
+    })
 }
 
 pub(super) extern "win64" fn native_raise_exception(
@@ -1194,7 +1296,7 @@ fn simulate_epilogue_return(context: &mut NativeExceptionContext, extra_stack_by
     true
 }
 
-fn context_register(context: &NativeExceptionContext, register: u8) -> Option<u64> {
+pub(super) fn context_register(context: &NativeExceptionContext, register: u8) -> Option<u64> {
     let offset = match register {
         0 => 120,  // RAX
         1 => 128,  // RCX
@@ -1220,7 +1322,7 @@ fn context_register(context: &NativeExceptionContext, register: u8) -> Option<u6
     ))
 }
 
-fn context_set_register(context: &mut NativeExceptionContext, register: u8, value: u64) {
+pub(super) fn context_set_register(context: &mut NativeExceptionContext, register: u8, value: u64) {
     let offset = match register {
         0 => 120,
         1 => 128,

@@ -5889,6 +5889,87 @@ mod protection_tests {
     }
 
     #[test]
+    fn frame_based_exception_dispatch_invokes_the_pe_language_handler() {
+        let image_size = 0x1000;
+        let image = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                image_size,
+                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(image, libc::MAP_FAILED);
+        let base = image as u64;
+        unsafe {
+            // UNWIND_INFO v1 with UNW_FLAG_EHANDLER and no unwind codes.
+            std::ptr::copy_nonoverlapping(
+                [9u8, 0, 0, 0].as_ptr(),
+                image.cast::<u8>().add(0x200),
+                4,
+            );
+            image.cast::<u32>().add(0x204 / 4).write_unaligned(0x300);
+            // Minimal Windows x64 handler: return ExceptionContinueExecution.
+            std::ptr::copy_nonoverlapping(
+                [0x31u8, 0xc0, 0xc3].as_ptr(),
+                image.cast::<u8>().add(0x300),
+                3,
+            );
+        }
+        let mut function = super::NativeRuntimeFunction {
+            begin_address: 0x10,
+            end_address: 0x20,
+            unwind_data: 0x200,
+        };
+        assert_eq!(native_rtl_add_function_table(&mut function, 1, base), 1);
+
+        let stack = [0u64];
+        let mut context = super::NativeExceptionContext::software_exception();
+        super::context_set_register(&mut context, 16, base + 0x15);
+        super::context_set_register(&mut context, 4, stack.as_ptr() as u64);
+        let mut image_base = 0;
+        let entry =
+            native_rtl_lookup_function_entry(base + 0x15, &mut image_base, std::ptr::null_mut())
+                as *const super::NativeRuntimeFunction;
+        assert_eq!(image_base, base);
+        let mut handler_data = std::ptr::null_mut();
+        let mut establisher = 0;
+        let mut unwind_context = context;
+        assert_eq!(
+            native_rtl_virtual_unwind(
+                1,
+                base,
+                base + 0x15,
+                entry,
+                &mut unwind_context,
+                &mut handler_data,
+                &mut establisher,
+                std::ptr::null_mut(),
+            ),
+            base + 0x300
+        );
+        let mut record = super::NativeExceptionRecord {
+            code: 0xc000_001d,
+            flags: 0,
+            nested_record: 0,
+            address: base + 0x15,
+            parameter_count: 0,
+            information: [0; 15],
+        };
+
+        assert!(super::dispatch_frame_exception_handlers(
+            &mut record,
+            &mut context
+        ));
+        assert_eq!(super::context_register(&context, 16), Some(base + 0x15));
+
+        assert_eq!(native_rtl_delete_function_table(&mut function), 1);
+        assert_eq!(unsafe { libc::munmap(image, image_size) }, 0);
+    }
+
+    #[test]
     fn rtl_lookup_function_entry_finds_mapped_pe_unwind_ranges() {
         use crate::native::linux_x86_64::state::NativeLoadedModule;
 

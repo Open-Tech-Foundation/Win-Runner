@@ -127,9 +127,11 @@ Items remain open until implementation and relevant verification are complete.
     filter with the captured guest context, and resume when a handler edits it.
   - [ ] Extend fault recovery to TLS callbacks and guest-created threads; they
     currently do not have registered recovery slots.
-  - [ ] Connect PE frame-based SEH handlers to virtual unwinding and exception
-    dispatch; current fault delivery covers vectored handlers and the process
-    unhandled filter.
+  - [x] Walk mapped guest x64 frames during exception dispatch, call language
+    handlers returned by `RtlVirtualUnwind`, and honor continue-execution and
+    continue-search dispositions.
+  - [ ] Implement complete nested/collided unwind behavior, language-specific
+    handler semantics such as `__C_specific_handler`, and `RtlUnwindEx`.
 
 ### P1: common command-line tools
 

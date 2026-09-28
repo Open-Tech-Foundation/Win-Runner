@@ -37,6 +37,9 @@ All notable changes to this project will be documented in this file.
   vectored exception handlers and the unhandled exception filter, and resume
   from a handler-modified context. TLS callbacks and guest-created threads are
   not yet covered by this fault-recovery trampoline.
+- Walk mapped guest x64 frames during exception dispatch and invoke PE
+  language handlers described by `UNWIND_INFO`; nested/collided unwind behavior
+  and language-specific runtime handlers remain incomplete.
 - Detect .NET Framework `_CorExeMain`/`_CorDllMain` images and report the clear
   unsupported-runtime limitation in `winrun inspect` and native execution.
 - Replaced the PS1 interpreter's proposed install-script .NET API expansion
