@@ -434,6 +434,11 @@ fn run_rust_baseline_argv_with_fs_impl(
         let lock_wait_ms = lock_started.elapsed().as_secs_f64() * 1000.0;
         let entry_started = std::time::Instant::now();
         let entry = entry(img)?;
+        let tls_callbacks = img
+            .tls
+            .as_ref()
+            .map(|tls| tls.callbacks.clone())
+            .unwrap_or_default();
         let entry_ms = entry_started.elapsed().as_secs_f64() * 1000.0;
         let map_started = std::time::Instant::now();
         let mapping = map(img)?;
@@ -578,6 +583,11 @@ fn run_rust_baseline_argv_with_fs_impl(
                     guest_process
                         .gs_base
                         .store(teb.as_ptr() as u64, Ordering::Release);
+                    super::thread_runtime::invoke_tls_callbacks(
+                        guest_process.image_base,
+                        &tls_callbacks,
+                        1,
+                    );
                     let guest: unsafe extern "win64" fn() -> u32 =
                         unsafe { std::mem::transmute(entry) };
                     let code = unsafe { guest() as i32 };
@@ -674,6 +684,7 @@ fn run_rust_baseline_argv_with_fs_impl(
             // Launcher threads can have 64 KiB stacks. V8 needs a larger
             // Windows thread stack, with bounds reflected in the guest TEB.
             let guest_process = Arc::clone(&process);
+            let tls_callbacks = tls_callbacks.clone();
             let guest_thread = std::thread::Builder::new()
                 .stack_size(16 * 1024 * 1024)
                 .spawn(move || {
@@ -692,6 +703,11 @@ fn run_rust_baseline_argv_with_fs_impl(
                     guest_process
                         .gs_base
                         .store(teb.as_ptr() as u64, Ordering::Release);
+                    super::thread_runtime::invoke_tls_callbacks(
+                        guest_process.image_base,
+                        &tls_callbacks,
+                        1,
+                    );
                     // SAFETY: entry is in the child-owned RX PE mapping.
                     let guest: unsafe extern "win64" fn() -> u32 =
                         unsafe { std::mem::transmute(entry) };

@@ -373,6 +373,7 @@ impl NativeCompletion {
 pub(super) struct DynamicTlsSlots {
     pub(super) active: [bool; 64],
     pub(super) generation: [u64; 64],
+    pub(super) reserved: [bool; 64],
     pub(super) reserved_static: bool,
 }
 

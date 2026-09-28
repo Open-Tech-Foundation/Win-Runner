@@ -113,6 +113,7 @@ pub(super) extern "win64" fn native_tls_alloc() -> u32 {
         return u32::MAX;
     };
     slots.active[index] = true;
+    slots.reserved[index] = false;
     slots.generation[index] = slots.generation[index].wrapping_add(1);
     index as u32
 }
@@ -123,7 +124,8 @@ pub(super) extern "win64" fn native_tls_free(index: u32) -> i32 {
     let Ok(mut slots) = process.dynamic_tls.lock() else {
         return 0;
     };
-    let reserved = index == 0 && slots.reserved_static;
+    let reserved = slots.reserved.get(index as usize).copied().unwrap_or(false)
+        || (index == 0 && slots.reserved_static);
     let Some(active) = slots.active.get_mut(index as usize) else {
         native_set_last_error(87);
         return 0;
@@ -135,6 +137,39 @@ pub(super) extern "win64" fn native_tls_free(index: u32) -> i32 {
     *active = false;
     slots.generation[index as usize] = slots.generation[index as usize].wrapping_add(1);
     1
+}
+
+pub(super) fn reserve_module_tls_slot(process: &NativeProcessContext) -> Option<u32> {
+    let mut slots = process.dynamic_tls.lock().ok()?;
+    let index = slots.active.iter().position(|active| !active)?;
+    slots.active[index] = true;
+    slots.reserved[index] = true;
+    slots.generation[index] = slots.generation[index].wrapping_add(1);
+    Some(index as u32)
+}
+
+pub(super) fn release_module_tls_slot(process: &NativeProcessContext, index: u32) {
+    if let Ok(mut slots) = process.dynamic_tls.lock() {
+        let index = index as usize;
+        if index < slots.active.len() && slots.reserved[index] {
+            slots.active[index] = false;
+            slots.reserved[index] = false;
+            slots.generation[index] = slots.generation[index].wrapping_add(1);
+        }
+    }
+}
+
+/// Invoke loader callbacks whose RVAs have already been validated by the PE parser.
+pub(super) fn invoke_tls_callbacks(base: u64, callbacks: &[u32], reason: u32) {
+    for &callback_rva in callbacks {
+        let Some(address) = base.checked_add(u64::from(callback_rva)) else {
+            continue;
+        };
+        // SAFETY: PE parsing verifies callback RVAs point into executable image sections.
+        let callback: unsafe extern "win64" fn(u64, u32, u64) =
+            unsafe { std::mem::transmute(address as usize) };
+        unsafe { callback(base, reason, 0) };
+    }
 }
 pub(super) extern "win64" fn native_tls_get_value(index: u32) -> u64 {
     let Some(process) = process_ctx() else {
@@ -207,4 +242,30 @@ pub(super) extern "win64" fn native_fls_set_value(index: u32, value: u64) -> i32
         return 0;
     }
     1
+}
+
+#[cfg(test)]
+mod tls_callback_tests {
+    use super::invoke_tls_callbacks;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static CALLBACK_REASON: AtomicU32 = AtomicU32::new(0);
+    static CALLBACK_BASE: AtomicU32 = AtomicU32::new(0);
+
+    unsafe extern "win64" fn record_callback(base: u64, reason: u32, _reserved: u64) {
+        CALLBACK_BASE.store(base as u32, Ordering::SeqCst);
+        CALLBACK_REASON.store(reason, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn invokes_tls_callbacks_with_image_base_and_reason() {
+        let callback = record_callback as *const () as usize as u64;
+        CALLBACK_BASE.store(0, Ordering::SeqCst);
+        CALLBACK_REASON.store(0, Ordering::SeqCst);
+
+        invoke_tls_callbacks(callback, &[0], 1);
+
+        assert_eq!(CALLBACK_BASE.load(Ordering::SeqCst), callback as u32);
+        assert_eq!(CALLBACK_REASON.load(Ordering::SeqCst), 1);
+    }
 }

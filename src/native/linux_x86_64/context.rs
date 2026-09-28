@@ -133,6 +133,7 @@ impl DynamicTlsSlots {
         Self {
             active,
             generation: [0; 64],
+            reserved: [false; 64],
             reserved_static: static_tls,
         }
     }

@@ -18,6 +18,9 @@ All notable changes to this project will be documented in this file.
   ordinal, and shim-forwarded exports.
 - Resolve acyclic guest-DLL dependency graphs recursively and map common
   Kernel32, UCRT, and Advapi32 API-set names onto existing shim registrations.
+- Invoke process-attach TLS callbacks for the main image and DLLs; reject DLL
+  TLS templates that need per-thread static storage until that storage is
+  implemented.
 
 - Added a "Why Win-Runner?" section to the README explaining the project's focus
   and how it differs from Wine, VMs, and Windows CI runners.

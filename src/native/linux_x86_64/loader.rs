@@ -573,9 +573,20 @@ fn load_guest_module_inner(
     }
     let result = (|| {
         let image = crate::pe::load_lenient(&bytes).ok()?;
-        if !image.is_dll || image.tls.is_some() {
+        if !image.is_dll
+            || image
+                .tls
+                .as_ref()
+                .is_some_and(|tls| !tls.raw_data.is_empty() || tls.zero_fill != 0)
+        {
             return None;
         }
+        let tls_callbacks = image
+            .tls
+            .as_ref()
+            .map(|tls| tls.callbacks.clone())
+            .unwrap_or_default();
+        let tls_index_rva = image.tls.as_ref().map(|tls| tls.index_rva);
 
         let mut shim_imports = Vec::new();
         let mut guest_imports = Vec::new();
@@ -617,6 +628,21 @@ fn load_guest_module_inner(
         }
         protect_exec(&mapping).ok()?;
         let base = mapping.ptr as u64;
+        let process = process_ctx()?;
+        let tls_index = if tls_index_rva.is_some() {
+            Some(super::thread_runtime::reserve_module_tls_slot(&process)?)
+        } else {
+            None
+        };
+        if let (Some(index_rva), Some(index)) = (tls_index_rva, tls_index) {
+            let offset = index_rva as usize;
+            if offset.checked_add(4)? > mapping.len {
+                super::thread_runtime::release_module_tls_slot(&process, index);
+                return None;
+            }
+            // SAFETY: the parsed TLS directory supplies a checked index RVA.
+            unsafe { ptr::write_unaligned(mapping.ptr.add(offset).cast::<u32>(), index) };
+        }
         let module = NativeLoadedModule {
             path: path.clone(),
             name: module_basename(&path),
@@ -624,7 +650,6 @@ fn load_guest_module_inner(
             size_of_image: image.size_of_image,
             exports: image.exports,
         };
-        let process = process_ctx()?;
         let handle = module.base;
         {
             let mut modules = process.loaded_modules.lock().ok()?;
@@ -632,10 +657,14 @@ fn load_guest_module_inner(
                 loaded.path.eq_ignore_ascii_case(&path)
                     || loaded.name.eq_ignore_ascii_case(&module.name)
             }) {
+                if let Some(index) = tls_index {
+                    super::thread_runtime::release_module_tls_slot(&process, index);
+                }
                 return Some(existing.base);
             }
             modules.insert(handle, module);
         }
+        super::thread_runtime::invoke_tls_callbacks(base, &tls_callbacks, 1);
         if image.entry_rva != 0 {
             let entry = base.checked_add(image.entry_rva as u64)?;
             // SAFETY: the validated PE entry RVA is inside the executable mapping.
@@ -644,6 +673,9 @@ fn load_guest_module_inner(
             if unsafe { dll_main(base, 1, 0) } == 0 {
                 if let Ok(mut modules) = process.loaded_modules.lock() {
                     modules.remove(&handle);
+                }
+                if let Some(index) = tls_index {
+                    super::thread_runtime::release_module_tls_slot(&process, index);
                 }
                 return None;
             }
