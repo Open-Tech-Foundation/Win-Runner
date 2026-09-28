@@ -12,6 +12,9 @@ All notable changes to this project will be documented in this file.
   stack unwinding remain unimplemented.
 - Resolve `RtlLookupFunctionEntry` against loaded PE x64 exception directories,
   returning the mapped `RUNTIME_FUNCTION` record for a control PC.
+- Support registration and removal of bounded, sorted dynamic x64 function
+  tables through `RtlAddFunctionTable` and `RtlDeleteFunctionTable`; function
+  lookup now checks these JIT-style tables too.
 - Detect .NET Framework `_CorExeMain`/`_CorDllMain` images and report the clear
   unsupported-runtime limitation in `winrun inspect` and native execution.
 - Replaced the PS1 interpreter's proposed install-script .NET API expansion

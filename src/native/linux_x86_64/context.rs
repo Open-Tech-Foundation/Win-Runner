@@ -93,6 +93,7 @@ pub(super) static TEST_PROCESS: LazyLock<Arc<NativeProcessContext>> = LazyLock::
         unhandled_exception_filter: AtomicU64::new(0),
         vectored_exception_handlers: Mutex::new(Vec::new()),
         vectored_exception_handler_next: AtomicU64::new(0xe100_0000),
+        dynamic_function_tables: Mutex::new(Vec::new()),
         exit_status: AtomicU32::new(259),
         exited: AtomicBool::new(false),
         children: Mutex::new(NativeProcessTable::new()),

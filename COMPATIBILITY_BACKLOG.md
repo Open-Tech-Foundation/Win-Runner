@@ -103,6 +103,9 @@ Items remain open until implementation and relevant verification are complete.
     and the unhandled exception filter.
   - [x] Resolve `RtlLookupFunctionEntry` for control PCs covered by a loaded
     image's bounded x64 exception directory.
+  - [x] Register and remove sorted dynamic function tables for generated code
+    with `RtlAddFunctionTable` and `RtlDeleteFunctionTable`, and search them
+    during `RtlLookupFunctionEntry`.
   - [ ] Capture the live guest CPU context, continue execution from a modified
     context, and implement native SEH frame lookup/unwinding and Linux fault
     translation. The current explicit-raise path supplies a synthetic context

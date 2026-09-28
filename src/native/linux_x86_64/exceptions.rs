@@ -181,6 +181,25 @@ pub(super) extern "win64" fn native_rtl_lookup_function_entry(
     let Some(process) = process_ctx() else {
         return 0;
     };
+    let dynamic_tables = process.dynamic_function_tables.lock().unwrap();
+    for table in dynamic_tables.iter() {
+        let Some(relative_pc) = control_pc.checked_sub(table.base) else {
+            continue;
+        };
+        let entries = table.table as *const NativeRuntimeFunction;
+        for index in 0..table.entry_count as usize {
+            let entry = unsafe { entries.add(index) };
+            let function = unsafe { entry.read_unaligned() };
+            if function.begin_address < function.end_address
+                && relative_pc >= u64::from(function.begin_address)
+                && relative_pc < u64::from(function.end_address)
+            {
+                unsafe { image_base.write(table.base) };
+                return entry as u64;
+            }
+        }
+    }
+    drop(dynamic_tables);
     let modules = process.loaded_modules.lock().unwrap();
     for module in modules.values() {
         let Some(relative_pc) = control_pc.checked_sub(module.base) else {
@@ -205,6 +224,78 @@ pub(super) extern "win64" fn native_rtl_lookup_function_entry(
         }
     }
     0
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct NativeRuntimeFunction {
+    pub(super) begin_address: u32,
+    pub(super) end_address: u32,
+    pub(super) unwind_data: u32,
+}
+
+pub(super) extern "win64" fn native_rtl_add_function_table(
+    function_table: *mut NativeRuntimeFunction,
+    entry_count: u32,
+    base_address: u64,
+) -> u8 {
+    const MAX_DYNAMIC_FUNCTION_ENTRIES: u32 = 1_000_000;
+    if function_table.is_null()
+        || entry_count == 0
+        || entry_count > MAX_DYNAMIC_FUNCTION_ENTRIES
+        || base_address == 0
+        || (entry_count as usize)
+            .checked_mul(std::mem::size_of::<NativeRuntimeFunction>())
+            .and_then(|size| (function_table as usize).checked_add(size))
+            .is_none()
+    {
+        return 0;
+    }
+    let entries = unsafe { std::slice::from_raw_parts(function_table, entry_count as usize) };
+    if entries
+        .iter()
+        .any(|entry| entry.begin_address >= entry.end_address)
+        || entries.windows(2).any(|pair| {
+            pair[0].begin_address > pair[1].begin_address
+                || pair[0].end_address > pair[1].begin_address
+        })
+    {
+        return 0;
+    }
+    let Some(process) = process_ctx() else {
+        return 0;
+    };
+    let table = function_table as u64;
+    let mut tables = process.dynamic_function_tables.lock().unwrap();
+    if tables.iter().any(|registered| registered.table == table) {
+        return 0;
+    }
+    tables.push(NativeDynamicFunctionTable {
+        table,
+        entry_count,
+        base: base_address,
+    });
+    1
+}
+
+pub(super) extern "win64" fn native_rtl_delete_function_table(
+    function_table: *mut NativeRuntimeFunction,
+) -> u8 {
+    if function_table.is_null() {
+        return 0;
+    }
+    let Some(process) = process_ctx() else {
+        return 0;
+    };
+    let mut tables = process.dynamic_function_tables.lock().unwrap();
+    let Some(index) = tables
+        .iter()
+        .position(|registered| registered.table == function_table as u64)
+    else {
+        return 0;
+    };
+    tables.remove(index);
+    1
 }
 
 fn mapped_exception_directory(module: &NativeLoadedModule) -> Option<(u32, u32)> {

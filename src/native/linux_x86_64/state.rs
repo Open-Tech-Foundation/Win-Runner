@@ -223,6 +223,7 @@ pub(super) struct NativeProcessContext {
     pub(super) unhandled_exception_filter: AtomicU64,
     pub(super) vectored_exception_handlers: Mutex<Vec<NativeVectoredExceptionHandler>>,
     pub(super) vectored_exception_handler_next: AtomicU64,
+    pub(super) dynamic_function_tables: Mutex<Vec<NativeDynamicFunctionTable>>,
     pub(super) exit_status: AtomicU32,
     pub(super) exited: AtomicBool,
     pub(super) children: Mutex<NativeProcessTable>,
@@ -324,6 +325,12 @@ pub(super) struct NativeVirtualPage {
 pub(super) struct NativeVectoredExceptionHandler {
     pub(super) handle: u64,
     pub(super) callback: u64,
+}
+
+pub(super) struct NativeDynamicFunctionTable {
+    pub(super) table: u64,
+    pub(super) entry_count: u32,
+    pub(super) base: u64,
 }
 #[derive(Clone)]
 pub(super) struct NativeFileMapping {

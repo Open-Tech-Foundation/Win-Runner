@@ -133,7 +133,9 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
         "IPHLPAPI.DLL" => func == "GetAdaptersAddresses",
         "NTDLL.DLL" => matches!(
             func,
-            "RtlCaptureContext"
+            "RtlAddFunctionTable"
+                | "RtlCaptureContext"
+                | "RtlDeleteFunctionTable"
                 | "RtlLookupFunctionEntry"
                 | "RtlRaiseException"
                 | "RtlGetVersion"
@@ -210,7 +212,11 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
             NATIVE_CRT_ACMDLN.store(empty, Ordering::Release);
             Some(NATIVE_CRT_ACMDLN.as_ptr() as u64)
         }
+        "RtlAddFunctionTable" => Some(native_rtl_add_function_table as *const () as usize as u64),
         "RtlCaptureContext" => Some(winrun_native_rtl_capture_context as *const () as usize as u64),
+        "RtlDeleteFunctionTable" => {
+            Some(native_rtl_delete_function_table as *const () as usize as u64)
+        }
         "RtlLookupFunctionEntry" => {
             Some(native_rtl_lookup_function_entry as *const () as usize as u64)
         }

@@ -30,7 +30,8 @@ mod protection_tests {
         native_need_current_directory_for_exe_path_w, native_process_prng,
         native_query_depth_slist, native_query_performance_frequency, native_raise_exception,
         native_release_srw_lock_exclusive, native_release_srw_lock_shared,
-        native_remove_vectored_exception_handler, native_resolve_code_page, native_rtl_get_version,
+        native_remove_vectored_exception_handler, native_resolve_code_page,
+        native_rtl_add_function_table, native_rtl_delete_function_table, native_rtl_get_version,
         native_rtl_lookup_function_entry, native_rtl_nt_status_to_dos_error,
         native_set_console_active_screen_buffer, native_set_console_cursor_info,
         native_set_console_cursor_position, native_set_console_mode,
@@ -2042,6 +2043,11 @@ mod protection_tests {
         assert!(super::supports_import("KERNEL32.dll", "GetTickCount64"));
         assert!(super::supports_import("KERNEL32.dll", "RaiseException"));
         assert!(super::supports_import("NTDLL.dll", "RtlRaiseException"));
+        assert!(super::supports_import("NTDLL.dll", "RtlAddFunctionTable"));
+        assert!(super::supports_import(
+            "NTDLL.dll",
+            "RtlDeleteFunctionTable"
+        ));
         assert!(super::supports_import(
             "NTDLL.dll",
             "RtlLookupFunctionEntry"
@@ -5924,6 +5930,52 @@ mod protection_tests {
         );
         assert_eq!(reported_base, 0);
         process.loaded_modules.lock().unwrap().remove(&base);
+    }
+
+    #[test]
+    fn dynamic_function_tables_register_lookup_and_remove() {
+        let mut functions = [
+            super::NativeRuntimeFunction {
+                begin_address: 0x100,
+                end_address: 0x180,
+                unwind_data: 0x400,
+            },
+            super::NativeRuntimeFunction {
+                begin_address: 0x200,
+                end_address: 0x280,
+                unwind_data: 0x420,
+            },
+        ];
+        let table = functions.as_mut_ptr();
+        let base = 0x0000_7fff_1000_0000;
+        assert_eq!(native_rtl_add_function_table(table, 2, base), 1);
+        assert_eq!(native_rtl_add_function_table(table, 2, base), 0);
+
+        let mut reported_base = 0;
+        assert_eq!(
+            native_rtl_lookup_function_entry(
+                base + 0x240,
+                &mut reported_base,
+                std::ptr::null_mut()
+            ),
+            table as u64 + std::mem::size_of::<super::NativeRuntimeFunction>() as u64
+        );
+        assert_eq!(reported_base, base);
+        assert_eq!(native_rtl_delete_function_table(table), 1);
+        assert_eq!(native_rtl_delete_function_table(table), 0);
+        reported_base = u64::MAX;
+        assert_eq!(
+            native_rtl_lookup_function_entry(
+                base + 0x240,
+                &mut reported_base,
+                std::ptr::null_mut()
+            ),
+            0
+        );
+        assert_eq!(reported_base, 0);
+
+        functions.swap(0, 1);
+        assert_eq!(native_rtl_add_function_table(table, 2, base), 0);
     }
 
     #[test]
