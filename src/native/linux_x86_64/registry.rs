@@ -79,6 +79,12 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                     | "fopen"
                     | "fread"
                     | "fclose"
+                    | "feof"
+                    | "ferror"
+                    | "clearerr"
+                    | "fgetc"
+                    | "getc"
+                    | "fgets"
                     | "fseek"
                     | "_fseeki64"
                     | "ftell"
@@ -249,6 +255,11 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "fopen" => Some(native_crt_fopen as *const () as usize as u64),
         "fread" => Some(native_crt_fread as *const () as usize as u64),
         "fclose" => Some(native_crt_fclose as *const () as usize as u64),
+        "feof" => Some(native_crt_feof as *const () as usize as u64),
+        "ferror" => Some(native_crt_ferror as *const () as usize as u64),
+        "clearerr" => Some(native_crt_clearerr as *const () as usize as u64),
+        "fgetc" | "getc" => Some(native_crt_fgetc as *const () as usize as u64),
+        "fgets" => Some(native_crt_fgets as *const () as usize as u64),
         "fseek" => Some(native_crt_fseek as *const () as usize as u64),
         "_fseeki64" => Some(native_crt_fseeki64 as *const () as usize as u64),
         "ftell" => Some(native_crt_ftell as *const () as usize as u64),

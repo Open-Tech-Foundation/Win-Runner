@@ -2099,10 +2099,22 @@ mod protection_tests {
         let read_mode = b"rb\0";
         let file = super::native_crt_fopen(path.as_ptr(), read_mode.as_ptr());
         assert!(!file.is_null());
+        let mut line = [0u8; 8];
+        assert_eq!(
+            super::native_crt_fgets(line.as_mut_ptr(), 4, file),
+            line.as_mut_ptr()
+        );
+        assert_eq!(&line[..4], b"abc\0");
+        assert_eq!(super::native_crt_fgetc(file), b'd' as i32);
+        super::native_crt_rewind(file);
         let mut output = [0xcc; 8];
         assert_eq!(super::native_crt_fread(output.as_mut_ptr(), 2, 4, file), 4);
         assert_eq!(&output[..8], b"abcdefgh");
         assert_eq!(super::native_crt_fread(output.as_mut_ptr(), 1, 1, file), 0);
+        assert_eq!(super::native_crt_feof(file), 1);
+        assert_eq!(super::native_crt_ferror(file), 0);
+        super::native_crt_clearerr(file);
+        assert_eq!(super::native_crt_feof(file), 0);
         assert_eq!(super::native_crt_ftell(file), 8);
         assert_eq!(super::native_crt_fseek(file, 2, 0), 0);
         assert_eq!(super::native_crt_ftell(file), 2);
@@ -2119,6 +2131,9 @@ mod protection_tests {
         let file = super::native_crt_fopen(path.as_ptr(), read_mode.as_ptr());
         assert!(!file.is_null());
         assert_eq!(super::native_crt_fwrite(source.as_ptr(), 1, 1, file), 0);
+        assert_eq!(super::native_crt_ferror(file), 1);
+        super::native_crt_clearerr(file);
+        assert_eq!(super::native_crt_ferror(file), 0);
         assert_eq!(unsafe { super::native_crt_errno().read() }, 9);
         unsafe { super::native_crt_errno().write(0) };
         assert_eq!(super::native_crt_fclose(file), 0);
@@ -2130,6 +2145,8 @@ mod protection_tests {
         assert!(super::supports_import("UCRTBASE.DLL", "fopen"));
         assert!(super::supports_import("UCRTBASE.DLL", "fread"));
         assert!(super::supports_import("UCRTBASE.DLL", "fclose"));
+        assert!(super::supports_import("UCRTBASE.DLL", "fgets"));
+        assert!(super::supports_import("UCRTBASE.DLL", "feof"));
     }
 
     #[test]

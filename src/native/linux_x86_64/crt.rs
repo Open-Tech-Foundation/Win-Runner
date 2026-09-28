@@ -1574,23 +1574,34 @@ pub(super) extern "win64" fn native_crt_fread(
         THREAD_CRT_ERRNO.with(|errno| errno.set(22));
         return 0;
     }
-    let (handle, readable) = if let Some(index) = native_crt_standard_stream_index(stream) {
-        if index != 0 {
+    let (handle, readable, file_state) =
+        if let Some(index) = native_crt_standard_stream_index(stream) {
+            if index != 0 {
+                THREAD_CRT_ERRNO.with(|errno| errno.set(9));
+                return 0;
+            }
+            let Some(process) = process_ctx() else {
+                return 0;
+            };
+            (process.std_handles[0].load(Ordering::Acquire), true, None)
+        } else if let Some(file) = native_crt_file(stream) {
+            (
+                unsafe { (*file).handle },
+                unsafe { (*file).readable != 0 },
+                Some(file),
+            )
+        } else {
             THREAD_CRT_ERRNO.with(|errno| errno.set(9));
             return 0;
-        }
-        let Some(process) = process_ctx() else {
-            return 0;
         };
-        (process.std_handles[0].load(Ordering::Acquire), true)
-    } else if let Some(file) = native_crt_file(stream) {
-        (unsafe { (*file).handle }, unsafe { (*file).readable != 0 })
-    } else {
+    if !readable {
+        if let Some(file) = file_state {
+            unsafe { (*file).reserved[1] = 1 };
+        }
         THREAD_CRT_ERRNO.with(|errno| errno.set(9));
         return 0;
-    };
-    if !readable {
-        THREAD_CRT_ERRNO.with(|errno| errno.set(9));
+    }
+    if file_state.is_some_and(|file| unsafe { (*file).reserved[0] != 0 }) {
         return 0;
     }
     let mut total = 0usize;
@@ -1605,6 +1616,9 @@ pub(super) extern "win64" fn native_crt_fread(
             0,
         ) == 0
         {
+            if let Some(file) = file_state {
+                unsafe { (*file).reserved[1] = 1 };
+            }
             if total == 0 {
                 THREAD_CRT_ERRNO.with(|errno| errno.set(5));
             }
@@ -1612,6 +1626,9 @@ pub(super) extern "win64" fn native_crt_fread(
         }
         total += received as usize;
         if received < chunk {
+            if let Some(file) = file_state {
+                unsafe { (*file).reserved[0] = 1 };
+            }
             break;
         }
     }
@@ -1641,6 +1658,78 @@ pub(super) extern "win64" fn native_crt_fclose(stream: *mut u8) -> i32 {
     }
 }
 
+pub(super) extern "win64" fn native_crt_feof(stream: *mut u8) -> i32 {
+    if native_crt_standard_stream_index(stream).is_some() {
+        return 0;
+    }
+    let Some(file) = native_crt_file(stream) else {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(9));
+        return 0;
+    };
+    i32::from(unsafe { (*file).reserved[0] != 0 })
+}
+
+pub(super) extern "win64" fn native_crt_ferror(stream: *mut u8) -> i32 {
+    if native_crt_standard_stream_index(stream).is_some() {
+        return 0;
+    }
+    let Some(file) = native_crt_file(stream) else {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(9));
+        return 0;
+    };
+    i32::from(unsafe { (*file).reserved[1] != 0 })
+}
+
+pub(super) extern "win64" fn native_crt_clearerr(stream: *mut u8) {
+    if let Some(file) = native_crt_file(stream) {
+        unsafe {
+            (*file).reserved[0] = 0;
+            (*file).reserved[1] = 0;
+        }
+    }
+}
+
+pub(super) extern "win64" fn native_crt_fgetc(stream: *mut u8) -> i32 {
+    let mut byte = 0u8;
+    if native_crt_fread(&mut byte, 1, 1, stream) == 1 {
+        i32::from(byte)
+    } else {
+        -1 // EOF
+    }
+}
+
+pub(super) extern "win64" fn native_crt_fgets(
+    output: *mut u8,
+    capacity: i32,
+    stream: *mut u8,
+) -> *mut u8 {
+    if output.is_null() || capacity <= 0 {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+        return std::ptr::null_mut();
+    }
+    if capacity == 1 {
+        unsafe { output.write(0) };
+        return output;
+    }
+    let mut length = 0usize;
+    while length < (capacity - 1) as usize {
+        let byte = native_crt_fgetc(stream);
+        if byte < 0 {
+            break;
+        }
+        unsafe { output.add(length).write(byte as u8) };
+        length += 1;
+        if byte == b'\n' as i32 {
+            break;
+        }
+    }
+    if length == 0 {
+        return std::ptr::null_mut();
+    }
+    unsafe { output.add(length).write(0) };
+    output
+}
+
 fn native_crt_file_handle_for_seek(stream: *mut u8) -> Option<u64> {
     let file = native_crt_file(stream)?;
     Some(unsafe { (*file).handle })
@@ -1656,6 +1745,9 @@ pub(super) extern "win64" fn native_crt_fseeki64(stream: *mut u8, offset: i64, o
     {
         THREAD_CRT_ERRNO.with(|errno| errno.set(22));
         return -1;
+    }
+    if let Some(file) = native_crt_file(stream) {
+        unsafe { (*file).reserved[0] = 0 };
     }
     0
 }
@@ -1694,6 +1786,7 @@ pub(super) extern "win64" fn native_crt_ftell(stream: *mut u8) -> i32 {
 
 pub(super) extern "win64" fn native_crt_rewind(stream: *mut u8) {
     if native_crt_fseeki64(stream, 0, 0) == 0 {
+        native_crt_clearerr(stream);
         THREAD_CRT_ERRNO.with(|errno| errno.set(0));
     }
 }
@@ -1750,7 +1843,8 @@ pub(super) extern "win64" fn native_crt_fwrite(
         THREAD_CRT_ERRNO.with(|errno| errno.set(22));
         return 0;
     }
-    let (handle, append) = if let Some(index) = native_crt_standard_stream_index(stream) {
+    let (handle, append, file_state) = if let Some(index) = native_crt_standard_stream_index(stream)
+    {
         if index == 0 {
             THREAD_CRT_ERRNO.with(|errno| errno.set(9));
             return 0;
@@ -1758,18 +1852,30 @@ pub(super) extern "win64" fn native_crt_fwrite(
         let Some(process) = process_ctx() else {
             return 0;
         };
-        (process.std_handles[index].load(Ordering::Acquire), false)
+        (
+            process.std_handles[index].load(Ordering::Acquire),
+            false,
+            None,
+        )
     } else if let Some(file) = native_crt_file(stream) {
         if unsafe { (*file).writable == 0 } {
+            unsafe { (*file).reserved[1] = 1 };
             THREAD_CRT_ERRNO.with(|errno| errno.set(9));
             return 0;
         }
-        (unsafe { (*file).handle }, unsafe { (*file).append != 0 })
+        (
+            unsafe { (*file).handle },
+            unsafe { (*file).append != 0 },
+            Some(file),
+        )
     } else {
         THREAD_CRT_ERRNO.with(|errno| errno.set(9));
         return 0;
     };
     if append && native_set_file_pointer_ex(handle, 0, std::ptr::null_mut(), 2) == 0 {
+        if let Some(file) = file_state {
+            unsafe { (*file).reserved[1] = 1 };
+        }
         THREAD_CRT_ERRNO.with(|errno| errno.set(5));
         return 0;
     }
@@ -1785,12 +1891,18 @@ pub(super) extern "win64" fn native_crt_fwrite(
             0,
         ) == 0
         {
+            if let Some(file) = file_state {
+                unsafe { (*file).reserved[1] = 1 };
+            }
             THREAD_CRT_ERRNO
                 .with(|errno| errno.set(if native_get_last_error() == 5 { 13 } else { 5 }));
             break;
         }
         written += chunk_written as usize;
         if chunk_written < chunk {
+            if let Some(file) = file_state {
+                unsafe { (*file).reserved[1] = 1 };
+            }
             break;
         }
     }
