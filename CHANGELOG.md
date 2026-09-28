@@ -23,6 +23,8 @@ All notable changes to this project will be documented in this file.
   implemented.
 - Send DLL/TLS thread-attach and thread-detach notifications around guest
   `CreateThread` start routines using modules captured in load order.
+- Resolve cyclic guest-DLL import references by publishing mapped exports while
+  their dependency imports are patched.
 
 - Added a "Why Win-Runner?" section to the README explaining the project's focus
   and how it differs from Wine, VMs, and Windows CI runners.

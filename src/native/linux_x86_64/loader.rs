@@ -346,6 +346,65 @@ mod module_export_tests {
         native_fs.fs.delete_file(consumer_path).unwrap();
         native_fs.fs.delete_file(dependency_path).unwrap();
     }
+
+    #[test]
+    fn load_library_resolves_cyclic_guest_dll_imports() {
+        let process = &*super::TEST_PROCESS;
+        let path_a = r"C:\loader-tests\cycle-a.dll";
+        let path_b = r"C:\loader-tests\cycle-b.dll";
+        let image_a = dll_fixture(
+            &[("cycle-b.dll", "CycleBEntry")],
+            Some("CycleAEntry"),
+            crate::pe::builder::IMAGE_BASE,
+        );
+        let image_b = dll_fixture(
+            &[("cycle-a.dll", "CycleAEntry")],
+            Some("CycleBEntry"),
+            0x0000_5002_0000_0000,
+        );
+        {
+            let mut native_fs = process.fs.lock().unwrap();
+            native_fs.fs.mkdir(r"C:\loader-tests").unwrap();
+            native_fs.fs.write_file(path_a, image_a.clone()).unwrap();
+            native_fs.fs.write_file(path_b, image_b.clone()).unwrap();
+        }
+
+        let name_a: Vec<u16> = "cycle-a.dll".encode_utf16().chain(Some(0)).collect();
+        let handle_a = native_load_library_ex_w(name_a.as_ptr(), 0, 0);
+        assert_ne!(handle_a, 0, "first member of import cycle loads");
+        let handle_b = native_get_module_handle_w(
+            "cycle-b.dll"
+                .encode_utf16()
+                .chain(Some(0))
+                .collect::<Vec<_>>()
+                .as_ptr(),
+        );
+        assert_ne!(handle_b, 0, "second member of import cycle loads");
+
+        for (handle, bytes, expected) in
+            [(handle_a, image_a, handle_b), (handle_b, image_b, handle_a)]
+        {
+            let image = crate::pe::load_lenient(&bytes).unwrap();
+            let import = image
+                .imports
+                .iter()
+                .chain(&image.unsupported)
+                .next()
+                .unwrap();
+            let target = unsafe {
+                std::ptr::read_unaligned((handle + u64::from(import.iat_rva)) as *const u64)
+            };
+            assert_eq!(target, expected + crate::pe::builder::SECTION_RVA as u64);
+            let entry: unsafe extern "win64" fn() -> u32 = unsafe { std::mem::transmute(target) };
+            assert_eq!(unsafe { entry() }, 1);
+        }
+
+        native_free_library(handle_a);
+        native_free_library(handle_b);
+        let mut native_fs = process.fs.lock().unwrap();
+        native_fs.fs.delete_file(path_a).unwrap();
+        native_fs.fs.delete_file(path_b).unwrap();
+    }
 }
 
 pub(super) fn protect_exec(mapping: &Mapping) -> Result<(), String> {
@@ -575,8 +634,18 @@ fn load_guest_module_inner(
     let (path, bytes) = guest_module_path(name)?;
     let key = path.to_uppercase();
     if !loading.insert(key.clone()) {
-        return None;
+        return process_ctx()?
+            .loaded_modules
+            .lock()
+            .ok()?
+            .values()
+            .find(|module| {
+                module.path.eq_ignore_ascii_case(&path)
+                    || module.name.eq_ignore_ascii_case(&module_basename(&path))
+            })
+            .map(|module| module.base);
     }
+    let mut provisional_module = None;
     let result = (|| {
         let image = crate::pe::load_lenient(&bytes).ok()?;
         if !image.is_dll
@@ -594,44 +663,11 @@ fn load_guest_module_inner(
             .unwrap_or_default();
         let tls_index_rva = image.tls.as_ref().map(|tls| tls.index_rva);
 
-        let mut shim_imports = Vec::new();
-        let mut guest_imports = Vec::new();
-        for import in image.imports.iter().chain(&image.unsupported) {
-            if super::registry::supports_import(&import.dll, &import.func) {
-                shim_imports.push(import.clone());
-                continue;
-            }
-            if native_module_name_supported(&import.dll) {
-                return None;
-            }
-            let dependency = load_guest_module_inner(&import.dll, loading, depth + 1)?;
-            if dependency == API_SET_MODULE {
-                return None;
-            }
-            let target = resolve_module_export(dependency, &import.func, 0)?;
-            guest_imports.push((import.iat_rva, target));
-        }
-
         let (mapping, image) = match map_relocated(&image) {
             Ok(mapped) => mapped,
             Err(_) if image.relocations.is_empty() => (map(&image).ok()?, image),
             Err(_) => return None,
         };
-        let mut shim_image = image.clone();
-        shim_image.imports = shim_imports;
-        shim_image.unsupported.clear();
-        let stubs = super::registry::patch_baseline_imports(&mapping, &shim_image, false).ok()?;
-        for (iat_rva, target) in guest_imports {
-            let offset = iat_rva as usize;
-            if offset.checked_add(8)? > mapping.len {
-                return None;
-            }
-            // SAFETY: the PE import parser supplied an RVA and the range was
-            // checked against this module's mapped image above.
-            unsafe {
-                ptr::write_unaligned(mapping.ptr.add(offset).cast::<u64>(), target);
-            }
-        }
         protect_exec(&mapping).ok()?;
         let base = mapping.ptr as u64;
         let process = process_ctx()?;
@@ -654,7 +690,7 @@ fn load_guest_module_inner(
             name: module_basename(&path),
             base,
             size_of_image: image.size_of_image,
-            exports: image.exports,
+            exports: image.exports.clone(),
             entry_point: (image.entry_rva != 0)
                 .then(|| base.checked_add(u64::from(image.entry_rva)))
                 .flatten(),
@@ -675,6 +711,41 @@ fn load_guest_module_inner(
             }
             modules.insert(handle, module);
         }
+        provisional_module = Some((handle, tls_index));
+
+        let mut shim_imports = Vec::new();
+        let mut guest_imports = Vec::new();
+        for import in image.imports.iter().chain(&image.unsupported) {
+            if super::registry::supports_import(&import.dll, &import.func) {
+                shim_imports.push(import.clone());
+                continue;
+            }
+            if native_module_name_supported(&import.dll) {
+                return None;
+            }
+            let dependency = load_guest_module_inner(&import.dll, loading, depth + 1)?;
+            if dependency == API_SET_MODULE {
+                return None;
+            }
+            let target = resolve_module_export(dependency, &import.func, 0)?;
+            guest_imports.push((import.iat_rva, target));
+        }
+
+        let mut shim_image = image.clone();
+        shim_image.imports = shim_imports;
+        shim_image.unsupported.clear();
+        let stubs = super::registry::patch_baseline_imports(&mapping, &shim_image, false).ok()?;
+        for (iat_rva, target) in guest_imports {
+            let offset = iat_rva as usize;
+            if offset.checked_add(8)? > mapping.len {
+                return None;
+            }
+            // SAFETY: the PE import parser supplied an RVA and the range was
+            // checked against this module's mapped image above.
+            unsafe {
+                ptr::write_unaligned(mapping.ptr.add(offset).cast::<u64>(), target);
+            }
+        }
         super::thread_runtime::invoke_tls_callbacks(base, &tls_callbacks, 1);
         if image.entry_rva != 0 {
             let entry = base.checked_add(image.entry_rva as u64)?;
@@ -682,12 +753,6 @@ fn load_guest_module_inner(
             let dll_main: unsafe extern "win64" fn(u64, u32, u64) -> i32 =
                 unsafe { std::mem::transmute(entry as usize) };
             if unsafe { dll_main(base, 1, 0) } == 0 {
-                if let Ok(mut modules) = process.loaded_modules.lock() {
-                    modules.remove(&handle);
-                }
-                if let Some(index) = tls_index {
-                    super::thread_runtime::release_module_tls_slot(&process, index);
-                }
                 return None;
             }
         }
@@ -697,8 +762,19 @@ fn load_guest_module_inner(
         // DLL mappings remain live until the guest worker exits. Complete
         // FreeLibrary reference counting/unmapping is tracked separately.
         std::mem::forget(mapping);
+        provisional_module = None;
         Some(handle)
     })();
+    if let Some((handle, tls_index)) = provisional_module {
+        if let Some(process) = process_ctx() {
+            if let Ok(mut modules) = process.loaded_modules.lock() {
+                modules.remove(&handle);
+            }
+            if let Some(index) = tls_index {
+                super::thread_runtime::release_module_tls_slot(&process, index);
+            }
+        }
+    }
     loading.remove(&key);
     result
 }

@@ -130,9 +130,12 @@ Items remain open until implementation and relevant verification are complete.
       directories with non-empty templates or zero-fill remain unsupported.
     - [x] Send TLS and `DllMain` thread-attach/detach notifications around
       guest `CreateThread` routines, ordered by module load sequence.
-    - [ ] Support circular dependency initialization, per-thread static TLS,
-      notifications for already-running threads when a DLL is loaded, and
-      FreeLibrary reference-count/unload semantics.
+    - [x] Resolve cyclic guest-DLL import references using provisional module
+      records so each side can resolve the other's exports.
+    - [ ] Match Windows initialization order for cyclic dependency graphs,
+      support per-thread static TLS and notifications for already-running
+      threads when a DLL is loaded, and implement FreeLibrary reference-count
+      and unload semantics.
   - [ ] Host `hostfxr.dll`, `hostpolicy.dll`, and `coreclr.dll` using the
     supported native hosting interfaces; cover shared, app-local, and
     self-contained runtime layouts, then add single-file apps.
