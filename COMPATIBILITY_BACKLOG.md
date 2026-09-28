@@ -101,6 +101,8 @@ Items remain open until implementation and relevant verification are complete.
     ordering and opaque removable handles; dispatch explicit
     `RaiseException`/`RtlRaiseException` records through registered handlers
     and the unhandled exception filter.
+  - [x] Resolve `RtlLookupFunctionEntry` for control PCs covered by a loaded
+    image's bounded x64 exception directory.
   - [ ] Capture the live guest CPU context, continue execution from a modified
     context, and implement native SEH frame lookup/unwinding and Linux fault
     translation. The current explicit-raise path supplies a synthetic context

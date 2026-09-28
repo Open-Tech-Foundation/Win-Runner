@@ -165,3 +165,78 @@ pub(super) extern "win64" fn native_rtl_raise_exception(record: *mut NativeExcep
         native_exit_process(record.code)
     }
 }
+
+/// Find the x64 RUNTIME_FUNCTION covering ControlPc in a loaded guest image.
+/// The returned pointer refers to the image's mapped exception directory.
+pub(super) extern "win64" fn native_rtl_lookup_function_entry(
+    control_pc: u64,
+    image_base: *mut u64,
+    _history_table: *mut c_void,
+) -> u64 {
+    if image_base.is_null() {
+        native_set_last_error(87); // ERROR_INVALID_PARAMETER
+        return 0;
+    }
+    unsafe { image_base.write(0) };
+    let Some(process) = process_ctx() else {
+        return 0;
+    };
+    let modules = process.loaded_modules.lock().unwrap();
+    for module in modules.values() {
+        let Some(relative_pc) = control_pc.checked_sub(module.base) else {
+            continue;
+        };
+        if relative_pc >= u64::from(module.size_of_image) {
+            continue;
+        }
+        let Some((table_rva, table_size)) = mapped_exception_directory(module) else {
+            continue;
+        };
+        let count = table_size / 12;
+        for index in 0..count {
+            let entry_rva = table_rva + index * 12;
+            let entry = module.base + u64::from(entry_rva);
+            let begin = unsafe { (entry as *const u32).read_unaligned() };
+            let end = unsafe { (entry as *const u32).add(1).read_unaligned() };
+            if begin < end && relative_pc >= u64::from(begin) && relative_pc < u64::from(end) {
+                unsafe { image_base.write(module.base) };
+                return entry;
+            }
+        }
+    }
+    0
+}
+
+fn mapped_exception_directory(module: &NativeLoadedModule) -> Option<(u32, u32)> {
+    let base = module.base as *const u8;
+    let size = module.size_of_image as usize;
+    let read_u16 = |offset: usize| -> Option<u16> {
+        let end = offset.checked_add(2)?;
+        (end <= size).then(|| unsafe { base.add(offset).cast::<u16>().read_unaligned() })
+    };
+    let read_u32 = |offset: usize| -> Option<u32> {
+        let end = offset.checked_add(4)?;
+        (end <= size).then(|| unsafe { base.add(offset).cast::<u32>().read_unaligned() })
+    };
+    if read_u16(0)? != 0x5a4d {
+        return None;
+    }
+    let nt_offset = read_u32(0x3c)? as usize;
+    if read_u32(nt_offset)? != 0x0000_4550 {
+        return None;
+    }
+    let optional_size = usize::from(read_u16(nt_offset.checked_add(20)?)?);
+    let optional_offset = nt_offset.checked_add(24)?;
+    if optional_size < 112 + 4 * 8
+        || read_u16(optional_offset)? != 0x20b
+        || read_u32(optional_offset.checked_add(108)?)? < 4
+    {
+        return None;
+    }
+    let directory_offset = optional_offset.checked_add(112 + 3 * 8)?;
+    let rva = read_u32(directory_offset)?;
+    let directory_size = read_u32(directory_offset.checked_add(4)?)?;
+    let end = rva.checked_add(directory_size)?;
+    (rva != 0 && directory_size >= 12 && directory_size % 12 == 0 && end as usize <= size)
+        .then_some((rva, directory_size))
+}

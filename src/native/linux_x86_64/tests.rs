@@ -31,19 +31,19 @@ mod protection_tests {
         native_query_depth_slist, native_query_performance_frequency, native_raise_exception,
         native_release_srw_lock_exclusive, native_release_srw_lock_shared,
         native_remove_vectored_exception_handler, native_resolve_code_page, native_rtl_get_version,
-        native_rtl_nt_status_to_dos_error, native_set_console_active_screen_buffer,
-        native_set_console_cursor_info, native_set_console_cursor_position,
-        native_set_console_mode, native_set_console_screen_buffer_size,
-        native_set_console_window_info, native_set_environment_variable_w, native_set_file_time,
-        native_set_last_error, native_set_thread_stack_guarantee,
-        native_set_unhandled_exception_filter, native_set_waitable_timer, native_shutdown_socket,
-        native_sleep_condition_variable_srw, native_terminate_process,
-        native_try_acquire_srw_lock_shared, native_wait_for_single_object, native_wait_on_address,
-        native_wake_all_condition_variable, native_wake_by_address_all,
-        native_wide_char_to_multi_byte, native_write_console_w, native_wsa_get_last_error,
-        native_wsa_inet_addr, parse_windows_command_line, process_ctx, uppercase_ascii_utf16,
-        waitpid, write_process_information, NativeLaunchSpec, NativeMemoryStatus, API_SET_MODULE,
-        PROT_EXEC, PROT_READ, PROT_WRITE, THREAD_NATIVE_HANDLE,
+        native_rtl_lookup_function_entry, native_rtl_nt_status_to_dos_error,
+        native_set_console_active_screen_buffer, native_set_console_cursor_info,
+        native_set_console_cursor_position, native_set_console_mode,
+        native_set_console_screen_buffer_size, native_set_console_window_info,
+        native_set_environment_variable_w, native_set_file_time, native_set_last_error,
+        native_set_thread_stack_guarantee, native_set_unhandled_exception_filter,
+        native_set_waitable_timer, native_shutdown_socket, native_sleep_condition_variable_srw,
+        native_terminate_process, native_try_acquire_srw_lock_shared,
+        native_wait_for_single_object, native_wait_on_address, native_wake_all_condition_variable,
+        native_wake_by_address_all, native_wide_char_to_multi_byte, native_write_console_w,
+        native_wsa_get_last_error, native_wsa_inet_addr, parse_windows_command_line, process_ctx,
+        uppercase_ascii_utf16, waitpid, write_process_information, NativeLaunchSpec,
+        NativeMemoryStatus, API_SET_MODULE, PROT_EXEC, PROT_READ, PROT_WRITE, THREAD_NATIVE_HANDLE,
     };
     use crate::winfs::WinFs;
 
@@ -2042,6 +2042,10 @@ mod protection_tests {
         assert!(super::supports_import("KERNEL32.dll", "GetTickCount64"));
         assert!(super::supports_import("KERNEL32.dll", "RaiseException"));
         assert!(super::supports_import("NTDLL.dll", "RtlRaiseException"));
+        assert!(super::supports_import(
+            "NTDLL.dll",
+            "RtlLookupFunctionEntry"
+        ));
         assert!(super::supports_import(
             "api-ms-win-core-file-l1-1-0.dll",
             "CreateFileW"
@@ -5852,6 +5856,74 @@ mod protection_tests {
             0xe123_4567
         );
         assert_eq!(native_remove_vectored_exception_handler(handle), 1);
+    }
+
+    #[test]
+    fn rtl_lookup_function_entry_finds_mapped_pe_unwind_ranges() {
+        use crate::native::linux_x86_64::state::NativeLoadedModule;
+
+        let mut image = vec![0u8; 0x2000];
+        let base = image.as_mut_ptr() as u64;
+        let write16 = |offset: usize, value: u16, image: &mut [u8]| {
+            image[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+        };
+        let write32 = |offset: usize, value: u32, image: &mut [u8]| {
+            image[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        };
+        write16(0, 0x5a4d, &mut image);
+        write32(0x3c, 0x80, &mut image);
+        write32(0x80, 0x0000_4550, &mut image);
+        write16(0x80 + 20, 0xf0, &mut image);
+        write16(0x98, 0x20b, &mut image);
+        write32(0x98 + 108, 16, &mut image);
+        let exception_directory = 0x98 + 112 + 3 * 8;
+        write32(exception_directory, 0x500, &mut image);
+        write32(exception_directory + 4, 12, &mut image);
+        write32(0x500, 0x1000, &mut image);
+        write32(0x504, 0x1200, &mut image);
+        write32(0x508, 0x600, &mut image);
+
+        let process = super::process_ctx().unwrap();
+        process.loaded_modules.lock().unwrap().insert(
+            base,
+            NativeLoadedModule {
+                path: "C:\\unwind-test.exe".to_string(),
+                name: "unwind-test.exe".to_string(),
+                base,
+                size_of_image: image.len() as u32,
+                exports: Vec::new(),
+                entry_point: None,
+                tls_callbacks: Vec::new(),
+                static_tls_index: None,
+                static_tls_template: None,
+                load_order: 0,
+                load_references: 0,
+                dependencies: Vec::new(),
+                mapping: None,
+                initialized: true,
+            },
+        );
+
+        let mut reported_base = u64::MAX;
+        let function = native_rtl_lookup_function_entry(
+            base + 0x1100,
+            &mut reported_base,
+            std::ptr::null_mut(),
+        );
+        assert_eq!(function, base + 0x500);
+        assert_eq!(reported_base, base);
+
+        reported_base = u64::MAX;
+        assert_eq!(
+            native_rtl_lookup_function_entry(
+                base + 0x1300,
+                &mut reported_base,
+                std::ptr::null_mut()
+            ),
+            0
+        );
+        assert_eq!(reported_base, 0);
+        process.loaded_modules.lock().unwrap().remove(&base);
     }
 
     #[test]

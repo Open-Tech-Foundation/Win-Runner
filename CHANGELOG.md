@@ -10,6 +10,8 @@ All notable changes to this project will be documented in this file.
   `RaiseException`/`RtlRaiseException` calls with Windows-shaped exception
   records. Native fault translation, real guest CPU context capture, and SEH
   stack unwinding remain unimplemented.
+- Resolve `RtlLookupFunctionEntry` against loaded PE x64 exception directories,
+  returning the mapped `RUNTIME_FUNCTION` record for a control PC.
 - Detect .NET Framework `_CorExeMain`/`_CorDllMain` images and report the clear
   unsupported-runtime limitation in `winrun inspect` and native execution.
 - Replaced the PS1 interpreter's proposed install-script .NET API expansion
