@@ -18,6 +18,17 @@ pub(super) static NATIVE_CRT_ACMDLN: AtomicU64 = AtomicU64::new(0);
 pub(super) static NATIVE_CRT_EMPTY_COMMAND_LINE: [u8; 1] = [0];
 pub(super) static NATIVE_CRT_INITENV: AtomicU64 = AtomicU64::new(0);
 pub(super) static NATIVE_CRT_IOB: [AtomicU64; 24] = [const { AtomicU64::new(0) }; 24];
+const NATIVE_CRT_FILE_SIGNATURE: u64 = 0x5749_4e52_554e_4649;
+
+#[repr(C)]
+struct NativeCrtFile {
+    signature: u64,
+    handle: u64,
+    readable: u8,
+    writable: u8,
+    append: u8,
+    reserved: [u8; 45],
+}
 
 pub(super) extern "win64" fn native_crt_set_app_type(_app_type: i32) {}
 pub(super) extern "win64" fn native_crt_iob_func() -> *mut u8 {
@@ -34,6 +45,15 @@ pub(super) extern "win64" fn native_crt_acrt_iob_func(index: u32) -> *mut u8 {
             .cast::<u8>()
             .add(index as usize * 64)
     }
+}
+fn native_crt_standard_stream_index(stream: *mut u8) -> Option<usize> {
+    if stream.is_null() {
+        return None;
+    }
+    let base = NATIVE_CRT_IOB.as_ptr() as usize;
+    let address = stream as usize;
+    let offset = address.checked_sub(base)?;
+    (offset < 192 && offset % 64 == 0).then_some(offset / 64)
 }
 pub(super) extern "win64" fn native_crt_errno() -> *mut i32 {
     THREAD_CRT_ERRNO.with(std::cell::Cell::as_ptr)
@@ -1392,33 +1412,15 @@ pub(super) extern "win64" fn native_crt_stdio_common_vfprintf(
         THREAD_CRT_ERRNO.with(|errno| errno.set(22));
         return -1;
     };
-    let base = NATIVE_CRT_IOB.as_ptr() as usize;
-    let stream = stream as usize;
-    let descriptor = if stream >= base + 128 && stream < base + 192 {
-        2
-    } else if stream >= base && stream < base + 64 {
-        -1
-    } else {
-        1
-    };
-    if descriptor < 0 {
+    if native_crt_standard_stream_index(stream) == Some(0)
+        || (native_crt_standard_stream_index(stream).is_none() && native_crt_file(stream).is_none())
+    {
         THREAD_CRT_ERRNO.with(|errno| errno.set(9)); // EBADF
         return -1;
     }
-    let mut written = 0usize;
-    while written < bytes.len() {
-        let count = unsafe {
-            write(
-                descriptor,
-                bytes[written..].as_ptr().cast(),
-                bytes.len() - written,
-            )
-        };
-        if count <= 0 {
-            THREAD_CRT_ERRNO.with(|errno| errno.set(5));
-            return -1;
-        }
-        written += count as usize;
+    let written = native_crt_fwrite(bytes.as_ptr(), 1, bytes.len(), stream);
+    if written != bytes.len() {
+        return -1;
     }
     written as i32
 }
@@ -1448,21 +1450,193 @@ pub(super) extern "win64" fn native_crt_stdio_common_vsprintf(
 }
 pub(super) extern "win64" fn native_crt_fputs(input: *const u8, _file: *mut u8) -> i32 {
     let len = native_crt_strlen(input);
-    if len == 0 {
-        return 0;
-    }
-    let written = unsafe { write(1, input.cast(), len) };
-    if written < 0 {
-        -1
-    } else {
+    if native_crt_fwrite(input, 1, len, _file) == len {
         0
+    } else {
+        -1
     }
 }
-pub(super) extern "win64" fn native_crt_fputc(byte: i32, _file: *mut u8) -> i32 {
+pub(super) extern "win64" fn native_crt_fputc(byte: i32, file: *mut u8) -> i32 {
     let value = [byte as u8];
-    if unsafe { write(1, value.as_ptr().cast(), 1) } == 1 {
+    if native_crt_fwrite(value.as_ptr(), 1, 1, file) == 1 {
         byte & 0xff
     } else {
+        -1
+    }
+}
+pub(super) extern "win64" fn native_crt_fopen(path: *const u8, mode: *const u8) -> *mut u8 {
+    if path.is_null() || mode.is_null() {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+        return std::ptr::null_mut();
+    }
+    let mut mode_bytes = Vec::new();
+    for offset in 0..64usize {
+        let byte = unsafe { mode.add(offset).read() };
+        if byte == 0 {
+            break;
+        }
+        mode_bytes.push(byte);
+    }
+    if mode_bytes.is_empty() || mode_bytes.len() == 64 {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+        return std::ptr::null_mut();
+    }
+    let mode_char = mode_bytes[0];
+    if !matches!(mode_char, b'r' | b'w' | b'a')
+        || mode_bytes[1..]
+            .iter()
+            .any(|flag| !matches!(flag, b'+' | b'b' | b't' | b'x' | b'c' | b'n' | b'S' | b'R'))
+    {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+        return std::ptr::null_mut();
+    }
+    let update = mode_bytes.contains(&b'+');
+    let exclusive = mode_bytes.contains(&b'x');
+    if exclusive && !matches!(mode_char, b'w' | b'a') {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+        return std::ptr::null_mut();
+    }
+    let readable = mode_char == b'r' || update;
+    let writable = mode_char != b'r' || update;
+    let access =
+        (if readable { 0x8000_0000 } else { 0 }) | (if writable { 0x4000_0000 } else { 0 });
+    let creation = match (mode_char, exclusive) {
+        (b'r', _) => 3,     // OPEN_EXISTING
+        (b'w', false) => 2, // CREATE_ALWAYS
+        (b'a', false) => 4, // OPEN_ALWAYS
+        (_, true) => 1,     // CREATE_NEW
+        _ => {
+            THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+            return std::ptr::null_mut();
+        }
+    };
+    let Some(wide_path) = native_ansi_path(path) else {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+        return std::ptr::null_mut();
+    };
+    let handle = native_create_file_w(wide_path.as_ptr(), access, 7, 0, creation, 0, 0);
+    if handle == u64::MAX {
+        THREAD_CRT_ERRNO.with(|errno| {
+            errno.set(match native_get_last_error() {
+                2 | 3 => 2, // ENOENT
+                5 => 13,    // EACCES
+                _ => 22,    // EINVAL
+            });
+        });
+        return std::ptr::null_mut();
+    }
+    if mode_char == b'a' && native_set_file_pointer_ex(handle, 0, std::ptr::null_mut(), 2) == 0 {
+        native_close_handle(handle);
+        THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+        return std::ptr::null_mut();
+    }
+    let file = unsafe { malloc(std::mem::size_of::<NativeCrtFile>()) }.cast::<NativeCrtFile>();
+    if file.is_null() {
+        native_close_handle(handle);
+        THREAD_CRT_ERRNO.with(|errno| errno.set(12)); // ENOMEM
+        return std::ptr::null_mut();
+    }
+    unsafe {
+        file.write(NativeCrtFile {
+            signature: NATIVE_CRT_FILE_SIGNATURE,
+            handle,
+            readable: u8::from(readable),
+            writable: u8::from(writable),
+            append: u8::from(mode_char == b'a'),
+            reserved: [0; 45],
+        });
+    }
+    file.cast()
+}
+
+fn native_crt_file(stream: *mut u8) -> Option<*mut NativeCrtFile> {
+    if stream.is_null() || native_crt_standard_stream_index(stream).is_some() {
+        return None;
+    }
+    let file = stream.cast::<NativeCrtFile>();
+    (unsafe { stream.cast::<u64>().read_unaligned() == NATIVE_CRT_FILE_SIGNATURE }).then_some(file)
+}
+
+pub(super) extern "win64" fn native_crt_fread(
+    buffer: *mut u8,
+    size: usize,
+    count: usize,
+    stream: *mut u8,
+) -> usize {
+    let Some(length) = size.checked_mul(count) else {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(75)); // EOVERFLOW
+        return 0;
+    };
+    if length == 0 {
+        return 0;
+    }
+    if buffer.is_null() || stream.is_null() {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+        return 0;
+    }
+    let (handle, readable) = if let Some(index) = native_crt_standard_stream_index(stream) {
+        if index != 0 {
+            THREAD_CRT_ERRNO.with(|errno| errno.set(9));
+            return 0;
+        }
+        let Some(process) = process_ctx() else {
+            return 0;
+        };
+        (process.std_handles[0].load(Ordering::Acquire), true)
+    } else if let Some(file) = native_crt_file(stream) {
+        (unsafe { (*file).handle }, unsafe { (*file).readable != 0 })
+    } else {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(9));
+        return 0;
+    };
+    if !readable {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(9));
+        return 0;
+    }
+    let mut total = 0usize;
+    while total < length {
+        let chunk = (length - total).min(16 * 1024 * 1024) as u32;
+        let mut received = 0u32;
+        if native_read_file(
+            handle,
+            unsafe { buffer.add(total) },
+            chunk,
+            &mut received,
+            0,
+        ) == 0
+        {
+            if total == 0 {
+                THREAD_CRT_ERRNO.with(|errno| errno.set(5));
+            }
+            break;
+        }
+        total += received as usize;
+        if received < chunk {
+            break;
+        }
+    }
+    total / size
+}
+
+pub(super) extern "win64" fn native_crt_fclose(stream: *mut u8) -> i32 {
+    if stream.is_null() {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+        return -1;
+    }
+    if native_crt_standard_stream_index(stream).is_some() {
+        return 0;
+    }
+    let Some(file) = native_crt_file(stream) else {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(9));
+        return -1;
+    };
+    let handle = unsafe { (*file).handle };
+    unsafe { (*file).signature = 0 };
+    unsafe { free(file.cast()) };
+    if native_close_handle(handle) != 0 {
+        0
+    } else {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(9));
         -1
     }
 }
@@ -1506,30 +1680,62 @@ pub(super) extern "win64" fn native_crt_fwrite(
     buffer: *const u8,
     size: usize,
     count: usize,
-    _stream: *mut u8,
+    stream: *mut u8,
 ) -> usize {
     let Some(length) = size.checked_mul(count) else {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(75)); // EOVERFLOW
         return 0;
     };
     if size == 0 || length == 0 {
         return 0;
     }
-    if buffer.is_null() {
+    if buffer.is_null() || stream.is_null() {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+        return 0;
+    }
+    let (handle, append) = if let Some(index) = native_crt_standard_stream_index(stream) {
+        if index == 0 {
+            THREAD_CRT_ERRNO.with(|errno| errno.set(9));
+            return 0;
+        }
+        let Some(process) = process_ctx() else {
+            return 0;
+        };
+        (process.std_handles[index].load(Ordering::Acquire), false)
+    } else if let Some(file) = native_crt_file(stream) {
+        if unsafe { (*file).writable == 0 } {
+            THREAD_CRT_ERRNO.with(|errno| errno.set(9));
+            return 0;
+        }
+        (unsafe { (*file).handle }, unsafe { (*file).append != 0 })
+    } else {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(9));
+        return 0;
+    };
+    if append && native_set_file_pointer_ex(handle, 0, std::ptr::null_mut(), 2) == 0 {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(5));
         return 0;
     }
     let mut written = 0usize;
     while written < length {
-        let result = unsafe {
-            write(
-                1,
-                buffer.add(written).cast(),
-                length.saturating_sub(written),
-            )
-        };
-        if result <= 0 {
+        let chunk = (length - written).min(16 * 1024 * 1024) as u32;
+        let mut chunk_written = 0u32;
+        if native_write_file(
+            handle,
+            unsafe { buffer.add(written) },
+            chunk,
+            &mut chunk_written,
+            0,
+        ) == 0
+        {
+            THREAD_CRT_ERRNO
+                .with(|errno| errno.set(if native_get_last_error() == 5 { 13 } else { 5 }));
             break;
         }
-        written += result as usize;
+        written += chunk_written as usize;
+        if chunk_written < chunk {
+            break;
+        }
     }
     written / size
 }

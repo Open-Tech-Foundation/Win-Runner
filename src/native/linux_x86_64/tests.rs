@@ -2081,6 +2081,47 @@ mod protection_tests {
     }
 
     #[test]
+    fn ucrt_fopen_fwrite_fread_and_fclose_use_winfs_handles() {
+        let path = b"C:\\crt-stdio-roundtrip.bin\0";
+        let write_mode = b"w+b\0";
+        let file = super::native_crt_fopen(path.as_ptr(), write_mode.as_ptr());
+        assert!(!file.is_null());
+        let source = b"abcdef";
+        assert_eq!(super::native_crt_fwrite(source.as_ptr(), 2, 3, file), 3);
+        assert_eq!(super::native_crt_fclose(file), 0);
+
+        let append_mode = b"ab\0";
+        let file = super::native_crt_fopen(path.as_ptr(), append_mode.as_ptr());
+        assert!(!file.is_null());
+        assert_eq!(super::native_crt_fwrite(b"gh".as_ptr(), 2, 1, file), 1);
+        assert_eq!(super::native_crt_fclose(file), 0);
+
+        let read_mode = b"rb\0";
+        let file = super::native_crt_fopen(path.as_ptr(), read_mode.as_ptr());
+        assert!(!file.is_null());
+        let mut output = [0xcc; 8];
+        assert_eq!(super::native_crt_fread(output.as_mut_ptr(), 2, 4, file), 4);
+        assert_eq!(&output[..8], b"abcdefgh");
+        assert_eq!(super::native_crt_fread(output.as_mut_ptr(), 1, 1, file), 0);
+        assert_eq!(super::native_crt_fclose(file), 0);
+
+        let file = super::native_crt_fopen(path.as_ptr(), read_mode.as_ptr());
+        assert!(!file.is_null());
+        assert_eq!(super::native_crt_fwrite(source.as_ptr(), 1, 1, file), 0);
+        assert_eq!(unsafe { super::native_crt_errno().read() }, 9);
+        unsafe { super::native_crt_errno().write(0) };
+        assert_eq!(super::native_crt_fclose(file), 0);
+
+        let missing = b"C:\\crt-stdio-no-such-file.bin\0";
+        assert!(super::native_crt_fopen(missing.as_ptr(), read_mode.as_ptr()).is_null());
+        assert_eq!(unsafe { super::native_crt_errno().read() }, 2);
+        unsafe { super::native_crt_errno().write(0) };
+        assert!(super::supports_import("UCRTBASE.DLL", "fopen"));
+        assert!(super::supports_import("UCRTBASE.DLL", "fread"));
+        assert!(super::supports_import("UCRTBASE.DLL", "fclose"));
+    }
+
+    #[test]
     fn crt_sprintf_formats_strings_integers_and_escaped_percent() {
         let name = b"nano\0";
         let format = b"%s:%04d %%\0";

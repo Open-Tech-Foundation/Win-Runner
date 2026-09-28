@@ -97,14 +97,16 @@ Items remain open until implementation and relevant verification are complete.
     callbacks and execute them in reverse registration order on CRT exit.
   - [x] Add the standard UCRT stream table and a narrow formatting subset for
     `__acrt_iob_func`, `__stdio_common_vfprintf`, and
-    `__stdio_common_vsprintf`; wide formatting and file-backed `FILE` streams
-    remain unsupported.
+    `__stdio_common_vsprintf`; wide formatting remains unsupported.
+  - [x] Add unbuffered WinFS-backed `fopen`, `fread`, `fwrite`, and `fclose`;
+    buffering, seek, EOF/error state, and wide file modes remain unsupported.
   - [x] Add `strtol`, `strtod`, and `strstr` with Windows `long` width,
     end-pointer reporting, radix parsing, and common decimal input handling.
   - [x] Add in-place `qsort` and `_time64`; CRT `fopen`/`fread`/`fclose` and
     other file-backed `FILE` operations remain pending.
   - [ ] Add `_seh_filter_exe` and remaining startup exports.
-- [ ] Add basic `msvcrt.dll` output and file I/O, including `printf` and `fopen`.
+- [ ] Add basic `msvcrt.dll` output and remaining file I/O, including `printf`.
+  - [x] Share the unbuffered `fopen`/`fread`/`fwrite`/`fclose` subset with MSVCRT.
 - [ ] Add VCRUNTIME140 exception handlers, `_CxxThrowException`, and memory
   functions needed by C++ and default Rust MSVC binaries.
 - [ ] Implement structured exception lookup/unwind/raise APIs and translate
