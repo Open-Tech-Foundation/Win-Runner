@@ -112,6 +112,8 @@ Items remain open until implementation and relevant verification are complete.
   - [x] Add `strtol`, `strtod`, and `strstr` with Windows `long` width,
     end-pointer reporting, radix parsing, and common decimal input handling.
   - [x] Add in-place `qsort` and `_time64`.
+  - [x] Add bounded UTF-16 string length, comparison, search, copy, and
+    concatenation routines alongside `wcscmp` and `wcsstr`.
   - [x] Add `_seh_filter_exe` dispatch for documented access-violation,
     illegal-instruction, and floating-point exception statuses through the
     existing CRT `signal()` registrations.

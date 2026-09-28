@@ -9,6 +9,9 @@ All notable changes to this project will be documented in this file.
 - Route the existing `memcmp`, `memcpy`, `memmove`, `memset`, and `strlen`
   shims for `VCRUNTIME140.dll` imports; C++ exception runtime exports remain
   unsupported.
+- Add bounded UTF-16 CRT length, comparison, search, copy, and concatenation
+  functions, including `wcslen`, `wcsncmp`, `wcschr`, `wcsrchr`, `wcscpy`,
+  `wcsncpy`, `wcscat`, and `wcsncat`.
 - Add stable UTF-16 CRT startup arrays and accessors for wide arguments and
   environment variables, including `_configure_wide_argv`, `__p___wargv`, and
   the initial/environment pointer APIs.

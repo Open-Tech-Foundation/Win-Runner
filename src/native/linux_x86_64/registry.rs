@@ -109,6 +109,14 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                     | "fwrite"
                     | "sprintf"
                     | "wcscmp"
+                    | "wcslen"
+                    | "wcsncmp"
+                    | "wcschr"
+                    | "wcsrchr"
+                    | "wcscpy"
+                    | "wcsncpy"
+                    | "wcscat"
+                    | "wcsncat"
                     | "wcsstr"
                     | "fflush"
                     | "fputs"
@@ -313,6 +321,14 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "fwrite" => Some(native_crt_fwrite as *const () as usize as u64),
         "sprintf" => Some(native_crt_sprintf as *const () as usize as u64),
         "wcscmp" => Some(native_crt_wcscmp as *const () as usize as u64),
+        "wcslen" => Some(native_crt_wcslen as *const () as usize as u64),
+        "wcsncmp" => Some(native_crt_wcsncmp as *const () as usize as u64),
+        "wcschr" => Some(native_crt_wcschr as *const () as usize as u64),
+        "wcsrchr" => Some(native_crt_wcsrchr as *const () as usize as u64),
+        "wcscpy" => Some(native_crt_wcscpy as *const () as usize as u64),
+        "wcsncpy" => Some(native_crt_wcsncpy as *const () as usize as u64),
+        "wcscat" => Some(native_crt_wcscat as *const () as usize as u64),
+        "wcsncat" => Some(native_crt_wcsncat as *const () as usize as u64),
         "wcsstr" => Some(native_crt_wcsstr as *const () as usize as u64),
         "fflush" => Some(native_crt_fflush as *const () as usize as u64),
         "fputs" => Some(native_crt_fputs as *const () as usize as u64),

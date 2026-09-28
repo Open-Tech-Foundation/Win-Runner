@@ -1432,6 +1432,113 @@ pub(super) extern "win64" fn native_crt_wcscmp(left: *const u16, right: *const u
     }
     0
 }
+pub(super) extern "win64" fn native_crt_wcslen(input: *const u16) -> usize {
+    for length in 0..1_048_576usize {
+        if unsafe { input.add(length).read() } == 0 {
+            return length;
+        }
+    }
+    1_048_576
+}
+pub(super) extern "win64" fn native_crt_wcsncmp(
+    left: *const u16,
+    right: *const u16,
+    count: usize,
+) -> i32 {
+    for index in 0..count.min(1_048_576) {
+        let (a, b) = unsafe { (left.add(index).read(), right.add(index).read()) };
+        if a != b || a == 0 {
+            return i32::from(a) - i32::from(b);
+        }
+    }
+    0
+}
+pub(super) extern "win64" fn native_crt_wcschr(input: *const u16, value: u32) -> *mut u16 {
+    let value = value as u16;
+    for index in 0..1_048_576usize {
+        let current = unsafe { input.add(index).read() };
+        if current == value {
+            return unsafe { input.add(index).cast_mut() };
+        }
+        if current == 0 {
+            return std::ptr::null_mut();
+        }
+    }
+    std::ptr::null_mut()
+}
+pub(super) extern "win64" fn native_crt_wcsrchr(input: *const u16, value: u32) -> *mut u16 {
+    let value = value as u16;
+    let mut found = std::ptr::null_mut();
+    for index in 0..1_048_576usize {
+        let current = unsafe { input.add(index).read() };
+        if current == value {
+            found = unsafe { input.add(index).cast_mut() };
+        }
+        if current == 0 {
+            return found;
+        }
+    }
+    found
+}
+pub(super) extern "win64" fn native_crt_wcscpy(output: *mut u16, input: *const u16) -> *mut u16 {
+    for index in 0..1_048_576usize {
+        let value = unsafe { input.add(index).read() };
+        unsafe { output.add(index).write(value) };
+        if value == 0 {
+            break;
+        }
+    }
+    output
+}
+pub(super) extern "win64" fn native_crt_wcsncpy(
+    output: *mut u16,
+    input: *const u16,
+    count: usize,
+) -> *mut u16 {
+    let mut index = 0usize;
+    while index < count.min(1_048_576) {
+        let value = unsafe { input.add(index).read() };
+        unsafe { output.add(index).write(value) };
+        index += 1;
+        if value == 0 {
+            while index < count.min(1_048_576) {
+                unsafe { output.add(index).write(0) };
+                index += 1;
+            }
+            break;
+        }
+    }
+    output
+}
+pub(super) extern "win64" fn native_crt_wcscat(output: *mut u16, input: *const u16) -> *mut u16 {
+    let length = native_crt_wcslen(output);
+    if length < 1_048_576 {
+        unsafe { native_crt_wcscpy(output.add(length), input) };
+    }
+    output
+}
+pub(super) extern "win64" fn native_crt_wcsncat(
+    output: *mut u16,
+    input: *const u16,
+    count: usize,
+) -> *mut u16 {
+    let length = native_crt_wcslen(output);
+    if length >= 1_048_576 {
+        return output;
+    }
+    let limit = count.min(1_048_575usize.saturating_sub(length));
+    let mut copied = 0usize;
+    while copied < limit {
+        let value = unsafe { input.add(copied).read() };
+        if value == 0 {
+            break;
+        }
+        unsafe { output.add(length + copied).write(value) };
+        copied += 1;
+    }
+    unsafe { output.add(length + copied).write(0) };
+    output
+}
 pub(super) extern "win64" fn native_crt_wcsstr(
     haystack: *const u16,
     needle: *const u16,
@@ -1442,6 +1549,9 @@ pub(super) extern "win64" fn native_crt_wcsstr(
     let mut needle_len = 0usize;
     while needle_len < 32768 && unsafe { needle.add(needle_len).read() } != 0 {
         needle_len += 1;
+    }
+    if needle_len == 0 {
+        return haystack.cast_mut();
     }
     let mut offset = 0usize;
     while offset < 1_048_576 {

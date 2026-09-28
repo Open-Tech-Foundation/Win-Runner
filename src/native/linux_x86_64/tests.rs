@@ -2426,6 +2426,52 @@ mod protection_tests {
     }
 
     #[test]
+    fn crt_wide_string_functions_compare_search_copy_and_terminate() {
+        let source = [b'h' as u16, b'i' as u16, 0];
+        let nul = unsafe { source.as_ptr().add(2) };
+        let second = unsafe { source.as_ptr().add(1) };
+        assert_eq!(super::native_crt_wcslen(source.as_ptr()), 2);
+        assert_eq!(
+            super::native_crt_wcsncmp(source.as_ptr(), source.as_ptr(), 1),
+            0
+        );
+        assert!(
+            super::native_crt_wcschr(source.as_ptr(), b'h' as u32) == source.as_ptr().cast_mut()
+        );
+        assert!(super::native_crt_wcschr(source.as_ptr(), 0) == nul.cast_mut());
+        assert!(super::native_crt_wcsrchr(source.as_ptr(), b'i' as u32) == second.cast_mut());
+        assert!(
+            super::native_crt_wcsstr(source.as_ptr(), [0u16].as_ptr())
+                == source.as_ptr().cast_mut()
+        );
+
+        let mut copied = [0xaaaa; 5];
+        assert_eq!(
+            super::native_crt_wcscpy(copied.as_mut_ptr(), source.as_ptr()),
+            copied.as_mut_ptr()
+        );
+        assert_eq!(&copied[..3], &[b'h' as u16, b'i' as u16, 0]);
+        assert_eq!(
+            super::native_crt_wcsncpy(copied.as_mut_ptr(), [b'x' as u16, 0].as_ptr(), 4),
+            copied.as_mut_ptr()
+        );
+        assert_eq!(&copied[..4], &[b'x' as u16, 0, 0, 0]);
+        assert_eq!(
+            super::native_crt_wcscat(copied.as_mut_ptr(), source.as_ptr()),
+            copied.as_mut_ptr()
+        );
+        assert_eq!(&copied[..4], &[b'x' as u16, b'h' as u16, b'i' as u16, 0]);
+        assert_eq!(
+            super::native_crt_wcsncat(copied.as_mut_ptr(), source.as_ptr(), 1),
+            copied.as_mut_ptr()
+        );
+        assert_eq!(
+            &copied[..5],
+            &[b'x' as u16, b'h' as u16, b'i' as u16, b'h' as u16, 0]
+        );
+    }
+
+    #[test]
     fn crt_stat64_reports_winfs_file_type_and_size() {
         let context = super::fs_ctx().unwrap();
         let path = r"C:\stat64_probe.txt";
@@ -2723,6 +2769,14 @@ mod protection_tests {
                 super::baseline_trampoline(export).is_some(),
                 "{export} has no trampoline"
             );
+        }
+        for export in [
+            "wcscmp", "wcslen", "wcsncmp", "wcschr", "wcsrchr", "wcscpy", "wcsncpy", "wcscat",
+            "wcsncat", "wcsstr",
+        ] {
+            assert!(super::supports_import("UCRTBASE.dll", export), "{export}");
+            assert!(super::supports_import("MSVCRT.dll", export), "{export}");
+            assert!(super::baseline_trampoline(export).is_some(), "{export}");
         }
         assert!(!super::supports_import(
             "VCRUNTIME140.dll",
