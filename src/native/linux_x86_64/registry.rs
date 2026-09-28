@@ -37,6 +37,8 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                     | "__p___wargv"
                     | "__p__acmdln"
                     | "__p__wcmdln"
+                    | "__p___initenv"
+                    | "__p___winitenv"
                     | "__p__pgmptr"
                     | "__p__wpgmptr"
                     | "_get_initial_narrow_environment"
@@ -267,6 +269,8 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "__p__wcmdln" => Some(native_crt_p_wcmdln as *const () as usize as u64),
         "__p__pgmptr" => Some(native_crt_p_pgmptr as *const () as usize as u64),
         "__p__wpgmptr" => Some(native_crt_p_wpgmptr as *const () as usize as u64),
+        "__p___initenv" => Some(native_crt_p_initenv as *const () as usize as u64),
+        "__p___winitenv" => Some(native_crt_p_winitenv as *const () as usize as u64),
         "_get_initial_narrow_environment" => {
             Some(native_crt_get_initial_narrow_environment as *const () as usize as u64)
         }

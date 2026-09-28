@@ -1881,6 +1881,8 @@ mod protection_tests {
                 || !super::supports_import("UCRTBASE.dll", "__p__wcmdln")
                 || !super::supports_import("UCRTBASE.dll", "__p__pgmptr")
                 || !super::supports_import("UCRTBASE.dll", "__p__wpgmptr")
+                || !super::supports_import("UCRTBASE.dll", "__p___initenv")
+                || !super::supports_import("UCRTBASE.dll", "__p___winitenv")
                 || !super::supports_import("UCRTBASE.dll", "_crt_atexit")
                 || !super::supports_import("UCRTBASE.dll", "_register_onexit_function")
                 || !super::supports_import("UCRTBASE.dll", "_initialize_onexit_table")
@@ -1932,6 +1934,10 @@ mod protection_tests {
                     != process.command_line_a.as_ptr() as *mut u8
                 || unsafe { super::native_crt_p_wcmdln().read() }
                     != process.command_line_w.as_ptr() as *mut u16
+                || unsafe { super::native_crt_p_initenv().read() as u64 }
+                    != super::NATIVE_CRT_INITENV.load(std::sync::atomic::Ordering::Acquire)
+                || unsafe { super::native_crt_p_winitenv().read() as u64 }
+                    != super::NATIVE_CRT_WINITENV.load(std::sync::atomic::Ordering::Acquire)
             {
                 unsafe { _exit(119) };
             }

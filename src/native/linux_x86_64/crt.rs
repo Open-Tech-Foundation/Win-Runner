@@ -463,6 +463,20 @@ pub(super) extern "win64" fn native_crt_p_wenviron() -> *mut *mut *mut u16 {
         .unwrap_or(std::ptr::null_mut())
 }
 
+pub(super) extern "win64" fn native_crt_p_initenv() -> *mut *mut *mut i8 {
+    if let Some(process) = process_ctx() {
+        ensure_crt_startup(&process);
+    }
+    NATIVE_CRT_INITENV.as_ptr().cast()
+}
+
+pub(super) extern "win64" fn native_crt_p_winitenv() -> *mut *mut *mut u16 {
+    if let Some(process) = process_ctx() {
+        ensure_crt_startup(&process);
+    }
+    NATIVE_CRT_WINITENV.as_ptr().cast()
+}
+
 pub(super) extern "win64" fn native_crt_set_new_mode(mode: i32) -> i32 {
     if !matches!(mode, 0 | 1) {
         THREAD_CRT_ERRNO.with(|errno| errno.set(22)); // EINVAL
