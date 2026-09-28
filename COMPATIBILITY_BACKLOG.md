@@ -114,8 +114,10 @@ Items remain open until implementation and relevant verification are complete.
     registers during virtual unwinding.
   - [x] Simulate x64 epilogue tails containing `add rsp, imm`, frame-pointer
     `lea rsp, disp[reg]`, nonvolatile `pop`, and `ret`/`ret imm16` instructions.
-  - [ ] Add epilogue indirect/tail `jmp` forms and guest/native fault
-    integration; validate remaining opcode edge cases.
+  - [x] Follow epilogue tail jumps using rel8/rel32, `rex.w jmp reg`, and
+    RIP-relative `jmp qword ptr [rip+disp32]` targets outside the function.
+  - [ ] Add guest/native fault integration and validate remaining opcode
+    edge cases.
   - [ ] Capture the live guest CPU context, continue execution from a modified
     context, and implement native SEH frame lookup/unwinding and Linux fault
     translation. The current explicit-raise path supplies a synthetic context

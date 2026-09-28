@@ -691,6 +691,15 @@ fn simulate_epilogue(
             can_adjust_stack = false;
             continue;
         }
+        let Some(instruction_pc) = control_pc.checked_add(cursor as u64) else {
+            return false;
+        };
+        if let Some(target) =
+            decode_epilogue_jump(remaining, instruction_pc, image_base, function, context)
+        {
+            context_set_register(context, 16, target);
+            return true;
+        }
         return false;
     }
 }
@@ -773,6 +782,55 @@ fn decode_epilogue_pop(bytes: &[u8]) -> Option<(usize, u8)> {
         }
     };
     Some((instruction_len, register))
+}
+
+fn decode_epilogue_jump(
+    bytes: &[u8],
+    instruction_pc: u64,
+    image_base: u64,
+    function: NativeRuntimeFunction,
+    context: &NativeExceptionContext,
+) -> Option<u64> {
+    let target = if bytes.first() == Some(&0xeb) && bytes.len() >= 2 {
+        let displacement = i8::from_le_bytes([bytes[1]]) as i64;
+        instruction_pc
+            .checked_add(2)?
+            .checked_add_signed(displacement)?
+    } else if bytes.first() == Some(&0xe9) && bytes.len() >= 5 {
+        let displacement = i32::from_le_bytes(bytes[1..5].try_into().ok()?) as i64;
+        instruction_pc
+            .checked_add(5)?
+            .checked_add_signed(displacement)?
+    } else if bytes.len() >= 3 && (0x48..=0x4f).contains(&bytes[0]) && bytes[1] == 0xff {
+        let rex = bytes[0];
+        let modrm = bytes[2];
+        if (modrm >> 3) & 7 != 4 || rex & 6 != 0 {
+            return None;
+        }
+        if modrm >> 6 == 3 {
+            let register = (modrm & 7) | ((rex & 1) << 3);
+            context_register(context, register)?
+        } else {
+            return None;
+        }
+    } else if bytes.len() >= 6 && bytes[0] == 0xff && bytes[1] == 0x25
+    // jmp qword ptr [rip + disp32]
+    {
+        let displacement = i32::from_le_bytes(bytes[2..6].try_into().ok()?) as i64;
+        let pointer_address = instruction_pc
+            .checked_add(6)?
+            .checked_add_signed(displacement)?;
+        stack_u64(pointer_address)?
+    } else {
+        return None;
+    };
+
+    let function_start = image_base.checked_add(u64::from(function.begin_address))?;
+    let function_end = image_base.checked_add(u64::from(function.end_address))?;
+    if (function_start..function_end).contains(&target) {
+        return None;
+    }
+    Some(target)
 }
 
 fn simulate_epilogue_return(context: &mut NativeExceptionContext, extra_stack_bytes: u64) -> bool {
