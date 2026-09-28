@@ -118,10 +118,11 @@ Items remain open until implementation and relevant verification are complete.
     RIP-relative `jmp qword ptr [rip+disp32]` targets outside the function.
   - [ ] Add guest/native fault integration and validate remaining opcode
     edge cases.
-  - [ ] Capture the live guest CPU context, continue execution from a modified
-    context, and implement native SEH frame lookup/unwinding and Linux fault
-    translation. The current explicit-raise path supplies a synthetic context
-    and is not a complete SEH implementation.
+  - [x] Capture current x64 control, integer, segment, and floating-point
+    state through the native `RtlCaptureContext` entry point.
+  - [ ] Capture Linux fault contexts, continue execution from a modified guest
+    `CONTEXT`, and implement native SEH frame lookup/unwinding and fault
+    translation. Explicit raises still use a synthetic context.
 
 ### P1: common command-line tools
 

@@ -44,8 +44,8 @@ mod protection_tests {
         native_wake_all_condition_variable, native_wake_by_address_all,
         native_wide_char_to_multi_byte, native_write_console_w, native_wsa_get_last_error,
         native_wsa_inet_addr, parse_windows_command_line, process_ctx, uppercase_ascii_utf16,
-        waitpid, write_process_information, NativeLaunchSpec, NativeMemoryStatus, API_SET_MODULE,
-        PROT_EXEC, PROT_READ, PROT_WRITE, THREAD_NATIVE_HANDLE,
+        waitpid, winrun_native_rtl_capture_context, write_process_information, NativeLaunchSpec,
+        NativeMemoryStatus, API_SET_MODULE, PROT_EXEC, PROT_READ, PROT_WRITE, THREAD_NATIVE_HANDLE,
     };
     use crate::winfs::WinFs;
 
@@ -5978,6 +5978,26 @@ mod protection_tests {
 
         functions.swap(0, 1);
         assert_eq!(native_rtl_add_function_table(table, 2, base), 0);
+    }
+
+    #[test]
+    fn rtl_capture_context_records_control_integer_and_floating_state() {
+        let mut context = super::NativeExceptionContext { bytes: [0; 1232] };
+
+        unsafe { winrun_native_rtl_capture_context(context.bytes.as_mut_ptr()) };
+
+        assert_eq!(
+            u32::from_le_bytes(context.bytes[48..52].try_into().unwrap()),
+            0x0010_001f
+        );
+        let rsp = u64::from_le_bytes(context.bytes[152..160].try_into().unwrap());
+        let rip = u64::from_le_bytes(context.bytes[248..256].try_into().unwrap());
+        assert_ne!(rsp, 0);
+        assert_eq!(rsp & 0xf, 0, "captured RSP should be caller-aligned");
+        assert_ne!(rip, 0);
+        // FXSAVE's MXCSR field is at byte 24 in the floating save area.
+        let mxcsr = u32::from_le_bytes(context.bytes[280..284].try_into().unwrap());
+        assert_ne!(mxcsr, 0);
     }
 
     #[test]
