@@ -108,8 +108,10 @@ Items remain open until implementation and relevant verification are complete.
     during `RtlLookupFunctionEntry`.
   - [x] Implement common version-1 `RtlVirtualUnwind` operations, leaf-frame
     unwinding, saved-register restoration, and handler-data lookup.
-  - [ ] Complete chained unwind records, epilogue simulation, every unwind
-    opcode, context-pointer output, and guest/native fault integration.
+  - [x] Follow chained `RUNTIME_FUNCTION` records with compatible frame
+    metadata and bounded cycle detection.
+  - [ ] Add epilogue simulation, complete context-pointer output, and
+    guest/native fault integration; validate remaining opcode edge cases.
   - [ ] Capture the live guest CPU context, continue execution from a modified
     context, and implement native SEH frame lookup/unwinding and Linux fault
     translation. The current explicit-raise path supplies a synthetic context

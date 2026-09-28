@@ -6196,6 +6196,98 @@ mod protection_tests {
     }
 
     #[test]
+    fn rtl_virtual_unwind_follows_chained_runtime_function_records() {
+        let mut image = vec![0u8; 0x1000];
+        let base = image.as_mut_ptr() as u64;
+        // Secondary unwind info: allocate 32 bytes, then chain to the primary
+        // function's unwind info, which restores the previously pushed RBX.
+        image[0x800..0x804].copy_from_slice(&[0x21, 2, 1, 0]);
+        image[0x804..0x806].copy_from_slice(&[2, 0x32]);
+        image[0x808..0x814].copy_from_slice(&[
+            0x00, 0x01, 0x00, 0x00, // primary BeginAddress
+            0x00, 0x02, 0x00, 0x00, // primary EndAddress
+            0x40, 0x08, 0x00, 0x00, // primary UnwindData
+        ]);
+        image[0x840..0x844].copy_from_slice(&[1, 4, 1, 0]);
+        image[0x844..0x846].copy_from_slice(&[1, 0x30]);
+        let secondary = super::NativeRuntimeFunction {
+            begin_address: 0x300,
+            end_address: 0x380,
+            unwind_data: 0x800,
+        };
+        let mut stack = [0u64; 8];
+        stack[4] = 0x1234_5678_9abc_def0;
+        stack[5] = 0x0000_7fff_7777_8888;
+        let original_rsp = stack.as_ptr() as u64;
+        let mut context = super::NativeExceptionContext { bytes: [0; 1232] };
+        context.bytes[152..160].copy_from_slice(&original_rsp.to_le_bytes());
+
+        assert_eq!(
+            native_rtl_virtual_unwind(
+                0,
+                base,
+                base + 0x320,
+                &secondary,
+                &mut context,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ),
+            0
+        );
+        assert_eq!(
+            u64::from_le_bytes(context.bytes[144..152].try_into().unwrap()),
+            0x1234_5678_9abc_def0
+        );
+        assert_eq!(
+            u64::from_le_bytes(context.bytes[248..256].try_into().unwrap()),
+            0x0000_7fff_7777_8888
+        );
+        assert_eq!(
+            u64::from_le_bytes(context.bytes[152..160].try_into().unwrap()),
+            original_rsp + 48
+        );
+    }
+
+    #[test]
+    fn rtl_virtual_unwind_rejects_cyclic_chains_without_changing_context() {
+        let mut image = vec![0u8; 0x1000];
+        let base = image.as_mut_ptr() as u64;
+        image[0x800..0x804].copy_from_slice(&[0x21, 0, 0, 0]);
+        image[0x804..0x810].copy_from_slice(&[
+            0x00, 0x01, 0x00, 0x00, // self BeginAddress
+            0x00, 0x02, 0x00, 0x00, // self EndAddress
+            0x00, 0x08, 0x00, 0x00, // self UnwindData
+        ]);
+        let function = super::NativeRuntimeFunction {
+            begin_address: 0x100,
+            end_address: 0x200,
+            unwind_data: 0x800,
+        };
+        let mut stack = [0u64; 2];
+        stack[0] = 0x0000_7fff_9999_aaaa;
+        let mut context = super::NativeExceptionContext { bytes: [0; 1232] };
+        context.bytes[152..160].copy_from_slice(&(stack.as_ptr() as u64).to_le_bytes());
+        context.bytes[120..128].copy_from_slice(&0xfeed_beefu64.to_le_bytes());
+        let original_context = context;
+
+        assert_eq!(
+            native_rtl_virtual_unwind(
+                0,
+                base,
+                base + 0x150,
+                &function,
+                &mut context,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ),
+            0
+        );
+        assert_eq!(context.bytes, original_context.bytes);
+    }
+
+    #[test]
     fn accepts_a_thread_stack_guarantee_request() {
         let mut size = 0x5000;
         assert_eq!(native_set_thread_stack_guarantee(&mut size), 1);

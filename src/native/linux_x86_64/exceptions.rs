@@ -339,77 +339,24 @@ pub(super) extern "win64" fn native_rtl_virtual_unwind(
     }
 
     let function = unsafe { function_entry.read_unaligned() };
-    if function.begin_address >= function.end_address {
-        return 0;
-    }
     let Some(function_start) = image_base.checked_add(u64::from(function.begin_address)) else {
         return 0;
     };
     let Some(prologue_offset) = control_pc.checked_sub(function_start) else {
         return 0;
     };
-    if prologue_offset >= u64::from(function.end_address - function.begin_address) {
-        return 0;
-    }
-    let Some(unwind_address) = image_base.checked_add(u64::from(function.unwind_data)) else {
+    let Some(plan) = decode_unwind_plan(
+        image_base,
+        function,
+        prologue_offset,
+        0,
+        &mut std::collections::HashSet::new(),
+    ) else {
         return 0;
     };
-    let header = unsafe { std::slice::from_raw_parts(unwind_address as *const u8, 4) };
-    let version = header[0] & 7;
-    let flags = header[0] >> 3;
-    let prologue_size = header[1];
-    let code_count = header[2] as usize;
-    let frame_register = header[3] & 0x0f;
-    let frame_offset = header[3] >> 4;
-    if version != 1 || flags & !7 != 0 || flags & 4 != 0 {
-        return 0;
-    }
-    let code_bytes = code_count * 2;
-    let codes =
-        unsafe { std::slice::from_raw_parts((unwind_address + 4) as *const u8, code_bytes) };
-    let mut operations = Vec::new();
-    let mut slot = 0usize;
-    let mut previous_code_offset = u8::MAX;
-    while slot < code_count {
-        let code_offset = codes[slot * 2];
-        if code_offset > previous_code_offset {
-            return 0;
-        }
-        previous_code_offset = code_offset;
-        let op_and_info = codes[slot * 2 + 1];
-        let op = op_and_info & 0x0f;
-        let info = op_and_info >> 4;
-        if code_offset > prologue_size {
-            return 0;
-        }
-        let slots = match op {
-            0 | 2 | 3 | 10 => 1,
-            1 if info == 0 => 2,
-            1 if info == 1 => 3,
-            4 | 8 => 2,
-            5 | 9 => 3,
-            _ => return 0,
-        };
-        if slot + slots > code_count {
-            return 0;
-        }
-        let operand = match slots {
-            2 => u64::from(u16::from_le_bytes([
-                codes[(slot + 1) * 2],
-                codes[(slot + 1) * 2 + 1],
-            ])),
-            3 => {
-                let low = u16::from_le_bytes([codes[(slot + 1) * 2], codes[(slot + 1) * 2 + 1]]);
-                let high = u16::from_le_bytes([codes[(slot + 2) * 2], codes[(slot + 2) * 2 + 1]]);
-                u64::from(low) | (u64::from(high) << 16)
-            }
-            _ => 0,
-        };
-        if u64::from(code_offset) <= prologue_offset {
-            operations.push((op, info, operand));
-        }
-        slot += slots;
-    }
+    let operations = plan.operations;
+    let frame_register = plan.frame_register;
+    let frame_offset = plan.frame_offset;
     if frame_register == 0 && frame_offset != 0 {
         return 0;
     }
@@ -591,29 +538,24 @@ pub(super) extern "win64" fn native_rtl_virtual_unwind(
         context_set_register(&mut context, 4, restored_rsp);
     }
 
-    let handler_flags = flags & 3;
-    let handler_flag = match handler_type {
-        1 => 1,
-        2 => 2,
-        _ => 0,
-    };
     let mut handler = 0;
-    if handler_flag != 0 && handler_flags & handler_flag != 0 {
-        let padded_code_count = (code_count + 1) & !1;
-        let handler_rva_address = unwind_address + 4 + (padded_code_count * 2) as u64;
-        let handler_rva = unsafe { (handler_rva_address as *const u32).read_unaligned() };
-        if handler_rva == 0 {
-            return 0;
-        }
-        if !handler_data.is_null() {
-            unsafe {
-                handler_data.write((handler_rva_address + 4) as *mut c_void);
+    let handler_flag = match handler_type {
+        1 => Some(1),
+        2 => Some(2),
+        _ => None,
+    };
+    if let Some((handler_flags, handler_rva, handler_data_address)) = plan.handler {
+        if handler_flag.is_some_and(|flag| handler_flags & flag != 0) {
+            let Some(handler_address) = image_base.checked_add(u64::from(handler_rva)) else {
+                return 0;
+            };
+            if !handler_data.is_null() {
+                unsafe {
+                    handler_data.write(handler_data_address as *mut c_void);
+                }
             }
+            handler = handler_address;
         }
-        let Some(handler_address) = image_base.checked_add(u64::from(handler_rva)) else {
-            return 0;
-        };
-        handler = handler_address;
     }
     unsafe { context_record.write_unaligned(context) };
     if !establisher_frame.is_null() {
@@ -685,6 +627,128 @@ fn stack_u32(address: u64) -> Option<u32> {
 
 fn stack_u16(address: u64) -> Option<u16> {
     (address != 0).then(|| unsafe { (address as *const u16).read_unaligned() })
+}
+
+struct DecodedUnwindPlan {
+    operations: Vec<(u8, u8, u64)>,
+    frame_register: u8,
+    frame_offset: u8,
+    handler: Option<(u8, u32, u64)>,
+}
+
+fn decode_unwind_plan(
+    image_base: u64,
+    function: NativeRuntimeFunction,
+    prologue_offset: u64,
+    depth: usize,
+    visited: &mut std::collections::HashSet<u32>,
+) -> Option<DecodedUnwindPlan> {
+    const MAX_CHAIN_DEPTH: usize = 32;
+    if depth >= MAX_CHAIN_DEPTH
+        || function.begin_address >= function.end_address
+        || (prologue_offset != u64::MAX
+            && prologue_offset >= u64::from(function.end_address - function.begin_address))
+        || !visited.insert(function.unwind_data)
+    {
+        return None;
+    }
+    let unwind_address = image_base.checked_add(u64::from(function.unwind_data))?;
+    let header = unsafe { std::slice::from_raw_parts(unwind_address as *const u8, 4) };
+    let version = header[0] & 7;
+    let flags = header[0] >> 3;
+    let prologue_size = header[1];
+    let code_count = header[2] as usize;
+    let frame_register = header[3] & 0x0f;
+    let frame_offset = header[3] >> 4;
+    if version != 1
+        || flags & !7 != 0
+        || (flags & 4 != 0 && flags & 3 != 0)
+        || (frame_register == 0 && frame_offset != 0)
+        || (frame_register != 0 && !is_nonvolatile_register(frame_register))
+    {
+        return None;
+    }
+    let code_bytes = code_count.checked_mul(2)?;
+    let codes =
+        unsafe { std::slice::from_raw_parts((unwind_address + 4) as *const u8, code_bytes) };
+    let mut operations = Vec::new();
+    let mut slot = 0usize;
+    let mut previous_code_offset = u8::MAX;
+    while slot < code_count {
+        let code_offset = codes[slot * 2];
+        if code_offset > previous_code_offset || code_offset > prologue_size {
+            return None;
+        }
+        previous_code_offset = code_offset;
+        let op_and_info = codes[slot * 2 + 1];
+        let op = op_and_info & 0x0f;
+        let info = op_and_info >> 4;
+        let slots = match op {
+            0 | 2 | 3 | 10 => 1,
+            1 if info == 0 => 2,
+            1 if info == 1 => 3,
+            4 | 8 => 2,
+            5 | 9 => 3,
+            _ => return None,
+        };
+        if slot + slots > code_count {
+            return None;
+        }
+        let operand = match slots {
+            2 => u64::from(u16::from_le_bytes([
+                codes[(slot + 1) * 2],
+                codes[(slot + 1) * 2 + 1],
+            ])),
+            3 => {
+                let low = u16::from_le_bytes([codes[(slot + 1) * 2], codes[(slot + 1) * 2 + 1]]);
+                let high = u16::from_le_bytes([codes[(slot + 2) * 2], codes[(slot + 2) * 2 + 1]]);
+                u64::from(low) | (u64::from(high) << 16)
+            }
+            _ => 0,
+        };
+        if prologue_offset == u64::MAX || u64::from(code_offset) <= prologue_offset {
+            operations.push((op, info, operand));
+        }
+        slot += slots;
+    }
+
+    if flags & 4 != 0 {
+        let padded_slots = (code_count + 1) & !1;
+        let chained_entry_address = unwind_address.checked_add(4 + (padded_slots * 2) as u64)?;
+        let chained_function =
+            unsafe { (chained_entry_address as *const NativeRuntimeFunction).read_unaligned() };
+        let mut parent =
+            decode_unwind_plan(image_base, chained_function, u64::MAX, depth + 1, visited)?;
+        if parent.frame_register != frame_register || parent.frame_offset != frame_offset {
+            return None;
+        }
+        operations.append(&mut parent.operations);
+        return Some(DecodedUnwindPlan {
+            operations,
+            frame_register,
+            frame_offset,
+            handler: parent.handler,
+        });
+    }
+
+    let handler = if flags & 3 != 0 {
+        let padded_slots = (code_count + 1) & !1;
+        let handler_rva_address = unwind_address.checked_add(4 + (padded_slots * 2) as u64)?;
+        let handler_rva = unsafe { (handler_rva_address as *const u32).read_unaligned() };
+        let handler_data_address = handler_rva_address.checked_add(4)?;
+        if handler_rva == 0 {
+            return None;
+        }
+        Some((flags & 3, handler_rva, handler_data_address))
+    } else {
+        None
+    };
+    Some(DecodedUnwindPlan {
+        operations,
+        frame_register,
+        frame_offset,
+        handler,
+    })
 }
 
 fn mapped_exception_directory(module: &NativeLoadedModule) -> Option<(u32, u32)> {
