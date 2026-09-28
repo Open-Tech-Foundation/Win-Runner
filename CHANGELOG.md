@@ -8,8 +8,10 @@ All notable changes to this project will be documented in this file.
 
 - Support multiple ordered vectored exception handlers and dispatch explicit
   `RaiseException`/`RtlRaiseException` calls with Windows-shaped exception
-  records. Native fault translation, real guest CPU context capture, and SEH
-  stack unwinding remain unimplemented.
+  records. The native x86-64 entry path now translates synchronous Linux
+  faults, dispatches registered handlers with the guest CPU context, and can
+  resume guest execution after a handler edits that context. Frame-based SEH
+  dispatch and fault recovery on other guest threads remain unimplemented.
 - Resolve `RtlLookupFunctionEntry` against loaded PE x64 exception directories,
   returning the mapped `RUNTIME_FUNCTION` record for a control PC.
 - Support registration and removal of bounded, sorted dynamic x64 function
@@ -31,6 +33,10 @@ All notable changes to this project will be documented in this file.
 - Convert Linux x86-64 fault contexts to Windows `CONTEXT` and apply modified
   guest contexts back to Linux `ucontext_t`; map synchronous `SIGSEGV`,
   `SIGBUS`, `SIGILL`, and `SIGFPE` metadata to Windows exception records.
+- Capture synchronous guest faults around the native entry point, dispatch
+  vectored exception handlers and the unhandled exception filter, and resume
+  from a handler-modified context. TLS callbacks and guest-created threads are
+  not yet covered by this fault-recovery trampoline.
 - Detect .NET Framework `_CorExeMain`/`_CorDllMain` images and report the clear
   unsupported-runtime limitation in `winrun inspect` and native execution.
 - Replaced the PS1 interpreter's proposed install-script .NET API expansion

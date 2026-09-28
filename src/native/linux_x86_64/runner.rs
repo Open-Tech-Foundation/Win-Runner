@@ -680,6 +680,9 @@ fn run_rust_baseline_argv_with_fs_impl(
         if pid == 0 {
             #[cfg(test)]
             NATIVE_GUEST_ACTIVE.store(true, Ordering::Release);
+            if super::exceptions::install_guest_fault_signal_handlers().is_err() {
+                unsafe { _exit(127) };
+            }
             unsafe {
                 close(fds[0]);
                 close(state_fds[0]);
@@ -724,10 +727,11 @@ fn run_rust_baseline_argv_with_fs_impl(
                         &tls_callbacks,
                         1,
                     );
-                    // SAFETY: entry is in the child-owned RX PE mapping.
-                    let guest: unsafe extern "win64" fn() -> u32 =
-                        unsafe { std::mem::transmute(entry) };
-                    let code = unsafe { guest() as i32 };
+                    let code = match unsafe {
+                        super::exceptions::invoke_guest_with_fault_translation(entry)
+                    } {
+                        Ok(code) | Err(code) => code as i32,
+                    };
                     native_wait_file_io(&guest_process);
                     code
                 });

@@ -116,15 +116,20 @@ Items remain open until implementation and relevant verification are complete.
     `lea rsp, disp[reg]`, nonvolatile `pop`, and `ret`/`ret imm16` instructions.
   - [x] Follow epilogue tail jumps using rel8/rel32, `rex.w jmp reg`, and
     RIP-relative `jmp qword ptr [rip+disp32]` targets outside the function.
-  - [ ] Add guest/native fault integration and validate remaining opcode
-    edge cases.
+  - [ ] Validate remaining virtual-unwind opcode and metadata edge cases.
   - [x] Capture current x64 control, integer, segment, and floating-point
     state through the native `RtlCaptureContext` entry point.
   - [x] Convert Linux x86-64 `ucontext_t` state and synchronous `SIGSEGV`,
     `SIGBUS`, `SIGILL`, and `SIGFPE` details into Windows-shaped records, and
     apply a modified guest `CONTEXT` back to Linux `ucontext_t`.
-  - [ ] Install the signal capture trampoline and dispatch native SEH handlers;
-    explicit raises still use a synthetic context.
+  - [x] Install synchronous Linux fault capture around the native image entry
+    point, dispatch registered vectored handlers and the unhandled exception
+    filter with the captured guest context, and resume when a handler edits it.
+  - [ ] Extend fault recovery to TLS callbacks and guest-created threads; they
+    currently do not have registered recovery slots.
+  - [ ] Connect PE frame-based SEH handlers to virtual unwinding and exception
+    dispatch; current fault delivery covers vectored handlers and the process
+    unhandled filter.
 
 ### P1: common command-line tools
 

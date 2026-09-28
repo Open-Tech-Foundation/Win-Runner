@@ -5,7 +5,8 @@ mod protection_tests {
     use super::{
         _exit, apply_windows_context_to_linux_ucontext, command_line_a,
         context_from_linux_ucontext, environment_block, exception_record_from_linux_signal,
-        linux_protection, load_native_child_image, native_acquire_srw_lock_exclusive,
+        install_guest_fault_signal_handlers, invoke_guest_with_fault_translation, linux_protection,
+        load_native_child_image, native_acquire_srw_lock_exclusive,
         native_add_vectored_exception_handler, native_close_handle, native_connect_socket,
         native_create_process_w, native_create_waitable_timer_ex_w, native_decode_pointer,
         native_delete_critical_section, native_encode_pointer, native_enter_critical_section,
@@ -49,6 +50,26 @@ mod protection_tests {
         NativeMemoryStatus, API_SET_MODULE, PROT_EXEC, PROT_READ, PROT_WRITE, THREAD_NATIVE_HANDLE,
     };
     use crate::winfs::WinFs;
+
+    extern "win64" fn continue_after_guest_sigill(
+        pointers: *mut super::NativeExceptionPointers,
+    ) -> i32 {
+        if pointers.is_null() {
+            return 0;
+        }
+        let pointers = unsafe { &mut *pointers };
+        if pointers.record.is_null() || pointers.context.is_null() {
+            return 0;
+        }
+        let record = unsafe { &*pointers.record };
+        if record.code != 0xc000_001d {
+            return 0;
+        }
+        let context = unsafe { &mut *pointers.context };
+        let rip = u64::from_le_bytes(context.bytes[248..256].try_into().unwrap());
+        context.bytes[248..256].copy_from_slice(&(rip + 2).to_le_bytes());
+        -1 // EXCEPTION_CONTINUE_EXECUTION
+    }
 
     fn require_kernel32_api(name: &'static [u8]) -> u64 {
         let address = super::native_get_proc_address(super::API_SET_MODULE, name.as_ptr());
@@ -6114,6 +6135,83 @@ mod protection_tests {
         assert_eq!(integer_divide.code, 0xc000_0094);
         assert_eq!(integer_divide.parameter_count, 0);
         assert!(exception_record_from_linux_signal(libc::SIGTERM, 0, 0, 0, 0).is_none());
+    }
+
+    #[test]
+    fn guest_sigill_is_translated_to_a_windows_exception_status() {
+        unsafe extern "win64" fn guest_illegal_instruction() -> u32 {
+            unsafe { core::arch::asm!("ud2", options(noreturn)) }
+        }
+
+        let child = unsafe { super::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            if install_guest_fault_signal_handlers().is_err() {
+                unsafe { _exit(127) };
+            }
+            if let Some(process) = process_ctx() {
+                process.vectored_exception_handlers.lock().unwrap().clear();
+                process
+                    .unhandled_exception_filter
+                    .store(0, std::sync::atomic::Ordering::Release);
+            }
+            let result = unsafe {
+                invoke_guest_with_fault_translation(
+                    guest_illegal_instruction as *const () as usize as u64,
+                )
+            };
+            let code = result.err().unwrap_or(0x7f) as i32;
+            unsafe { _exit(code & 0xff) };
+        }
+
+        let mut status = 0;
+        assert_eq!(unsafe { waitpid(child, &mut status, 0) }, child);
+        assert_eq!(status & 0x7f, 0);
+        assert_eq!((status >> 8) & 0xff, 0x1d); // STATUS_ILLEGAL_INSTRUCTION
+    }
+
+    #[test]
+    fn vectored_handler_can_resume_guest_from_modified_linux_context() {
+        unsafe extern "win64" fn guest_illegal_instruction_then_return() -> u32 {
+            // rustc emits `push rax` for this noreturn body, so undo its 8-byte
+            // frame before returning through the assembly call gate.
+            unsafe {
+                core::arch::asm!("ud2", "mov eax, 42", "add rsp, 8", "ret", options(noreturn))
+            }
+        }
+
+        let child = unsafe { super::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            if install_guest_fault_signal_handlers().is_err() {
+                unsafe { _exit(127) };
+            }
+            if let Some(process) = process_ctx() {
+                process.vectored_exception_handlers.lock().unwrap().clear();
+                process
+                    .unhandled_exception_filter
+                    .store(0, std::sync::atomic::Ordering::Release);
+            }
+            if native_add_vectored_exception_handler(
+                1,
+                continue_after_guest_sigill as *const () as usize as u64,
+            ) == 0
+            {
+                unsafe { _exit(126) };
+            }
+            let result = unsafe {
+                invoke_guest_with_fault_translation(
+                    guest_illegal_instruction_then_return as *const () as usize as u64,
+                )
+            };
+            let code = result.unwrap_or(0xfe) as i32;
+            unsafe { _exit(code & 0xff) };
+        }
+
+        let mut status = 0;
+        assert_eq!(unsafe { waitpid(child, &mut status, 0) }, child);
+        assert_eq!(status & 0x7f, 0);
+        assert_eq!((status >> 8) & 0xff, 42);
     }
 
     #[test]

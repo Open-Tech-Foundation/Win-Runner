@@ -2,6 +2,55 @@
 
 use super::*;
 
+const NATIVE_FAULT_SLOT_COUNT: usize = 64;
+
+#[repr(align(16))]
+struct NativeFaultFxState([u8; 512]);
+
+struct NativeFaultSlot {
+    thread_id: AtomicI32,
+    jump_buffer: std::cell::UnsafeCell<[u64; 32]>,
+    context: std::cell::UnsafeCell<std::mem::MaybeUninit<libc::ucontext_t>>,
+    fxstate: std::cell::UnsafeCell<NativeFaultFxState>,
+    signal: AtomicI32,
+    signal_code: AtomicI32,
+    fault_address: AtomicU64,
+    page_fault_error: AtomicU64,
+}
+
+impl NativeFaultSlot {
+    const fn new() -> Self {
+        Self {
+            thread_id: AtomicI32::new(0),
+            jump_buffer: std::cell::UnsafeCell::new([0; 32]),
+            context: std::cell::UnsafeCell::new(std::mem::MaybeUninit::uninit()),
+            fxstate: std::cell::UnsafeCell::new(NativeFaultFxState([0; 512])),
+            signal: AtomicI32::new(0),
+            signal_code: AtomicI32::new(0),
+            fault_address: AtomicU64::new(0),
+            page_fault_error: AtomicU64::new(0),
+        }
+    }
+
+    fn jump_buffer(&self) -> *mut std::ffi::c_void {
+        self.jump_buffer.get().cast()
+    }
+
+    unsafe fn context_mut(&self) -> &mut libc::ucontext_t {
+        unsafe { (&mut *self.context.get()).assume_init_mut() }
+    }
+}
+
+unsafe impl Sync for NativeFaultSlot {}
+
+static NATIVE_FAULT_SLOTS: [NativeFaultSlot; NATIVE_FAULT_SLOT_COUNT] =
+    [const { NativeFaultSlot::new() }; NATIVE_FAULT_SLOT_COUNT];
+static NATIVE_FAULT_HANDLERS_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+unsafe extern "C" {
+    fn siglongjmp(environment: *mut std::ffi::c_void, value: libc::c_int) -> !;
+}
+
 #[repr(C)]
 pub(super) struct NativeExceptionRecord {
     pub(super) code: u32,
@@ -35,7 +84,6 @@ impl NativeExceptionContext {
 
 /// Convert the interrupted Linux x86-64 register state into the Windows
 /// CONTEXT layout consumed by the native exception APIs.
-#[allow(dead_code)] // Wired into the fault trampoline in the next SEH step.
 pub(super) fn context_from_linux_ucontext(source: &libc::ucontext_t) -> NativeExceptionContext {
     let registers = &source.uc_mcontext.gregs;
     let mut context = NativeExceptionContext::software_exception();
@@ -88,7 +136,6 @@ pub(super) fn context_from_linux_ucontext(source: &libc::ucontext_t) -> NativeEx
 
 /// Apply a guest Windows CONTEXT back to the Linux signal frame so execution
 /// can resume from registers changed by a Windows exception handler.
-#[allow(dead_code)] // Wired into the signal trampoline alongside capture.
 pub(super) fn apply_windows_context_to_linux_ucontext(
     source: &NativeExceptionContext,
     destination: &mut libc::ucontext_t,
@@ -137,7 +184,6 @@ pub(super) fn apply_windows_context_to_linux_ucontext(
 
 /// Map a synchronous Linux x86-64 fault signal into its Windows status code
 /// and exception parameters. Asynchronous/user-generated signals are ignored.
-#[allow(dead_code)] // Wired into the fault trampoline in the next SEH step.
 pub(super) fn exception_record_from_linux_signal(
     signal: i32,
     signal_code: i32,
@@ -194,6 +240,141 @@ pub(super) fn exception_record_from_linux_signal(
     Some(record)
 }
 
+pub(super) fn install_guest_fault_signal_handlers() -> Result<(), String> {
+    if NATIVE_FAULT_HANDLERS_INSTALLED.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    for signal in [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGFPE] {
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = native_guest_fault_signal_handler as *const () as usize;
+        action.sa_flags = libc::SA_SIGINFO;
+        unsafe { libc::sigemptyset(&mut action.sa_mask) };
+        if unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) } != 0 {
+            return Err(format!(
+                "could not install guest fault handler for signal {signal}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    NATIVE_FAULT_HANDLERS_INSTALLED.store(true, Ordering::Release);
+    Ok(())
+}
+
+extern "C" fn native_guest_fault_signal_handler(
+    signal: libc::c_int,
+    signal_info: *mut libc::siginfo_t,
+    signal_context: *mut std::ffi::c_void,
+) {
+    if signal_info.is_null() || signal_context.is_null() {
+        unsafe { libc::_exit(128 + signal) };
+    }
+    let thread_id = unsafe { linux_current_thread_id() };
+    let Some(slot) = NATIVE_FAULT_SLOTS
+        .iter()
+        .find(|slot| slot.thread_id.load(Ordering::Relaxed) == thread_id)
+    else {
+        unsafe { libc::_exit(128 + signal) };
+    };
+
+    let source = signal_context.cast::<libc::ucontext_t>();
+    let destination = unsafe { (&mut *slot.context.get()).as_mut_ptr() };
+    unsafe { std::ptr::copy_nonoverlapping(source, destination, 1) };
+    let fpregs = unsafe { (*source).uc_mcontext.fpregs };
+    if !fpregs.is_null() {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                fpregs.cast::<u8>(),
+                (*slot.fxstate.get()).0.as_mut_ptr(),
+                512,
+            );
+            (*destination).uc_mcontext.fpregs = (*slot.fxstate.get()).0.as_mut_ptr().cast();
+        }
+    }
+    slot.signal.store(signal, Ordering::Relaxed);
+    slot.signal_code
+        .store(unsafe { (*signal_info).si_code }, Ordering::Relaxed);
+    slot.fault_address.store(
+        unsafe { (*signal_info).si_addr() } as u64,
+        Ordering::Relaxed,
+    );
+    slot.page_fault_error.store(
+        unsafe { (*source).uc_mcontext.gregs[libc::REG_ERR as usize] as u64 },
+        Ordering::Relaxed,
+    );
+    unsafe { siglongjmp(slot.jump_buffer(), 1) }
+}
+
+unsafe fn linux_current_thread_id() -> i32 {
+    let thread_id: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") libc::SYS_gettid as i64 => thread_id,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack)
+        );
+    }
+    thread_id as i32
+}
+
+extern "C" fn dispatch_linux_guest_fault(slot_pointer: *const std::ffi::c_void) -> i32 {
+    if slot_pointer.is_null() {
+        return 0xc000_0005u32 as i32; // STATUS_ACCESS_VIOLATION
+    }
+    let slot = unsafe { &*slot_pointer.cast::<NativeFaultSlot>() };
+    let signal = slot.signal.load(Ordering::Relaxed);
+    let signal_code = slot.signal_code.load(Ordering::Relaxed);
+    let fault_address = slot.fault_address.load(Ordering::Relaxed);
+    let page_fault_error = slot.page_fault_error.load(Ordering::Relaxed);
+    let linux_context = unsafe { slot.context_mut() };
+    let mut windows_context = context_from_linux_ucontext(linux_context);
+    let instruction_pointer = context_register(&windows_context, 16).unwrap_or(0);
+    let Some(mut record) = exception_record_from_linux_signal(
+        signal,
+        signal_code,
+        fault_address,
+        instruction_pointer,
+        page_fault_error,
+    ) else {
+        return 0xc000_001d_u32 as i32; // STATUS_ILLEGAL_INSTRUCTION fallback.
+    };
+
+    if dispatch_exception(&mut record, &mut windows_context) {
+        apply_windows_context_to_linux_ucontext(&windows_context, linux_context);
+        1 // The assembly call gate restores this context while its frame is alive.
+    } else {
+        record.code as i32
+    }
+}
+
+pub(super) unsafe fn invoke_guest_with_fault_translation(entry: u64) -> Result<u32, u32> {
+    let thread_id = unsafe { linux_current_thread_id() };
+    let Some(slot) = NATIVE_FAULT_SLOTS.iter().find(|slot| {
+        slot.thread_id
+            .compare_exchange(0, thread_id, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+    }) else {
+        return Err(0xc000_0017); // STATUS_NO_MEMORY: no fault slot available.
+    };
+    let mut guest_exit_code = 0;
+    let result = unsafe {
+        winrun_call_guest_with_signal_recovery(
+            entry,
+            slot.jump_buffer(),
+            &mut guest_exit_code,
+            dispatch_linux_guest_fault,
+            (slot as *const NativeFaultSlot).cast(),
+            slot.context.get().cast(),
+        )
+    };
+    slot.thread_id.store(0, Ordering::Release);
+    if result == 0 {
+        return Ok(guest_exit_code);
+    }
+    Err(guest_exit_code)
+}
+
 pub(super) extern "win64" fn native_set_unhandled_exception_filter(filter: u64) -> u64 {
     process_ctx()
         .map(|process| {
@@ -245,15 +426,14 @@ pub(super) extern "win64" fn native_remove_vectored_exception_handler(handle: u6
     }
 }
 
-fn dispatch_exception(record: &mut NativeExceptionRecord) -> bool {
+fn dispatch_exception(
+    record: &mut NativeExceptionRecord,
+    context: &mut NativeExceptionContext,
+) -> bool {
     let Some(process) = process_ctx() else {
         return false;
     };
-    let mut context = NativeExceptionContext::software_exception();
-    let mut pointers = NativeExceptionPointers {
-        record,
-        context: &mut context,
-    };
+    let mut pointers = NativeExceptionPointers { record, context };
     let callbacks: Vec<u64> = process
         .vectored_exception_handlers
         .lock()
@@ -306,7 +486,8 @@ pub(super) extern "win64" fn native_raise_exception(
             );
         }
     }
-    if !dispatch_exception(&mut record) {
+    let mut context = NativeExceptionContext::software_exception();
+    if !dispatch_exception(&mut record, &mut context) {
         native_exit_process(code)
     }
 }
@@ -321,7 +502,8 @@ pub(super) extern "win64" fn native_rtl_raise_exception(record: *mut NativeExcep
         native_set_last_error(87);
         return 87;
     }
-    if dispatch_exception(record) {
+    let mut context = NativeExceptionContext::software_exception();
+    if dispatch_exception(record, &mut context) {
         0
     } else {
         native_exit_process(record.code)
