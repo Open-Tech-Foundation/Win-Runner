@@ -6003,6 +6003,7 @@ mod protection_tests {
         context.bytes[152..160].copy_from_slice(&original_rsp.to_le_bytes());
         let mut handler_data = std::ptr::null_mut();
         let mut establisher = 0;
+        let mut context_pointers = [u64::MAX; 32];
 
         let handler = native_rtl_virtual_unwind(
             1,
@@ -6012,7 +6013,7 @@ mod protection_tests {
             &mut context,
             &mut handler_data,
             &mut establisher,
-            std::ptr::null_mut(),
+            context_pointers.as_mut_ptr().cast(),
         );
         assert_eq!(handler, base + 0x900);
         assert_eq!(handler_data, (base + 0x80c) as *mut std::ffi::c_void);
@@ -6029,6 +6030,11 @@ mod protection_tests {
             u64::from_le_bytes(context.bytes[152..160].try_into().unwrap()),
             original_rsp + 48
         );
+        assert_eq!(context_pointers[19], original_rsp + 32);
+        assert!(context_pointers
+            .iter()
+            .enumerate()
+            .all(|(slot, address)| slot == 19 || *address == 0));
     }
 
     #[test]
@@ -6078,6 +6084,7 @@ mod protection_tests {
         let xmm_rsp = xmm_stack.as_ptr() as u64;
         let mut xmm_context = super::NativeExceptionContext { bytes: [0; 1232] };
         xmm_context.bytes[152..160].copy_from_slice(&xmm_rsp.to_le_bytes());
+        let mut xmm_context_pointers = [0u64; 32];
         assert_eq!(
             native_rtl_virtual_unwind(
                 0,
@@ -6087,11 +6094,12 @@ mod protection_tests {
                 &mut xmm_context,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                std::ptr::null_mut(),
+                xmm_context_pointers.as_mut_ptr().cast(),
             ),
             0
         );
         assert_eq!(&xmm_context.bytes[512..528], &[0xa5; 16]);
+        assert_eq!(xmm_context_pointers[6], xmm_rsp);
         assert_eq!(
             u64::from_le_bytes(xmm_context.bytes[248..256].try_into().unwrap()),
             0x0000_7fff_3333_4444
@@ -6167,6 +6175,7 @@ mod protection_tests {
         let mut context = super::NativeExceptionContext { bytes: [0; 1232] };
         context.bytes[152..160].copy_from_slice(&original_rsp.to_le_bytes());
         context.bytes[160..168].copy_from_slice(&(original_rsp + 16).to_le_bytes());
+        let mut context_pointers = [0u64; 32];
 
         assert_eq!(
             native_rtl_virtual_unwind(
@@ -6177,7 +6186,7 @@ mod protection_tests {
                 &mut context,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                std::ptr::null_mut(),
+                context_pointers.as_mut_ptr().cast(),
             ),
             0
         );
@@ -6193,6 +6202,7 @@ mod protection_tests {
             u64::from_le_bytes(context.bytes[152..160].try_into().unwrap()),
             original_rsp + 40
         );
+        assert_eq!(context_pointers[28], original_rsp + 16);
     }
 
     #[test]

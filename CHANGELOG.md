@@ -20,6 +20,8 @@ All notable changes to this project will be documented in this file.
   allocations, machine frames, and optional language-handler metadata.
 - Follow bounded `UNW_FLAG_CHAININFO` records during x64 virtual unwinding,
   including cycle detection and primary-handler metadata.
+- Populate the optional x64 `KNONVOLATILE_CONTEXT_POINTERS` output for saved
+  integer and XMM registers during virtual unwinding.
 - Detect .NET Framework `_CorExeMain`/`_CorDllMain` images and report the clear
   unsupported-runtime limitation in `winrun inspect` and native execution.
 - Replaced the PS1 interpreter's proposed install-script .NET API expansion

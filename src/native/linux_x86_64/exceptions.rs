@@ -308,7 +308,7 @@ pub(super) extern "win64" fn native_rtl_virtual_unwind(
     context_record: *mut NativeExceptionContext,
     handler_data: *mut *mut c_void,
     establisher_frame: *mut u64,
-    _context_pointers: *mut c_void,
+    context_pointers: *mut c_void,
 ) -> u64 {
     if context_record.is_null() || handler_type > 2 {
         native_set_last_error(87); // ERROR_INVALID_PARAMETER
@@ -317,6 +317,7 @@ pub(super) extern "win64" fn native_rtl_virtual_unwind(
     if !handler_data.is_null() {
         unsafe { handler_data.write(std::ptr::null_mut()) };
     }
+    clear_context_pointers(context_pointers);
     let mut context = unsafe { context_record.read_unaligned() };
     let original_rsp = context_register(&context, 4).unwrap_or(0);
     if original_rsp == 0 {
@@ -385,6 +386,7 @@ pub(super) extern "win64" fn native_rtl_virtual_unwind(
                     return 0;
                 };
                 context_set_register(&mut context, info, value);
+                set_context_pointer(context_pointers, 16 + usize::from(info), rsp);
                 let Some(next_rsp) = rsp.checked_add(8) else {
                     return 0;
                 };
@@ -452,6 +454,7 @@ pub(super) extern "win64" fn native_rtl_virtual_unwind(
                     return 0;
                 };
                 context_set_register(&mut context, info, value);
+                set_context_pointer(context_pointers, 16 + usize::from(info), address);
             }
             8 | 9 => {
                 if !(6..=15).contains(&info) {
@@ -482,6 +485,7 @@ pub(super) extern "win64" fn native_rtl_virtual_unwind(
                 let xmm_offset = 416 + usize::from(info) * 16;
                 let saved = unsafe { std::slice::from_raw_parts(address as *const u8, 16) };
                 context.bytes[xmm_offset..xmm_offset + 16].copy_from_slice(saved);
+                set_context_pointer(context_pointers, usize::from(info), address);
             }
             10 => {
                 if info > 1 {
@@ -562,6 +566,25 @@ pub(super) extern "win64" fn native_rtl_virtual_unwind(
         unsafe { establisher_frame.write(establisher) };
     }
     handler
+}
+
+fn clear_context_pointers(context_pointers: *mut c_void) {
+    if !context_pointers.is_null() {
+        unsafe {
+            std::ptr::write_bytes(context_pointers.cast::<u64>(), 0, 32);
+        }
+    }
+}
+
+fn set_context_pointer(context_pointers: *mut c_void, slot: usize, address: u64) {
+    if !context_pointers.is_null() {
+        unsafe {
+            context_pointers
+                .cast::<u64>()
+                .add(slot)
+                .write_unaligned(address);
+        }
+    }
 }
 
 fn context_register(context: &NativeExceptionContext, register: u8) -> Option<u64> {
