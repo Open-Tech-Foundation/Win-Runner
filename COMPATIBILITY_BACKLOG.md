@@ -101,6 +101,8 @@ Items remain open until implementation and relevant verification are complete.
     `__p___initenv` and `__p___winitenv`.
   - [x] Expose existing file/commit mode storage through `__p__fmode` and
     `__p__commode`.
+  - [x] Add `_wgetenv` for case-insensitive lookup of UTF-16 guest environment
+    variables.
   - [x] Implement `_configure_narrow_argv`, `_initialize_narrow_environment`,
     `_set_new_mode`, and `_configthreadlocale`.
   - [x] Register `_crt_atexit`, `_register_onexit_function`, and `_onexit`

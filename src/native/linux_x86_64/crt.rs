@@ -7,6 +7,8 @@ thread_local! {
     static THREAD_CRT_LOCALE_MODE: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
     pub(super) static THREAD_CRT_GETENV_VALUE: std::cell::RefCell<Vec<u8>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    static THREAD_CRT_WGETENV_VALUE: std::cell::RefCell<Vec<u16>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 pub(super) static NATIVE_CRT_SIGNAL_HANDLERS: LazyLock<Mutex<HashMap<(u32, i32), u64>>> =
@@ -165,6 +167,40 @@ pub(super) extern "win64" fn native_crt_getenv(name: *const u8) -> *mut u8 {
         let mut buffer = buffer.borrow_mut();
         buffer.clear();
         buffer.extend_from_slice(value.as_bytes());
+        buffer.push(0);
+        buffer.as_mut_ptr()
+    })
+}
+
+pub(super) extern "win64" fn native_crt_wgetenv(name: *const u16) -> *mut u16 {
+    if name.is_null() {
+        return std::ptr::null_mut();
+    }
+    let mut key = Vec::new();
+    for index in 0..32768usize {
+        let unit = unsafe { name.add(index).read() };
+        if unit == 0 {
+            break;
+        }
+        key.push(unit);
+    }
+    if key.is_empty() {
+        return std::ptr::null_mut();
+    }
+    let key = String::from_utf16_lossy(&key);
+    let Some(value) = process_ctx().and_then(|process| {
+        process.environment.lock().ok().and_then(|environment| {
+            environment
+                .iter()
+                .find_map(|(name, value)| name.eq_ignore_ascii_case(&key).then(|| value.clone()))
+        })
+    }) else {
+        return std::ptr::null_mut();
+    };
+    THREAD_CRT_WGETENV_VALUE.with(|buffer| {
+        let mut buffer = buffer.borrow_mut();
+        buffer.clear();
+        buffer.extend(value.encode_utf16());
         buffer.push(0);
         buffer.as_mut_ptr()
     })

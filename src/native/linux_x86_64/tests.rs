@@ -2852,8 +2852,49 @@ mod protection_tests {
     }
 
     #[test]
+    fn crt_wgetenv_reads_unicode_guest_values_case_insensitively() {
+        let key: Vec<u16> = "WINRUN_TEST_CRT_WGETENV"
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        let value: Vec<u16> = "guest ☀ value".encode_utf16().chain([0]).collect();
+        assert_eq!(
+            super::native_set_environment_variable_w(key.as_ptr(), value.as_ptr()),
+            1
+        );
+
+        let lookup: Vec<u16> = "winrun_test_crt_wgetenv"
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        let result = super::native_crt_wgetenv(lookup.as_ptr());
+        assert!(!result.is_null());
+        let mut length = 0;
+        while unsafe { *result.add(length) != 0 } {
+            length += 1;
+        }
+        assert_eq!(
+            unsafe { String::from_utf16(std::slice::from_raw_parts(result, length)).unwrap() },
+            "guest ☀ value"
+        );
+        assert!(super::native_crt_wgetenv([0u16].as_ptr()).is_null());
+        assert!(super::native_crt_wgetenv(
+            "WINRUN_MISSING_CRT_WGETENV\0"
+                .encode_utf16()
+                .collect::<Vec<_>>()
+                .as_ptr()
+        )
+        .is_null());
+        assert_eq!(
+            super::native_set_environment_variable_w(key.as_ptr(), std::ptr::null()),
+            1
+        );
+    }
+
+    #[test]
     fn import_binding_checks_the_dll_as_well_as_the_function() {
         for export in [
+            "_wgetenv",
             "__p__fmode",
             "__p__commode",
             "_configure_wide_argv",

@@ -77,6 +77,7 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                     | "_strnicmp"
                     | "_errno"
                     | "getenv"
+                    | "_wgetenv"
                     | "__iob_func"
                     | "__acrt_iob_func"
                     | "__stdio_common_vfprintf"
@@ -241,6 +242,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "__p__commode" => Some(native_crt_p_commode as *const () as usize as u64),
         "_errno" => Some(native_crt_errno as *const () as usize as u64),
         "getenv" => Some(native_crt_getenv as *const () as usize as u64),
+        "_wgetenv" => Some(native_crt_wgetenv as *const () as usize as u64),
         "__iob_func" => Some(native_crt_iob_func as *const () as usize as u64),
         "__acrt_iob_func" => Some(native_crt_acrt_iob_func as *const () as usize as u64),
         "__stdio_common_vfprintf" => {
