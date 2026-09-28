@@ -28,9 +28,9 @@ All notable changes to this project will be documented in this file.
   RIP-relative memory-indirect targets outside the current function.
 - Add direct ABI coverage for x64 `RtlCaptureContext`, including caller control,
   integer, segment, and FXSAVE state fields.
-- Add Linux x86-64 fault-context conversion to Windows `CONTEXT` and map
-  synchronous `SIGSEGV`, `SIGBUS`, `SIGILL`, and `SIGFPE` metadata to Windows
-  exception records.
+- Convert Linux x86-64 fault contexts to Windows `CONTEXT` and apply modified
+  guest contexts back to Linux `ucontext_t`; map synchronous `SIGSEGV`,
+  `SIGBUS`, `SIGILL`, and `SIGFPE` metadata to Windows exception records.
 - Detect .NET Framework `_CorExeMain`/`_CorDllMain` images and report the clear
   unsupported-runtime limitation in `winrun inspect` and native execution.
 - Replaced the PS1 interpreter's proposed install-script .NET API expansion

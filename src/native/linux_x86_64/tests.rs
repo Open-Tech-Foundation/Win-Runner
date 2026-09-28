@@ -3,18 +3,18 @@ use super::*;
 #[cfg(test)]
 mod protection_tests {
     use super::{
-        _exit, command_line_a, context_from_linux_ucontext, environment_block,
-        exception_record_from_linux_signal, linux_protection, load_native_child_image,
-        native_acquire_srw_lock_exclusive, native_add_vectored_exception_handler,
-        native_close_handle, native_connect_socket, native_create_process_w,
-        native_create_waitable_timer_ex_w, native_decode_pointer, native_delete_critical_section,
-        native_encode_pointer, native_enter_critical_section, native_extended_path,
-        native_file_attributes, native_format_message_a, native_format_message_w,
-        native_free_environment_strings_w, native_get_acp, native_get_computer_name_ex_w,
-        native_get_console_cursor_info, native_get_console_mode, native_get_console_output_cp,
-        native_get_console_screen_buffer_info, native_get_cp_info, native_get_current_directory_w,
-        native_get_current_process, native_get_current_process_id, native_get_current_thread,
-        native_get_current_thread_id, native_get_environment_strings_w,
+        _exit, apply_windows_context_to_linux_ucontext, command_line_a,
+        context_from_linux_ucontext, environment_block, exception_record_from_linux_signal,
+        linux_protection, load_native_child_image, native_acquire_srw_lock_exclusive,
+        native_add_vectored_exception_handler, native_close_handle, native_connect_socket,
+        native_create_process_w, native_create_waitable_timer_ex_w, native_decode_pointer,
+        native_delete_critical_section, native_encode_pointer, native_enter_critical_section,
+        native_extended_path, native_file_attributes, native_format_message_a,
+        native_format_message_w, native_free_environment_strings_w, native_get_acp,
+        native_get_computer_name_ex_w, native_get_console_cursor_info, native_get_console_mode,
+        native_get_console_output_cp, native_get_console_screen_buffer_info, native_get_cp_info,
+        native_get_current_directory_w, native_get_current_process, native_get_current_process_id,
+        native_get_current_thread, native_get_current_thread_id, native_get_environment_strings_w,
         native_get_environment_variable_w, native_get_exit_code_process, native_get_file_type,
         native_get_full_path_name_w, native_get_last_error, native_get_module_file_name_w,
         native_get_module_handle_a, native_get_module_handle_ex_w, native_get_module_handle_w,
@@ -6020,7 +6020,7 @@ mod protection_tests {
         }
         linux.uc_mcontext.fpregs = fxstate.0.as_mut_ptr().cast();
 
-        let context = context_from_linux_ucontext(&linux);
+        let mut context = context_from_linux_ucontext(&linux);
 
         assert_eq!(
             u32::from_le_bytes(context.bytes[48..52].try_into().unwrap()),
@@ -6063,6 +6063,25 @@ mod protection_tests {
             0x2b
         );
         assert_eq!(&context.bytes[256..768], &[0x5a; 512]);
+
+        context.bytes[128..136].copy_from_slice(&0x7777u64.to_le_bytes());
+        context.bytes[248..256].copy_from_slice(&0x8888u64.to_le_bytes());
+        context.bytes[68..72].copy_from_slice(&0x246u32.to_le_bytes());
+        context.bytes[56..58].copy_from_slice(&0x23u16.to_le_bytes());
+        context.bytes[64..66].copy_from_slice(&0x33u16.to_le_bytes());
+        context.bytes[62..64].copy_from_slice(&0x44u16.to_le_bytes());
+        context.bytes[66..68].copy_from_slice(&0x2bu16.to_le_bytes());
+        context.bytes[256..768].fill(0xa5);
+        apply_windows_context_to_linux_ucontext(&context, &mut linux);
+
+        assert_eq!(linux.uc_mcontext.gregs[libc::REG_RCX as usize], 0x7777);
+        assert_eq!(linux.uc_mcontext.gregs[libc::REG_RIP as usize], 0x8888);
+        assert_eq!(linux.uc_mcontext.gregs[libc::REG_EFL as usize], 0x246);
+        assert_eq!(
+            linux.uc_mcontext.gregs[libc::REG_CSGSFS as usize] as u64,
+            0x002b_0044_0033_0023
+        );
+        assert_eq!(&fxstate.0, &[0xa5; 512]);
     }
 
     #[test]

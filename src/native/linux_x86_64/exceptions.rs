@@ -86,6 +86,55 @@ pub(super) fn context_from_linux_ucontext(source: &libc::ucontext_t) -> NativeEx
     context
 }
 
+/// Apply a guest Windows CONTEXT back to the Linux signal frame so execution
+/// can resume from registers changed by a Windows exception handler.
+#[allow(dead_code)] // Wired into the signal trampoline alongside capture.
+pub(super) fn apply_windows_context_to_linux_ucontext(
+    source: &NativeExceptionContext,
+    destination: &mut libc::ucontext_t,
+) {
+    let registers = &mut destination.uc_mcontext.gregs;
+    for (windows_register, linux_register) in [
+        (0, libc::REG_RAX),
+        (1, libc::REG_RCX),
+        (2, libc::REG_RDX),
+        (3, libc::REG_RBX),
+        (4, libc::REG_RSP),
+        (5, libc::REG_RBP),
+        (6, libc::REG_RSI),
+        (7, libc::REG_RDI),
+        (8, libc::REG_R8),
+        (9, libc::REG_R9),
+        (10, libc::REG_R10),
+        (11, libc::REG_R11),
+        (12, libc::REG_R12),
+        (13, libc::REG_R13),
+        (14, libc::REG_R14),
+        (15, libc::REG_R15),
+        (16, libc::REG_RIP),
+    ] {
+        registers[linux_register as usize] =
+            context_register(source, windows_register).unwrap_or(0) as libc::greg_t;
+    }
+    registers[libc::REG_EFL as usize] =
+        u32::from_le_bytes(source.bytes[68..72].try_into().unwrap()) as libc::greg_t;
+    let cs = u16::from_le_bytes(source.bytes[56..58].try_into().unwrap()) as u64;
+    let gs = u16::from_le_bytes(source.bytes[64..66].try_into().unwrap()) as u64;
+    let fs = u16::from_le_bytes(source.bytes[62..64].try_into().unwrap()) as u64;
+    let ss = u16::from_le_bytes(source.bytes[66..68].try_into().unwrap()) as u64;
+    registers[libc::REG_CSGSFS as usize] = (cs | gs << 16 | fs << 32 | ss << 48) as libc::greg_t;
+
+    if !destination.uc_mcontext.fpregs.is_null() {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                source.bytes.as_ptr().add(256),
+                destination.uc_mcontext.fpregs.cast::<u8>(),
+                512,
+            );
+        }
+    }
+}
+
 /// Map a synchronous Linux x86-64 fault signal into its Windows status code
 /// and exception parameters. Asynchronous/user-generated signals are ignored.
 #[allow(dead_code)] // Wired into the fault trampoline in the next SEH step.
@@ -981,6 +1030,7 @@ fn context_register(context: &NativeExceptionContext, register: u8) -> Option<u6
         13 => 224, // R13
         14 => 232, // R14
         15 => 240, // R15
+        16 => 248, // RIP
         _ => return None,
     };
     Some(u64::from_le_bytes(
