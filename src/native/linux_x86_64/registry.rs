@@ -100,6 +100,7 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                     | "_access"
                     | "calloc"
                     | "fopen"
+                    | "_wfopen"
                     | "fread"
                     | "fclose"
                     | "feof"
@@ -331,6 +332,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "_access" => Some(native_crt_access as *const () as usize as u64),
         "calloc" => Some(native_crt_calloc as *const () as usize as u64),
         "fopen" => Some(native_crt_fopen as *const () as usize as u64),
+        "_wfopen" => Some(native_crt_wfopen as *const () as usize as u64),
         "fread" => Some(native_crt_fread as *const () as usize as u64),
         "fclose" => Some(native_crt_fclose as *const () as usize as u64),
         "feof" => Some(native_crt_feof as *const () as usize as u64),

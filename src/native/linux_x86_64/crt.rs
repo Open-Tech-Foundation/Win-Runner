@@ -2552,19 +2552,7 @@ pub(super) extern "win64" fn native_crt_puts(input: *const u8) -> i32 {
         0
     }
 }
-pub(super) extern "win64" fn native_crt_fopen(path: *const u8, mode: *const u8) -> *mut u8 {
-    if path.is_null() || mode.is_null() {
-        THREAD_CRT_ERRNO.with(|errno| errno.set(22));
-        return std::ptr::null_mut();
-    }
-    let mut mode_bytes = Vec::new();
-    for offset in 0..64usize {
-        let byte = unsafe { mode.add(offset).read() };
-        if byte == 0 {
-            break;
-        }
-        mode_bytes.push(byte);
-    }
+fn native_crt_open_wide_path(path: &[u16], mode_bytes: &[u8]) -> *mut u8 {
     if mode_bytes.is_empty() || mode_bytes.len() == 64 {
         THREAD_CRT_ERRNO.with(|errno| errno.set(22));
         return std::ptr::null_mut();
@@ -2598,11 +2586,7 @@ pub(super) extern "win64" fn native_crt_fopen(path: *const u8, mode: *const u8) 
             return std::ptr::null_mut();
         }
     };
-    let Some(wide_path) = native_ansi_path(path) else {
-        THREAD_CRT_ERRNO.with(|errno| errno.set(22));
-        return std::ptr::null_mut();
-    };
-    let handle = native_create_file_w(wide_path.as_ptr(), access, 7, 0, creation, 0, 0);
+    let handle = native_create_file_w(path.as_ptr(), access, 7, 0, creation, 0, 0);
     if handle == u64::MAX {
         THREAD_CRT_ERRNO.with(|errno| {
             errno.set(match native_get_last_error() {
@@ -2635,6 +2619,74 @@ pub(super) extern "win64" fn native_crt_fopen(path: *const u8, mode: *const u8) 
         });
     }
     file.cast()
+}
+
+fn native_crt_read_mode_a(mode: *const u8) -> Option<Vec<u8>> {
+    if mode.is_null() {
+        return None;
+    }
+    let mut mode_bytes = Vec::new();
+    for offset in 0..64usize {
+        let byte = unsafe { mode.add(offset).read() };
+        if byte == 0 {
+            return (!mode_bytes.is_empty()).then_some(mode_bytes);
+        }
+        mode_bytes.push(byte);
+    }
+    None
+}
+
+fn native_crt_read_mode_w(mode: *const u16) -> Option<Vec<u8>> {
+    if mode.is_null() {
+        return None;
+    }
+    let mut mode_bytes = Vec::new();
+    for offset in 0..64usize {
+        let unit = unsafe { mode.add(offset).read() };
+        if unit == 0 {
+            return (!mode_bytes.is_empty()).then_some(mode_bytes);
+        }
+        if unit > u8::MAX as u16 {
+            return None;
+        }
+        mode_bytes.push(unit as u8);
+    }
+    None
+}
+
+fn native_crt_read_wide_path(path: *const u16) -> Option<Vec<u16>> {
+    if path.is_null() {
+        return None;
+    }
+    let mut output = Vec::new();
+    for offset in 0..32768usize {
+        let unit = unsafe { path.add(offset).read() };
+        output.push(unit);
+        if unit == 0 {
+            return Some(output);
+        }
+    }
+    None
+}
+
+pub(super) extern "win64" fn native_crt_fopen(path: *const u8, mode: *const u8) -> *mut u8 {
+    let (Some(mode_bytes), Some(path)) = (native_crt_read_mode_a(mode), native_ansi_path(path))
+    else {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+        return std::ptr::null_mut();
+    };
+    native_crt_open_wide_path(&path, &mode_bytes)
+}
+
+pub(super) extern "win64" fn native_crt_wfopen(path: *const u16, mode: *const u16) -> *mut u8 {
+    let (Some(mode_bytes), Some(path)) = (
+        native_crt_read_mode_w(mode),
+        native_crt_read_wide_path(path),
+    ) else {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+        return std::ptr::null_mut();
+    };
+    native_crt_open_wide_path(&path, &mode_bytes)
 }
 
 fn native_crt_file(stream: *mut u8) -> Option<*mut NativeCrtFile> {

@@ -120,6 +120,8 @@ Items remain open until implementation and relevant verification are complete.
     compatibility remain unsupported.
   - [x] Add unbuffered WinFS-backed `fopen`, `fread`, `fwrite`, and `fclose`;
     buffering and wide file modes remain unsupported.
+  - [x] Add `_wfopen` with UTF-16 paths using the same unbuffered WinFS stream
+    implementation.
   - [x] Add `fseek`/`ftell`, `_fseeki64`/`_ftelli64`, and `rewind` for these
     file-backed streams.
   - [x] Track EOF/error state and add `feof`, `ferror`, `clearerr`, `fgetc`,

@@ -2309,6 +2309,21 @@ mod protection_tests {
     }
 
     #[test]
+    fn ucrt_wfopen_preserves_utf16_paths_in_winfs() {
+        let path = r"C:\crt-wide-☀.txt";
+        let path_wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+        let mode_wide = "w+b".encode_utf16().chain([0]).collect::<Vec<_>>();
+        let stream = super::native_crt_wfopen(path_wide.as_ptr(), mode_wide.as_ptr());
+        assert!(!stream.is_null());
+        assert_eq!(super::native_crt_fwrite(b"wide".as_ptr(), 1, 4, stream), 4);
+        assert_eq!(super::native_crt_fclose(stream), 0);
+        let context = super::fs_ctx().unwrap();
+        assert_eq!(context.lock().unwrap().fs.read_file(path).unwrap(), b"wide");
+        assert!(super::supports_import("UCRTBASE.DLL", "_wfopen"));
+        assert!(super::supports_import("MSVCRT.DLL", "_wfopen"));
+    }
+
+    #[test]
     fn crt_fprintf_formats_into_a_winfs_file_stream() {
         let path = b"C:\\crt-fprintf-roundtrip.txt\0";
         let mode = b"w+b\0";

@@ -31,6 +31,8 @@ All notable changes to this project will be documented in this file.
 - Add CRT `_putenv` and `_wputenv` parsing for environment assignment and
   deletion; updates flow through the Windows environment API and refresh the
   current CRT arrays.
+- Add UCRT/MSVCRT `_wfopen` support with direct UTF-16 path handling and the
+  existing WinFS-backed file stream behavior.
 - Add stable UTF-16 CRT startup arrays and accessors for wide arguments and
   environment variables, including `_configure_wide_argv`, `__p___wargv`, and
   the initial/environment pointer APIs.
