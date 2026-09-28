@@ -111,6 +111,9 @@ Items remain open until implementation and relevant verification are complete.
   - [ ] Add `_seh_filter_exe` and remaining startup exports.
 - [ ] Add basic `msvcrt.dll` output and remaining file I/O, including `printf`.
   - [x] Share the unbuffered `fopen`/`fread`/`fwrite`/`fclose` subset with MSVCRT.
+  - [x] Add narrow `printf`/`fprintf` through the shared formatter; the current
+    ABI bridge captures at most ten vararg slots and supports only the listed
+    narrow conversions.
 - [ ] Add VCRUNTIME140 exception handlers, `_CxxThrowException`, and memory
   functions needed by C++ and default Rust MSVC binaries.
 - [ ] Implement structured exception lookup/unwind/raise APIs and translate

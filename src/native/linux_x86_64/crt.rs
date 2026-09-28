@@ -1135,8 +1135,8 @@ pub(super) extern "win64" fn native_crt_fflush(_file: *mut u8) -> i32 {
     0
 }
 
-fn crt_read_argument(arguments: *mut c_void, index: &mut usize) -> Option<u64> {
-    if arguments.is_null() {
+fn crt_read_argument(arguments: *mut c_void, index: &mut usize, limit: usize) -> Option<u64> {
+    if arguments.is_null() || *index >= limit {
         return None;
     }
     let address = (arguments as usize).checked_add(index.checked_mul(8)?)?;
@@ -1161,6 +1161,14 @@ fn crt_read_argument_string(pointer: u64) -> Vec<u8> {
 }
 
 fn crt_format_narrow(format: *const u8, arguments: *mut c_void) -> Option<Vec<u8>> {
+    crt_format_narrow_limited(format, arguments, 256)
+}
+
+fn crt_format_narrow_limited(
+    format: *const u8,
+    arguments: *mut c_void,
+    argument_limit: usize,
+) -> Option<Vec<u8>> {
     if format.is_null() {
         return None;
     }
@@ -1205,7 +1213,7 @@ fn crt_format_narrow(format: *const u8, arguments: *mut c_void) -> Option<Vec<u8
         }
         let mut width = 0usize;
         if format_byte(cursor)? == b'*' {
-            let value = crt_read_argument(arguments, &mut arg_index)? as i32;
+            let value = crt_read_argument(arguments, &mut arg_index, argument_limit)? as i32;
             cursor += 1;
             if value < 0 {
                 left = true;
@@ -1230,7 +1238,7 @@ fn crt_format_narrow(format: *const u8, arguments: *mut c_void) -> Option<Vec<u8
         if format_byte(cursor)? == b'.' {
             cursor += 1;
             if format_byte(cursor)? == b'*' {
-                let value = crt_read_argument(arguments, &mut arg_index)? as i32;
+                let value = crt_read_argument(arguments, &mut arg_index, argument_limit)? as i32;
                 cursor += 1;
                 if value >= 0 {
                     precision = Some((value as usize).min(MAX_OUTPUT_BYTES));
@@ -1286,13 +1294,13 @@ fn crt_format_narrow(format: *const u8, arguments: *mut c_void) -> Option<Vec<u8
         }
         cursor += 1;
         if specifier == b'n' {
-            let pointer = crt_read_argument(arguments, &mut arg_index)? as *mut i32;
+            let pointer = crt_read_argument(arguments, &mut arg_index, argument_limit)? as *mut i32;
             unsafe { pointer.write_unaligned(output.len() as i32) };
             continue;
         }
         let mut field = match specifier {
             b's' => {
-                let value = crt_read_argument(arguments, &mut arg_index)?;
+                let value = crt_read_argument(arguments, &mut arg_index, argument_limit)?;
                 let mut value = crt_read_argument_string(value);
                 if let Some(limit) = precision {
                     value.truncate(limit);
@@ -1314,9 +1322,9 @@ fn crt_format_narrow(format: *const u8, arguments: *mut c_void) -> Option<Vec<u8
                 }
                 continue;
             }
-            b'c' => vec![crt_read_argument(arguments, &mut arg_index)? as u8],
+            b'c' => vec![crt_read_argument(arguments, &mut arg_index, argument_limit)? as u8],
             b'd' | b'i' => {
-                let raw = crt_read_argument(arguments, &mut arg_index)?;
+                let raw = crt_read_argument(arguments, &mut arg_index, argument_limit)?;
                 let value = match integer_bits {
                     8 => raw as i8 as i64,
                     16 => raw as i16 as i64,
@@ -1339,7 +1347,7 @@ fn crt_format_narrow(format: *const u8, arguments: *mut c_void) -> Option<Vec<u8
                 rendered.into_bytes()
             }
             b'u' | b'x' | b'X' | b'o' => {
-                let raw = crt_read_argument(arguments, &mut arg_index)?;
+                let raw = crt_read_argument(arguments, &mut arg_index, argument_limit)?;
                 let value = match integer_bits {
                     8 => raw as u8 as u64,
                     16 => raw as u16 as u64,
@@ -1366,9 +1374,17 @@ fn crt_format_narrow(format: *const u8, arguments: *mut c_void) -> Option<Vec<u8
                 }
                 rendered.into_bytes()
             }
-            b'p' => format!("0x{:x}", crt_read_argument(arguments, &mut arg_index)?).into_bytes(),
+            b'p' => format!(
+                "0x{:x}",
+                crt_read_argument(arguments, &mut arg_index, argument_limit)?
+            )
+            .into_bytes(),
             b'f' | b'F' | b'e' | b'E' | b'g' | b'G' => {
-                let value = f64::from_bits(crt_read_argument(arguments, &mut arg_index)?);
+                let value = f64::from_bits(crt_read_argument(
+                    arguments,
+                    &mut arg_index,
+                    argument_limit,
+                )?);
                 let rendered = match (specifier, precision) {
                     (b'e' | b'E', Some(precision)) => format!("{value:.precision$e}"),
                     (_, Some(precision)) => format!("{value:.precision$}"),
@@ -1447,6 +1463,58 @@ pub(super) extern "win64" fn native_crt_stdio_common_vsprintf(
         output.add(copied).write(0);
     }
     bytes.len().min(i32::MAX as usize) as i32
+}
+
+fn native_crt_format_to_stream(stream: *mut u8, format: *const u8, arguments: &[u64]) -> i32 {
+    let Some(bytes) =
+        crt_format_narrow_limited(format, arguments.as_ptr() as *mut c_void, arguments.len())
+    else {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+        return -1;
+    };
+    let written = native_crt_fwrite(bytes.as_ptr(), 1, bytes.len(), stream);
+    if written == bytes.len() {
+        written.min(i32::MAX as usize) as i32
+    } else {
+        -1
+    }
+}
+
+pub(super) extern "win64" fn native_crt_printf(
+    format: *const u8,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    a6: u64,
+    a7: u64,
+    a8: u64,
+    a9: u64,
+) -> i32 {
+    native_crt_format_to_stream(
+        native_crt_acrt_iob_func(1),
+        format,
+        &[a0, a1, a2, a3, a4, a5, a6, a7, a8, a9],
+    )
+}
+
+pub(super) extern "win64" fn native_crt_fprintf(
+    stream: *mut u8,
+    format: *const u8,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    a6: u64,
+    a7: u64,
+    a8: u64,
+    a9: u64,
+) -> i32 {
+    native_crt_format_to_stream(stream, format, &[a0, a1, a2, a3, a4, a5, a6, a7, a8, a9])
 }
 pub(super) extern "win64" fn native_crt_fputs(input: *const u8, _file: *mut u8) -> i32 {
     let len = native_crt_strlen(input);

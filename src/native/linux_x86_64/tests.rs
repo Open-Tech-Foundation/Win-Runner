@@ -2162,6 +2162,41 @@ mod protection_tests {
     }
 
     #[test]
+    fn crt_fprintf_formats_into_a_winfs_file_stream() {
+        let path = b"C:\\crt-fprintf-roundtrip.txt\0";
+        let mode = b"w+b\0";
+        let stream = super::native_crt_fopen(path.as_ptr(), mode.as_ptr());
+        assert!(!stream.is_null());
+        let name = b"guest\0";
+        let format = b"%s:%d %#x%%\0";
+        let written = super::native_crt_fprintf(
+            stream,
+            format.as_ptr(),
+            name.as_ptr() as u64,
+            (-7i64) as u64,
+            42,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(written, 14);
+        super::native_crt_rewind(stream);
+        let mut output = [0; 32];
+        assert_eq!(
+            super::native_crt_fread(output.as_mut_ptr(), 1, 32, stream),
+            14
+        );
+        assert_eq!(&output[..14], b"guest:-7 0x2a%");
+        assert_eq!(super::native_crt_fclose(stream), 0);
+        assert!(super::supports_import("MSVCRT.DLL", "printf"));
+        assert!(super::supports_import("MSVCRT.DLL", "fprintf"));
+    }
+
+    #[test]
     fn crt_sprintf_formats_strings_integers_and_escaped_percent() {
         let name = b"nano\0";
         let format = b"%s:%04d %%\0";

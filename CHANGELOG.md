@@ -63,6 +63,8 @@ All notable changes to this project will be documented in this file.
   `clearerr`, `fgetc`, `fgets`, and one-byte `ungetc` pushback.
 - Add standard-stream `getchar`, `putchar`, and `puts` using the guest's current
   Windows standard handles.
+- Add narrow `printf`/`fprintf` wrappers using the common formatter, with ten
+  captured Windows x64 vararg slots.
 - Add CRT `strtol`, `strtod`, and `strstr` shims with radix parsing, end-pointer
   reporting, common decimal/special floating-point input, and range errors.
 - Add in-place CRT `qsort` using the guest comparator and `_time64` using the
