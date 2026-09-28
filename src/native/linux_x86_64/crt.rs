@@ -4,6 +4,7 @@ use super::*;
 
 thread_local! {
     pub(super) static THREAD_CRT_ERRNO: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+    static THREAD_CRT_LOCALE_MODE: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
     pub(super) static THREAD_CRT_GETENV_VALUE: std::cell::RefCell<Vec<u8>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
@@ -95,9 +96,170 @@ pub(super) extern "win64" fn native_crt_setlocale(category: i32, locale: *const 
     }
     NATIVE_CRT_C_LOCALE.as_ptr()
 }
-pub(super) extern "win64" fn native_crt_cexit() {}
+fn build_crt_startup(command_line: &[u8], environment: &[(String, String)]) -> NativeCrtStartup {
+    let line = String::from_utf8_lossy(command_line);
+    let args = parse_windows_command_line(line.trim_end_matches('\0')).unwrap_or_default();
+    let argv_storage = args
+        .into_iter()
+        .map(|arg| {
+            let mut bytes = arg.into_bytes();
+            bytes.push(0);
+            bytes.into_boxed_slice()
+        })
+        .collect::<Vec<_>>();
+    let mut argv = argv_storage
+        .iter()
+        .map(|arg| arg.as_ptr() as usize)
+        .collect::<Vec<_>>();
+    argv.push(0);
+    let argv_value = argv.as_mut_ptr() as usize;
+    let environment_storage = environment
+        .iter()
+        .map(|(name, value)| {
+            let mut bytes = format!("{name}={value}").into_bytes();
+            bytes.push(0);
+            bytes.into_boxed_slice()
+        })
+        .collect::<Vec<_>>();
+    let mut environment = environment_storage
+        .iter()
+        .map(|entry| entry.as_ptr() as usize)
+        .collect::<Vec<_>>();
+    environment.push(0);
+    NativeCrtStartup {
+        argc: argv.len().saturating_sub(1) as i32,
+        _argv_storage: argv_storage,
+        argv,
+        argv_value,
+        _environment_storage: environment_storage,
+        environment,
+    }
+}
+
+fn ensure_crt_startup(process: &NativeProcessContext) {
+    if let Ok(mut startup) = process.crt_startup.lock() {
+        if startup.is_none() {
+            let environment = process.environment.lock().map(|env| env.clone());
+            *startup = Some(build_crt_startup(
+                &process.command_line_a,
+                environment.as_deref().unwrap_or_default(),
+            ));
+        }
+    }
+}
+
+pub(super) extern "win64" fn native_crt_configure_narrow_argv(_mode: i32) -> i32 {
+    if (0..=2).contains(&_mode) {
+        0
+    } else {
+        -1
+    }
+}
+
+pub(super) extern "win64" fn native_crt_initialize_narrow_environment() {
+    if let Some(process) = process_ctx() {
+        ensure_crt_startup(&process);
+    }
+}
+
+pub(super) extern "win64" fn native_crt_p_argc() -> *mut i32 {
+    let Some(process) = process_ctx() else {
+        return std::ptr::null_mut();
+    };
+    ensure_crt_startup(&process);
+    process
+        .crt_startup
+        .lock()
+        .ok()
+        .and_then(|mut startup| {
+            startup
+                .as_mut()
+                .map(|startup| std::ptr::addr_of_mut!(startup.argc))
+        })
+        .unwrap_or(std::ptr::null_mut())
+}
+
+pub(super) extern "win64" fn native_crt_p_argv() -> *mut *mut *mut i8 {
+    let Some(process) = process_ctx() else {
+        return std::ptr::null_mut();
+    };
+    ensure_crt_startup(&process);
+    process
+        .crt_startup
+        .lock()
+        .ok()
+        .and_then(|mut startup| {
+            startup
+                .as_mut()
+                .map(|startup| std::ptr::addr_of_mut!(startup.argv_value).cast::<*mut *mut i8>())
+        })
+        .unwrap_or(std::ptr::null_mut())
+}
+
+pub(super) extern "win64" fn native_crt_set_new_mode(mode: i32) -> i32 {
+    if !matches!(mode, 0 | 1) {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(22)); // EINVAL
+        return -1;
+    }
+    process_ctx()
+        .map(|process| process.crt_new_mode.swap(mode, Ordering::AcqRel))
+        .unwrap_or(0)
+}
+
+pub(super) extern "win64" fn native_crt_config_thread_locale(mode: i32) -> i32 {
+    if !matches!(mode, -1..=1) {
+        return -1;
+    }
+    THREAD_CRT_LOCALE_MODE.with(|locale| locale.replace(mode))
+}
+
+pub(super) extern "win64" fn native_crt_atexit(callback: u64) -> i32 {
+    let Some(process) = process_ctx() else {
+        return -1;
+    };
+    if callback == 0 {
+        return -1;
+    }
+    process
+        .crt_exit_functions
+        .lock()
+        .map(|mut callbacks| callbacks.push(callback))
+        .map(|()| 0)
+        .unwrap_or(-1)
+}
+
+pub(super) extern "win64" fn native_crt_register_onexit_function(
+    _table: *mut c_void,
+    callback: u64,
+) -> i32 {
+    native_crt_atexit(callback)
+}
+
+pub(super) fn native_crt_run_exit_handlers() {
+    let Some(process) = process_ctx() else {
+        return;
+    };
+    let callbacks = process
+        .crt_exit_functions
+        .lock()
+        .map(|mut callbacks| std::mem::take(&mut *callbacks))
+        .unwrap_or_default();
+    for callback in callbacks.into_iter().rev() {
+        let callback: extern "win64" fn() = unsafe { std::mem::transmute(callback as usize) };
+        callback();
+    }
+}
+
+pub(super) extern "win64" fn native_crt_cexit() {
+    native_crt_run_exit_handlers();
+}
+pub(super) extern "win64" fn native_crt_c_exit() {}
 pub(super) extern "win64" fn native_crt_onexit(callback: u64) -> u64 {
-    callback
+    if native_crt_atexit(callback) == 0 {
+        callback
+    } else {
+        0
+    }
 }
 pub(super) extern "win64" fn native_crt_strlen(input: *const u8) -> usize {
     if input.is_null() {
@@ -784,37 +946,56 @@ pub(super) extern "win64" fn native_crt_getmainargs(
     _wildcard: i32,
     _startup: *mut u8,
 ) -> i32 {
-    let line = process_ctx()
-        .map(|process| String::from_utf8_lossy(&process.command_line_a).into_owned())
-        .unwrap_or_default();
-    let args = parse_windows_command_line(line.trim_end_matches('\0')).unwrap_or_default();
-    let argv = unsafe { malloc((args.len() + 1) * std::mem::size_of::<*mut i8>()) } as *mut *mut i8;
-    if argv.is_null() {
+    let Some(process) = process_ctx() else {
         return 12;
-    }
-    for (index, arg) in args.iter().enumerate() {
-        let bytes = arg.as_bytes();
-        let buffer = unsafe { malloc(bytes.len() + 1) } as *mut i8;
-        if buffer.is_null() {
-            return 12;
-        }
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.cast(), bytes.len());
-            buffer.add(bytes.len()).write(0);
-            argv.add(index).write(buffer);
-        }
-    }
+    };
+    ensure_crt_startup(&process);
+    let Ok(mut startup) = process.crt_startup.lock() else {
+        return 12;
+    };
+    let Some(startup) = startup.as_mut() else {
+        return 12;
+    };
     unsafe {
-        argv.add(args.len()).write(std::ptr::null_mut());
         if !argc_out.is_null() {
-            argc_out.write_unaligned(args.len() as i32);
+            argc_out.write_unaligned(startup.argc);
         }
         if !argv_out.is_null() {
-            argv_out.write_unaligned(argv);
+            argv_out.write_unaligned(startup.argv.as_mut_ptr().cast());
         }
         if !env_out.is_null() {
-            env_out.write_unaligned(std::ptr::null_mut());
+            env_out.write_unaligned(startup.environment.as_mut_ptr().cast());
         }
     }
     0
+}
+
+pub(super) extern "win64" fn native_crt_exit(code: u32) -> ! {
+    native_crt_run_exit_handlers();
+    native_exit_process(code)
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::build_crt_startup;
+
+    #[test]
+    fn narrow_startup_arrays_keep_windows_arguments_and_environment_alive() {
+        let environment = vec![("PATH".to_string(), "C:\\bin".to_string())];
+        let mut startup = build_crt_startup(b"tool.exe \"hello world\" arg\0", &environment);
+        assert_eq!(startup.argc, 3);
+        let argv = startup.argv.as_mut_ptr().cast::<*mut i8>();
+        let read_arg = |index| unsafe { std::ffi::CStr::from_ptr(*argv.add(index)) };
+        assert_eq!(read_arg(0).to_bytes(), b"tool.exe");
+        assert_eq!(read_arg(1).to_bytes(), b"hello world");
+        assert_eq!(read_arg(2).to_bytes(), b"arg");
+        assert!(unsafe { (*argv.add(3)).is_null() });
+        let env = startup.environment.as_mut_ptr().cast::<*mut i8>();
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(*env) }.to_bytes(),
+            b"PATH=C:\\bin"
+        );
+        assert!(unsafe { (*env.add(1)).is_null() });
+        assert_eq!(startup.argv_value, startup.argv.as_mut_ptr() as usize);
+    }
 }

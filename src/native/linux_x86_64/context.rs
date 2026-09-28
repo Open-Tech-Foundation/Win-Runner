@@ -35,6 +35,9 @@ pub(super) static TEST_PROCESS: LazyLock<Arc<NativeProcessContext>> = LazyLock::
         command_line_a: vec![0],
         environment: Mutex::new(Vec::new()),
         environment_block: Mutex::new(vec![0, 0]),
+        crt_startup: Mutex::new(None),
+        crt_exit_functions: Mutex::new(Vec::new()),
+        crt_new_mode: AtomicI32::new(0),
         std_handles: [
             AtomicU64::new(STD_HANDLE_BASE),
             AtomicU64::new(STD_HANDLE_BASE + 1),

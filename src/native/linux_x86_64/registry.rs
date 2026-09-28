@@ -27,6 +27,14 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                     | "_acmdln"
                     | "_initterm"
                     | "__getmainargs"
+                    | "_configure_narrow_argv"
+                    | "_initialize_narrow_environment"
+                    | "__p___argc"
+                    | "__p___argv"
+                    | "_crt_atexit"
+                    | "_register_onexit_function"
+                    | "_set_new_mode"
+                    | "_configthreadlocale"
                     | "exit"
                     | "_exit"
                     | "_cexit"
@@ -167,8 +175,24 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "setlocale" => Some(native_crt_setlocale as *const () as usize as u64),
         "_initterm" => Some(native_crt_initterm as *const () as usize as u64),
         "__getmainargs" => Some(native_crt_getmainargs as *const () as usize as u64),
-        "exit" | "_exit" => Some(native_exit_process as *const () as usize as u64),
-        "_cexit" | "_c_exit" => Some(native_crt_cexit as *const () as usize as u64),
+        "_configure_narrow_argv" => {
+            Some(native_crt_configure_narrow_argv as *const () as usize as u64)
+        }
+        "_initialize_narrow_environment" => {
+            Some(native_crt_initialize_narrow_environment as *const () as usize as u64)
+        }
+        "__p___argc" => Some(native_crt_p_argc as *const () as usize as u64),
+        "__p___argv" => Some(native_crt_p_argv as *const () as usize as u64),
+        "_crt_atexit" => Some(native_crt_atexit as *const () as usize as u64),
+        "_register_onexit_function" => {
+            Some(native_crt_register_onexit_function as *const () as usize as u64)
+        }
+        "_set_new_mode" => Some(native_crt_set_new_mode as *const () as usize as u64),
+        "_configthreadlocale" => Some(native_crt_config_thread_locale as *const () as usize as u64),
+        "exit" => Some(native_crt_exit as *const () as usize as u64),
+        "_exit" => Some(native_exit_process as *const () as usize as u64),
+        "_cexit" => Some(native_crt_cexit as *const () as usize as u64),
+        "_c_exit" => Some(native_crt_c_exit as *const () as usize as u64),
         "_onexit" => Some(native_crt_onexit as *const () as usize as u64),
         "strlen" => Some(native_crt_strlen as *const () as usize as u64),
         "_strdup" => Some(native_crt_strdup as *const () as usize as u64),

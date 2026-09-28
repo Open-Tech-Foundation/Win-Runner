@@ -85,13 +85,17 @@ Items remain open until implementation and relevant verification are complete.
     Kernel32/UCRT/Advapi32 shim registrations.
   - [ ] Expand family mappings and exports as CoreCLR import inspection
     identifies additional modules and functions.
-- [ ] Implement UCRT startup (`_configure_narrow_argv`,
-  `_initialize_narrow_environment`, `__p___argc`, `__p___argv`, `_crt_atexit`,
-  `_register_onexit_function`, `_seh_filter_exe`, `_set_new_mode`,
-  `_configthreadlocale`), standard I/O (`__stdio_common_vfprintf`,
+- [ ] Complete UCRT startup, standard I/O (`__stdio_common_vfprintf`,
   `__stdio_common_vsprintf`, `__acrt_iob_func`), and basic file, conversion,
   sorting, time, and string functions (`fopen`, `fread`, `fclose`, `strtol`,
   `strtod`, `qsort`, `_time64`, `strstr`).
+  - [x] Provide stable narrow `argc`/`argv` and environment arrays through
+    `__p___argc`, `__p___argv`, and `__getmainargs`.
+  - [x] Implement `_configure_narrow_argv`, `_initialize_narrow_environment`,
+    `_set_new_mode`, and `_configthreadlocale`.
+  - [x] Register `_crt_atexit`, `_register_onexit_function`, and `_onexit`
+    callbacks and execute them in reverse registration order on CRT exit.
+  - [ ] Add `_seh_filter_exe` and remaining startup exports.
 - [ ] Add basic `msvcrt.dll` output and file I/O, including `printf` and `fopen`.
 - [ ] Add VCRUNTIME140 exception handlers, `_CxxThrowException`, and memory
   functions needed by C++ and default Rust MSVC binaries.

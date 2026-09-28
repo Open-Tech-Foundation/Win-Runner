@@ -1746,6 +1746,105 @@ mod protection_tests {
         assert!(super::native_crt_setlocale(0, b"fr_FR\0".as_ptr()).is_null());
     }
 
+    static CRT_EXIT_ORDER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    extern "win64" fn crt_exit_first() {
+        let _ = CRT_EXIT_ORDER.compare_exchange(
+            1,
+            2,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
+    }
+
+    extern "win64" fn crt_exit_second() {
+        let _ = CRT_EXIT_ORDER.compare_exchange(
+            0,
+            1,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
+    }
+
+    #[test]
+    fn ucrt_startup_exposes_stable_narrow_argv_environment_and_exit_handlers() {
+        let child = unsafe { super::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            let Some(process) = process_ctx() else {
+                unsafe { _exit(127) };
+            };
+            *process.environment.lock().unwrap() = vec![
+                ("PATH".to_string(), "C:\\bin".to_string()),
+                ("MODE".to_string(), "test".to_string()),
+            ];
+            *process.crt_startup.lock().unwrap() = None;
+            CRT_EXIT_ORDER.store(0, std::sync::atomic::Ordering::Release);
+
+            if !super::supports_import("UCRTBASE.dll", "__p___argc")
+                || !super::supports_import("UCRTBASE.dll", "__p___argv")
+                || !super::supports_import("UCRTBASE.dll", "_crt_atexit")
+                || !super::supports_import("UCRTBASE.dll", "_register_onexit_function")
+                || !super::supports_import("UCRTBASE.dll", "_set_new_mode")
+                || !super::supports_import("UCRTBASE.dll", "_configthreadlocale")
+                || super::native_crt_configure_narrow_argv(1) != 0
+                || super::native_crt_configure_narrow_argv(3) != -1
+            {
+                unsafe { _exit(126) };
+            }
+            super::native_crt_initialize_narrow_environment();
+            let argc = super::native_crt_p_argc();
+            let argv_location = super::native_crt_p_argv();
+            if argc.is_null() || argv_location.is_null() || unsafe { argc.read() } != 0 {
+                unsafe { _exit(125) };
+            }
+            let argv = unsafe { argv_location.read() };
+            if argv.is_null() || !unsafe { (*argv).is_null() } {
+                unsafe { _exit(124) };
+            }
+            let mut out_argc = 0;
+            let mut out_argv = std::ptr::null_mut();
+            let mut out_environment = std::ptr::null_mut();
+            if super::native_crt_getmainargs(
+                &mut out_argc,
+                &mut out_argv,
+                &mut out_environment,
+                0,
+                std::ptr::null_mut(),
+            ) != 0
+                || out_argc != 0
+                || out_argv != argv
+                || out_environment.is_null()
+                || unsafe { std::ffi::CStr::from_ptr(*out_environment) }.to_bytes()
+                    != b"PATH=C:\\bin"
+            {
+                unsafe { _exit(123) };
+            }
+
+            if super::native_crt_atexit(crt_exit_first as *const () as usize as u64) != 0
+                || super::native_crt_register_onexit_function(
+                    std::ptr::null_mut(),
+                    crt_exit_second as *const () as usize as u64,
+                ) != 0
+                || super::native_crt_set_new_mode(1) != 0
+                || super::native_crt_set_new_mode(0) != 1
+                || super::native_crt_set_new_mode(2) != -1
+                || super::native_crt_config_thread_locale(1) != 0
+                || super::native_crt_config_thread_locale(0) != 1
+            {
+                unsafe { _exit(122) };
+            }
+            super::native_crt_run_exit_handlers();
+            let result = CRT_EXIT_ORDER.load(std::sync::atomic::Ordering::Acquire);
+            unsafe { _exit(if result == 2 { 42 } else { 121 }) };
+        }
+
+        let mut status = 0;
+        assert_eq!(unsafe { waitpid(child, &mut status, 0) }, child);
+        assert_eq!(status & 0x7f, 0);
+        assert_eq!((status >> 8) & 0xff, 42);
+    }
+
     #[test]
     fn crt_strchr_finds_bytes_and_the_terminating_nul() {
         let text = b"nano\0";

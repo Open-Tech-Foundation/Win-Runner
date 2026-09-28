@@ -178,6 +178,9 @@ pub(super) struct NativeProcessContext {
     pub(super) command_line_a: Vec<u8>,
     pub(super) environment: Mutex<Vec<(String, String)>>,
     pub(super) environment_block: Mutex<Vec<u16>>,
+    pub(super) crt_startup: Mutex<Option<NativeCrtStartup>>,
+    pub(super) crt_exit_functions: Mutex<Vec<u64>>,
+    pub(super) crt_new_mode: AtomicI32,
     pub(super) std_handles: [AtomicU64; 3],
     pub(super) crt_fds: Mutex<HashMap<i32, u64>>,
     pub(super) crt_fd_next: AtomicI32,
@@ -321,6 +324,15 @@ pub(super) struct NativeVirtualAllocation {
 pub(super) struct NativeVirtualPage {
     pub(super) committed: bool,
     pub(super) protection: u32,
+}
+
+pub(super) struct NativeCrtStartup {
+    pub(super) argc: i32,
+    pub(super) _argv_storage: Vec<Box<[u8]>>,
+    pub(super) argv: Vec<usize>,
+    pub(super) argv_value: usize,
+    pub(super) _environment_storage: Vec<Box<[u8]>>,
+    pub(super) environment: Vec<usize>,
 }
 
 pub(super) struct NativeVectoredExceptionHandler {

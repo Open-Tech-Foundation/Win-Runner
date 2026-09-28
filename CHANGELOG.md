@@ -48,6 +48,11 @@ All notable changes to this project will be documented in this file.
 - Track per-page `VirtualProtect` changes and guard flags for loaded PE images;
   `VirtualQuery` now reports the resulting protection regions rather than one
   coarse RWX range.
+- Add UCRT narrow startup state for stable `argc`/`argv` and environment arrays,
+  plus `_crt_atexit`/on-exit registration and reverse-order callback execution.
+  Implement `_configure_narrow_argv`, `_initialize_narrow_environment`,
+  `_set_new_mode`, and `_configthreadlocale`; UCRT stdio, `_seh_filter_exe`,
+  and remaining startup exports are still pending.
 - Detect .NET Framework `_CorExeMain`/`_CorDllMain` images and report the clear
   unsupported-runtime limitation in `winrun inspect` and native execution.
 - Replaced the PS1 interpreter's proposed install-script .NET API expansion
