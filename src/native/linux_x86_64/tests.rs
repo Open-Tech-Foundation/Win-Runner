@@ -72,6 +72,37 @@ mod protection_tests {
         -1 // EXCEPTION_CONTINUE_EXECUTION
     }
 
+    static GUEST_GUARD_ADDRESS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static GUEST_GUARD_HANDLER_CALLS: std::sync::atomic::AtomicU32 =
+        std::sync::atomic::AtomicU32::new(0);
+
+    extern "win64" fn continue_after_guard_page(
+        pointers: *mut super::NativeExceptionPointers,
+    ) -> i32 {
+        if pointers.is_null() {
+            return 0;
+        }
+        let pointers = unsafe { &mut *pointers };
+        if pointers.record.is_null() || unsafe { (*pointers.record).code } != 0x8000_0001 {
+            return 0;
+        }
+        GUEST_GUARD_HANDLER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        -1 // EXCEPTION_CONTINUE_EXECUTION
+    }
+
+    extern "win64" fn guest_guarded_page_store() -> u32 {
+        unsafe {
+            core::arch::asm!(
+                "mov r12, qword ptr [rip + {guard_address}]",
+                "mov byte ptr [r12], 0x7b",
+                guard_address = sym GUEST_GUARD_ADDRESS,
+                out("r12") _,
+                options(nostack)
+            )
+        };
+        42
+    }
+
     fn require_kernel32_api(name: &'static [u8]) -> u64 {
         let address = super::native_get_proc_address(super::API_SET_MODULE, name.as_ptr());
         let label = String::from_utf8_lossy(&name[..name.len().saturating_sub(1)]);
@@ -82,6 +113,7 @@ mod protection_tests {
     #[test]
     fn translates_standard_windows_page_protections() {
         assert_eq!(linux_protection(0x01), Some(0));
+        assert_eq!(linux_protection(0x104), Some(0));
         assert_eq!(linux_protection(0x02), Some(PROT_READ));
         assert_eq!(linux_protection(0x04), Some(PROT_READ | PROT_WRITE));
         assert_eq!(linux_protection(0x10), Some(PROT_EXEC));
@@ -6306,6 +6338,73 @@ mod protection_tests {
                 )
             };
             let code = result.unwrap_or(0xfe) as i32;
+            unsafe { _exit(code & 0xff) };
+        }
+
+        let mut status = 0;
+        assert_eq!(unsafe { waitpid(child, &mut status, 0) }, child);
+        assert_eq!(status & 0x7f, 0);
+        assert_eq!((status >> 8) & 0xff, 42);
+    }
+
+    #[test]
+    fn page_guard_fault_is_delivered_once_then_access_resumes() {
+        let child = unsafe { super::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            if install_guest_fault_signal_handlers().is_err() {
+                unsafe { _exit(127) };
+            }
+            let Some(process) = process_ctx() else {
+                unsafe { _exit(126) };
+            };
+            process.vectored_exception_handlers.lock().unwrap().clear();
+            process
+                .unhandled_exception_filter
+                .store(0, std::sync::atomic::Ordering::Release);
+            let address = super::native_virtual_alloc(
+                std::ptr::null_mut(),
+                4096,
+                0x3000, // MEM_RESERVE | MEM_COMMIT
+                0x04,   // PAGE_READWRITE
+            );
+            if address.is_null() {
+                unsafe { _exit(125) };
+            }
+            GUEST_GUARD_ADDRESS.store(address as u64, std::sync::atomic::Ordering::Relaxed);
+            GUEST_GUARD_HANDLER_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+            if super::native_virtual_protect(address.cast(), 4096, 0x104, std::ptr::null_mut()) == 0
+                || native_add_vectored_exception_handler(
+                    1,
+                    continue_after_guard_page as *const () as usize as u64,
+                ) == 0
+            {
+                unsafe { _exit(124) };
+            }
+            let result = unsafe {
+                invoke_guest_with_fault_translation(
+                    guest_guarded_page_store as *const () as usize as u64,
+                )
+            };
+            let protection_cleared = process
+                .virtual_allocations
+                .lock()
+                .ok()
+                .and_then(|allocations| {
+                    allocations
+                        .get(&(address as u64))
+                        .and_then(|allocation| allocation.pages.first())
+                        .map(|page| page.protection == 0x04)
+                })
+                .unwrap_or(false);
+            let store_resumed = unsafe { address.read_volatile() == 0x7b };
+            let handler_called_once =
+                GUEST_GUARD_HANDLER_CALLS.load(std::sync::atomic::Ordering::Relaxed) == 1;
+            let code = if store_resumed && protection_cleared && handler_called_once {
+                42
+            } else {
+                result.unwrap_or(0xfe) as i32
+            };
             unsafe { _exit(code & 0xff) };
         }
 

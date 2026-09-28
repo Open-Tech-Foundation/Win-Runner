@@ -9,9 +9,10 @@ pub(super) fn page_len(len: usize) -> Result<usize, String> {
 }
 
 pub(super) fn linux_protection(page_protection: u32) -> Option<i32> {
-    // The low byte specifies the page access mode. Guard/cache modifiers
-    // are intentionally not implemented by the native backend yet.
-    match page_protection & 0xff {
+    // PAGE_GUARD is represented as inaccessible until its first fault. The
+    // fault dispatcher removes the modifier and restores the underlying mode.
+    let guard = page_protection & 0x100 != 0;
+    let protection = match page_protection & 0xff {
         0x01 => Some(0),                                  // PAGE_NOACCESS
         0x02 => Some(PROT_READ),                          // PAGE_READONLY
         0x04 => Some(PROT_READ | PROT_WRITE),             // PAGE_READWRITE
@@ -19,7 +20,39 @@ pub(super) fn linux_protection(page_protection: u32) -> Option<i32> {
         0x20 => Some(PROT_READ | PROT_EXEC),              // PAGE_EXECUTE_READ
         0x40 => Some(PROT_READ | PROT_WRITE | PROT_EXEC), // PAGE_EXECUTE_READWRITE
         _ => None,
+    }?;
+    Some(if guard { 0 } else { protection })
+}
+
+pub(super) fn consume_guard_page_fault(address: u64) -> bool {
+    let Some(process) = process_ctx() else {
+        return false;
+    };
+    let Ok(mut allocations) = process.virtual_allocations.lock() else {
+        return false;
+    };
+    let Some((&base, allocation)) = allocations.iter_mut().find(|(&base, allocation)| {
+        address >= base && address < base.saturating_add(allocation.length as u64)
+    }) else {
+        return false;
+    };
+    let page_index = (address - base) as usize / 4096;
+    let Some(page) = allocation.pages.get_mut(page_index) else {
+        return false;
+    };
+    if !page.committed || page.protection & 0x100 == 0 {
+        return false;
     }
+    let protection = page.protection & !0x100;
+    let Some(host_protection) = linux_protection(protection) else {
+        return false;
+    };
+    let page_address = base + page_index as u64 * 4096;
+    if unsafe { mprotect(page_address as *mut c_void, 4096, host_protection) } != 0 {
+        return false;
+    }
+    page.protection = protection;
+    true
 }
 
 #[repr(C)]

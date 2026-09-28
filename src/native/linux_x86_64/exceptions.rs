@@ -353,6 +353,11 @@ extern "C" fn dispatch_linux_guest_fault(slot_pointer: *const std::ffi::c_void) 
     ) else {
         return 0xc000_001d_u32 as i32; // STATUS_ILLEGAL_INSTRUCTION fallback.
     };
+    let guard_fault = matches!(signal, libc::SIGSEGV | libc::SIGBUS)
+        && super::memory::consume_guard_page_fault(fault_address);
+    if guard_fault {
+        record.code = 0x8000_0001; // STATUS_GUARD_PAGE_VIOLATION
+    }
 
     if dispatch_exception(&mut record, &mut windows_context) {
         apply_windows_context_to_linux_ucontext(&windows_context, linux_context);

@@ -42,6 +42,9 @@ All notable changes to this project will be documented in this file.
   and language-specific runtime handlers remain incomplete.
 - Export `ntdll!RtlDispatchException` through the native shim registry so guest
   code can enter vectored, frame-based, and unhandled-filter dispatch directly.
+- Implement one-shot `PAGE_GUARD` faults for tracked private virtual-memory
+  allocations: deliver `STATUS_GUARD_PAGE_VIOLATION`, clear the modifier, and
+  restore access so a continuing handler can retry the instruction.
 - Detect .NET Framework `_CorExeMain`/`_CorDllMain` images and report the clear
   unsupported-runtime limitation in `winrun inspect` and native execution.
 - Replaced the PS1 interpreter's proposed install-script .NET API expansion

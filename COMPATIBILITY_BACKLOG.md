@@ -191,8 +191,10 @@ Items remain open until implementation and relevant verification are complete.
       protection for tracked pages.
     - [x] Implement `VirtualQuery` region results for tracked private
       allocations and mapped PE images.
-    - [ ] Add guard-page fault behavior and track protections for PE image
-      mappings used by JIT/runtime code.
+    - [x] Deliver one-shot `PAGE_GUARD` faults for tracked private allocations,
+      clear the guard modifier, and restore the requested protection.
+    - [ ] Track per-page protections and guard state for PE image mappings used
+      by JIT/runtime code.
   - [ ] Implement GC thread suspension/context APIs (`SuspendThread`,
     `GetThreadContext`, `SetThreadContext`, `FlushProcessWriteBuffers`) with a
     Linux signal-based stop/resume protocol.
