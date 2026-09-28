@@ -122,6 +122,7 @@ mod module_export_tests {
     use crate::native::linux_x86_64::state::NativeLoadedModule;
     use crate::pe::Export;
     use std::ffi::CString;
+    use std::sync::{Arc, Mutex};
 
     fn dll_fixture(
         imports: &[(&str, &str)],
@@ -473,11 +474,18 @@ mod module_export_tests {
                 reserved_static: slots.reserved_static,
             }
         };
-        let mut current_tls = NativeTls::new(0x1400_0000);
+        let old_tls_blocks = process.tls_blocks.lock().unwrap().clone();
+        let current_tls = Arc::new(Mutex::new(NativeTls::new(0x1400_0000)));
+        let sibling_tls = Arc::new(Mutex::new(NativeTls::new(0x1400_0000)));
         assert!(super::thread_runtime::install_thread_teb(
-            &mut current_tls.teb
+            &mut current_tls.lock().unwrap().teb
         ));
-        *process.tls_template.lock().unwrap() = Some(current_tls.clone_for_thread());
+        *process.tls_template.lock().unwrap() =
+            Some(current_tls.lock().unwrap().clone_for_thread());
+        *process.tls_blocks.lock().unwrap() = std::collections::HashMap::from([
+            (0, Arc::downgrade(&current_tls)),
+            (1, Arc::downgrade(&sibling_tls)),
+        ]);
         *process.dynamic_tls.lock().unwrap() = DynamicTlsSlots::new(false);
         {
             let mut native_fs = process.fs.lock().unwrap();
@@ -491,11 +499,18 @@ mod module_export_tests {
         let assigned_index =
             unsafe { std::ptr::read_unaligned((handle + u64::from(tls_index_rva)) as *const u32) };
         assert_eq!(assigned_index, 0);
-        let address = current_tls.slots[assigned_index as usize];
+        let address = current_tls.lock().unwrap().slots[assigned_index as usize];
+        let sibling_address = sibling_tls.lock().unwrap().slots[assigned_index as usize];
         assert_ne!(address, 0);
+        assert_ne!(sibling_address, 0);
+        assert_ne!(address, sibling_address);
         unsafe {
             assert_eq!(
                 std::slice::from_raw_parts(address as *const u8, 5),
+                [0x31, 0x42, 0x53, 0, 0]
+            );
+            assert_eq!(
+                std::slice::from_raw_parts(sibling_address as *const u8, 5),
                 [0x31, 0x42, 0x53, 0, 0]
             );
         }
@@ -517,8 +532,26 @@ mod module_export_tests {
             );
         }
 
+        super::thread_runtime::clear_module_static_tls(process, assigned_index);
+        assert_eq!(
+            current_tls.lock().unwrap().slots[assigned_index as usize],
+            0
+        );
+        assert_eq!(
+            sibling_tls.lock().unwrap().slots[assigned_index as usize],
+            0
+        );
+        assert_eq!(
+            process.tls_template.lock().unwrap().as_ref().unwrap().slots[assigned_index as usize],
+            0
+        );
+
         process.loaded_modules.lock().unwrap().remove(&handle);
-        super::thread_runtime::clear_current_thread_static_tls(assigned_index);
+        process
+            .tls_blocks
+            .lock()
+            .unwrap()
+            .clone_from(&old_tls_blocks);
         *process.dynamic_tls.lock().unwrap() = old_slots;
         *process.tls_template.lock().unwrap() = old_template;
         process.fs.lock().unwrap().fs.delete_file(path).unwrap();
@@ -870,12 +903,7 @@ fn load_guest_module_inner(
             }
         }
         if let (Some(index), Some(template)) = (tls_index, static_tls_template.as_ref()) {
-            if !super::thread_runtime::install_current_thread_static_tls(index, template) {
-                return None;
-            }
-            let mut tls_template = process.tls_template.lock().ok()?;
-            let tls_template = tls_template.as_mut()?;
-            if !tls_template.set_static_tls(index, template.clone()) {
+            if !super::thread_runtime::install_module_static_tls(&process, index, template) {
                 return None;
             }
         }
@@ -904,12 +932,7 @@ fn load_guest_module_inner(
                 modules.remove(&handle);
             }
             if let Some(index) = tls_index {
-                if let Ok(mut tls_template) = process.tls_template.lock() {
-                    if let Some(tls_template) = tls_template.as_mut() {
-                        tls_template.clear_static_tls(index);
-                    }
-                }
-                super::thread_runtime::clear_current_thread_static_tls(index);
+                super::thread_runtime::clear_module_static_tls(&process, index);
                 super::thread_runtime::release_module_tls_slot(&process, index);
             }
         }

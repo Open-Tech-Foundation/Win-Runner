@@ -24,8 +24,8 @@ All notable changes to this project will be documented in this file.
   `CreateThread` start routines using modules captured in load order.
 - Resolve cyclic guest-DLL import references by publishing mapped exports while
   their dependency imports are patched.
-- Allocate DLL static TLS templates and zero-fill for the loading thread and
-  for later guest threads cloned from the process TLS template.
+- Allocate DLL static TLS templates and zero-fill for live guest threads and
+  later-created threads cloned from the process TLS template.
 
 - Added a "Why Win-Runner?" section to the README explaining the project's focus
   and how it differs from Wine, VMs, and Windows CI runners.

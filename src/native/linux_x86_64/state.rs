@@ -192,6 +192,9 @@ pub(super) struct NativeProcessContext {
     pub(super) mapping_next: AtomicU64,
     pub(super) gs_base: AtomicU64,
     pub(super) tls_template: Mutex<Option<NativeTls>>,
+    /// Weak references to TLS blocks for the primary thread and live guest
+    /// threads. A DLL load updates these blocks before running its callbacks.
+    pub(super) tls_blocks: Mutex<HashMap<u64, std::sync::Weak<Mutex<NativeTls>>>>,
     pub(super) dynamic_tls: Mutex<DynamicTlsSlots>,
     pub(super) threads: Mutex<HashMap<u64, NativeThread>>,
     pub(super) thread_next: AtomicU64,

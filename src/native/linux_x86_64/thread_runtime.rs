@@ -2,11 +2,6 @@
 
 use super::*;
 
-thread_local! {
-    static THREAD_ADDITIONAL_TLS_DATA: std::cell::RefCell<Vec<(u32, Box<[u8]>)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
 pub(super) fn put64(dst: &mut [u8], off: usize, value: u64) {
     dst[off..off + 8].copy_from_slice(&value.to_le_bytes());
 }
@@ -46,7 +41,6 @@ pub(super) fn set_teb_stack_bounds(teb: &mut [u8; 0x1000]) {
     }
 }
 pub(super) fn install_thread_teb(teb: &mut [u8; 0x1000]) -> bool {
-    THREAD_ADDITIONAL_TLS_DATA.with(|data| data.borrow_mut().clear());
     set_teb_stack_bounds(teb);
     let base = teb.as_ptr() as u64;
     if !unsafe { set_gs(base) } {
@@ -55,7 +49,7 @@ pub(super) fn install_thread_teb(teb: &mut [u8; 0x1000]) -> bool {
     THREAD_TEB_BASE.set(base);
     true
 }
-pub(super) fn setup_tls(mapping: &Mapping, img: &PeImage) -> Result<Option<NativeTls>, String> {
+pub(super) fn setup_tls(mapping: &Mapping, img: &PeImage) -> Result<NativeTls, String> {
     let mut out = NativeTls::new(img.image_base);
     if let Some(tls) = &img.tls {
         let data = tls_template_from_mapping(mapping, tls)
@@ -69,7 +63,7 @@ pub(super) fn setup_tls(mapping: &Mapping, img: &PeImage) -> Result<Option<Nativ
         }
         unsafe { (mapping.ptr.add(off) as *mut u32).write_unaligned(0) };
     }
-    Ok(Some(out))
+    Ok(out)
 }
 
 pub(super) fn tls_template_from_mapping(
@@ -87,47 +81,71 @@ pub(super) fn tls_template_from_mapping(
     Some(data)
 }
 
-pub(super) fn install_current_thread_static_tls(index: u32, template: &[u8]) -> bool {
-    let Some(end) = (index as usize).checked_add(1) else {
+pub(super) fn install_module_static_tls(
+    process: &NativeProcessContext,
+    index: u32,
+    template: &[u8],
+) -> bool {
+    let Ok(mut tls_template_guard) = process.tls_template.lock() else {
         return false;
     };
-    if end > 64 {
+    let Some(tls_template) = tls_template_guard.as_mut() else {
+        return false;
+    };
+    if !tls_template.set_static_tls(index, template.to_vec()) {
         return false;
     }
-    let teb = THREAD_TEB_BASE.get();
-    if teb == 0 {
+    let Ok(mut tls_blocks) = process.tls_blocks.lock() else {
+        tls_template.clear_static_tls(index);
         return false;
+    };
+    let blocks: Vec<_> = tls_blocks
+        .iter()
+        .filter_map(|(id, weak)| match weak.upgrade() {
+            Some(block) => Some((*id, block)),
+            None => None,
+        })
+        .collect();
+    tls_blocks.retain(|_, weak| weak.strong_count() != 0);
+    drop(tls_blocks);
+    drop(tls_template_guard);
+    for (_, block) in blocks {
+        let Ok(mut block) = block.lock() else {
+            return false;
+        };
+        if !block.set_static_tls(index, template.to_vec()) {
+            return false;
+        }
     }
-    let slots = unsafe { ((teb + 0x58) as *const u64).read_unaligned() };
-    if slots == 0 {
-        return false;
-    }
-    let mut data = template.to_vec().into_boxed_slice();
-    let address = data.as_mut_ptr() as u64;
-    unsafe { ((slots as *mut u64).add(index as usize)).write_unaligned(address) };
-    THREAD_ADDITIONAL_TLS_DATA.with(|extra| {
-        let mut extra = extra.borrow_mut();
-        extra.retain(|(existing, _)| *existing != index);
-        extra.push((index, data));
-    });
     true
 }
 
-pub(super) fn clear_current_thread_static_tls(index: u32) {
-    if index < 64 {
-        let teb = THREAD_TEB_BASE.get();
-        if teb != 0 {
-            let slots = unsafe { ((teb + 0x58) as *const u64).read_unaligned() };
-            if slots != 0 {
-                unsafe { ((slots as *mut u64).add(index as usize)).write_unaligned(0) };
-            }
+pub(super) fn clear_module_static_tls(process: &NativeProcessContext, index: u32) {
+    // Thread startup can hold a TLS block while reading the process template.
+    // Snapshot block references under the global locks, then release them
+    // before locking any block to keep the lock order acyclic.
+    let blocks = {
+        let Ok(mut tls_template) = process.tls_template.lock() else {
+            return;
+        };
+        if let Some(tls_template) = tls_template.as_mut() {
+            tls_template.clear_static_tls(index);
+        }
+        let Ok(mut tls_blocks) = process.tls_blocks.lock() else {
+            return;
+        };
+        let blocks = tls_blocks
+            .values()
+            .filter_map(std::sync::Weak::upgrade)
+            .collect::<Vec<_>>();
+        tls_blocks.retain(|_, weak| weak.strong_count() != 0);
+        blocks
+    };
+    for block in blocks {
+        if let Ok(mut block) = block.lock() {
+            block.clear_static_tls(index);
         }
     }
-    THREAD_ADDITIONAL_TLS_DATA.with(|extra| {
-        extra
-            .borrow_mut()
-            .retain(|(existing, _)| *existing != index)
-    });
 }
 pub(super) unsafe fn set_gs(base: u64) -> bool {
     let result: u64;
@@ -460,22 +478,5 @@ mod tls_callback_tests {
                 [5, 6, 0, 0]
             );
         }
-    }
-
-    #[test]
-    fn installs_and_clears_tls_for_the_current_guest_thread() {
-        let mut tls = NativeTls::new(0x1400_0000);
-        assert!(super::install_thread_teb(&mut tls.teb));
-        assert!(super::install_current_thread_static_tls(2, &[7, 8, 0, 0]));
-        let address = tls.slots[2];
-        assert_ne!(address, 0);
-        unsafe {
-            assert_eq!(
-                std::slice::from_raw_parts(address as *const u8, 4),
-                [7, 8, 0, 0]
-            );
-        }
-        super::clear_current_thread_static_tls(2);
-        assert_eq!(tls.slots[2], 0);
     }
 }

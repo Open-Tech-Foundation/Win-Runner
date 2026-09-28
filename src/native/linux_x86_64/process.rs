@@ -383,17 +383,34 @@ pub(super) extern "win64" fn native_create_thread(
         native_set_last_error(6);
         return 0;
     };
-    let tls = process
-        .tls_template
-        .lock()
-        .ok()
-        .and_then(|value| value.as_ref().map(NativeTls::clone_for_thread));
     let handle = process.thread_next.fetch_add(1, Ordering::AcqRel);
+    // Serialize thread creation with DLL TLS updates. The loader takes these
+    // locks in the same order, so a new block is either cloned after a DLL's
+    // template is published or registered before the loader fans it out.
+    let tls_block = {
+        let Ok(template) = process.tls_template.lock() else {
+            native_set_last_error(6);
+            return 0;
+        };
+        let tls = template
+            .as_ref()
+            .map(NativeTls::clone_for_thread)
+            .unwrap_or_else(|| NativeTls::new(process.image_base));
+        let tls = Arc::new(Mutex::new(tls));
+        let Ok(mut blocks) = process.tls_blocks.lock() else {
+            native_set_last_error(6);
+            return 0;
+        };
+        blocks.retain(|_, block| block.strong_count() != 0);
+        blocks.insert(handle, Arc::downgrade(&tls));
+        tls
+    };
     // Windows CreateThread uses the image's default stack when callers
     // pass zero. Node's libuv worker pool does this, and small host thread
     // defaults are too small for its nested module loading / async work.
     let builder = std::thread::Builder::new().stack_size(stack_size.max(4 * 1024 * 1024));
     let thread_process = Arc::clone(&process);
+    let thread_tls = Arc::clone(&tls_block);
     let suspension = Arc::new((Mutex::new((flags & 4 != 0) as u32), Condvar::new()));
     let thread_suspension = Arc::clone(&suspension);
     let spawned = builder.spawn(move || {
@@ -412,21 +429,16 @@ pub(super) extern "win64" fn native_create_thread(
             };
         }
         drop(count);
-        let mut _tls = tls;
-        if let Some(tls) = _tls.as_mut() {
-            if !thread_runtime::initialize_module_static_tls(&thread_process, tls) {
-                return 1;
-            }
-        }
-        if let Some(tls) = _tls.as_mut() {
-            set_teb_stack_bounds(&mut tls.teb);
-            if !unsafe { set_gs(tls.teb.as_ptr() as u64) } {
-                return 1;
-            }
-            THREAD_TEB_BASE.set(tls.teb.as_ptr() as u64);
-        } else if thread_process.gs_base.load(Ordering::Acquire) != 0 {
+        let Ok(mut tls) = thread_tls.lock() else {
+            return 1;
+        };
+        if !thread_runtime::initialize_module_static_tls(&thread_process, &mut tls)
+            || !install_thread_teb(&mut tls.teb)
+        {
             return 1;
         }
+        THREAD_TEB_BASE.set(tls.teb.as_ptr() as u64);
+        drop(tls);
         thread_runtime::notify_guest_thread_modules(&thread_process, true);
         let entry: unsafe extern "win64" fn(u64) -> u32 = unsafe { std::mem::transmute(start) };
         let exit_code = unsafe { entry(parameter) };

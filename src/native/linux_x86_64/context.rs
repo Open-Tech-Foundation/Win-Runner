@@ -64,6 +64,7 @@ pub(super) static TEST_PROCESS: LazyLock<Arc<NativeProcessContext>> = LazyLock::
         mapping_next: AtomicU64::new(0x9800_0000),
         gs_base: AtomicU64::new(0),
         tls_template: Mutex::new(None),
+        tls_blocks: Mutex::new(HashMap::new()),
         dynamic_tls: Mutex::new(DynamicTlsSlots::new(false)),
         threads: Mutex::new(HashMap::new()),
         thread_next: AtomicU64::new(0x8000_0000),

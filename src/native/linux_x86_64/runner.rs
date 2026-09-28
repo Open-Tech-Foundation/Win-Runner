@@ -448,7 +448,7 @@ fn run_rust_baseline_argv_with_fs_impl(
         let _import_stubs = registry::patch_baseline_imports(&mapping, img, strict_imports)?;
         let import_ms = import_started.elapsed().as_secs_f64() * 1000.0;
         let tls_started = std::time::Instant::now();
-        let tls = setup_tls(&mapping, img)?;
+        let tls = Arc::new(Mutex::new(setup_tls(&mapping, img)?));
         let tls_ms = tls_started.elapsed().as_secs_f64() * 1000.0;
         let context_started = std::time::Instant::now();
         let mut instance_fs = recovery_fs
@@ -503,7 +503,8 @@ fn run_rust_baseline_argv_with_fs_impl(
             mapping_views: Mutex::new(HashMap::new()),
             mapping_next: AtomicU64::new(0x9800_0000),
             gs_base: AtomicU64::new(0),
-            tls_template: Mutex::new(tls.as_ref().map(NativeTls::clone_for_thread)),
+            tls_template: Mutex::new(tls.lock().ok().map(|tls| tls.clone_for_thread())),
+            tls_blocks: Mutex::new(HashMap::from([(0, Arc::downgrade(&tls))])),
             dynamic_tls: Mutex::new(DynamicTlsSlots::new(img.tls.is_some())),
             threads: Mutex::new(HashMap::new()),
             thread_next: AtomicU64::new(0x8000_0000),
@@ -585,18 +586,15 @@ fn run_rust_baseline_argv_with_fs_impl(
                     THREAD_NATIVE_PROCESS.with(|active| {
                         *active.borrow_mut() = Some(Arc::clone(&guest_process));
                     });
-                    let mut tls = tls;
-                    let mut fallback_teb = Box::new([0u8; 0x1000]);
-                    let teb = tls
-                        .as_mut()
-                        .map(|tls| &mut tls.teb)
-                        .unwrap_or(&mut fallback_teb);
-                    if !install_thread_teb(teb) {
+                    let Ok(mut tls) = tls.lock() else {
+                        return 127;
+                    };
+                    if !install_thread_teb(&mut tls.teb) {
                         return 127;
                     }
-                    guest_process
-                        .gs_base
-                        .store(teb.as_ptr() as u64, Ordering::Release);
+                    let teb = tls.teb.as_ptr() as u64;
+                    drop(tls);
+                    guest_process.gs_base.store(teb, Ordering::Release);
                     super::thread_runtime::invoke_tls_callbacks(
                         guest_process.image_base,
                         &tls_callbacks,
@@ -699,24 +697,22 @@ fn run_rust_baseline_argv_with_fs_impl(
             // Windows thread stack, with bounds reflected in the guest TEB.
             let guest_process = Arc::clone(&process);
             let tls_callbacks = tls_callbacks.clone();
+            let thread_tls = Arc::clone(&tls);
             let guest_thread = std::thread::Builder::new()
                 .stack_size(16 * 1024 * 1024)
                 .spawn(move || {
                     THREAD_NATIVE_PROCESS.with(|active| {
                         *active.borrow_mut() = Some(Arc::clone(&guest_process));
                     });
-                    let mut tls = tls;
-                    let mut fallback_teb = Box::new([0u8; 0x1000]);
-                    let teb = tls
-                        .as_mut()
-                        .map(|tls| &mut tls.teb)
-                        .unwrap_or(&mut fallback_teb);
-                    if !install_thread_teb(teb) {
+                    let Ok(mut tls) = thread_tls.lock() else {
+                        return 127;
+                    };
+                    if !install_thread_teb(&mut tls.teb) {
                         return 127;
                     }
-                    guest_process
-                        .gs_base
-                        .store(teb.as_ptr() as u64, Ordering::Release);
+                    let teb = tls.teb.as_ptr() as u64;
+                    drop(tls);
+                    guest_process.gs_base.store(teb, Ordering::Release);
                     super::thread_runtime::invoke_tls_callbacks(
                         guest_process.image_base,
                         &tls_callbacks,
