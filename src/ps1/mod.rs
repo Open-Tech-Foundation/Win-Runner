@@ -2010,10 +2010,10 @@ impl<'a> Interpreter<'a> {
         let m = method.to_lowercase();
         if t == "environment" || t == "system.environment" {
             if m == "setenvironmentvariable" {
-                eval_environment(self.environment, &m, &argvals)?;
+                eval_environment(self.fs, self.environment, &m, &argvals)?;
                 return Ok(None);
             }
-            return eval_environment(self.environment, &m, &argvals).map(Some);
+            return eval_environment(self.fs, self.environment, &m, &argvals).map(Some);
         }
         if t == "guid" || t == "system.guid" {
             if m != "newguid" {
@@ -3842,10 +3842,23 @@ fn render_json_string(s: &str) -> String {
 /// `[Environment]::Get/SetEnvironmentVariable`. `User`/`Machine` targets
 /// read the host process env; sets land in the host process env too
 /// (visible for the rest of the session, never persisted anywhere).
-/// `[Environment]::Get/SetEnvironmentVariable` against the guest session
-/// environment. `User` and `Machine` targets act on the session until the
-/// guest registry persists them.
+/// Where `[Environment]` reads or writes a variable. `Process` is this
+/// session; `User` and `Machine` are the persistent registry keys.
+fn environment_target(target: Option<&String>) -> Result<Option<crate::winreg::Hive>, String> {
+    use crate::winreg::Hive;
+    match target.map(|target| target.to_ascii_lowercase()).as_deref() {
+        None | Some("process") => Ok(None),
+        Some("user") => Ok(Some(Hive::CurrentUser)),
+        Some("machine") => Ok(Some(Hive::LocalMachine)),
+        Some(_) => Err(format!("unknown environment target: {}", target.unwrap())),
+    }
+}
+
+/// `[Environment]::Get/SetEnvironmentVariable`. As in .NET, `User` and
+/// `Machine` writes go to the registry for sessions started later and leave
+/// this session's environment unchanged.
 fn eval_environment(
+    fs: &mut WinFs,
     environment: &mut Vec<(String, String)>,
     method: &str,
     args: &[String],
@@ -3855,29 +3868,28 @@ fn eval_environment(
             if args.len() != 1 && args.len() != 2 {
                 return Err("GetEnvironmentVariable takes one or two arguments".to_string());
             }
-            if args.len() == 2
-                && !args[1].eq_ignore_ascii_case("user")
-                && !args[1].eq_ignore_ascii_case("machine")
-                && !args[1].eq_ignore_ascii_case("process")
-            {
-                return Err(format!("unknown environment target: {}", args[1]));
+            match environment_target(args.get(1))? {
+                None => Ok(environment_get(environment, &args[0])
+                    .unwrap_or_default()
+                    .to_string()),
+                Some(hive) => {
+                    Ok(
+                        crate::winreg::persistent_environment(fs, hive, &args[0], environment)?
+                            .unwrap_or_default(),
+                    )
+                }
             }
-            Ok(environment_get(environment, &args[0])
-                .unwrap_or_default()
-                .to_string())
         }
         "setenvironmentvariable" => {
             if args.len() != 2 && args.len() != 3 {
                 return Err("SetEnvironmentVariable takes two or three arguments".to_string());
             }
-            if args.len() == 3
-                && !args[2].eq_ignore_ascii_case("user")
-                && !args[2].eq_ignore_ascii_case("machine")
-                && !args[2].eq_ignore_ascii_case("process")
-            {
-                return Err(format!("unknown environment target: {}", args[2]));
+            match environment_target(args.get(2))? {
+                None => environment_set(environment, &args[0], &args[1]),
+                Some(hive) => {
+                    crate::winreg::set_persistent_environment(fs, hive, &args[0], &args[1])?
+                }
             }
-            environment_set(environment, &args[0], &args[1]);
             Ok(String::new())
         }
         _ => Err(format!("method {method} is not supported on Environment")),
@@ -5228,7 +5240,7 @@ mod tests {
         run_ps1_session(
             &mut session,
             &mut fs,
-            "$env:WINRUN_GUEST_ONLY = first\n$env:WINRUN_GUEST_ONLY += -more\n[Environment]::SetEnvironmentVariable('Tool_Home', 'C:\\tools', 'User')\necho $env:winrun_guest_only\necho ([Environment]::GetEnvironmentVariable('TOOL_HOME'))",
+            "$env:WINRUN_GUEST_ONLY = first\n$env:WINRUN_GUEST_ONLY += -more\n[Environment]::SetEnvironmentVariable('Tool_Home', 'C:\\tools', 'Process')\necho $env:winrun_guest_only\necho ([Environment]::GetEnvironmentVariable('TOOL_HOME'))",
             &mut out,
         )
         .unwrap();
@@ -5242,6 +5254,47 @@ mod tests {
         out.clear();
         run_ps1_session(&mut session, &mut fs, "$env:Tool_Home = $null", &mut out).unwrap();
         assert_eq!(environment_get(&session.environment, "TOOL_HOME"), None);
+    }
+
+    #[test]
+    fn user_and_machine_environment_targets_persist_in_the_registry_only() {
+        let mut fs = WinFs::ephemeral_runner();
+        let mut session = Session::default();
+        let mut out = Vec::new();
+        run_ps1_session(
+            &mut session,
+            &mut fs,
+            "[Environment]::SetEnvironmentVariable('EDITOR', 'vim', 'User')\n[Environment]::SetEnvironmentVariable('TOOLS', '%USERPROFILE%\\tools', 'Machine')\necho ([Environment]::GetEnvironmentVariable('EDITOR', 'User'))\necho ([Environment]::GetEnvironmentVariable('TOOLS', 'Machine'))\necho x$env:EDITOR",
+            &mut out,
+        )
+        .unwrap();
+        // Saved for later sessions (expanded on read); this one is unchanged.
+        assert_eq!(out, b"vim\nC:\\Users\\runner\\tools\nx\n");
+        let registry = crate::winreg::Registry::load(&fs).unwrap();
+        let environment = crate::winreg::login_environment(&registry);
+        assert_eq!(environment_get(&environment, "EDITOR"), Some("vim"));
+        assert_eq!(
+            environment_get(&environment, "TOOLS"),
+            Some("C:\\Users\\runner\\tools")
+        );
+        out.clear();
+        run_ps1_session(
+            &mut session,
+            &mut fs,
+            "[Environment]::SetEnvironmentVariable('EDITOR', $null, 'User')\necho x([Environment]::GetEnvironmentVariable('EDITOR', 'User'))",
+            &mut out,
+        )
+        .unwrap();
+        let registry = crate::winreg::Registry::load(&fs).unwrap();
+        assert!(registry
+            .value(crate::winreg::Hive::CurrentUser, "Environment", "EDITOR")
+            .is_none());
+        assert!(
+            run_session("[Environment]::GetEnvironmentVariable('A', 'Nope')")
+                .1
+                .unwrap_err()
+                .contains("unknown environment target")
+        );
     }
 
     #[test]
@@ -5405,9 +5458,10 @@ mod tests {
         );
         assert!(r.is_ok());
         assert!(out.is_empty());
-        let (out, r) = run_session("[Environment]::SetEnvironmentVariable('WINRUN_DOTNET_XYZ', 'dotnet-ok', 'User')\n[Environment]::GetEnvironmentVariable('WINRUN_DOTNET_XYZ')");
+        let (out, r) = run_session("[Environment]::SetEnvironmentVariable('WINRUN_DOTNET_XYZ', 'dotnet-ok', 'User')\n[Environment]::GetEnvironmentVariable('WINRUN_DOTNET_XYZ', 'User')\n[Environment]::GetEnvironmentVariable('WINRUN_DOTNET_XYZ')");
         assert!(r.is_ok());
-        assert_eq!(out, b"dotnet-ok\n");
+        // User-target writes persist; the running session's copy is unchanged.
+        assert_eq!(out, b"dotnet-ok\n\n");
         // Process target and missing names behave the same way.
         let (out, r) =
             run_session("[Environment]::GetEnvironmentVariable('WINRUN_DEFINITELY_NOT_SET_XYZ')");

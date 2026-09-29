@@ -30,6 +30,9 @@ All notable changes to this project will be documented in this file.
   `RegDeleteTreeW`, `RegEnumKeyExW`, `RegEnumValueW`, `RegQueryInfoKeyW`, and
   `RegCloseKey` over the guest registry, including sign-extended predefined
   keys; opens previously always failed and writes were discarded.
+- `[Environment]::Get/SetEnvironmentVariable` with a `User` or `Machine`
+  target now reads and writes the registry and, as in .NET, leaves the running
+  session unchanged.
 - Lay out the guest disk and environment like a stock Windows installation
   from one `system_profile` definition: user `runner`, computer `WINRUNNER`,
   profile `C:\Users\runner` (the shell's starting directory, replacing
