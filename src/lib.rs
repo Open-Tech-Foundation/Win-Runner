@@ -1,5 +1,4 @@
 pub mod backend;
-pub mod choco;
 pub mod control;
 pub mod deflate;
 pub mod inspect;
@@ -12,4 +11,4 @@ pub mod ps1;
 pub mod shell;
 pub mod snapshot;
 pub mod winfs;
-pub mod winget;
+pub mod wpkg;

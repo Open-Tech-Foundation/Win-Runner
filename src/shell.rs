@@ -10,7 +10,7 @@
 //! shell continues. `exit [n]`/`quit`, Ctrl-D (EOF), or a closed pipe ends
 //! the session (code = argument, else the last guest code).
 
-use crate::{backend, choco, inspect, install, pe, ps1, winfs::WinFs};
+use crate::{backend, inspect, pe, ps1, winfs::WinFs, wpkg};
 use rustyline::{
     completion::{Completer, Pair},
     error::ReadlineError,
@@ -120,10 +120,8 @@ const SHELL_COMMANDS: &[&str] = &[
     "set",
     "path",
     "mount",
-    "install",
     "snapshot",
-    "choco",
-    "winget",
+    "wpkg",
     "powershell",
     "inspect",
     "exit",
@@ -309,6 +307,14 @@ fn default_environment() -> Vec<(String, String)> {
             "USERPROFILE".to_string(),
             r"C:\Users\Win-Runner".to_string(),
         ),
+        (
+            "APPDATA".to_string(),
+            r"C:\Users\Win-Runner\AppData\Roaming".to_string(),
+        ),
+        (
+            "LOCALAPPDATA".to_string(),
+            r"C:\Users\Win-Runner\AppData\Local".to_string(),
+        ),
         ("USERNAME".to_string(), "Win-Runner".to_string()),
         ("WINDIR".to_string(), r"C:\Windows".to_string()),
     ])
@@ -355,6 +361,19 @@ impl Shell {
     /// subsequent `snapshot save` commands without a path.
     pub fn with_snapshot_path(mut fs: WinFs, snapshot_path: Option<std::path::PathBuf>) -> Self {
         seed_powershell_shell_link(&mut fs);
+        fs.mkdir(r"C:\.system\npm-cache\_cacache\tmp")
+            .expect("npm cache temp directory must fit the guest filesystem");
+        fs.mkdir(r"C:\.system\npm-cache\_logs")
+            .expect("npm log directory must fit the guest filesystem");
+        fs.mkdir(r"C:\Users\Win-Runner\AppData\Roaming")
+            .expect("guest roaming profile directory must fit the filesystem");
+        fs.mkdir(r"C:\Users\Win-Runner\AppData\Local")
+            .expect("guest local profile directory must fit the filesystem");
+        let windows_npm_cache = r"C:\Users\Win-Runner\AppData\Local\npm-cache";
+        if !fs.exists(windows_npm_cache) {
+            fs.create_symlink(windows_npm_cache, r"C:\.system\npm-cache", true)
+                .expect("Windows npm cache path must map into C:\\.system");
+        }
         let backend_started = std::time::Instant::now();
         let backend = backend::configured().map_err(|e| format!("failed to select backend: {e}"));
         if std::env::var_os("WINRUN_TIMINGS").is_some() {
@@ -652,21 +671,6 @@ impl Shell {
                 self.seed_host_file(host, guest)?;
                 Ok(ShellFlow::Continue)
             }
-            "install" => {
-                let name = argv
-                    .get(1)
-                    .ok_or_else(|| "usage: install <pkg>".to_string())?;
-                let inst = do_install(name)?;
-                self.seed_host_file(&inst.host_path.display().to_string(), &inst.guest_path)?;
-                out.extend_from_slice(
-                    format!(
-                        "Installed {} {} → {}\n",
-                        inst.name, inst.version, inst.guest_path
-                    )
-                    .as_bytes(),
-                );
-                Ok(ShellFlow::Continue)
-            }
             "snapshot" => {
                 self.do_snapshot(&argv[1..], out)?;
                 Ok(ShellFlow::Continue)
@@ -680,7 +684,7 @@ impl Shell {
                 Ok(ShellFlow::Continue)
             }
             "help" => {
-                out.extend_from_slice(b"Built-in commands: cd, pwd, dir, type, copy, move, del, mkdir, rmdir, cls, set, path, mount, choco, winget, powershell, snapshot, inspect, exit\n");
+                out.extend_from_slice(b"Built-in commands: cd, pwd, dir, type, copy, move, del, mkdir, rmdir, cls, set, path, mount, wpkg, powershell, snapshot, inspect, exit\n");
                 Ok(ShellFlow::Continue)
             }
             "cd" | "chdir" => {
@@ -772,12 +776,8 @@ impl Shell {
                 }
                 Ok(ShellFlow::Continue)
             }
-            "choco" => {
-                self.do_choco(&argv[1..], out)?;
-                Ok(ShellFlow::Continue)
-            }
-            "winget" => {
-                self.do_winget(&argv[1..], out)?;
+            "wpkg" => {
+                self.do_wpkg(&argv[1..], out, sink.as_ref())?;
                 Ok(ShellFlow::Continue)
             }
             "powershell" => {
@@ -843,7 +843,8 @@ impl Shell {
                 .read_file(target)
                 .map_err(|e| format!("cannot read guest executable {target}: {e}"))?;
             report_timing(target, "guest_file_read", file_read_started);
-            return self.run_exe_bytes(&data, target, &argv[1..], out, sink);
+            let image_path = self.guest_image_path(target);
+            return self.run_exe_bytes(&data, &image_path, &argv[1..], out, sink);
         }
         // Bare names resolve on the guest PATH, like a Windows terminal.
         if !target.contains(['\\', '/', ':']) {
@@ -869,7 +870,8 @@ impl Shell {
                             format!("cannot read guest executable {candidate}: {e}")
                         })?;
                         report_timing(&candidate, "guest_file_read", file_read_started);
-                        return self.run_exe_bytes(&data, &candidate, &argv[1..], out, sink);
+                        let image_path = self.guest_image_path(&candidate);
+                        return self.run_exe_bytes(&data, &image_path, &argv[1..], out, sink);
                     }
                 }
             }
@@ -887,7 +889,7 @@ impl Shell {
                 Ok(ShellFlow::Continue)
             }
             Err(_) => Err(format!(
-                "nothing to run: {target} (no such file; try `install {target}`)"
+                "nothing to run: {target} (no such file; try `wpkg install {target}`)"
             )),
         }
     }
@@ -988,185 +990,34 @@ impl Shell {
             _ => Err("usage: snapshot save [file]".to_string()),
         }
     }
-    /// `choco install nodejs [--version=X.Y.Z]`: fetch and verify the official
-    /// distribution, then place node.exe and npm in this guest disk.
-    /// `choco` itself is built into winrun (no bootstrap needed).
-    fn do_choco(&mut self, argv: &[String], out: &mut Vec<u8>) -> Result<(), String> {
-        match choco::parse_args(argv)? {
-            choco::ChocoCmd::Version => {
-                out.extend_from_slice(format!("winrun-choco {}\n", choco::SHIM_VERSION).as_bytes());
-                Ok(())
-            }
-            choco::ChocoCmd::InstallNode { version } => {
-                let cache = install::cache_dir();
-                let inst = choco::install_nodejs(&version, &cache)?;
-                self.seed_host_file(
-                    &inst.node_exe_host.display().to_string(),
-                    r"C:\bin\node.exe",
-                )?;
-                self.seed_npm_tree(&inst)?;
-                self.last_code = 0;
-                out.extend_from_slice(
-                    format!(
-                        "Installed nodejs {} → C:\\bin\\node.exe\nnpm {} ready as 'npm'\n",
-                        inst.version, inst.npm_version
-                    )
-                    .as_bytes(),
-                );
-                Ok(())
-            }
-            choco::ChocoCmd::InstallCommunity { id, version } => {
-                if id == "7zip.install" {
-                    return self.install_7zip_guest(version.as_deref(), out);
-                }
-                let cache = install::cache_dir();
-                let app = choco::install_community(&id, version.as_deref(), &cache)?;
-                self.seed_choco_app(&app)?;
-                self.last_code = 0;
-                out.extend_from_slice(
-                    format!(
-                        "Installed {} {} → C:\\bin\\{}.exe\n",
-                        app.name, app.version, app.name
-                    )
-                    .as_bytes(),
-                );
-                Ok(())
-            }
-        }
-    }
-
-    /// WinGet-compatible shell entry point for verified portable catalog
-    /// packages. This deliberately supports only `install` and `--version`.
-    fn do_winget(&mut self, argv: &[String], out: &mut Vec<u8>) -> Result<(), String> {
-        match crate::winget::parse_args(argv)? {
-            crate::winget::WingetCmd::Version => {
-                out.extend_from_slice(
-                    format!("winrun-winget {}\n", crate::winget::SHIM_VERSION).as_bytes(),
-                );
-                Ok(())
-            }
-            crate::winget::WingetCmd::Install { id } => {
-                let installed = do_install(&id)?;
-                self.seed_host_file(
-                    &installed.host_path.display().to_string(),
-                    &installed.guest_path,
-                )?;
-                self.last_code = 0;
-                out.extend_from_slice(
-                    format!(
-                        "Installed {} {} → {}\n",
-                        installed.name, installed.version, installed.guest_path
-                    )
-                    .as_bytes(),
-                );
-                Ok(())
-            }
-        }
-    }
-
-    /// Install Chocolatey's `7zip.install` package by running its silent
-    /// Windows installer against WinFS. The installer and resulting program
-    /// files stay on the guest disk and therefore travel with snapshots.
-    fn install_7zip_guest(
+    /// Resolve package metadata directly from the Win-Runner GitHub registry.
+    /// The archive itself is fetched and verified by the wpkg engine.
+    fn do_wpkg(
         &mut self,
-        version: Option<&str>,
+        argv: &[String],
         out: &mut Vec<u8>,
+        sink: Option<&backend::OutputSink>,
     ) -> Result<(), String> {
-        let (pkg, blob) = choco::download_community_nupkg("7zip.install", version)?;
-        let tools = r"C:\ProgramData\chocolatey\lib\7zip.install\tools";
-        let files = choco::extract_nupkg_tools_to_guest(&blob, &mut self.fs, tools)?;
-        let installer = files
-            .iter()
-            .find(|path| {
-                path.rsplit('\\')
-                    .next()
-                    .is_some_and(|name| name.eq_ignore_ascii_case("7zip_x64.exe"))
-            })
-            .ok_or_else(|| format!("choco: {} has no 64-bit 7-Zip installer", pkg.id))?;
-        let bytes = self
-            .fs
-            .read_file(installer)
-            .map_err(|e| format!("choco: cannot read guest installer: {e}"))?;
-        let staged_disk = self.fs.clone();
-        if let Err(error) = self.run_exe_bytes(&bytes, installer, &["/S".to_string()], out, None) {
-            // A native guest crash consumes its moved WinFS. Keep the package
-            // tools available so the caller can inspect or retry the install.
-            self.fs = staged_disk;
-            return Err(error);
-        }
-        if self.last_code != 0 {
-            return Err(format!(
-                "choco: 7-Zip guest installer exited with code {}",
-                self.last_code
-            ));
-        }
-
-        let installed_path = self
-            .fs
-            .find_file_path_suffix(r"\7-zip\7z.exe")
-            .ok_or_else(|| {
-                "choco: 7-Zip installer completed but did not create 7-Zip\\7z.exe".to_string()
-            })?;
-        let installed = self
-            .fs
-            .read_file(&installed_path)
-            .map_err(|e| format!("choco: cannot read installed 7z.exe: {e}"))?;
-        let install_dir = installed_path
-            .strip_suffix(r"\7z.exe")
-            .unwrap_or(&installed_path);
-        self.fs
-            .mkdir(r"C:\bin")
-            .map_err(|e| format!("choco: cannot create C:\\bin: {e}"))?;
-        self.fs
-            .write_file(r"C:\bin\7z.exe", installed)
-            .map_err(|e| format!("choco: cannot install C:\\bin\\7z.exe: {e}"))?;
+        let repository = wpkg::EmbeddedRepository::new()?;
+        let result = {
+            let mut report = |message: &str| {
+                if let Some(sink) = sink {
+                    sink(backend::OutputChannel::Stdout, message.as_bytes());
+                } else {
+                    out.extend_from_slice(message.as_bytes());
+                }
+            };
+            wpkg::execute_with_progress(
+                &mut self.fs,
+                &repository,
+                wpkg::host_architecture(),
+                argv,
+                &mut report,
+            )
+        };
+        let output = result.map_err(|error| format!("❌ wpkg failed: {error}"))?;
+        out.extend_from_slice(&output);
         self.last_code = 0;
-        out.extend_from_slice(
-            format!("Installed 7zip.install {} → {install_dir}\n", pkg.version).as_bytes(),
-        );
-        Ok(())
-    }
-
-    /// Copy a community app onto the guest disk. Keeping the app tree and
-    /// PATH entry in WinFS makes it part of snapshots and removes runtime
-    /// dependence on host-side package staging.
-    fn seed_choco_app(&mut self, app: &choco::ChocoApp) -> Result<(), String> {
-        let mut files = Vec::new();
-        collect_host_files(&app.dir_host, &mut files)
-            .map_err(|e| format!("cannot seed {}: {e}", app.name))?;
-        files.sort();
-        for file in files {
-            let rel = file
-                .strip_prefix(&app.dir_host)
-                .map_err(|_| "cannot seed Chocolatey app: bad path".to_string())?;
-            let guest = format!(
-                r"C:\apps\{}\{}",
-                app.name,
-                rel.to_string_lossy().replace('/', "\\")
-            );
-            self.seed_host_file(&file.display().to_string(), &guest)?;
-        }
-        let exe = app.exe_rel.rsplit('/').next().unwrap_or(&app.name);
-        let exe_guest = format!(r"C:\apps\{}\{}", app.name, app.exe_rel.replace('/', "\\"));
-        let bytes = self
-            .fs
-            .read_file(&exe_guest)
-            .map_err(|e| format!("cannot seed {} executable: {e}", app.name))?;
-        self.fs
-            .mkdir(r"C:\bin")
-            .map_err(|e| format!("cannot create command directory: {e}"))?;
-        self.fs
-            .write_file(&format!(r"C:\bin\{}.exe", app.name), bytes.clone())
-            .map_err(|e| format!("cannot seed {} command: {e}", app.name))?;
-        let stem = exe
-            .strip_suffix(".exe")
-            .or_else(|| exe.strip_suffix(".EXE"))
-            .unwrap_or(exe);
-        if !stem.eq_ignore_ascii_case(&app.name) {
-            self.fs
-                .write_file(&format!(r"C:\bin\{stem}.exe"), bytes)
-                .map_err(|e| format!("cannot seed {} command: {e}", app.name))?;
-        }
         Ok(())
     }
 
@@ -1189,54 +1040,48 @@ impl Shell {
         sink: Option<backend::OutputSink>,
     ) -> Result<ShellFlow, String> {
         let node_guest = r"C:\bin\node.exe";
-        let npm_guest = choco::npm_cli_guest();
-        if let (Ok(node), Ok(_)) = (self.fs.read_file(node_guest), self.fs.read_file(npm_guest)) {
+        let node_path = self.guest_image_path(node_guest);
+        // npm ships beside node.exe; prefer the default Node.js version's
+        // copy over any other version's installed elsewhere on the disk.
+        let npm_guest = node_path
+            .rsplit_once('\\')
+            .map(|(directory, _)| format!(r"{directory}\node_modules\npm\bin\npm-cli.js"))
+            .filter(|path| self.fs.is_file(path))
+            .or_else(|| {
+                self.fs
+                    .find_file_path_suffix(r"\node_modules\npm\bin\npm-cli.js")
+            })
+            .unwrap_or_else(|| r"C:\npm\bin\npm-cli.js".to_string());
+        if let (Ok(node), Ok(_)) = (self.fs.read_file(node_guest), self.fs.read_file(&npm_guest)) {
             let mut args = vec![npm_guest.to_string()];
             args.extend_from_slice(guest_args);
-            return self.run_exe_bytes(&node, "node", &args, out, sink);
+            return self.run_exe_bytes(&node, &node_path, &args, out, sink);
         }
         let data = self.fs.read_file(node_guest).map_err(|_| {
-            "nothing to run: npm (Node.js is not installed in this session; run `choco install nodejs`)"
+            "nothing to run: npm (Node.js is not installed in this session; install it with `wpkg install nodejs`)"
                 .to_string()
         })?;
-        if self.fs.read_file(npm_guest).is_err() {
+        if self.fs.read_file(&npm_guest).is_err() {
             return Err(
-                "nothing to run: npm (npm is not installed in this session; run `choco install nodejs`)"
+                "nothing to run: npm (npm is not installed in this session; install Node.js with `wpkg install nodejs`)"
                     .to_string(),
             );
         }
         let mut args = vec![npm_guest.to_string()];
         args.extend_from_slice(guest_args);
-        self.run_exe_bytes(&data, "node", &args, out, sink)
+        self.run_exe_bytes(&data, &node_path, &args, out, sink)
     }
 
-    /// One-way host-to-guest copy of the npm tree (`C:\npm`),
-    /// skipped when this session already seeded the same version.
-    fn seed_npm_tree(&mut self, inst: &choco::NodeInstalled) -> Result<(), String> {
-        const MARKER: &str = r"C:\npm\.winrun-seeded";
-        if self
-            .fs
-            .read_file(MARKER)
-            .is_ok_and(|have| have == inst.version.as_bytes())
-        {
-            return Ok(());
-        }
-        let mut files = Vec::new();
-        collect_host_files(&inst.npm_root_host, &mut files)
-            .map_err(|e| format!("cannot seed npm: {e}"))?;
-        files.sort();
-        for file in files {
-            let rel = file
-                .strip_prefix(&inst.npm_root_host)
-                .map_err(|_| "cannot seed npm: bad path".to_string())?;
-            let guest = format!(r"C:\npm\{}", rel.to_string_lossy().replace('/', "\\"));
-            self.seed_host_file(&file.display().to_string(), &guest)?;
-        }
+    /// The path a guest EXE runs as. Commands in `C:\bin` are links into
+    /// `C:\softwares\<name>\current`; running the real file keeps
+    /// `GetModuleFileName`, DLL search, and files shipped beside the EXE
+    /// inside the selected package version.
+    fn guest_image_path(&self, path: &str) -> String {
         self.fs
-            .write_file(MARKER, inst.version.as_bytes().to_vec())
-            .map_err(|e| format!("cannot seed npm: {e}"))?;
-        Ok(())
+            .resolve_links(path)
+            .unwrap_or_else(|| path.to_string())
     }
+
     /// One-way host-to-guest copy used while booting a local runner image.
     /// The guest path is validated and written through WinFs; no guest call
     /// can recover the corresponding host path.
@@ -1264,17 +1109,6 @@ impl Shell {
     }
 }
 
-/// Install a package into process-local staging before copying it into the guest disk.
-fn do_install(name: &str) -> Result<install::Installed, String> {
-    let cache = install::cache_dir();
-    let source = install::source_from_env()?;
-    match source {
-        install::Source::Local(dir) => install::install(name, &dir, &cache),
-        install::Source::Winget => install::install_remote(name, &cache),
-    }
-    .map_err(|e| format!("install failed: {e}"))
-}
-
 /// Read a host executable or a file from this session's guest disk.
 fn read_target_bytes(fs: &WinFs, target: &str) -> Result<Vec<u8>, String> {
     if std::path::Path::new(target).is_file() {
@@ -1292,7 +1126,7 @@ fn read_target_bytes(fs: &WinFs, target: &str) -> Result<Vec<u8>, String> {
         }
     }
     Err(format!(
-        "nothing to inspect: {target} (no such file; try `install {target}` inside `winrun shell`)"
+        "nothing to inspect: {target} (no such file; try `wpkg install {target}` inside `winrun shell`)"
     ))
 }
 
@@ -1303,22 +1137,6 @@ fn report_timing(program: &str, stage: &str, started: std::time::Instant) {
             started.elapsed().as_secs_f64() * 1000.0
         );
     }
-}
-
-/// Recursively collect host files under `root` (for npm tree seeding).
-fn collect_host_files(
-    root: &std::path::Path,
-    out: &mut Vec<std::path::PathBuf>,
-) -> std::io::Result<()> {
-    for entry in std::fs::read_dir(root)? {
-        let path = entry?.path();
-        if path.is_dir() {
-            collect_host_files(&path, out)?;
-        } else if path.is_file() {
-            out.push(path);
-        }
-    }
-    Ok(())
 }
 
 /// Split a shell line on whitespace, honoring single/double quotes.
@@ -1702,6 +1520,17 @@ mod tests {
     fn shell_boots_an_ephemeral_runner_image() {
         let shell = Shell::new();
         assert_eq!(shell.cwd(), r"C:\actions-runner\_work");
+        assert_eq!(
+            shell.environment_value("localappdata"),
+            Some(r"C:\Users\Win-Runner\AppData\Local")
+        );
+        assert!(shell
+            .fs
+            .is_dir(r"C:\Users\Win-Runner\AppData\Local\npm-cache\_cacache\tmp"));
+        assert!(shell.fs.is_dir(r"C:\.system\npm-cache\_logs"));
+        assert!(shell
+            .fs
+            .is_symlink(r"C:\Users\Win-Runner\AppData\Local\npm-cache"));
     }
 
     #[test]
@@ -1764,7 +1593,7 @@ mod tests {
         let mut shell = Shell::new();
         let mut out = Vec::new();
         let err = shell.exec_line("frobnicate", &mut out).unwrap_err();
-        assert!(err.contains("install frobnicate"), "err: {err}");
+        assert!(err.contains("wpkg install frobnicate"), "err: {err}");
     }
 
     #[test]
@@ -1783,11 +1612,24 @@ mod tests {
     }
 
     #[test]
-    fn install_and_inspect_need_args() {
+    fn wpkg_and_inspect_need_args() {
         let mut shell = Shell::new();
         let mut out = Vec::new();
-        assert!(shell.exec_line("install", &mut out).is_err());
+        assert!(shell
+            .exec_line("wpkg", &mut out)
+            .unwrap_err()
+            .contains("usage: wpkg"));
         assert!(shell.exec_line("inspect", &mut out).is_err());
+    }
+
+    #[test]
+    fn wpkg_install_failure_has_failure_emoji() {
+        let mut shell = Shell::new();
+        let mut out = Vec::new();
+        let error = shell
+            .exec_line("wpkg install missing-package", &mut out)
+            .unwrap_err();
+        assert!(error.contains("❌ wpkg failed"), "{error}");
     }
 
     #[test]
@@ -1889,10 +1731,10 @@ mod tests {
         let mut helper = ShellHelper::default();
         helper.refresh(&shell.fs, &shell.environment);
 
-        let (_, command_candidates) = helper.complete_line("wi", 2);
+        let (_, command_candidates) = helper.complete_line("wp", 2);
         assert!(command_candidates
             .iter()
-            .any(|candidate| candidate.replacement == "winget"));
+            .any(|candidate| candidate.replacement == "wpkg"));
 
         let (_, path_candidates) = helper.complete_line("cd Doc", 6);
         assert!(path_candidates
@@ -1924,50 +1766,27 @@ mod tests {
     }
 
     #[test]
-    fn choco_reports_builtin_version() {
+    fn wpkg_uses_embedded_registry_without_network_for_search_and_info() {
         let mut shell = Shell::new();
         let mut out = Vec::new();
-        shell.exec_line("choco --version", &mut out).unwrap();
-        assert_eq!(
-            out,
-            format!("winrun-choco {}\n", choco::SHIM_VERSION).as_bytes()
-        );
+        shell.exec_line("wpkg search node", &mut out).unwrap();
+        assert_eq!(out, b"nodejs\n");
+        out.clear();
+        shell.exec_line("wpkg info nodejs@24", &mut out).unwrap();
+        assert!(String::from_utf8_lossy(&out)
+            .contains(&format!("nodejs 24.21.0 ({})", wpkg::host_architecture())));
+        assert!(shell.exec_line("choco --version", &mut Vec::new()).is_err());
+        assert!(shell
+            .exec_line("winget --version", &mut Vec::new())
+            .is_err());
     }
 
     #[test]
-    fn winget_reports_builtin_version_and_parses_install_command() {
-        let mut shell = Shell::new();
-        let mut out = Vec::new();
-        shell.exec_line("winget --version", &mut out).unwrap();
-        assert_eq!(
-            out,
-            format!("winrun-winget {}\n", crate::winget::SHIM_VERSION).as_bytes()
-        );
-
-        let error = shell
-            .exec_line("winget install", &mut Vec::new())
-            .unwrap_err();
-        assert!(error.contains("usage: winget install"), "{error}");
-    }
-
-    #[test]
-    fn choco_rejects_unknown_packages_and_options() {
-        let mut shell = Shell::new();
-        let mut out = Vec::new();
-        let err = shell.exec_line("choco", &mut out).unwrap_err();
-        assert!(err.contains("usage"), "err: {err}");
-        let err = shell
-            .exec_line("choco install python", &mut out)
-            .unwrap_err();
-        assert!(err.contains("package not found"), "err: {err}");
-    }
-
-    #[test]
-    fn npm_without_nodejs_hints_choco() {
+    fn npm_without_nodejs_hints_wpkg() {
         let mut shell = Shell::new();
         let mut out = Vec::new();
         let err = shell.exec_line("npm -v", &mut out).unwrap_err();
-        assert!(err.contains("choco install nodejs"), "err: {err}");
+        assert!(err.contains("wpkg install nodejs"), "err: {err}");
     }
 
     #[test]

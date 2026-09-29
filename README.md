@@ -41,7 +41,7 @@ programs**, driven by people, CI pipelines, and coding agents.
   accepts input, key, and resize events, and reports exit codes, so an agent can
   build, run, and check Windows programs without a Windows machine.
 - **One small binary:** a single Rust executable with a shell, PowerShell-style
-  scripts, and `choco`/`winget` package installs built in.
+  scripts, and a manifest-based portable package manager.
 
 Win-Runner does not aim to replace Wine. It targets command-line programs, not GUI
 apps, games, or drivers. For those, use Wine or a real Windows machine.
@@ -75,8 +75,23 @@ Explicitly mounted host directories appear as separate guest drives (for example
 
 ## Shell and packages
 
-The interactive shell supports common file and directory commands, PowerShell-style scripts, environment updates, history, and tab completion.
-Its built-in `choco` and `winget` commands install a limited set of portable packages into the guest C: drive.
+The shell includes `wpkg`, which installs SHA-256-verified ZIP and 7z packages into the guest C: drive without running installers or package scripts. Its text registry is bundled in the binary; package archives download only when installed.
+
+```text
+wpkg search <query> | info <package[@version]>
+wpkg install <package[@version]> | list [package] | default <package> [version]
+wpkg upgrade [package] | remove <package[@version]>
+```
+
+Versions install side by side under `C:\softwares\<package>\<version>`. The first version installed becomes the default; `C:\softwares\<package>\current` links to the default, and each command in `C:\bin` links through it. `@26` selects the newest `26.x` release, and `wpkg default nodejs 26` switches every Node.js command to it. `upgrade` installs the latest release beside the existing ones and moves the default only when it was already on the newest version.
+
+```text
+wpkg install nodejs          # latest; becomes the default
+wpkg install nodejs@26       # side by side; the default is unchanged
+wpkg list nodejs             # * marks the default
+wpkg default nodejs 26
+wpkg remove nodejs@24        # one version; `remove nodejs` removes all
+```
 
 ## Headless control
 

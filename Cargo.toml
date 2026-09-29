@@ -10,6 +10,7 @@ base64 = "0.22"
 libc = "0.2"
 rustyline = { version = "15", default-features = false }
 serde_json = "1"
+sevenz-rust2 = { version = "=0.22.2", default-features = false, features = ["bzip2", "ppmd", "deflate", "util"] }
 tungstenite = "=0.26.2"
 
 [[bin]]

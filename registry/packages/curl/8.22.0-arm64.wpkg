@@ -1,0 +1,6 @@
+name = "curl"
+version = "8.22.0"
+arch = "arm64"
+url = "https://curl.se/windows/dl-8.22.0_2/curl-8.22.0_2-win64a-mingw.zip"
+sha256 = "dbd14fec4f2ae61b1fb7f885319f47b8f1de4db2e1f3edd7bcfbbc08e20d08af"
+bin = ["curl-8.22.0_2-win64a-mingw/bin/curl.exe"]

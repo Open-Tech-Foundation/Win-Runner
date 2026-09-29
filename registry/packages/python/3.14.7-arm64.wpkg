@@ -1,0 +1,6 @@
+name = "python"
+version = "3.14.7"
+arch = "arm64"
+url = "https://www.python.org/ftp/python/3.14.7/python-3.14.7-embeddable-arm64.zip"
+sha256 = "b777fa08b68a177e350f8730c3e97a2b216d81e3eb5d183b039c65d43a6a2b3e"
+bin = ["python.exe"]

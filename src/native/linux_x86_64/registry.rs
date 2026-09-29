@@ -760,6 +760,9 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "GetEnvironmentVariableW" => {
             Some(native_get_environment_variable_w as *const () as usize as u64)
         }
+        "GetEnvironmentVariableA" => {
+            Some(native_get_environment_variable_a as *const () as usize as u64)
+        }
         "SetEnvironmentVariableW" => {
             Some(native_set_environment_variable_w as *const () as usize as u64)
         }

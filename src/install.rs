@@ -1,68 +1,9 @@
-//! Package install + process-local staging.
-//!
-//! Package downloads and extracted host-side staging live in a per-process
-//! temporary directory which is removed when Win-Runner exits.
-//!
-//! ```text
-//! index/<name>.json     resolved metadata (version, exe, archive sha256)
-//! archives/<sha256>.*   downloaded blobs, content-addressed (fetch once ever)
-//! pkgs/<name>.exe       extracted runnable EXEs
-//! ```
-//!
-//! Sources: a local directory (`$WINRUN_SOURCE` set to a path, holding
-//! `<name>.json` + `<name>.zip` per package) or, by default, the remote
-//! WinGet catalog (see `winget`). Archives may be stored or deflated zips,
-//! or (remote portable installers) the exe itself.
+//! Shared HTTPS, ZIP, and checksum helpers for guest package data and snapshots.
 
-use std::path::{Path, PathBuf};
-
-/// Resolve package staging to a process-local temporary directory. The path
-/// never reuses another run's downloaded programs.
-pub fn cache_dir() -> PathBuf {
-    std::env::temp_dir().join(format!("winrun-session-{}", std::process::id()))
-}
-
-/// Remove a stale directory if the OS reused a PID from an unclean exit.
-pub fn prepare_process_cache() {
-    let _ = std::fs::remove_dir_all(cache_dir());
-}
-
-/// Delete process-local scratch at the end of a CLI process.
-pub fn cleanup_process_cache() {
-    let _ = std::fs::remove_dir_all(cache_dir());
-}
-
-/// Package source: a local directory, or the remote WinGet catalog.
-#[derive(Debug, Clone)]
-pub enum Source {
-    Local(PathBuf),
-    Winget,
-}
-
-/// Resolve the source: `$WINRUN_SOURCE` unset/`winget` → remote catalog,
-/// otherwise a local package directory (must exist).
-pub fn source_from_env() -> Result<Source, String> {
-    match std::env::var("WINRUN_SOURCE") {
-        Ok(p) if !p.is_empty() && p != "winget" => {
-            let dir = PathBuf::from(&p);
-            if !dir.is_dir() {
-                return Err(format!("package source dir not found: {p}"));
-            }
-            Ok(Source::Local(dir))
-        }
-        Ok(_) | Err(_) => Ok(Source::Winget),
-    }
-}
-
-/// Kept for explicit local-dir use (tests, fixtures).
-pub fn source_dir() -> Result<PathBuf, String> {
-    match source_from_env()? {
-        Source::Local(p) => Ok(p),
-        Source::Winget => {
-            Err("no local package source: set WINRUN_SOURCE to a package directory".to_string())
-        }
-    }
-}
+use std::{
+    io::{BufRead, BufReader, Read},
+    process::Stdio,
+};
 
 /// Download bytes over HTTPS via `curl`. Clear error when curl is missing.
 pub fn fetch_url(url: &str, max_time_secs: u64) -> Result<Vec<u8>, String> {
@@ -93,199 +34,107 @@ pub fn fetch_url(url: &str, max_time_secs: u64) -> Result<Vec<u8>, String> {
     Ok(out.stdout)
 }
 
-#[derive(Debug, Clone)]
-pub struct Installed {
-    pub name: String,
-    pub version: String,
-    /// File name of the exe inside the archive.
-    pub exe_name: String,
-    /// Guest-logical install location (copied into WinFS after download).
-    pub guest_path: String,
-    /// Host path of the runnable in temporary process staging.
-    pub host_path: PathBuf,
-}
+/// Download bytes over HTTPS while forwarding curl's progress meter as
+/// monotonically increasing whole percentages.
+pub fn fetch_url_with_progress(
+    url: &str,
+    max_time_secs: u64,
+    mut progress: impl FnMut(u8),
+) -> Result<Vec<u8>, String> {
+    let mut child = std::process::Command::new("curl")
+        .args([
+            "--progress-bar",
+            "--show-error",
+            "--fail",
+            "--location",
+            "--max-time",
+            &max_time_secs.to_string(),
+            "-A",
+            "winrun/0.1.0",
+            url,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|_| "cannot run curl: install it to use remote sources".to_string())?;
 
-/// Install a package from a local source dir into temporary process staging.
-pub fn install(name: &str, source: &Path, cache: &Path) -> Result<Installed, String> {
-    if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
-        return Err(format!("invalid package name: {name}"));
-    }
-    let manifest_path = source.join(format!("{name}.json"));
-    let manifest = std::fs::read_to_string(&manifest_path).map_err(|_| {
-        format!(
-            "package not found: {name} (no {} in source)",
-            manifest_path.display()
-        )
-    })?;
-    let version = json_string(&manifest, "version")
-        .ok_or_else(|| format!("package {name}: manifest missing \"version\""))?;
-    let exe = json_string(&manifest, "exe")
-        .ok_or_else(|| format!("package {name}: manifest missing \"exe\""))?;
-    let archive_name = json_string(&manifest, "archive").unwrap_or_else(|| format!("{name}.zip"));
-    if archive_name.contains('/') || archive_name.contains('\\') || archive_name.contains("..") {
-        return Err(format!("package {name}: bad archive name"));
-    }
-    let blob = std::fs::read(source.join(&archive_name))
-        .map_err(|_| format!("package {name}: missing archive {archive_name} in source"))?;
-    let exe_bytes = extract_entry(&blob, &exe).map_err(|e| format!("package {name}: {e}"))?;
-    if exe_bytes.len() < 2 || &exe_bytes[0..2] != b"MZ" {
-        return Err(format!(
-            "package {name}: archive entry {exe} is not a PE file"
-        ));
-    }
-    finalize(name, &version, &exe, &blob, "zip", cache)
-}
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "curl did not provide a download stream".to_string())?;
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = BufReader::new(stdout).read_to_end(&mut bytes);
+        (result, bytes)
+    });
 
-/// Install from the remote WinGet catalog: resolve → download (unless the
-/// content-addressed blob is already cached) → verify SHA-256 → extract →
-/// cache. Re-running never re-downloads.
-pub fn install_remote(name: &str, cache: &Path) -> Result<Installed, String> {
-    check_name(name)?;
-    let r = crate::winget::resolve(name)?;
-    let ext = match r.kind {
-        crate::winget::Kind::Exe => "exe",
-        crate::winget::Kind::Zip { .. } => "zip",
-    };
-    let blob_path = cache.join("archives").join(format!("{}.{ext}", r.sha256));
-    let blob = if blob_path.is_file() {
-        std::fs::read(&blob_path).map_err(|e| format!("cannot read cache: {e}"))?
-    } else {
-        let bytes = fetch_url(&r.url, 180)?;
-        let sha = sha256_hex(&bytes);
-        if sha != r.sha256 {
-            return Err(format!(
-                "SHA-256 mismatch for {} {} (manifest {}, got {})",
-                r.id, r.version, r.sha256, sha
-            ));
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "curl did not provide a progress stream".to_string())?;
+    let mut stderr_reader = BufReader::new(stderr);
+    let mut stderr_message = Vec::new();
+    let mut progress_line = Vec::new();
+    let mut last_percent = 0;
+    loop {
+        progress_line.clear();
+        let read = stderr_reader
+            .read_until(b'\r', &mut progress_line)
+            .map_err(|error| format!("cannot read curl progress: {error}"))?;
+        if read == 0 {
+            break;
         }
-        std::fs::create_dir_all(blob_path.parent().unwrap())
-            .map_err(|e| format!("cannot create cache: {e}"))?;
-        std::fs::write(&blob_path, &bytes).map_err(|e| format!("cannot write cache: {e}"))?;
-        bytes
-    };
-    // Re-verify even on cache hit (cheap, guards against tampering).
-    if sha256_hex(&blob) != r.sha256 {
+        if let Some(percent) = curl_progress_percent(&progress_line) {
+            if percent > last_percent {
+                last_percent = percent;
+                progress(percent);
+            }
+        } else {
+            stderr_message.extend_from_slice(&progress_line);
+        }
+    }
+
+    let status = child
+        .wait()
+        .map_err(|error| format!("cannot wait for curl: {error}"))?;
+    let (stdout_result, bytes) = stdout_reader
+        .join()
+        .map_err(|_| "curl download reader stopped unexpectedly".to_string())?;
+    stdout_result.map_err(|error| format!("cannot read curl download: {error}"))?;
+    if !status.success() {
+        let tail = String::from_utf8_lossy(&stderr_message);
         return Err(format!(
-            "cached blob failed SHA-256 for {} {}",
-            r.id, r.version
+            "download failed: {url} ({status}){}",
+            if tail.trim().is_empty() {
+                String::new()
+            } else {
+                format!(": {}", tail.trim())
+            }
         ));
     }
-    let (exe_bytes, exe_rel) = match &r.kind {
-        crate::winget::Kind::Exe => (blob.clone(), r.exe_name.clone()),
-        crate::winget::Kind::Zip { nested } => (
-            extract_entry(&blob, nested).map_err(|e| format!("package {}: {e}", r.id))?,
-            nested.clone(),
-        ),
-    };
-    crate::pe::load_lenient(&exe_bytes).map_err(|e| {
-        format!(
-            "package {}: payload is not a supported x64 PE file: {e}",
-            r.id
-        )
-    })?;
-    let mut installed = finalize(name, &r.version, &exe_rel, &blob, ext, cache)?;
-    if r.command.is_some() {
-        installed.exe_name = r.exe_name;
-        installed.guest_path = format!("C:\\bin\\{}", installed.exe_name);
+    if last_percent < 100 {
+        progress(100);
     }
-    Ok(installed)
+    Ok(bytes)
 }
 
-fn check_name(name: &str) -> Result<(), String> {
-    if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
-        return Err(format!("invalid package name: {name}"));
+fn curl_progress_percent(line: &[u8]) -> Option<u8> {
+    let percent_index = line.iter().rposition(|byte| *byte == b'%')?;
+    let number_end = percent_index;
+    let mut number_start = number_end;
+    while number_start > 0
+        && (line[number_start - 1].is_ascii_digit() || line[number_start - 1] == b'.')
+    {
+        number_start -= 1;
     }
-    Ok(())
-}
-
-/// Shared cache-write tail for local + remote installs.
-pub(crate) fn finalize(
-    name: &str,
-    version: &str,
-    exe_rel: &str,
-    blob: &[u8],
-    blob_ext: &str,
-    cache: &Path,
-) -> Result<Installed, String> {
-    let sha = sha256_hex(blob);
-    for d in ["archives", "pkgs", "index"] {
-        std::fs::create_dir_all(cache.join(d)).map_err(|e| format!("cannot create cache: {e}"))?;
-    }
-    // Local path already wrote the blob; remote path too. Ensure present.
-    let blob_path = cache.join("archives").join(format!("{sha}.{blob_ext}"));
-    if !blob_path.is_file() {
-        std::fs::write(&blob_path, blob).map_err(|e| format!("cannot write cache: {e}"))?;
-    }
-    let exe_bytes = if blob_ext == "zip" {
-        extract_entry(blob, exe_rel).map_err(|e| format!("package {name}: {e}"))?
-    } else {
-        blob.to_vec()
-    };
-    let host_path = cache.join("pkgs").join(format!("{name}.exe"));
-    std::fs::write(&host_path, &exe_bytes).map_err(|e| format!("cannot write cache: {e}"))?;
-
-    let exe_base = exe_rel
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(exe_rel)
-        .to_string();
-    let index = format!(
-        "{{\"name\":\"{}\",\"version\":\"{}\",\"exe\":\"{}\",\"sha256\":\"{}\"}}\n",
-        esc(name),
-        esc(version),
-        esc(exe_rel),
-        sha
-    );
-    std::fs::write(cache.join("index").join(format!("{name}.json")), index)
-        .map_err(|e| format!("cannot write cache: {e}"))?;
-
-    Ok(Installed {
-        name: name.to_string(),
-        version: version.to_string(),
-        exe_name: exe_base.clone(),
-        guest_path: format!("C:\\bin\\{exe_base}"),
-        host_path,
-    })
-}
-
-/// Resolve a cached runnable by package name (`demo` or `demo.exe`).
-pub fn find_cached(cache: &Path, name: &str) -> Option<PathBuf> {
-    let base = name.strip_suffix(".exe").unwrap_or(name);
-    if base.contains('/') || base.contains('\\') || base.contains("..") {
+    let number = std::str::from_utf8(&line[number_start..number_end])
+        .ok()?
+        .parse::<f32>()
+        .ok()?;
+    if !(0.0..=100.0).contains(&number) {
         return None;
     }
-    let p = cache.join("pkgs").join(format!("{base}.exe"));
-    p.is_file().then_some(p)
-}
-
-fn esc(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-/// Extract one string field from a flat JSON object. Handles \" and \\.
-pub fn json_string(doc: &str, key: &str) -> Option<String> {
-    let pat = format!("\"{key}\"");
-    let mut search = doc;
-    loop {
-        let i = search.find(&pat)?;
-        let rest = search[i + pat.len()..].trim_start();
-        let rest = match rest.strip_prefix(':') {
-            Some(r) => r.trim_start(),
-            None => {
-                search = &search[i + pat.len()..];
-                continue;
-            }
-        };
-        let mut chars = rest.strip_prefix('"')?.chars();
-        let mut out = String::new();
-        loop {
-            match chars.next()? {
-                '\\' => out.push(chars.next()?),
-                '"' => return Some(out),
-                c => out.push(c),
-            }
-        }
-    }
+    Some(number.round() as u8)
 }
 
 /// One ZIP local-header entry (directories end in `/`).
@@ -465,178 +314,9 @@ pub fn sha256_hex(data: &[u8]) -> String {
     sha256(data).iter().map(|b| format!("{b:02x}")).collect()
 }
 
-// ---------- SHA-512 (FIPS 180-4, compact) ----------
-
-const K512: [u64; 80] = [
-    0x428a2f98d728ae22,
-    0x7137449123ef65cd,
-    0xb5c0fbcfec4d3b2f,
-    0xe9b5dba58189dbbc,
-    0x3956c25bf348b538,
-    0x59f111f1b605d019,
-    0x923f82a4af194f9b,
-    0xab1c5ed5da6d8118,
-    0xd807aa98a3030242,
-    0x12835b0145706fbe,
-    0x243185be4ee4b28c,
-    0x550c7dc3d5ffb4e2,
-    0x72be5d74f27b896f,
-    0x80deb1fe3b1696b1,
-    0x9bdc06a725c71235,
-    0xc19bf174cf692694,
-    0xe49b69c19ef14ad2,
-    0xefbe4786384f25e3,
-    0x0fc19dc68b8cd5b5,
-    0x240ca1cc77ac9c65,
-    0x2de92c6f592b0275,
-    0x4a7484aa6ea6e483,
-    0x5cb0a9dcbd41fbd4,
-    0x76f988da831153b5,
-    0x983e5152ee66dfab,
-    0xa831c66d2db43210,
-    0xb00327c898fb213f,
-    0xbf597fc7beef0ee4,
-    0xc6e00bf33da88fc2,
-    0xd5a79147930aa725,
-    0x06ca6351e003826f,
-    0x142929670a0e6e70,
-    0x27b70a8546d22ffc,
-    0x2e1b21385c26c926,
-    0x4d2c6dfc5ac42aed,
-    0x53380d139d95b3df,
-    0x650a73548baf63de,
-    0x766a0abb3c77b2a8,
-    0x81c2c92e47edaee6,
-    0x92722c851482353b,
-    0xa2bfe8a14cf10364,
-    0xa81a664bbc423001,
-    0xc24b8b70d0f89791,
-    0xc76c51a30654be30,
-    0xd192e819d6ef5218,
-    0xd69906245565a910,
-    0xf40e35855771202a,
-    0x106aa07032bbd1b8,
-    0x19a4c116b8d2d0c8,
-    0x1e376c085141ab53,
-    0x2748774cdf8eeb99,
-    0x34b0bcb5e19b48a8,
-    0x391c0cb3c5c95a63,
-    0x4ed8aa4ae3418acb,
-    0x5b9cca4f7763e373,
-    0x682e6ff3d6b2b8a3,
-    0x748f82ee5defb2fc,
-    0x78a5636f43172f60,
-    0x84c87814a1f0ab72,
-    0x8cc702081a6439ec,
-    0x90befffa23631e28,
-    0xa4506cebde82bde9,
-    0xbef9a3f7b2c67915,
-    0xc67178f2e372532b,
-    0xca273eceea26619c,
-    0xd186b8c721c0c207,
-    0xeada7dd6cde0eb1e,
-    0xf57d4f7fee6ed178,
-    0x06f067aa72176fba,
-    0x0a637dc5a2c898a6,
-    0x113f9804bef90dae,
-    0x1b710b35131c471b,
-    0x28db77f523047d84,
-    0x32caab7b40c72493,
-    0x3c9ebe0a15c9bebc,
-    0x431d67c49c100d4c,
-    0x4cc5d4becb3e42b6,
-    0x597f299cfc657e2a,
-    0x5fcb6fab3ad6faec,
-    0x6c44198c4a475817,
-];
-
-pub fn sha512(data: &[u8]) -> [u8; 64] {
-    let mut h: [u64; 8] = [
-        0x6a09e667f3bcc908,
-        0xbb67ae8584caa73b,
-        0x3c6ef372fe94f82b,
-        0xa54ff53a5f1d36f1,
-        0x510e527fade682d1,
-        0x9b05688c2b3e6c1f,
-        0x1f83d9abfb41bd6b,
-        0x5be0cd19137e2179,
-    ];
-    let bitlen = (data.len() as u128).wrapping_mul(8);
-    let mut msg = data.to_vec();
-    msg.push(0x80);
-    while msg.len() % 128 != 112 {
-        msg.push(0);
-    }
-    msg.extend_from_slice(&bitlen.to_be_bytes());
-    for chunk in msg.chunks_exact(128) {
-        let mut w = [0u64; 80];
-        for i in 0..16 {
-            let mut b = [0u8; 8];
-            b.copy_from_slice(&chunk[8 * i..8 * i + 8]);
-            w[i] = u64::from_be_bytes(b);
-        }
-        for i in 16..80 {
-            let s0 = w[i - 15].rotate_right(1) ^ w[i - 15].rotate_right(8) ^ (w[i - 15] >> 7);
-            let s1 = w[i - 2].rotate_right(19) ^ w[i - 2].rotate_right(61) ^ (w[i - 2] >> 6);
-            w[i] = w[i - 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[i - 7])
-                .wrapping_add(s1);
-        }
-        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
-            (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
-        for i in 0..80 {
-            let s1 = e.rotate_right(14) ^ e.rotate_right(18) ^ e.rotate_right(41);
-            let ch = (e & f) ^ ((!e) & g);
-            let t1 = hh
-                .wrapping_add(s1)
-                .wrapping_add(ch)
-                .wrapping_add(K512[i])
-                .wrapping_add(w[i]);
-            let s0 = a.rotate_right(28) ^ a.rotate_right(34) ^ a.rotate_right(39);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let t2 = s0.wrapping_add(maj);
-            hh = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(t1);
-            d = c;
-            c = b;
-            b = a;
-            a = t1.wrapping_add(t2);
-        }
-        h[0] = h[0].wrapping_add(a);
-        h[1] = h[1].wrapping_add(b);
-        h[2] = h[2].wrapping_add(c);
-        h[3] = h[3].wrapping_add(d);
-        h[4] = h[4].wrapping_add(e);
-        h[5] = h[5].wrapping_add(f);
-        h[6] = h[6].wrapping_add(g);
-        h[7] = h[7].wrapping_add(hh);
-    }
-    let mut out = [0u8; 64];
-    for (i, v) in h.iter().enumerate() {
-        out[8 * i..8 * i + 8].copy_from_slice(&v.to_be_bytes());
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    fn tmpdir(tag: &str) -> PathBuf {
-        static C: AtomicU64 = AtomicU64::new(0);
-        let p = std::env::temp_dir().join(format!(
-            "winrun-install-test-{}-{}-{tag}",
-            std::process::id(),
-            C.fetch_add(1, Ordering::SeqCst)
-        ));
-        std::fs::create_dir_all(&p).unwrap();
-        p
-    }
-
     /// Minimal stored-zip writer (test + fixture use).
     fn zip_stored(files: &[(&str, &[u8])]) -> Vec<u8> {
         let mut out = Vec::new();
@@ -717,21 +397,12 @@ mod tests {
         );
     }
 
-    fn sha512_hex(data: &[u8]) -> String {
-        sha512(data).iter().map(|b| format!("{b:02x}")).collect()
-    }
-
     #[test]
-    fn sha512_vectors() {
-        // Arbitrate the K-table above (vectors from a reference hasher).
-        assert_eq!(
-            sha512_hex(b""),
-            "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"
-        );
-        assert_eq!(
-            sha512_hex(b"abc"),
-            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
-        );
+    fn parses_curl_progress_bar_percentages() {
+        assert_eq!(curl_progress_percent(b"################ 25.0%\r"), Some(25));
+        assert_eq!(curl_progress_percent(b"100.0%\r"), Some(100));
+        assert_eq!(curl_progress_percent(b"curl: (22) 404 not found\n"), None);
+        assert_eq!(curl_progress_percent(b""), None);
     }
 
     #[test]
@@ -771,43 +442,5 @@ mod tests {
         z[8] = 99;
         let err = extract_entry(&z, "a.defl").unwrap_err();
         assert!(err.contains("unsupported zip method 99"), "{err}");
-    }
-
-    #[test]
-    fn json_string_fields() {
-        let doc = r#"{"name":"demo", "version" : "0.1.0", "exe":"demo.exe"}"#;
-        assert_eq!(json_string(doc, "name").as_deref(), Some("demo"));
-        assert_eq!(json_string(doc, "version").as_deref(), Some("0.1.0"));
-        assert_eq!(json_string(doc, "missing"), None);
-    }
-
-    #[test]
-    fn install_local_roundtrip() {
-        let src = tmpdir("src");
-        let cache = tmpdir("cache");
-        let exe = b"MZ-fake-pe-bytes";
-        std::fs::write(src.join("demo.zip"), zip_stored(&[("demo.exe", exe)])).unwrap();
-        std::fs::write(
-            src.join("demo.json"),
-            r#"{"name":"demo","version":"0.1.0","exe":"demo.exe"}"#,
-        )
-        .unwrap();
-        let inst = install("demo", &src, &cache).unwrap();
-        assert_eq!(inst.version, "0.1.0");
-        assert_eq!(inst.guest_path, "C:\\bin\\demo.exe");
-        assert_eq!(std::fs::read(&inst.host_path).unwrap(), exe);
-        assert_eq!(
-            find_cached(&cache, "demo").unwrap(),
-            cache.join("pkgs").join("demo.exe")
-        );
-        assert!(find_cached(&cache, "demo.exe").is_some());
-        // content-addressed blob present
-        let sha = sha256_hex(&std::fs::read(src.join("demo.zip")).unwrap());
-        assert!(cache.join("archives").join(format!("{sha}.zip")).is_file());
-        // unknown package + traversal rejected
-        assert!(install("nope", &src, &cache).is_err());
-        assert!(install("../evil", &src, &cache).is_err());
-        let _ = std::fs::remove_dir_all(&src);
-        let _ = std::fs::remove_dir_all(&cache);
     }
 }

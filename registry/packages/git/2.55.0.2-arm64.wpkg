@@ -1,0 +1,6 @@
+name = "git"
+version = "2.55.0.2"
+arch = "arm64"
+url = "https://github.com/git-for-windows/git/releases/download/v2.55.0.windows.2/MinGit-2.55.0.2-arm64.zip"
+sha256 = "0b2b81fdce284efd174cbb51b886ccea2fd271679c4b5c21f07d9e03bae51413"
+bin = ["cmd/git.exe"]

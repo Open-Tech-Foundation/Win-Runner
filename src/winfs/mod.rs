@@ -1155,6 +1155,23 @@ impl WinFs {
             .is_some_and(|p| self.symlinks.contains_key(&p.key()))
     }
 
+    /// Absolute target of the link at `path`, without following further links.
+    pub(crate) fn symlink_target(&self, path: &str) -> Option<String> {
+        let p = self.normalize(path).ok()?;
+        let target = self.symlinks.get(&p.key())?;
+        self.normalize_symlink_target(&p, target)
+            .ok()
+            .map(|target| target.display())
+    }
+
+    /// `path` with every symbolic-link component followed, like
+    /// `GetFinalPathNameByHandle`; `None` when a link chain is too deep.
+    pub fn resolve_links(&self, path: &str) -> Option<String> {
+        let p = self.normalize(path).ok()?;
+        self.resolve_symlink_path(&p)
+            .map(|resolved| resolved.display())
+    }
+
     pub fn create_symlink(
         &mut self,
         path: &str,

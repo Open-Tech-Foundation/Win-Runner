@@ -868,19 +868,64 @@ fn module_basename(path: &str) -> String {
 fn guest_module_path(name: &str) -> Option<(String, Vec<u8>)> {
     let process = process_ctx()?;
     let fs = process.fs.lock().ok()?;
+    let path = locate_guest_module(&fs.fs, &process.module_path, name)?;
+    let bytes = fs.fs.read_file(&path).ok()?;
+    Some((path, bytes))
+}
+
+/// Windows searches the application directory first, so a DLL shipped
+/// beside the EXE wins over a same-named copy elsewhere on the disk (for
+/// example another installed version of the same package).
+fn locate_guest_module(fs: &crate::winfs::WinFs, module_path: &str, name: &str) -> Option<String> {
     let suffixed = if name.rsplit(['\\', '/']).next()?.contains('.') {
         name.to_string()
     } else {
         format!("{name}.dll")
     };
-    let path = if fs.fs.exists(&suffixed) {
-        Some(suffixed.clone())
+    if !suffixed.contains(['\\', '/', ':']) {
+        if let Some((directory, _)) = module_path.rsplit_once(['\\', '/']) {
+            let beside = format!(r"{directory}\{suffixed}");
+            if fs.is_file(&beside) {
+                return Some(beside);
+            }
+        }
+    }
+    if fs.exists(&suffixed) {
+        Some(suffixed)
     } else {
-        fs.fs
-            .find_file_path_suffix(&format!("\\{}", module_basename(&suffixed)))
-    }?;
-    let bytes = fs.fs.read_file(&path).ok()?;
-    Some((path, bytes))
+        fs.find_file_path_suffix(&format!("\\{}", module_basename(&suffixed)))
+    }
+}
+
+#[cfg(test)]
+mod guest_module_search_tests {
+    use super::locate_guest_module;
+    use crate::winfs::WinFs;
+
+    #[test]
+    fn application_directory_wins_over_other_copies_on_the_disk() {
+        let mut fs = WinFs::ephemeral_runner();
+        for version in ["24.0.0", "26.0.0"] {
+            let directory = format!(r"C:\softwares\tool\{version}");
+            fs.mkdir(&directory).unwrap();
+            fs.write_file(&format!(r"{directory}\helper.dll"), version.into())
+                .unwrap();
+        }
+        let found = locate_guest_module(&fs, r"C:\softwares\tool\26.0.0\tool.exe", "HELPER");
+        assert_eq!(fs.read_file(&found.unwrap()).unwrap(), b"26.0.0");
+        let found = locate_guest_module(&fs, r"C:\softwares\tool\24.0.0\tool.exe", "helper.dll");
+        assert_eq!(fs.read_file(&found.unwrap()).unwrap(), b"24.0.0");
+    }
+
+    #[test]
+    fn falls_back_to_a_disk_search_when_the_application_directory_lacks_it() {
+        let mut fs = WinFs::ephemeral_runner();
+        fs.mkdir(r"C:\libs").unwrap();
+        fs.write_file(r"C:\libs\only.dll", b"x".to_vec()).unwrap();
+        let found = locate_guest_module(&fs, r"C:\apps\tool.exe", "only.dll").unwrap();
+        assert!(found.eq_ignore_ascii_case(r"C:\libs\only.dll"), "{found}");
+        assert!(locate_guest_module(&fs, r"C:\apps\tool.exe", "missing.dll").is_none());
+    }
 }
 
 fn load_guest_module(name: &str) -> Option<u64> {
@@ -1303,6 +1348,9 @@ pub(super) extern "win64" fn native_get_proc_address(module: u64, name: *const u
         Some("CompareStringOrdinal") => native_compare_string_ordinal as *const () as usize as u64,
         Some("GetEnvironmentVariableW") => {
             native_get_environment_variable_w as *const () as usize as u64
+        }
+        Some("GetEnvironmentVariableA") => {
+            native_get_environment_variable_a as *const () as usize as u64
         }
         Some("GetCurrentDirectoryW") => native_get_current_directory_w as *const () as usize as u64,
         Some("NtDeviceIoControlFile") => {

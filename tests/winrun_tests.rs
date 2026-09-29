@@ -1471,76 +1471,102 @@ fn run_shell_env(input: &str, envs: &[(&str, &str)]) -> (i32, String, String) {
 }
 
 #[test]
-fn shell_package_install_is_forgotten_without_a_snapshot() {
-    let source = artifact("packages").to_string_lossy().to_string();
+fn wpkg_registry_metadata_is_available_in_ephemeral_shells() {
     let (code, stdout, stderr) = run_shell_env(
-        "install demo\ndemo\nexit\n",
-        &[("WINRUN_SOURCE", source.as_str())],
-    );
-    assert_eq!(code, 0, "stderr: {stderr}");
-    assert!(stdout.contains("Installed demo 0.1.0"), "stdout: {stdout}");
-    assert!(stdout.contains("demo 0.1.0"), "stdout: {stdout}");
-
-    let (code, stdout, stderr) = run_shell_env("demo\nexit\n", &[]);
-    assert_eq!(code, 0, "stderr: {stderr}");
-    assert!(stdout.is_empty(), "stdout: {stdout}");
-    assert!(stderr.contains("nothing to run: demo"), "stderr: {stderr}");
-}
-
-#[test]
-fn snapshot_is_the_only_way_to_carry_installed_packages_between_shells() {
-    let source = artifact("packages").to_string_lossy().to_string();
-    let snapshot = tmp_path("installed.snap");
-    let ignored_cache = tmp_path("ignored-cache");
-    let snapshot_arg = format!("--snapshot={}", snapshot.display());
-    let (code, stdout, stderr) = run_shell_env(
-        &format!(
-            "install demo\nsnapshot save {}\nsnapshot save\nexit\n",
-            snapshot.display()
-        ),
-        &[
-            ("WINRUN_SOURCE", source.as_str()),
-            ("WINRUN_CACHE", ignored_cache.to_str().unwrap()),
-        ],
-    );
-    assert_eq!(code, 0, "stderr: {stderr}");
-    assert!(stdout.contains("Installed demo 0.1.0"), "stdout: {stdout}");
-    assert!(
-        !ignored_cache.exists(),
-        "WINRUN_CACHE must not persist staging"
-    );
-
-    let (code, stdout, stderr) = run_session_args(
-        &[snapshot_arg.clone(), "shell".to_string()],
-        "demo\nsnapshot save\nexit\n",
+        "wpkg search node
+wpkg info nodejs
+wpkg list
+exit
+",
         &[],
     );
     assert_eq!(code, 0, "stderr: {stderr}");
-    assert!(stdout.contains("demo 0.1.0"), "stdout: {stdout}");
     assert!(
-        stdout.contains("Saved C: disk snapshot"),
+        stdout.contains(
+            "nodejs
+"
+        ),
         "stdout: {stdout}"
     );
-
-    let (code, stdout, stderr) =
-        run_session_args(&[snapshot_arg, "shell".to_string()], "demo\nexit\n", &[]);
-    assert_eq!(code, 0, "stderr: {stderr}");
-    assert!(stdout.contains("demo 0.1.0"), "stdout: {stdout}");
-
-    std::fs::remove_file(snapshot).ok();
+    assert!(stdout.contains("nodejs 24.21.0"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("No packages installed."),
+        "stdout: {stdout}"
+    );
 }
 
 #[test]
-fn winget_builtin_installs_a_package_into_the_guest_session() {
-    let source = artifact("packages").to_string_lossy().to_string();
-    let (code, stdout, stderr) = run_shell_env(
-        "winget --version\nwinget install -e --id demo --silent\ndemo\nexit\n",
-        &[("WINRUN_SOURCE", source.as_str())],
+fn wpkg_default_switches_which_side_by_side_version_a_bin_command_runs() {
+    // The layout `wpkg install` produces for two versions, seeded offline.
+    let snapshot = tmp_path("wpkg-versions.winfs");
+    let exe = std::fs::read(artifact("exe/rust_argv.exe")).unwrap();
+    let mut fs = WinFs::new();
+    for version in ["1", "2"] {
+        let directory = format!(r"C:\softwares\argv\{version}");
+        fs.mkdir(&directory).unwrap();
+        fs.write_file(&format!(r"{directory}\rust_argv.exe"), exe.clone())
+            .unwrap();
+    }
+    fs.create_symlink(r"C:\softwares\argv\current", r"C:\softwares\argv\1", true)
+        .unwrap();
+    fs.mkdir(r"C:\bin").unwrap();
+    fs.create_symlink(
+        r"C:\bin\rust_argv.exe",
+        r"C:\softwares\argv\current\rust_argv.exe",
+        false,
+    )
+    .unwrap();
+    let versions: Vec<_> = ["1", "2"]
+        .iter()
+        .map(|version| {
+            serde_json::json!({
+                "version": version,
+                "arch": winrun::wpkg::host_architecture(),
+                "install_path": format!(r"C:\softwares\argv\{version}"),
+                "bin": ["rust_argv.exe"],
+                "dependencies": [],
+            })
+        })
+        .collect();
+    fs.mkdir(r"C:\.system\wpkg").unwrap();
+    fs.write_file(
+        r"C:\.system\wpkg\installed.json",
+        serde_json::to_vec(&serde_json::json!([
+            {"name": "argv", "default": "1", "versions": versions}
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    winrun::snapshot::save_file(&mut fs, snapshot.to_str().unwrap()).unwrap();
+
+    let (code, stdout, stderr) = run_session_args(
+        &[
+            format!("--snapshot={}", snapshot.display()),
+            "shell".to_string(),
+        ],
+        "rust_argv first
+wpkg list argv
+wpkg default argv 2
+rust_argv second
+exit
+",
+        &[],
     );
+    let _ = std::fs::remove_file(snapshot);
     assert_eq!(code, 0, "stderr: {stderr}");
-    assert!(stdout.contains("winrun-winget"), "stdout: {stdout}");
-    assert!(stdout.contains("Installed demo 0.1.0"), "stdout: {stdout}");
-    assert!(stdout.contains("demo 0.1.0"), "stdout: {stdout}");
+    // Commands run as the real file inside the selected version, so
+    // GetModuleFileName and sibling files resolve within that version.
+    assert!(
+        stdout.contains(r"C:\softwares\argv\1\rust_argv.exe first"),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("* argv 1 ("), "stdout: {stdout}");
+    assert!(stdout.contains("  argv 2 ("), "stdout: {stdout}");
+    assert!(stdout.contains("argv default is now 2"), "stdout: {stdout}");
+    assert!(
+        stdout.contains(r"C:\softwares\argv\2\rust_argv.exe second"),
+        "stdout: {stdout}"
+    );
 }
 
 #[test]
@@ -1566,12 +1592,11 @@ fn shell_mounts_host_folder_as_a_live_guest_drive() {
 
 #[test]
 fn failed_guest_execution_preserves_unsaved_c_drive_changes() {
-    let source = artifact("packages").to_string_lossy().to_string();
     let snapshot = tmp_path("failed-run.snap");
     let snapshot_arg = format!("--snapshot={}", snapshot.display());
     let (code, _, stderr) = run_shell_env(
-        &format!("install demo\nsnapshot save {}\nexit\n", snapshot.display()),
-        &[("WINRUN_SOURCE", source.as_str())],
+        &format!("snapshot save {}\nexit\n", snapshot.display()),
+        &[],
     );
     assert_eq!(code, 0, "stderr: {stderr}");
 
@@ -1587,12 +1612,11 @@ fn failed_guest_execution_preserves_unsaved_c_drive_changes() {
 
     let (code, stdout, stderr) = run_session_args(
         &[snapshot_arg, "shell".to_string()],
-        "Get-Content C:\\actions-runner\\_work\\keep.txt\ndemo\nexit\n",
+        "Get-Content C:\\actions-runner\\_work\\keep.txt\nexit\n",
         &[],
     );
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(stdout.contains("before-failure"), "stdout: {stdout}");
-    assert!(stdout.contains("demo 0.1.0"), "stdout: {stdout}");
     std::fs::remove_file(snapshot).ok();
 }
 
@@ -1663,12 +1687,12 @@ fn interactive_shell_completes_commands_and_inserts_text_at_the_cursor() {
         "interactive prompt did not appear: {}",
         String::from_utf8_lossy(&output)
     );
-    master.write_all(b"wi\t --version\r").unwrap();
+    master.write_all(b"wp\t search node\r").unwrap();
     assert!(
         read_until(&mut master, &mut output, &|bytes| bytes
-            .windows(b"winrun-winget".len())
-            .any(|window| window == b"winrun-winget")),
-        "Tab did not complete the winget command: {}",
+            .windows(b"node".len())
+            .any(|window| window == b"node")),
+        "Tab did not complete the wpkg command: {}",
         String::from_utf8_lossy(&output)
     );
     assert!(
@@ -1708,7 +1732,7 @@ fn interactive_shell_completes_commands_and_inserts_text_at_the_cursor() {
     )
     .unwrap();
     assert!(
-        saved_history.contains("winget --version"),
+        saved_history.contains("wpkg search node"),
         "history: {saved_history}"
     );
     assert!(
@@ -2074,18 +2098,11 @@ fn test_named_instance_boot_status_and_destroy() {
 }
 
 #[test]
-fn test_shell_install_run_session_offline() {
-    let src = artifact("packages").to_string_lossy().to_string();
-    let envs = [("WINRUN_SOURCE", src.as_ref())];
-    // One session: install, run the package, share PS1 files across lines.
-    let input = "install demo\ndemo\nNew-Item C:\\shell-t.txt -Value hi\nGet-Content C:\\shell-t.txt\n$v = 42\necho \"v=$v\"\nif ($v -eq 42) { echo if-ok }\n$langs = @('a', 'b')\nif ('a' -in $langs) { echo in-ok }\nswitch ('q') { 'q' { echo sw-ok } }\nfunction Hi($n) { echo \"hi-$n\" }\nforeach ($i in @('a', 'b')) { Hi $i }\n$ht = @{}\n$ht['k'] = 'v'\nif ($ht.ContainsKey('k')) { echo ht-ok }\ntry { echo try-ok } catch { echo bad }\n$cap = Join-Path 'C:\\x' 'y'\necho $cap\necho $cap | Out-Null\n$m = 'aBc'\necho $m.ToUpper()\n[Environment]::SetEnvironmentVariable('WINRUN_E2E_XYZ', 'e2e-ok', 'User')\necho $([Environment]::GetEnvironmentVariable('WINRUN_E2E_XYZ'))\necho '[{\"tag_name\": \"esrun@0.24.0\"}, {\"tag_name\": \"other\"}]' | ForEach-Object { $_.tag_name } | Where-Object { $_ -match \"esrun\" } | Select-Object -First 1\necho done\nexit\n";
-    let (code, stdout, stderr) = run_shell_env(input, &envs);
+fn test_shell_ps1_run_session_offline() {
+    // One session: share PS1 files and variables across input lines.
+    let input = "New-Item C:\\shell-t.txt -Value hi\nGet-Content C:\\shell-t.txt\n$v = 42\necho \"v=$v\"\nif ($v -eq 42) { echo if-ok }\n$langs = @('a', 'b')\nif ('a' -in $langs) { echo in-ok }\nswitch ('q') { 'q' { echo sw-ok } }\nfunction Hi($n) { echo \"hi-$n\" }\nforeach ($i in @('a', 'b')) { Hi $i }\n$ht = @{}\n$ht['k'] = 'v'\nif ($ht.ContainsKey('k')) { echo ht-ok }\ntry { echo try-ok } catch { echo bad }\n$cap = Join-Path 'C:\\x' 'y'\necho $cap\necho $cap | Out-Null\n$m = 'aBc'\necho $m.ToUpper()\n[Environment]::SetEnvironmentVariable('WINRUN_E2E_XYZ', 'e2e-ok', 'User')\necho $([Environment]::GetEnvironmentVariable('WINRUN_E2E_XYZ'))\necho '[{\"tag_name\": \"esrun@0.24.0\"}, {\"tag_name\": \"other\"}]' | ForEach-Object { $_.tag_name } | Where-Object { $_ -match \"esrun\" } | Select-Object -First 1\necho done\nexit\n";
+    let (code, stdout, stderr) = run_shell_env(input, &[]);
     assert_eq!(code, 0, "stderr: {stderr}");
-    assert!(
-        stdout.contains("Installed demo 0.1.0 → C:\\bin\\demo.exe"),
-        "stdout: {stdout}"
-    );
-    assert!(stdout.contains("demo 0.1.0"), "stdout: {stdout}");
     assert!(stdout.contains("hi\n"), "stdout: {stdout}");
     assert!(stdout.contains("v=42\n"), "stdout: {stdout}");
     assert!(stdout.contains("if-ok\n"), "stdout: {stdout}");
@@ -2108,6 +2125,9 @@ fn test_shell_unknown_and_bad_exit() {
     // EOF ends the session cleanly.
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(stdout.is_empty(), "stdout: {stdout}");
-    assert!(stderr.contains("install frobnicate"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("wpkg install frobnicate"),
+        "stderr: {stderr}"
+    );
     assert!(stderr.contains("exit: bad code"), "stderr: {stderr}");
 }

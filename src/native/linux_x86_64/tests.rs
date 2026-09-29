@@ -16,11 +16,12 @@ mod protection_tests {
         native_get_console_output_cp, native_get_console_screen_buffer_info, native_get_cp_info,
         native_get_current_directory_w, native_get_current_process, native_get_current_process_id,
         native_get_current_thread, native_get_current_thread_id, native_get_environment_strings_w,
-        native_get_environment_variable_w, native_get_exit_code_process, native_get_file_type,
-        native_get_full_path_name_w, native_get_last_error, native_get_module_file_name_w,
-        native_get_module_handle_a, native_get_module_handle_ex_w, native_get_module_handle_w,
-        native_get_oem_cp, native_get_proc_address, native_get_startup_info_w,
-        native_get_string_type_w, native_get_system_info, native_get_user_profile_directory_w,
+        native_get_environment_variable_a, native_get_environment_variable_w,
+        native_get_exit_code_process, native_get_file_type, native_get_full_path_name_w,
+        native_get_last_error, native_get_module_file_name_w, native_get_module_handle_a,
+        native_get_module_handle_ex_w, native_get_module_handle_w, native_get_oem_cp,
+        native_get_proc_address, native_get_startup_info_w, native_get_string_type_w,
+        native_get_system_info, native_get_user_profile_directory_w,
         native_global_memory_status_ex, native_heap_alloc, native_heap_free, native_heap_realloc,
         native_heap_size, native_init_once_execute_once, native_initialize_condition_variable,
         native_initialize_critical_section_and_spin_count, native_initialize_critical_section_ex,
@@ -6190,6 +6191,48 @@ mod protection_tests {
     }
 
     #[test]
+    fn gets_guest_environment_variables_through_the_ansi_api() {
+        let name_wide: Vec<u16> = "WINRUN_TEST_NODE_ENV"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let value_wide: Vec<u16> = "node-value"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let name = b"winrun_test_node_env\0";
+        assert_eq!(
+            native_set_environment_variable_w(name_wide.as_ptr(), value_wide.as_ptr()),
+            1
+        );
+        let mut too_small = [0u8; 4];
+        assert_eq!(
+            native_get_environment_variable_a(
+                name.as_ptr(),
+                too_small.as_mut_ptr(),
+                too_small.len() as u32
+            ),
+            11
+        );
+        assert_eq!(native_get_last_error(), 122);
+        let mut output = [0u8; 16];
+        assert_eq!(
+            native_get_environment_variable_a(
+                name.as_ptr(),
+                output.as_mut_ptr(),
+                output.len() as u32
+            ),
+            10
+        );
+        assert_eq!(&output[..10], b"node-value");
+        assert_eq!(output[10], 0);
+        assert_eq!(
+            native_set_environment_variable_w(name_wide.as_ptr(), std::ptr::null()),
+            1
+        );
+    }
+
+    #[test]
     fn executable_search_current_directory_policy_matches_windows() {
         let executable: Vec<u16> = "powershell.exe"
             .encode_utf16()
@@ -6747,6 +6790,10 @@ mod protection_tests {
         assert_eq!(
             native_get_proc_address(API_SET_MODULE, c"GetEnvironmentVariableW".as_ptr().cast()),
             native_get_environment_variable_w as *const () as usize as u64
+        );
+        assert_eq!(
+            native_get_proc_address(API_SET_MODULE, c"GetEnvironmentVariableA".as_ptr().cast()),
+            native_get_environment_variable_a as *const () as usize as u64
         );
         assert_ne!(
             native_get_proc_address(API_SET_MODULE, c"FlsAlloc".as_ptr().cast()),

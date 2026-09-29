@@ -36,10 +36,33 @@ pub(super) extern "win64" fn native_wsa_startup(requested: u16, data: *mut Nativ
         max_udp_datagram: 0,
         vendor_info: std::ptr::null(),
     };
-    value.description[..6].copy_from_slice(b"Win-Runner");
-    value.system_status[..7].copy_from_slice(b"Running");
+    let description = b"Win-Runner";
+    value.description[..description.len()].copy_from_slice(description);
+    let status = b"Running";
+    value.system_status[..status.len()].copy_from_slice(status);
     unsafe { data.write(value) };
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wsa_startup_accepts_win_runner_description_and_status() {
+        let mut data = std::mem::MaybeUninit::<NativeWsaData>::uninit();
+        assert_eq!(native_wsa_startup(0x0202, data.as_mut_ptr()), 0);
+        let data = unsafe { data.assume_init() };
+        assert_eq!(data.version, 0x0202);
+        assert_eq!(&data.description[..10], b"Win-Runner");
+        assert_eq!(data.description[10], 0);
+        assert_eq!(&data.system_status[..7], b"Running");
+    }
+
+    #[test]
+    fn wsa_startup_rejects_null_data_without_panicking() {
+        assert_eq!(native_wsa_startup(0x0202, std::ptr::null_mut()), 10014);
+    }
 }
 
 pub(super) extern "win64" fn native_wsa_cleanup() -> i32 {

@@ -1,0 +1,7 @@
+# One package name per line; search is case-insensitive substring matching.
+7zip
+curl
+git
+nodejs
+python
+ripgrep

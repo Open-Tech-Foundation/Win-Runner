@@ -107,6 +107,78 @@ pub(super) extern "win64" fn native_get_environment_variable_w(
     }
     value.len() as u32
 }
+
+pub(super) extern "win64" fn native_get_environment_variable_a(
+    name: *const u8,
+    output: *mut u8,
+    output_len: u32,
+) -> u32 {
+    if name.is_null() {
+        native_set_last_error(87); // ERROR_INVALID_PARAMETER
+        return 0;
+    }
+    let name_len = native_multi_byte_to_wide_char(0, 0, name, -1, std::ptr::null_mut(), 0);
+    if name_len == 0 {
+        native_set_last_error(87);
+        return 0;
+    }
+    let mut name_wide = vec![0u16; name_len as usize];
+    if native_multi_byte_to_wide_char(0, 0, name, -1, name_wide.as_mut_ptr(), name_len) == 0 {
+        native_set_last_error(87);
+        return 0;
+    }
+    let Some(name) = wide(name_wide.as_ptr()) else {
+        native_set_last_error(87);
+        return 0;
+    };
+    let Some(value) = process_ctx().and_then(|process| {
+        process.environment.lock().ok().and_then(|environment| {
+            environment
+                .iter()
+                .find_map(|(key, value)| key.eq_ignore_ascii_case(&name).then(|| value.clone()))
+        })
+    }) else {
+        native_set_last_error(203); // ERROR_ENVVAR_NOT_FOUND
+        return 0;
+    };
+    let value_wide: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+    let required = native_wide_char_to_multi_byte(
+        0,
+        0,
+        value_wide.as_ptr(),
+        -1,
+        std::ptr::null_mut(),
+        0,
+        std::ptr::null(),
+        std::ptr::null_mut(),
+    );
+    if required <= 0 {
+        native_set_last_error(87);
+        return 0;
+    }
+    if output.is_null() || output_len == 0 || output_len < required as u32 {
+        if !output.is_null() && output_len != 0 {
+            native_set_last_error(122); // ERROR_INSUFFICIENT_BUFFER
+        }
+        return required as u32;
+    }
+    let written = native_wide_char_to_multi_byte(
+        0,
+        0,
+        value_wide.as_ptr(),
+        -1,
+        output,
+        output_len as i32,
+        std::ptr::null(),
+        std::ptr::null_mut(),
+    );
+    if written <= 0 {
+        native_set_last_error(122);
+        0
+    } else {
+        written as u32 - 1
+    }
+}
 pub(super) extern "win64" fn native_set_environment_variable_w(
     name: *const u16,
     value: *const u16,

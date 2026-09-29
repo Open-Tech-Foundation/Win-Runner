@@ -1,0 +1,6 @@
+name = "ripgrep"
+version = "15.2.0"
+arch = "arm64"
+url = "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-aarch64-pc-windows-msvc.zip"
+sha256 = "e4abca10c3a64ebea742667dd7009449d49403db5460dd6873e389fa2945360f"
+bin = ["ripgrep-15.2.0-aarch64-pc-windows-msvc/rg.exe"]

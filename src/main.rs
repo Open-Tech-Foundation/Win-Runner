@@ -1,10 +1,9 @@
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
-use winrun::{backend, inspect, install, instance, pe, snapshot, winfs::WinFs};
+use winrun::{backend, inspect, instance, pe, snapshot, winfs::WinFs};
 
 fn exit(code: i32) -> ! {
-    install::cleanup_process_cache();
     std::process::exit(code)
 }
 
@@ -30,7 +29,6 @@ fn usage() -> ! {
     eprintln!("  winrun instance status|destroy <name>");
     eprintln!("  winrun instance exec <name> -- <command> [args...]");
     eprintln!("  winrun inspect <app.exe>      report PE imports vs supported APIs");
-    eprintln!("env: WINRUN_SOURCE (local package dir)");
     exit(2);
 }
 
@@ -109,7 +107,6 @@ fn main() {
         }
         return;
     }
-    install::prepare_process_cache();
     let (options, args) = parse_runtime_options(&args);
     let snapshot_path = options.snapshot_path.as_deref();
     let save_snapshot_path = options.save_snapshot_path.as_deref().or_else(|| {

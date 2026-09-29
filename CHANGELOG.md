@@ -4,8 +4,47 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Fix the Winsock startup shim's buffer length when writing its description,
+  which could panic and abort guest processes during `WSAStartup`.
+- Add `GetEnvironmentVariableA` with ANSI conversion and Windows buffer-size
+  behavior.
+- Expose Windows `APPDATA` and `LOCALAPPDATA` profile paths, mapping the real
+  `%LOCALAPPDATA%\npm-cache` directory to `C:\.system\npm-cache` in WinFS.
+  Create npm's required cache temporary and log directories on shell startup.
+
 ### Changed
 
+- Add the built-in `wpkg` portable-package manager with an embedded text
+  registry, SHA-256-verified ZIP and 7z downloads, safe guest-FS extraction,
+  dependency resolution, installed-package tracking, upgrades, and removal.
+- Install `wpkg` package versions side by side under
+  `C:\softwares\<package>\<version>`. A `current` directory link selects the
+  default version and `C:\bin` commands link through it; `wpkg default
+  <package> [version]` shows or switches it, and `wpkg list [package]` marks it
+  with `*`. `@26` installs the newest `26.x` release listed in the registry's
+  new per-package `versions` file. `upgrade` installs beside existing versions
+  and moves the default only when it tracked the newest one; `remove
+  <package>@<version>` removes a single non-default version. Dependencies are
+  satisfied by any installed version and no longer move another package's
+  default.
+- Rename the Node.js registry package from `node` to `nodejs`, matching the
+  shell's install hints.
+- Run guest EXEs reached through `C:\bin` links as their real file, so
+  `GetModuleFileName`, DLL loading, and npm resolve within the selected package
+  version. The native loader now searches the EXE's own directory for DLLs
+  before searching the rest of the guest disk.
+- Stream package download progress and emoji-marked verification, installation,
+  success, and failure status into the shell and control output.
+- Add embedded registry entries for Node.js, Python's embeddable distribution,
+  ripgrep, curl, Git for Windows, and 7-Zip's x64 standalone CLI.
+- Remove the shell-facing `choco` and `winget` package-manager commands; package
+  operations now use `wpkg` and the `.wpkg` manifest format.
+- Add `scripts/build-wpkg-registry.py` to rebuild the deterministic metadata ZIP
+  embedded in the `winrun` binary.
+- Remove the unused host package staging cache; package data is installed only
+  into guest WinFS, and registry metadata is embedded in the executable.
 - Route the existing `memcmp`, `memcpy`, `memmove`, `memset`, and `strlen`
   shims for `VCRUNTIME140.dll` imports; C++ exception runtime exports remain
   unsupported.
