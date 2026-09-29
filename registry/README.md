@@ -16,7 +16,7 @@ manifest, one per line; `wpkg install <name>@26` picks the newest listed
 version equal to `26` or starting with `26.`, `26-`, or `26+`. The build script
 rejects a `versions` file that disagrees with the manifests. Versions may not be
 named `current` or start with `.`, because those names are reserved inside
-`C:\softwares\<name>`. A `.wpkg` file is a UTF-8 TOML
+`C:\Program Files\<name>`. A `.wpkg` file is a UTF-8 TOML
 manifest with `name`, `version`, `arch` (`x64` or `arm64`), `url` (ZIP or 7z), `sha256`,
 `bin`, and optional `dependencies`. `packages/index` contains one package name
 per line for `wpkg search`.

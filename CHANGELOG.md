@@ -10,18 +10,47 @@ All notable changes to this project will be documented in this file.
   which could panic and abort guest processes during `WSAStartup`.
 - Add `GetEnvironmentVariableA` with ANSI conversion and Windows buffer-size
   behavior.
-- Expose Windows `APPDATA` and `LOCALAPPDATA` profile paths, mapping the real
-  `%LOCALAPPDATA%\npm-cache` directory to `C:\.system\npm-cache` in WinFS.
-  Create npm's required cache temporary and log directories on shell startup.
+- Expose Windows `APPDATA` and `LOCALAPPDATA` profile paths and create npm's
+  required cache temporary and log directories on shell startup.
 
 ### Changed
 
+- Lay out the guest disk and environment like a stock Windows installation
+  from one `system_profile` definition: user `runner`, computer `WINRUNNER`,
+  profile `C:\Users\runner` (the shell's starting directory, replacing
+  `C:\actions-runner\_work`), per-user `AppData` and `Temp`, `Program Files`,
+  `Program Files (x86)`, `ProgramData`, and `Users\Public`. The default
+  environment now carries the standard Windows variables, including
+  `PATHEXT`, `ComSpec`, `COMPUTERNAME`, `HOMEDRIVE`/`HOMEPATH`, and the
+  `ProgramFiles`/`CommonProgramFiles` family, with `PATH` listing the Windows
+  directories first.
+- Answer `SHGetFolderPathW` (now including Desktop, Documents, Music,
+  Pictures, Videos, and `Program Files (x86)`), `GetUserProfileDirectoryW`,
+  `GetUserNameW`, `GetComputerNameExW`, `GetSystemDirectoryW`, and the
+  `GetSystemInfo` processor count from the same profile, replacing the
+  conflicting `runner`, `Win-Runner`, and `runneradmin` profile paths.
+- Resolve `GetTempPathW`/`GetTempPathA` from the process's `TMP`, `TEMP`, and
+  `USERPROFILE` like Windows, instead of always returning `C:\Windows\Temp`.
+- Make PowerShell `$env:`, `$HOME`, and `[Environment]::Get/SetEnvironmentVariable`
+  use the guest session environment shared with `set` and launched programs.
+  They previously read the Linux host's environment, and
+  `SetEnvironmentVariable` changed the host winrun process. `$env:NAME =`
+  and `+=` assignments are now supported.
+- `set` lists variables with their original spelling, as `cmd` does.
+- Move wpkg installs to `C:\Program Files\<package>\<version>` and its command
+  links and state to `C:\ProgramData\wpkg`; `remove` deletes only the version
+  directories it installed. Seed `powershell.exe` at
+  `C:\Windows\System32\WindowsPowerShell\v1.0`, keep shell history where
+  PSReadLine does (`%APPDATA%\Microsoft\Windows\PowerShell\PSReadLine`), and
+  create npm's standard `%LOCALAPPDATA%\npm-cache` and `%APPDATA%\npm` folders.
+  The `C:\.system` and `C:\bin` guest folders are no longer used.
 - Add the built-in `wpkg` portable-package manager with an embedded text
   registry, SHA-256-verified ZIP and 7z downloads, safe guest-FS extraction,
   dependency resolution, installed-package tracking, upgrades, and removal.
 - Install `wpkg` package versions side by side under
-  `C:\softwares\<package>\<version>`. A `current` directory link selects the
-  default version and `C:\bin` commands link through it; `wpkg default
+  `C:\Program Files\<package>\<version>`. A `current` directory link selects
+  the default version and commands in `C:\ProgramData\wpkg\bin` link through
+  it; `wpkg default
   <package> [version]` shows or switches it, and `wpkg list [package]` marks it
   with `*`. `@26` installs the newest `26.x` release listed in the registry's
   new per-package `versions` file. `upgrade` installs beside existing versions
@@ -31,7 +60,7 @@ All notable changes to this project will be documented in this file.
   default.
 - Rename the Node.js registry package from `node` to `nodejs`, matching the
   shell's install hints.
-- Run guest EXEs reached through `C:\bin` links as their real file, so
+- Run guest EXEs reached through wpkg command links as their real file, so
   `GetModuleFileName`, DLL loading, and npm resolve within the selected package
   version. The native loader now searches the EXE's own directory for DLLs
   before searching the rest of the guest disk.

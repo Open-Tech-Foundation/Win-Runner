@@ -5,10 +5,11 @@
 //! TOML `.wpkg` manifests; the package archive is fetched separately and never
 //! executed.
 //!
-//! Versions install side by side as `C:\softwares\<name>\<version>`. The
-//! directory link `C:\softwares\<name>\current` selects the default version,
-//! and `C:\bin` links each command through it, so switching the default
-//! rewrites one link and never leaves a command pointing at removed files.
+//! Versions install side by side as `C:\Program Files\<name>\<version>`.
+//! The directory link `C:\Program Files\<name>\current` selects the default
+//! version, and `C:\ProgramData\wpkg\bin` (on the system `PATH`) links each
+//! command through it, so switching the default rewrites one link and never
+//! leaves a command pointing at removed files.
 
 use crate::{install, winfs::WinFs};
 use serde_json::{json, Value};
@@ -18,9 +19,11 @@ use std::{
     path::Path,
 };
 
-const DATABASE: &str = r"C:\.system\wpkg\installed.json";
-const ROOT: &str = r"C:\softwares";
-const BIN: &str = r"C:\bin";
+const STATE: &str = r"C:\ProgramData\wpkg";
+const DATABASE: &str = r"C:\ProgramData\wpkg\installed.json";
+const ROOT: &str = crate::system_profile::PROGRAM_FILES;
+/// Command links for every package's default version; on the system `PATH`.
+pub const BIN: &str = r"C:\ProgramData\wpkg\bin";
 const CURRENT: &str = "current";
 const MAX_7Z_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_7Z_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
@@ -146,7 +149,7 @@ pub struct Manifest {
     pub dependencies: Vec<String>,
 }
 
-/// One extracted version under `C:\softwares\<name>\<version>`.
+/// One extracted version under `C:\Program Files\<name>\<version>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledVersion {
     pub version: String,
@@ -157,7 +160,7 @@ pub struct InstalledVersion {
 }
 
 /// A package with side-by-side versions. `default` is the version that
-/// `C:\softwares\<name>\current` points at, and so the one `C:\bin` runs.
+/// `C:\Program Files\<name>\current` points at, and so the one [`BIN`] runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledPackage {
     pub name: String,
@@ -541,7 +544,7 @@ fn install_version(
     ));
     let mut packages = load_database(fs)?;
     let first_version = !packages.iter().any(|package| package.name == manifest.name);
-    // Only the default version is linked into C:\bin, so only a first
+    // Only the default version is linked into BIN, so only a first
     // install can collide with another package's commands.
     if first_version {
         check_bin_conflicts(fs, &manifest.name, &manifest.bin)?;
@@ -780,10 +783,22 @@ fn remove_package(fs: &mut WinFs, name: &str, spec: Option<&str>) -> Result<Stri
         fs.remove(&current, false)
             .map_err(|error| format!("wpkg: cannot remove {current}: {error}"))?;
     }
+    // Program Files is shared: delete only the version directories wpkg
+    // installed, then the package directory if nothing else is left in it.
+    for entry in &package.versions {
+        let path = version_path(name, &entry.version);
+        if fs.exists(&path) {
+            fs.remove(&path, true)
+                .map_err(|error| format!("wpkg: cannot remove package files: {error}"))?;
+        }
+    }
     let directory = package_dir(name);
-    if fs.exists(&directory) {
-        fs.remove(&directory, true)
-            .map_err(|error| format!("wpkg: cannot remove package files: {error}"))?;
+    if fs
+        .list_dir(&directory)
+        .is_ok_and(|entries| entries.is_empty())
+    {
+        fs.remove(&directory, false)
+            .map_err(|error| format!("wpkg: cannot remove {directory}: {error}"))?;
     }
     packages.retain(|entry| entry.name != name);
     save_database(fs, &packages)?;
@@ -793,8 +808,8 @@ fn remove_package(fs: &mut WinFs, name: &str, spec: Option<&str>) -> Result<Stri
     })
 }
 
-/// Point `C:\softwares\<name>\current` at `version` and relink its commands
-/// in `C:\bin` through that directory link. Conflicts are checked before
+/// Point `C:\Program Files\<name>\current` at `version` and relink its
+/// commands in [`BIN`] through that directory link. Conflicts are checked before
 /// anything changes.
 fn set_default(
     fs: &mut WinFs,
@@ -835,7 +850,7 @@ fn set_default(
     Ok(())
 }
 
-/// `C:\bin` entries this package may replace: links into its own directory.
+/// Command links this package may replace: links into its own directory.
 fn owns_link(fs: &WinFs, name: &str, path: &str) -> bool {
     let prefix = format!(r"{}\", package_dir(name)).to_ascii_lowercase();
     fs.symlink_target(path)
@@ -1096,7 +1111,7 @@ fn save_database(fs: &mut WinFs, packages: &[InstalledPackage]) -> Result<(), St
             })
         })
         .collect::<Vec<_>>();
-    fs.mkdir(r"C:\.system\wpkg")
+    fs.mkdir(STATE)
         .map_err(|error| format!("wpkg: cannot create package database directory: {error}"))?;
     let data = serde_json::to_vec_pretty(&value)
         .map_err(|error| format!("wpkg: cannot encode installed database: {error}"))?;
@@ -1400,7 +1415,7 @@ mod tests {
             }
             self.add(&versions_path, versions);
             // Each version's binaries carry the version so tests can tell
-            // which copy a C:\bin link reaches.
+            // which copy a command link reaches.
             let contents = format!("MZ {version}");
             let archive = zip_stored(
                 bin.iter()
@@ -1497,14 +1512,19 @@ mod tests {
         let output = run(&mut fs, &repo, &["install", "python@3.13.7"]);
         assert!(output.contains("Installed python 3.13.7"), "{output}");
         assert_eq!(
-            fs.read_file(r"C:\softwares\python\3.13.7\python.exe")
+            fs.read_file(r"C:\Program Files\python\3.13.7\python.exe")
                 .unwrap(),
             b"MZ 3.13.7"
         );
-        assert_eq!(fs.read_file(r"C:\bin\python.exe").unwrap(), b"MZ 3.13.7");
-        let resolved = fs.resolve_links(r"C:\bin\python.exe").unwrap();
+        assert_eq!(
+            fs.read_file(r"C:\ProgramData\wpkg\bin\python.exe").unwrap(),
+            b"MZ 3.13.7"
+        );
+        let resolved = fs
+            .resolve_links(r"C:\ProgramData\wpkg\bin\python.exe")
+            .unwrap();
         assert!(
-            resolved.eq_ignore_ascii_case(r"C:\softwares\python\3.13.7\python.exe"),
+            resolved.eq_ignore_ascii_case(r"C:\Program Files\python\3.13.7\python.exe"),
             "{resolved}"
         );
 
@@ -1516,12 +1536,15 @@ mod tests {
         );
         assert_eq!(installed_versions(&fs, "python"), ["3.13.7", "3.14.0"]);
         assert_eq!(default_version(&fs, "python"), "3.13.7");
-        assert_eq!(fs.read_file(r"C:\bin\python.exe").unwrap(), b"MZ 3.13.7");
+        assert_eq!(
+            fs.read_file(r"C:\ProgramData\wpkg\bin\python.exe").unwrap(),
+            b"MZ 3.13.7"
+        );
 
         let list = run(&mut fs, &repo, &["list", "python"]);
         assert_eq!(
             list,
-            "* python 3.13.7 (x64) C:\\softwares\\python\\3.13.7\n  python 3.14.0 (x64) C:\\softwares\\python\\3.14.0\n"
+            "* python 3.13.7 (x64) C:\\Program Files\\python\\3.13.7\n  python 3.14.0 (x64) C:\\Program Files\\python\\3.14.0\n"
         );
         let output = run(&mut fs, &repo, &["install", "python@3.14.0"]);
         assert!(output.contains("is already installed"), "{output}");
@@ -1542,10 +1565,15 @@ mod tests {
 
         let output = run(&mut fs, &repo, &["default", "nodejs", "26"]);
         assert!(output.contains("nodejs default is now 26.1.0"), "{output}");
-        assert_eq!(fs.read_file(r"C:\bin\node.exe").unwrap(), b"MZ 26.1.0");
-        let current = fs.symlink_target(r"C:\softwares\nodejs\current").unwrap();
+        assert_eq!(
+            fs.read_file(r"C:\ProgramData\wpkg\bin\node.exe").unwrap(),
+            b"MZ 26.1.0"
+        );
+        let current = fs
+            .symlink_target(r"C:\Program Files\nodejs\current")
+            .unwrap();
         assert!(
-            current.eq_ignore_ascii_case(r"C:\softwares\nodejs\26.1.0"),
+            current.eq_ignore_ascii_case(r"C:\Program Files\nodejs\26.1.0"),
             "{current}"
         );
         assert!(run(&mut fs, &repo, &["list"]).contains("* nodejs 26.1.0"));
@@ -1633,11 +1661,12 @@ mod tests {
             .any(|message| message.contains("🛠️ Installing")));
         assert!(String::from_utf8_lossy(&output).contains("✅ Installed tool 1.0"));
         assert_eq!(
-            fs.read_file(r"C:\softwares\tool\1.0\bin\tool.exe").unwrap(),
+            fs.read_file(r"C:\Program Files\tool\1.0\bin\tool.exe")
+                .unwrap(),
             b"MZ 7z fixture\n"
         );
         assert_eq!(
-            fs.read_file(r"C:\bin\tool.exe").unwrap(),
+            fs.read_file(r"C:\ProgramData\wpkg\bin\tool.exe").unwrap(),
             b"MZ 7z fixture\n"
         );
         assert_eq!(installed_versions(&fs, "tool"), ["1.0"]);
@@ -1672,7 +1701,7 @@ mod tests {
         let error = execute(&mut fs, &repo, "x64", &args(&["install", "escape"])).unwrap_err();
         assert!(error.contains("unsafe archive path"), "{error}");
         assert!(!fs.exists(r"C:\outside.exe"));
-        assert!(!fs.exists(r"C:\softwares\escape"));
+        assert!(!fs.exists(r"C:\Program Files\escape"));
         assert!(load_database(&fs).unwrap().is_empty());
     }
 
@@ -1689,10 +1718,13 @@ mod tests {
         repo.add("packages/tool/2.wpkg", manifest);
         let error = execute(&mut fs, &repo, "x64", &args(&["install", "tool@2"])).unwrap_err();
         assert!(error.contains("missing from package archive"), "{error}");
-        assert!(!fs.exists(r"C:\softwares\tool\.staging-2"));
-        assert!(!fs.exists(r"C:\softwares\tool\2"));
+        assert!(!fs.exists(r"C:\Program Files\tool\.staging-2"));
+        assert!(!fs.exists(r"C:\Program Files\tool\2"));
         assert_eq!(installed_versions(&fs, "tool"), ["1"]);
-        assert_eq!(fs.read_file(r"C:\bin\tool.exe").unwrap(), b"MZ 1");
+        assert_eq!(
+            fs.read_file(r"C:\ProgramData\wpkg\bin\tool.exe").unwrap(),
+            b"MZ 1"
+        );
     }
 
     #[test]
@@ -1738,7 +1770,10 @@ mod tests {
         assert!(output.contains("tool default is now 2"), "{output}");
         assert!(!output.contains("is still"), "{output}");
         assert_eq!(installed_versions(&fs, "tool"), ["1", "2"]);
-        assert_eq!(fs.read_file(r"C:\bin\tool.exe").unwrap(), b"MZ 2");
+        assert_eq!(
+            fs.read_file(r"C:\ProgramData\wpkg\bin\tool.exe").unwrap(),
+            b"MZ 2"
+        );
 
         run(&mut fs, &repo, &["default", "tool", "1"]);
         repo.package("tool", "3", "x64", &["tool.exe"], &[]);
@@ -1774,15 +1809,40 @@ mod tests {
             run(&mut fs, &repo, &["remove", "tool@1.1"]),
             "Removed tool 1.1\n"
         );
-        assert!(!fs.exists(r"C:\softwares\tool\1.1"));
+        assert!(!fs.exists(r"C:\Program Files\tool\1.1"));
         assert_eq!(installed_versions(&fs, "tool"), ["1.2", "2.0"]);
-        assert_eq!(fs.read_file(r"C:\bin\tool.exe").unwrap(), b"MZ 2.0");
+        assert_eq!(
+            fs.read_file(r"C:\ProgramData\wpkg\bin\tool.exe").unwrap(),
+            b"MZ 2.0"
+        );
 
         assert_eq!(run(&mut fs, &repo, &["remove", "tool"]), "Removed tool\n");
         assert!(load_database(&fs).unwrap().is_empty());
-        assert!(!fs.exists(r"C:\bin\tool.exe") && !fs.is_symlink(r"C:\bin\tool.exe"));
-        assert!(!fs.exists(r"C:\softwares\tool"));
+        assert!(
+            !fs.exists(r"C:\ProgramData\wpkg\bin\tool.exe")
+                && !fs.is_symlink(r"C:\ProgramData\wpkg\bin\tool.exe")
+        );
+        assert!(!fs.exists(r"C:\Program Files\tool"));
         assert!(fs.snapshot_symlinks().is_empty());
+    }
+
+    #[test]
+    fn remove_keeps_files_it_did_not_install_in_program_files() {
+        let mut repo = MemoryRepo::default();
+        repo.package("tool", "1", "x64", &["tool.exe"], &[]);
+        let mut fs = WinFs::ephemeral_runner();
+        fs.mkdir(r"C:\Program Files\tool").unwrap();
+        fs.write_file(r"C:\Program Files\tool\settings.ini", b"keep".to_vec())
+            .unwrap();
+        run(&mut fs, &repo, &["install", "tool"]);
+        run(&mut fs, &repo, &["remove", "tool"]);
+        assert!(!fs.exists(r"C:\Program Files\tool\1"));
+        assert!(!fs.exists(r"C:\Program Files\tool\current"));
+        assert_eq!(
+            fs.read_file(r"C:\Program Files\tool\settings.ini").unwrap(),
+            b"keep"
+        );
+        assert!(fs.is_dir(r"C:\Program Files"));
     }
 
     #[test]
@@ -1796,7 +1856,7 @@ mod tests {
             "Removed tool 1\n"
         );
         assert!(load_database(&fs).unwrap().is_empty());
-        assert!(!fs.exists(r"C:\softwares\tool"));
+        assert!(!fs.exists(r"C:\Program Files\tool"));
     }
 
     #[test]
@@ -1808,15 +1868,18 @@ mod tests {
         run(&mut fs, &repo, &["install", "first"]);
         let error = execute(&mut fs, &repo, "x64", &args(&["install", "second"])).unwrap_err();
         assert!(
-            error.contains(r"binary path already exists: C:\bin\tool.exe"),
+            error.contains(r"binary path already exists: C:\ProgramData\wpkg\bin\tool.exe"),
             "{error}"
         );
-        assert!(!fs.exists(r"C:\softwares\second"));
-        assert_eq!(fs.read_file(r"C:\bin\tool.exe").unwrap(), b"MZ 1");
+        assert!(!fs.exists(r"C:\Program Files\second"));
+        assert_eq!(
+            fs.read_file(r"C:\ProgramData\wpkg\bin\tool.exe").unwrap(),
+            b"MZ 1"
+        );
 
         run(&mut fs, &repo, &["remove", "first"]);
         run(&mut fs, &repo, &["install", "second"]);
-        assert!(fs.is_file(r"C:\bin\tool.exe"));
+        assert!(fs.is_file(r"C:\ProgramData\wpkg\bin\tool.exe"));
     }
 
     #[test]

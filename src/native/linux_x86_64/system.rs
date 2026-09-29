@@ -1,6 +1,7 @@
 //! Windows host identity, version, processor, and system-information APIs.
 
 use super::*;
+use crate::system_profile;
 
 pub(super) extern "win64" fn native_open_process_token(
     process: u64,
@@ -34,7 +35,7 @@ pub(super) extern "win64" fn native_get_user_name_w(name: *mut u16, size: *mut u
                     .map(|(_, value)| value.clone())
             })
         })
-        .unwrap_or_else(|| "Win-Runner".to_string());
+        .unwrap_or_else(|| system_profile::USER_NAME.to_string());
     let encoded: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
     let capacity = unsafe { size.read() } as usize;
     if capacity < encoded.len() {
@@ -231,21 +232,22 @@ pub(super) extern "win64" fn native_get_computer_name_ex_w(
     output: *mut u16,
     len: *mut u32,
 ) -> i32 {
-    const NAME: [u16; 7] = [
-        'w' as u16, 'i' as u16, 'n' as u16, 'c' as u16, 'l' as u16, 'i' as u16, 0,
-    ];
+    let name: Vec<u16> = system_profile::COMPUTER_NAME
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     if len.is_null() {
         return 0;
     }
     let capacity = unsafe { len.read() };
-    if output.is_null() || capacity < NAME.len() as u32 {
-        unsafe { len.write(NAME.len() as u32) };
+    if output.is_null() || capacity < name.len() as u32 {
+        unsafe { len.write(name.len() as u32) };
         native_set_last_error(234);
         return 0;
     }
     unsafe {
-        output.copy_from_nonoverlapping(NAME.as_ptr(), NAME.len());
-        len.write((NAME.len() - 1) as u32)
+        output.copy_from_nonoverlapping(name.as_ptr(), name.len());
+        len.write((name.len() - 1) as u32)
     };
     1
 }
@@ -260,7 +262,7 @@ pub(super) extern "win64" fn native_get_system_info(output: *mut u8) {
         (output.add(8) as *mut u64).write_unaligned(0x1_0000);
         (output.add(16) as *mut u64).write_unaligned(0x7fff_ffff_ffff);
         (output.add(24) as *mut u64).write_unaligned(1);
-        (output.add(32) as *mut u32).write_unaligned(1);
+        (output.add(32) as *mut u32).write_unaligned(system_profile::PROCESSOR_COUNT);
         (output.add(36) as *mut u32).write_unaligned(8664);
         (output.add(40) as *mut u32).write_unaligned(65_536);
     }

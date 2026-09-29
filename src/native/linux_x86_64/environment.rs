@@ -1,6 +1,7 @@
 //! Guest environment and current-directory APIs.
 
 use super::*;
+use crate::system_profile;
 
 pub(super) fn environment_block(ptr: u64) -> Result<Vec<(String, String)>, u32> {
     if ptr == 0 {
@@ -249,8 +250,7 @@ pub(super) extern "win64" fn native_get_current_directory_w(
     (encoded.len() - 1) as u32
 }
 pub(super) extern "win64" fn native_get_system_directory_w(output: *mut u16, capacity: u32) -> u32 {
-    const SYSTEM_DIR: &str = r"C:\Windows\System32";
-    let encoded: Vec<u16> = SYSTEM_DIR
+    let encoded: Vec<u16> = system_profile::SYSTEM32
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
@@ -267,16 +267,8 @@ pub(super) extern "win64" fn native_sh_get_folder_path_w(
     _flags: u32,
     output: *mut u16,
 ) -> i32 {
-    let path = match csidl & 0x7fff {
-        0x1a => r"C:\Users\runneradmin\AppData\Roaming",
-        0x1c => r"C:\Users\runneradmin\AppData\Local",
-        0x23 => r"C:\ProgramData",
-        0x24 => r"C:\Windows",
-        0x25 => r"C:\Windows\System32",
-        0x26 => r"C:\Program Files",
-        0x2b => r"C:\Program Files\Common Files",
-        0x28 => r"C:\Users\runneradmin",
-        _ => return 0x8007_0049u32 as i32, // E_FAIL
+    let Some(path) = system_profile::csidl_path(csidl) else {
+        return 0x8007_0049u32 as i32; // E_FAIL
     };
     if output.is_null() {
         return 0x8007_0057u32 as i32; // E_INVALIDARG
@@ -291,39 +283,21 @@ pub(super) extern "win64" fn native_get_user_profile_directory_w(
     output: *mut u16,
     len: *mut u32,
 ) -> i32 {
-    const PROFILE: &[u16] = &[
-        b'C' as u16,
-        b':' as u16,
-        b'\\' as u16,
-        b'U' as u16,
-        b's' as u16,
-        b'e' as u16,
-        b'r' as u16,
-        b's' as u16,
-        b'\\' as u16,
-        b'W' as u16,
-        b'i' as u16,
-        b'n' as u16,
-        b'-' as u16,
-        b'R' as u16,
-        b'u' as u16,
-        b'n' as u16,
-        b'n' as u16,
-        b'e' as u16,
-        b'r' as u16,
-        0,
-    ];
+    let profile: Vec<u16> = system_profile::PROFILE
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     if len.is_null() {
         return 0;
     }
-    if output.is_null() || unsafe { len.read() } < PROFILE.len() as u32 {
-        unsafe { len.write(PROFILE.len() as u32) };
+    if output.is_null() || unsafe { len.read() } < profile.len() as u32 {
+        unsafe { len.write(profile.len() as u32) };
         native_set_last_error(122);
         return 0;
     }
     unsafe {
-        output.copy_from_nonoverlapping(PROFILE.as_ptr(), PROFILE.len());
-        len.write((PROFILE.len() - 1) as u32)
+        output.copy_from_nonoverlapping(profile.as_ptr(), profile.len());
+        len.write((profile.len() - 1) as u32)
     };
     1
 }

@@ -1471,6 +1471,57 @@ fn run_shell_env(input: &str, envs: &[(&str, &str)]) -> (i32, String, String) {
 }
 
 #[test]
+fn shell_starts_in_the_user_profile_with_a_standard_windows_environment() {
+    let (code, stdout, stderr) = run_shell_env(
+        "Get-Location
+$HOME
+$env:LOCALAPPDATA
+$env:WINRUN_E2E = from-powershell
+set
+powershell -c \"Write-Output via-system32\"
+exit
+",
+        &[("WINRUN_E2E_HOST_ONLY", "leak")],
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let lines: Vec<_> = stdout.lines().collect();
+    assert_eq!(lines[0], r"C:\Users\runner", "stdout: {stdout}");
+    assert_eq!(lines[1], r"C:\Users\runner", "stdout: {stdout}");
+    assert_eq!(
+        lines[2], r"C:\Users\runner\AppData\Local",
+        "stdout: {stdout}"
+    );
+    for expected in [
+        r"USERPROFILE=C:\Users\runner",
+        r"TEMP=C:\Users\runner\AppData\Local\Temp",
+        r"ProgramFiles=C:\Program Files",
+        r"ProgramData=C:\ProgramData",
+        "USERNAME=runner",
+        "COMPUTERNAME=WINRUNNER",
+        r"windir=C:\Windows",
+        // `$env:` and `set` share the one guest environment.
+        "WINRUN_E2E=from-powershell",
+        "via-system32",
+    ] {
+        assert!(lines.contains(&expected), "missing {expected}: {stdout}");
+    }
+    let path = lines
+        .iter()
+        .find_map(|line| line.strip_prefix("Path="))
+        .unwrap();
+    assert!(
+        path.starts_with(r"C:\Windows\System32;C:\Windows;"),
+        "{path}"
+    );
+    assert!(path
+        .split(';')
+        .any(|entry| entry == r"C:\ProgramData\wpkg\bin"));
+    // Nothing from the Linux host environment reaches the guest.
+    assert!(!stdout.contains("WINRUN_E2E_HOST_ONLY"), "stdout: {stdout}");
+    assert!(!stdout.contains("/home/"), "stdout: {stdout}");
+}
+
+#[test]
 fn wpkg_registry_metadata_is_available_in_ephemeral_shells() {
     let (code, stdout, stderr) = run_shell_env(
         "wpkg search node
@@ -1502,17 +1553,21 @@ fn wpkg_default_switches_which_side_by_side_version_a_bin_command_runs() {
     let exe = std::fs::read(artifact("exe/rust_argv.exe")).unwrap();
     let mut fs = WinFs::new();
     for version in ["1", "2"] {
-        let directory = format!(r"C:\softwares\argv\{version}");
+        let directory = format!(r"C:\Program Files\argv\{version}");
         fs.mkdir(&directory).unwrap();
         fs.write_file(&format!(r"{directory}\rust_argv.exe"), exe.clone())
             .unwrap();
     }
-    fs.create_symlink(r"C:\softwares\argv\current", r"C:\softwares\argv\1", true)
-        .unwrap();
-    fs.mkdir(r"C:\bin").unwrap();
     fs.create_symlink(
-        r"C:\bin\rust_argv.exe",
-        r"C:\softwares\argv\current\rust_argv.exe",
+        r"C:\Program Files\argv\current",
+        r"C:\Program Files\argv\1",
+        true,
+    )
+    .unwrap();
+    fs.mkdir(r"C:\ProgramData\wpkg\bin").unwrap();
+    fs.create_symlink(
+        r"C:\ProgramData\wpkg\bin\rust_argv.exe",
+        r"C:\Program Files\argv\current\rust_argv.exe",
         false,
     )
     .unwrap();
@@ -1522,15 +1577,14 @@ fn wpkg_default_switches_which_side_by_side_version_a_bin_command_runs() {
             serde_json::json!({
                 "version": version,
                 "arch": winrun::wpkg::host_architecture(),
-                "install_path": format!(r"C:\softwares\argv\{version}"),
+                "install_path": format!(r"C:\Program Files\argv\{version}"),
                 "bin": ["rust_argv.exe"],
                 "dependencies": [],
             })
         })
         .collect();
-    fs.mkdir(r"C:\.system\wpkg").unwrap();
     fs.write_file(
-        r"C:\.system\wpkg\installed.json",
+        r"C:\ProgramData\wpkg\installed.json",
         serde_json::to_vec(&serde_json::json!([
             {"name": "argv", "default": "1", "versions": versions}
         ]))
@@ -1557,14 +1611,14 @@ exit
     // Commands run as the real file inside the selected version, so
     // GetModuleFileName and sibling files resolve within that version.
     assert!(
-        stdout.contains(r"C:\softwares\argv\1\rust_argv.exe first"),
+        stdout.contains(r#""C:\Program Files\argv\1\rust_argv.exe" first"#),
         "stdout: {stdout}"
     );
     assert!(stdout.contains("* argv 1 ("), "stdout: {stdout}");
     assert!(stdout.contains("  argv 2 ("), "stdout: {stdout}");
     assert!(stdout.contains("argv default is now 2"), "stdout: {stdout}");
     assert!(
-        stdout.contains(r"C:\softwares\argv\2\rust_argv.exe second"),
+        stdout.contains(r#""C:\Program Files\argv\2\rust_argv.exe" second"#),
         "stdout: {stdout}"
     );
 }
@@ -1603,7 +1657,7 @@ fn failed_guest_execution_preserves_unsaved_c_drive_changes() {
     let bad_exe = artifact("exe/bad_import.exe").to_string_lossy().to_string();
     let (code, _, stderr) = run_session_args(
         &[snapshot_arg.clone(), "shell".to_string()],
-        &format!("Set-Content C:\\actions-runner\\_work\\keep.txt before-failure\n{bad_exe}\nsnapshot save\nexit\n"),
+        &format!("Set-Content C:\\Users\\runner\\keep.txt before-failure\n{bad_exe}\nsnapshot save\nexit\n"),
         &[("WINRUN_NATIVE_STRICT_IMPORTS", "1")],
     );
     assert_eq!(code, 0, "stderr: {stderr}");
@@ -1612,7 +1666,7 @@ fn failed_guest_execution_preserves_unsaved_c_drive_changes() {
 
     let (code, stdout, stderr) = run_session_args(
         &[snapshot_arg, "shell".to_string()],
-        "Get-Content C:\\actions-runner\\_work\\keep.txt\nexit\n",
+        "Get-Content C:\\Users\\runner\\keep.txt\nexit\n",
         &[],
     );
     assert_eq!(code, 0, "stderr: {stderr}");
@@ -1656,7 +1710,7 @@ fn interactive_shell_completes_commands_and_inserts_text_at_the_cursor() {
     drop(slave);
 
     let mut output = Vec::new();
-    let prompt = b"PS C:\\actions-runner\\_work> ";
+    let prompt = b"PS C:\\Users\\runner> ";
     let read_until =
         |master: &mut std::fs::File, output: &mut Vec<u8>, condition: &dyn Fn(&[u8]) -> bool| {
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -1727,7 +1781,7 @@ fn interactive_shell_completes_commands_and_inserts_text_at_the_cursor() {
         .expect("load saved guest disk");
     let saved_history = String::from_utf8(
         saved_disk
-            .read_file(r"C:\.system\shell-history")
+            .read_file(r"C:\Users\runner\AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt")
             .expect("read shell history from guest disk"),
     )
     .unwrap();
@@ -1756,7 +1810,7 @@ fn interactive_shell_completes_commands_and_inserts_text_at_the_cursor() {
 
 #[test]
 fn test_runner_executes_host_controlled_ephemeral_job() {
-    let input = "New-Item C:\\actions-runner\\_work\\job.txt -Value ready\nGet-Content C:\\actions-runner\\_work\\job.txt\nexit\n";
+    let input = "New-Item C:\\Users\\runner\\job.txt -Value ready\nGet-Content C:\\Users\\runner\\job.txt\nexit\n";
     let (code, stdout, stderr) = run_session_env("runner", input, &[]);
     assert_eq!(code, 0, "stderr: {stderr}");
     assert_eq!(stdout, "ready\n");
@@ -1767,7 +1821,7 @@ fn test_runner_executes_host_controlled_ephemeral_job() {
 fn test_runner_seeds_and_executes_a_guest_pe() {
     let host_exe = artifact("exe/rust_hello.exe");
     let input = format!(
-        "@seed {} C:\\actions-runner\\_work\\hello.exe\nC:\\actions-runner\\_work\\hello.exe\nexit\n",
+        "@seed {} C:\\Users\\runner\\hello.exe\nC:\\Users\\runner\\hello.exe\nexit\n",
         host_exe.display()
     );
     let (code, stdout, stderr) = run_session_env("runner", &input, &[]);
@@ -1781,11 +1835,11 @@ fn test_native_runner_commits_guest_files_to_the_session() {
     let host_exe = tmp_path("native-writer.exe");
     std::fs::write(
         &host_exe,
-        pe::builder::write_file(r"C:\actions-runner\_work\native.txt", b"persisted"),
+        pe::builder::write_file(r"C:\Users\runner\native.txt", b"persisted"),
     )
     .unwrap();
     let input = format!(
-        "@seed {} C:\\actions-runner\\_work\\writer.exe\nC:\\actions-runner\\_work\\writer.exe\nGet-Content C:\\actions-runner\\_work\\native.txt\nexit\n",
+        "@seed {} C:\\Users\\runner\\writer.exe\nC:\\Users\\runner\\writer.exe\nGet-Content C:\\Users\\runner\\native.txt\nexit\n",
         host_exe.display()
     );
     let (code, stdout, stderr) = run_session_env("runner", &input, &[]);
@@ -1799,12 +1853,8 @@ fn test_native_runner_commits_guest_files_to_the_session() {
 fn test_runner_boots_snapshot_file() {
     let input = tmp_path("snapshot-input");
     let path = tmp_path("runner.snap");
-    std::fs::create_dir_all(input.join("C/actions-runner/_work")).unwrap();
-    std::fs::write(
-        input.join("C/actions-runner/_work/from-snapshot.txt"),
-        b"booted",
-    )
-    .unwrap();
+    std::fs::create_dir_all(input.join("C/Users/runner")).unwrap();
+    std::fs::write(input.join("C/Users/runner/from-snapshot.txt"), b"booted").unwrap();
     let bin = env!("CARGO_BIN_EXE_winrun");
     let built = Command::new(bin)
         .args(["snapshot", "build"])
@@ -1827,7 +1877,7 @@ fn test_runner_boots_snapshot_file() {
         .stdin
         .take()
         .unwrap()
-        .write_all(b"Get-Content C:\\actions-runner\\_work\\from-snapshot.txt\nexit\n")
+        .write_all(b"Get-Content C:\\Users\\runner\\from-snapshot.txt\nexit\n")
         .unwrap();
     let output = child.wait_with_output().unwrap();
     std::fs::remove_file(path).ok();
@@ -2051,7 +2101,7 @@ fn test_named_instance_boot_status_and_destroy() {
             &name,
             "--",
             "New-Item",
-            "C:\\actions-runner\\_work\\live.txt",
+            "C:\\Users\\runner\\live.txt",
             "-Value",
             "live",
         ])
@@ -2071,7 +2121,7 @@ fn test_named_instance_boot_status_and_destroy() {
             &name,
             "--",
             "Get-Content",
-            "C:\\actions-runner\\_work\\live.txt",
+            "C:\\Users\\runner\\live.txt",
         ])
         .env("WINRUN_INSTANCE_DIR", &state)
         .output()

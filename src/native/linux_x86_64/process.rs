@@ -108,8 +108,8 @@ pub(super) fn native_resolve_launch_application(
     if !no_current_directory {
         directories.push(launch.current_directory.clone());
     }
-    directories.push(r"C:\Windows\System32".to_string());
-    directories.push(r"C:\Windows".to_string());
+    directories.push(crate::system_profile::SYSTEM32.to_string());
+    directories.push(crate::system_profile::WINDOWS.to_string());
     if let Some((_, path)) = environment
         .iter()
         .find(|(key, _)| key.eq_ignore_ascii_case("PATH"))

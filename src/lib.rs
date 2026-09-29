@@ -10,5 +10,6 @@ pub mod protocol;
 pub mod ps1;
 pub mod shell;
 pub mod snapshot;
+pub mod system_profile;
 pub mod winfs;
 pub mod wpkg;

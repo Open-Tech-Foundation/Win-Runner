@@ -63,7 +63,19 @@ winrun inspect app.exe
 
 ## Guest state
 
-Each new run gets a disposable C: drive. Use a WinFS snapshot to keep its files and installed programs between runs.
+Each new run gets a disposable C: drive laid out like a stock Windows installation, signed in as the user `runner` on the computer `WINRUNNER`. The shell starts in the profile directory `C:\Users\runner`.
+
+| Folder | Path |
+|---|---|
+| `%USERPROFILE%`, `$HOME` | `C:\Users\runner` |
+| `%APPDATA%` / `%LOCALAPPDATA%` | `C:\Users\runner\AppData\Roaming` / `...\Local` |
+| `%TEMP%`, `%TMP%` | `C:\Users\runner\AppData\Local\Temp` |
+| `%ProgramFiles%` / `%ProgramData%` | `C:\Program Files` / `C:\ProgramData` |
+| `%SystemRoot%` | `C:\Windows` |
+
+The standard Windows environment variables (`PATH`, `PATHEXT`, `ComSpec`, `COMPUTERNAME`, `ProgramFiles(x86)`, and so on) are set, and the Windows folder APIs (`SHGetFolderPath`, `GetUserProfileDirectory`, `GetTempPath`, `GetComputerName`) report the same locations, so tools such as npm find their usual folders. `$env:` and `[Environment]` in PowerShell read and change this guest environment, never the host's. Changes last for the session.
+
+Use a WinFS snapshot to keep files and installed programs between runs.
 
 ```bash
 winrun --snapshot=tools.winfs --save shell
@@ -83,7 +95,7 @@ wpkg install <package[@version]> | list [package] | default <package> [version]
 wpkg upgrade [package] | remove <package[@version]>
 ```
 
-Versions install side by side under `C:\softwares\<package>\<version>`. The first version installed becomes the default; `C:\softwares\<package>\current` links to the default, and each command in `C:\bin` links through it. `@26` selects the newest `26.x` release, and `wpkg default nodejs 26` switches every Node.js command to it. `upgrade` installs the latest release beside the existing ones and moves the default only when it was already on the newest version.
+Versions install side by side under `C:\Program Files\<package>\<version>`. The first version installed becomes the default; `C:\Program Files\<package>\current` links to the default, and each command in `C:\ProgramData\wpkg\bin` (on the `PATH`) links through it. Package state lives in `C:\ProgramData\wpkg`. `@26` selects the newest `26.x` release, and `wpkg default nodejs 26` switches every Node.js command to it. `upgrade` installs the latest release beside the existing ones and moves the default only when it was already on the newest version.
 
 ```text
 wpkg install nodejs          # latest; becomes the default

@@ -903,7 +903,8 @@ mod tests {
             ("files/C/tools/hello.txt", b"hello"),
         ]);
         let fs = load(&snap).unwrap();
-        assert!(fs.is_dir(r"C:\actions-runner\_work"));
+        assert!(fs.is_dir(r"C:\Users\runner\AppData\Local\Temp"));
+        assert_eq!(fs.cwd(), r"C:\Users\runner");
         assert_eq!(fs.read_file(r"C:\tools\hello.txt").unwrap(), b"hello");
     }
 

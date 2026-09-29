@@ -4,13 +4,13 @@
 //! Each input line is, in order: an `exit`/`quit`, a host-only `@seed`
 //! injection directive, an `install`/`inspect` command, a host or guest
 //! `.exe`/`.ps1` file, a package installed into the guest session
-//! (`name`, `name.exe`, `C:\bin\name.exe` + args), or a PS1 statement run
+//! (`name` or `name.exe` on `PATH`, or a full path, + args), or a PS1 statement run
 //! against the session filesystem. Guest console output streams exactly
 //! like the one-shot CLI paths; errors print as `winrun: ...` and the
 //! shell continues. `exit [n]`/`quit`, Ctrl-D (EOF), or a closed pipe ends
 //! the session (code = argument, else the last guest code).
 
-use crate::{backend, inspect, pe, ps1, winfs::WinFs, wpkg};
+use crate::{backend, inspect, pe, ps1, system_profile, winfs::WinFs, wpkg};
 use rustyline::{
     completion::{Completer, Pair},
     error::ReadlineError,
@@ -23,7 +23,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, Write};
 use std::sync::Arc;
 
-const SHELL_HISTORY_PATH: &str = r"C:\.system\shell-history";
+/// Where PowerShell's PSReadLine keeps console history for the user.
+const SHELL_HISTORY_PATH: &str = r"C:\Users\runner\AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt";
 const MAX_SHELL_HISTORY_ENTRIES: usize = 1000;
 pub(crate) const POWERSHELL_SHELL_LINK: &[u8] = b"WINRUN_POWERSHELL_SHELL_LINK/v1\n";
 
@@ -32,15 +33,20 @@ pub(crate) fn is_powershell_shell_link(fs: &WinFs, path: &str) -> bool {
         .is_ok_and(|contents| contents == POWERSHELL_SHELL_LINK)
 }
 
+/// `powershell.exe` at its Windows location, which the default `PATH` lists.
+fn powershell_exe_path() -> String {
+    format!(r"{}\powershell.exe", system_profile::POWERSHELL_HOME)
+}
+
 fn seed_powershell_shell_link(fs: &mut WinFs) {
-    let path = r"C:\bin\powershell.exe";
-    if fs.is_file(path) {
+    let path = powershell_exe_path();
+    if fs.is_file(&path) {
         return;
     }
-    if !fs.is_dir(r"C:\bin") && fs.mkdir(r"C:\bin").is_err() {
+    if fs.mkdir(system_profile::POWERSHELL_HOME).is_err() {
         return;
     }
-    let _ = fs.write_file(path, POWERSHELL_SHELL_LINK.to_vec());
+    let _ = fs.write_file(&path, POWERSHELL_SHELL_LINK.to_vec());
 }
 
 pub(crate) fn powershell_script(fs: &WinFs, argv: &[String]) -> Result<String, String> {
@@ -294,32 +300,7 @@ impl Validator for ShellHelper {}
 impl Helper for ShellHelper {}
 
 fn default_environment() -> Vec<(String, String)> {
-    BTreeMap::from([
-        (
-            "PATH".to_string(),
-            r"C:\bin;C:\Windows\System32".to_string(),
-        ),
-        ("SystemDrive".to_string(), "C:".to_string()),
-        ("SystemRoot".to_string(), r"C:\Windows".to_string()),
-        ("TEMP".to_string(), r"C:\Windows\Temp".to_string()),
-        ("TMP".to_string(), r"C:\Windows\Temp".to_string()),
-        (
-            "USERPROFILE".to_string(),
-            r"C:\Users\Win-Runner".to_string(),
-        ),
-        (
-            "APPDATA".to_string(),
-            r"C:\Users\Win-Runner\AppData\Roaming".to_string(),
-        ),
-        (
-            "LOCALAPPDATA".to_string(),
-            r"C:\Users\Win-Runner\AppData\Local".to_string(),
-        ),
-        ("USERNAME".to_string(), "Win-Runner".to_string()),
-        ("WINDIR".to_string(), r"C:\Windows".to_string()),
-    ])
-    .into_iter()
-    .collect()
+    system_profile::default_environment(&[wpkg::BIN])
 }
 
 /// What the REPL does after a line.
@@ -336,7 +317,6 @@ pub struct Shell {
     last_code: i32,
     backend: Result<&'static dyn backend::ExecutionBackend, String>,
     snapshot_path: Option<std::path::PathBuf>,
-    environment: Vec<(String, String)>,
 }
 
 impl Default for Shell {
@@ -361,18 +341,15 @@ impl Shell {
     /// subsequent `snapshot save` commands without a path.
     pub fn with_snapshot_path(mut fs: WinFs, snapshot_path: Option<std::path::PathBuf>) -> Self {
         seed_powershell_shell_link(&mut fs);
-        fs.mkdir(r"C:\.system\npm-cache\_cacache\tmp")
-            .expect("npm cache temp directory must fit the guest filesystem");
-        fs.mkdir(r"C:\.system\npm-cache\_logs")
-            .expect("npm log directory must fit the guest filesystem");
-        fs.mkdir(r"C:\Users\Win-Runner\AppData\Roaming")
-            .expect("guest roaming profile directory must fit the filesystem");
-        fs.mkdir(r"C:\Users\Win-Runner\AppData\Local")
-            .expect("guest local profile directory must fit the filesystem");
-        let windows_npm_cache = r"C:\Users\Win-Runner\AppData\Local\npm-cache";
-        if !fs.exists(windows_npm_cache) {
-            fs.create_symlink(windows_npm_cache, r"C:\.system\npm-cache", true)
-                .expect("Windows npm cache path must map into C:\\.system");
+        // npm's standard Windows cache and global-prefix folders; npm
+        // expects the cache's temp and log directories to exist.
+        for directory in [
+            format!(r"{}\npm-cache\_cacache\tmp", system_profile::LOCAL_APP_DATA),
+            format!(r"{}\npm-cache\_logs", system_profile::LOCAL_APP_DATA),
+            format!(r"{}\npm", system_profile::APP_DATA),
+        ] {
+            fs.mkdir(&directory)
+                .expect("npm profile directories must fit the guest filesystem");
         }
         let backend_started = std::time::Instant::now();
         let backend = backend::configured().map_err(|e| format!("failed to select backend: {e}"));
@@ -384,11 +361,10 @@ impl Shell {
         }
         Shell {
             fs,
-            sess: ps1::Session::default(),
+            sess: ps1::Session::with_environment(default_environment()),
             last_code: 0,
             backend,
             snapshot_path,
-            environment: default_environment(),
         }
     }
 
@@ -422,7 +398,9 @@ impl Shell {
     }
 
     fn persist_shell_history(&mut self, entries: &[String]) -> Result<(), String> {
-        self.fs.mkdir(r"C:\.system")?;
+        if let Some((directory, _)) = SHELL_HISTORY_PATH.rsplit_once('\\') {
+            self.fs.mkdir(directory)?;
+        }
         let start = entries.len().saturating_sub(MAX_SHELL_HISTORY_ENTRIES);
         let mut contents = entries[start..].join("\n");
         if !contents.is_empty() {
@@ -433,26 +411,15 @@ impl Shell {
     }
 
     fn environment_value(&self, name: &str) -> Option<&str> {
-        self.environment
-            .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.as_str())
+        ps1::environment_get(&self.sess.environment, name)
     }
 
     fn set_environment_value(&mut self, name: String, value: Option<String>) {
-        if let Some(index) = self
-            .environment
-            .iter()
-            .position(|(key, _)| key.eq_ignore_ascii_case(&name))
-        {
-            if let Some(value) = value {
-                self.environment[index].1 = value;
-            } else {
-                self.environment.remove(index);
-            }
-        } else if let Some(value) = value {
-            self.environment.push((name, value));
-        }
+        ps1::environment_set(
+            &mut self.sess.environment,
+            &name,
+            value.as_deref().unwrap_or_default(),
+        );
     }
 
     fn expand_environment_references(&self, input: &str) -> String {
@@ -481,12 +448,14 @@ impl Shell {
 
     fn do_set(&mut self, argv: &[String], out: &mut Vec<u8>) -> Result<(), String> {
         if argv.is_empty() {
+            // Like cmd's `set`: original spelling, sorted case-insensitively.
             let vars = self
+                .sess
                 .environment
                 .iter()
-                .map(|(name, value)| (name.to_ascii_uppercase(), value.clone()))
+                .map(|(name, value)| (name.to_ascii_uppercase(), (name, value)))
                 .collect::<BTreeMap<_, _>>();
-            for (name, value) in vars {
+            for (name, value) in vars.into_values() {
                 out.extend_from_slice(format!("{name}={value}\n").as_bytes());
             }
             return Ok(());
@@ -494,7 +463,7 @@ impl Shell {
         let expression = argv.join(" ");
         let Some((name, value)) = expression.split_once('=') else {
             let prefix = expression.to_ascii_uppercase();
-            for (name, value) in &self.environment {
+            for (name, value) in &self.sess.environment {
                 if name.to_ascii_uppercase().starts_with(&prefix) {
                     out.extend_from_slice(format!("{name}={value}\n").as_bytes());
                 }
@@ -939,10 +908,12 @@ impl Shell {
                 fs,
                 prog,
                 guest_args,
-                &self.environment,
+                &self.sess.environment,
                 sink,
             ),
-            None => backend.execute_with_environment(&img, fs, prog, guest_args, &self.environment),
+            None => {
+                backend.execute_with_environment(&img, fs, prog, guest_args, &self.sess.environment)
+            }
         };
         let result = match result {
             Ok(result) => result,
@@ -1039,7 +1010,8 @@ impl Shell {
         out: &mut Vec<u8>,
         sink: Option<backend::OutputSink>,
     ) -> Result<ShellFlow, String> {
-        let node_guest = r"C:\bin\node.exe";
+        let node_guest = format!(r"{}\node.exe", wpkg::BIN);
+        let node_guest = node_guest.as_str();
         let node_path = self.guest_image_path(node_guest);
         // npm ships beside node.exe; prefer the default Node.js version's
         // copy over any other version's installed elsewhere on the disk.
@@ -1072,8 +1044,8 @@ impl Shell {
         self.run_exe_bytes(&data, &node_path, &args, out, sink)
     }
 
-    /// The path a guest EXE runs as. Commands in `C:\bin` are links into
-    /// `C:\softwares\<name>\current`; running the real file keeps
+    /// The path a guest EXE runs as. wpkg commands are links into
+    /// `C:\Program Files\<name>\current`; running the real file keeps
     /// `GetModuleFileName`, DLL search, and files shipped beside the EXE
     /// inside the selected package version.
     fn guest_image_path(&self, path: &str) -> String {
@@ -1116,8 +1088,8 @@ fn read_target_bytes(fs: &WinFs, target: &str) -> Result<Vec<u8>, String> {
     }
     for candidate in [
         target.to_string(),
-        format!(r"C:\bin\{target}"),
-        format!(r"C:\bin\{target}.exe"),
+        format!(r"{}\{target}", wpkg::BIN),
+        format!(r"{}\{target}.exe", wpkg::BIN),
     ] {
         if fs.is_file(&candidate) {
             return fs
@@ -1212,7 +1184,7 @@ fn run_session_controlled(
         }
         loop {
             if let Some(helper) = editor.helper_mut() {
-                helper.refresh(&shell.fs, &shell.environment);
+                helper.refresh(&shell.fs, &shell.sess.environment);
             }
             let prompt = format!("PS {}> ", shell.cwd());
             match editor.readline(&prompt) {
@@ -1517,20 +1489,43 @@ mod tests {
     }
 
     #[test]
-    fn shell_boots_an_ephemeral_runner_image() {
+    fn shell_boots_in_the_user_profile_with_the_standard_environment() {
         let shell = Shell::new();
-        assert_eq!(shell.cwd(), r"C:\actions-runner\_work");
+        assert_eq!(shell.cwd(), r"C:\Users\runner");
+        assert_eq!(
+            shell.environment_value("userprofile"),
+            Some(r"C:\Users\runner")
+        );
         assert_eq!(
             shell.environment_value("localappdata"),
-            Some(r"C:\Users\Win-Runner\AppData\Local")
+            Some(r"C:\Users\runner\AppData\Local")
         );
-        assert!(shell
+        assert_eq!(shell.environment_value("USERNAME"), Some("runner"));
+        assert_eq!(
+            shell.environment_value("TEMP"),
+            Some(r"C:\Users\runner\AppData\Local\Temp")
+        );
+        let path: Vec<_> = shell
+            .environment_value("PATH")
+            .unwrap()
+            .split(';')
+            .collect();
+        assert_eq!(path[0], r"C:\Windows\System32");
+        assert!(path.contains(&r"C:\ProgramData\wpkg\bin"), "{path:?}");
+        assert!(path.contains(&r"C:\Windows\System32\WindowsPowerShell\v1.0\"));
+        // npm's own Windows defaults exist without any path redirection.
+        for directory in [
+            r"C:\Users\runner\AppData\Local\npm-cache\_cacache\tmp",
+            r"C:\Users\runner\AppData\Local\npm-cache\_logs",
+            r"C:\Users\runner\AppData\Roaming\npm",
+        ] {
+            assert!(shell.fs.is_dir(directory), "missing {directory}");
+        }
+        assert!(!shell
             .fs
-            .is_dir(r"C:\Users\Win-Runner\AppData\Local\npm-cache\_cacache\tmp"));
-        assert!(shell.fs.is_dir(r"C:\.system\npm-cache\_logs"));
-        assert!(shell
-            .fs
-            .is_symlink(r"C:\Users\Win-Runner\AppData\Local\npm-cache"));
+            .is_symlink(r"C:\Users\runner\AppData\Local\npm-cache"));
+        assert!(!shell.fs.exists(r"C:\.system"));
+        assert!(SHELL_HISTORY_PATH.starts_with(system_profile::APP_DATA));
     }
 
     #[test]
@@ -1729,7 +1724,7 @@ mod tests {
         shell.fs.mkdir("Documents").unwrap();
         shell.fs.write_file("notes.txt", b"hello".to_vec()).unwrap();
         let mut helper = ShellHelper::default();
-        helper.refresh(&shell.fs, &shell.environment);
+        helper.refresh(&shell.fs, &shell.sess.environment);
 
         let (_, command_candidates) = helper.complete_line("wp", 2);
         assert!(command_candidates
@@ -1750,7 +1745,7 @@ mod tests {
             .fs
             .write_file("inside.txt", b"inside".to_vec())
             .unwrap();
-        helper.refresh(&shell.fs, &shell.environment);
+        helper.refresh(&shell.fs, &shell.sess.environment);
         let (_, nested_candidates) = helper.complete_line("type ins", 8);
         assert!(nested_candidates
             .iter()
@@ -1804,7 +1799,7 @@ mod tests {
         let mut shell = Shell::new();
         assert!(is_powershell_shell_link(
             &shell.fs,
-            r"C:\bin\powershell.exe"
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
         ));
         let mut out = Vec::new();
         shell

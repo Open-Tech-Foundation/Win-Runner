@@ -42,14 +42,14 @@ mod protection_tests {
         native_set_console_screen_buffer_size, native_set_console_window_info,
         native_set_environment_variable_w, native_set_file_time, native_set_last_error,
         native_set_thread_stack_guarantee, native_set_unhandled_exception_filter,
-        native_set_waitable_timer, native_shutdown_socket, native_sleep_condition_variable_srw,
-        native_terminate_process, native_try_acquire_srw_lock_shared,
-        native_wait_for_single_object, native_wait_on_address, native_wake_all_condition_variable,
-        native_wake_by_address_all, native_wide_char_to_multi_byte, native_write_console_w,
-        native_wsa_get_last_error, native_wsa_inet_addr, parse_windows_command_line, process_ctx,
-        uppercase_ascii_utf16, waitpid, winrun_native_rtl_capture_context,
-        write_process_information, NativeLaunchSpec, NativeMemoryStatus, API_SET_MODULE, PROT_EXEC,
-        PROT_READ, PROT_WRITE, THREAD_NATIVE_HANDLE,
+        native_set_waitable_timer, native_sh_get_folder_path_w, native_shutdown_socket,
+        native_sleep_condition_variable_srw, native_terminate_process,
+        native_try_acquire_srw_lock_shared, native_wait_for_single_object, native_wait_on_address,
+        native_wake_all_condition_variable, native_wake_by_address_all,
+        native_wide_char_to_multi_byte, native_write_console_w, native_wsa_get_last_error,
+        native_wsa_inet_addr, parse_windows_command_line, process_ctx, uppercase_ascii_utf16,
+        waitpid, winrun_native_rtl_capture_context, write_process_information, NativeLaunchSpec,
+        NativeMemoryStatus, API_SET_MODULE, PROT_EXEC, PROT_READ, PROT_WRITE, THREAD_NATIVE_HANDLE,
     };
     use crate::winfs::WinFs;
 
@@ -6326,22 +6326,20 @@ mod protection_tests {
     }
 
     #[test]
-    fn supplies_a_synthetic_computer_name() {
+    fn supplies_the_profile_computer_name() {
         let mut len = 0;
         assert_eq!(
             native_get_computer_name_ex_w(5, std::ptr::null_mut(), &mut len),
             0
         );
-        assert_eq!(len, 7);
-        let mut output = [0; 7];
+        assert_eq!(len, 10);
+        let mut output = [0; 10];
         assert_eq!(
             native_get_computer_name_ex_w(5, output.as_mut_ptr(), &mut len),
             1
         );
-        assert_eq!(
-            &output[..6],
-            &['w' as u16, 'i' as u16, 'n' as u16, 'c' as u16, 'l' as u16, 'i' as u16]
-        );
+        assert_eq!(len, 9);
+        assert_eq!(String::from_utf16_lossy(&output[..9]), "WINRUNNER");
     }
 
     #[test]
@@ -6629,21 +6627,46 @@ mod protection_tests {
     }
 
     #[test]
-    fn supplies_a_synthetic_user_profile_directory() {
+    fn supplies_the_profile_user_directory() {
         let mut len = 0;
         assert_eq!(
             native_get_user_profile_directory_w(u64::MAX - 3, std::ptr::null_mut(), &mut len),
             0
         );
-        assert_eq!(len, 20);
+        assert_eq!(len, 16);
         let mut output = [0; 32];
         assert_eq!(
             native_get_user_profile_directory_w(u64::MAX - 3, output.as_mut_ptr(), &mut len),
             1
         );
+        assert_eq!(len, 15);
+        assert_eq!(String::from_utf16_lossy(&output[..15]), "C:\\Users\\runner");
+    }
+
+    #[test]
+    fn known_folders_match_the_profile_environment() {
+        let folder = |csidl: i32| {
+            let mut output = [0u16; 260];
+            assert_eq!(
+                native_sh_get_folder_path_w(0, csidl, 0, 0, output.as_mut_ptr()),
+                0,
+                "CSIDL {csidl:#x}"
+            );
+            let len = output.iter().position(|unit| *unit == 0).unwrap();
+            String::from_utf16(&output[..len]).unwrap()
+        };
+        assert_eq!(folder(0x28), "C:\\Users\\runner");
+        assert_eq!(folder(0x1a), "C:\\Users\\runner\\AppData\\Roaming");
+        // CSIDL_FLAG_CREATE does not change the folder.
+        assert_eq!(folder(0x801c), "C:\\Users\\runner\\AppData\\Local");
+        assert_eq!(folder(0x26), "C:\\Program Files");
+        assert_eq!(folder(0x2a), "C:\\Program Files (x86)");
+        assert_eq!(folder(0x23), "C:\\ProgramData");
+        assert_eq!(folder(0x05), "C:\\Users\\runner\\Documents");
+        let mut output = [0u16; 260];
         assert_eq!(
-            String::from_utf16_lossy(&output[..19]),
-            "C:\\Users\\Win-Runner"
+            native_sh_get_folder_path_w(0, 0x3f, 0, 0, output.as_mut_ptr()),
+            0x8007_0049u32 as i32
         );
     }
 

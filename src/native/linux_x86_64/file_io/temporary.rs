@@ -1,15 +1,27 @@
 use super::*;
+use crate::system_profile;
+
+/// `GetTempPath` from this process's environment (`%TMP%`, `%TEMP%`,
+/// `%USERPROFILE%`, then the Windows directory). The directory is created
+/// so a fresh guest disk can use it immediately.
+fn guest_temp_path() -> String {
+    let environment = process_ctx()
+        .and_then(|process| process.environment.lock().ok().map(|env| env.clone()))
+        .unwrap_or_default();
+    let path = system_profile::temp_path(&environment);
+    if let Some(context) = fs_ctx() {
+        if let Ok(mut ctx) = context.lock() {
+            let _ = ctx.fs.mkdir(path.trim_end_matches('\\'));
+        }
+    }
+    path
+}
 
 pub(in crate::native::linux_x86_64) extern "win64" fn native_get_temp_path_w(
     capacity: u32,
     output: *mut u16,
 ) -> u32 {
-    let path = r"C:\Windows\Temp\";
-    if let Some(context) = fs_ctx() {
-        if let Ok(mut ctx) = context.lock() {
-            let _ = ctx.fs.mkdir(r"C:\Windows\Temp");
-        }
-    }
+    let path = guest_temp_path();
     let encoded = path.encode_utf16().chain([0]).collect::<Vec<_>>();
     if capacity == 0 || output.is_null() || (capacity as usize) < encoded.len() {
         return encoded.len() as u32;
@@ -22,12 +34,8 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_get_temp_path_a(
     capacity: u32,
     output: *mut u8,
 ) -> u32 {
-    let path = b"C:\\Windows\\Temp\\\0";
-    if let Some(context) = fs_ctx() {
-        if let Ok(mut ctx) = context.lock() {
-            let _ = ctx.fs.mkdir(r"C:\Windows\Temp");
-        }
-    }
+    let mut path = guest_temp_path().into_bytes();
+    path.push(0);
     if capacity == 0 || output.is_null() || (capacity as usize) < path.len() {
         return path.len() as u32;
     }

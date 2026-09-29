@@ -603,24 +603,19 @@ impl WinFs {
     /// instance disk. The layout mirrors the writable locations a freshly
     /// provisioned Windows Actions-style runner expects before it downloads
     /// tools or checks out a repository.
+    /// A fresh boot disk with the standard Windows folders of
+    /// [`system_profile`](crate::system_profile), starting in the user's
+    /// profile directory.
     pub fn ephemeral_runner() -> Self {
+        use crate::system_profile;
         let mut fs = Self::new();
-        for path in [
-            r"C:\\Windows\\System32",
-            r"C:\\Windows\\Temp",
-            r"C:\\Program Files",
-            r"C:\\Users\\runner",
-            r"C:\\Users\\runner\\AppData\\Local\\Temp",
-            r"C:\\actions-runner\\_work",
-            r"C:\\actions-runner\\_diag",
-            r"C:\\actions-runner\\externals",
-        ] {
-            // The paths above have no conflicting files in a fresh WinFs.
+        for path in system_profile::DIRECTORIES {
+            // The profile's folders have no conflicting files in a fresh WinFs.
             fs.mkdir(path)
-                .expect("ephemeral runner layout must be internally valid");
+                .expect("standard Windows layout must be internally valid");
         }
-        fs.set_cwd(r"C:\\actions-runner\\_work")
-            .expect("ephemeral runner work directory must exist");
+        fs.set_cwd(system_profile::PROFILE)
+            .expect("user profile directory must exist");
         fs
     }
 
@@ -2915,23 +2910,30 @@ mod tests {
     }
 
     #[test]
-    fn ephemeral_runner_has_fresh_windows_runner_layout() {
+    fn ephemeral_runner_has_fresh_standard_windows_layout() {
         let mut first = WinFs::ephemeral_runner();
-        assert_eq!(first.cwd(), r"C:\actions-runner\_work");
+        assert_eq!(first.cwd(), r"C:\Users\runner");
         for path in [
             r"C:\Windows\System32",
+            r"C:\Windows\Temp",
+            r"C:\Program Files",
+            r"C:\Program Files (x86)",
+            r"C:\ProgramData",
+            r"C:\Users\Public",
+            r"C:\Users\runner\AppData\Roaming",
             r"C:\Users\runner\AppData\Local\Temp",
-            r"C:\actions-runner\_diag",
+            r"C:\Users\runner\Documents",
         ] {
             assert!(first.is_dir(path), "missing {path}");
         }
+        assert!(!first.exists(r"C:\actions-runner"));
         first
-            .write_file(r"C:\actions-runner\_work\checkout.txt", b"one".to_vec())
+            .write_file(r"C:\Users\runner\checkout.txt", b"one".to_vec())
             .unwrap();
 
         let second = WinFs::ephemeral_runner();
-        assert!(!second.exists(r"C:\actions-runner\_work\checkout.txt"));
-        assert_eq!(second.cwd(), r"C:\actions-runner\_work");
+        assert!(!second.exists(r"C:\Users\runner\checkout.txt"));
+        assert_eq!(second.cwd(), r"C:\Users\runner");
     }
 
     #[test]

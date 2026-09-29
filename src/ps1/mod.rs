@@ -47,12 +47,55 @@ const MAX_IEX_DEPTH: usize = 32;
 /// Session variables (`$name = value`). Held by the caller (e.g. the
 /// interactive shell) so assignments persist across lines; one-shot
 /// `run_ps1` uses a throwaway session.
-#[derive(Default)]
 pub struct Session {
     pub vars: HashMap<String, Value>,
     pub funcs: HashMap<String, FuncDef>,
     /// `Push-Location`/`Pop-Location` stack (guest-absolute directories).
     pub dir_stack: Vec<String>,
+    /// The guest process environment behind `$env:`, `$HOME`, and
+    /// `[Environment]`; never the host's.
+    pub environment: Vec<(String, String)>,
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self::with_environment(crate::system_profile::default_environment(&[]))
+    }
+}
+
+impl Session {
+    pub fn with_environment(environment: Vec<(String, String)>) -> Self {
+        Session {
+            vars: HashMap::new(),
+            funcs: HashMap::new(),
+            dir_stack: Vec::new(),
+            environment,
+        }
+    }
+}
+
+/// Case-insensitive lookup, as Windows environment names are.
+pub fn environment_get<'a>(environment: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    environment
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+/// Set (or, with an empty value, remove) a variable, keeping an existing
+/// name's spelling like `SetEnvironmentVariable` does.
+pub fn environment_set(environment: &mut Vec<(String, String)>, name: &str, value: &str) {
+    match environment
+        .iter()
+        .position(|(key, _)| key.eq_ignore_ascii_case(name))
+    {
+        Some(index) if value.is_empty() => {
+            environment.remove(index);
+        }
+        Some(index) => environment[index].1 = value.to_string(),
+        None if value.is_empty() => {}
+        None => environment.push((name.to_string(), value.to_string())),
+    }
 }
 
 /// A defined function: parameter names (lowercased, no `$`) and body text.
@@ -101,6 +144,7 @@ pub fn run_ps1_session(
         vars: &mut sess.vars,
         funcs: &mut sess.funcs,
         dir_stack: &mut sess.dir_stack,
+        environment: &mut sess.environment,
     };
     interp.run(script)
 }
@@ -112,6 +156,7 @@ struct Interpreter<'a> {
     vars: &'a mut HashMap<String, Value>,
     funcs: &'a mut HashMap<String, FuncDef>,
     dir_stack: &'a mut Vec<String>,
+    environment: &'a mut Vec<(String, String)>,
 }
 
 impl<'a> Interpreter<'a> {
@@ -1023,6 +1068,18 @@ impl<'a> Interpreter<'a> {
     /// Store an assignment value (`$name` target; `+=` appends with the
     /// same merge rules as variable append).
     fn store_assign(&mut self, name: &str, op: AssignOp, v: Value) -> Result<(), String> {
+        if let Some(variable) = name.strip_prefix('$').filter(|bare| is_env_name(bare)) {
+            let value = match op {
+                AssignOp::Set => value_string(&v),
+                AssignOp::Append => format!(
+                    "{}{}",
+                    environment_get(self.environment, &variable[4..]).unwrap_or_default(),
+                    value_string(&v)
+                ),
+            };
+            environment_set(self.environment, &variable[4..], &value);
+            return Ok(());
+        }
         let key = check_assign_target(name)?;
         match op {
             AssignOp::Set => {
@@ -1672,6 +1729,7 @@ impl<'a> Interpreter<'a> {
             vars: &mut *self.vars,
             funcs: &mut *self.funcs,
             dir_stack: &mut *self.dir_stack,
+            environment: &mut *self.environment,
         }
     }
 
@@ -1703,11 +1761,8 @@ impl<'a> Interpreter<'a> {
         if name.eq_ignore_ascii_case("null") {
             return Some(Value::Str(String::new()));
         }
-        if name.eq_ignore_ascii_case("home") {
-            return Some(Value::Str(std::env::var("HOME").unwrap_or_default()));
-        }
-        if name.len() > 4 && name[..4].eq_ignore_ascii_case("env:") {
-            return Some(Value::Str(std::env::var(&name[4..]).unwrap_or_default()));
+        if name.eq_ignore_ascii_case("home") || is_env_name(name) {
+            return Some(Value::Str(self.lookup_scalar(name)));
         }
         if name.contains(':') {
             return None;
@@ -1719,11 +1774,16 @@ impl<'a> Interpreter<'a> {
         if name.eq_ignore_ascii_case("null") {
             return String::new();
         }
+        // PowerShell's $HOME is the Windows profile directory.
         if name.eq_ignore_ascii_case("home") {
-            return std::env::var("HOME").unwrap_or_default();
+            return environment_get(self.environment, "USERPROFILE")
+                .unwrap_or_default()
+                .to_string();
         }
-        if name.len() > 4 && name[..4].eq_ignore_ascii_case("env:") {
-            return std::env::var(&name[4..]).unwrap_or_default();
+        if is_env_name(name) {
+            return environment_get(self.environment, &name[4..])
+                .unwrap_or_default()
+                .to_string();
         }
         if name.contains(':') {
             return format!("${name}");
@@ -1950,10 +2010,10 @@ impl<'a> Interpreter<'a> {
         let m = method.to_lowercase();
         if t == "environment" || t == "system.environment" {
             if m == "setenvironmentvariable" {
-                eval_environment(&m, &argvals)?;
+                eval_environment(self.environment, &m, &argvals)?;
                 return Ok(None);
             }
-            return eval_environment(&m, &argvals).map(Some);
+            return eval_environment(self.environment, &m, &argvals).map(Some);
         }
         if t == "guid" || t == "system.guid" {
             if m != "newguid" {
@@ -3782,7 +3842,14 @@ fn render_json_string(s: &str) -> String {
 /// `[Environment]::Get/SetEnvironmentVariable`. `User`/`Machine` targets
 /// read the host process env; sets land in the host process env too
 /// (visible for the rest of the session, never persisted anywhere).
-fn eval_environment(method: &str, args: &[String]) -> Result<String, String> {
+/// `[Environment]::Get/SetEnvironmentVariable` against the guest session
+/// environment. `User` and `Machine` targets act on the session until the
+/// guest registry persists them.
+fn eval_environment(
+    environment: &mut Vec<(String, String)>,
+    method: &str,
+    args: &[String],
+) -> Result<String, String> {
     match method {
         "getenvironmentvariable" => {
             if args.len() != 1 && args.len() != 2 {
@@ -3795,7 +3862,9 @@ fn eval_environment(method: &str, args: &[String]) -> Result<String, String> {
             {
                 return Err(format!("unknown environment target: {}", args[1]));
             }
-            Ok(std::env::var(&args[0]).unwrap_or_default())
+            Ok(environment_get(environment, &args[0])
+                .unwrap_or_default()
+                .to_string())
         }
         "setenvironmentvariable" => {
             if args.len() != 2 && args.len() != 3 {
@@ -3808,8 +3877,7 @@ fn eval_environment(method: &str, args: &[String]) -> Result<String, String> {
             {
                 return Err(format!("unknown environment target: {}", args[2]));
             }
-            // Session-local: visible to later reads, gone with the process.
-            std::env::set_var(&args[0], &args[1]);
+            environment_set(environment, &args[0], &args[1]);
             Ok(String::new())
         }
         _ => Err(format!("method {method} is not supported on Environment")),
@@ -4080,6 +4148,11 @@ fn split_assign_if_head(chunk: &str) -> Option<(String, AssignOp, String)> {
     Some((name, op, after))
 }
 
+/// `env:NAME`, the environment drive's variable syntax.
+fn is_env_name(name: &str) -> bool {
+    name.len() > 4 && name[..4].eq_ignore_ascii_case("env:")
+}
+
 /// Validate an assignment target (`$name`), returning the key.
 fn check_assign_target(name: &str) -> Result<String, String> {
     let bare = name
@@ -4091,8 +4164,8 @@ fn check_assign_target(name: &str) -> Result<String, String> {
     if bare.eq_ignore_ascii_case("home") {
         return Err("assigning $HOME is not supported".to_string());
     }
-    if bare.len() > 4 && bare[..4].eq_ignore_ascii_case("env:") {
-        return Err("assigning $env: is not supported".to_string());
+    if is_env_name(bare) {
+        return Err("$env: variables hold strings; assign them directly".to_string());
     }
     if !is_var_name(bare) {
         return Err(format!("invalid variable name: {name}"));
@@ -4652,6 +4725,7 @@ mod tests {
             let mut vars = HashMap::new();
             let mut funcs = HashMap::new();
             let mut stack = Vec::new();
+            let mut environment = Vec::new();
             let mut interp = Interpreter {
                 fs: &mut fs,
                 out: &mut out,
@@ -4659,6 +4733,7 @@ mod tests {
                 vars: &mut vars,
                 funcs: &mut funcs,
                 dir_stack: &mut stack,
+                environment: &mut environment,
             };
             interp.cmd_iex(&["echo hi".to_string()], None).map(|_| ())
         }
@@ -5125,21 +5200,48 @@ mod tests {
         let (out, r) = run_session("echo x$null y");
         assert!(r.is_ok());
         assert_eq!(out, b"x y\n");
-        let home = std::env::var("HOME").unwrap_or_default();
         let (out, r) = run_session("echo $HOME");
         assert!(r.is_ok());
-        assert_eq!(out, format!("{home}\n").as_bytes());
+        assert_eq!(out, b"C:\\Users\\runner\n");
     }
 
     #[test]
-    fn env_var_reads_host() {
-        std::env::set_var("WINRUN_TEST_VAR_XYZ", "env-ok");
+    fn env_vars_come_from_the_guest_profile_not_the_host() {
+        std::env::set_var("WINRUN_TEST_VAR_XYZ", "host-only");
         let (out, r) = run_session("echo $env:WINRUN_TEST_VAR_XYZ");
         std::env::remove_var("WINRUN_TEST_VAR_XYZ");
         assert!(r.is_ok());
-        assert_eq!(out, b"env-ok\n");
-        let (_, r) = run_session("echo $env:WINRUN_DEFINITELY_NOT_SET_XYZ");
+        assert_eq!(out, b"\n");
+        let (out, r) = run_session("echo $env:userprofile $env:LOCALAPPDATA");
         assert!(r.is_ok());
+        assert_eq!(
+            out,
+            b"C:\\Users\\runner C:\\Users\\runner\\AppData\\Local\n"
+        );
+    }
+
+    #[test]
+    fn env_assignments_and_environment_class_change_only_the_guest_session() {
+        let mut fs = WinFs::new();
+        let mut session = Session::default();
+        let mut out = Vec::new();
+        run_ps1_session(
+            &mut session,
+            &mut fs,
+            "$env:WINRUN_GUEST_ONLY = first\n$env:WINRUN_GUEST_ONLY += -more\n[Environment]::SetEnvironmentVariable('Tool_Home', 'C:\\tools', 'User')\necho $env:winrun_guest_only\necho ([Environment]::GetEnvironmentVariable('TOOL_HOME'))",
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(out, b"first-more\nC:\\tools\n");
+        assert!(std::env::var_os("WINRUN_GUEST_ONLY").is_none());
+        assert!(std::env::var_os("Tool_Home").is_none());
+        assert_eq!(
+            environment_get(&session.environment, "tool_home"),
+            Some("C:\\tools")
+        );
+        out.clear();
+        run_ps1_session(&mut session, &mut fs, "$env:Tool_Home = $null", &mut out).unwrap();
+        assert_eq!(environment_get(&session.environment, "TOOL_HOME"), None);
     }
 
     #[test]
@@ -5147,7 +5249,6 @@ mod tests {
         assert!(run_session("$x =").1.is_err());
         assert!(run_session("$x = a b").1.is_err());
         assert!(run_session("$x == 1").1.unwrap_err().contains("comparison"));
-        assert!(run_session("$env:A = b").1.unwrap_err().contains("$env:"));
         assert!(run_session("$HOME = b").1.unwrap_err().contains("$HOME"));
         assert!(run_session("$null = b").1.unwrap_err().contains("$null"));
     }
