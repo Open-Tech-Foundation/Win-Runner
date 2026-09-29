@@ -119,6 +119,10 @@ wpkg default nodejs 26
 wpkg remove nodejs@24        # one version; `remove nodejs` removes all
 ```
 
+### cmd.exe for programs that shell out
+
+The shell you type into is PowerShell-style, but many programs start `%ComSpec%` themselves: Node's `child_process` with `shell: true`, `npm run`, Python's `subprocess(shell=True)`, and the `.cmd` launchers that npm and pip install. For those, the disk has `C:\Windows\System32\cmd.exe`, a narrow command processor that runs as a real child process. It supports `cmd /c` and `/d /s /c`, `&`, `&&`, `||`, `( )` blocks, `>`, `>>`, `2>&1`, `<` and `nul` redirection, `%VAR%` expansion (including `:a=b` and `:~n,m`), and batch files with `%1`, `%*`, `%~dp0`, labels, `goto`, `call`, `exit /b`, `setlocal`, `if`, `for`, and `for /f` over command output. There is no interactive cmd prompt, and pipes, `set /a`, `set /p`, and delayed `!var!` expansion are not supported yet. As on Windows, starting a `.bat` or `.cmd` file with `CreateProcess` runs it through cmd.exe.
+
 ## Headless control
 
 Start a persistent shell with a loopback WebSocket endpoint; any WebSocket client can send input and read streamed output events.

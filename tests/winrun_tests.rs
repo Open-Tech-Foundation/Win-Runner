@@ -190,6 +190,113 @@ fn create_process_child_runs_in_an_exec_worker_and_returns_output() {
     std::fs::remove_file(snapshot_path).unwrap();
 }
 
+/// Run a parent PE that starts `command_line` with CreateProcessW and exits
+/// with the child's exit code, on a disk that holds the Rust fixtures in
+/// `C:\tools` plus `files`. Returns the output and the saved disk.
+fn run_create_process(
+    command_line: &str,
+    files: &[(&str, &[u8])],
+) -> (std::process::Output, WinFs) {
+    let binary = env!("CARGO_BIN_EXE_winrun");
+    let snapshot_path = tmp_path("cmd-parent.winfs");
+    let parent_path = tmp_path("cmd-parent.exe");
+    let mut fs = WinFs::ephemeral_runner();
+    fs.mkdir(r"C:\tools").unwrap();
+    for fixture in ["rust_argv.exe", "rust_hello.exe"] {
+        fs.write_file(
+            &format!(r"C:\tools\{fixture}"),
+            std::fs::read(artifact(&format!("exe/{fixture}"))).unwrap(),
+        )
+        .unwrap();
+    }
+    for (path, contents) in files {
+        fs.mkdir(path.rsplit_once('\\').unwrap().0).unwrap();
+        fs.write_file(path, contents.to_vec()).unwrap();
+    }
+    winrun::snapshot::save_file(&mut fs, snapshot_path.to_str().unwrap()).unwrap();
+    std::fs::write(
+        &parent_path,
+        pe::builder::create_process_command_line(command_line),
+    )
+    .unwrap();
+    let output = Command::new(binary)
+        .arg(format!("--snapshot={}", snapshot_path.display()))
+        .arg("--save")
+        .arg(&parent_path)
+        .output()
+        .expect("run a parent guest that starts cmd.exe");
+    let saved = winrun::snapshot::load_file(snapshot_path.to_str().unwrap()).unwrap();
+    std::fs::remove_file(parent_path).unwrap();
+    std::fs::remove_file(snapshot_path).unwrap();
+    (output, saved)
+}
+
+#[test]
+fn cmd_exe_runs_node_style_command_lines_with_exact_arguments_and_exit_codes() {
+    // Node's child_process uses `%ComSpec% /d /s /c "<command>"`.
+    let (output, _) = run_create_process(
+        r#"C:\Windows\System32\cmd.exe /d /s /c ""C:\tools\rust_argv.exe" "a b" c && exit 7""#,
+        &[],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "stdout: {stdout} stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The child sees the command text cmd ran, verbatim.
+    assert_eq!(stdout, "\"C:\\tools\\rust_argv.exe\" \"a b\" c\n");
+}
+
+#[test]
+fn create_process_runs_batch_files_through_cmd_exe() {
+    let (output, _) = run_create_process(
+        r#""C:\scripts\hi.cmd" first "second arg""#,
+        &[(
+            r"C:\scripts\hi.cmd",
+            b"@echo off\r\necho one=%1 two=%~2\r\nexit /b 5\r\n",
+        )],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"one=first two=second arg\r\n");
+
+    // A bare `cmd` resolves to System32\cmd.exe, as CreateProcess appends .exe.
+    let (output, _) = run_create_process("cmd /c exit 4", &[]);
+    assert_eq!(output.status.code(), Some(4));
+}
+
+#[test]
+fn cmd_exe_redirects_child_output_and_captures_it_with_for_f() {
+    let (output, saved) = run_create_process(
+        r#"cmd.exe /d /s /c "C:\tools\rust_hello.exe > C:\out.txt && C:\scripts\capture.cmd""#,
+        &[(
+            r"C:\scripts\capture.cmd",
+            b"@echo off\r\nfor /f \"delims=\" %%l in ('C:\\tools\\rust_hello.exe') do echo got=%%l\r\n",
+        )],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"got=Hello from Rust\r\n");
+    assert_eq!(saved.read_file(r"C:\out.txt").unwrap(), b"Hello from Rust");
+    // The capture's temporary file is gone.
+    assert!(saved
+        .list_dir(r"C:\Windows\Temp")
+        .unwrap()
+        .iter()
+        .all(|name| !name.starts_with("winrun-cmd-capture")));
+}
+
 #[test]
 fn create_process_child_keeps_its_working_directory_in_winfs() {
     let binary = env!("CARGO_BIN_EXE_winrun");

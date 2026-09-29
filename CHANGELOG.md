@@ -23,6 +23,11 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Seed `C:\Windows\System32\cmd.exe`, a small PE that runs the cmd processor
+  as a real child process, so programs that start `%ComSpec% /d /s /c "..."`
+  (Node's `child_process` with `shell: true`, `npm run`, Python's
+  `shell=True`) run their commands, redirect output into guest files, and
+  capture program output with `for /f`.
 - Give `CreateProcessW` children their caller's command line verbatim from
   `GetCommandLineW` instead of re-quoting parsed arguments, append `.exe` to
   a program name without an extension, and run `.bat` and `.cmd` targets

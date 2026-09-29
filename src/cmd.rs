@@ -67,7 +67,15 @@ pub fn run_command_line<H: CmdHost>(
     environment: Vec<(String, String)>,
     current_directory: String,
 ) -> u32 {
-    let command = match command_after_switches(command_line) {
+    let executable = |host: &mut H, path: &str| {
+        let full = collapse_path(&if path.contains(':') {
+            path.to_string()
+        } else {
+            format!(r"{}\{path}", current_directory.trim_end_matches('\\'))
+        });
+        host.with_fs(|fs| fs.is_file(&full) || fs.is_file(&format!("{full}.exe")))
+    };
+    let command = match command_after_switches(command_line, |path| executable(host, path)) {
         Ok(command) => command,
         Err(message) => {
             host.write(true, message.as_bytes());
@@ -90,11 +98,14 @@ pub fn run_command_line<H: CmdHost>(
     cmd.run_line(&command)
 }
 
-/// The command after `/c` or `/k`, with cmd's quote handling: under `/s`,
-/// or unless the text is exactly one quoted run with whitespace and no
-/// special characters inside, a leading quote and the last quote are
-/// removed.
-fn command_after_switches(command_line: &str) -> Result<String, String> {
+/// The command after `/c` or `/k`, with cmd's quote handling: a leading
+/// quote and the last quote are removed, unless (without `/s`) the text is
+/// exactly one quoted run with whitespace and no special characters inside
+/// that names an existing executable.
+fn command_after_switches(
+    command_line: &str,
+    mut is_executable: impl FnMut(&str) -> bool,
+) -> Result<String, String> {
     let mut rest = skip_program_name(command_line);
     let mut strip = false;
     loop {
@@ -127,7 +138,8 @@ fn command_after_switches(command_line: &str) -> Result<String, String> {
         && command[1..command.trim_end().len() - 1]
             .chars()
             .any(char::is_whitespace)
-        && !command.contains(['&', '<', '>', '(', ')', '@', '^', '|']);
+        && !command.contains(['&', '<', '>', '(', ')', '@', '^', '|'])
+        && is_executable(&command.trim_end()[1..command.trim_end().len() - 1]);
     if keep {
         return Ok(command.to_string());
     }
@@ -145,6 +157,41 @@ fn skip_program_name(command_line: &str) -> &str {
     }
     text.find(char::is_whitespace)
         .map_or("", |end| &text[end..])
+}
+
+/// Where Windows keeps `cmd.exe`, and where `%ComSpec%` points.
+pub fn cmd_exe_path() -> String {
+    format!(r"{}\cmd.exe", crate::system_profile::SYSTEM32)
+}
+
+/// A minimal PE whose entry point runs this processor through the private
+/// `WinrunCmdMain` native export and exits with its result, so cmd.exe runs
+/// as a real child process with its own command line and handles.
+pub fn cmd_exe_image() -> Vec<u8> {
+    use crate::pe::builder::{build, Asm};
+    let mut asm = Asm::new();
+    asm.sub_rsp(0x28);
+    asm.call_import(0);
+    asm.emit(&[0x89, 0xC1]); // mov ecx, eax
+    asm.call_import(1);
+    asm.add_rsp(0x28);
+    asm.ret();
+    build(
+        asm,
+        &[
+            ("KERNEL32.dll", "WinrunCmdMain"),
+            ("KERNEL32.dll", "ExitProcess"),
+        ],
+    )
+}
+
+/// Put `cmd.exe` in System32 unless the disk already has one.
+pub fn seed_cmd_exe(fs: &mut WinFs) {
+    let path = cmd_exe_path();
+    if fs.is_file(&path) || fs.mkdir(crate::system_profile::SYSTEM32).is_err() {
+        return;
+    }
+    let _ = fs.write_file(&path, cmd_exe_image());
 }
 
 // ---- parsing ---------------------------------------------------------------
@@ -2353,7 +2400,9 @@ mod tests {
 
     #[test]
     fn switches_and_quote_rules_select_the_command_text() {
-        let command = |line: &str| command_after_switches(line).unwrap();
+        let command = |line: &str| {
+            command_after_switches(line, |path| path == r"C:\Program Files\x.exe").unwrap()
+        };
         assert_eq!(
             command(r#"C:\Windows\System32\cmd.exe /d /s /c "echo a && echo b""#),
             "echo a && echo b"
@@ -2367,9 +2416,11 @@ mod tests {
             command(r#"cmd /c ""C:\Program Files\x.exe" arg""#),
             r#""C:\Program Files\x.exe" arg"#
         );
+        // A quoted command that is not an executable loses its quotes.
+        assert_eq!(command(r#"cmd /c "exit 3""#), "exit 3");
         assert_eq!(command(r#""C:\Windows\System32\cmd.exe" /q/c ver"#), "ver");
-        assert!(command_after_switches("cmd.exe").is_err());
-        assert!(command_after_switches("cmd.exe /d").is_err());
+        assert!(command_after_switches("cmd.exe", |_| false).is_err());
+        assert!(command_after_switches("cmd.exe /d", |_| false).is_err());
     }
 
     #[test]

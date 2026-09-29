@@ -28,6 +28,9 @@ pub(super) use registry::supports_import;
 #[path = "linux_x86_64/advapi_registry.rs"]
 mod advapi_registry;
 use advapi_registry::*;
+#[path = "linux_x86_64/cmd_host.rs"]
+mod cmd_host;
+use cmd_host::*;
 #[path = "linux_x86_64/sockets.rs"]
 mod sockets;
 use sockets::*;

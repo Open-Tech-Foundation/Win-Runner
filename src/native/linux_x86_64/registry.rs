@@ -487,6 +487,8 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "RegQueryValueExW" => Some(native_reg_query_value_ex_w as *const () as usize as u64),
         "RegCloseKey" => Some(native_reg_close_key as *const () as usize as u64),
         "RegGetValueW" => Some(native_reg_get_value_w as *const () as usize as u64),
+        // Private entry point of the seeded cmd.exe.
+        "WinrunCmdMain" => Some(native_winrun_cmd_main as *const () as usize as u64),
         "RegDeleteValueW" => Some(native_reg_delete_value_w as *const () as usize as u64),
         "RegDeleteKeyW" => Some(native_reg_delete_key_w as *const () as usize as u64),
         "RegDeleteTreeW" => Some(native_reg_delete_tree_w as *const () as usize as u64),

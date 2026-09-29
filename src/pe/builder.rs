@@ -697,6 +697,59 @@ pub fn create_process_wait(application: &str, current_directory: Option<&str>) -
     )
 }
 
+/// `CreateProcessW(NULL, command_line, ...)` with inherited handles, wait,
+/// and exit with the child's exit code (99 when it cannot start). This is
+/// how runtimes such as Node start `cmd.exe /d /s /c "..."`.
+pub fn create_process_command_line(command_line: &str) -> Vec<u8> {
+    // imports: 0 CreateProcessW, 1 WaitForSingleObject,
+    //          2 GetExitCodeProcess, 3 ExitProcess
+    let mut a = Asm::new();
+    let d_command_line = a.add_utf16(command_line);
+    let d_process_information = a.add_zeroed(24);
+    let d_exit_code = a.add_zeroed(8);
+    let fail = a.fresh_label();
+    a.sub_rsp(0x58);
+    a.xor_eax();
+    a.mov_rcx_rax();
+    a.lea_reg_rip(2, d_command_line);
+    a.mov_r8d_imm(0);
+    a.mov_r9d_imm(0);
+    for offset in [0x20, 0x28, 0x30, 0x38, 0x40] {
+        a.mov_rspoff_rax(offset);
+    }
+    a.mov_rspoff_imm32(0x20, 1); // bInheritHandles
+    a.lea_reg_rip(0, d_process_information);
+    a.mov_rspoff_rax(0x48);
+    a.call_import(0);
+    a.test_eax_eax();
+    a.jz(fail);
+    a.mov_eax_mem_rip(d_process_information);
+    a.mov_rcx_rax();
+    a.mov_edx_imm(u32::MAX);
+    a.call_import(1);
+    a.mov_eax_mem_rip(d_process_information);
+    a.mov_rcx_rax();
+    a.lea_reg_rip(2, d_exit_code);
+    a.call_import(2);
+    a.mov_eax_mem_rip(d_exit_code);
+    a.emit(&[0x89, 0xC1]); // mov ecx, eax
+    a.call_import(3);
+    a.ret();
+    a.mark(fail);
+    a.mov_ecx_imm(99);
+    a.call_import(3);
+    a.ret();
+    build(
+        a,
+        &[
+            ("KERNEL32.dll", "CreateProcessW"),
+            ("KERNEL32.dll", "WaitForSingleObject"),
+            ("KERNEL32.dll", "GetExitCodeProcess"),
+            ("KERNEL32.dll", "ExitProcess"),
+        ],
+    )
+}
+
 /// write file via CreateFileW + WriteFile + CloseHandle, exit 0/1.
 pub fn write_file(path: &str, content: &[u8]) -> Vec<u8> {
     // imports: 0 CreateFileW, 1 WriteFile, 2 CloseHandle, 3 ExitProcess

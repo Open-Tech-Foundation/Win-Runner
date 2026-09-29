@@ -351,6 +351,7 @@ impl Shell {
     /// subsequent `snapshot save` commands without a path.
     pub fn with_snapshot_path(mut fs: WinFs, snapshot_path: Option<std::path::PathBuf>) -> Self {
         seed_powershell_shell_link(&mut fs);
+        crate::cmd::seed_cmd_exe(&mut fs);
         // npm's standard Windows cache and global-prefix folders; npm
         // expects the cache's temp and log directories to exist.
         for directory in [
