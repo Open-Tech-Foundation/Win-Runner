@@ -941,6 +941,58 @@ mod protection_tests {
     }
 
     #[test]
+    fn find_first_file_reports_directories_sizes_and_names() {
+        let context = super::fs_ctx().unwrap();
+        {
+            let mut ctx = context.lock().unwrap();
+            ctx.fs.mkdir(r"C:\find_data_cases\10.0.12").unwrap();
+            ctx.fs
+                .write_file(r"C:\find_data_cases\notes.txt", b"hello".to_vec())
+                .unwrap();
+        }
+        let pattern: Vec<u16> = r"C:\find_data_cases\*".encode_utf16().chain([0]).collect();
+        let mut find_data = [0u8; 592];
+        let find = super::native_find_first_file_ex_w(
+            pattern.as_ptr(),
+            1, // FindExInfoBasic, as the .NET host uses
+            find_data.as_mut_ptr(),
+            0,
+            0,
+            0,
+        );
+        assert_ne!(find, u64::MAX);
+        let mut entries = Vec::new();
+        loop {
+            let name: Vec<u16> = find_data[44..564]
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .take_while(|unit| *unit != 0)
+                .collect();
+            let attributes = u32::from_le_bytes(find_data[..4].try_into().unwrap());
+            let size = u32::from_le_bytes(find_data[32..36].try_into().unwrap());
+            entries.push((String::from_utf16(&name).unwrap(), attributes, size));
+            if super::native_find_next_file_w(find, find_data.as_mut_ptr()) == 0 {
+                break;
+            }
+        }
+        assert_eq!(super::native_find_close(find), 1);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, "10.0.12");
+        assert_ne!(
+            entries[0].1 & 0x10,
+            0,
+            "directories carry FILE_ATTRIBUTE_DIRECTORY"
+        );
+        assert_eq!(entries[1], ("notes.txt".to_string(), 0x80, 5));
+        context
+            .lock()
+            .unwrap()
+            .fs
+            .remove(r"C:\find_data_cases", true)
+            .unwrap();
+    }
+
+    #[test]
     fn win32_file_copy_move_enumerate_and_delete_roundtrip() {
         let directory = r"C:\winfs_compat_file_api_cases";
         let source = r"C:\winfs_compat_file_api_cases\source.txt";

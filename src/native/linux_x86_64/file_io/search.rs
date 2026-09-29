@@ -68,13 +68,48 @@ fn native_name_matches_pattern(pattern: &str, name: &str) -> bool {
     }
     previous[name.len()]
 }
-fn native_write_find_data(output: *mut u8, name: &str) -> bool {
-    let name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+/// Fill a `WIN32_FIND_DATAW` for the entry at `path`: attributes
+/// (directories always carry `FILE_ATTRIBUTE_DIRECTORY`), the three
+/// timestamps, the size, and the file name.
+fn native_write_find_data(output: *mut u8, fs: &WinFs, path: &str) -> bool {
+    let leaf = path.rsplit('\\').next().unwrap_or(path);
+    let name: Vec<u16> = leaf.encode_utf16().chain(std::iter::once(0)).collect();
     if output.is_null() || name.len() > 260 {
         return false;
     }
+    let metadata = fs.file_metadata(path);
+    let directory = fs.is_dir(path);
+    let mut attributes = metadata.attributes;
+    if directory {
+        attributes = (attributes & !0x80) | 0x10;
+    } else if attributes == 0 {
+        attributes = 0x80; // FILE_ATTRIBUTE_NORMAL
+    }
+    let size = if directory {
+        0
+    } else {
+        fs.file_len(path).unwrap_or(0)
+    };
     unsafe {
         std::ptr::write_bytes(output, 0, 592);
+        output.cast::<u32>().write_unaligned(attributes);
+        output
+            .add(4)
+            .cast::<u64>()
+            .write_unaligned(metadata.creation_time);
+        output
+            .add(12)
+            .cast::<u64>()
+            .write_unaligned(metadata.access_time);
+        output
+            .add(20)
+            .cast::<u64>()
+            .write_unaligned(metadata.write_time);
+        output
+            .add(28)
+            .cast::<u32>()
+            .write_unaligned((size >> 32) as u32);
+        output.add(32).cast::<u32>().write_unaligned(size as u32);
         output
             .add(44)
             .cast::<u16>()
@@ -122,11 +157,16 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_find_first_file_ex_
     };
     names.retain(|name| native_name_matches_pattern(&name_pattern, name));
     names.sort_by_key(|name| name.to_lowercase());
+    // Keep full paths so each result can report its attributes and size.
+    let names: Vec<String> = names
+        .into_iter()
+        .map(|name| format!(r"{}\{name}", directory.trim_end_matches('\\')))
+        .collect();
     let Some(first) = names.first() else {
         native_set_last_error(2);
         return u64::MAX;
     };
-    if !native_write_find_data(output, first) {
+    if !native_write_find_data(output, &ctx.fs, first) {
         native_set_last_error(87);
         return u64::MAX;
     }
@@ -158,11 +198,11 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_find_next_file_w(
         None => return 0,
     };
     find.index += 1;
-    let Some(name) = find.names.get(find.index) else {
+    let Some(entry) = find.names.get(find.index).cloned() else {
         native_set_last_error(18);
         return 0;
     };
-    native_write_find_data(output, name) as i32
+    native_write_find_data(output, &ctx.fs, &entry) as i32
 }
 pub(in crate::native::linux_x86_64) extern "win64" fn native_find_close(handle: u64) -> i32 {
     fs_ctx()

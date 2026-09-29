@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Report each `FindFirstFileExW`/`FindNextFileW` result's attributes (with
+  `FILE_ATTRIBUTE_DIRECTORY` for directories), timestamps, and size instead of
+  only its name, so programs that walk directories, such as the .NET host
+  looking for runtime versions, can tell folders from files.
 - Give `CreateProcessW` children the handles that `DuplicateHandle` aliases
   refer to. Node (libuv) passes duplicated standard handles for inherited
   stdio, so children such as `npm run` scripts previously wrote to nothing.
