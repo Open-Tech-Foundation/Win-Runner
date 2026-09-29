@@ -8,8 +8,10 @@
 //! and `%~dp0`-style modifiers, expanded a whole line at a time as cmd does;
 //! batch files with labels, `goto`, `call`, `exit /b`, `setlocal`, `shift`;
 //! `if` and `for` (including `for /f` over command output); and the common
-//! internal commands. Not supported: an interactive prompt, pipes,
-//! `set /a`/`set /p`, and delayed `!var!` expansion.
+//! internal commands, `set /a` arithmetic, `set /p`, pipes (run one side
+//! after the other through a temporary file), and delayed `!var!`
+//! expansion under `setlocal enabledelayedexpansion` or `cmd /v:on`. Not
+//! supported: an interactive prompt.
 //!
 //! The processor is platform-neutral: a [`CmdHost`] supplies the guest
 //! filesystem, runs programs, and receives cmd's own output.
@@ -57,6 +59,11 @@ pub trait CmdHost {
     fn run(&mut self, request: &RunRequest) -> Result<(u32, Vec<u8>), String>;
     /// cmd's own output: `false` for standard output, `true` for error.
     fn write(&mut self, stderr: bool, bytes: &[u8]);
+    /// One line from cmd's standard input for `set /p`, without its line
+    /// ending; `None` at end of input.
+    fn read_line(&mut self) -> Option<String> {
+        None
+    }
 }
 
 /// Run `cmd.exe` with its full command line (program name first), starting
@@ -75,19 +82,21 @@ pub fn run_command_line<H: CmdHost>(
         });
         host.with_fs(|fs| fs.is_file(&full) || fs.is_file(&format!("{full}.exe")))
     };
-    let command = match command_after_switches(command_line, |path| executable(host, path)) {
-        Ok(command) => command,
-        Err(message) => {
-            host.write(true, message.as_bytes());
-            return 1;
-        }
-    };
+    let (command, delayed) =
+        match command_after_switches(command_line, |path| executable(host, path)) {
+            Ok(command) => command,
+            Err(message) => {
+                host.write(true, message.as_bytes());
+                return 1;
+            }
+        };
     let mut cmd = Cmd {
         host,
         environment,
         cwd: current_directory,
         errorlevel: 0,
         echo: true,
+        delayed,
         locals: Vec::new(),
         directories: Vec::new(),
         frames: Vec::new(),
@@ -98,16 +107,18 @@ pub fn run_command_line<H: CmdHost>(
     cmd.run_line(&command)
 }
 
-/// The command after `/c` or `/k`, with cmd's quote handling: a leading
-/// quote and the last quote are removed, unless (without `/s`) the text has
-/// exactly two quotes enclosing an existing executable's name that contains
-/// whitespace and no special characters.
+/// The command after `/c` or `/k`, and whether `/v:on` enabled delayed
+/// expansion. Quotes follow cmd's rules: a leading quote and the last quote
+/// are removed, unless (without `/s`) the text has exactly two quotes
+/// enclosing an existing executable's name that contains whitespace and no
+/// special characters.
 fn command_after_switches(
     command_line: &str,
-    mut is_executable: impl FnMut(&str) -> bool,
-) -> Result<String, String> {
+    is_executable: impl FnMut(&str) -> bool,
+) -> Result<(String, bool), String> {
     let mut rest = skip_program_name(command_line);
     let mut strip = false;
+    let mut delayed = false;
     loop {
         rest = rest.trim_start();
         if !rest.starts_with('/') {
@@ -124,12 +135,22 @@ fn command_after_switches(
         match switch.as_str() {
             "/c" | "/k" => break,
             "/s" => strip = true,
+            "/v" | "/v:on" => delayed = true,
+            "/v:off" => delayed = false,
             _ => {}
         }
     }
     let command = rest.strip_prefix(' ').unwrap_or(rest).trim_start();
+    Ok((strip_command_quotes(command, strip, is_executable), delayed))
+}
+
+fn strip_command_quotes(
+    command: &str,
+    strip: bool,
+    mut is_executable: impl FnMut(&str) -> bool,
+) -> String {
     if !command.starts_with('"') {
-        return Ok(command.to_string());
+        return command.to_string();
     }
     // The run between the first two quotes; what follows the second quote
     // (arguments) does not matter.
@@ -142,13 +163,13 @@ fn command_after_switches(
                 && is_executable(quoted)
         });
     if keep {
-        return Ok(command.to_string());
+        return command.to_string();
     }
     let without_first = &command[1..];
-    Ok(match without_first.rfind('"') {
+    match without_first.rfind('"') {
         Some(last) => format!("{}{}", &without_first[..last], &without_first[last + 1..]),
         None => without_first.to_string(),
-    })
+    }
 }
 
 fn skip_program_name(command_line: &str) -> &str {
@@ -944,13 +965,19 @@ struct Frame {
     stop_after_line: bool,
 }
 
+/// What `setlocal` saves: environment, directory, delayed expansion.
+type LocalScope = (Vec<(String, String)>, String, bool);
+
 struct Cmd<'h, H: CmdHost> {
     host: &'h mut H,
     environment: Vec<(String, String)>,
     cwd: String,
     errorlevel: u32,
     echo: bool,
-    locals: Vec<(Vec<(String, String)>, String)>,
+    /// `!var!` expansion at execution time.
+    delayed: bool,
+    /// `setlocal` saves the environment, directory, and delayed expansion.
+    locals: Vec<LocalScope>,
     directories: Vec<String>,
     frames: Vec<Frame>,
     capture: Vec<u8>,
@@ -1326,9 +1353,7 @@ impl<H: CmdHost> Cmd<'_, H> {
                 }
                 self.exec(right, io)
             }
-            Node::Pipe(_, _) => {
-                self.fail(io, "winrun's cmd.exe does not support pipes (|) yet.", 255)
-            }
+            Node::Pipe(left, right) => self.run_pipe(left, right, io),
             Node::Block { body, redirects } => match self.apply_redirects(redirects, io) {
                 Ok(inner) => self.exec(body, &inner),
                 Err(message) => self.fail(io, &message, 1),
@@ -1353,15 +1378,31 @@ impl<H: CmdHost> Cmd<'_, H> {
                 set,
                 body,
             } => self.run_for(*variable, kind, set, body, io),
-            Node::Command { text, redirects } => match self.apply_redirects(redirects, io) {
-                Ok(inner) => self.run_command(text, &inner, false),
-                Err(message) => self.fail(io, &message, 1),
-            },
+            Node::Command { text, redirects } => {
+                let text = self.delayed_expand(text);
+                let redirects: Vec<Redirect> = redirects
+                    .iter()
+                    .map(|redirect| self.delayed_redirect(redirect))
+                    .collect();
+                match self.apply_redirects(&redirects, io) {
+                    Ok(inner) => self.run_command(&text, &inner, false),
+                    Err(message) => self.fail(io, &message, 1),
+                }
+            }
         }
     }
 
     fn condition(&mut self, condition: &Condition, case_insensitive: bool) -> bool {
-        match condition {
+        let condition = match condition {
+            Condition::Exist(path) => Condition::Exist(self.delayed_expand(path)),
+            Condition::Compare { left, op, right } => Condition::Compare {
+                left: self.delayed_expand(left),
+                op: *op,
+                right: self.delayed_expand(right),
+            },
+            other => other.clone(),
+        };
+        match &condition {
             Condition::Exist(path) => {
                 let full = self.full_path(path);
                 self.host.with_fs(|fs| fs.exists(&full))
@@ -1377,7 +1418,7 @@ impl<H: CmdHost> Cmd<'_, H> {
                     _ if case_insensitive => left.to_lowercase().cmp(&right.to_lowercase()),
                     _ => left.cmp(right),
                 };
-                match op {
+                match *op {
                     CompareOp::Equal | CompareOp::Equ => ordering.is_eq(),
                     CompareOp::Neq => ordering.is_ne(),
                     CompareOp::Lss => ordering.is_lt(),
@@ -1418,15 +1459,23 @@ impl<H: CmdHost> Cmd<'_, H> {
             "call" => self.builtin_call(rest, io),
             "setlocal" => {
                 self.locals
-                    .push((self.environment.clone(), self.cwd.clone()));
+                    .push((self.environment.clone(), self.cwd.clone(), self.delayed));
+                for option in rest.split_whitespace() {
+                    match option.to_ascii_lowercase().as_str() {
+                        "enabledelayedexpansion" => self.delayed = true,
+                        "disabledelayedexpansion" => self.delayed = false,
+                        _ => {}
+                    }
+                }
                 (0, Flow::Next)
             }
             "endlocal" => {
                 let floor = self.frames.last().map_or(0, |frame| frame.locals);
                 if self.locals.len() > floor {
-                    let (environment, cwd) = self.locals.pop().unwrap();
+                    let (environment, cwd, delayed) = self.locals.pop().unwrap();
                     self.environment = environment;
                     self.cwd = cwd;
+                    self.delayed = delayed;
                 }
                 (0, Flow::Next)
             }
@@ -1557,9 +1606,10 @@ impl<H: CmdHost> Cmd<'_, H> {
     fn pop_frame(&mut self) {
         if let Some(frame) = self.frames.pop() {
             while self.locals.len() > frame.locals {
-                let (environment, cwd) = self.locals.pop().unwrap();
+                let (environment, cwd, delayed) = self.locals.pop().unwrap();
                 self.environment = environment;
                 self.cwd = cwd;
+                self.delayed = delayed;
             }
         }
     }
@@ -1854,15 +1904,209 @@ impl<H: CmdHost> Cmd<'_, H> {
         (0, Flow::Next)
     }
 
+    /// `set /a`: evaluate comma-separated integer expressions. Outside a
+    /// batch file the last result is printed, without a newline, as cmd does.
+    fn set_arithmetic(&mut self, expression: &str, io: &Io) -> (u32, Flow) {
+        let expression = expression.replace('"', "");
+        let parsed = match ArithmeticParser::new(&expression).parse() {
+            Ok(parsed) => parsed,
+            Err(message) => return self.fail(io, &message, 1_073_750_988),
+        };
+        match self.evaluate(&parsed) {
+            Ok(value) => {
+                if self.frames.is_empty() {
+                    self.emit(&io.stdout.clone(), value.to_string().as_bytes());
+                }
+                (0, Flow::Next)
+            }
+            Err(message) => self.fail(io, &message, 1_073_750_993),
+        }
+    }
+
+    fn evaluate(&mut self, expression: &Arithmetic) -> Result<i32, String> {
+        Ok(match expression {
+            Arithmetic::Number(value) => *value,
+            Arithmetic::Variable(name) => self
+                .environment
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .and_then(|(_, value)| parse_arithmetic_number(value.trim()))
+                .unwrap_or(0),
+            Arithmetic::Unary(operator, operand) => {
+                let value = self.evaluate(operand)?;
+                match operator {
+                    '-' => value.wrapping_neg(),
+                    '~' => !value,
+                    _ => i32::from(value == 0),
+                }
+            }
+            Arithmetic::Binary(operator, left, right) => {
+                let left = self.evaluate(left)?;
+                let right = self.evaluate(right)?;
+                apply_arithmetic(operator, left, right)?
+            }
+            Arithmetic::Assign(name, operator, value) => {
+                let value = self.evaluate(value)?;
+                let value = match operator {
+                    Some(operator) => {
+                        let current = self.evaluate(&Arithmetic::Variable(name.clone()))?;
+                        apply_arithmetic(operator, current, value)?
+                    }
+                    None => value,
+                };
+                self.set_variable(name, &value.to_string());
+                value
+            }
+            Arithmetic::Sequence(first, second) => {
+                self.evaluate(first)?;
+                self.evaluate(second)?
+            }
+        })
+    }
+
+    /// `set /p NAME=prompt`: print the prompt, then read one line from
+    /// standard input (a redirected or piped file, or the console). Empty
+    /// input leaves the variable unchanged and sets errorlevel 1.
+    fn set_prompt(&mut self, rest: &str, io: &Io) -> (u32, Flow) {
+        let text = rest.trim_start();
+        let text = text
+            .strip_prefix('"')
+            .and_then(|quoted| quoted.rfind('"').map(|end| &quoted[..end]))
+            .unwrap_or(text);
+        let Some((name, prompt)) = text.split_once('=') else {
+            return self.fail(io, SYNTAX_ERROR, 1);
+        };
+        if name.is_empty() {
+            return self.fail(io, SYNTAX_ERROR, 1);
+        }
+        self.emit(&io.stdout.clone(), prompt.as_bytes());
+        let line = match &io.stdin {
+            Some(path) => {
+                let path = path.clone();
+                self.host
+                    .with_fs(|fs| fs.read_file(&path))
+                    .ok()
+                    .and_then(|bytes| {
+                        String::from_utf8_lossy(&bytes)
+                            .split('\n')
+                            .next()
+                            .map(|line| line.trim_end_matches('\r').to_string())
+                    })
+            }
+            None => self.host.read_line(),
+        };
+        match line.filter(|line| !line.is_empty()) {
+            Some(line) => {
+                self.set_variable(name, &line);
+                (0, Flow::Next)
+            }
+            None => {
+                self.errorlevel = 1;
+                (1, Flow::Next)
+            }
+        }
+    }
+
+    /// Run `left | right`: the left side's output, collected first, is the
+    /// right side's standard input.
+    fn run_pipe(&mut self, left: &Node, right: &Node, io: &Io) -> (u32, Flow) {
+        let saved = std::mem::take(&mut self.capture);
+        let producer = Io {
+            stdin: io.stdin.clone(),
+            stdout: Output::Capture,
+            stderr: io.stderr.clone(),
+        };
+        let (_, flow) = self.exec(left, &producer);
+        let output = std::mem::replace(&mut self.capture, saved);
+        if flow == Flow::Exit {
+            return (self.errorlevel, flow);
+        }
+        let directory = self
+            .variable("TEMP")
+            .unwrap_or_else(|| crate::system_profile::WINDOWS_TEMP.to_string());
+        self.random = self.random.wrapping_mul(1_103_515_245).wrapping_add(12345);
+        let path = format!(
+            r"{}\winrun-pipe-{:08x}.tmp",
+            directory.trim_end_matches('\\'),
+            self.random
+        );
+        let written = self.host.with_fs(|fs| {
+            fs.mkdir(&directory)?;
+            fs.write_file(&path, output)
+        });
+        if let Err(message) = written {
+            return self.fail(io, &format!("The pipe cannot be created: {message}"), 1);
+        }
+        let consumer = Io {
+            stdin: Some(path.clone()),
+            stdout: io.stdout.clone(),
+            stderr: io.stderr.clone(),
+        };
+        let result = self.exec(right, &consumer);
+        let _ = self.host.with_fs(|fs| fs.delete_file(&path));
+        result
+    }
+
+    // -- delayed expansion -------------------------------------------------------
+
+    fn delayed_expand(&mut self, text: &str) -> String {
+        if !self.delayed || !text.contains('!') {
+            return text.to_string();
+        }
+        let batch = !self.frames.is_empty();
+        let mut output = String::new();
+        let mut rest = text;
+        while let Some(start) = rest.find('!') {
+            output.push_str(&rest[..start]);
+            let after = &rest[start + 1..];
+            let Some(end) = after.find('!') else {
+                // A lone `!` disappears, as in cmd.
+                rest = after;
+                continue;
+            };
+            let reference = &after[..end];
+            let (name, spec) = match reference.split_once(':') {
+                Some((name, spec)) => (name, Some(spec)),
+                None => (reference, None),
+            };
+            match self.variable(name).filter(|_| !name.is_empty()) {
+                Some(value) => output.push_str(&apply_variable_spec(&value, spec)),
+                None if batch => {}
+                None => {
+                    output.push('!');
+                    output.push_str(reference);
+                    output.push('!');
+                }
+            }
+            rest = &after[end + 1..];
+        }
+        output.push_str(rest);
+        output
+    }
+
+    fn delayed_redirect(&mut self, redirect: &Redirect) -> Redirect {
+        let kind = match &redirect.kind {
+            RedirectKind::Write { path, append } => RedirectKind::Write {
+                path: self.delayed_expand(path),
+                append: *append,
+            },
+            RedirectKind::Read(path) => RedirectKind::Read(self.delayed_expand(path)),
+            other => other.clone(),
+        };
+        Redirect {
+            fd: redirect.fd,
+            kind,
+        }
+    }
+
     fn builtin_set(&mut self, rest: &str, io: &Io) -> (u32, Flow) {
         let argument = rest.trim_start();
         let lower = argument.to_ascii_lowercase();
-        if lower.starts_with("/a") || lower.starts_with("/p") {
-            return self.fail(
-                io,
-                "winrun's cmd.exe does not support set /a or set /p yet.",
-                1,
-            );
+        if lower.starts_with("/a") {
+            return self.set_arithmetic(&argument[2..], io);
+        }
+        if lower.starts_with("/p") {
+            return self.set_prompt(&argument[2..], io);
         }
         let assignment = match argument.strip_prefix('"') {
             Some(quoted) => match quoted.rfind('"') {
@@ -2060,6 +2304,233 @@ impl<H: CmdHost> Cmd<'_, H> {
             }
             Err(()) => self.fail(io, "The system cannot find the file specified.", 1),
         }
+    }
+}
+
+/// A `set /a` expression.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Arithmetic {
+    Number(i32),
+    Variable(String),
+    Unary(char, Box<Arithmetic>),
+    Binary(&'static str, Box<Arithmetic>, Box<Arithmetic>),
+    /// `name = value` or a compound `name op= value`.
+    Assign(String, Option<&'static str>, Box<Arithmetic>),
+    Sequence(Box<Arithmetic>, Box<Arithmetic>),
+}
+
+/// Numbers as `set /a` reads them: `0x` hex, leading-zero octal, decimal,
+/// wrapping to 32 bits.
+fn parse_arithmetic_number(text: &str) -> Option<i32> {
+    let (negative, digits) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    let value = if let Some(hex) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        i64::from_str_radix(hex, 16).ok()?
+    } else if digits.len() > 1 && digits.starts_with('0') {
+        i64::from_str_radix(&digits[1..], 8).ok()?
+    } else {
+        digits.parse::<i64>().ok()?
+    };
+    let value = value as i32;
+    Some(if negative {
+        value.wrapping_neg()
+    } else {
+        value
+    })
+}
+
+fn apply_arithmetic(operator: &str, left: i32, right: i32) -> Result<i32, String> {
+    Ok(match operator {
+        "+" => left.wrapping_add(right),
+        "-" => left.wrapping_sub(right),
+        "*" => left.wrapping_mul(right),
+        "/" | "%" if right == 0 => return Err("Divide by zero error.".to_string()),
+        "/" => left.wrapping_div(right),
+        "%" => left.wrapping_rem(right),
+        "<<" => left.wrapping_shl(right as u32),
+        ">>" => left.wrapping_shr(right as u32),
+        "&" => left & right,
+        "^" => left ^ right,
+        _ => left | right,
+    })
+}
+
+/// Precedence climbing over cmd's operators, lowest first: `,`, the
+/// assignments, `|`, `^`, `&`, shifts, `+ -`, `* / %`, then unary `! ~ -`.
+struct ArithmeticParser {
+    chars: Vec<char>,
+    pos: usize,
+}
+
+impl ArithmeticParser {
+    fn new(text: &str) -> Self {
+        ArithmeticParser {
+            chars: text.chars().collect(),
+            pos: 0,
+        }
+    }
+
+    fn parse(mut self) -> Result<Arithmetic, String> {
+        let expression = self.sequence()?;
+        self.skip_ws();
+        if self.pos < self.chars.len() {
+            return Err("Missing operator.".to_string());
+        }
+        Ok(expression)
+    }
+
+    fn skip_ws(&mut self) {
+        while self.chars.get(self.pos).is_some_and(|c| c.is_whitespace()) {
+            self.pos += 1;
+        }
+    }
+
+    fn eat(&mut self, token: &str) -> bool {
+        self.skip_ws();
+        let matches = token
+            .chars()
+            .enumerate()
+            .all(|(index, expected)| self.chars.get(self.pos + index) == Some(&expected));
+        if matches {
+            self.pos += token.chars().count();
+        }
+        matches
+    }
+
+    /// An operator that is not the start of a longer one (`<` of `<<=`).
+    fn eat_operator(&mut self, token: &str, not_followed_by: &[char]) -> bool {
+        let start = self.pos;
+        if self.eat(token) {
+            if self
+                .chars
+                .get(self.pos)
+                .is_some_and(|next| not_followed_by.contains(next))
+            {
+                self.pos = start;
+                return false;
+            }
+            return true;
+        }
+        false
+    }
+
+    fn sequence(&mut self) -> Result<Arithmetic, String> {
+        let mut left = self.assignment()?;
+        while self.eat(",") {
+            let right = self.assignment()?;
+            left = Arithmetic::Sequence(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn assignment(&mut self) -> Result<Arithmetic, String> {
+        self.skip_ws();
+        let start = self.pos;
+        let name: String = self.chars[self.pos..]
+            .iter()
+            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '$' | '#' | '@'))
+            .collect();
+        if !name.is_empty() && !name.starts_with(|c: char| c.is_ascii_digit()) {
+            self.pos += name.chars().count();
+            const COMPOUND: [&str; 10] =
+                ["<<=", ">>=", "+=", "-=", "*=", "/=", "%=", "&=", "^=", "|="];
+            for operator in COMPOUND {
+                if self.eat(operator) {
+                    let value = self.assignment()?;
+                    let binary = &operator[..operator.len() - 1];
+                    let binary: &'static str = match binary {
+                        "<<" => "<<",
+                        ">>" => ">>",
+                        "+" => "+",
+                        "-" => "-",
+                        "*" => "*",
+                        "/" => "/",
+                        "%" => "%",
+                        "&" => "&",
+                        "^" => "^",
+                        _ => "|",
+                    };
+                    return Ok(Arithmetic::Assign(name, Some(binary), Box::new(value)));
+                }
+            }
+            if self.eat_operator("=", &['=']) {
+                let value = self.assignment()?;
+                return Ok(Arithmetic::Assign(name, None, Box::new(value)));
+            }
+            self.pos = start;
+        }
+        self.binary(0)
+    }
+
+    fn binary(&mut self, level: usize) -> Result<Arithmetic, String> {
+        const LEVELS: [&[&str]; 6] = [
+            &["|"],
+            &["^"],
+            &["&"],
+            &["<<", ">>"],
+            &["+", "-"],
+            &["*", "/", "%"],
+        ];
+        if level == LEVELS.len() {
+            return self.unary();
+        }
+        let mut left = self.binary(level + 1)?;
+        'operators: loop {
+            for operator in LEVELS[level] {
+                // `a << = b` is not an operator here; `a <<= b` is an
+                // assignment, handled above.
+                if self.eat_operator(operator, &['=']) {
+                    let right = self.binary(level + 1)?;
+                    left = Arithmetic::Binary(operator, Box::new(left), Box::new(right));
+                    continue 'operators;
+                }
+            }
+            return Ok(left);
+        }
+    }
+
+    fn unary(&mut self) -> Result<Arithmetic, String> {
+        for operator in ['!', '~', '-', '+'] {
+            if self.eat(&operator.to_string()) {
+                let operand = self.unary()?;
+                return Ok(if operator == '+' {
+                    operand
+                } else {
+                    Arithmetic::Unary(operator, Box::new(operand))
+                });
+            }
+        }
+        self.primary()
+    }
+
+    fn primary(&mut self) -> Result<Arithmetic, String> {
+        self.skip_ws();
+        if self.eat("(") {
+            let inner = self.sequence()?;
+            if !self.eat(")") {
+                return Err("Unbalanced parenthesis.".to_string());
+            }
+            return Ok(inner);
+        }
+        let word: String = self.chars[self.pos..]
+            .iter()
+            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '$' | '#' | '@'))
+            .collect();
+        if word.is_empty() {
+            return Err("Missing operand.".to_string());
+        }
+        self.pos += word.chars().count();
+        if word.starts_with(|c: char| c.is_ascii_digit()) {
+            return parse_arithmetic_number(&word)
+                .map(Arithmetic::Number)
+                .ok_or_else(|| "Invalid number.  Numeric constants are either decimal (17),\r\nhexadecimal (0x11), or octal (021).".to_string());
+        }
+        Ok(Arithmetic::Variable(word))
     }
 }
 
@@ -2468,7 +2939,9 @@ mod tests {
     #[test]
     fn switches_and_quote_rules_select_the_command_text() {
         let command = |line: &str| {
-            command_after_switches(line, |path| path == r"C:\Program Files\x.exe").unwrap()
+            command_after_switches(line, |path| path == r"C:\Program Files\x.exe")
+                .unwrap()
+                .0
         };
         assert_eq!(
             command(r#"C:\Windows\System32\cmd.exe /d /s /c "echo a && echo b""#),
@@ -2866,7 +3339,8 @@ for /f \"delims=\" %%l in (\"one line\") do echo whole=%%l\r
         host.cmd(r#""set "GREETING=hello world" & set GREET""#);
         assert_eq!(host.out(), "GREETING=hello world\r\n");
         assert_eq!(host.cmd(r"set NOPE_PREFIX"), 1);
-        assert_eq!(host.cmd(r#""set /a X=1+1""#), 1);
+        host.cmd(r#""set /a X=1+1 >nul & set X""#);
+        assert_eq!(host.out(), "X=2\r\n");
     }
 
     #[test]
@@ -2890,16 +3364,84 @@ for /f \"delims=\" %%l in (\"one line\") do echo whole=%%l\r
             r#"C:\Windows\System32\cmd.exe /d /s /c ""C:\Program Files\nodejs\npm.cmd" install "a b"""#
         );
         assert_eq!(
-            command_after_switches(&line, |_| false).unwrap(),
+            command_after_switches(&line, |_| false).unwrap().0,
             r#""C:\Program Files\nodejs\npm.cmd" install "a b""#
         );
     }
 
     #[test]
-    fn pipes_are_reported_as_unsupported() {
+    fn pipes_feed_the_left_output_to_the_right_input() {
         let mut host = FakeHost::new();
-        assert_eq!(host.cmd(r#""ok | ok""#), 255);
-        assert!(host.err().contains("does not support pipes"));
-        assert!(host.runs.is_empty());
+        host.program(r"C:\tools\produce.exe", 0, b"piped line\r\nsecond\r\n");
+        assert_eq!(host.cmd(r#""produce | ok""#), 0);
+        let consumer = host.runs.last().unwrap();
+        let input = consumer.stdin.clone().expect("consumer reads the pipe");
+        assert_eq!(host.runs[0].stdout, Output::Capture);
+        // The temporary pipe file is gone afterwards.
+        assert!(!host.fs.exists(&input));
+        host.cmd(r#""echo hello| set /p GOT=& echo got=!GOT!""#);
+        assert_eq!(
+            host.out(),
+            "got=!GOT!\r\n",
+            "delayed expansion is off by default"
+        );
+    }
+
+    #[test]
+    fn set_a_evaluates_integer_expressions_with_cmd_precedence() {
+        let mut host = FakeHost::new();
+        host.cmd(r#""set /a 2+3*4""#);
+        assert_eq!(host.out(), "14");
+        host.cmd(r#""set /a "x=7, y=x<<2, z=(x+y)%5, w=0x10|010, x*=2" & echo.& set x & set y & set z & set w""#);
+        assert_eq!(host.out(), "14\r\nx=14\r\ny=28\r\nz=0\r\nw=24\r\n");
+        host.cmd(r#""set /a -5/2& echo.& set /a !0& echo.& set /a ~0""#);
+        assert_eq!(host.out(), "-2\r\n1\r\n-1");
+        assert_eq!(host.cmd(r#""set /a 1/0""#), 1_073_750_993);
+        assert!(host.err().contains("Divide by zero"));
+        assert_eq!(host.cmd(r#""set /a 1+""#), 1_073_750_988);
+    }
+
+    #[test]
+    fn delayed_expansion_reads_variables_when_each_command_runs() {
+        let mut host = FakeHost::new();
+        host.file(
+            r"C:\scripts\delay.cmd",
+            "@echo off\r
+setlocal enabledelayedexpansion\r
+set COUNT=0\r
+for /l %%i in (1,1,3) do (\r
+  set /a COUNT+=%%i\r
+  echo now=!COUNT! then=%COUNT%\r
+)\r
+set NAME=abc\r
+if \"!NAME!\"==\"abc\" echo matched !NAME:b=X!\r
+endlocal\r
+echo after=!COUNT!\r
+",
+        );
+        host.cmd(r"C:\scripts\delay.cmd");
+        assert_eq!(
+            host.out(),
+            // After endlocal, delayed expansion is off again: `!COUNT!` is text.
+            "now=1 then=0\r\nnow=3 then=0\r\nnow=6 then=0\r\nmatched aXc\r\nafter=!COUNT!\r\n"
+        );
+        // `cmd /v:on` enables it for the command line.
+        run_command_line(
+            &mut host,
+            r#"cmd /v:on /c "set A=1& echo !A!""#,
+            Vec::new(),
+            r"C:\Users\runner".to_string(),
+        );
+        assert!(host.out().ends_with("1\r\n"), "{}", host.out());
+    }
+
+    #[test]
+    fn set_p_reads_a_line_from_redirected_input() {
+        let mut host = FakeHost::new();
+        host.file(r"C:\data\answer.txt", "yes please\r\nignored\r\n");
+        host.cmd(r#""set /p ANSWER=Continue? < C:\data\answer.txt & set ANSWER""#);
+        // The space before `<` is part of the prompt, as in cmd.
+        assert_eq!(host.out(), "Continue?  ANSWER=yes please\r\n");
+        assert_eq!(host.cmd(r#""set /p NOTHING=?""#), 1, "no console input");
     }
 }

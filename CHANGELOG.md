@@ -28,6 +28,10 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Add `set /a` integer arithmetic (cmd's operators, precedence, compound
+  assignments, hex and octal constants), `set /p` from redirected or piped
+  input, pipes run through a temporary file, and delayed `!var!` expansion
+  under `setlocal enabledelayedexpansion` or `cmd /v:on` to the cmd processor.
 - Look up shell commands through `PATH` with `PATHEXT` extensions in order,
   and run `.cmd` and `.bat` files with the cmd processor inside the shell, so
   package launchers such as npm's `tsc.cmd` run when typed by name. As with a
