@@ -25,6 +25,11 @@ All notable changes to this project will be documented in this file.
 - Build each session's environment from the registry like a Windows logon:
   profile variables, then the machine `Environment` key, then the user's, with
   `%VAR%` expansion and the user `Path` appended to the machine `Path`.
+- Implement `RegOpenKeyExW/A`, `RegCreateKeyExW`, `RegSetValueExW`,
+  `RegQueryValueExW`, `RegGetValueW`, `RegDeleteValueW`, `RegDeleteKeyW`,
+  `RegDeleteTreeW`, `RegEnumKeyExW`, `RegEnumValueW`, `RegQueryInfoKeyW`, and
+  `RegCloseKey` over the guest registry, including sign-extended predefined
+  keys; opens previously always failed and writes were discarded.
 - Lay out the guest disk and environment like a stock Windows installation
   from one `system_profile` definition: user `runner`, computer `WINRUNNER`,
   profile `C:\Users\runner` (the shell's starting directory, replacing

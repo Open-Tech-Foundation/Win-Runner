@@ -25,6 +25,9 @@ use process::*;
 mod registry;
 use registry::baseline_trampoline;
 pub(super) use registry::supports_import;
+#[path = "linux_x86_64/advapi_registry.rs"]
+mod advapi_registry;
+use advapi_registry::*;
 #[path = "linux_x86_64/sockets.rs"]
 mod sockets;
 use sockets::*;
