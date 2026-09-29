@@ -11,6 +11,13 @@ pub const USER_NAME: &str = "runner";
 pub const COMPUTER_NAME: &str = "WINRUNNER";
 /// `GetSystemInfo` and `NUMBER_OF_PROCESSORS` report the same count.
 pub const PROCESSOR_COUNT: u32 = 1;
+/// The build `GetVersionEx`, `RtlGetVersion`, and the registry report
+/// (Windows 10 22H2).
+pub const OS_BUILD_NUMBER: u32 = 19045;
+pub const OS_BUILD: &str = "19045";
+/// The local account's security identifier, as `ProfileList` and
+/// `HKEY_USERS` name it.
+pub const USER_SID: &str = "S-1-5-21-1000000000-1000000000-1000000000-1001";
 
 pub const SYSTEM_DRIVE: &str = "C:";
 pub const WINDOWS: &str = r"C:\Windows";
@@ -41,6 +48,7 @@ pub const DOWNLOADS: &str = r"C:\Users\runner\Downloads";
 pub const MUSIC: &str = r"C:\Users\runner\Music";
 pub const PICTURES: &str = r"C:\Users\runner\Pictures";
 pub const VIDEOS: &str = r"C:\Users\runner\Videos";
+pub const WINDOWS_APPS: &str = r"C:\Users\runner\AppData\Local\Microsoft\WindowsApps";
 
 /// Directories every boot image starts with.
 pub const DIRECTORIES: &[&str] = &[
@@ -55,6 +63,7 @@ pub const DIRECTORIES: &[&str] = &[
     APP_DATA,
     LOCAL_LOW_APP_DATA,
     TEMP,
+    WINDOWS_APPS,
     DESKTOP,
     DOCUMENTS,
     DOWNLOADS,
@@ -71,65 +80,11 @@ pub fn processor_architecture() -> &'static str {
     }
 }
 
-/// The environment a new logon session starts with. `extra_path` entries
-/// follow the Windows directories on `PATH`.
-pub fn default_environment(extra_path: &[&str]) -> Vec<(String, String)> {
-    let mut path = vec![
-        SYSTEM32.to_string(),
-        WINDOWS.to_string(),
-        format!(r"{SYSTEM32}\Wbem"),
-        format!(r"{POWERSHELL_HOME}\"),
-    ];
-    path.extend(extra_path.iter().map(|entry| entry.to_string()));
-    let variables: Vec<(&str, String)> = vec![
-        ("ALLUSERSPROFILE", PROGRAM_DATA.into()),
-        ("APPDATA", APP_DATA.into()),
-        ("CommonProgramFiles", COMMON_FILES.into()),
-        ("CommonProgramFiles(x86)", COMMON_FILES_X86.into()),
-        ("CommonProgramW6432", COMMON_FILES.into()),
-        ("COMPUTERNAME", COMPUTER_NAME.into()),
-        ("ComSpec", format!(r"{SYSTEM32}\cmd.exe")),
-        ("HOMEDRIVE", SYSTEM_DRIVE.into()),
-        ("HOMEPATH", HOME_PATH.into()),
-        ("LOCALAPPDATA", LOCAL_APP_DATA.into()),
-        ("LOGONSERVER", format!(r"\\{COMPUTER_NAME}")),
-        ("NUMBER_OF_PROCESSORS", PROCESSOR_COUNT.to_string()),
-        ("OS", "Windows_NT".into()),
-        ("Path", path.join(";")),
-        (
-            "PATHEXT",
-            ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC".into(),
-        ),
-        ("PROCESSOR_ARCHITECTURE", processor_architecture().into()),
-        ("ProgramData", PROGRAM_DATA.into()),
-        ("ProgramFiles", PROGRAM_FILES.into()),
-        ("ProgramFiles(x86)", PROGRAM_FILES_X86.into()),
-        ("ProgramW6432", PROGRAM_FILES.into()),
-        (
-            "PSModulePath",
-            format!(r"{PROGRAM_FILES}\WindowsPowerShell\Modules;{POWERSHELL_HOME}\Modules"),
-        ),
-        ("PUBLIC", PUBLIC.into()),
-        ("SystemDrive", SYSTEM_DRIVE.into()),
-        ("SystemRoot", WINDOWS.into()),
-        ("TEMP", TEMP.into()),
-        ("TMP", TEMP.into()),
-        ("USERDOMAIN", COMPUTER_NAME.into()),
-        ("USERDOMAIN_ROAMINGPROFILE", COMPUTER_NAME.into()),
-        ("USERNAME", USER_NAME.into()),
-        ("USERPROFILE", PROFILE.into()),
-        ("windir", WINDOWS.into()),
-        ("DriverData", format!(r"{SYSTEM32}\Drivers\DriverData")),
-        ("PROCESSOR_LEVEL", "6".into()),
-        ("SESSIONNAME", "Console".into()),
-    ];
-    let mut environment: Vec<(String, String)> = variables
-        .into_iter()
-        .map(|(name, value)| (name.to_string(), value))
-        .collect();
-    // Windows keeps the block sorted case-insensitively.
-    environment.sort_by_key(|(name, _)| name.to_ascii_uppercase());
-    environment
+/// The environment a new logon session starts with on a stock disk; a
+/// session on an existing disk composes it from that disk's registry with
+/// [`winreg::login_environment`](crate::winreg::login_environment).
+pub fn default_environment() -> Vec<(String, String)> {
+    crate::winreg::login_environment(&crate::winreg::Registry::defaults())
 }
 
 /// `SHGetFolderPath` CSIDL values (flags masked off) for the folders above.
@@ -189,7 +144,7 @@ mod tests {
 
     #[test]
     fn environment_and_known_folders_describe_the_same_profile() {
-        let environment = default_environment(&[]);
+        let environment = default_environment();
         assert_eq!(value(&environment, "USERPROFILE"), PROFILE);
         assert_eq!(csidl_path(0x28), Some(PROFILE));
         assert_eq!(value(&environment, "APPDATA"), csidl_path(0x1a).unwrap());
@@ -220,22 +175,6 @@ mod tests {
         assert_eq!(value(&environment, "USERNAME"), USER_NAME);
         assert_eq!(value(&environment, "COMPUTERNAME"), COMPUTER_NAME);
         assert!(COMPUTER_NAME.len() <= 15);
-    }
-
-    #[test]
-    fn path_lists_windows_directories_before_extra_entries() {
-        let environment = default_environment(&[r"C:\Tools"]);
-        let path: Vec<_> = value(&environment, "PATH").split(';').collect();
-        assert_eq!(path[0], SYSTEM32);
-        assert_eq!(path[1], WINDOWS);
-        assert_eq!(path.last(), Some(&r"C:\Tools"));
-        let names: Vec<_> = environment
-            .iter()
-            .map(|(name, _)| name.to_ascii_uppercase())
-            .collect();
-        let mut sorted = names.clone();
-        sorted.sort();
-        assert_eq!(names, sorted);
     }
 
     #[test]

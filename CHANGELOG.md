@@ -15,6 +15,16 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Add a guest Windows registry stored in WinFS (`HKLM` in
+  `C:\Windows\System32\config\machine.json`, `HKCU` in
+  `C:\Users\runner\NTUSER.json`), so snapshots keep it. Unwritten hives read
+  as stock contents: the machine and user `Environment` keys, Windows version
+  (`CurrentVersion`, build 19045), `ProfileList`, `Program Files` locations,
+  computer name, and shell folders. `HKCR` maps to `HKLM\SOFTWARE\Classes` and
+  `HKU\<runner's SID>` to `HKCU`.
+- Build each session's environment from the registry like a Windows logon:
+  profile variables, then the machine `Environment` key, then the user's, with
+  `%VAR%` expansion and the user `Path` appended to the machine `Path`.
 - Lay out the guest disk and environment like a stock Windows installation
   from one `system_profile` definition: user `runner`, computer `WINRUNNER`,
   profile `C:\Users\runner` (the shell's starting directory, replacing

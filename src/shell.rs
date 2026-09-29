@@ -10,7 +10,7 @@
 //! shell continues. `exit [n]`/`quit`, Ctrl-D (EOF), or a closed pipe ends
 //! the session (code = argument, else the last guest code).
 
-use crate::{backend, inspect, pe, ps1, system_profile, winfs::WinFs, wpkg};
+use crate::{backend, inspect, pe, ps1, system_profile, winfs::WinFs, winreg, wpkg};
 use rustyline::{
     completion::{Completer, Pair},
     error::ReadlineError,
@@ -299,8 +299,16 @@ impl Highlighter for ShellHelper {}
 impl Validator for ShellHelper {}
 impl Helper for ShellHelper {}
 
-fn default_environment() -> Vec<(String, String)> {
-    system_profile::default_environment(&[wpkg::BIN])
+/// The logon environment for this disk: stock variables plus whatever
+/// `setx`, `reg add`, or `[Environment]` saved in its registry.
+fn logon_environment(fs: &WinFs) -> Vec<(String, String)> {
+    match winreg::Registry::load(fs) {
+        Ok(registry) => winreg::login_environment(&registry),
+        Err(error) => {
+            eprintln!("winrun: {error}; using the default environment");
+            system_profile::default_environment()
+        }
+    }
 }
 
 /// What the REPL does after a line.
@@ -359,9 +367,10 @@ impl Shell {
                 backend_started.elapsed().as_secs_f64() * 1000.0
             );
         }
+        let environment = logon_environment(&fs);
         Shell {
             fs,
-            sess: ps1::Session::with_environment(default_environment()),
+            sess: ps1::Session::with_environment(environment),
             last_code: 0,
             backend,
             snapshot_path,

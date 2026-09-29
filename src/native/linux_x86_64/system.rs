@@ -73,7 +73,7 @@ pub(super) extern "win64" fn native_rtl_get_version(info: *mut u8) -> u32 {
     unsafe {
         (info.add(4) as *mut u32).write_unaligned(10);
         (info.add(8) as *mut u32).write_unaligned(0);
-        (info.add(12) as *mut u32).write_unaligned(19045);
+        (info.add(12) as *mut u32).write_unaligned(system_profile::OS_BUILD_NUMBER);
         (info.add(16) as *mut u32).write_unaligned(2); // VER_PLATFORM_WIN32_NT
         std::ptr::write_bytes(info.add(20), 0, 256);
     }
@@ -158,7 +158,7 @@ pub(super) extern "win64" fn native_get_adapters_addresses(
 
 pub(super) extern "win64" fn native_get_version() -> u32 {
     // Windows 10.0, build 19045, encoded using the legacy GetVersion layout.
-    (19045u32 << 16) | 0x0a00
+    (system_profile::OS_BUILD_NUMBER << 16) | 0x0a00
 }
 pub(super) extern "win64" fn native_set_default_dll_directories(_flags: u32) -> i32 {
     1
@@ -378,7 +378,7 @@ pub(super) extern "win64" fn native_verify_version_info_w(
     let checks = [
         (0x02, 10, read32(4), 3),
         (0x01, 0, read32(8), 0),
-        (0x04, 19045, read32(12), 6),
+        (0x04, system_profile::OS_BUILD_NUMBER, read32(12), 6),
         (0x08, 2, read32(16), 9),
         (0x20, 0, read16(276) as u32, 15),
         (0x10, 0, read16(278) as u32, 12),

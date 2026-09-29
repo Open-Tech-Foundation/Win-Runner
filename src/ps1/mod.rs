@@ -59,7 +59,7 @@ pub struct Session {
 
 impl Default for Session {
     fn default() -> Self {
-        Self::with_environment(crate::system_profile::default_environment(&[]))
+        Self::with_environment(crate::system_profile::default_environment())
     }
 }
 
