@@ -892,6 +892,17 @@ impl WinFs {
         &self.changes
     }
 
+    /// The bytes a journaled overlay write stored, even if the file was
+    /// later deleted or renamed.
+    pub(crate) fn overlay_bytes(&self, offset: u64, length: u64) -> Result<Vec<u8>, String> {
+        let store = self
+            .overlay
+            .as_ref()
+            .ok_or("WinFS disk overlay is unavailable")?;
+        let length = usize::try_from(length).map_err(|_| "WinFS write is too large")?;
+        store.read_at(offset, length)
+    }
+
     pub(crate) fn apply_changes(&mut self, changes: &[FsChange]) -> Result<(), String> {
         let result = (|| {
             for change in changes {

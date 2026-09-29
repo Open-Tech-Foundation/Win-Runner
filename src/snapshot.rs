@@ -525,7 +525,8 @@ pub(crate) fn encode_changes(fs: &WinFs) -> Result<Vec<u8>, String> {
 
 /// Encode a self-contained journal for a process with an independent disk
 /// overlay. Disk offsets are local to one WinFS process and cannot be replayed
-/// by an exec worker, so materialize those writes as bytes.
+/// by an exec worker, so materialize those writes as the bytes they stored;
+/// the file itself may since have been deleted or renamed.
 pub(crate) fn encode_portable_changes(fs: &WinFs) -> Result<Vec<u8>, String> {
     encode_change_records(fs, true)
 }
@@ -538,12 +539,12 @@ fn encode_change_records(fs: &WinFs, portable: bool) -> Result<Vec<u8>, String> 
             .map(|change| match change {
                 FsChange::Write {
                     path,
-                    offset: Some(_),
+                    offset: Some((offset, length)),
                     ..
                 } => Ok(FsChange::Write {
                     path: path.clone(),
                     offset: None,
-                    bytes: fs.read_file(path)?,
+                    bytes: fs.overlay_bytes(*offset, *length)?,
                 }),
                 other => Ok(other.clone()),
             })
@@ -1012,6 +1013,39 @@ mod tests {
             parent.read_file_range(r"C:\tools\curl.exe", 0, 1).unwrap(),
             b"c"
         );
+    }
+
+    #[test]
+    fn portable_journals_keep_changes_around_deleted_and_renamed_files() {
+        // A worker process writes a temp file and deletes it, and renames a
+        // file after writing it; its other changes must still reach the
+        // parent, whose disk overlay is separate.
+        let mut child = WinFs::ephemeral_runner();
+        child.clear_changes();
+        child.write_file(r"C:\kept.txt", b"kept".to_vec()).unwrap();
+        child
+            .write_file(r"C:\temp.txt", b"scratch".to_vec())
+            .unwrap();
+        child.delete_file(r"C:\temp.txt").unwrap();
+        child
+            .write_file(r"C:\draft.txt", b"final".to_vec())
+            .unwrap();
+        child.move_path(r"C:\draft.txt", r"C:\renamed.txt").unwrap();
+        assert!(child.changes().iter().any(|change| matches!(
+            change,
+            crate::winfs::FsChange::Write {
+                offset: Some(_),
+                ..
+            }
+        )));
+
+        let journal = encode_portable_changes(&child).unwrap();
+        let mut parent = WinFs::ephemeral_runner();
+        apply_changes(&journal, &mut parent).unwrap();
+        assert_eq!(parent.read_file(r"C:\kept.txt").unwrap(), b"kept");
+        assert!(!parent.exists(r"C:\temp.txt"));
+        assert_eq!(parent.read_file(r"C:\renamed.txt").unwrap(), b"final");
+        assert!(!parent.exists(r"C:\draft.txt"));
     }
 
     #[test]

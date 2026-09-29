@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Keep a guest child process's filesystem changes when it deletes or renames a
+  file it wrote. Exec workers journal their changes for the parent by
+  re-reading each written file at exit, so a deleted temporary file made that
+  read fail and dropped every change the process had made; writes are now
+  taken from the bytes they stored.
 - Fix the Winsock startup shim's buffer length when writing its description,
   which could panic and abort guest processes during `WSAStartup`.
 - Add `GetEnvironmentVariableA` with ANSI conversion and Windows buffer-size
