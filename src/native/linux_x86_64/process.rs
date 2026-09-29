@@ -11,7 +11,8 @@ pub(super) struct NativeLaunchSpec {
 
 /// Parse the subset of Windows command-line syntax needed to identify an
 /// executable. Backslashes are literal except when immediately before a
-/// quote, following the CommandLineToArgvW/MSVC escaping rules.
+/// quote, following the CommandLineToArgvW/MSVC escaping rules; like them,
+/// an unterminated quote runs to the end of the line rather than failing.
 pub(super) fn parse_windows_command_line(line: &str) -> Result<Vec<String>, String> {
     let mut args = Vec::new();
     let chars: Vec<char> = line.chars().collect();
@@ -50,9 +51,6 @@ pub(super) fn parse_windows_command_line(line: &str) -> Result<Vec<String>, Stri
             }
             arg.push(chars[index]);
             index += 1;
-        }
-        if quoted {
-            return Err("unterminated quote in command line".to_string());
         }
         args.push(arg);
     }

@@ -5966,7 +5966,16 @@ mod protection_tests {
             parse_windows_command_line(r#"tool.exe "a\"b""#).unwrap(),
             ["tool.exe", "a\"b"]
         );
-        assert!(parse_windows_command_line("\"unterminated").is_err());
+        // CreateProcess and the CRT accept an unterminated quote: the last
+        // argument runs to the end, so `dir C:\"` style lines still start.
+        assert_eq!(
+            parse_windows_command_line(r#"cmd /c "dir C:\""#).unwrap(),
+            ["cmd", "/c", r#"dir C:""#]
+        );
+        assert_eq!(
+            parse_windows_command_line("\"unterminated arg").unwrap(),
+            ["unterminated arg"]
+        );
     }
 
     #[test]

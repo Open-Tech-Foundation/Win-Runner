@@ -11,6 +11,9 @@ All notable changes to this project will be documented in this file.
   re-reading each written file at exit, so a deleted temporary file made that
   read fail and dropped every change the process had made; writes are now
   taken from the bytes they stored.
+- Accept an unterminated quote in a `CreateProcessW` or CRT command line, as
+  Windows does: the last argument runs to the end of the line instead of the
+  launch failing with `ERROR_INVALID_PARAMETER`.
 - Fix the Winsock startup shim's buffer length when writing its description,
   which could panic and abort guest processes during `WSAStartup`.
 - Add `GetEnvironmentVariableA` with ANSI conversion and Windows buffer-size
