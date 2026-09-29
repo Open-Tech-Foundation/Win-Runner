@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Keep the quotes of `cmd /c "C:\Program Files\x.exe" args` when the quoted
+  text names an executable, as cmd does, even when arguments follow it.
 - Keep a guest child process's filesystem changes when it deletes or renames a
   file it wrote. Exec workers journal their changes for the parent by
   re-reading each written file at exit, so a deleted temporary file made that

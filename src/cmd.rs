@@ -99,9 +99,9 @@ pub fn run_command_line<H: CmdHost>(
 }
 
 /// The command after `/c` or `/k`, with cmd's quote handling: a leading
-/// quote and the last quote are removed, unless (without `/s`) the text is
-/// exactly one quoted run with whitespace and no special characters inside
-/// that names an existing executable.
+/// quote and the last quote are removed, unless (without `/s`) the text has
+/// exactly two quotes enclosing an existing executable's name that contains
+/// whitespace and no special characters.
 fn command_after_switches(
     command_line: &str,
     mut is_executable: impl FnMut(&str) -> bool,
@@ -131,15 +131,16 @@ fn command_after_switches(
     if !command.starts_with('"') {
         return Ok(command.to_string());
     }
-    let quotes = command.matches('"').count();
+    // The run between the first two quotes; what follows the second quote
+    // (arguments) does not matter.
+    let quoted = command[1..].find('"').map(|end| &command[1..end + 1]);
     let keep = !strip
-        && quotes == 2
-        && command.trim_end().ends_with('"')
-        && command[1..command.trim_end().len() - 1]
-            .chars()
-            .any(char::is_whitespace)
-        && !command.contains(['&', '<', '>', '(', ')', '@', '^', '|'])
-        && is_executable(&command.trim_end()[1..command.trim_end().len() - 1]);
+        && command.matches('"').count() == 2
+        && quoted.is_some_and(|quoted| {
+            quoted.chars().any(char::is_whitespace)
+                && !quoted.contains(['&', '<', '>', '(', ')', '@', '^', '|'])
+                && is_executable(quoted)
+        });
     if keep {
         return Ok(command.to_string());
     }
@@ -2482,8 +2483,14 @@ mod tests {
             command(r#"cmd /c ""C:\Program Files\x.exe" arg""#),
             r#""C:\Program Files\x.exe" arg"#
         );
+        // Arguments may follow the quoted executable.
+        assert_eq!(
+            command(r#"cmd /c "C:\Program Files\x.exe" -v"#),
+            r#""C:\Program Files\x.exe" -v"#
+        );
         // A quoted command that is not an executable loses its quotes.
         assert_eq!(command(r#"cmd /c "exit 3""#), "exit 3");
+        assert_eq!(command(r#"cmd /c "exit 3" & ver"#), "exit 3 & ver");
         assert_eq!(command(r#""C:\Windows\System32\cmd.exe" /q/c ver"#), "ver");
         assert!(command_after_switches("cmd.exe", |_| false).is_err());
         assert!(command_after_switches("cmd.exe /d", |_| false).is_err());
