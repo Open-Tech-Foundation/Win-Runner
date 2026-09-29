@@ -30,6 +30,8 @@ All notable changes to this project will be documented in this file.
   `RegDeleteTreeW`, `RegEnumKeyExW`, `RegEnumValueW`, `RegQueryInfoKeyW`, and
   `RegCloseKey` over the guest registry, including sign-extended predefined
   keys; opens previously always failed and writes were discarded.
+- Add `setx NAME VALUE [/M]` and `reg query|add|delete` shell commands. `setx`
+  stores values containing `%` as `REG_EXPAND_SZ`.
 - `[Environment]::Get/SetEnvironmentVariable` with a `User` or `Machine`
   target now reads and writes the registry and, as in .NET, leaves the running
   session unchanged.

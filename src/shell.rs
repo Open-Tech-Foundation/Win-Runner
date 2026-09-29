@@ -10,7 +10,7 @@
 //! shell continues. `exit [n]`/`quit`, Ctrl-D (EOF), or a closed pipe ends
 //! the session (code = argument, else the last guest code).
 
-use crate::{backend, inspect, pe, ps1, system_profile, winfs::WinFs, winreg, wpkg};
+use crate::{backend, inspect, pe, ps1, reg_command, system_profile, winfs::WinFs, winreg, wpkg};
 use rustyline::{
     completion::{Completer, Pair},
     error::ReadlineError,
@@ -124,6 +124,8 @@ const SHELL_COMMANDS: &[&str] = &[
     "clear",
     "help",
     "set",
+    "setx",
+    "reg",
     "path",
     "mount",
     "snapshot",
@@ -661,8 +663,20 @@ impl Shell {
                 self.do_path(&argv[1..], out);
                 Ok(ShellFlow::Continue)
             }
+            "setx" => {
+                let message = reg_command::setx(&mut self.fs, &argv[1..])?;
+                out.extend_from_slice(message.as_bytes());
+                self.last_code = 0;
+                Ok(ShellFlow::Continue)
+            }
+            "reg" => {
+                let message = reg_command::reg(&mut self.fs, &argv[1..])?;
+                out.extend_from_slice(message.as_bytes());
+                self.last_code = 0;
+                Ok(ShellFlow::Continue)
+            }
             "help" => {
-                out.extend_from_slice(b"Built-in commands: cd, pwd, dir, type, copy, move, del, mkdir, rmdir, cls, set, path, mount, wpkg, powershell, snapshot, inspect, exit\n");
+                out.extend_from_slice(b"Built-in commands: cd, pwd, dir, type, copy, move, del, mkdir, rmdir, cls, set, setx, reg, path, mount, wpkg, powershell, snapshot, inspect, exit\n");
                 Ok(ShellFlow::Continue)
             }
             "cd" | "chdir" => {

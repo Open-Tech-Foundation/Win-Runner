@@ -8,6 +8,7 @@ pub mod native;
 pub mod pe;
 pub mod protocol;
 pub mod ps1;
+pub mod reg_command;
 pub mod shell;
 pub mod snapshot;
 pub mod system_profile;

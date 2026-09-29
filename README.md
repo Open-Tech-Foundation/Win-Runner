@@ -73,7 +73,20 @@ Each new run gets a disposable C: drive laid out like a stock Windows installati
 | `%ProgramFiles%` / `%ProgramData%` | `C:\Program Files` / `C:\ProgramData` |
 | `%SystemRoot%` | `C:\Windows` |
 
-The standard Windows environment variables (`PATH`, `PATHEXT`, `ComSpec`, `COMPUTERNAME`, `ProgramFiles(x86)`, and so on) are set, and the Windows folder APIs (`SHGetFolderPath`, `GetUserProfileDirectory`, `GetTempPath`, `GetComputerName`) report the same locations, so tools such as npm find their usual folders. `$env:` and `[Environment]` in PowerShell read and change this guest environment, never the host's. Changes last for the session.
+The standard Windows environment variables (`PATH`, `PATHEXT`, `ComSpec`, `COMPUTERNAME`, `ProgramFiles(x86)`, and so on) are set, and the Windows folder APIs (`SHGetFolderPath`, `GetUserProfileDirectory`, `GetTempPath`, `GetComputerName`) report the same locations, so tools such as npm find their usual folders. `$env:` and `[Environment]` in PowerShell read and change this guest environment, never the host's.
+
+Each disk also has a Windows registry, stored in WinFS so snapshots keep it (`HKLM` in `C:\Windows\System32\config\machine.json`, `HKCU` in `C:\Users\runner\NTUSER.json`). As on Windows, a new session builds its environment from the registry's machine and user `Environment` keys, and programs can use the `Reg*` APIs.
+
+```text
+setx EDITOR vim                    # user variable for sessions started later
+setx JAVA_HOME C:\jdk /M           # machine variable
+[Environment]::SetEnvironmentVariable('EDITOR', 'vim', 'User')
+reg query HKCU\Environment
+reg add HKCU\Software\Vendor /v Mode /t REG_DWORD /d 3
+reg delete HKCU\Software\Vendor /f
+```
+
+`set` and `$env:NAME = value` change only the current session; `setx`, `reg`, and the `User`/`Machine` targets persist and apply from the next session, as on Windows. Where Windows `reg` would prompt before overwriting or deleting, add `/f`.
 
 Use a WinFS snapshot to keep files and installed programs between runs.
 

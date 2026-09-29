@@ -1522,6 +1522,68 @@ exit
 }
 
 #[test]
+fn persistent_environment_variables_reach_the_next_session_through_the_registry() {
+    let snapshot = tmp_path("registry-environment.winfs");
+    let _ = std::fs::remove_file(&snapshot);
+    let save_arg = format!("--save-snapshot={}", snapshot.display());
+    let (code, stdout, stderr) = run_session_args(
+        &[save_arg, "shell".to_string()],
+        "setx EDITOR vim
+setx TOOLS_HOME %USERPROFILE%\\tools
+setx JAVA_HOME C:\\jdk /M
+[Environment]::SetEnvironmentVariable('FROM_DOTNET', 'yes', 'User')
+reg add HKCU\\Software\\Vendor /v Mode /t REG_DWORD /d 3
+echo x$env:EDITOR
+exit
+",
+        &[],
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(
+        stdout
+            .matches("SUCCESS: Specified value was saved.")
+            .count(),
+        3,
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("The operation completed successfully."));
+    // Like Windows, saved variables do not change the running session.
+    assert!(stdout.lines().any(|line| line == "x"), "stdout: {stdout}");
+
+    let (code, stdout, stderr) = run_session_args(
+        &[
+            format!("--snapshot={}", snapshot.display()),
+            "shell".to_string(),
+        ],
+        "$env:EDITOR
+$env:TOOLS_HOME
+$env:JAVA_HOME
+$env:FROM_DOTNET
+reg query HKCU\\Environment /v TOOLS_HOME
+reg query HKCU\\Software\\Vendor
+exit
+",
+        &[],
+    );
+    let _ = std::fs::remove_file(&snapshot);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let lines: Vec<_> = stdout.lines().collect();
+    assert_eq!(
+        &lines[..4],
+        ["vim", r"C:\Users\runner\tools", r"C:\jdk", "yes"],
+        "stdout: {stdout}"
+    );
+    assert!(
+        lines.contains(&r"    TOOLS_HOME    REG_EXPAND_SZ    %USERPROFILE%\tools"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        lines.contains(&"    Mode    REG_DWORD    0x3"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
 fn wpkg_registry_metadata_is_available_in_ephemeral_shells() {
     let (code, stdout, stderr) = run_shell_env(
         "wpkg search node
