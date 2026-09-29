@@ -7,6 +7,10 @@ pub(super) struct NativeLaunchSpec {
     pub(super) application: String,
     pub(super) arguments: Vec<String>,
     pub(super) current_directory: String,
+    /// The caller's command line exactly as passed to `CreateProcessW`; the
+    /// child's `GetCommandLineW` returns it unchanged, since programs such
+    /// as cmd.exe parse it themselves.
+    pub(super) command_line: Option<String>,
 }
 
 /// Parse the subset of Windows command-line syntax needed to identify an
@@ -63,6 +67,7 @@ pub(super) fn native_launch_spec(
     current_directory: Option<String>,
     fs: &WinFs,
 ) -> Result<NativeLaunchSpec, u32> {
+    let verbatim = command_line.clone().filter(|line| !line.trim().is_empty());
     let command_line = command_line.unwrap_or_default();
     let arguments = parse_windows_command_line(&command_line).map_err(|_| 87u32)?;
     let application = application
@@ -84,6 +89,7 @@ pub(super) fn native_launch_spec(
         application,
         arguments,
         current_directory,
+        command_line: verbatim,
     })
 }
 
@@ -92,10 +98,19 @@ pub(super) fn native_resolve_launch_application(
     fs: &WinFs,
     environment: &[(String, String)],
 ) {
-    let Some(name) = launch.arguments.first() else {
+    let Some(name) = launch.arguments.first().cloned() else {
         return;
     };
+    // Like CreateProcess, a file name without an extension means `.exe`.
+    let has_extension = name
+        .rsplit(['\\', '/'])
+        .next()
+        .is_some_and(|file| file.contains('.'));
     if name.contains(['\\', '/', ':']) {
+        let with_exe = format!("{}.exe", launch.application);
+        if !has_extension && !fs.is_file(&launch.application) && fs.is_file(&with_exe) {
+            launch.application = with_exe;
+        }
         return;
     }
 
@@ -119,8 +134,13 @@ pub(super) fn native_resolve_launch_application(
         );
     }
 
+    let file = if has_extension {
+        name
+    } else {
+        format!("{name}.exe")
+    };
     for directory in directories {
-        let candidate = format!("{}\\{}", directory.trim_end_matches(['\\', '/']), name);
+        let candidate = format!("{}\\{}", directory.trim_end_matches(['\\', '/']), file);
         let Ok(candidate) = fs.normalize(&candidate) else {
             continue;
         };
@@ -130,6 +150,24 @@ pub(super) fn native_resolve_launch_application(
             return;
         }
     }
+}
+
+/// CreateProcess runs a `.bat` or `.cmd` file as `cmd.exe /c "<command
+/// line>"`.
+pub(super) fn native_batch_launch_through_cmd(launch: &mut NativeLaunchSpec) {
+    let lower = launch.application.to_ascii_lowercase();
+    if !(lower.ends_with(".bat") || lower.ends_with(".cmd")) {
+        return;
+    }
+    let original = launch
+        .command_line
+        .clone()
+        .unwrap_or_else(|| format!("\"{}\"", launch.application));
+    let cmd = format!(r"{}\cmd.exe", crate::system_profile::SYSTEM32);
+    let command_line = format!("{cmd} /c \"{original}\"");
+    launch.arguments = vec![cmd.clone(), "/c".to_string(), original];
+    launch.application = cmd;
+    launch.command_line = Some(command_line);
 }
 
 pub(super) fn execute_powershell_shell_link(
@@ -1845,6 +1883,7 @@ fn create_exec_worker_child(
         "result_path": result_path,
         "program": launch.application,
         "args": launch.arguments.get(1..).unwrap_or(&[]),
+        "command_line": launch.command_line,
         "environment": environment,
         "process_id": child.process_id,
         "parent_process_id": parent.process_id,
@@ -2036,6 +2075,7 @@ pub(super) extern "win64" fn native_create_process_w(
         .map(|environment| environment.clone())
         .unwrap_or_default();
     native_resolve_launch_application(&mut launch, &fs.fs, &search_environment);
+    native_batch_launch_through_cmd(&mut launch);
     let parent_std_handles =
         std::array::from_fn(|index| parent.std_handles[index].load(Ordering::Acquire));
     let child_std_handles = native_startup_std_handles(startup_info, parent_std_handles);

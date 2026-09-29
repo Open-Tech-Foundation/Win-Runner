@@ -53,6 +53,14 @@ pub(super) fn command_line_w(prog: &str, args: &[String]) -> Result<Vec<u16>, St
     Ok(wide)
 }
 
+fn verbatim_command_line_w(line: &str) -> Result<Vec<u16>, String> {
+    let wide: Vec<u16> = line.encode_utf16().chain(std::iter::once(0)).collect();
+    if wide.len() * 2 > COMMAND_LINE_BYTES {
+        return Err("command line too long (64K guest block)".to_string());
+    }
+    Ok(wide)
+}
+
 pub(super) fn command_line_a(command_line: &[u16]) -> Vec<u8> {
     let end = command_line
         .iter()
@@ -467,7 +475,12 @@ fn run_rust_baseline_argv_with_fs_impl(
             file_locks: Vec::new(),
             next: 0x100,
         }));
-        let command_line_w = command_line_w(prog, args)?;
+        // A child started by CreateProcessW sees its caller's exact command
+        // line; otherwise one is built from the arguments.
+        let command_line_w = match std::env::var("WINRUN_NATIVE_COMMAND_LINE") {
+            Ok(line) => verbatim_command_line_w(&line)?,
+            Err(_) => command_line_w(prog, args)?,
+        };
         let command_line_a = command_line_a(&command_line_w);
         let std_handles = std::env::var("WINRUN_NATIVE_STD_HANDLES")
             .ok()

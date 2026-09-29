@@ -23,6 +23,10 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Give `CreateProcessW` children their caller's command line verbatim from
+  `GetCommandLineW` instead of re-quoting parsed arguments, append `.exe` to
+  a program name without an extension, and run `.bat` and `.cmd` targets
+  through `cmd.exe /c`, as Windows does.
 - Add a narrow `cmd.exe` command processor core for programs that shell out
   through `%ComSpec% /d /s /c`: cmd's quote rules, `&`, `&&`, `||`, blocks,
   `>`/`>>`/`2>&1`/`<`/`nul` redirection, line-at-a-time `%VAR%` expansion with

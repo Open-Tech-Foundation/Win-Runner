@@ -272,6 +272,13 @@ pub(crate) fn execute_request(path: &Path) -> Result<u32, String> {
     } else {
         std::env::remove_var("WINRUN_NATIVE_STD_HANDLES");
     }
+    match request
+        .get("command_line")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(command_line) => std::env::set_var("WINRUN_NATIVE_COMMAND_LINE", command_line),
+        None => std::env::remove_var("WINRUN_NATIVE_COMMAND_LINE"),
+    }
     std::env::set_var(
         "WINRUN_NATIVE_STATE_FD",
         state_file.into_raw_fd().to_string(),

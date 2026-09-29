@@ -6039,6 +6039,7 @@ mod protection_tests {
                     application: r"C:\missing.exe".to_string(),
                     arguments: vec![],
                     current_directory: r"C:\".to_string(),
+                    command_line: None,
                 },
             )
             .unwrap_err(),
@@ -6288,6 +6289,47 @@ mod protection_tests {
     }
 
     #[test]
+    fn native_child_lookup_appends_exe_and_runs_batch_files_through_cmd() {
+        let mut fs = WinFs::ephemeral_runner();
+        fs.mkdir(r"C:\tools").unwrap();
+        fs.write_file(r"C:\tools\tool.exe", b"MZ".to_vec()).unwrap();
+        fs.write_file(r"C:\tools\run.cmd", b"@echo off".to_vec())
+            .unwrap();
+        let environment = [("PATH".to_string(), r"C:\tools".to_string())];
+
+        let mut launch =
+            native_launch_spec(None, Some("tool --flag".to_string()), None, &fs).unwrap();
+        super::native_resolve_launch_application(&mut launch, &fs, &environment);
+        assert_eq!(launch.application, r"C:\tools\tool.exe");
+        assert_eq!(launch.command_line.as_deref(), Some("tool --flag"));
+
+        let mut launch =
+            native_launch_spec(None, Some(r"C:\tools\tool arg".to_string()), None, &fs).unwrap();
+        super::native_resolve_launch_application(&mut launch, &fs, &environment);
+        assert_eq!(launch.application, r"C:\tools\tool.exe");
+
+        // A name with an extension is used as given.
+        let mut launch =
+            native_launch_spec(None, Some("run.cmd a \"b c\"".to_string()), None, &fs).unwrap();
+        super::native_resolve_launch_application(&mut launch, &fs, &environment);
+        assert_eq!(launch.application, r"C:\tools\run.cmd");
+        super::native_batch_launch_through_cmd(&mut launch);
+        assert_eq!(launch.application, r"C:\Windows\System32\cmd.exe");
+        assert_eq!(
+            launch.command_line.as_deref(),
+            Some(r#"C:\Windows\System32\cmd.exe /c "run.cmd a "b c"""#)
+        );
+
+        let mut launch =
+            native_launch_spec(Some(r"C:\tools\run.cmd".to_string()), None, None, &fs).unwrap();
+        super::native_batch_launch_through_cmd(&mut launch);
+        assert_eq!(
+            launch.command_line.as_deref(),
+            Some(r#"C:\Windows\System32\cmd.exe /c ""C:\tools\run.cmd"""#)
+        );
+    }
+
+    #[test]
     fn native_child_lookup_resolves_the_power_shell_shell_link_from_path() {
         let mut fs = WinFs::new();
         fs.mkdir(r"C:\work").unwrap();
@@ -6307,6 +6349,7 @@ mod protection_tests {
                 "Write-Output shell-link-ok".to_string(),
             ],
             current_directory: fs.cwd(),
+            command_line: None,
         };
         super::native_resolve_launch_application(
             &mut launch,
