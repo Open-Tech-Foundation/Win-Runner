@@ -23,6 +23,10 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Look up shell commands through `PATH` with `PATHEXT` extensions in order,
+  and run `.cmd` and `.bat` files with the cmd processor inside the shell, so
+  package launchers such as npm's `tsc.cmd` run when typed by name. As with a
+  child `cmd.exe`, a batch file's environment changes do not reach the shell.
 - Seed `C:\Windows\System32\cmd.exe`, a small PE that runs the cmd processor
   as a real child process, so programs that start `%ComSpec% /d /s /c "..."`
   (Node's `child_process` with `shell: true`, `npm run`, Python's

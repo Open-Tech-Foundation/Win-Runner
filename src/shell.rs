@@ -829,6 +829,9 @@ impl Shell {
                 }
             }
         }
+        if self.fs.is_file(target) && is_batch_file(target) {
+            return self.run_batch(target, &argv[1..], out, sink);
+        }
         if self.fs.is_file(target) {
             let file_read_started = std::time::Instant::now();
             let data = self
@@ -849,14 +852,14 @@ impl Shell {
                 .map(|directory| directory.trim_matches('"'))
                 .filter(|directory| !directory.is_empty())
             {
-                for candidate in [
-                    format!(r"{directory}\{target}"),
-                    format!(r"{directory}\{target}.exe"),
-                ] {
+                for candidate in self.path_candidates(directory, target) {
                     if self.fs.is_file(&candidate) {
                         if is_powershell_shell_link(&self.fs, &candidate) {
                             self.do_powershell(&argv[1..], out)?;
                             return Ok(ShellFlow::Continue);
+                        }
+                        if is_batch_file(&candidate) {
+                            return self.run_batch(&candidate, &argv[1..], out, sink);
                         }
                         let file_read_started = std::time::Instant::now();
                         let data = self.fs.read_file(&candidate).map_err(|e| {
@@ -885,6 +888,51 @@ impl Shell {
                 "nothing to run: {target} (no such file; try `wpkg install {target}`)"
             )),
         }
+    }
+
+    /// `directory\target` as Windows tries it: as typed when it already has
+    /// a runnable extension, otherwise with each runnable `PATHEXT`
+    /// extension in order.
+    fn path_candidates(&self, directory: &str, target: &str) -> Vec<String> {
+        const RUNNABLE: [&str; 4] = [".com", ".exe", ".bat", ".cmd"];
+        let has_extension = target
+            .rfind('.')
+            .is_some_and(|dot| RUNNABLE.contains(&target[dot..].to_ascii_lowercase().as_str()));
+        if has_extension {
+            return vec![format!(r"{directory}\{target}")];
+        }
+        self.environment_value("PATHEXT")
+            .unwrap_or(".COM;.EXE;.BAT;.CMD")
+            .split(';')
+            .map(|extension| extension.trim().to_ascii_lowercase())
+            .filter(|extension| RUNNABLE.contains(&extension.as_str()))
+            .map(|extension| format!(r"{directory}\{target}{extension}"))
+            .collect()
+    }
+
+    /// Run a `.cmd`/`.bat` file with the cmd processor inside the shell, as
+    /// the shell runs `.ps1` files itself. Like a child `cmd.exe`, the
+    /// script's environment changes stay with it.
+    fn run_batch(
+        &mut self,
+        path: &str,
+        arguments: &[String],
+        out: &mut Vec<u8>,
+        sink: Option<backend::OutputSink>,
+    ) -> Result<ShellFlow, String> {
+        let command_line = crate::cmd::batch_command_line(path, arguments);
+        let environment = self.sess.environment.clone();
+        let cwd = self.fs.cwd();
+        let code = {
+            let mut host = ShellCmdHost {
+                shell: self,
+                out,
+                sink,
+            };
+            crate::cmd::run_command_line(&mut host, &command_line, environment, cwd)
+        };
+        self.last_code = code as i32;
+        Ok(ShellFlow::Continue)
     }
 
     /// Run an EXE with the session filesystem; the FS comes back with the
@@ -1102,6 +1150,87 @@ impl Shell {
         self.fs
             .write_file(&normalized.display(), bytes)
             .map_err(|e| format!("cannot seed {guest}: {e}"))
+    }
+}
+
+fn is_batch_file(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".cmd") || lower.ends_with(".bat")
+}
+
+/// Runs the programs a batch file starts through the shell's own launcher,
+/// streaming console output and routing redirected output where cmd asked.
+struct ShellCmdHost<'s> {
+    shell: &'s mut Shell,
+    out: &'s mut Vec<u8>,
+    sink: Option<backend::OutputSink>,
+}
+
+impl crate::cmd::CmdHost for ShellCmdHost<'_> {
+    fn with_fs<R>(&mut self, action: impl FnOnce(&mut WinFs) -> R) -> R {
+        action(&mut self.shell.fs)
+    }
+
+    fn run(&mut self, request: &crate::cmd::RunRequest) -> Result<(u32, Vec<u8>), String> {
+        use crate::cmd::Output;
+        if request.stdin.is_some() {
+            return Err(
+                "input redirection (<) is not supported for programs run from the shell yet."
+                    .to_string(),
+            );
+        }
+        let data = self
+            .shell
+            .fs
+            .read_file(&request.application)
+            .map_err(|error| format!("cannot read {}: {error}", request.application))?;
+        let arguments: Vec<String> = crate::cmd::split_windows_command_line(&request.command_line)
+            .into_iter()
+            .skip(1)
+            .collect();
+        let image_path = self.shell.guest_image_path(&request.application);
+        let saved_environment = std::mem::replace(
+            &mut self.shell.sess.environment,
+            request.environment.clone(),
+        );
+        let saved_cwd = self.shell.fs.cwd();
+        let _ = self.shell.fs.set_cwd(&request.current_directory);
+        let mut buffer = Vec::new();
+        let result = if request.stdout == Output::Stdout {
+            self.shell
+                .run_exe_bytes(&data, &image_path, &arguments, self.out, self.sink.clone())
+        } else {
+            self.shell
+                .run_exe_bytes(&data, &image_path, &arguments, &mut buffer, None)
+        };
+        self.shell.sess.environment = saved_environment;
+        let _ = self.shell.fs.set_cwd(&saved_cwd);
+        result?;
+        let code = self.shell.last_code as u32;
+        let captured = match &request.stdout {
+            Output::Stdout | Output::Null => Vec::new(),
+            Output::Stderr => {
+                self.write(true, &buffer);
+                Vec::new()
+            }
+            Output::File(path) => {
+                self.shell.fs.append_file(path, &buffer)?;
+                Vec::new()
+            }
+            Output::Capture => buffer,
+        };
+        Ok((code, captured))
+    }
+
+    fn write(&mut self, stderr: bool, bytes: &[u8]) {
+        match (&self.sink, stderr) {
+            (Some(sink), true) => sink(backend::OutputChannel::Stderr, bytes),
+            (Some(sink), false) => sink(backend::OutputChannel::Stdout, bytes),
+            (None, true) => {
+                let _ = std::io::stderr().write_all(bytes);
+            }
+            (None, false) => self.out.extend_from_slice(bytes),
+        }
     }
 }
 
@@ -1775,6 +1904,28 @@ mod tests {
             .iter()
             .any(|candidate| candidate.replacement == "inside.txt"));
         assert_eq!(shell.cwd(), format!("{initial_cwd}\\Documents"));
+    }
+
+    #[test]
+    fn path_lookup_follows_pathext_order_and_keeps_typed_extensions() {
+        let mut shell = Shell::new();
+        shell.set_environment_value(
+            "PATHEXT".to_string(),
+            Some(".COM;.EXE;.JS;.CMD".to_string()),
+        );
+        assert_eq!(
+            shell.path_candidates(r"C:\tools", "tsc"),
+            [
+                r"C:\tools\tsc.com",
+                r"C:\tools\tsc.exe",
+                r"C:\tools\tsc.cmd"
+            ]
+        );
+        assert_eq!(
+            shell.path_candidates(r"C:\tools", "tsc.CMD"),
+            [r"C:\tools\tsc.CMD"]
+        );
+        assert!(is_batch_file(r"C:\x\run.BAT") && !is_batch_file(r"C:\x\run.exe"));
     }
 
     #[test]

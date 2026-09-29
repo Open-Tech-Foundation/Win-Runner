@@ -185,6 +185,72 @@ pub fn cmd_exe_image() -> Vec<u8> {
     )
 }
 
+/// Split a Windows command line into arguments with the MSVC/
+/// `CommandLineToArgvW` rules: backslashes are literal unless they precede
+/// a quote, `""` inside quotes is a quote, and an unterminated quote runs
+/// to the end.
+pub fn split_windows_command_line(line: &str) -> Vec<String> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut arguments = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        while index < chars.len() && chars[index].is_whitespace() {
+            index += 1;
+        }
+        if index == chars.len() {
+            break;
+        }
+        let mut argument = String::new();
+        let mut quoted = false;
+        while index < chars.len() {
+            let mut slashes = 0;
+            while index < chars.len() && chars[index] == '\\' {
+                slashes += 1;
+                index += 1;
+            }
+            if index < chars.len() && chars[index] == '"' {
+                argument.extend(std::iter::repeat_n('\\', slashes / 2));
+                if slashes % 2 == 1 {
+                    argument.push('"');
+                } else if quoted && chars.get(index + 1) == Some(&'"') {
+                    argument.push('"');
+                    index += 1;
+                } else {
+                    quoted = !quoted;
+                }
+                index += 1;
+                continue;
+            }
+            argument.extend(std::iter::repeat_n('\\', slashes));
+            if index == chars.len() || (!quoted && chars[index].is_whitespace()) {
+                break;
+            }
+            argument.push(chars[index]);
+            index += 1;
+        }
+        arguments.push(argument);
+    }
+    arguments
+}
+
+/// The `cmd.exe` command line that runs `path` with `arguments`, quoting
+/// words with spaces the way cmd reads them back.
+pub fn batch_command_line(path: &str, arguments: &[String]) -> String {
+    let quote = |word: &str| {
+        if word.is_empty() || word.contains([' ', '\t']) {
+            format!("\"{word}\"")
+        } else {
+            word.to_string()
+        }
+    };
+    let mut command = quote(path);
+    for argument in arguments {
+        command.push(' ');
+        command.push_str(&quote(argument));
+    }
+    format!("{} /d /s /c \"{command}\"", cmd_exe_path())
+}
+
 /// Put `cmd.exe` in System32 unless the disk already has one.
 pub fn seed_cmd_exe(fs: &mut WinFs) {
     let path = cmd_exe_path();
@@ -2794,6 +2860,32 @@ for /f \"delims=\" %%l in (\"one line\") do echo whole=%%l\r
         assert_eq!(host.out(), "GREETING=hello world\r\n");
         assert_eq!(host.cmd(r"set NOPE_PREFIX"), 1);
         assert_eq!(host.cmd(r#""set /a X=1+1""#), 1);
+    }
+
+    #[test]
+    fn windows_command_lines_split_like_command_line_to_argv() {
+        assert_eq!(
+            split_windows_command_line(r#""C:\Program Files\x.exe" a "b c" d\"e "f""g""#),
+            [r"C:\Program Files\x.exe", "a", "b c", "d\"e", "f\"g"]
+        );
+        assert_eq!(split_windows_command_line(r#"x "open"#), ["x", "open"]);
+        assert_eq!(split_windows_command_line(r"a\\b c\\"), [r"a\\b", r"c\\"]);
+    }
+
+    #[test]
+    fn batch_command_lines_quote_paths_and_arguments_with_spaces() {
+        let line = batch_command_line(
+            r"C:\Program Files\nodejs\npm.cmd",
+            &["install".to_string(), "a b".to_string()],
+        );
+        assert_eq!(
+            line,
+            r#"C:\Windows\System32\cmd.exe /d /s /c ""C:\Program Files\nodejs\npm.cmd" install "a b"""#
+        );
+        assert_eq!(
+            command_after_switches(&line, |_| false).unwrap(),
+            r#""C:\Program Files\nodejs\npm.cmd" install "a b""#
+        );
     }
 
     #[test]

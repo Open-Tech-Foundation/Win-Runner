@@ -298,6 +298,39 @@ fn cmd_exe_redirects_child_output_and_captures_it_with_for_f() {
 }
 
 #[test]
+fn shell_runs_cmd_launchers_found_through_pathext() {
+    // npm's generated launcher for a package bin, with a Rust fixture
+    // standing in for node.exe beside it.
+    let launcher = "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\r\nIF EXIST \"%dp0%\\node.exe\" (\r\n  SET \"_prog=%dp0%\\node.exe\"\r\n) ELSE (\r\n  SET \"_prog=node\"\r\n  SET PATHEXT=%PATHEXT:;.JS;=;%\r\n)\r\n\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\"  \"%dp0%\\node_modules\\typescript\\bin\\tsc\" %*\r\n";
+    let launcher_path = tmp_path("tsc.cmd");
+    std::fs::write(&launcher_path, launcher).unwrap();
+    let setter_path = tmp_path("setter.cmd");
+    std::fs::write(
+        &setter_path,
+        "@echo off\r\nset FROM_BATCH=leaked\r\nexit /b 3\r\n",
+    )
+    .unwrap();
+    let input = format!(
+        "@seed {} C:\\tools\\node.exe\n@seed {} C:\\tools\\tsc.cmd\n@seed {} C:\\tools\\setter.cmd\nset PATH=%PATH%;C:\\tools\ntsc --version \"a b\"\nsetter\necho x$env:FROM_BATCH\nexit\n",
+        artifact("exe/rust_argv.exe").display(),
+        launcher_path.display(),
+        setter_path.display(),
+    );
+    let (code, stdout, stderr) = run_shell_env(&input, &[]);
+    let _ = std::fs::remove_file(launcher_path);
+    let _ = std::fs::remove_file(setter_path);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let lines: Vec<_> = stdout.lines().collect();
+    assert_eq!(
+        lines[0], r#"C:\tools\node.exe C:\tools\\node_modules\typescript\bin\tsc --version "a b""#,
+        "stdout: {stdout}"
+    );
+    // Like a child cmd.exe, a batch file's environment changes stay with it.
+    assert_eq!(lines[1], "x", "stdout: {stdout}");
+    assert!(stderr.is_empty(), "stderr: {stderr}");
+}
+
+#[test]
 fn create_process_child_keeps_its_working_directory_in_winfs() {
     let binary = env!("CARGO_BIN_EXE_winrun");
     let snapshot_path = tmp_path("create-process-cwd.winfs");
