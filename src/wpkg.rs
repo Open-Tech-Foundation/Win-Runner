@@ -25,6 +25,8 @@ const ROOT: &str = crate::system_profile::PROGRAM_FILES;
 /// Command links for every package's default version; on the system `PATH`.
 pub const BIN: &str = r"C:\ProgramData\wpkg\bin";
 const CURRENT: &str = "current";
+/// Where Windows lists installed programs; wpkg adds one key per version.
+const UNINSTALL_KEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
 const MAX_7Z_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_7Z_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
 
@@ -554,6 +556,7 @@ fn install_version(
     let package_parent = package_dir(&manifest.name);
     let staging_path = format!(r"{}\.staging-{}", package_parent, manifest.version);
     let entries = package_entries(&archive, &manifest.url)?;
+    let installed_bytes: u64 = entries.iter().map(|entry| entry.bytes.len() as u64).sum();
     let mut seen = HashSet::new();
     let mut validated = Vec::with_capacity(entries.len());
     for entry in entries {
@@ -617,7 +620,7 @@ fn install_version(
     let entry = InstalledVersion {
         version: manifest.version.clone(),
         arch: manifest.arch.clone(),
-        install_path: final_path,
+        install_path: final_path.clone(),
         bin: manifest.bin.clone(),
         dependencies: manifest.dependencies.clone(),
     };
@@ -650,6 +653,7 @@ fn install_version(
         None => set_default(fs, &mut packages, &manifest.name, &manifest.version)?,
     }
     save_database(fs, &packages)?;
+    register_uninstall(fs, manifest, &final_path, installed_bytes)?;
     Ok(previous_default.filter(|default| default != &manifest.version))
 }
 
@@ -773,6 +777,7 @@ fn remove_package(fs: &mut WinFs, name: &str, spec: Option<&str>) -> Result<Stri
                 package.versions.retain(|entry| entry.version != version);
             }
             save_database(fs, &packages)?;
+            unregister_uninstall(fs, name, &[version.as_str()])?;
             return Ok(format!("{name} {version}"));
         }
     }
@@ -802,10 +807,71 @@ fn remove_package(fs: &mut WinFs, name: &str, spec: Option<&str>) -> Result<Stri
     }
     packages.retain(|entry| entry.name != name);
     save_database(fs, &packages)?;
+    let versions: Vec<&str> = package
+        .versions
+        .iter()
+        .map(|entry| entry.version.as_str())
+        .collect();
+    unregister_uninstall(fs, name, &versions)?;
     Ok(match spec {
         Some(_) => format!("{name} {}", package.default),
         None => name.to_string(),
     })
+}
+
+fn uninstall_key(name: &str, version: &str) -> String {
+    format!(r"{UNINSTALL_KEY}\wpkg-{name}-{version}")
+}
+
+/// List an installed version under the registry key Windows inventory and
+/// uninstall tools read for installed programs.
+fn register_uninstall(
+    fs: &mut WinFs,
+    manifest: &Manifest,
+    install_path: &str,
+    installed_bytes: u64,
+) -> Result<(), String> {
+    use crate::winreg::{Hive, RegValue, Registry};
+    let mut registry = Registry::load(fs).map_err(|error| format!("wpkg: {error}"))?;
+    let key = registry
+        .create_key(
+            Hive::LocalMachine,
+            &uninstall_key(&manifest.name, &manifest.version),
+        )
+        .0;
+    let remove = format!("wpkg remove {}@{}", manifest.name, manifest.version);
+    let estimated_kib = u32::try_from(installed_bytes.div_ceil(1024)).unwrap_or(u32::MAX);
+    for (name, value) in [
+        (
+            "DisplayName",
+            RegValue::string(&format!("{} {}", manifest.name, manifest.version)),
+        ),
+        ("DisplayVersion", RegValue::string(&manifest.version)),
+        ("Publisher", RegValue::string("wpkg")),
+        ("InstallLocation", RegValue::string(install_path)),
+        ("UninstallString", RegValue::string(&remove)),
+        ("QuietUninstallString", RegValue::string(&remove)),
+        ("EstimatedSize", RegValue::dword(estimated_kib)),
+        ("NoModify", RegValue::dword(1)),
+        ("NoRepair", RegValue::dword(1)),
+    ] {
+        key.set_value(name, value);
+    }
+    registry
+        .save(fs, Hive::LocalMachine)
+        .map_err(|error| format!("wpkg: cannot record {}: {error}", manifest.name))
+}
+
+fn unregister_uninstall(fs: &mut WinFs, name: &str, versions: &[&str]) -> Result<(), String> {
+    use crate::winreg::{Hive, Registry};
+    let mut registry = Registry::load(fs).map_err(|error| format!("wpkg: {error}"))?;
+    for version in versions {
+        // A key someone already removed is not an error.
+        let _ = registry.delete_key(Hive::LocalMachine, &uninstall_key(name, version), true);
+    }
+    registry
+        .save(fs, Hive::LocalMachine)
+        .map_err(|error| format!("wpkg: cannot update installed programs: {error}"))
 }
 
 /// Point `C:\Program Files\<name>\current` at `version` and relink its
@@ -1843,6 +1909,54 @@ mod tests {
             b"keep"
         );
         assert!(fs.is_dir(r"C:\Program Files"));
+    }
+
+    #[test]
+    fn installed_versions_are_listed_under_the_windows_uninstall_key() {
+        use crate::winreg::{Hive, Registry};
+        let mut repo = MemoryRepo::default();
+        repo.package("tool", "1.0", "x64", &["tool.exe"], &[]);
+        repo.package("tool", "2.0", "x64", &["tool.exe"], &[]);
+        let mut fs = WinFs::ephemeral_runner();
+        run(&mut fs, &repo, &["install", "tool@1"]);
+        run(&mut fs, &repo, &["install", "tool@2"]);
+
+        let registry = Registry::load(&fs).unwrap();
+        let key = registry
+            .key(Hive::LocalMachine, &uninstall_key("tool", "1.0"))
+            .expect("uninstall entry");
+        let text = |name: &str| key.value(name).and_then(|value| value.as_str());
+        assert_eq!(text("DisplayName").as_deref(), Some("tool 1.0"));
+        assert_eq!(text("DisplayVersion").as_deref(), Some("1.0"));
+        assert_eq!(text("Publisher").as_deref(), Some("wpkg"));
+        assert_eq!(
+            text("InstallLocation").as_deref(),
+            Some(r"C:\Program Files\tool\1.0")
+        );
+        assert_eq!(
+            text("UninstallString").as_deref(),
+            Some("wpkg remove tool@1.0")
+        );
+        // Each archive here holds one 6-byte file: rounded up to 1 KiB.
+        assert_eq!(key.value("EstimatedSize").unwrap().as_dword(), Some(1));
+        assert_eq!(key.value("NoModify").unwrap().as_dword(), Some(1));
+        assert!(registry
+            .key(Hive::LocalMachine, &uninstall_key("tool", "2.0"))
+            .is_some());
+
+        run(&mut fs, &repo, &["remove", "tool@2"]);
+        let registry = Registry::load(&fs).unwrap();
+        assert!(registry
+            .key(Hive::LocalMachine, &uninstall_key("tool", "2.0"))
+            .is_none());
+        assert!(registry
+            .key(Hive::LocalMachine, &uninstall_key("tool", "1.0"))
+            .is_some());
+
+        run(&mut fs, &repo, &["remove", "tool"]);
+        let registry = Registry::load(&fs).unwrap();
+        let uninstall = registry.key(Hive::LocalMachine, UNINSTALL_KEY).unwrap();
+        assert!(uninstall.subkey_names().is_empty());
     }
 
     #[test]

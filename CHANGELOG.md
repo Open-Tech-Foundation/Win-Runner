@@ -15,6 +15,10 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- List each wpkg-installed version under
+  `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\wpkg-<package>-<version>`
+  with its display name, version, publisher, install location, uninstall
+  command, and estimated size, and remove the entry with that version.
 - Add a guest Windows registry stored in WinFS (`HKLM` in
   `C:\Windows\System32\config\machine.json`, `HKCU` in
   `C:\Users\runner\NTUSER.json`), so snapshots keep it. Unwritten hives read

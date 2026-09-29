@@ -108,7 +108,7 @@ wpkg install <package[@version]> | list [package] | default <package> [version]
 wpkg upgrade [package] | remove <package[@version]>
 ```
 
-Versions install side by side under `C:\Program Files\<package>\<version>`. The first version installed becomes the default; `C:\Program Files\<package>\current` links to the default, and each command in `C:\ProgramData\wpkg\bin` (on the `PATH`) links through it. Package state lives in `C:\ProgramData\wpkg`. `@26` selects the newest `26.x` release, and `wpkg default nodejs 26` switches every Node.js command to it. `upgrade` installs the latest release beside the existing ones and moves the default only when it was already on the newest version.
+Versions install side by side under `C:\Program Files\<package>\<version>`. The first version installed becomes the default; `C:\Program Files\<package>\current` links to the default, and each command in `C:\ProgramData\wpkg\bin` (on the `PATH`) links through it. Package state lives in `C:\ProgramData\wpkg`, and each installed version is listed under the registry's installed-programs key (`HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\wpkg-<package>-<version>`). `@26` selects the newest `26.x` release, and `wpkg default nodejs 26` switches every Node.js command to it. `upgrade` installs the latest release beside the existing ones and moves the default only when it was already on the newest version.
 
 ```text
 wpkg install nodejs          # latest; becomes the default
