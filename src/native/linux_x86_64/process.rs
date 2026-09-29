@@ -2079,6 +2079,16 @@ pub(super) extern "win64" fn native_create_process_w(
     let parent_std_handles =
         std::array::from_fn(|index| parent.std_handles[index].load(Ordering::Acquire));
     let child_std_handles = native_startup_std_handles(startup_info, parent_std_handles);
+    // Callers such as libuv pass DuplicateHandle aliases of their standard
+    // handles; the child inherits what the aliases refer to.
+    let child_std_handles = child_std_handles.map(|handle| {
+        parent
+            .duplicate_handles
+            .lock()
+            .ok()
+            .and_then(|aliases| aliases.get(&handle).copied())
+            .unwrap_or(handle)
+    });
     if crate::shell::is_powershell_shell_link(&fs.fs, &launch.application) {
         let powershell_fs = fs.fs.clone();
         drop(fs);

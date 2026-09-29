@@ -331,6 +331,53 @@ fn shell_runs_cmd_launchers_found_through_pathext() {
 }
 
 #[test]
+fn children_started_with_duplicated_std_handles_write_to_the_console() {
+    // libuv (Node) passes DuplicateHandle aliases of its standard handles
+    // to children started with inherited stdio.
+    let binary = env!("CARGO_BIN_EXE_winrun");
+    for (command_line, expected) in [
+        (r"C:\child.exe", "Hello from Rust"),
+        (
+            r#"cmd.exe /d /s /c "echo via-duplicate""#,
+            "via-duplicate\r\n",
+        ),
+    ] {
+        let snapshot_path = tmp_path("duplicate-handles.winfs");
+        let parent_path = tmp_path("duplicate-handles.exe");
+        let mut fs = WinFs::ephemeral_runner();
+        fs.write_file(
+            r"C:\child.exe",
+            std::fs::read(artifact("exe/rust_hello.exe")).unwrap(),
+        )
+        .unwrap();
+        winrun::snapshot::save_file(&mut fs, snapshot_path.to_str().unwrap()).unwrap();
+        std::fs::write(
+            &parent_path,
+            pe::builder::create_process_with_duplicated_stdout(command_line),
+        )
+        .unwrap();
+        let output = Command::new(binary)
+            .arg(format!("--snapshot={}", snapshot_path.display()))
+            .arg(&parent_path)
+            .output()
+            .expect("run a parent that passes duplicated std handles");
+        std::fs::remove_file(parent_path).unwrap();
+        std::fs::remove_file(snapshot_path).unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{command_line}: stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            expected,
+            "{command_line}"
+        );
+    }
+}
+
+#[test]
 fn create_process_child_keeps_its_working_directory_in_winfs() {
     let binary = env!("CARGO_BIN_EXE_winrun");
     let snapshot_path = tmp_path("create-process-cwd.winfs");

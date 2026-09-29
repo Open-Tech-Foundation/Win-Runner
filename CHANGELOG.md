@@ -6,6 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Give `CreateProcessW` children the handles that `DuplicateHandle` aliases
+  refer to. Node (libuv) passes duplicated standard handles for inherited
+  stdio, so children such as `npm run` scripts previously wrote to nothing.
 - Keep the quotes of `cmd /c "C:\Program Files\x.exe" args` when the quoted
   text names an executable, as cmd does, even when arguments follow it.
 - Keep a guest child process's filesystem changes when it deletes or renames a

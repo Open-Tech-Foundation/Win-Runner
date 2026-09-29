@@ -750,6 +750,90 @@ pub fn create_process_command_line(command_line: &str) -> Vec<u8> {
     )
 }
 
+/// Duplicate stdout as an inheritable handle, then start `command_line`
+/// with that duplicate as the child's stdout and stderr, the way libuv
+/// passes inherited stdio. Exits with the child's exit code (99 when a call
+/// fails).
+pub fn create_process_with_duplicated_stdout(command_line: &str) -> Vec<u8> {
+    // imports: 0 GetStdHandle, 1 DuplicateHandle, 2 CreateProcessW,
+    //          3 WaitForSingleObject, 4 GetExitCodeProcess, 5 ExitProcess
+    let mut a = Asm::new();
+    let d_command_line = a.add_utf16(command_line);
+    let d_duplicate = a.add_zeroed(8);
+    let mut startup = vec![0u8; 104];
+    startup[..4].copy_from_slice(&104u32.to_le_bytes());
+    startup[60..64].copy_from_slice(&0x100u32.to_le_bytes()); // STARTF_USESTDHANDLES
+    let d_startup = a.add_data(startup);
+    let d_process_information = a.add_zeroed(24);
+    let d_exit_code = a.add_zeroed(8);
+    let fail = a.fresh_label();
+    a.sub_rsp(0x58);
+    // DuplicateHandle(-1, GetStdHandle(STD_OUTPUT_HANDLE), -1, &dup, 0,
+    //                 TRUE, DUPLICATE_SAME_ACCESS)
+    a.mov_ecx_imm(0xFFFF_FFF5);
+    a.call_import(0);
+    a.mov_rdx_rax();
+    a.mov_rcx_imm64(u64::MAX);
+    a.emit(&[0x49, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF]); // mov r8, -1
+    a.lea_reg_rip(9, d_duplicate);
+    a.xor_eax();
+    a.mov_rspoff_rax(0x20);
+    a.mov_rspoff_imm32(0x28, 1);
+    a.mov_rspoff_imm32(0x30, 2);
+    a.call_import(1);
+    a.test_eax_eax();
+    a.jz(fail);
+    // STARTUPINFO.hStdOutput (+88) and hStdError (+96) = dup.
+    a.mov_eax_mem_rip(d_duplicate);
+    a.lea_reg_rip(1, d_startup);
+    a.emit(&[0x48, 0x89, 0x41, 88]); // mov [rcx+88], rax
+    a.emit(&[0x48, 0x89, 0x41, 96]); // mov [rcx+96], rax
+                                     // CreateProcessW(NULL, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)
+    a.xor_eax();
+    a.mov_rcx_rax();
+    a.lea_reg_rip(2, d_command_line);
+    a.mov_r8d_imm(0);
+    a.mov_r9d_imm(0);
+    for offset in [0x28, 0x30, 0x38] {
+        a.mov_rspoff_rax(offset);
+    }
+    a.mov_rspoff_imm32(0x20, 1);
+    a.lea_reg_rip(0, d_startup);
+    a.mov_rspoff_rax(0x40);
+    a.lea_reg_rip(0, d_process_information);
+    a.mov_rspoff_rax(0x48);
+    a.call_import(2);
+    a.test_eax_eax();
+    a.jz(fail);
+    a.mov_eax_mem_rip(d_process_information);
+    a.mov_rcx_rax();
+    a.mov_edx_imm(u32::MAX);
+    a.call_import(3);
+    a.mov_eax_mem_rip(d_process_information);
+    a.mov_rcx_rax();
+    a.lea_reg_rip(2, d_exit_code);
+    a.call_import(4);
+    a.mov_eax_mem_rip(d_exit_code);
+    a.emit(&[0x89, 0xC1]); // mov ecx, eax
+    a.call_import(5);
+    a.ret();
+    a.mark(fail);
+    a.mov_ecx_imm(99);
+    a.call_import(5);
+    a.ret();
+    build(
+        a,
+        &[
+            ("KERNEL32.dll", "GetStdHandle"),
+            ("KERNEL32.dll", "DuplicateHandle"),
+            ("KERNEL32.dll", "CreateProcessW"),
+            ("KERNEL32.dll", "WaitForSingleObject"),
+            ("KERNEL32.dll", "GetExitCodeProcess"),
+            ("KERNEL32.dll", "ExitProcess"),
+        ],
+    )
+}
+
 /// write file via CreateFileW + WriteFile + CloseHandle, exit 0/1.
 pub fn write_file(path: &str, content: &[u8]) -> Vec<u8> {
     // imports: 0 CreateFileW, 1 WriteFile, 2 CloseHandle, 3 ExitProcess
