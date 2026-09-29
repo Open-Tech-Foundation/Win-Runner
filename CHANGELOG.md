@@ -15,6 +15,14 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Add a narrow `cmd.exe` command processor core for programs that shell out
+  through `%ComSpec% /d /s /c`: cmd's quote rules, `&`, `&&`, `||`, blocks,
+  `>`/`>>`/`2>&1`/`<`/`nul` redirection, line-at-a-time `%VAR%` expansion with
+  `:a=b` and `:~n,m`, batch files with `%0`-`%9`, `%*`, `%~dp0`, labels,
+  `goto`, `call`, `exit /b`, `setlocal`, `shift`, `if`, `for`, `for /l`, and
+  `for /f` over command output, plus common internal commands. It runs npm's
+  generated `.cmd` launchers and `npm.cmd`. Pipes, `set /a`, `set /p`, and
+  delayed `!var!` expansion are not supported yet.
 - Cache verified wpkg archives in
   `C:\ProgramData\wpkg\cache\<package>#<version>#<arch>.<zip|7z>` and reuse a
   cached copy that still matches the manifest's SHA-256 instead of
