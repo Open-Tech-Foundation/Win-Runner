@@ -2499,6 +2499,12 @@ pub(super) extern "win64" fn native_crt_stdio_common_vsprintf(
     _locale: *mut c_void,
     arguments: *mut c_void,
 ) -> i32 {
+    // A null buffer with count 0 asks for the formatted length, as
+    // `_vscprintf` and two-pass callers do.
+    if output.is_null() && output_count == 0 {
+        return crt_format_narrow(format, arguments)
+            .map_or(-1, |bytes| bytes.len().min(i32::MAX as usize) as i32);
+    }
     if output.is_null() || output_count == 0 {
         THREAD_CRT_ERRNO.with(|errno| errno.set(22));
         return -1;
@@ -2523,6 +2529,12 @@ pub(super) extern "win64" fn native_crt_stdio_common_vswprintf(
     _locale: *mut c_void,
     arguments: *mut c_void,
 ) -> i32 {
+    // A null buffer with count 0 asks for the formatted length, as
+    // `_vscwprintf` and two-pass callers do.
+    if output.is_null() && output_count == 0 {
+        return crt_format_wide(format, arguments)
+            .map_or(-1, |units| units.len().min(i32::MAX as usize) as i32);
+    }
     if output.is_null() || output_count == 0 {
         THREAD_CRT_ERRNO.with(|errno| errno.set(22));
         return -1;
@@ -2537,6 +2549,95 @@ pub(super) extern "win64" fn native_crt_stdio_common_vswprintf(
         output.add(copied).write(0);
     }
     units.len().min(i32::MAX as usize) as i32
+}
+
+/// The secure (`_s`) printf truncation rules: output that fits both the
+/// buffer and `max_count` is copied whole. Otherwise, with `_TRUNCATE`
+/// (`usize::MAX`) or a `max_count` smaller than the buffer, the text is cut
+/// to fit and -1 is returned; a buffer that is simply too small is emptied,
+/// with `errno = ERANGE`.
+fn crt_secure_print<T: Copy + Default>(
+    formatted: Option<Vec<T>>,
+    output: *mut T,
+    buffer_count: usize,
+    max_count: usize,
+) -> i32 {
+    if output.is_null() || buffer_count == 0 {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+        return -1;
+    }
+    let Some(units) = formatted else {
+        unsafe { output.write(T::default()) };
+        THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+        return -1;
+    };
+    let limit = max_count.min(buffer_count - 1);
+    if units.len() <= limit {
+        unsafe {
+            std::ptr::copy_nonoverlapping(units.as_ptr(), output, units.len());
+            output.add(units.len()).write(T::default());
+        }
+        return units.len().min(i32::MAX as usize) as i32;
+    }
+    if max_count == usize::MAX || max_count < buffer_count {
+        unsafe {
+            std::ptr::copy_nonoverlapping(units.as_ptr(), output, limit);
+            output.add(limit).write(T::default());
+        }
+        return -1;
+    }
+    unsafe { output.write(T::default()) };
+    THREAD_CRT_ERRNO.with(|errno| errno.set(34));
+    -1
+}
+
+pub(super) extern "win64" fn native_crt_stdio_common_vsnwprintf_s(
+    _options: u64,
+    output: *mut u16,
+    buffer_count: usize,
+    max_count: usize,
+    format: *const u16,
+    _locale: *mut c_void,
+    arguments: *mut c_void,
+) -> i32 {
+    crt_secure_print(
+        crt_format_wide(format, arguments),
+        output,
+        buffer_count,
+        max_count,
+    )
+}
+
+pub(super) extern "win64" fn native_crt_stdio_common_vsprintf_s(
+    _options: u64,
+    output: *mut u8,
+    buffer_count: usize,
+    format: *const u8,
+    _locale: *mut c_void,
+    arguments: *mut c_void,
+) -> i32 {
+    crt_secure_print(
+        crt_format_narrow(format, arguments),
+        output,
+        buffer_count,
+        usize::MAX - 1,
+    )
+}
+
+pub(super) extern "win64" fn native_crt_stdio_common_vswprintf_s(
+    _options: u64,
+    output: *mut u16,
+    buffer_count: usize,
+    format: *const u16,
+    _locale: *mut c_void,
+    arguments: *mut c_void,
+) -> i32 {
+    crt_secure_print(
+        crt_format_wide(format, arguments),
+        output,
+        buffer_count,
+        usize::MAX - 1,
+    )
 }
 
 fn native_crt_format_to_stream(stream: *mut u8, format: *const u8, arguments: &[u64]) -> i32 {
@@ -3208,6 +3309,75 @@ pub(super) extern "win64" fn native_crt_initterm(first: *const u64, last: *const
         }
     }
 }
+/// `_initterm_e`: like `_initterm`, but initializers return an error code;
+/// the first non-zero one stops the walk and is returned.
+pub(super) extern "win64" fn native_crt_initterm_e(first: *const u64, last: *const u64) -> i32 {
+    if first.is_null() || last.is_null() {
+        return 0;
+    }
+    let (start, end) = (first as usize, last as usize);
+    if end < start || (end - start) % std::mem::size_of::<u64>() != 0 {
+        return 0;
+    }
+    let count = ((end - start) / std::mem::size_of::<u64>()).min(4096);
+    for index in 0..count {
+        let address = unsafe { first.add(index).read_unaligned() };
+        if address != 0 {
+            let init: extern "win64" fn() -> i32 = unsafe { std::mem::transmute(address as usize) };
+            let result = init();
+            if result != 0 {
+                return result;
+            }
+        }
+    }
+    0
+}
+
+pub(super) extern "win64" fn native_crt_set_fmode(mode: i32) -> i32 {
+    // _O_TEXT (0x4000) or _O_BINARY (0x8000); EINVAL otherwise.
+    if mode != 0x4000 && mode != 0x8000 {
+        return 22;
+    }
+    NATIVE_CRT_FMODE.store(mode, Ordering::Release);
+    0
+}
+
+/// Math errors are reported through errno; a custom `_matherr` handler is
+/// accepted and not called.
+pub(super) extern "win64" fn native_crt_set_user_math_err(_handler: u64) {}
+
+/// Thread-local destructors for the executable run at thread exit; the
+/// runtime tears threads down without calling them, as at process exit.
+pub(super) extern "win64" fn native_crt_register_thread_local_exe_atexit_callback(_callback: u64) {}
+
+/// `_seh_filter_dll`/`_seh_filter_exe`: the CRT's default filter for
+/// exceptions reaching a module entry point; keep searching outer handlers.
+pub(super) extern "win64" fn native_crt_seh_filter(_code: u32, _pointers: u64) -> i32 {
+    0 // EXCEPTION_CONTINUE_SEARCH
+}
+
+/// `abort`/`terminate`: exit with code 3, as the UCRT does after the
+/// abort message.
+pub(super) extern "win64" fn native_crt_abort() -> ! {
+    native_write_to_handle(
+        STD_HANDLE_BASE + 2,
+        b"\r\nThis application has requested the Runtime to terminate it in an unusual way.\r\n",
+    );
+    native_exit_process(3)
+}
+
+/// `_invoke_watson`: an invalid-parameter fast fail
+/// (`STATUS_STACK_BUFFER_OVERRUN`, 0xC0000409).
+pub(super) extern "win64" fn native_crt_invoke_watson(
+    _expression: u64,
+    _function: u64,
+    _file: u64,
+    _line: u32,
+    _reserved: u64,
+) -> ! {
+    native_exit_process(0xC000_0409)
+}
+
 pub(super) extern "win64" fn native_crt_getmainargs(
     argc_out: *mut i32,
     argv_out: *mut *mut *mut i8,

@@ -32,6 +32,17 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Run the modern .NET host chain on the native backend: a framework-dependent
+  .NET 10 app's apphost now finds the runtime in `C:\Program Files\dotnet`,
+  loads `hostfxr.dll` and `hostpolicy.dll`, and loads `coreclr.dll`. Guest
+  DLLs that import unimplemented functions from Windows system modules now
+  load with call-time stubs (as the main image already did) instead of
+  failing, and `ole32`, `oleaut32`, `user32`, `shell32`, `bcrypt`, and other
+  system DLLs are recognized as system modules. Adds UCRT startup
+  (`_initterm_e`, `_set_fmode`, `abort`, ...), secure printf variants and
+  length queries, integer conversions, secure string copies, character
+  classes, `<math.h>`, and `LoadLibraryW/A`, `IsWow64Process`,
+  `GetWindowsDirectoryW`, `IsDebuggerPresent`, and `OutputDebugString`.
 - Add `set /a` integer arithmetic (cmd's operators, precedence, compound
   assignments, hex and octal constants), `set /p` from redirected or piped
   input, pipes run through a temporary file, and delayed `!var!` expansion

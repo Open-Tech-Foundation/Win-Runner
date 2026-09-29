@@ -28,6 +28,12 @@ pub(super) use registry::supports_import;
 #[path = "linux_x86_64/advapi_registry.rs"]
 mod advapi_registry;
 use advapi_registry::*;
+#[path = "linux_x86_64/crt_math.rs"]
+mod crt_math;
+use crt_math::*;
+#[path = "linux_x86_64/crt_text.rs"]
+mod crt_text;
+use crt_text::*;
 #[path = "linux_x86_64/cmd_host.rs"]
 mod cmd_host;
 use cmd_host::*;

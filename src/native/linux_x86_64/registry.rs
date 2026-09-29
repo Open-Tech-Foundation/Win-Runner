@@ -29,6 +29,15 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                     | "_acmdln"
                     | "_wcmdln"
                     | "_initterm"
+                    | "_initterm_e"
+                    | "_set_app_type"
+                    | "_set_fmode"
+                    | "__setusermatherr"
+                    | "_register_thread_local_exe_atexit_callback"
+                    | "_seh_filter_dll"
+                    | "abort"
+                    | "terminate"
+                    | "_invoke_watson"
                     | "__getmainargs"
                     | "_configure_narrow_argv"
                     | "_configure_wide_argv"
@@ -85,6 +94,95 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                     | "__stdio_common_vfprintf"
                     | "__stdio_common_vsprintf"
                     | "__stdio_common_vswprintf"
+                    | "__stdio_common_vsnwprintf_s"
+                    | "acos"
+                    | "acosf"
+                    | "acosh"
+                    | "acoshf"
+                    | "asin"
+                    | "asinf"
+                    | "asinh"
+                    | "asinhf"
+                    | "atan"
+                    | "atanf"
+                    | "atanh"
+                    | "atanhf"
+                    | "cbrt"
+                    | "cbrtf"
+                    | "ceil"
+                    | "ceilf"
+                    | "cos"
+                    | "cosf"
+                    | "cosh"
+                    | "coshf"
+                    | "exp"
+                    | "expf"
+                    | "floor"
+                    | "floorf"
+                    | "log"
+                    | "logf"
+                    | "log10"
+                    | "log10f"
+                    | "log2"
+                    | "log2f"
+                    | "sin"
+                    | "sinf"
+                    | "sinh"
+                    | "sinhf"
+                    | "sqrt"
+                    | "sqrtf"
+                    | "tan"
+                    | "tanf"
+                    | "tanh"
+                    | "tanhf"
+                    | "round"
+                    | "roundf"
+                    | "trunc"
+                    | "truncf"
+                    | "atan2"
+                    | "atan2f"
+                    | "pow"
+                    | "powf"
+                    | "fmod"
+                    | "fmodf"
+                    | "fma"
+                    | "fmaf"
+                    | "modf"
+                    | "modff"
+                    | "strtoul"
+                    | "strtoull"
+                    | "wcstoul"
+                    | "_wcstoui64"
+                    | "wcstoull"
+                    | "_wtoi"
+                    | "_wtol"
+                    | "atol"
+                    | "_atoi64"
+                    | "_ltow_s"
+                    | "strnlen"
+                    | "wcsnlen"
+                    | "_wcsdup"
+                    | "strcpy_s"
+                    | "strcat_s"
+                    | "strncpy_s"
+                    | "strncat_s"
+                    | "wcscpy_s"
+                    | "wcscat_s"
+                    | "wcsncpy_s"
+                    | "wcsncat_s"
+                    | "_wcsicmp"
+                    | "_wcsnicmp"
+                    | "strtok_s"
+                    | "isalpha"
+                    | "isdigit"
+                    | "isspace"
+                    | "iswspace"
+                    | "iswupper"
+                    | "iswascii"
+                    | "towlower"
+                    | "towupper"
+                    | "__stdio_common_vsprintf_s"
+                    | "__stdio_common_vswprintf_s"
                     | "atoi"
                     | "strtol"
                     | "strtod"
@@ -273,6 +371,112 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "__lconv_init" => Some(native_crt_lconv_init as *const () as usize as u64),
         "setlocale" => Some(native_crt_setlocale as *const () as usize as u64),
         "_initterm" => Some(native_crt_initterm as *const () as usize as u64),
+        "strtoul" => Some(native_crt_strtoul as *const () as usize as u64),
+        "strtoull" => Some(native_crt_strtoull as *const () as usize as u64),
+        "wcstoul" => Some(native_crt_wcstoul as *const () as usize as u64),
+        "_wcstoui64" => Some(native_crt_wcstoui64 as *const () as usize as u64),
+        "wcstoull" => Some(native_crt_wcstoui64 as *const () as usize as u64),
+        "_wtoi" => Some(native_crt_wtoi as *const () as usize as u64),
+        "_wtol" => Some(native_crt_wtoi as *const () as usize as u64),
+        "atol" => Some(native_crt_atol as *const () as usize as u64),
+        "_atoi64" => Some(native_crt_atoi64 as *const () as usize as u64),
+        "_ltow_s" => Some(native_crt_ltow_s as *const () as usize as u64),
+        "strnlen" => Some(native_crt_strnlen as *const () as usize as u64),
+        "wcsnlen" => Some(native_crt_wcsnlen as *const () as usize as u64),
+        "_wcsdup" => Some(native_crt_wcsdup as *const () as usize as u64),
+        "strcpy_s" => Some(native_crt_strcpy_s as *const () as usize as u64),
+        "strcat_s" => Some(native_crt_strcat_s as *const () as usize as u64),
+        "strncpy_s" => Some(native_crt_strncpy_s as *const () as usize as u64),
+        "strncat_s" => Some(native_crt_strncat_s as *const () as usize as u64),
+        "wcscpy_s" => Some(native_crt_wcscpy_s as *const () as usize as u64),
+        "wcscat_s" => Some(native_crt_wcscat_s as *const () as usize as u64),
+        "wcsncpy_s" => Some(native_crt_wcsncpy_s as *const () as usize as u64),
+        "wcsncat_s" => Some(native_crt_wcsncat_s as *const () as usize as u64),
+        "_wcsicmp" => Some(native_crt_wcsicmp as *const () as usize as u64),
+        "_wcsnicmp" => Some(native_crt_wcsnicmp as *const () as usize as u64),
+        "strtok_s" => Some(native_crt_strtok_s as *const () as usize as u64),
+        "isalpha" => Some(native_crt_isalpha as *const () as usize as u64),
+        "isdigit" => Some(native_crt_isdigit as *const () as usize as u64),
+        "isspace" => Some(native_crt_isspace as *const () as usize as u64),
+        "iswspace" => Some(native_crt_iswspace as *const () as usize as u64),
+        "iswupper" => Some(native_crt_iswupper as *const () as usize as u64),
+        "iswascii" => Some(native_crt_iswascii as *const () as usize as u64),
+        "towlower" => Some(native_crt_towlower as *const () as usize as u64),
+        "towupper" => Some(native_crt_towupper as *const () as usize as u64),
+        "acos" => Some(native_crt_acos as *const () as usize as u64),
+        "acosf" => Some(native_crt_acosf as *const () as usize as u64),
+        "acosh" => Some(native_crt_acosh as *const () as usize as u64),
+        "acoshf" => Some(native_crt_acoshf as *const () as usize as u64),
+        "asin" => Some(native_crt_asin as *const () as usize as u64),
+        "asinf" => Some(native_crt_asinf as *const () as usize as u64),
+        "asinh" => Some(native_crt_asinh as *const () as usize as u64),
+        "asinhf" => Some(native_crt_asinhf as *const () as usize as u64),
+        "atan" => Some(native_crt_atan as *const () as usize as u64),
+        "atanf" => Some(native_crt_atanf as *const () as usize as u64),
+        "atanh" => Some(native_crt_atanh as *const () as usize as u64),
+        "atanhf" => Some(native_crt_atanhf as *const () as usize as u64),
+        "cbrt" => Some(native_crt_cbrt as *const () as usize as u64),
+        "cbrtf" => Some(native_crt_cbrtf as *const () as usize as u64),
+        "ceil" => Some(native_crt_ceil as *const () as usize as u64),
+        "ceilf" => Some(native_crt_ceilf as *const () as usize as u64),
+        "cos" => Some(native_crt_cos as *const () as usize as u64),
+        "cosf" => Some(native_crt_cosf as *const () as usize as u64),
+        "cosh" => Some(native_crt_cosh as *const () as usize as u64),
+        "coshf" => Some(native_crt_coshf as *const () as usize as u64),
+        "exp" => Some(native_crt_exp as *const () as usize as u64),
+        "expf" => Some(native_crt_expf as *const () as usize as u64),
+        "floor" => Some(native_crt_floor as *const () as usize as u64),
+        "floorf" => Some(native_crt_floorf as *const () as usize as u64),
+        "log" => Some(native_crt_log as *const () as usize as u64),
+        "logf" => Some(native_crt_logf as *const () as usize as u64),
+        "log10" => Some(native_crt_log10 as *const () as usize as u64),
+        "log10f" => Some(native_crt_log10f as *const () as usize as u64),
+        "log2" => Some(native_crt_log2 as *const () as usize as u64),
+        "log2f" => Some(native_crt_log2f as *const () as usize as u64),
+        "sin" => Some(native_crt_sin as *const () as usize as u64),
+        "sinf" => Some(native_crt_sinf as *const () as usize as u64),
+        "sinh" => Some(native_crt_sinh as *const () as usize as u64),
+        "sinhf" => Some(native_crt_sinhf as *const () as usize as u64),
+        "sqrt" => Some(native_crt_sqrt as *const () as usize as u64),
+        "sqrtf" => Some(native_crt_sqrtf as *const () as usize as u64),
+        "tan" => Some(native_crt_tan as *const () as usize as u64),
+        "tanf" => Some(native_crt_tanf as *const () as usize as u64),
+        "tanh" => Some(native_crt_tanh as *const () as usize as u64),
+        "tanhf" => Some(native_crt_tanhf as *const () as usize as u64),
+        "round" => Some(native_crt_round as *const () as usize as u64),
+        "roundf" => Some(native_crt_roundf as *const () as usize as u64),
+        "trunc" => Some(native_crt_trunc as *const () as usize as u64),
+        "truncf" => Some(native_crt_truncf as *const () as usize as u64),
+        "atan2" => Some(native_crt_atan2 as *const () as usize as u64),
+        "atan2f" => Some(native_crt_atan2f as *const () as usize as u64),
+        "pow" => Some(native_crt_pow as *const () as usize as u64),
+        "powf" => Some(native_crt_powf as *const () as usize as u64),
+        "fmod" => Some(native_crt_fmod as *const () as usize as u64),
+        "fmodf" => Some(native_crt_fmodf as *const () as usize as u64),
+        "fma" => Some(native_crt_fma as *const () as usize as u64),
+        "fmaf" => Some(native_crt_fmaf as *const () as usize as u64),
+        "modf" => Some(native_crt_modf as *const () as usize as u64),
+        "modff" => Some(native_crt_modff as *const () as usize as u64),
+        "__stdio_common_vsnwprintf_s" => {
+            Some(native_crt_stdio_common_vsnwprintf_s as *const () as usize as u64)
+        }
+        "__stdio_common_vsprintf_s" => {
+            Some(native_crt_stdio_common_vsprintf_s as *const () as usize as u64)
+        }
+        "__stdio_common_vswprintf_s" => {
+            Some(native_crt_stdio_common_vswprintf_s as *const () as usize as u64)
+        }
+        "_initterm_e" => Some(native_crt_initterm_e as *const () as usize as u64),
+        "_set_app_type" => Some(native_crt_set_app_type as *const () as usize as u64),
+        "_set_fmode" => Some(native_crt_set_fmode as *const () as usize as u64),
+        "__setusermatherr" => Some(native_crt_set_user_math_err as *const () as usize as u64),
+        "_register_thread_local_exe_atexit_callback" => {
+            Some(native_crt_register_thread_local_exe_atexit_callback as *const () as usize as u64)
+        }
+        "_seh_filter_dll" => Some(native_crt_seh_filter as *const () as usize as u64),
+        "abort" => Some(native_crt_abort as *const () as usize as u64),
+        "terminate" => Some(native_crt_abort as *const () as usize as u64),
+        "_invoke_watson" => Some(native_crt_invoke_watson as *const () as usize as u64),
         "__getmainargs" => Some(native_crt_getmainargs as *const () as usize as u64),
         "_configure_narrow_argv" => {
             Some(native_crt_configure_narrow_argv as *const () as usize as u64)
@@ -592,6 +796,20 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "VirtualFree" => Some(native_virtual_free as *const () as usize as u64),
         "VirtualQuery" => Some(native_virtual_query as *const () as usize as u64),
         "LoadLibraryExW" => Some(native_load_library_ex_w as *const () as usize as u64),
+        "LoadLibraryW" => Some(native_load_library_w as *const () as usize as u64),
+        "LoadLibraryA" => Some(native_load_library_a as *const () as usize as u64),
+        "IsWow64Process" => Some(native_is_wow64_process as *const () as usize as u64),
+        "IsWow64Process2" => Some(native_is_wow64_process2 as *const () as usize as u64),
+        "GetWindowsDirectoryW" | "GetSystemWindowsDirectoryW" => {
+            Some(native_get_windows_directory_w as *const () as usize as u64)
+        }
+        "GetWindowsDirectoryA" | "GetSystemWindowsDirectoryA" => {
+            Some(native_get_windows_directory_a as *const () as usize as u64)
+        }
+        "IsDebuggerPresent" => Some(native_is_debugger_present as *const () as usize as u64),
+        "OutputDebugStringW" | "OutputDebugStringA" => {
+            Some(native_output_debug_string as *const () as usize as u64)
+        }
         "LoadLibraryExA" => Some(native_load_library_ex_a as *const () as usize as u64),
         "GetProcAddress" => Some(native_get_proc_address as *const () as usize as u64),
         "FreeLibrary" => Some(native_free_library as *const () as usize as u64),

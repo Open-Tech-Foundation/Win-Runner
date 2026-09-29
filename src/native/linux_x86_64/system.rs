@@ -393,3 +393,71 @@ pub(super) extern "win64" fn native_verify_version_info_w(
         1
     }
 }
+
+/// A native x64 process is never running under WOW64.
+pub(super) extern "win64" fn native_is_wow64_process(_process: u64, wow64: *mut i32) -> i32 {
+    if wow64.is_null() {
+        native_set_last_error(87);
+        return 0;
+    }
+    unsafe { wow64.write_unaligned(0) };
+    1
+}
+
+/// `IsWow64Process2`: not WOW64, and the machine is the host's.
+pub(super) extern "win64" fn native_is_wow64_process2(
+    _process: u64,
+    process_machine: *mut u16,
+    native_machine: *mut u16,
+) -> i32 {
+    if process_machine.is_null() {
+        native_set_last_error(87);
+        return 0;
+    }
+    unsafe {
+        process_machine.write_unaligned(0); // IMAGE_FILE_MACHINE_UNKNOWN
+        if !native_machine.is_null() {
+            native_machine.write_unaligned(0x8664);
+        }
+    }
+    1
+}
+
+/// Copy `text` as UTF-16 into a caller buffer of `capacity` characters with
+/// the Get*DirectoryW protocol: the length without the terminator on
+/// success, or the required size including it when the buffer is short.
+fn copy_directory_w(text: &str, output: *mut u16, capacity: u32) -> u32 {
+    let encoded: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    if output.is_null() || (capacity as usize) < encoded.len() {
+        return encoded.len() as u32;
+    }
+    unsafe { output.copy_from_nonoverlapping(encoded.as_ptr(), encoded.len()) };
+    (encoded.len() - 1) as u32
+}
+
+pub(super) extern "win64" fn native_get_windows_directory_w(
+    output: *mut u16,
+    capacity: u32,
+) -> u32 {
+    copy_directory_w(system_profile::WINDOWS, output, capacity)
+}
+
+pub(super) extern "win64" fn native_get_windows_directory_a(output: *mut u8, capacity: u32) -> u32 {
+    let text = system_profile::WINDOWS.as_bytes();
+    if output.is_null() || (capacity as usize) <= text.len() {
+        return text.len() as u32 + 1;
+    }
+    unsafe {
+        output.copy_from_nonoverlapping(text.as_ptr(), text.len());
+        output.add(text.len()).write(0);
+    }
+    text.len() as u32
+}
+
+/// No debugger is ever attached to a guest process.
+pub(super) extern "win64" fn native_is_debugger_present() -> i32 {
+    0
+}
+
+/// Debug output goes to an attached debugger; there is none.
+pub(super) extern "win64" fn native_output_debug_string(_text: u64) {}

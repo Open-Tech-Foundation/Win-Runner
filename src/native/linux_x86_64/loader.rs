@@ -361,6 +361,43 @@ mod module_export_tests {
     }
 
     #[test]
+    fn a_guest_dll_loads_when_system_imports_it_never_calls_are_missing() {
+        // CoreCLR and the .NET host import far more than a program uses;
+        // unimplemented system functions become call-time stubs.
+        let bytes = dll_fixture(
+            &[
+                ("user32.dll", "MessageBoxW"),
+                ("KERNEL32.dll", "WinrunNoSuchFunctionForTests"),
+                ("api-ms-win-crt-private-l1-1-0.dll", "_o_nothing_here"),
+            ],
+            None,
+            0x0000_5009_0000_0000,
+        );
+        let process = &*super::TEST_PROCESS;
+        let path = r"C:\loader-tests\missing-system-imports.dll";
+        {
+            let mut native_fs = process.fs.lock().unwrap();
+            native_fs.fs.mkdir(r"C:\loader-tests").unwrap();
+            native_fs.fs.write_file(path, bytes).unwrap();
+        }
+        let name: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+        let handle = native_load_library_ex_w(name.as_ptr(), 0, 0);
+        assert_ne!(handle, 0, "the DLL loads with stubbed imports");
+        assert_eq!(native_free_library(handle), 1);
+        // A system DLL named directly loads as winrun's module, while
+        // GetModuleHandle still reports it as not loaded.
+        let user32: Vec<u16> = "user32.dll"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        assert_eq!(
+            native_load_library_ex_w(user32.as_ptr(), 0, 0),
+            API_SET_MODULE
+        );
+        assert_eq!(native_get_module_handle_w(user32.as_ptr()), 0);
+    }
+
+    #[test]
     fn load_library_maps_a_guest_dll_from_winfs() {
         let bytes = dll_fixture(&[], None, 0x0000_5000_0000_0000);
 
@@ -740,6 +777,44 @@ fn native_module_name_supported(name: &str) -> bool {
                 | "ws2_32.dll"
         )
 }
+
+/// Windows system DLLs beyond [`native_module_name_supported`]: imports
+/// from them get winrun's shims or call-time stubs, and `LoadLibrary`
+/// succeeds, but they are never loaded from the disk. `GetModuleHandle`
+/// still reports them as not loaded, as on Windows for a console process
+/// that has not loaded them.
+fn native_system_module_name(name: &str) -> bool {
+    let module = name
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(name)
+        .to_ascii_lowercase();
+    native_module_name_supported(name)
+        || matches!(
+            module.trim_end_matches(".dll"),
+            "ole32"
+                | "oleaut32"
+                | "combase"
+                | "user32"
+                | "gdi32"
+                | "shell32"
+                | "shlwapi"
+                | "bcrypt"
+                | "crypt32"
+                | "ncrypt"
+                | "secur32"
+                | "sspicli"
+                | "version"
+                | "psapi"
+                | "dbghelp"
+                | "iphlpapi"
+                | "mswsock"
+                | "netapi32"
+                | "wintrust"
+                | "powrprof"
+                | "rpcrt4"
+        )
+}
 pub(super) extern "win64" fn native_get_module_handle_ex_w(
     flags: u32,
     name: *const u16,
@@ -813,6 +888,14 @@ pub(super) extern "win64" fn native_load_library_ex_w(
         native_set_last_error(126); // ERROR_MOD_NOT_FOUND
         0
     })
+}
+
+pub(super) extern "win64" fn native_load_library_w(path: *const u16) -> u64 {
+    native_load_library_ex_w(path, 0, 0)
+}
+
+pub(super) extern "win64" fn native_load_library_a(path: *const u8) -> u64 {
+    native_load_library_ex_a(path, 0, 0)
 }
 
 pub(super) extern "win64" fn native_load_library_ex_a(
@@ -1156,7 +1239,7 @@ fn load_guest_module_inner(
     if depth >= 64 {
         return None;
     }
-    if native_module_name_supported(name) {
+    if native_system_module_name(name) {
         return Some(API_SET_MODULE);
     }
     if let Some(handle) = module_handle_by_name(name) {
@@ -1255,12 +1338,14 @@ fn load_guest_module_inner(
         let mut shim_imports = Vec::new();
         let mut guest_imports = Vec::new();
         for import in image.imports.iter().chain(&image.unsupported) {
-            if super::registry::supports_import(&import.dll, &import.func) {
+            // System-module imports go to the shim table; one without a shim
+            // gets a stub that reports it only if called, as for the main
+            // image, so a DLL still loads when unused imports are missing.
+            if super::registry::supports_import(&import.dll, &import.func)
+                || native_system_module_name(&import.dll)
+            {
                 shim_imports.push(import.clone());
                 continue;
-            }
-            if native_module_name_supported(&import.dll) {
-                return None;
             }
             let dependency = load_guest_module_inner(&import.dll, loading, depth + 1)?;
             if dependency == API_SET_MODULE {
