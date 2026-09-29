@@ -22,6 +22,8 @@ use std::{
 const STATE: &str = r"C:\ProgramData\wpkg";
 const DATABASE: &str = r"C:\ProgramData\wpkg\installed.json";
 const ROOT: &str = crate::system_profile::PROGRAM_FILES;
+/// Verified archives, kept so reinstalling a version needs no download.
+const CACHE: &str = r"C:\ProgramData\wpkg\cache";
 /// Command links for every package's default version; on the system `PATH`.
 pub const BIN: &str = r"C:\ProgramData\wpkg\bin";
 const CURRENT: &str = "current";
@@ -205,9 +207,11 @@ enum Command {
     Upgrade(Option<String>),
     Remove(String),
     Default(String, Option<String>),
+    CacheList,
+    CacheClean(Option<String>),
 }
 
-const USAGE: &str = "usage: wpkg search <query> | info <package[@version]> | install <package[@version]> | list [package] | default <package> [version] | upgrade [package] | remove <package[@version]>";
+const USAGE: &str = "usage: wpkg search <query> | info <package[@version]> | install <package[@version]> | list [package] | default <package> [version] | upgrade [package] | remove <package[@version]> | cache [clean [package]]";
 
 fn parse_command(args: &[String]) -> Result<Command, String> {
     match args.first().map(|arg| arg.to_ascii_lowercase()).as_deref() {
@@ -219,6 +223,10 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         Some("remove") if args.len() == 2 => Ok(Command::Remove(args[1].clone())),
         Some("default") if matches!(args.len(), 2 | 3) => {
             Ok(Command::Default(args[1].clone(), args.get(2).cloned()))
+        }
+        Some("cache") if args.len() == 1 => Ok(Command::CacheList),
+        Some("cache") if args[1].eq_ignore_ascii_case("clean") && args.len() <= 3 => {
+            Ok(Command::CacheClean(args.get(2).cloned()))
         }
         _ => Err(USAGE.to_string()),
     }
@@ -387,6 +395,64 @@ pub fn execute_with_progress(
             let removed = remove_package(fs, &name, version.as_deref())?;
             output.extend_from_slice(format!("Removed {removed}\n").as_bytes());
         }
+        Command::CacheList => {
+            let archives = cached_archives(fs, None)?;
+            if archives.is_empty() {
+                output.extend_from_slice(b"Cache is empty.\n");
+            }
+            let mut total = 0;
+            for archive in &archives {
+                total += archive.bytes;
+                output.extend_from_slice(
+                    format!(
+                        "{} {} ({}) {}\n",
+                        archive.name,
+                        archive.version,
+                        archive.arch,
+                        format_size(archive.bytes)
+                    )
+                    .as_bytes(),
+                );
+            }
+            if !archives.is_empty() {
+                output.extend_from_slice(
+                    format!(
+                        "Total: {} in {} {} at {CACHE}\n",
+                        format_size(total),
+                        archives.len(),
+                        if archives.len() == 1 {
+                            "archive"
+                        } else {
+                            "archives"
+                        }
+                    )
+                    .as_bytes(),
+                );
+            }
+        }
+        Command::CacheClean(package) => {
+            let package = package.map(|name| normalize_name(&name)).transpose()?;
+            let archives = cached_archives(fs, package.as_deref())?;
+            let mut total = 0;
+            for archive in &archives {
+                fs.remove(&archive.path, false)
+                    .map_err(|error| format!("wpkg: cannot remove {}: {error}", archive.path))?;
+                total += archive.bytes;
+            }
+            output.extend_from_slice(
+                format!(
+                    "Removed {} cached {} ({})\n",
+                    archives.len(),
+                    if archives.len() == 1 {
+                        "archive"
+                    } else {
+                        "archives"
+                    },
+                    format_size(total)
+                )
+                .as_bytes(),
+            );
+        }
     }
     Ok(output)
 }
@@ -516,29 +582,51 @@ fn install_version(
     manifest: &Manifest,
     progress: &mut dyn FnMut(&str),
 ) -> Result<Option<String>, String> {
-    progress(&format!(
-        "⬇️ Downloading {} {}...\n",
-        manifest.name, manifest.version
-    ));
-    let archive = repository.fetch_with_progress(&manifest.url, &mut |percent| {
-        if percent == 100 || percent.is_multiple_of(10) {
+    let cache_path = cache_path(manifest);
+    let cached = fs
+        .read_file(&cache_path)
+        .ok()
+        .filter(|bytes| install::sha256_hex(bytes).eq_ignore_ascii_case(&manifest.sha256));
+    let archive = match cached {
+        Some(archive) => {
             progress(&format!(
-                "⬇️ Downloading {} {}: {percent}%\n",
+                "📦 Using cached {} {}\n",
                 manifest.name, manifest.version
             ));
+            archive
         }
-    })?;
-    progress(&format!(
-        "🔎 Verifying {} {}...\n",
-        manifest.name, manifest.version
-    ));
-    let actual = install::sha256_hex(&archive);
-    if !actual.eq_ignore_ascii_case(&manifest.sha256) {
-        return Err(format!(
-            "wpkg: SHA-256 mismatch for {} {} (expected {}, got {actual})",
-            manifest.name, manifest.version, manifest.sha256
-        ));
-    }
+        None => {
+            progress(&format!(
+                "⬇️ Downloading {} {}...\n",
+                manifest.name, manifest.version
+            ));
+            let archive = repository.fetch_with_progress(&manifest.url, &mut |percent| {
+                if percent == 100 || percent.is_multiple_of(10) {
+                    progress(&format!(
+                        "⬇️ Downloading {} {}: {percent}%\n",
+                        manifest.name, manifest.version
+                    ));
+                }
+            })?;
+            progress(&format!(
+                "🔎 Verifying {} {}...\n",
+                manifest.name, manifest.version
+            ));
+            let actual = install::sha256_hex(&archive);
+            if !actual.eq_ignore_ascii_case(&manifest.sha256) {
+                return Err(format!(
+                    "wpkg: SHA-256 mismatch for {} {} (expected {}, got {actual})",
+                    manifest.name, manifest.version, manifest.sha256
+                ));
+            }
+            // Only a verified archive is cached; a stale or damaged copy is
+            // replaced.
+            fs.mkdir(CACHE)
+                .and_then(|_| fs.write_file(&cache_path, archive.clone()))
+                .map_err(|error| format!("wpkg: cannot cache {}: {error}", manifest.name))?;
+            archive
+        }
+    };
 
     progress(&format!(
         "🛠️ Installing {} {}...\n",
@@ -657,13 +745,17 @@ fn install_version(
     Ok(previous_default.filter(|default| default != &manifest.version))
 }
 
-fn package_entries(archive: &[u8], url: &str) -> Result<Vec<PackageEntry>, String> {
-    let url_path = url
-        .split(['?', '#'])
+/// Whether a manifest URL names a 7z archive (anything else is ZIP).
+fn archive_is_7z(url: &str) -> bool {
+    url.split(['?', '#'])
         .next()
         .unwrap_or(url)
-        .to_ascii_lowercase();
-    if !url_path.ends_with(".7z") {
+        .to_ascii_lowercase()
+        .ends_with(".7z")
+}
+
+fn package_entries(archive: &[u8], url: &str) -> Result<Vec<PackageEntry>, String> {
+    if !archive_is_7z(url) {
         return install::zip_entries(archive)?
             .into_iter()
             .map(|entry| {
@@ -817,6 +909,83 @@ fn remove_package(fs: &mut WinFs, name: &str, spec: Option<&str>) -> Result<Stri
         Some(_) => format!("{name} {}", package.default),
         None => name.to_string(),
     })
+}
+
+/// `<package>#<version>#<arch>.<zip|7z>`: `#` cannot occur in package
+/// names or versions, so a file name maps back to exactly one package.
+fn cache_path(manifest: &Manifest) -> String {
+    let extension = if archive_is_7z(&manifest.url) {
+        "7z"
+    } else {
+        "zip"
+    };
+    format!(
+        r"{CACHE}\{}#{}#{}.{extension}",
+        manifest.name, manifest.version, manifest.arch
+    )
+}
+
+struct CachedArchive {
+    path: String,
+    name: String,
+    version: String,
+    arch: String,
+    bytes: u64,
+}
+
+/// Cached archives, optionally for one package, sorted by package then
+/// version. Files wpkg did not name are left alone.
+fn cached_archives(fs: &WinFs, package: Option<&str>) -> Result<Vec<CachedArchive>, String> {
+    if !fs.is_dir(CACHE) {
+        return Ok(Vec::new());
+    }
+    let mut archives = Vec::new();
+    for file in fs
+        .list_dir(CACHE)
+        .map_err(|error| format!("wpkg: cannot list {CACHE}: {error}"))?
+    {
+        let Some(stem) = file
+            .strip_suffix(".zip")
+            .or_else(|| file.strip_suffix(".7z"))
+        else {
+            continue;
+        };
+        let mut parts = stem.split('#');
+        let (Some(name), Some(version), Some(arch), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if package.is_some_and(|package| !package.eq_ignore_ascii_case(name)) {
+            continue;
+        }
+        let path = format!(r"{CACHE}\{file}");
+        archives.push(CachedArchive {
+            bytes: fs.file_len(&path).unwrap_or_default(),
+            path,
+            name: name.to_string(),
+            version: version.to_string(),
+            arch: arch.to_string(),
+        });
+    }
+    archives.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| compare_versions(&left.version, &right.version))
+    });
+    Ok(archives)
+}
+
+fn format_size(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    let value = bytes as f64;
+    if value >= KIB * KIB {
+        format!("{:.1} MiB", value / (KIB * KIB))
+    } else if value >= KIB {
+        format!("{:.1} KiB", value / KIB)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 fn uninstall_key(name: &str, version: &str) -> String {
@@ -1957,6 +2126,122 @@ mod tests {
         let registry = Registry::load(&fs).unwrap();
         let uninstall = registry.key(Hive::LocalMachine, UNINSTALL_KEY).unwrap();
         assert!(uninstall.subkey_names().is_empty());
+    }
+
+    fn install_with_progress(fs: &mut WinFs, repo: &MemoryRepo, spec: &str) -> Vec<String> {
+        let mut progress = Vec::new();
+        execute_with_progress(fs, repo, "x64", &args(&["install", spec]), &mut |message| {
+            progress.push(message.to_string())
+        })
+        .unwrap();
+        progress
+    }
+
+    #[test]
+    fn reinstalling_a_version_uses_the_verified_cache_without_downloading() {
+        let mut repo = MemoryRepo::default();
+        repo.package("tool", "1.0", "x64", &["tool.exe"], &[]);
+        let mut fs = WinFs::ephemeral_runner();
+        let progress = install_with_progress(&mut fs, &repo, "tool");
+        assert!(progress[0].contains("Downloading tool 1.0"), "{progress:?}");
+        let cached = r"C:\ProgramData\wpkg\cache\tool#1.0#x64.zip";
+        assert_eq!(
+            fs.read_file(cached).unwrap(),
+            repo.files["https://packages.invalid/tool-1.0-x64.zip"]
+        );
+
+        // Offline: the archive URL is gone, yet the reinstall succeeds.
+        run(&mut fs, &repo, &["remove", "tool"]);
+        repo.files
+            .remove("https://packages.invalid/tool-1.0-x64.zip");
+        let progress = install_with_progress(&mut fs, &repo, "tool");
+        assert_eq!(progress[0], "📦 Using cached tool 1.0\n");
+        assert!(!progress.iter().any(|line| line.contains("Downloading")));
+        assert_eq!(
+            fs.read_file(r"C:\ProgramData\wpkg\bin\tool.exe").unwrap(),
+            b"MZ 1.0"
+        );
+    }
+
+    #[test]
+    fn a_damaged_cached_archive_is_downloaded_again_and_replaced() {
+        let mut repo = MemoryRepo::default();
+        repo.package("tool", "1.0", "x64", &["tool.exe"], &[]);
+        let mut fs = WinFs::ephemeral_runner();
+        let cached = r"C:\ProgramData\wpkg\cache\tool#1.0#x64.zip";
+        fs.mkdir(r"C:\ProgramData\wpkg\cache").unwrap();
+        fs.write_file(cached, b"tampered".to_vec()).unwrap();
+        let progress = install_with_progress(&mut fs, &repo, "tool");
+        assert!(progress[0].contains("Downloading"), "{progress:?}");
+        assert_eq!(
+            fs.read_file(cached).unwrap(),
+            repo.files["https://packages.invalid/tool-1.0-x64.zip"]
+        );
+    }
+
+    #[test]
+    fn archives_that_fail_verification_are_not_cached() {
+        let mut repo = MemoryRepo::default();
+        repo.package("bad", "1", "x64", &["bad.exe"], &[]);
+        repo.add(
+            "https://packages.invalid/bad-1-x64.zip",
+            b"not the archive".to_vec(),
+        );
+        let mut fs = WinFs::ephemeral_runner();
+        assert!(execute(&mut fs, &repo, "x64", &args(&["install", "bad"]))
+            .unwrap_err()
+            .contains("SHA-256 mismatch"));
+        assert!(!fs.exists(r"C:\ProgramData\wpkg\cache\bad#1#x64.zip"));
+    }
+
+    #[test]
+    fn cache_lists_and_cleans_archives_per_package() {
+        let mut repo = MemoryRepo::default();
+        repo.package("tool", "1.0", "x64", &["tool.exe"], &[]);
+        repo.package("tool", "2.0", "x64", &["tool.exe"], &[]);
+        repo.package("tool-extra", "1.0", "x64", &["extra.exe"], &[]);
+        let mut fs = WinFs::ephemeral_runner();
+        assert_eq!(run(&mut fs, &repo, &["cache"]), "Cache is empty.\n");
+        run(&mut fs, &repo, &["install", "tool@1"]);
+        run(&mut fs, &repo, &["install", "tool@2"]);
+        run(&mut fs, &repo, &["install", "tool-extra"]);
+        fs.write_file(r"C:\ProgramData\wpkg\cache\notes.txt", b"keep".to_vec())
+            .unwrap();
+
+        let listing = run(&mut fs, &repo, &["cache"]);
+        let lines: Vec<_> = listing.lines().collect();
+        assert!(lines[0].starts_with("tool 1.0 (x64) "), "{listing}");
+        assert!(lines[1].starts_with("tool 2.0 (x64) "), "{listing}");
+        assert!(lines[2].starts_with("tool-extra 1.0 (x64) "), "{listing}");
+        assert!(
+            lines[3].starts_with("Total: ") && lines[3].contains(" in 3 archives at "),
+            "{listing}"
+        );
+
+        // `tool` does not match `tool-extra`.
+        let cleaned = run(&mut fs, &repo, &["cache", "clean", "tool"]);
+        assert!(
+            cleaned.starts_with("Removed 2 cached archives ("),
+            "{cleaned}"
+        );
+        assert!(run(&mut fs, &repo, &["cache"]).starts_with("tool-extra 1.0"));
+        let cleaned = run(&mut fs, &repo, &["cache", "clean"]);
+        assert!(
+            cleaned.starts_with("Removed 1 cached archive ("),
+            "{cleaned}"
+        );
+        assert_eq!(run(&mut fs, &repo, &["cache"]), "Cache is empty.\n");
+        assert!(fs.is_file(r"C:\ProgramData\wpkg\cache\notes.txt"));
+        // Installed packages are unaffected.
+        assert!(fs.is_file(r"C:\ProgramData\wpkg\bin\tool.exe"));
+        assert!(execute(&mut fs, &repo, "x64", &args(&["cache", "prune"])).is_err());
+    }
+
+    #[test]
+    fn sizes_use_binary_units() {
+        assert_eq!(format_size(512), "512 B");
+        assert_eq!(format_size(1536), "1.5 KiB");
+        assert_eq!(format_size(3 * 1024 * 1024), "3.0 MiB");
     }
 
     #[test]

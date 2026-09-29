@@ -1589,6 +1589,7 @@ fn wpkg_registry_metadata_is_available_in_ephemeral_shells() {
         "wpkg search node
 wpkg info nodejs
 wpkg list
+wpkg cache
 exit
 ",
         &[],
@@ -1606,6 +1607,7 @@ exit
         stdout.contains("No packages installed."),
         "stdout: {stdout}"
     );
+    assert!(stdout.contains("Cache is empty."), "stdout: {stdout}");
 }
 
 #[test]

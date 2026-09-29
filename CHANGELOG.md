@@ -15,6 +15,12 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Cache verified wpkg archives in
+  `C:\ProgramData\wpkg\cache\<package>#<version>#<arch>.<zip|7z>` and reuse a
+  cached copy that still matches the manifest's SHA-256 instead of
+  downloading, so reinstalls work offline; a damaged copy is downloaded again
+  and replaced. `wpkg cache` lists cached archives with sizes and
+  `wpkg cache clean [package]` removes them.
 - List each wpkg-installed version under
   `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\wpkg-<package>-<version>`
   with its display name, version, publisher, install location, uninstall
