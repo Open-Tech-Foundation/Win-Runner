@@ -293,33 +293,45 @@ pub(super) extern "win64" fn native_reg_get_value_w(
             .value(&optional_wide(value_name).unwrap_or_default())
             .ok_or(ERROR_FILE_NOT_FOUND)?
             .clone();
-        let value = if value.kind == winreg::REG_EXPAND_SZ && flags & RRF_NOEXPAND == 0 {
-            let environment = process_ctx()
-                .and_then(|process| process.environment.lock().ok().map(|env| env.clone()))
-                .unwrap_or_default();
-            RegValue::string(&winreg::expand_environment_strings(
-                &value.as_str().unwrap_or_default(),
-                &environment,
-            ))
-        } else {
-            value
-        };
-        let type_bit = match value.kind {
-            0 => 0x01,
-            winreg::REG_SZ => 0x02,
-            winreg::REG_EXPAND_SZ => 0x04,
-            winreg::REG_BINARY => 0x08,
-            winreg::REG_DWORD => 0x10,
-            winreg::REG_MULTI_SZ => 0x20,
-            winreg::REG_QWORD => 0x40,
-            _ => 0,
-        };
-        if flags & 0xffff & type_bit == 0 {
-            return Err(ERROR_UNSUPPORTED_TYPE);
-        }
+        let environment = process_ctx()
+            .and_then(|process| process.environment.lock().ok().map(|env| env.clone()))
+            .unwrap_or_default();
+        let value = get_value_result(value, flags, &environment)?;
         write_out(value_type, value.kind);
         copy_out(&value.data, data, data_len)
     })())
+}
+
+/// `RegGetValueW`'s view of a stored value: `REG_EXPAND_SZ` is expanded
+/// with `environment` (and reported as `REG_SZ`) unless `RRF_NOEXPAND` is
+/// set, then the `RRF_RT_*` type mask must allow the result.
+fn get_value_result(
+    value: RegValue,
+    flags: u32,
+    environment: &[(String, String)],
+) -> Result<RegValue, u32> {
+    let value = if value.kind == winreg::REG_EXPAND_SZ && flags & RRF_NOEXPAND == 0 {
+        RegValue::string(&winreg::expand_environment_strings(
+            &value.as_str().unwrap_or_default(),
+            environment,
+        ))
+    } else {
+        value
+    };
+    let type_bit = match value.kind {
+        0 => 0x01,
+        winreg::REG_SZ => 0x02,
+        winreg::REG_EXPAND_SZ => 0x04,
+        winreg::REG_BINARY => 0x08,
+        winreg::REG_DWORD => 0x10,
+        winreg::REG_MULTI_SZ => 0x20,
+        winreg::REG_QWORD => 0x40,
+        _ => 0,
+    };
+    if flags & 0xffff & type_bit == 0 {
+        return Err(ERROR_UNSUPPORTED_TYPE);
+    }
+    Ok(value)
 }
 
 pub(super) extern "win64" fn native_reg_delete_value_w(key: u64, value_name: *const u16) -> u32 {
@@ -820,10 +832,16 @@ mod tests {
             data.as_ptr(),
             data.len() as u32,
         );
-        let process = process_ctx().unwrap();
-        let saved = process.environment.lock().unwrap().clone();
-        *process.environment.lock().unwrap() =
-            vec![("SystemRoot".to_string(), r"C:\Windows".to_string())];
+        // Expansion itself is checked on the pure rule below, so this test
+        // leaves the shared test process's environment alone.
+        let environment = vec![("SystemRoot".to_string(), r"C:\Windows".to_string())];
+        let expanded = get_value_result(
+            RegValue::expand_string(r"%SystemRoot%\x"),
+            0x02,
+            &environment,
+        )
+        .unwrap();
+        assert_eq!(expanded, RegValue::string(r"C:\Windows\x"));
         let read = |flags: u32| {
             let mut kind = 0;
             let mut buffer = [0u8; 64];
@@ -839,11 +857,6 @@ mod tests {
             );
             (status, kind, buffer[..len as usize].to_vec())
         };
-        // RRF_RT_REG_SZ expands; RRF_NOEXPAND keeps the raw text.
-        let (status, kind, bytes) = read(0x02);
-        *process.environment.lock().unwrap() = saved;
-        assert_eq!((status, kind), (0, winreg::REG_SZ));
-        assert_eq!(bytes, RegValue::string(r"C:\Windows\x").data);
         let (status, kind, bytes) = read(0x04 | RRF_NOEXPAND);
         assert_eq!((status, kind), (0, winreg::REG_EXPAND_SZ));
         assert_eq!(bytes, data);
