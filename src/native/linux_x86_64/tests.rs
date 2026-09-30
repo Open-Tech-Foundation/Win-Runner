@@ -941,6 +941,41 @@ mod protection_tests {
     }
 
     #[test]
+    fn wait_for_multiple_objects_reports_the_first_signaled_or_all() {
+        let first = super::native_create_event_w(0, 1, 0, std::ptr::null());
+        let second = super::native_create_event_w(0, 1, 0, std::ptr::null());
+        let handles = [first, second];
+        assert_eq!(
+            super::native_wait_for_multiple_objects(2, handles.as_ptr(), 0, 0),
+            258,
+            "nothing signaled: WAIT_TIMEOUT"
+        );
+        super::native_set_event(second);
+        assert_eq!(super::native_wait_for_multiple_objects(2, handles.as_ptr(), 0, 50), 1);
+        assert_eq!(super::native_wait_for_multiple_objects(2, handles.as_ptr(), 1, 0), 258);
+        super::native_set_event(first);
+        assert_eq!(super::native_wait_for_multiple_objects(2, handles.as_ptr(), 1, 50), 0);
+        assert_eq!(super::native_wait_for_multiple_objects(0, handles.as_ptr(), 0, 0), u32::MAX);
+        // Signal one object and wait on another in a single call.
+        let signal = super::native_create_event_w(0, 1, 0, std::ptr::null());
+        assert_eq!(super::native_signal_object_and_wait(signal, first, 0, 0), 0);
+        assert_eq!(super::native_wait_for_single_object(signal, 0), 0);
+    }
+
+    #[test]
+    fn open_event_finds_named_events_of_the_process() {
+        let name: Vec<u16> = "winrun-open-event-test".encode_utf16().chain([0]).collect();
+        assert_eq!(super::native_open_event_w(0x1f0003, 0, name.as_ptr()), 0);
+        let created = super::native_create_event_w(0, 1, 0, name.as_ptr());
+        assert_ne!(created, 0);
+        let opened = super::native_open_event_w(0x1f0003, 0, name.as_ptr());
+        assert_ne!(opened, 0);
+        assert_ne!(opened, created);
+        assert_eq!(super::native_set_event(created), 1);
+        assert_eq!(super::native_wait_for_single_object(opened, 0), 0);
+    }
+
+    #[test]
     fn find_first_file_reports_directories_sizes_and_names() {
         let context = super::fs_ctx().unwrap();
         {

@@ -609,6 +609,8 @@ All notable changes to this project will be documented in this file.
   `RtlRestoreContext` (including `STATUS_UNWIND_CONSOLIDATE` catch callbacks)
   unwind guest frames and resume at the target, so MSVC `try`/`catch` and
   rethrow work in guest DLLs such as the .NET host.
+- Add `WaitForMultipleObjects(Ex)`, `SignalObjectAndWait`, and `OpenEventW`
+  for named events.
 - Added guest-disk installation for Chocolatey's `7zip.install`: the verified
   package is extracted into WinFS, its silent installer runs through the
   native backend, and `7z` remains available after snapshot reload.

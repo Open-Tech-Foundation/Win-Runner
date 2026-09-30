@@ -460,6 +460,14 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "fmaf" => Some(native_crt_fmaf as *const () as usize as u64),
         "modf" => Some(native_crt_modf as *const () as usize as u64),
         "modff" => Some(native_crt_modff as *const () as usize as u64),
+        "WaitForMultipleObjects" => {
+            Some(native_wait_for_multiple_objects as *const () as usize as u64)
+        }
+        "WaitForMultipleObjectsEx" => {
+            Some(native_wait_for_multiple_objects_ex as *const () as usize as u64)
+        }
+        "SignalObjectAndWait" => Some(native_signal_object_and_wait as *const () as usize as u64),
+        "OpenEventW" => Some(native_open_event_w as *const () as usize as u64),
         "__stdio_common_vsnwprintf_s" => {
             Some(native_crt_stdio_common_vsnwprintf_s as *const () as usize as u64)
         }

@@ -650,6 +650,40 @@ pub(super) extern "win64" fn native_create_event_w(
     };
     result
 }
+/// `OpenEventW`: a new handle to an existing named event of this process,
+/// or `ERROR_FILE_NOT_FOUND`.
+pub(super) extern "win64" fn native_open_event_w(_access: u32, _inherit: i32, name: *const u16) -> u64 {
+    let Some(process) = process_ctx() else {
+        return 0;
+    };
+    let Some(name) = wide(name).filter(|name| !name.is_empty()) else {
+        native_set_last_error(87);
+        return 0;
+    };
+    let event = process
+        .event_names
+        .lock()
+        .ok()
+        .and_then(|names| names.get(&name).and_then(std::sync::Weak::upgrade));
+    let Some(event) = event else {
+        native_set_last_error(2);
+        return 0;
+    };
+    let handle = process.event_next.fetch_add(4, Ordering::AcqRel);
+    let inserted = match process.events.lock() {
+        Ok(mut events) => {
+            events.insert(handle, event);
+            true
+        }
+        Err(_) => false,
+    };
+    if !inserted {
+        return 0;
+    }
+    native_set_last_error(0);
+    handle
+}
+
 pub(super) extern "win64" fn native_create_event_ex_w(
     attributes: u64,
     name: *const u16,
@@ -1231,4 +1265,87 @@ pub(super) extern "win64" fn native_sleep(milliseconds: u32) {
 pub(super) extern "win64" fn native_switch_to_thread() -> i32 {
     std::thread::yield_now();
     1
+}
+
+const WAIT_TIMEOUT: u32 = 258;
+const WAIT_ABANDONED_0: u32 = 0x80;
+const WAIT_FAILED: u32 = u32::MAX;
+
+/// `WaitForMultipleObjects(Ex)` over the single-object wait: "any" polls
+/// each handle until one is signaled (returning `WAIT_OBJECT_0 + i` or
+/// `WAIT_ABANDONED_0 + i`); "all" waits on each in turn within the one
+/// timeout. No APCs are ever queued, so alertable waits behave the same.
+pub(super) extern "win64" fn native_wait_for_multiple_objects_ex(
+    count: u32,
+    handles: *const u64,
+    wait_all: i32,
+    milliseconds: u32,
+    _alertable: i32,
+) -> u32 {
+    if count == 0 || count > 64 || handles.is_null() {
+        native_set_last_error(87);
+        return WAIT_FAILED;
+    }
+    let handles: Vec<u64> = (0..count as usize)
+        .map(|index| unsafe { handles.add(index).read_unaligned() })
+        .collect();
+    let deadline = (milliseconds != u32::MAX).then(|| {
+        std::time::Instant::now() + std::time::Duration::from_millis(u64::from(milliseconds))
+    });
+    let remaining = || match deadline {
+        None => u32::MAX,
+        Some(deadline) => deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .as_millis()
+            .min(u128::from(u32::MAX - 1)) as u32,
+    };
+    if wait_all != 0 {
+        for handle in &handles {
+            match native_wait_for_single_object(*handle, remaining()) {
+                0 | WAIT_ABANDONED_0 => {}
+                other => return other,
+            }
+        }
+        return 0;
+    }
+    loop {
+        for (index, handle) in handles.iter().enumerate() {
+            match native_wait_for_single_object(*handle, 0) {
+                0 => return index as u32,
+                WAIT_ABANDONED_0 => return WAIT_ABANDONED_0 + index as u32,
+                WAIT_TIMEOUT => {}
+                failed => return failed,
+            }
+        }
+        if remaining() == 0 {
+            return WAIT_TIMEOUT;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+pub(super) extern "win64" fn native_wait_for_multiple_objects(
+    count: u32,
+    handles: *const u64,
+    wait_all: i32,
+    milliseconds: u32,
+) -> u32 {
+    native_wait_for_multiple_objects_ex(count, handles, wait_all, milliseconds, 0)
+}
+
+/// `SignalObjectAndWait`: signal an event (or release a semaphore), then
+/// wait on the other object.
+pub(super) extern "win64" fn native_signal_object_and_wait(
+    signal: u64,
+    wait: u64,
+    milliseconds: u32,
+    _alertable: i32,
+) -> u32 {
+    if native_set_event(signal) == 0
+        && native_release_semaphore(signal, 1, std::ptr::null_mut()) == 0
+    {
+        native_set_last_error(6);
+        return WAIT_FAILED;
+    }
+    native_wait_for_single_object(wait, milliseconds)
 }
