@@ -645,6 +645,9 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add `tests/esrun_native.rs`, which runs ES-Runtime's `esrun.exe` (set
+  `WINRUN_ESRUN_EXE`) through Windows path cases: forward slashes, `C:/`,
+  `..`, case-insensitive names, `realPath`, and recursive removal.
 - Add the UCRT and VCRUNTIME imports ES-Runtime calls: C-locale `mbtowc`,
   `mbrtowc`, `mbsrtowcs`, `wcrtomb(_s)`, and `___mb_cur_max_l_func`;
   `strcpy`, `strcat`, `isalnum`, `isprint`, `strtof` and the `_l` string to
