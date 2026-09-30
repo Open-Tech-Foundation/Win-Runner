@@ -48,21 +48,48 @@ pub(super) fn map(img: &PeImage) -> Result<Mapping, String> {
     })
 }
 
-/// Reserve a non-conflicting host address and rebase a child image to the
-/// address actually chosen by the kernel.
-#[allow(dead_code)] // attached to CreateProcessW's child launcher next
-pub(super) fn map_relocated(img: &PeImage) -> Result<(Mapping, PeImage), String> {
-    let len = page_len(img.image.len())?;
+/// Windows places images on its 64 KiB allocation granularity, and
+/// runtimes rely on it (CoreCLR rejects an IL image whose `ImageBase` is
+/// not 64 KiB-aligned), so image mappings are carved from an oversized
+/// anonymous mapping at the first aligned address.
+fn mmap_image_region(len: usize) -> *mut c_void {
+    const GRANULARITY: usize = 0x10000;
+    let Some(reserved) = len.checked_add(GRANULARITY) else {
+        return MAP_FAILED;
+    };
     let raw = unsafe {
         mmap(
             ptr::null_mut(),
-            len,
+            reserved,
             PROT_READ | PROT_WRITE,
             MAP_PRIVATE | MAP_ANONYMOUS,
             -1,
             0,
         )
     };
+    if raw == MAP_FAILED {
+        return raw;
+    }
+    let start = raw as usize;
+    let aligned = (start + GRANULARITY - 1) & !(GRANULARITY - 1);
+    unsafe {
+        if aligned > start {
+            munmap(raw, aligned - start);
+        }
+        let tail = start + reserved - (aligned + len);
+        if tail > 0 {
+            munmap((aligned + len) as *mut c_void, tail);
+        }
+    }
+    aligned as *mut c_void
+}
+
+/// Reserve a non-conflicting host address and rebase a child image to the
+/// address actually chosen by the kernel.
+#[allow(dead_code)] // attached to CreateProcessW's child launcher next
+pub(super) fn map_relocated(img: &PeImage) -> Result<(Mapping, PeImage), String> {
+    let len = page_len(img.image.len())?;
+    let raw = mmap_image_region(len);
     if raw == MAP_FAILED {
         return Err(format!(
             "native backend could not reserve relocated image: {}",
@@ -83,9 +110,62 @@ pub(super) fn map_relocated(img: &PeImage) -> Result<(Mapping, PeImage), String>
     Ok((mapping, relocated))
 }
 
+/// Map an IL-only image at any free address. It holds no absolute
+/// addresses, so nothing is relocated; a PE32+ header's `ImageBase` is set
+/// to the actual base, as the Windows loader does for a moved image.
+pub(super) fn map_il_only(img: &PeImage) -> Result<(Mapping, PeImage), String> {
+    let len = page_len(img.image.len())?;
+    let raw = mmap_image_region(len);
+    if raw == MAP_FAILED {
+        return Err(format!(
+            "native backend could not map IL image: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mapping = Mapping {
+        ptr: raw.cast(),
+        len,
+    };
+    let mut mapped = img.clone();
+    mapped.image_base = raw as u64;
+    let header = u32::from_le_bytes(mapped.image[0x3c..0x40].try_into().unwrap()) as usize;
+    let optional = header + 24;
+    if mapped.image.get(optional..optional + 2) == Some(&0x20bu16.to_le_bytes()[..]) {
+        mapped.image[optional + 24..optional + 32].copy_from_slice(&(raw as u64).to_le_bytes());
+    }
+    unsafe { ptr::copy_nonoverlapping(mapped.image.as_ptr(), mapping.ptr, mapped.image.len()) };
+    Ok((mapping, mapped))
+}
+
 #[cfg(test)]
 mod relocated_map_tests {
     use super::{map_relocated, PeImage};
+
+    #[test]
+    fn maps_il_images_anywhere_and_records_the_base_in_the_header() {
+        let mut bytes = vec![0; 0x200];
+        bytes[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        bytes[0x98..0x9a].copy_from_slice(&0x20bu16.to_le_bytes());
+        bytes[0xb0..0xb8].copy_from_slice(&0x1_4000_0000u64.to_le_bytes());
+        let image = PeImage {
+            is_dll: false,
+            image_base: 0x1_4000_0000,
+            entry_rva: 0,
+            size_of_image: 0x200,
+            image: bytes,
+            imports: vec![],
+            exports: vec![],
+            unsupported: vec![],
+            tls: None,
+            code_ranges: vec![],
+            relocations: vec![],
+        };
+        let (mapping, mapped) = super::map_il_only(&image).unwrap();
+        assert_eq!(mapped.image_base, mapping.ptr as u64);
+        assert_eq!(mapping.ptr as u64 % 0x10000, 0, "64 KiB allocation granularity");
+        let header_base = unsafe { mapping.ptr.add(0xb0).cast::<u64>().read_unaligned() };
+        assert_eq!(header_base, mapping.ptr as u64);
+    }
 
     #[test]
     fn maps_at_the_reserved_address_and_applies_dir64_delta() {
@@ -106,6 +186,7 @@ mod relocated_map_tests {
         };
         let (mapping, relocated) = map_relocated(&image).unwrap();
         assert_eq!(relocated.image_base, mapping.ptr as u64);
+        assert_eq!(mapping.ptr as u64 % 0x10000, 0, "64 KiB allocation granularity");
         let value = unsafe {
             u64::from_le_bytes(
                 std::slice::from_raw_parts(mapping.ptr, 8)
@@ -878,16 +959,20 @@ pub(super) unsafe fn ascii_z(ptr: *const u8) -> Option<&'static str> {
 pub(super) extern "win64" fn native_load_library_ex_w(
     path: *const u16,
     _file: u64,
-    _flags: u32,
+    flags: u32,
 ) -> u64 {
     let Some(path) = wide(path) else {
         native_set_last_error(126);
         return 0;
     };
-    load_guest_module(&path).unwrap_or_else(|| {
+    let module = load_guest_module(&path).unwrap_or_else(|| {
         native_set_last_error(126); // ERROR_MOD_NOT_FOUND
         0
-    })
+    });
+    if native_diagnostic_enabled() {
+        eprintln!("native LoadLibraryExW path={path} flags={flags:#x} module={module:#x}");
+    }
+    module
 }
 
 pub(super) extern "win64" fn native_load_library_w(path: *const u16) -> u64 {
@@ -1262,8 +1347,13 @@ fn load_guest_module_inner(
     let mut provisional_module = None;
     let mut dependencies = Vec::new();
     let result = (|| {
-        let image = crate::pe::load_lenient(&bytes).ok()?;
-        if !image.is_dll {
+        // IL-only assemblies load even when they are EXE images (as .NET
+        // app assemblies are): they have no entry point to run.
+        let (image, il_only) = match crate::pe::load_il_only(&bytes) {
+            Ok(image) => (image, true),
+            Err(_) => (crate::pe::load_lenient(&bytes).ok()?, false),
+        };
+        if !image.is_dll && !il_only {
             return None;
         }
         let tls_callbacks = image
@@ -1273,10 +1363,14 @@ fn load_guest_module_inner(
             .unwrap_or_default();
         let tls_index_rva = image.tls.as_ref().map(|tls| tls.index_rva);
 
-        let (mapping, image) = match map_relocated(&image) {
-            Ok(mapped) => mapped,
-            Err(_) if image.relocations.is_empty() => (map(&image).ok()?, image),
-            Err(_) => return None,
+        let (mapping, image) = if il_only {
+            map_il_only(&image).ok()?
+        } else {
+            match map_relocated(&image) {
+                Ok(mapped) => mapped,
+                Err(_) if image.relocations.is_empty() => (map(&image).ok()?, image),
+                Err(_) => return None,
+            }
         };
         protect_exec(&mapping).ok()?;
         let base = mapping.ptr as u64;
@@ -1320,6 +1414,12 @@ fn load_guest_module_inner(
             initialized: false,
         };
         let handle = module.base;
+        if native_diagnostic_enabled() {
+            eprintln!(
+                "native LoadLibrary mapped path={} base={:#x} size={:#x}",
+                module.path, module.base, module.size_of_image
+            );
+        }
         {
             let mut modules = process.loaded_modules.lock().ok()?;
             if let Some(existing) = modules.values().find(|loaded| {

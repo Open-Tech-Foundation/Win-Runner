@@ -179,6 +179,88 @@ pub fn load(data: &[u8]) -> Result<PeImage, String> {
     load_inner(data, true)
 }
 
+/// Map an IL-only .NET assembly (a PE32 or PE32+ image whose CLI header has
+/// `COMIMAGE_FLAGS_ILONLY`) as the 64-bit Windows loader does: headers and
+/// sections at their RVAs, with no imports bound, no relocations applied,
+/// and no entry point, since such an image contains no code to run
+/// natively. The runtime (CoreCLR) reads its metadata and IL through the
+/// mapping.
+pub fn load_il_only(data: &[u8]) -> Result<PeImage, String> {
+    const COMIMAGE_FLAGS_ILONLY: u32 = 0x1;
+    const CLR_DIRECTORY: usize = 14;
+    if data.len() < 0x40 || &data[0..2] != b"MZ" {
+        return Err("not a PE file (missing MZ)".to_string());
+    }
+    let e_lfanew = u32le(data, 0x3C)? as usize;
+    if data.get(e_lfanew..e_lfanew + 4) != Some(b"PE\0\0".as_slice()) {
+        return Err("not a PE file (missing PE signature)".to_string());
+    }
+    let coff = e_lfanew + 4;
+    let machine = u16le(data, coff)?;
+    if !matches!(machine, 0x014c | 0x8664) {
+        return Err(format!("unsupported IL image machine 0x{machine:04x}"));
+    }
+    let num_sections = u16le(data, coff + 2)? as usize;
+    let opt_size = u16le(data, coff + 16)? as usize;
+    let characteristics = u16le(data, coff + 18)?;
+    let opt = coff + 20;
+    let (image_base, directories) = match u16le(data, opt)? {
+        0x10b => (u64::from(u32le(data, opt + 28)?), opt + 96),
+        0x20b => (u64le(data, opt + 24)?, opt + 112),
+        magic => return Err(format!("unknown optional header magic 0x{magic:x}")),
+    };
+    let directory_count = u32le(data, directories - 4)? as usize;
+    if directory_count <= CLR_DIRECTORY || num_sections == 0 || num_sections > 96 {
+        return Err("not a .NET image (no CLI header)".to_string());
+    }
+    let clr_rva = u32le(data, directories + CLR_DIRECTORY * 8)? as usize;
+    let size_of_image = u32le(data, opt + 56)?;
+    let size_of_headers = u32le(data, opt + 60)? as usize;
+    if clr_rva == 0 {
+        return Err("not a .NET image (no CLI header)".to_string());
+    }
+    if size_of_image == 0 || size_of_image > 256 * 1024 * 1024 {
+        return Err("invalid SizeOfImage".to_string());
+    }
+    let mut image = vec![0u8; size_of_image as usize];
+    let header_len = size_of_headers.min(data.len()).min(image.len());
+    image[..header_len].copy_from_slice(&data[..header_len]);
+    let section_table = opt + opt_size;
+    for index in 0..num_sections {
+        let header = section_table + index * 40;
+        let virtual_address = u32le(data, header + 12)? as usize;
+        let raw_size = u32le(data, header + 16)? as usize;
+        let raw_offset = u32le(data, header + 20)? as usize;
+        let virtual_size = (u32le(data, header + 8)? as usize).max(raw_size);
+        let copied = raw_size.min(virtual_size);
+        let source = data
+            .get(raw_offset..raw_offset + copied)
+            .ok_or("section raw data out of bounds")?;
+        image
+            .get_mut(virtual_address..virtual_address + copied)
+            .ok_or("section virtual address out of bounds")?
+            .copy_from_slice(source);
+    }
+    // IMAGE_COR20_HEADER.Flags is at offset 16.
+    let flags = u32le(&image, clr_rva + 16)?;
+    if flags & COMIMAGE_FLAGS_ILONLY == 0 {
+        return Err("mixed-mode .NET image (not IL-only)".to_string());
+    }
+    Ok(PeImage {
+        is_dll: characteristics & 0x2000 != 0,
+        image_base,
+        entry_rva: 0,
+        size_of_image,
+        image,
+        imports: Vec::new(),
+        exports: Vec::new(),
+        unsupported: Vec::new(),
+        tls: None,
+        code_ranges: Vec::new(),
+        relocations: Vec::new(),
+    })
+}
+
 /// Parse without rejecting unknown imports. The native backend checks every
 /// import before guest execution and names unsupported APIs in its error.
 pub fn load_lenient(data: &[u8]) -> Result<PeImage, String> {
@@ -842,5 +924,67 @@ mod large_image_tests {
         assert!(load(&invalid)
             .unwrap_err()
             .contains("TLS address out of image"));
+    }
+}
+
+#[cfg(test)]
+mod il_only_tests {
+    use super::*;
+
+    /// A minimal PE32 AnyCPU assembly: one `.text` section holding a CLI
+    /// header with the given flags, an import of mscoree, and an entry stub.
+    fn il_image(cli_flags: u32) -> Vec<u8> {
+        let mut data = vec![0u8; 0x400];
+        data[0..2].copy_from_slice(b"MZ");
+        data[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        data[0x80..0x84].copy_from_slice(b"PE\0\0");
+        let coff = 0x84;
+        data[coff..coff + 2].copy_from_slice(&0x014cu16.to_le_bytes()); // i386
+        data[coff + 2..coff + 4].copy_from_slice(&1u16.to_le_bytes());
+        data[coff + 16..coff + 18].copy_from_slice(&0xe0u16.to_le_bytes());
+        data[coff + 18..coff + 20].copy_from_slice(&0x2102u16.to_le_bytes()); // DLL
+        let opt = coff + 20;
+        data[opt..opt + 2].copy_from_slice(&0x10bu16.to_le_bytes());
+        data[opt + 16..opt + 20].copy_from_slice(&0x2010u32.to_le_bytes()); // x86 entry stub
+        data[opt + 28..opt + 32].copy_from_slice(&0x1000_0000u32.to_le_bytes());
+        data[opt + 56..opt + 60].copy_from_slice(&0x4000u32.to_le_bytes());
+        data[opt + 60..opt + 64].copy_from_slice(&0x200u32.to_le_bytes());
+        data[opt + 92..opt + 96].copy_from_slice(&16u32.to_le_bytes());
+        let clr = opt + 96 + 14 * 8;
+        data[clr..clr + 4].copy_from_slice(&0x2000u32.to_le_bytes());
+        data[clr + 4..clr + 8].copy_from_slice(&0x48u32.to_le_bytes());
+        let section = opt + 0xe0;
+        data[section..section + 8].copy_from_slice(b".text\0\0\0");
+        data[section + 8..section + 12].copy_from_slice(&0x100u32.to_le_bytes());
+        data[section + 12..section + 16].copy_from_slice(&0x2000u32.to_le_bytes());
+        data[section + 16..section + 20].copy_from_slice(&0x200u32.to_le_bytes());
+        data[section + 20..section + 24].copy_from_slice(&0x200u32.to_le_bytes());
+        // IMAGE_COR20_HEADER at file offset 0x200 (RVA 0x2000).
+        data[0x200..0x204].copy_from_slice(&0x48u32.to_le_bytes());
+        data[0x210..0x214].copy_from_slice(&cli_flags.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn maps_il_only_pe32_assemblies_without_native_code() {
+        let image = load_il_only(&il_image(0x1)).unwrap();
+        assert!(image.is_dll);
+        assert_eq!(image.image_base, 0x1000_0000);
+        assert_eq!(image.entry_rva, 0, "the x86 entry stub is never run");
+        assert_eq!(image.size_of_image, 0x4000);
+        assert!(image.imports.is_empty() && image.relocations.is_empty());
+        assert_eq!(&image.image[0x2000..0x2004], &0x48u32.to_le_bytes());
+        // The strict native parser still rejects the 32-bit image.
+        assert!(load_lenient(&il_image(0x1)).is_err());
+    }
+
+    #[test]
+    fn rejects_mixed_mode_and_non_dotnet_images() {
+        assert!(load_il_only(&il_image(0x0)).unwrap_err().contains("mixed-mode"));
+        let mut native = il_image(0x1);
+        let clr = 0x84 + 20 + 96 + 14 * 8;
+        native[clr..clr + 8].fill(0);
+        assert!(load_il_only(&native).unwrap_err().contains("no CLI header"));
+        assert!(load_il_only(b"MZ").is_err());
     }
 }

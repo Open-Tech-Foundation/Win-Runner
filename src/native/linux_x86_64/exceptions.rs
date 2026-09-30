@@ -452,6 +452,17 @@ fn dispatch_exception(
     let Some(process) = process_ctx() else {
         return false;
     };
+    if native_diagnostic_enabled() {
+        eprintln!(
+            "native exception code={:#x} flags={:#x} address={:#x} info=[{:#x}, {:#x}] rsp={:#x}",
+            record.code,
+            record.flags,
+            record.address,
+            record.information[0],
+            record.information[1],
+            context_register(context, 4).unwrap_or(0)
+        );
+    }
     let mut pointers = NativeExceptionPointers { record, context };
     let callbacks: Vec<u64> = process
         .vectored_exception_handlers

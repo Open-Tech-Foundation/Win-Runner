@@ -623,6 +623,14 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Run modern .NET apps: a framework-dependent .NET 10 app now runs through
+  Microsoft's apphost, hostfxr, hostpolicy, CoreCLR, and RyuJIT on the
+  native backend and prints its output. `LoadLibrary` maps IL-only
+  assemblies (PE32 or PE32+, including EXE-kind app assemblies) as Windows
+  does, without imports, relocations, or an entry point, and image
+  mappings sit on the 64 KiB allocation granularity CoreCLR requires.
+  `tests/dotnet_native.rs` runs such an app when `WINRUN_DOTNET_FIXTURE`
+  names a fixture from `scripts/fetch-dotnet-fixture.sh`.
 - Add CRT `_beginthreadex`, `_fileno`, and `__stdio_common_vsnprintf_s`, and
   resolve `_write` from the UCRT API sets.
 - Add `RoInitialize`, `CoGetContextToken`, `GetErrorInfo`/`SetErrorInfo`
