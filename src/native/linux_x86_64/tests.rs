@@ -5928,6 +5928,27 @@ mod protection_tests {
     }
 
     #[test]
+    fn verify_version_info_compares_major_minor_and_service_pack_together() {
+        // IsWindowsVersionOrGreater(major, minor, sp) as the SDK writes it.
+        let at_least = |major: u32, minor: u32, service_pack: u16| {
+            let mut info = [0u8; 284];
+            info[..4].copy_from_slice(&284u32.to_le_bytes());
+            info[4..8].copy_from_slice(&major.to_le_bytes());
+            info[8..12].copy_from_slice(&minor.to_le_bytes());
+            info[276..278].copy_from_slice(&service_pack.to_le_bytes());
+            let mut mask = super::native_ver_set_condition_mask(0, 0x02, 3);
+            mask = super::native_ver_set_condition_mask(mask, 0x01, 3);
+            mask = super::native_ver_set_condition_mask(mask, 0x20, 3);
+            super::native_verify_version_info_w(info.as_ptr(), 0x02 | 0x01 | 0x20, mask)
+        };
+        assert_eq!(at_least(6, 1, 0), 1, "Windows 7 or later");
+        assert_eq!(at_least(6, 3, 0), 1, "Windows 8.1 or later");
+        assert_eq!(at_least(10, 0, 0), 1, "Windows 10 or later");
+        assert_eq!(at_least(10, 1, 0), 0);
+        assert_eq!(at_least(11, 0, 0), 0);
+    }
+
+    #[test]
     fn exposes_the_windows_current_thread_pseudo_handle() {
         assert_eq!(native_get_current_thread(), u64::MAX - 1);
     }

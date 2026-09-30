@@ -375,18 +375,44 @@ pub(super) extern "win64" fn native_verify_version_info_w(
         5 => actual <= expected,
         _ => false,
     };
-    let checks = [
+    // Major, minor, and service-pack major/minor form one version compared
+    // in that order under the condition of the most significant field
+    // present, so 10.0 satisfies "6.1 or greater".
+    let version_fields = [
         (0x02, 10, read32(4), 3),
         (0x01, 0, read32(8), 0),
-        (0x04, system_profile::OS_BUILD_NUMBER, read32(12), 6),
-        (0x08, 2, read32(16), 9),
         (0x20, 0, read16(276) as u32, 15),
         (0x10, 0, read16(278) as u32, 12),
+    ];
+    let version_holds = match version_fields.iter().find(|(bit, ..)| types & bit != 0) {
+        None => true,
+        Some(&(_, _, _, condition_shift)) => {
+            let condition = (mask >> condition_shift) & 7;
+            let mut holds = true;
+            for &(bit, actual, expected, _) in &version_fields {
+                if types & bit == 0 {
+                    continue;
+                }
+                holds = matches(actual, expected, condition_shift);
+                // Later fields decide only while this one is equal and the
+                // condition is relational.
+                if actual != expected || !(1..=5).contains(&condition) {
+                    break;
+                }
+            }
+            holds
+        }
+    };
+    let checks = [
+        (0x04, system_profile::OS_BUILD_NUMBER, read32(12), 6),
+        (0x08, 2, read32(16), 9),
         (0x80, 1, unsafe { *info.add(282) } as u32, 21),
     ];
-    if checks.iter().any(|(bit, actual, expected, shift)| {
-        types & bit != 0 && !matches(*actual, *expected, *shift)
-    }) {
+    if !version_holds
+        || checks.iter().any(|(bit, actual, expected, shift)| {
+            types & bit != 0 && !matches(*actual, *expected, *shift)
+        })
+    {
         native_set_last_error(1150); // ERROR_OLD_WIN_VERSION
         0
     } else {

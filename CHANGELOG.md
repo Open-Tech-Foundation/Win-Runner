@@ -11,6 +11,9 @@ All notable changes to this project will be documented in this file.
   addresses outside guest allocations: gaps read as `MEM_FREE` and host
   mappings as reserved. CoreCLR's GC sizes and places its heap from these and
   previously failed with `E_OUTOFMEMORY`.
+- Compare `VerifyVersionInfoW`'s major, minor, and service-pack fields as one
+  version, as Windows does, so `IsWindowsVersionOrGreater(6, 1, 0)` (the
+  CoreCLR "Windows 7 is the minimum" check) succeeds on Windows 10.
 - Report each `FindFirstFileExW`/`FindNextFileW` result's attributes (with
   `FILE_ATTRIBUTE_DIRECTORY` for directories), timestamps, and size instead of
   only its name, so programs that walk directories, such as the .NET host
