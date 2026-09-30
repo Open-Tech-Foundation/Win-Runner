@@ -21,6 +21,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+pub mod full_path;
 mod win_path;
 use win_path::{is_extended_path, windows_name_key};
 pub(crate) use win_path::{parse as parse_win_path, DosDevicePath, ParsedWinPath};

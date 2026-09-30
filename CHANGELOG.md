@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Compute `GetFullPathNameW` as Windows does, as a string transformation
+  against the current directory that never consults the disk, and report its
+  file part: `...` components and a trailing separator are kept, trailing dots
+  and spaces go only from the final component, `name:stream` stays relative,
+  a bare DOS device name maps to `\\.\nul`, `\\.\` and `\\?\` paths keep
+  their prefix, UNC paths keep `\\server\share\` as their root, and an empty
+  path fails with `ERROR_INVALID_NAME`. Verified line by line against real
+  Windows by the `fs_paths` oracle probe.
 - Add `SetCurrentDirectoryW` and `SetCurrentDirectoryA`, which were missing
   (`GetProcAddress` failed and static imports hit a stub), with
   `ERROR_FILE_NOT_FOUND` for a missing path and `ERROR_DIRECTORY` for a file.

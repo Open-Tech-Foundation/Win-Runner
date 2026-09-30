@@ -1,35 +1,51 @@
 use super::*;
 
+/// `GetFullPathNameW(path, length, buffer, file_part)`, a pure string
+/// transformation against the current directory (see
+/// [`crate::winfs::full_path`]).
 pub(in crate::native::linux_x86_64) extern "win64" fn native_get_full_path_name_w(
     input: *const u16,
     output_len: u32,
     output: *mut u16,
-    _part: *mut *mut u16,
+    part: *mut *mut u16,
 ) -> u32 {
     let Some(raw) = wide(input) else {
+        native_set_last_error(87);
         return 0;
     };
-    let path = fs_ctx()
+    let (cwd, drives) = fs_ctx()
         .and_then(|context| {
             context
                 .lock()
                 .ok()
-                .and_then(|ctx| ctx.fs.normalize(&raw).ok().map(|path| path.display()))
+                .map(|ctx| (ctx.fs.cwd(), ctx.fs.drive_current_directories()))
         })
-        .unwrap_or_else(|| {
-            if raw == "." || raw.is_empty() {
-                "C:\\".to_string()
-            } else if raw.len() >= 2 && raw.as_bytes()[1] == b':' {
-                raw.replace('/', "\\")
-            } else {
-                format!("C:\\{}", raw.replace('/', "\\"))
-            }
-        });
-    let encoded: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+        .unwrap_or_else(|| ("C:\\".to_string(), Vec::new()));
+    let resolved = crate::winfs::full_path::full_path_name(&raw, &cwd, |drive| {
+        drives
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(&drive))
+            .map(|(_, directory)| directory.clone())
+    });
+    let full = match resolved {
+        Ok(full) => full,
+        Err(error) => {
+            native_set_last_error(error);
+            return 0;
+        }
+    };
+    let encoded: Vec<u16> = full.path.encode_utf16().chain(std::iter::once(0)).collect();
     if output.is_null() || output_len < encoded.len() as u32 {
         return encoded.len() as u32;
     }
     unsafe { output.copy_from_nonoverlapping(encoded.as_ptr(), encoded.len()) };
+    if !part.is_null() {
+        let file_part = full
+            .file_part
+            .map(|index| unsafe { output.add(full.path[..index].encode_utf16().count()) })
+            .unwrap_or(ptr::null_mut());
+        unsafe { part.write(file_part) };
+    }
     (encoded.len() - 1) as u32
 }
 fn native_find_parts(pattern: &str) -> (String, String) {
