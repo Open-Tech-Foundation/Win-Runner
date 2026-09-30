@@ -106,7 +106,16 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_create_file_w(
         native_set_last_error(32); // ERROR_SHARING_VIOLATION
         return u64::MAX;
     }
-    if exists && ctx.fs.is_dir(&path) && creation == 3 && flags & 0x0200_0000 == 0 {
+    if ctx.fs.file_named_as_directory(&path) {
+        native_set_last_error(267); // ERROR_DIRECTORY
+        return u64::MAX;
+    }
+    // A directory opens only with backup semantics, and is never replaced
+    // or truncated as a file.
+    if exists
+        && ctx.fs.is_dir(&path)
+        && ((matches!(creation, 3 | 4) && flags & 0x0200_0000 == 0) || matches!(creation, 2 | 5))
+    {
         native_set_last_error(5); // ERROR_ACCESS_DENIED
         return u64::MAX;
     }
@@ -126,9 +135,10 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_create_file_w(
     };
     if ok.is_err() {
         native_set_last_error(match (creation, exists) {
-            (1, true) => 80,         // ERROR_FILE_EXISTS
-            (3 | 4 | 5, false) => 2, // ERROR_FILE_NOT_FOUND
-            _ => 87,                 // ERROR_INVALID_PARAMETER
+            (1, true) => 80, // ERROR_FILE_EXISTS
+            // Not found: 2 with the parent there, else 3.
+            (_, false) => ctx.fs.missing_path_error(&path),
+            _ => 87, // ERROR_INVALID_PARAMETER
         });
         if native_diagnostic_enabled() {
             eprintln!("native CreateFileW failed path={path}");
@@ -639,14 +649,50 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_get_file_attributes
         native_set_last_error(6);
         return u32::MAX;
     };
-    if ctx.fs.is_dir(path) {
+    if ctx.fs.file_named_as_directory(path) {
+        native_set_last_error(267); // ERROR_DIRECTORY
+        u32::MAX
+    } else if !path.is_empty() && ctx.fs.is_dir(path) {
         native_file_attributes_at(&ctx, path, true)
-    } else if ctx.fs.is_file(path) {
+    } else if !path.is_empty() && ctx.fs.is_file(path) {
         native_file_attributes_at(&ctx, path, false)
     } else {
-        native_set_last_error(2);
+        native_set_last_error(ctx.fs.missing_path_error(path));
         u32::MAX
     }
+}
+
+/// `path` as `GetLongPathNameW` returns it: in the form given (a relative
+/// path stays relative, separators unchanged), with each name component
+/// spelled as it is on disk.
+fn long_path_form(fs: &crate::winfs::WinFs, path: &str) -> String {
+    let mut output = String::new();
+    let mut consumed = String::new();
+    let mut component = String::new();
+    let flush = |component: &mut String, consumed: &str, output: &mut String| {
+        if component.is_empty() {
+            return;
+        }
+        let is_name = component != "." && component != ".." && !component.ends_with(':');
+        let on_disk = is_name
+            .then(|| fs.canonical_path(consumed))
+            .flatten()
+            .and_then(|canonical| canonical.rsplit('\\').next().map(str::to_string));
+        output.push_str(on_disk.as_deref().unwrap_or(component));
+        component.clear();
+    };
+    for character in path.chars() {
+        consumed.push(character);
+        if character == '\\' || character == '/' {
+            let prefix = consumed[..consumed.len() - 1].to_string();
+            flush(&mut component, &prefix, &mut output);
+            output.push(character);
+        } else {
+            component.push(character);
+        }
+    }
+    flush(&mut component, &consumed, &mut output);
+    output
 }
 
 pub(in crate::native::linux_x86_64) extern "win64" fn native_get_long_path_name_w(
@@ -666,13 +712,11 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_get_long_path_name_
         native_set_last_error(6);
         return 0;
     };
-    let normalized = match fs.fs.normalize(&path) {
-        Ok(path) => path.display(),
-        Err(_) => {
-            native_set_last_error(3);
-            return 0;
-        }
-    };
+    if !fs.fs.exists(&path) || path.is_empty() {
+        native_set_last_error(fs.fs.missing_path_error(&path));
+        return 0;
+    }
+    let normalized = long_path_form(&fs.fs, &path);
     let encoded: Vec<u16> = normalized.encode_utf16().collect();
     if output.is_null() || capacity as usize <= encoded.len() {
         return (encoded.len() + 1) as u32;
@@ -792,12 +836,37 @@ pub(in crate::native::linux_x86_64) fn native_extended_path(path: &str) -> Strin
         format!("\\\\?\\{}", path)
     }
 }
+/// A final path in the volume form `GetFinalPathNameByHandleW` was asked
+/// for: `\\?\C:\dir` (DOS), `\\?\Volume{guid}\dir` (GUID),
+/// `\Device\HarddiskVolumeN\dir` (NT), or `\dir` (none).
+fn final_path_form(path: &str, volume: u32) -> String {
+    let dos = native_extended_path(path);
+    let Some(rest) = path.get(2..).filter(|_| path.as_bytes().get(1) == Some(&b':')) else {
+        return dos; // not a drive path (UNC, device): only the DOS form
+    };
+    let rest = if rest.is_empty() { "\\" } else { rest };
+    let drive = path.as_bytes()[0].to_ascii_uppercase();
+    let volume_number = u32::from(drive.saturating_sub(b'A'));
+    match volume {
+        1 => format!("\\\\?\\Volume{{{:08x}-0000-0000-0000-{:012x}}}{rest}", 0x7769_6e72, volume_number),
+        2 => format!("\\Device\\HarddiskVolume{}{rest}", volume_number + 1),
+        4 => rest.to_string(),
+        _ => dos,
+    }
+}
+
 pub(in crate::native::linux_x86_64) extern "win64" fn native_get_final_path_name_by_handle_w(
     handle: u64,
     output: *mut u16,
     output_len: u32,
-    _flags: u32,
+    flags: u32,
 ) -> u32 {
+    // FILE_NAME_OPENED (0x8) and FILE_NAME_NORMALIZED (0) name the same
+    // path here; the low bits pick the volume form.
+    if flags & !0xf != 0 || !matches!(flags & 0x7, 0 | 1 | 2 | 4) {
+        native_set_last_error(87);
+        return 0;
+    }
     let context = match fs_ctx() {
         Some(value) => value,
         None => return 0,
@@ -807,8 +876,11 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_get_final_path_name
         Err(_) => return 0,
     };
     let path = match ctx.handles.get(&handle) {
-        Some(value) => native_extended_path(&value.path),
-        None => return 0,
+        Some(value) => final_path_form(&value.path, flags & 0x7),
+        None => {
+            native_set_last_error(6);
+            return 0;
+        }
     };
     let encoded: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
     if output.is_null() || output_len < encoded.len() as u32 {
@@ -1484,11 +1556,12 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_remove_directory_w(
     match context.fs.rmdir(&path) {
         Ok(()) => 1,
         Err(_) if context.fs.is_file(&path) => {
-            native_set_last_error(3); // ERROR_PATH_NOT_FOUND
+            native_set_last_error(267); // ERROR_DIRECTORY
             0
         }
         Err(_) if !context.fs.exists(&path) => {
-            native_set_last_error(3); // ERROR_PATH_NOT_FOUND
+            let error = context.fs.missing_path_error(&path);
+            native_set_last_error(error);
             0
         }
         Err(_) => {
@@ -1586,7 +1659,11 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_move_file_ex_w(
         native_set_last_error(2);
         return 0;
     }
-    if ctx.fs.exists(&destination) {
+    let same_entry = matches!(
+        (ctx.fs.normalize(&source), ctx.fs.normalize(&destination)),
+        (Ok(a), Ok(b)) if a.key() == b.key()
+    );
+    if ctx.fs.exists(&destination) && !same_entry {
         if flags & 0x01 == 0 {
             native_set_last_error(183);
             return 0;

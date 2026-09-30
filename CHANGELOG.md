@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Match Windows in the file APIs the `fs_paths` oracle probe checks:
+  `ERROR_PATH_NOT_FOUND` (not `ERROR_FILE_NOT_FOUND`) when a parent is
+  missing or is a file, `ERROR_DIRECTORY` for `file.txt\` and for
+  `RemoveDirectoryW` on a file, `ERROR_ACCESS_DENIED` for `CREATE_ALWAYS` or
+  `TRUNCATE_EXISTING` on a directory; `.` and `..` in directory listings;
+  the `VOLUME_NAME_NONE`, `_NT`, and `_GUID` forms of
+  `GetFinalPathNameByHandleW`; `GetLongPathNameW` keeping the input's form
+  with on-disk casing and failing for a missing path; and case-only renames
+  with `MoveFileExW`.
 - Compute `GetFullPathNameW` as Windows does, as a string transformation
   against the current directory that never consults the disk, and report its
   file part: `...` components and a trailing separator are kept, trailing dots

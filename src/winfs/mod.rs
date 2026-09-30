@@ -1171,6 +1171,30 @@ impl WinFs {
             .map(|target| target.display())
     }
 
+    /// The Win32 error Windows reports for a path that does not exist:
+    /// `ERROR_FILE_NOT_FOUND` (2) when its parent directory exists,
+    /// `ERROR_PATH_NOT_FOUND` (3) when the parent is missing or is a file
+    /// (and for an empty path), `ERROR_INVALID_NAME` (123) when it does not
+    /// parse.
+    pub fn missing_path_error(&self, raw: &str) -> u32 {
+        if raw.is_empty() {
+            return 3;
+        }
+        let Ok(path) = self.normalize(raw) else {
+            return 123;
+        };
+        if path.parts.is_empty() {
+            return 3;
+        }
+        if self.is_dir(&self.parent_of(&path).display()) { 2 } else { 3 }
+    }
+
+    /// Whether `raw` names an existing file with a trailing separator
+    /// (`file.txt\`), which Windows rejects with `ERROR_DIRECTORY` (267).
+    pub fn file_named_as_directory(&self, raw: &str) -> bool {
+        raw.ends_with(['\\', '/']) && self.is_file(raw)
+    }
+
     /// The canonical spelling of `raw`, as Windows records an opened path:
     /// absolute, `\`-separated, `.`/`..` resolved, and each existing
     /// component in its on-disk casing (the rest as given).
@@ -2061,6 +2085,20 @@ impl WinFs {
         let s = self.normalize(src)?;
         let d = self.normalize(dst)?;
         if s.key() == d.key() {
+            // The same entry: a case-only rename respells it.
+            if s.parts.last() != d.parts.last() && !self.is_host_drive(s.drive) {
+                let leaf = d.parts.last().cloned().unwrap_or_default();
+                match self.get_node_raw_mut(&s) {
+                    Some(Node::Dir { name, .. } | Node::File { name, .. }) => *name = leaf,
+                    None => return Err(format!("source not found: {}", s.display())),
+                }
+                if self.record_changes {
+                    self.changes.push(FsChange::Move {
+                        source: s.display(),
+                        target: d.display(),
+                    });
+                }
+            }
             return Ok(());
         }
         if self.is_host_drive(s.drive) || self.is_host_drive(d.drive) {
@@ -2353,6 +2391,30 @@ impl WinFs {
 #[cfg(test)]
 mod canonical_path_tests {
     use super::*;
+
+    #[test]
+    fn a_case_only_rename_respells_the_entry() {
+        let mut fs = WinFs::new();
+        fs.mkdir(r"C:\w").unwrap();
+        fs.write_file(r"C:\w\One.txt", b"x".to_vec()).unwrap();
+        fs.move_path(r"C:\w\One.txt", r"C:\w\one.TXT").unwrap();
+        assert_eq!(fs.list_dir(r"C:\w").unwrap(), ["one.TXT"]);
+        assert_eq!(fs.read_file(r"C:\w\ONE.txt").unwrap(), b"x");
+    }
+
+    #[test]
+    fn missing_paths_report_file_or_path_not_found_as_windows_does() {
+        let mut fs = WinFs::new();
+        fs.mkdir(r"C:\w").unwrap();
+        fs.write_file(r"C:\w\f.txt", b"x".to_vec()).unwrap();
+        assert_eq!(fs.missing_path_error(r"C:\w\missing"), 2);
+        assert_eq!(fs.missing_path_error(r"C:\w\missing\x"), 3);
+        assert_eq!(fs.missing_path_error(r"C:\w\f.txt\x"), 3, "through a file");
+        assert_eq!(fs.missing_path_error(""), 3);
+        assert!(fs.file_named_as_directory(r"C:\w\f.txt\"));
+        assert!(!fs.file_named_as_directory(r"C:\w\f.txt"));
+        assert!(!fs.file_named_as_directory(r"C:\w\"));
+    }
 
     #[test]
     fn canonical_paths_use_backslashes_resolved_dots_and_disk_casing() {

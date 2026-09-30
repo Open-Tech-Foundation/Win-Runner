@@ -173,6 +173,16 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_find_first_file_ex_
     };
     names.retain(|name| native_name_matches_pattern(&name_pattern, name));
     names.sort_by_key(|name| name.to_lowercase());
+    // Every directory but a drive root lists `.` and `..` first, when the
+    // pattern matches them (as `*` does).
+    let is_root = ctx.fs.normalize(&directory).is_ok_and(|path| path.parts.is_empty());
+    if !is_root {
+        for (index, special) in [".", ".."].into_iter().enumerate() {
+            if native_name_matches_pattern(&name_pattern, special) {
+                names.insert(index.min(names.len()), special.to_string());
+            }
+        }
+    }
     // Keep full paths so each result can report its attributes and size.
     let names: Vec<String> = names
         .into_iter()

@@ -744,7 +744,7 @@ mod protection_tests {
             names.sort();
             assert_eq!(
                 names,
-                ["Alpha.txt", "beta.bin", "nested"],
+                [".", "..", "Alpha.txt", "beta.bin", "nested"],
                 "{info_level}/{search_op}/{flags}"
             );
             assert_eq!(super::native_find_close(find), 1);
@@ -759,7 +759,8 @@ mod protection_tests {
     fn modern_find_first_file_ex_reports_empty_missing_and_invalid_outputs() {
         let empty = r"C:\modern_find_ex_empty";
         let missing_pattern = r"C:\modern_find_ex_missing\*";
-        let empty_pattern = format!(r"{empty}\*");
+        // `*` would match `.` and `..`; nothing matches `*.txt`.
+        let empty_pattern = format!(r"{empty}\*.txt");
         let wide = |value: &str| value.encode_utf16().chain([0]).collect::<Vec<_>>();
         let empty_wide = wide(&empty_pattern);
         let missing_wide = wide(missing_pattern);
@@ -1045,6 +1046,25 @@ mod protection_tests {
     }
 
     #[test]
+    fn long_path_names_keep_the_input_form_with_disk_casing() {
+        {
+            let context = super::fs_ctx().unwrap();
+            let mut ctx = context.lock().unwrap();
+            ctx.fs.mkdir(r"C:\Long Cases\Sub Dir").unwrap();
+            ctx.fs.write_file(r"C:\Long Cases\Sub Dir\two.txt", b"x".to_vec()).unwrap();
+        }
+        let long = |path: &str| {
+            let mut buffer = [0u16; 128];
+            let length = super::native_get_long_path_name_w(wide_z(path).as_ptr(), buffer.as_mut_ptr(), 128);
+            (String::from_utf16_lossy(&buffer[..length as usize]), super::native_get_last_error())
+        };
+        assert_eq!(long(r"C:\long cases\sub dir\TWO.TXT").0, r"C:\Long Cases\Sub Dir\two.txt");
+        assert_eq!(long("C:/long cases/SUB DIR").0, "C:/Long Cases/Sub Dir", "separators as given");
+        assert_eq!(long(r"C:\Long Cases\missing"), (String::new(), 2));
+        assert_eq!(long(r"C:\Long Cases\missing\x"), (String::new(), 3));
+    }
+
+    #[test]
     fn opened_paths_are_canonical_for_final_path_queries() {
         {
             let context = super::fs_ctx().unwrap();
@@ -1057,6 +1077,17 @@ mod protection_tests {
         assert_ne!(handle, u64::MAX);
         let recorded = super::fs_ctx().unwrap().lock().unwrap().handles[&handle].path.clone();
         assert_eq!(recorded, r"C:\Canonical Cases\Sub\File.txt");
+        let final_path = |flags: u32| {
+            let mut buffer = [0u16; 128];
+            let length = super::native_get_final_path_name_by_handle_w(handle, buffer.as_mut_ptr(), 128, flags);
+            String::from_utf16_lossy(&buffer[..length as usize])
+        };
+        assert_eq!(final_path(0), r"\\?\C:\Canonical Cases\Sub\File.txt");
+        assert_eq!(final_path(0x8), r"\\?\C:\Canonical Cases\Sub\File.txt", "FILE_NAME_OPENED");
+        assert_eq!(final_path(0x4), r"\Canonical Cases\Sub\File.txt", "VOLUME_NAME_NONE");
+        assert_eq!(final_path(0x2), r"\Device\HarddiskVolume3\Canonical Cases\Sub\File.txt");
+        assert!(final_path(0x1).starts_with(r"\\?\Volume{"));
+        assert_eq!(final_path(0x3), "", "invalid volume flags");
         assert_eq!(super::native_close_handle(handle), 1);
     }
 
@@ -1183,14 +1214,17 @@ mod protection_tests {
             }
         }
         assert_eq!(super::native_find_close(find), 1);
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].0, "10.0.12");
+        // A non-root directory lists `.` and `..` first, as Windows does
+        // (tests/oracle/golden/fs_paths.txt, find.all).
+        assert_eq!(entries.len(), 4);
+        assert_eq!((entries[0].0.as_str(), entries[1].0.as_str()), (".", ".."));
+        assert_eq!(entries[2].0, "10.0.12");
         assert_ne!(
-            entries[0].1 & 0x10,
+            entries[2].1 & 0x10,
             0,
             "directories carry FILE_ATTRIBUTE_DIRECTORY"
         );
-        assert_eq!(entries[1], ("notes.txt".to_string(), 0x80, 5));
+        assert_eq!(entries[3], ("notes.txt".to_string(), 0x80, 5));
         context
             .lock()
             .unwrap()
@@ -1300,7 +1334,7 @@ mod protection_tests {
             }
         }
         names.sort();
-        assert_eq!(names, ["moved.txt", "source.txt"]);
+        assert_eq!(names, [".", "..", "moved.txt", "source.txt"]);
         assert_eq!(super::native_find_close(find), 1);
 
         assert_eq!(super::native_delete_file_w(source_wide.as_ptr()), 1);
@@ -1497,12 +1531,14 @@ mod protection_tests {
             String::from_utf16(&output[..written as usize]).unwrap(),
             r"\\?\C:\winfs_compat_final_path.txt"
         );
+        // FILE_NAME_OPENED (0x8) names the same DOS path (flag 1 would be
+        // VOLUME_NAME_GUID).
         let mut dos_path = vec![0u16; required as usize];
         let dos_written = super::native_get_final_path_name_by_handle_w(
             handle,
             dos_path.as_mut_ptr(),
             dos_path.len() as u32,
-            1,
+            0x8,
         );
         assert_eq!(dos_written, written);
         assert_eq!(
@@ -5106,7 +5142,7 @@ mod protection_tests {
             names.sort();
             assert_eq!(
                 names,
-                ["Alpha.txt", "beta.bin", "nested"],
+                [".", "..", "Alpha.txt", "beta.bin", "nested"],
                 "{info_level}/{search_op}/{flags}"
             );
             assert_eq!(super::native_find_close(find), 1);
@@ -5128,7 +5164,7 @@ mod protection_tests {
         let find_first: FindFirstFileExA =
             unsafe { std::mem::transmute(require_kernel32_api(b"FindFirstFileExA\0") as usize) };
         let directory = r"C:\modern_find_ex_ansi_failures";
-        let empty_pattern = b"C:\\modern_find_ex_ansi_failures\\*\0";
+        let empty_pattern = b"C:\\modern_find_ex_ansi_failures\\*.txt\0"; // `*` matches `.`
         let missing_pattern = b"C:\\modern_find_ex_ansi_absent\\*\0";
         let context = super::fs_ctx().unwrap();
         context.lock().unwrap().fs.mkdir(directory).unwrap();
@@ -5202,7 +5238,8 @@ mod protection_tests {
         let find_first: FindFirstFileA =
             unsafe { std::mem::transmute(require_kernel32_api(b"FindFirstFileA\0") as usize) };
         let directory = r"C:\modern_find_ansi_failures";
-        let pattern = b"C:\\modern_find_ansi_failures\\*\0";
+        // `*` would match `.` and `..`; nothing matches `*.txt`.
+        let pattern = b"C:\\modern_find_ansi_failures\\*.txt\0";
         let missing = b"C:\\modern_find_ansi_failures\\missing.txt\0";
         let context = super::fs_ctx().unwrap();
         context.lock().unwrap().fs.mkdir(directory).unwrap();
