@@ -2,7 +2,22 @@
 
 use super::*;
 
+/// The name of an export that a DLL publishes by ordinal only, for the
+/// ordinals winrun implements. Ordinals are per DLL, so they cannot share
+/// [`baseline_trampoline`]'s global names.
+pub(super) fn ordinal_export_name(dll: &str, func: &str) -> Option<&'static str> {
+    let module = dll.to_ascii_uppercase();
+    match (module.trim_end_matches(".DLL"), func) {
+        ("OLEAUT32", "#200") => Some("GetErrorInfo"),
+        ("OLEAUT32", "#201") => Some("SetErrorInfo"),
+        _ => None,
+    }
+}
+
 pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
+    if let Some(name) = ordinal_export_name(dll, func) {
+        return supports_import(dll, name);
+    }
     let module = dll.to_ascii_uppercase();
     let module = if module.starts_with("API-MS-WIN-CRT-") {
         "UCRTBASE.DLL"
@@ -274,8 +289,10 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                 | "CoTaskMemAlloc"
                 | "CoTaskMemFree"
                 | "CoCreateGuid"
+                | "CoGetContextToken"
         ),
         "SHELL32.DLL" => func == "SHGetFolderPathW",
+        "OLEAUT32.DLL" => matches!(func, "GetErrorInfo" | "SetErrorInfo"),
         "ADVAPI32.DLL" => matches!(
             func,
             "CryptAcquireContextW"
@@ -540,6 +557,13 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "DeregisterEventSource" => Some(native_deregister_event_source as *const () as usize as u64),
         "EventWrite" => Some(native_event_write as *const () as usize as u64),
         "CoInitializeEx" => Some(native_co_initialize_ex as *const () as usize as u64),
+        "CoGetContextToken" => Some(native_co_get_context_token as *const () as usize as u64),
+        "DisableThreadLibraryCalls" => Some(native_disable_thread_library_calls as *const () as usize as u64),
+        "GetErrorInfo" => Some(native_get_error_info as *const () as usize as u64),
+        "SetErrorInfo" => Some(native_set_error_info as *const () as usize as u64),
+        "RoInitialize" => Some(native_ro_initialize as *const () as usize as u64),
+        "RoUninitialize" => Some(native_co_uninitialize as *const () as usize as u64),
+        "SetThreadDescription" => Some(native_set_thread_description as *const () as usize as u64),
         "CoUninitialize" => Some(native_co_uninitialize as *const () as usize as u64),
         "CoTaskMemAlloc" => Some(native_co_task_mem_alloc as *const () as usize as u64),
         "CoTaskMemFree" => Some(native_co_task_mem_free as *const () as usize as u64),
@@ -799,7 +823,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "CreateNamedPipeA" => Some(native_create_named_pipe_a as *const () as usize as u64),
         "CreateFileA" => Some(native_create_file_a as *const () as usize as u64),
         "GetTempPathA" => Some(native_get_temp_path_a as *const () as usize as u64),
-        "GetTempPathW" => Some(native_get_temp_path_w as *const () as usize as u64),
+        "GetTempPathW" | "GetTempPath2W" => Some(native_get_temp_path_w as *const () as usize as u64),
         "GetTempFileNameA" => Some(native_get_temp_file_name_a as *const () as usize as u64),
         "GetTempFileNameW" => Some(native_get_temp_file_name_w as *const () as usize as u64),
         "FindFirstFileA" => Some(native_find_first_file_a as *const () as usize as u64),
@@ -1041,7 +1065,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "FlsFree" => Some(native_fls_free as *const () as usize as u64),
         "FlsGetValue" => Some(native_fls_get_value as *const () as usize as u64),
         "FlsSetValue" => Some(native_fls_set_value as *const () as usize as u64),
-        "GetSystemTimeAsFileTime" => {
+        "GetSystemTimeAsFileTime" | "GetSystemTimePreciseAsFileTime" => {
             Some(native_get_system_time_as_file_time as *const () as usize as u64)
         }
         "GetSystemTime" => Some(native_get_system_time as *const () as usize as u64),
@@ -1319,7 +1343,8 @@ pub(super) fn patch_baseline_imports(
     let mut stub_index = 0;
     for import in imports {
         let value = if supports_import(&import.dll, &import.func) {
-            baseline_trampoline(&import.func).unwrap()
+            let name = ordinal_export_name(&import.dll, &import.func).unwrap_or(&import.func);
+            baseline_trampoline(name).unwrap()
         } else {
             let stubs = stubs.as_mut().unwrap();
             let message = format!(

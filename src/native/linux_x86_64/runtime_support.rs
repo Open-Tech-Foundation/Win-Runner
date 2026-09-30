@@ -479,6 +479,53 @@ pub(super) extern "win64" fn native_co_initialize_ex(_reserved: u64, _model: u32
 
 pub(super) extern "win64" fn native_co_uninitialize() {}
 
+/// `CoGetContextToken(token)`: winrun has no COM object contexts, so this
+/// reports COM as uninitialized (`CO_E_NOTINITIALIZED`) with a null token,
+/// which callers such as CoreCLR treat as "no context".
+pub(super) extern "win64" fn native_co_get_context_token(token: *mut u64) -> i32 {
+    const CO_E_NOTINITIALIZED: i32 = 0x8004_01f0_u32 as i32;
+    if token.is_null() {
+        return E_POINTER;
+    }
+    unsafe { token.write(0) };
+    CO_E_NOTINITIALIZED
+}
+
+const E_POINTER: i32 = 0x8000_4003_u32 as i32;
+
+/// `GetErrorInfo(reserved, info)`: no COM error object is ever set, so
+/// there is none to return (`S_FALSE`).
+pub(super) extern "win64" fn native_get_error_info(_reserved: u32, info: *mut u64) -> i32 {
+    if info.is_null() {
+        return E_POINTER;
+    }
+    unsafe { info.write(0) };
+    1 // S_FALSE
+}
+
+/// `SetErrorInfo(reserved, info)`: accepts (and drops) the error object;
+/// winrun has no COM callers that would read it back.
+pub(super) extern "win64" fn native_set_error_info(_reserved: u32, _info: u64) -> i32 {
+    0 // S_OK
+}
+
+/// `DisableThreadLibraryCalls(module)`: an optimization hint; modules keep
+/// receiving thread notifications, which they must tolerate anyway.
+pub(super) extern "win64" fn native_disable_thread_library_calls(module: u64) -> i32 {
+    i32::from(module != 0)
+}
+
+/// `RoInitialize(type)`: the Windows Runtime shares COM's (no-op)
+/// apartment, so initialization always succeeds.
+pub(super) extern "win64" fn native_ro_initialize(_init_type: u32) -> i32 {
+    0 // S_OK
+}
+
+/// `SetThreadDescription(thread, name)`: thread names are informational.
+pub(super) extern "win64" fn native_set_thread_description(_thread: u64, _name: *const u16) -> i32 {
+    0 // S_OK
+}
+
 pub(super) extern "win64" fn native_co_task_mem_alloc(size: usize) -> *mut c_void {
     native_crt_malloc(size)
 }
@@ -599,6 +646,32 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(first[7] >> 4, 4);
         assert_eq!(first[8] & 0xc0, 0x80);
+    }
+
+    #[test]
+    fn winrt_initialization_is_resolvable_and_succeeds() {
+        // CoreCLR delay-loads RoInitialize from the WinRT API set; a missing
+        // export raises a delay-load exception during startup.
+        for name in ["RoInitialize", "RoUninitialize", "SetThreadDescription"] {
+            assert!(super::super::baseline_trampoline(name).is_some(), "{name}");
+        }
+        assert_eq!(native_ro_initialize(1), 0);
+        let mut info = 0x1234u64;
+        assert_eq!(native_set_error_info(0, 0), 0);
+        assert_eq!(native_get_error_info(0, &mut info), 1);
+        assert_eq!(info, 0);
+        assert_eq!(native_get_error_info(0, ptr::null_mut()), E_POINTER);
+        let mut token = 1u64;
+        assert_eq!(native_co_get_context_token(&mut token), 0x8004_01f0_u32 as i32);
+        assert_eq!(token, 0);
+        assert!(super::super::supports_import("ole32.dll", "CoGetContextToken"));
+        // oleaut32 exports these by ordinal only.
+        assert!(super::super::supports_import("OLEAUT32.dll", "#200"));
+        assert!(super::super::supports_import("OLEAUT32.dll", "#201"));
+        assert!(!super::super::supports_import("OLEAUT32.dll", "#202"));
+        assert_eq!(native_disable_thread_library_calls(0x1_8000_0000), 1);
+        assert_eq!(native_disable_thread_library_calls(0), 0);
+        assert_eq!(native_set_thread_description(0, ptr::null()), 0);
     }
 
     #[test]

@@ -612,6 +612,10 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add `RoInitialize`, `CoGetContextToken`, `GetErrorInfo`/`SetErrorInfo`
+  (oleaut32 ordinals 200/201), `DisableThreadLibraryCalls`,
+  `SetThreadDescription`, `GetSystemTimePreciseAsFileTime`, and
+  `GetTempPath2W`.
 - Implement x64 C++ exception unwinding: `RaiseException` captures the
   caller's real context, and `RtlUnwindEx`, `RtlUnwind`, and
   `RtlRestoreContext` (including `STATUS_UNWIND_CONSOLIDATE` catch callbacks)
