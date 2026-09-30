@@ -49,6 +49,36 @@ pub struct PeImage {
     /// RVAs of 64-bit words requiring IMAGE_REL_BASED_DIR64 adjustment when
     /// the image cannot be mapped at `image_base`.
     pub relocations: Vec<u32>,
+    /// The Windows page protection of each page of the mapped image, as
+    /// the loader derives it from the headers and section characteristics.
+    pub page_protections: Vec<u32>,
+}
+
+/// Per-page `PAGE_*` protections of a mapped image: headers read-only,
+/// each section by its execute/read/write characteristics.
+pub fn image_page_protections(size_of_image: u32, sections: &[(u32, u32, u32)]) -> Vec<u32> {
+    const PAGE: usize = 4096;
+    let pages = (size_of_image as usize).div_ceil(PAGE);
+    let mut protections = vec![0x02u32; pages]; // PAGE_READONLY
+    for &(rva, size, characteristics) in sections {
+        let execute = characteristics & 0x2000_0000 != 0;
+        let read = characteristics & 0x4000_0000 != 0;
+        let write = characteristics & 0x8000_0000 != 0;
+        let protection = match (execute, read, write) {
+            (true, _, true) => 0x40,      // PAGE_EXECUTE_READWRITE
+            (false, _, true) => 0x04,     // PAGE_READWRITE
+            (true, true, false) => 0x20,  // PAGE_EXECUTE_READ
+            (true, false, false) => 0x10, // PAGE_EXECUTE
+            (false, true, false) => 0x02, // PAGE_READONLY
+            (false, false, false) => 0x01, // PAGE_NOACCESS
+        };
+        let first = rva as usize / PAGE;
+        let end = (rva as usize + (size as usize).max(1)).div_ceil(PAGE).min(pages);
+        for page in protections.iter_mut().take(end).skip(first) {
+            *page = protection;
+        }
+    }
+    protections
 }
 
 impl PeImage {
@@ -241,6 +271,16 @@ pub fn load_il_only(data: &[u8]) -> Result<PeImage, String> {
             .ok_or("section virtual address out of bounds")?
             .copy_from_slice(source);
     }
+    let mut section_ranges = Vec::new();
+    for index in 0..num_sections {
+        let header = section_table + index * 40;
+        section_ranges.push((
+            u32le(data, header + 12)?,
+            u32le(data, header + 8)?.max(u32le(data, header + 16)?),
+            u32le(data, header + 36)?,
+        ));
+    }
+    let page_protections = image_page_protections(size_of_image, &section_ranges);
     // IMAGE_COR20_HEADER.Flags is at offset 16.
     let flags = u32le(&image, clr_rva + 16)?;
     if flags & COMIMAGE_FLAGS_ILONLY == 0 {
@@ -258,6 +298,7 @@ pub fn load_il_only(data: &[u8]) -> Result<PeImage, String> {
         tls: None,
         code_ranges: Vec::new(),
         relocations: Vec::new(),
+        page_protections,
     })
 }
 
@@ -483,6 +524,11 @@ fn load_inner(data: &[u8], strict: bool) -> Result<PeImage, String> {
         }
     }
 
+    let page_protections = image_page_protections(
+        size_of_image,
+        &secs.iter().map(|s| (s.vaddr, s.vsize.max(s.fsize), s.chars)).collect::<Vec<_>>(),
+    );
+
     // Executable-but-not-writable section ranges (absolute VAs) for W^X
     // enforcement (RWX sections stay writable, like real Windows).
     let code_ranges: Vec<(u64, u64)> = secs
@@ -576,6 +622,7 @@ fn load_inner(data: &[u8], strict: bool) -> Result<PeImage, String> {
         tls,
         code_ranges,
         relocations,
+        page_protections,
     })
 }
 
@@ -930,6 +977,20 @@ mod large_image_tests {
 #[cfg(test)]
 mod il_only_tests {
     use super::*;
+
+    #[test]
+    fn page_protections_follow_section_characteristics() {
+        let pages = image_page_protections(
+            0x5000,
+            &[
+                (0x1000, 0x1800, 0x6000_0020), // .text: execute + read
+                (0x3000, 0x0100, 0x4000_0040), // .rdata: read
+                (0x4000, 0x0200, 0xc000_0040), // .data: read + write
+            ],
+        );
+        assert_eq!(pages, vec![0x02, 0x20, 0x20, 0x02, 0x04]);
+        assert_eq!(load_il_only(&il_image(0x1)).unwrap().page_protections.len(), 4);
+    }
 
     /// A minimal PE32 AnyCPU assembly: one `.text` section holding a CLI
     /// header with the given flags, an import of mscoree, and an entry stub.

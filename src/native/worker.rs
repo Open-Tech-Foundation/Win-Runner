@@ -38,6 +38,7 @@ pub(crate) fn write_image(image: &PeImage, directory: &Path) -> Result<PathBuf, 
         "tls": tls,
         "code_ranges": image.code_ranges,
         "relocations": image.relocations,
+        "page_protections": image.page_protections,
     });
     let bytes = serde_json::to_vec(&metadata)
         .map_err(|error| format!("cannot encode native worker image metadata: {error}"))?;
@@ -132,6 +133,7 @@ pub(crate) fn read_image(directory: &Path) -> Result<PeImage, String> {
         tls,
         code_ranges,
         relocations,
+        page_protections: serde_json::from_value(metadata["page_protections"].clone()).unwrap_or_default(),
     })
 }
 

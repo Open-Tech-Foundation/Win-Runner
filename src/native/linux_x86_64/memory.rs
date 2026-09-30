@@ -43,16 +43,7 @@ pub(super) fn consume_guard_page_fault(address: u64) -> bool {
         }
     }
 
-    let module = process.loaded_modules.lock().ok().and_then(|modules| {
-        modules
-            .values()
-            .find(|module| {
-                address >= module.base
-                    && address < module.base.saturating_add(u64::from(module.size_of_image))
-            })
-            .map(|module| (module.base, module.size_of_image))
-    });
-    let Some((base, image_size)) = module else {
+    let Some((base, image_size)) = image_containing(&process, address, address + 1) else {
         return false;
     };
     let Ok(page_count) = page_len(image_size as usize) else {
@@ -69,6 +60,20 @@ pub(super) fn consume_guard_page_fault(address: u64) -> bool {
         return false;
     };
     consume_guard_page(base, page_index, protection)
+}
+
+/// The mapped PE image (main image or loaded DLL) holding `[start, end)`,
+/// as its base and `SizeOfImage`.
+pub(super) fn image_containing(process: &NativeProcessContext, start: u64, end: u64) -> Option<(u64, u32)> {
+    let inside = |base: u64, size: u32| start >= base && end <= base.saturating_add(u64::from(size));
+    if process.image_base != 0 && inside(process.image_base, process.image_size) {
+        return Some((process.image_base, process.image_size));
+    }
+    let modules = process.loaded_modules.lock().ok()?;
+    modules
+        .values()
+        .find(|module| inside(module.base, module.size_of_image))
+        .map(|module| (module.base, module.size_of_image))
 }
 
 fn consume_guard_page(base: u64, page_index: usize, protection: &mut u32) -> bool {
@@ -205,12 +210,10 @@ pub(super) extern "win64" fn native_virtual_query(
             return information_size;
         }
     }
-    if let Ok(modules) = process.loaded_modules.lock() {
-        if let Some(module) = modules.values().find(|module| {
-            query >= module.base
-                && query < module.base.saturating_add(u64::from(module.size_of_image))
-        }) {
-            let page_count = page_len(module.size_of_image as usize).unwrap_or(0) / 4096;
+    if let Some((module_base, module_size)) = image_containing(&process, query, query + 1) {
+        {
+            let module = (module_base, module_size);
+            let page_count = page_len(module.1 as usize).unwrap_or(0) / 4096;
             let image_pages =
                 process
                     .image_page_protections
@@ -219,14 +222,14 @@ pub(super) extern "win64" fn native_virtual_query(
                     .and_then(|mut protections| {
                         Some(
                             protections
-                                .entry(module.base)
+                                .entry(module.0)
                                 .or_insert_with(|| vec![0x40; page_count])
                                 .clone(),
                         )
                     });
             let pages = image_pages.unwrap_or_else(|| vec![0x40; page_count]);
             let page_index =
-                ((query - module.base) as usize / 4096).min(page_count.saturating_sub(1));
+                ((query - module.0) as usize / 4096).min(page_count.saturating_sub(1));
             let protection = pages.get(page_index).copied().unwrap_or(0x40);
             let mut first = page_index;
             while first > 0 && pages[first - 1] == protection {
@@ -237,9 +240,9 @@ pub(super) extern "win64" fn native_virtual_query(
                 end += 1;
             }
             let result = NativeMemoryBasicInformation {
-                base_address: module.base + first as u64 * 4096,
-                allocation_base: module.base,
-                allocation_protection: 0x40, // initial mapped-image protection is RWX
+                base_address: module.0 + first as u64 * 4096,
+                allocation_base: module.0,
+                allocation_protection: 0x80, // PAGE_EXECUTE_WRITECOPY, as for image mappings
                 partition_id: 0,
                 region_size: ((end - first) * 4096) as u64,
                 state: 0x1000, // MEM_COMMIT
@@ -517,16 +520,7 @@ pub(super) extern "win64" fn native_virtual_protect(
             native_set_last_error(487);
             return 0;
         }
-        let image = process.loaded_modules.lock().ok().and_then(|modules| {
-            modules
-                .values()
-                .find(|module| {
-                    (start as u64) >= module.base
-                        && (end as u64)
-                            <= module.base.saturating_add(u64::from(module.size_of_image))
-                })
-                .map(|module| (module.base, module.size_of_image))
-        });
+        let image = image_containing(&process, start as u64, end as u64);
         if let Some((base, image_size)) = image {
             let Ok(page_count) = page_len(image_size as usize) else {
                 native_set_last_error(487);

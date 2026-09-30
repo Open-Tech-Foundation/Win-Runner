@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Report each PE section's own protection from `VirtualQuery` and as the
+  previous protection from `VirtualProtect` (`PAGE_READWRITE` for `.data`,
+  `PAGE_EXECUTE_READ` for `.text`, read-only headers), and treat the main
+  image as an image (`MEM_IMAGE`) there too. Every image page used to read
+  as `PAGE_EXECUTE_READWRITE`, and V8 aborted with "Check failed:
+  old_protection == PAGE_READWRITE" when making its data read-only.
 - Accept executable and copy-on-write file mappings (`PAGE_EXECUTE_READ`
   and friends, with `SEC_COMMIT`/`SEC_RESERVE`), map views with
   `FILE_MAP_EXECUTE` as executable, and add `MapViewOfFileEx`. CoreCLR maps

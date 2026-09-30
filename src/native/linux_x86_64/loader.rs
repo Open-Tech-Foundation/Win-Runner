@@ -159,6 +159,7 @@ mod relocated_map_tests {
             tls: None,
             code_ranges: vec![],
             relocations: vec![],
+            page_protections: vec![],
         };
         let (mapping, mapped) = super::map_il_only(&image).unwrap();
         assert_eq!(mapped.image_base, mapping.ptr as u64);
@@ -183,6 +184,7 @@ mod relocated_map_tests {
             tls: None,
             code_ranges: vec![],
             relocations: vec![0],
+            page_protections: vec![],
         };
         let (mapping, relocated) = map_relocated(&image).unwrap();
         assert_eq!(relocated.image_base, mapping.ptr as u64);
@@ -1414,6 +1416,11 @@ fn load_guest_module_inner(
             initialized: false,
         };
         let handle = module.base;
+        if !image.page_protections.is_empty() {
+            if let Ok(mut pages) = process.image_page_protections.lock() {
+                pages.insert(base, image.page_protections.clone());
+            }
+        }
         if native_diagnostic_enabled() {
             eprintln!(
                 "native LoadLibrary mapped path={} base={:#x} size={:#x}",

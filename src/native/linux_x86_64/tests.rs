@@ -7883,6 +7883,22 @@ mod protection_tests {
         );
         assert!(previous.is_none());
 
+        // Seeded from section characteristics, as the loader does: V8's
+        // SetDataReadOnly requires .data to report PAGE_READWRITE.
+        process.image_page_protections.lock().unwrap().insert(base, vec![0x20, 0x04]);
+        let mut old_protection = 0;
+        assert_eq!(
+            super::native_virtual_protect(
+                (base + 4096) as *mut std::ffi::c_void,
+                4096,
+                0x02,
+                &mut old_protection,
+            ),
+            1
+        );
+        assert_eq!(old_protection, 0x04, "the data section's own protection");
+        process.image_page_protections.lock().unwrap().remove(&base);
+
         let mut old_protection = 0;
         assert_eq!(
             super::native_virtual_protect(
