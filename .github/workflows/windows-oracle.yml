@@ -1,0 +1,78 @@
+# Differential check of Win-Runner against real Windows.
+#
+# The oracle probes (guests/oracle) call Win32 APIs with fixed inputs and
+# print what happened. The same .exe files run on windows-latest (the
+# oracle) and under Win-Runner on Linux; any line that differs is a place
+# where Win-Runner does not behave like Windows. See tests/oracle/README.md.
+name: windows-oracle
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-probes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add x86_64-pc-windows-msvc
+      - run: bash guests/build-oracle.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oracle-probes
+          path: tests/artifacts/exe/oracle_*.exe
+
+  windows:
+    needs: build-probes
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: oracle-probes
+          path: tests/artifacts/exe
+      - shell: pwsh
+        run: tests/oracle/run-windows.ps1 -OutputDir oracle-windows
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oracle-windows
+          path: oracle-windows
+
+  winrun:
+    needs: [build-probes, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: oracle-probes
+          path: tests/artifacts/exe
+      - uses: actions/download-artifact@v4
+        with:
+          name: oracle-windows
+          path: oracle-windows
+      - run: cargo build --release
+      - run: bash tests/oracle/run-winrun.sh target/release/winrun oracle-winrun
+      - name: Compare with Windows
+        run: |
+          set -o pipefail
+          bash tests/oracle/compare.sh oracle-windows oracle-winrun | tee oracle-diff.txt
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '## Win-Runner vs Windows'
+            echo '```diff'
+            cat oracle-diff.txt 2>/dev/null || echo 'no comparison ran'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: oracle-comparison
+          path: |
+            oracle-windows
+            oracle-winrun
+            oracle-diff.txt

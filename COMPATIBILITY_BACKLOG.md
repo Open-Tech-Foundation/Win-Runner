@@ -304,6 +304,10 @@ Record oracle values from `GetFullPathNameW`, `CreateFileW`, and
 - [ ] **Path oracle table.** Build shared cases with input path, cwd, expected
   normalized path or device result, and expected error code. Include both
   WinFs unit tests and guest `.exe` tests.
+  - [x] Harness: `tests/oracle` probes run on `windows-latest` and under
+    Win-Runner (`windows-oracle` workflow); `fs_paths` holds the path cases.
+  - [ ] Record the first Windows transcript in `tests/oracle/golden` and fix
+    each differing line.
 - [x] **Per-drive current directories.** Relative `file.txt` under cwd
   `Z:\sub` must resolve to `Z:\sub\file.txt`; drive-relative `C:foo` must use
   the remembered C: cwd even when the active cwd is on another drive. Model

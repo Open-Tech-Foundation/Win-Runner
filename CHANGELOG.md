@@ -657,6 +657,14 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add the Windows oracle (`tests/oracle`): `no_std` probe programs that call
+  Win32 APIs directly and print each result and error code, run unchanged on
+  real Windows and under Win-Runner. The `windows-oracle` workflow builds the
+  probes once, runs them on `windows-latest` and under Win-Runner, and fails
+  on any differing line; `tests/oracle_native.rs` runs every probe and
+  compares it with a recorded Windows transcript when one is committed. The
+  first probe, `fs_paths`, covers path normalization, `CreateFileW` outcomes,
+  final paths, directory listings, and file-operation error codes.
 - Emulate the AFD socket-polling driver (`\Device\Afd`): `NtCreateFile`
   opens it, `CreateIoCompletionPort` associates it, `IOCTL_AFD_POLL` through
   `NtDeviceIoControlFile` completes on the port when the socket is ready

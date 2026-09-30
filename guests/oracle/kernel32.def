@@ -1,0 +1,9 @@
+; Static imports of the Windows-oracle probes. Everything else they call is
+; looked up with GetProcAddress, so a missing API is reported, not fatal.
+LIBRARY KERNEL32
+EXPORTS
+GetStdHandle
+WriteFile
+ExitProcess
+GetModuleHandleW
+GetProcAddress
