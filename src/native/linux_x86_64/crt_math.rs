@@ -182,9 +182,120 @@ pub(super) extern "win64" fn native_crt_modff(x: f32, integral: *mut f32) -> f32
     }
 }
 
+/// `_dsign`/`_fdsign`: the sign bit, as the UCRT reports it (0x8000 when set).
+pub(super) extern "win64" fn native_crt_dsign(x: f64) -> i32 {
+    if x.is_sign_negative() { 0x8000 } else { 0 }
+}
+pub(super) extern "win64" fn native_crt_fdsign(x: f32) -> i32 {
+    if x.is_sign_negative() { 0x8000 } else { 0 }
+}
+pub(super) extern "win64" fn native_crt_exp2(x: f64) -> f64 {
+    x.exp2()
+}
+pub(super) extern "win64" fn native_crt_log1p(x: f64) -> f64 {
+    x.ln_1p()
+}
+/// `nearbyint` in the default round-to-nearest-even mode, without raising
+/// the inexact exception.
+pub(super) extern "win64" fn native_crt_nearbyint(x: f64) -> f64 {
+    x.round_ties_even()
+}
+pub(super) extern "win64" fn native_crt_nearbyintf(x: f32) -> f32 {
+    x.round_ties_even()
+}
+
+/// `ldexp(x, exponent)`: x * 2^exponent, scaled in steps so intermediate
+/// powers of two neither overflow nor flush to zero early.
+pub(super) extern "win64" fn native_crt_ldexp(x: f64, exponent: i32) -> f64 {
+    let mut value = x;
+    let mut remaining = exponent;
+    while remaining > 1000 {
+        value *= 2f64.powi(1000);
+        remaining -= 1000;
+    }
+    while remaining < -1000 {
+        value *= 2f64.powi(-1000);
+        remaining += 1000;
+    }
+    value * 2f64.powi(remaining)
+}
+
+/// `frexp(x, exponent)`: the mantissa in [0.5, 1) and the power of two.
+pub(super) extern "win64" fn native_crt_frexp(x: f64, exponent: *mut i32) -> f64 {
+    let write = |value: i32| {
+        if !exponent.is_null() {
+            unsafe { exponent.write_unaligned(value) };
+        }
+    };
+    if x == 0.0 || !x.is_finite() {
+        write(0);
+        return x;
+    }
+    let (value, bias) = if x.is_subnormal() { (x * 2f64.powi(54), -54) } else { (x, 0) };
+    let bits = value.to_bits();
+    let biased = ((bits >> 52) & 0x7ff) as i32;
+    write(biased - 1022 + bias);
+    f64::from_bits((bits & !(0x7ffu64 << 52)) | (1022u64 << 52))
+}
+
+/// `nextafter(x, y)`: the adjacent representable value from x toward y.
+pub(super) extern "win64" fn native_crt_nextafter(x: f64, y: f64) -> f64 {
+    if x.is_nan() || y.is_nan() {
+        return x + y;
+    }
+    if x == y {
+        return y;
+    }
+    if x == 0.0 {
+        return f64::from_bits(1).copysign(y);
+    }
+    let bits = x.to_bits();
+    let away_from_zero = (y > x) == (x > 0.0);
+    f64::from_bits(if away_from_zero { bits + 1 } else { bits - 1 })
+}
+pub(super) extern "win64" fn native_crt_nextafterf(x: f32, y: f32) -> f32 {
+    if x.is_nan() || y.is_nan() {
+        return x + y;
+    }
+    if x == y {
+        return y;
+    }
+    if x == 0.0 {
+        return f32::from_bits(1).copysign(y);
+    }
+    let bits = x.to_bits();
+    let away_from_zero = (y > x) == (x > 0.0);
+    f32::from_bits(if away_from_zero { bits + 1 } else { bits - 1 })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frexp_ldexp_and_nextafter_follow_c_semantics() {
+        let mut exponent = 0;
+        assert_eq!(native_crt_frexp(8.0, &mut exponent), 0.5);
+        assert_eq!(exponent, 4);
+        assert_eq!(native_crt_frexp(-0.75, &mut exponent), -0.75);
+        assert_eq!(exponent, 0);
+        let tiny = f64::from_bits(1);
+        let mantissa = native_crt_frexp(tiny, &mut exponent);
+        assert_eq!((mantissa, exponent), (0.5, -1073));
+        assert_eq!(native_crt_ldexp(0.5, 4), 8.0);
+        assert_eq!(native_crt_ldexp(1.0, -1074), tiny);
+        assert_eq!(native_crt_ldexp(1.0, 1024), f64::INFINITY);
+        assert_eq!(native_crt_nextafter(1.0, 2.0), 1.0 + f64::EPSILON);
+        assert_eq!(native_crt_nextafter(0.0, -1.0), -tiny);
+        assert_eq!(native_crt_nextafter(-1.0, 0.0), -1.0 + f64::EPSILON / 2.0);
+        assert_eq!(native_crt_nextafterf(1.0, 0.0), 1.0 - f32::EPSILON / 2.0);
+        assert_eq!(native_crt_nearbyint(2.5), 2.0);
+        assert_eq!(native_crt_nearbyintf(3.5), 4.0);
+        assert_eq!(native_crt_dsign(-0.0), 0x8000);
+        assert_eq!(native_crt_fdsign(1.0), 0);
+        assert_eq!(native_crt_exp2(10.0), 1024.0);
+        assert!((native_crt_log1p(1e-10) - 1e-10).abs() < 1e-20);
+    }
 
     #[test]
     fn math_functions_follow_c_semantics() {

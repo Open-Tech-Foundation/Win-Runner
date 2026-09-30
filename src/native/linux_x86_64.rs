@@ -37,6 +37,9 @@ use runtime_support::*;
 #[path = "linux_x86_64/nls_locale.rs"]
 mod nls_locale;
 use nls_locale::*;
+#[path = "linux_x86_64/crt_support.rs"]
+mod crt_support;
+use crt_support::*;
 #[path = "linux_x86_64/crt_time.rs"]
 mod crt_time;
 use crt_time::*;

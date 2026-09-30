@@ -626,6 +626,16 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add the UCRT and VCRUNTIME imports ES-Runtime calls: C-locale `mbtowc`,
+  `mbrtowc`, `mbsrtowcs`, `wcrtomb(_s)`, and `___mb_cur_max_l_func`;
+  `strcpy`, `strcat`, `isalnum`, `isprint`, `strtof` and the `_l` string to
+  number variants, `_wtoi64`; `_aligned_malloc`/`_aligned_free`, `_msize`;
+  `bsearch`, `div`, `rand_s`, `strerror_s`, `feclearexcept`, `_wassert`;
+  `setvbuf`, `setbuf`, `_setmode`; `frexp`, `ldexp`, `nextafter(f)`,
+  `nearbyint(f)`, `exp2`, `log1p`, `_dsign`/`_fdsign`; `_localtime64_s`,
+  `strftime`/`_strftime_l`, `_tzset`, `__timezone`, `__tzname`; VCRUNTIME's
+  `memchr`, `std::exception`/`type_info` helpers, `__current_exception`, and
+  `_purecall`; and `IsThreadAFiber`.
 - Add `RtlAddGrowableFunctionTable`, `RtlGrowFunctionTable`, and
   `RtlDeleteGrowableFunctionTable`, which JITs use to register unwind data
   for generated code. V8 (in ES-Runtime) calls them unconditionally on

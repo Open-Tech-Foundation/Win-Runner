@@ -102,6 +102,52 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                     | "_errno"
                     | "_beginthreadex"
                     | "_fileno"
+                    | "___mb_cur_max_l_func"
+                    | "mbrtowc"
+                    | "mbrlen"
+                    | "mbsrtowcs"
+                    | "wcrtomb"
+                    | "wcrtomb_s"
+                    | "isalnum"
+                    | "isprint"
+                    | "strcpy"
+                    | "strcat"
+                    | "strtof"
+                    | "_strtod_l"
+                    | "_strtold_l"
+                    | "_strtof_l"
+                    | "_wtoi64"
+                    | "_aligned_malloc"
+                    | "_aligned_free"
+                    | "_msize"
+                    | "bsearch"
+                    | "div"
+                    | "rand_s"
+                    | "strerror_s"
+                    | "feclearexcept"
+                    | "_wassert"
+                    | "setvbuf"
+                    | "setbuf"
+                    | "_setmode"
+                    | "_dsign"
+                    | "_fdsign"
+                    | "exp2"
+                    | "frexp"
+                    | "ldexp"
+                    | "log1p"
+                    | "nearbyint"
+                    | "nearbyintf"
+                    | "nextafter"
+                    | "nextafterf"
+                    | "_localtime64_s"
+                    | "localtime_s"
+                    | "_tzset"
+                    | "__timezone"
+                    | "__tzname"
+                    | "_strftime_l"
+                    | "strftime"
+                    | "mbtowc"
+                    | "_mbtowc_l"
                     | "_write"
                     | "getenv"
                     | "_wgetenv"
@@ -280,7 +326,26 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
             )
         }
         "VCRUNTIME140.DLL" => {
-            matches!(func, "memcmp" | "memcpy" | "memmove" | "memset" | "strlen")
+            matches!(
+                func,
+                "memcmp"
+                    | "memcpy"
+                    | "memmove"
+                    | "memset"
+                    | "strlen"
+                    | "strchr"
+                    | "strrchr"
+                    | "strstr"
+                    | "memchr"
+                    | "__std_type_info_compare"
+                    | "__std_exception_copy"
+                    | "__std_exception_destroy"
+                    | "__std_terminate"
+                    | "_purecall"
+                    | "__uncaught_exceptions"
+                    | "__current_exception"
+                    | "__current_exception_context"
+            )
         }
         "WINMM.DLL" => func == "timeGetTime",
         "USERENV.DLL" => func == "GetUserProfileDirectoryW",
@@ -414,6 +479,61 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "__p__fmode" => Some(native_crt_p_fmode as *const () as usize as u64),
         "__p__commode" => Some(native_crt_p_commode as *const () as usize as u64),
         "_errno" => Some(native_crt_errno as *const () as usize as u64),
+        "mbtowc" => Some(native_crt_mbtowc as *const () as usize as u64),
+        "_mbtowc_l" => Some(native_crt_mbtowc_l as *const () as usize as u64),
+        "___mb_cur_max_l_func" => Some(native_crt_mb_cur_max_l as *const () as usize as u64),
+        "mbrtowc" => Some(native_crt_mbrtowc as *const () as usize as u64),
+        "mbrlen" => Some(native_crt_mbrlen as *const () as usize as u64),
+        "mbsrtowcs" => Some(native_crt_mbsrtowcs as *const () as usize as u64),
+        "wcrtomb" => Some(native_crt_wcrtomb as *const () as usize as u64),
+        "wcrtomb_s" => Some(native_crt_wcrtomb_s as *const () as usize as u64),
+        "isalnum" => Some(native_crt_isalnum as *const () as usize as u64),
+        "isprint" => Some(native_crt_isprint as *const () as usize as u64),
+        "strcpy" => Some(native_crt_strcpy as *const () as usize as u64),
+        "strcat" => Some(native_crt_strcat as *const () as usize as u64),
+        "strtof" => Some(native_crt_strtof as *const () as usize as u64),
+        "_strtod_l" => Some(native_crt_strtod_l as *const () as usize as u64),
+        "_strtold_l" => Some(native_crt_strtod_l as *const () as usize as u64),
+        "_strtof_l" => Some(native_crt_strtof_l as *const () as usize as u64),
+        "_wtoi64" => Some(native_crt_wtoi64 as *const () as usize as u64),
+        "_aligned_malloc" => Some(native_crt_aligned_malloc as *const () as usize as u64),
+        "_aligned_free" => Some(native_crt_aligned_free as *const () as usize as u64),
+        "_msize" => Some(native_crt_msize as *const () as usize as u64),
+        "bsearch" => Some(native_crt_bsearch as *const () as usize as u64),
+        "div" => Some(native_crt_div as *const () as usize as u64),
+        "rand_s" => Some(native_crt_rand_s as *const () as usize as u64),
+        "strerror_s" => Some(native_crt_strerror_s as *const () as usize as u64),
+        "feclearexcept" => Some(native_crt_feclearexcept as *const () as usize as u64),
+        "_wassert" => Some(native_crt_wassert as *const () as usize as u64),
+        "setvbuf" => Some(native_crt_setvbuf as *const () as usize as u64),
+        "setbuf" => Some(native_crt_setbuf as *const () as usize as u64),
+        "_setmode" => Some(native_crt_setmode as *const () as usize as u64),
+        "_dsign" => Some(native_crt_dsign as *const () as usize as u64),
+        "_fdsign" => Some(native_crt_fdsign as *const () as usize as u64),
+        "exp2" => Some(native_crt_exp2 as *const () as usize as u64),
+        "frexp" => Some(native_crt_frexp as *const () as usize as u64),
+        "ldexp" => Some(native_crt_ldexp as *const () as usize as u64),
+        "log1p" => Some(native_crt_log1p as *const () as usize as u64),
+        "nearbyint" => Some(native_crt_nearbyint as *const () as usize as u64),
+        "nearbyintf" => Some(native_crt_nearbyintf as *const () as usize as u64),
+        "nextafter" => Some(native_crt_nextafter as *const () as usize as u64),
+        "nextafterf" => Some(native_crt_nextafterf as *const () as usize as u64),
+        "_localtime64_s" => Some(native_crt_localtime64_s as *const () as usize as u64),
+        "localtime_s" => Some(native_crt_localtime64_s as *const () as usize as u64),
+        "_tzset" => Some(native_crt_tzset as *const () as usize as u64),
+        "__timezone" => Some(native_crt_timezone as *const () as usize as u64),
+        "__tzname" => Some(native_crt_tzname as *const () as usize as u64),
+        "_strftime_l" => Some(native_crt_strftime_l as *const () as usize as u64),
+        "strftime" => Some(native_crt_strftime as *const () as usize as u64),
+        "memchr" => Some(native_crt_memchr as *const () as usize as u64),
+        "__std_type_info_compare" => Some(native_std_type_info_compare as *const () as usize as u64),
+        "__std_exception_copy" => Some(native_std_exception_copy as *const () as usize as u64),
+        "__std_exception_destroy" => Some(native_std_exception_destroy as *const () as usize as u64),
+        "__std_terminate" => Some(native_std_terminate as *const () as usize as u64),
+        "_purecall" => Some(native_crt_purecall as *const () as usize as u64),
+        "__uncaught_exceptions" => Some(native_crt_uncaught_exceptions as *const () as usize as u64),
+        "__current_exception" => Some(native_current_exception as *const () as usize as u64),
+        "__current_exception_context" => Some(native_current_exception_context as *const () as usize as u64),
         "_fileno" => Some(native_crt_fileno as *const () as usize as u64),
         "_beginthreadex" => Some(native_crt_beginthreadex as *const () as usize as u64),
         "getenv" => Some(native_crt_getenv as *const () as usize as u64),
@@ -567,6 +687,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "EventWrite" => Some(native_event_write as *const () as usize as u64),
         "CoInitializeEx" => Some(native_co_initialize_ex as *const () as usize as u64),
         "CoGetContextToken" => Some(native_co_get_context_token as *const () as usize as u64),
+        "IsThreadAFiber" => Some(native_is_thread_a_fiber as *const () as usize as u64),
         "DisableThreadLibraryCalls" => Some(native_disable_thread_library_calls as *const () as usize as u64),
         "GetErrorInfo" => Some(native_get_error_info as *const () as usize as u64),
         "SetErrorInfo" => Some(native_set_error_info as *const () as usize as u64),

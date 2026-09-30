@@ -400,6 +400,31 @@ pub(super) extern "win64" fn native_crt_create_locale(category: i32, name: *cons
 
 pub(super) extern "win64" fn native_crt_free_locale(_locale: *const u64) {}
 
+/// `mbtowc` / `_mbtowc_l` in the "C" locale: one byte per character, each
+/// mapping to the code unit of the same value; the encoding is stateless.
+pub(super) extern "win64" fn native_crt_mbtowc_l(
+    output: *mut u16,
+    input: *const u8,
+    count: usize,
+    _locale: *const u64,
+) -> i32 {
+    if input.is_null() {
+        return 0; // no shift state
+    }
+    if count == 0 {
+        return -1;
+    }
+    let byte = unsafe { input.read() };
+    if !output.is_null() {
+        unsafe { output.write(u16::from(byte)) };
+    }
+    i32::from(byte != 0)
+}
+
+pub(super) extern "win64" fn native_crt_mbtowc(output: *mut u16, input: *const u8, count: usize) -> i32 {
+    native_crt_mbtowc_l(output, input, count, ptr::null())
+}
+
 /// `___lc_codepage_func`: the "C" locale's code page, the ANSI one.
 pub(super) extern "win64" fn native_crt_lc_codepage() -> u32 {
     native_get_acp()
@@ -463,6 +488,18 @@ pub(super) extern "win64" fn native_crt_pctype() -> *const u16 {
 
 #[cfg(test)]
 mod c_locale_tests {
+    #[test]
+    fn mbtowc_maps_bytes_one_to_one_in_the_c_locale() {
+        let mut output = 0u16;
+        assert_eq!(super::native_crt_mbtowc(&mut output, b"A".as_ptr(), 1), 1);
+        assert_eq!(output, u16::from(b'A'));
+        assert_eq!(super::native_crt_mbtowc_l(&mut output, [0xe9u8].as_ptr(), 4, std::ptr::null()), 1);
+        assert_eq!(output, 0xe9);
+        assert_eq!(super::native_crt_mbtowc(&mut output, b"\0".as_ptr(), 1), 0);
+        assert_eq!(super::native_crt_mbtowc(&mut output, b"A".as_ptr(), 0), -1);
+        assert_eq!(super::native_crt_mbtowc(&mut output, std::ptr::null(), 1), 0, "stateless");
+    }
+
     use super::*;
 
     #[test]

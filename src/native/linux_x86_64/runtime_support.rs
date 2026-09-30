@@ -509,6 +509,11 @@ pub(super) extern "win64" fn native_set_error_info(_reserved: u32, _info: u64) -
     0 // S_OK
 }
 
+/// `IsThreadAFiber()`: winrun threads never convert to fibers.
+pub(super) extern "win64" fn native_is_thread_a_fiber() -> i32 {
+    0
+}
+
 /// `DisableThreadLibraryCalls(module)`: an optimization hint; modules keep
 /// receiving thread notifications, which they must tolerate anyway.
 pub(super) extern "win64" fn native_disable_thread_library_calls(module: u64) -> i32 {
@@ -671,6 +676,7 @@ mod tests {
         assert!(!super::super::supports_import("OLEAUT32.dll", "#202"));
         assert_eq!(native_disable_thread_library_calls(0x1_8000_0000), 1);
         assert_eq!(native_disable_thread_library_calls(0), 0);
+        assert_eq!(native_is_thread_a_fiber(), 0);
         assert_eq!(native_set_thread_description(0, ptr::null()), 0);
     }
 
