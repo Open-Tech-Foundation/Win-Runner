@@ -249,6 +249,43 @@ pub(super) extern "win64" fn native_get_current_directory_w(
     unsafe { output.copy_from_nonoverlapping(encoded.as_ptr(), encoded.len()) };
     (encoded.len() - 1) as u32
 }
+/// `SetCurrentDirectoryW(path)`: `ERROR_FILE_NOT_FOUND` for a missing
+/// path, `ERROR_DIRECTORY` for a file.
+pub(super) extern "win64" fn native_set_current_directory_w(path: *const u16) -> i32 {
+    let Some(path) = wide(path) else {
+        native_set_last_error(87);
+        return 0;
+    };
+    let Some(context) = fs_ctx() else {
+        native_set_last_error(6);
+        return 0;
+    };
+    let Ok(mut ctx) = context.lock() else {
+        native_set_last_error(6);
+        return 0;
+    };
+    if ctx.fs.is_file(&path) {
+        native_set_last_error(267); // ERROR_DIRECTORY
+        return 0;
+    }
+    match ctx.fs.set_cwd(&path) {
+        Ok(()) => 1,
+        Err(_) => {
+            native_set_last_error(if ctx.fs.normalize(&path).is_ok() { 2 } else { 123 });
+            0
+        }
+    }
+}
+
+pub(super) extern "win64" fn native_set_current_directory_a(path: *const u8) -> i32 {
+    let Some(path) = (unsafe { ascii_z(path) }) else {
+        native_set_last_error(87);
+        return 0;
+    };
+    let wide_path: Vec<u16> = path.encode_utf16().chain([0]).collect();
+    native_set_current_directory_w(wide_path.as_ptr())
+}
+
 pub(super) extern "win64" fn native_get_system_directory_w(output: *mut u16, capacity: u32) -> u32 {
     let encoded: Vec<u16> = system_profile::SYSTEM32
         .encode_utf16()

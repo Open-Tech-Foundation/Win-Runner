@@ -1025,6 +1025,26 @@ mod protection_tests {
     }
 
     #[test]
+    fn set_current_directory_changes_relative_resolution() {
+        {
+            let context = super::fs_ctx().unwrap();
+            let mut ctx = context.lock().unwrap();
+            ctx.fs.mkdir(r"C:\chdir_cases\inner").unwrap();
+            ctx.fs.write_file(r"C:\chdir_cases\f.txt", b"x".to_vec()).unwrap();
+        }
+        let previous = super::fs_ctx().unwrap().lock().unwrap().fs.cwd();
+        assert_eq!(super::native_set_current_directory_w(wide_z(r"C:\chdir_cases\missing").as_ptr()), 0);
+        assert_eq!(super::native_get_last_error(), 2);
+        assert_eq!(super::native_set_current_directory_w(wide_z(r"C:\chdir_cases\f.txt").as_ptr()), 0);
+        assert_eq!(super::native_get_last_error(), 267, "ERROR_DIRECTORY");
+        assert_eq!(super::native_set_current_directory_a(b"C:\\chdir_cases\\inner\0".as_ptr()), 1);
+        let mut buffer = [0u16; 64];
+        let length = super::native_get_current_directory_w(64, buffer.as_mut_ptr());
+        assert_eq!(String::from_utf16_lossy(&buffer[..length as usize]), r"C:\chdir_cases\inner");
+        assert_eq!(super::native_set_current_directory_w(wide_z(&previous).as_ptr()), 1);
+    }
+
+    #[test]
     fn opened_paths_are_canonical_for_final_path_queries() {
         {
             let context = super::fs_ctx().unwrap();

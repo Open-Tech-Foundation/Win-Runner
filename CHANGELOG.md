@@ -6,6 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Add `SetCurrentDirectoryW` and `SetCurrentDirectoryA`, which were missing
+  (`GetProcAddress` failed and static imports hit a stub), with
+  `ERROR_FILE_NOT_FOUND` for a missing path and `ERROR_DIRECTORY` for a file.
 - Resolve Winsock imports by name as well as by ordinal (`WSAStartup`,
   `socket`, `connect`, `send`, and the rest), as Rust's std, mio, and
   socket2 import them, and add `accept`, `recv`, `recvfrom`, `sendto`,

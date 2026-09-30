@@ -1361,6 +1361,8 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
             Some(native_need_current_directory_for_exe_path_w as *const () as usize as u64)
         }
         "GetCurrentDirectoryW" => Some(native_get_current_directory_w as *const () as usize as u64),
+        "SetCurrentDirectoryW" => Some(native_set_current_directory_w as *const () as usize as u64),
+        "SetCurrentDirectoryA" => Some(native_set_current_directory_a as *const () as usize as u64),
         "GetComputerNameExW" => Some(native_get_computer_name_ex_w as *const () as usize as u64),
         "SetFileTime" => Some(native_set_file_time as *const () as usize as u64),
         "SetFilePointerEx" => Some(native_set_file_pointer_ex as *const () as usize as u64),
