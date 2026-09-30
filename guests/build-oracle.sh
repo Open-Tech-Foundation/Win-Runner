@@ -27,7 +27,8 @@ mkdir -p "$OUT" "$ART"
 
 for probe in "$ROOT"/guests/oracle/*.rs; do
     name="$(basename "$probe" .rs)"
-    [[ "$name" == common ]] && continue
+    # Shared code, included by the probes.
+    [[ "$name" == common || "$name" == *_support ]] && continue
     obj="$OUT/oracle_$name.o"
     rustc --target "$TARGET" --crate-type lib --emit obj \
         -C panic=abort -C opt-level=2 --edition 2021 \

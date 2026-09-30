@@ -674,6 +674,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Record the first Windows transcript (`tests/oracle/golden/fs_paths.txt`,
+  from `windows-latest`), which Win-Runner now matches line for line; make
+  oracle lengths and offsets relative so transcripts do not depend on the
+  checkout path; and add the `path_names` probe for how returned path
+  spellings and drive-letter case come back.
 - Add the Windows oracle (`tests/oracle`): `no_std` probe programs that call
   Win32 APIs directly and print each result and error code, run unchanged on
   real Windows and under Win-Runner. The `windows-oracle` workflow builds the

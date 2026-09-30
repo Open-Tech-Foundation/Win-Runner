@@ -1,0 +1,102 @@
+probe fs_paths
+setup.mkdir: ok
+setup.chdir: ok
+setup.one: ok
+setup.subdir: ok
+setup.two: ok
+full.plain: len=ok path="<W>\\One.txt" file=last
+full.case: len=ok path="<W>\\one.TXT" file=last
+full.dot: len=ok path="<W>\\One.txt" file=last
+full.dotdot: len=ok path="<W>\\One.txt" file=last
+full.slash: len=ok path="<W>\\Sub Dir\\two.txt" file=last
+full.double_sep: len=ok path="<W>\\Sub Dir\\two.txt" file=last
+full.dot_in_middle: len=ok path="<W>\\Sub Dir\\two.txt" file=last
+full.trailing_dot: len=ok path="<W>\\One.txt" file=last
+full.trailing_dots_spaces: len=ok path="<W>\\One.txt" file=last
+full.trailing_spaces: len=ok path="<W>\\One.txt" file=last
+full.three_dots: len=ok path="<W>\\a\\...\\b" file=last
+full.root_relative: len=ok path="<D>:\\One.txt" file=last
+full.drive_relative: len=ok path="<W>\\One.txt" file=last
+full.drive_forward: len=ok path="<D>:\\One.txt" file=last
+full.parent: len=ok path="<B>" file=last
+full.current: len=ok path="<W>" file=last
+full.trailing_sep: len=ok path="<W>\\Sub Dir\\" file=null
+full.above_root: len=ok path="<D>:\\x" file=last
+full.stream: len=ok path="<W>\\One.txt:alt" file=last
+full.verbatim: len=ok path="\\\\?\\<W>\\One.txt" file=last
+full.device_nul: len=ok path="\\\\.\\nul" file=null
+full.device_nul_ext: len=ok path="<W>\\NUL.txt" file=last
+full.device_con: len=ok path="\\\\.\\con" file=null
+full.device_com1: len=ok path="<W>\\com1.log" file=last
+full.device_path: len=ok path="\\\\.\\nul" file=last
+full.unc: len=ok path="\\\\server\\share\\b" file=last
+full.empty: fail err=123
+full.small_buffer: needs=len+1
+attr.file: 0x0 file
+attr.case: 0x0 file
+attr.dir: 0x10 dir
+attr.dir_trailing_sep: 0x10 dir
+attr.file_trailing_sep: INVALID err=267
+attr.trailing_dot: 0x0 file
+attr.slash: 0x0 file
+attr.missing: INVALID err=2
+attr.missing_parent: INVALID err=3
+attr.through_file: INVALID err=3
+attr.empty: INVALID err=3
+open.plain: ok
+open.trailing_dot: ok
+open.missing: INVALID err=2
+open.missing_parent: INVALID err=3
+open.through_file: INVALID err=3
+open.dir_plain: INVALID err=5
+open.dir_backup: ok
+open.file_trailing_sep: INVALID err=267
+open.invalid_lt: INVALID err=123
+open.invalid_star: INVALID err=123
+open.invalid_quote: INVALID err=123
+open.device_nul: ok
+open.create_new_existing: INVALID err=80
+open.create_always_dir: INVALID err=5
+open.dotdot: ok
+final.open: ok
+final.normalized: len=ok path="\\\\?\\<W>\\Sub Dir\\two.txt"
+final.opened_name: len=ok path="\\\\?\\<W>\\Sub Dir\\two.txt"
+final.volume_none: len=ok path="<W:nodrive>\\Sub Dir\\two.txt"
+final.small_buffer: needs=len+1
+final.dir_open: ok
+final.dir: len=ok path="\\\\?\\<W>\\Sub Dir"
+find.all: "."/, ".."/, "One.txt":5, "Sub Dir"/ end err=18
+find.ext_upper: "One.txt":5 end err=18
+find.prefix: "Sub Dir"/ end err=18
+find.in_subdir: "."/, ".."/, "two.txt":2 end err=18
+find.exact: "One.txt":5 end err=18
+find.dir_itself: "Sub Dir"/ end err=18
+find.question: "One.txt":5 end err=18
+find.nomatch: INVALID err=2
+find.missing_dir: INVALID err=3
+long.case: path="Sub Dir\\two.txt"
+long.missing: fail err=2
+size.open: ok
+size.one: 5
+move.case_only: ok
+move.case_only.listing: "one.txt":5 end err=18
+copy.fail_if_exists: fail err=80
+copy.overwrite: ok
+move.onto_existing: fail err=183
+move.replace_existing: ok
+move.missing: fail err=2
+mkdir.existing: fail err=183
+mkdir.missing_parent: fail err=3
+delete.dir: fail err=5
+delete.missing: fail err=2
+rmdir.nonempty: fail err=145
+rmdir.file: fail err=267
+chdir.file: fail err=267
+chdir.missing: fail err=2
+after_ops.listing: "."/, ".."/, "copy.txt":5, "two.txt":5 end err=18
+cleanup.two: ok
+cleanup.copy: ok
+cleanup.subdir: ok
+cleanup.chdir: ok
+cleanup.work: ok
+END

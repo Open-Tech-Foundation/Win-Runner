@@ -9,8 +9,9 @@
 // Every API except the handful needed to print and exit is looked up with
 // GetProcAddress, so an API Win-Runner lacks prints `unavailable` instead of
 // ending the probe. Machine-specific values are normalized before printing:
-// the probe's work directory becomes `<W>`, the directory it started in
-// `<B>`, and their drive letter `<D>`.
+// the probe's work directory becomes `<W>` (`<W:nodrive>` without its drive),
+// the directory it started in `<B>`, and their drive letter `<D>`. Lengths
+// and offsets print relative to the string they describe.
 // Included with `include!` (plain rustc builds, no_std, no allocator).
 
 extern "system" {
@@ -273,7 +274,13 @@ fn out_path(path: &[u16]) {
     let drive_at = if verbatim { 4 } else { 0 };
     while i < length {
         if prefix_at(path, i, &work[..work_len]) {
-            push(&mut normalized, &mut n, "<W>");
+            // Keep a drive letter that differs in case from the work
+            // directory's visible: `<d>:` marks a lowercase one.
+            if path[i] != work[0] && work_len > 2 && work[1] == 0x3a {
+                push(&mut normalized, &mut n, "<d>:<W:nodrive>");
+            } else {
+                push(&mut normalized, &mut n, "<W>");
+            }
             i += work_len;
             continue;
         }
@@ -282,8 +289,15 @@ fn out_path(path: &[u16]) {
             i += base_len;
             continue;
         }
+        // The work directory without its drive (`\dir\...`), as
+        // VOLUME_NAME_NONE reports it.
+        if work_len > 2 && work[1] == 0x3a && prefix_at(path, i, &work[2..work_len]) {
+            push(&mut normalized, &mut n, "<W:nodrive>");
+            i += work_len - 2;
+            continue;
+        }
         if i == drive_at && i + 1 < length && path[i + 1] == 0x3a && lower(path[i]) == drive {
-            push(&mut normalized, &mut n, "<D>");
+            push(&mut normalized, &mut n, if path[i] == work[0] { "<D>" } else { "<d>" });
             i += 1;
             continue;
         }
@@ -292,6 +306,43 @@ fn out_path(path: &[u16]) {
         i += 1;
     }
     out_wide_quoted(&normalized[..n]);
+}
+
+// ---- input paths ---------------------------------------------------------------
+
+/// An input path: ASCII, with `{W}` standing for the work directory, `{w}`
+/// for it without its drive (`\\dir\\...`), `{D}` for its drive letter, and
+/// `{d}` for the drive letter in lowercase.
+fn input<'a>(template: &str, buffer: &'a mut [u16; 1024]) -> &'a [u16] {
+    let (work, work_len) = unsafe { (&*core::ptr::addr_of!(WORK), WORK_LEN) };
+    let bytes = template.as_bytes();
+    let mut n = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"{W}") {
+            buffer[n..n + work_len].copy_from_slice(&work[..work_len]);
+            n += work_len;
+            i += 3;
+        } else if bytes[i..].starts_with(b"{w}") {
+            buffer[n..n + work_len - 2].copy_from_slice(&work[2..work_len]);
+            n += work_len - 2;
+            i += 3;
+        } else if bytes[i..].starts_with(b"{D}") {
+            buffer[n] = work[0];
+            n += 1;
+            i += 3;
+        } else if bytes[i..].starts_with(b"{d}") {
+            buffer[n] = lower(work[0]);
+            n += 1;
+            i += 3;
+        } else {
+            buffer[n] = bytes[i] as u16;
+            n += 1;
+            i += 1;
+        }
+    }
+    buffer[n] = 0;
+    &buffer[..=n]
 }
 
 // ---- API lookup ---------------------------------------------------------------
@@ -325,6 +376,26 @@ fn clear_error() {
 fn case(name: &str) {
     out_str(name);
     out_str(": ");
+}
+
+/// `<label>=ok` when a returned length equals `actual` (the string's
+/// length), else `<label>=len<+/-delta>`: never an absolute, machine-specific
+/// number.
+fn out_len_relation(label: &str, returned: u32, actual: usize) {
+    out_str(label);
+    out_byte(b'=');
+    if returned as usize == actual {
+        out_str("ok");
+        return;
+    }
+    out_str("len");
+    if returned as usize > actual {
+        out_byte(b'+');
+        out_dec((returned as usize - actual) as u64);
+    } else {
+        out_byte(b'-');
+        out_dec((actual - returned as usize) as u64);
+    }
 }
 
 /// ` err=<n>` for a failed call.
