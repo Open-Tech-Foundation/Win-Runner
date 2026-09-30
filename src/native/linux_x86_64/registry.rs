@@ -807,6 +807,19 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "MessageBeep" => Some(native_message_beep as *const () as usize as u64),
         "CompareStringOrdinal" => Some(native_compare_string_ordinal as *const () as usize as u64),
         "GetLocaleInfoEx" => Some(native_get_locale_info_ex as *const () as usize as u64),
+        "GetLocaleInfoW" => Some(native_get_locale_info_w as *const () as usize as u64),
+        "GetUserPreferredUILanguages"
+        | "GetSystemPreferredUILanguages"
+        | "GetThreadPreferredUILanguages"
+        | "GetProcessPreferredUILanguages" => {
+            Some(native_get_preferred_ui_languages as *const () as usize as u64)
+        }
+        "GetUserDefaultUILanguage" | "GetSystemDefaultUILanguage" | "GetUserDefaultLangID"
+        | "GetSystemDefaultLangID" => Some(native_get_default_ui_language as *const () as usize as u64),
+        "LocaleNameToLCID" => Some(native_locale_name_to_lcid as *const () as usize as u64),
+        "LCIDToLocaleName" => Some(native_lcid_to_locale_name as *const () as usize as u64),
+        "IsValidLocaleName" => Some(native_is_valid_locale_name as *const () as usize as u64),
+        "ResolveLocaleName" => Some(native_resolve_locale_name as *const () as usize as u64),
         "GetLongPathNameW" => Some(native_get_long_path_name_w as *const () as usize as u64),
         // WinFS has no short-name aliases, so the normalized DOS path is
         // the shortest spelling available for the path.

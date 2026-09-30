@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Answer `GetLocaleInfoEx` for the NLS data .NET reads (names, parent,
+  neutrality, number, currency, and date formats) instead of only
+  `LOCALE_SNAME`, and add `GetLocaleInfoW`, `LocaleNameToLCID`,
+  `LCIDToLocaleName`, `IsValidLocaleName`, `ResolveLocaleName`, and the
+  preferred UI language queries, for `en-US`, `en`, and the invariant
+  locale. .NET could not create `en-US` and failed with "infinite recursion
+  while looking up resource".
 - Allocate child process and thread handles outside the semaphore and event
   handle ranges; a wait on a child thread could instead find a signaled
   event with the same handle value.

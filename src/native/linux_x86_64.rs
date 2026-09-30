@@ -34,6 +34,9 @@ use topology::*;
 #[path = "linux_x86_64/runtime_support.rs"]
 mod runtime_support;
 use runtime_support::*;
+#[path = "linux_x86_64/nls_locale.rs"]
+mod nls_locale;
+use nls_locale::*;
 #[path = "linux_x86_64/crt_time.rs"]
 mod crt_time;
 use crt_time::*;

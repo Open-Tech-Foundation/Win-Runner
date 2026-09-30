@@ -371,34 +371,6 @@ mod compare_string_ordinal_tests {
     }
 }
 
-pub(super) extern "win64" fn native_get_locale_info_ex(
-    locale: *const u16,
-    kind: u32,
-    output: *mut u16,
-    capacity: i32,
-) -> i32 {
-    if native_diagnostic_enabled() {
-        eprintln!(
-            "native GetLocaleInfoEx locale={:?} kind={kind:#x}",
-            wide(locale)
-        );
-    }
-    if kind == 0x5c {
-        let value: Vec<u16> = "en-US\0".encode_utf16().collect();
-        if capacity == 0 {
-            return value.len() as i32;
-        }
-        if capacity > 0 && (capacity as usize) >= value.len() && !output.is_null() {
-            unsafe { ptr::copy_nonoverlapping(value.as_ptr(), output, value.len()) };
-            return value.len() as i32;
-        }
-        native_set_last_error(122);
-        return 0;
-    }
-    native_set_last_error(87);
-    0
-}
-
 pub(super) extern "win64" fn native_are_file_apis_ansi() -> i32 {
     1
 }
