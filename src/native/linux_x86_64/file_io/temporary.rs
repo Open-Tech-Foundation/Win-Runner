@@ -473,6 +473,23 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_reopen_file(
     native_create_file_w(wide_path.as_ptr(), access, share, 0, 3, flags, 0)
 }
 
+/// Whether a FileDispositionInfo (4) or FileDispositionInfoEx (21) record
+/// asks for deletion.
+fn delete_requested(class: i32, information: *const u8) -> bool {
+    let flags = if class == 21 {
+        (unsafe { information.cast::<u32>().read_unaligned() }) & 0x1
+    } else {
+        u32::from(unsafe { information.read() })
+    };
+    flags != 0
+}
+
+fn directory_not_empty(ctx: &NativeFs, handle: u64) -> bool {
+    ctx.handles.get(&handle).is_some_and(|file| {
+        ctx.fs.is_dir(&file.path) && ctx.fs.list_dir(&file.path).is_ok_and(|names| !names.is_empty())
+    })
+}
+
 pub(in crate::native::linux_x86_64) extern "win64" fn native_set_file_information_by_handle(
     handle: u64,
     class: i32,
@@ -521,8 +538,23 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_set_file_informatio
             }
             1
         }
+        4 | 21 if size >= 1 && delete_requested(class, information) && directory_not_empty(&ctx, handle) => {
+            native_set_last_error(145); // ERROR_DIR_NOT_EMPTY
+            0
+        }
         4 if size >= 1 => {
             if unsafe { information.read() } != 0 {
+                ctx.delete_on_close.insert(handle);
+            } else {
+                ctx.delete_on_close.remove(&handle);
+            }
+            1
+        }
+        // FileDispositionInfoEx: FILE_DISPOSITION_FLAG_DELETE (0x1); POSIX
+        // semantics and the other modifiers need no extra work here, since
+        // the name goes away when the handle closes.
+        21 if size >= 4 => {
+            if unsafe { information.cast::<u32>().read_unaligned() } & 0x1 != 0 {
                 ctx.delete_on_close.insert(handle);
             } else {
                 ctx.delete_on_close.remove(&handle);

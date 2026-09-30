@@ -439,7 +439,11 @@ pub(super) extern "win64" fn native_close_handle(h: u64) -> i32 {
                 if c.delete_on_close.remove(&h) {
                     if let Some(file) = c.handles.get(&h) {
                         let path = file.path.clone();
-                        let _ = c.fs.delete_file(&path);
+                        let _ = if c.fs.is_dir(&path) {
+                            c.fs.rmdir(&path)
+                        } else {
+                            c.fs.delete_file(&path)
+                        };
                     }
                 }
                 device_closed || c.handles.remove(&h).is_some() || c.finds.remove(&h).is_some()

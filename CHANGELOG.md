@@ -6,6 +6,19 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Record the canonical path of a file opened with `CreateFileW` (`\`
+  separators, `.` and `..` resolved, on-disk casing), as Windows does, so
+  `GetFinalPathNameByHandleW` no longer echoes `C:\proj\data/one.txt`.
+  Sandboxed runtimes such as ES-Runtime compare that path against their root
+  and rejected forward-slash and `..` paths as escaping it.
+- Support recursive directory deletion as Rust's `std::fs::remove_dir_all`
+  performs it: `GetFileInformationByHandleEx` directory enumeration
+  (`FileIdBothDirectory`, `FileFullDirectory`, and `FileIdExtdDirectory`
+  records with their restart variants, `.` and `..` first), `NtOpenFile` and
+  `NtCreateFile` with names relative to a directory handle,
+  `FileDispositionInfoEx`, `ERROR_DIR_NOT_EMPTY` for a non-empty directory,
+  and deleting a directory (not only a file) when its delete-on-close handle
+  closes.
 - Report each PE section's own protection from `VirtualQuery` and as the
   previous protection from `VirtualProtect` (`PAGE_READWRITE` for `.data`,
   `PAGE_EXECUTE_READ` for `.text`, read-only headers), and treat the main

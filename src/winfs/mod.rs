@@ -1170,6 +1170,26 @@ impl WinFs {
             .map(|target| target.display())
     }
 
+    /// The canonical spelling of `raw`, as Windows records an opened path:
+    /// absolute, `\`-separated, `.`/`..` resolved, and each existing
+    /// component in its on-disk casing (the rest as given).
+    pub fn canonical_path(&self, raw: &str) -> Option<String> {
+        let mut path = self.normalize(raw).ok()?;
+        if !self.is_host_drive(path.drive) {
+            let mut node = self.drives.get(&path.drive);
+            for part in &mut path.parts {
+                let Some(Node::Dir { children, .. }) = node else {
+                    break;
+                };
+                node = children.get(&windows_name_key(part));
+                if let Some(child) = node {
+                    *part = child.name().to_string();
+                }
+            }
+        }
+        Some(path.display())
+    }
+
     /// `path` with every symbolic-link component followed, like
     /// `GetFinalPathNameByHandle`; `None` when a link chain is too deep.
     pub fn resolve_links(&self, path: &str) -> Option<String> {
@@ -2326,6 +2346,27 @@ impl WinFs {
             });
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod canonical_path_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_paths_use_backslashes_resolved_dots_and_disk_casing() {
+        let mut fs = WinFs::new();
+        fs.mkdir(r"C:\Proj\Sub Dir").unwrap();
+        fs.write_file(r"C:\Proj\Sub Dir\One.txt", b"x".to_vec()).unwrap();
+        assert_eq!(
+            fs.canonical_path("c:/proj/sub dir/../Sub Dir/./ONE.TXT").as_deref(),
+            Some(r"C:\Proj\Sub Dir\One.txt")
+        );
+        // Components that do not exist keep the given spelling.
+        assert_eq!(
+            fs.canonical_path(r"C:\proj\new/File.txt").as_deref(),
+            Some(r"C:\Proj\new\File.txt")
+        );
     }
 }
 

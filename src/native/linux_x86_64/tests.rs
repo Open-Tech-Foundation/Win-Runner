@@ -1000,6 +1000,133 @@ mod protection_tests {
         assert_eq!(super::native_wait_for_single_object(opened, 0), 0);
     }
 
+    fn wide_z(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain([0]).collect()
+    }
+
+    /// Names in a `FILE_ID_BOTH_DIR_INFO` chain.
+    fn directory_record_names(buffer: &[u8]) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let record = &buffer[offset..];
+            let next = u32::from_le_bytes(record[..4].try_into().unwrap()) as usize;
+            let length = u32::from_le_bytes(record[60..64].try_into().unwrap()) as usize;
+            let units: Vec<u16> = record[104..104 + length]
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect();
+            names.push(String::from_utf16(&units).unwrap());
+            if next == 0 {
+                return names;
+            }
+            offset += next;
+        }
+    }
+
+    #[test]
+    fn opened_paths_are_canonical_for_final_path_queries() {
+        {
+            let context = super::fs_ctx().unwrap();
+            let mut ctx = context.lock().unwrap();
+            ctx.fs.mkdir(r"C:\Canonical Cases\Sub").unwrap();
+            ctx.fs.write_file(r"C:\Canonical Cases\Sub\File.txt", b"x".to_vec()).unwrap();
+        }
+        let path = wide_z("c:/canonical cases/sub/../Sub/./FILE.TXT");
+        let handle = super::native_create_file_w(path.as_ptr(), 0x8000_0000, 7, 0, 3, 0, 0);
+        assert_ne!(handle, u64::MAX);
+        let recorded = super::fs_ctx().unwrap().lock().unwrap().handles[&handle].path.clone();
+        assert_eq!(recorded, r"C:\Canonical Cases\Sub\File.txt");
+        assert_eq!(super::native_close_handle(handle), 1);
+    }
+
+    #[test]
+    fn directory_information_classes_enumerate_and_restart() {
+        {
+            let context = super::fs_ctx().unwrap();
+            let mut ctx = context.lock().unwrap();
+            ctx.fs.mkdir(r"C:\dir_info_cases\inner").unwrap();
+            ctx.fs.write_file(r"C:\dir_info_cases\a.txt", b"12345".to_vec()).unwrap();
+        }
+        let path = wide_z(r"C:\dir_info_cases");
+        let directory = super::native_create_file_w(path.as_ptr(), 1, 7, 0, 3, 0x0200_0000, 0);
+        assert_ne!(directory, u64::MAX);
+        let mut buffer = vec![0u8; 4096];
+        // FileIdBothDirectoryRestartInfo, then FileIdBothDirectoryInfo.
+        assert_eq!(
+            super::native_get_file_information_by_handle_ex(directory, 11, buffer.as_mut_ptr(), 4096),
+            1
+        );
+        let mut names = directory_record_names(&buffer);
+        names.sort();
+        assert_eq!(names, [".", "..", "a.txt", "inner"]);
+        assert_eq!(
+            super::native_get_file_information_by_handle_ex(directory, 10, buffer.as_mut_ptr(), 4096),
+            0
+        );
+        assert_eq!(super::native_get_last_error(), 18, "ERROR_NO_MORE_FILES");
+        // A buffer that fits one record returns one at a time.
+        assert_eq!(
+            super::native_get_file_information_by_handle_ex(directory, 11, buffer.as_mut_ptr(), 112),
+            1
+        );
+        assert_eq!(directory_record_names(&buffer[..112]), ["."]);
+        assert_eq!(
+            super::native_get_file_information_by_handle_ex(directory, 10, buffer.as_mut_ptr(), 8),
+            0
+        );
+        assert_eq!(super::native_get_last_error(), 234, "ERROR_MORE_DATA");
+        assert_eq!(super::native_close_handle(directory), 1);
+    }
+
+    #[test]
+    fn nt_open_file_resolves_names_relative_to_a_directory_handle() {
+        {
+            let context = super::fs_ctx().unwrap();
+            let mut ctx = context.lock().unwrap();
+            ctx.fs.mkdir(r"C:\nt_open_cases\child").unwrap();
+            ctx.fs.write_file(r"C:\nt_open_cases\child\f.txt", b"x".to_vec()).unwrap();
+        }
+        let path = wide_z(r"C:\nt_open_cases");
+        let root = super::native_create_file_w(path.as_ptr(), 1, 7, 0, 3, 0x0200_0000, 0);
+        let open = |root: u64, name: &str, options: u32, access: u32| {
+            let units: Vec<u16> = name.encode_utf16().collect();
+            let mut unicode = [0u8; 16];
+            unicode[..2].copy_from_slice(&((units.len() * 2) as u16).to_le_bytes());
+            unicode[8..].copy_from_slice(&(units.as_ptr() as u64).to_le_bytes());
+            let mut attributes = [0u8; 48];
+            attributes[..4].copy_from_slice(&48u32.to_le_bytes());
+            attributes[8..16].copy_from_slice(&root.to_le_bytes());
+            attributes[16..24].copy_from_slice(&(unicode.as_ptr() as u64).to_le_bytes());
+            let mut handle = 0u64;
+            let mut io_status = [0u8; 16];
+            let status = super::native_nt_open_file(&mut handle, access, attributes.as_ptr(), io_status.as_mut_ptr(), 7, options);
+            (status, handle)
+        };
+        let (status, child) = open(root, r"child\f.txt", 0x40 | 0x20, 0x10000);
+        assert_eq!(status, 0);
+        assert_eq!(
+            super::fs_ctx().unwrap().lock().unwrap().handles[&child].path,
+            r"C:\nt_open_cases\child\f.txt"
+        );
+        assert_eq!(open(root, "missing", 0x20, 1).0, 0xC000_0034, "STATUS_OBJECT_NAME_NOT_FOUND");
+        assert_eq!(open(root, r"child\f.txt", 0x1, 1).0, 0xC000_0103, "STATUS_NOT_A_DIRECTORY");
+        assert_eq!(open(0, r"\??\C:\nt_open_cases\child", 0x1, 1).0, 0);
+
+        // Delete the file, then the (now empty) directory, through their
+        // handles with FileDispositionInfoEx, as Rust's remove_dir_all does.
+        let (_, directory) = open(root, "child", 0x1, 0x10000);
+        let delete = 0x1u32.to_le_bytes();
+        assert_eq!(super::native_set_file_information_by_handle(directory, 21, delete.as_ptr(), 4), 0);
+        assert_eq!(super::native_get_last_error(), 145, "ERROR_DIR_NOT_EMPTY");
+        assert_eq!(super::native_set_file_information_by_handle(child, 21, delete.as_ptr(), 4), 1);
+        assert_eq!(super::native_close_handle(child), 1);
+        assert_eq!(super::native_set_file_information_by_handle(directory, 21, delete.as_ptr(), 4), 1);
+        assert_eq!(super::native_close_handle(directory), 1);
+        assert!(!super::fs_ctx().unwrap().lock().unwrap().fs.exists(r"C:\nt_open_cases\child"));
+        assert_eq!(super::native_close_handle(root), 1);
+    }
+
     #[test]
     fn find_first_file_reports_directories_sizes_and_names() {
         let context = super::fs_ctx().unwrap();

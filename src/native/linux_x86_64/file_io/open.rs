@@ -140,6 +140,9 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_create_file_w(
     }
     let h = ctx.next;
     ctx.next += 1;
+    // Windows records the canonical path of an opened file, so
+    // GetFinalPathNameByHandle never echoes `/`, `..`, or the caller's casing.
+    let path = ctx.fs.canonical_path(&path).unwrap_or(path);
     if native_diagnostic_enabled() {
         eprintln!("native CreateFileW opened path={path} handle={h:#x} flags={flags:#x} access={access:#x}");
     }
@@ -858,6 +861,136 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_get_file_informatio
     }
     1
 }
+/// A directory-enumeration class of `GetFileInformationByHandleEx`: where
+/// each record keeps its file id and name, and whether it restarts the scan.
+#[derive(Clone, Copy)]
+struct DirectoryInfoLayout {
+    name_offset: usize,
+    file_id_offset: Option<usize>,
+    wide_file_id: bool,
+    restart: bool,
+}
+
+impl DirectoryInfoLayout {
+    fn for_class(class: i32) -> Option<Self> {
+        let (name_offset, file_id_offset, wide_file_id) = match class {
+            10 | 11 => (104, Some(96), false), // FileIdBothDirectory[Restart]Info
+            14 | 15 => (68, None, false),      // FileFullDirectory[Restart]Info
+            19 | 20 => (88, Some(72), true),   // FileIdExtdDirectory[Restart]Info
+            _ => return None,
+        };
+        Some(Self {
+            name_offset,
+            file_id_offset,
+            wide_file_id,
+            restart: matches!(class, 11 | 15 | 20),
+        })
+    }
+}
+
+/// Fill `output` with as many directory records as fit, continuing from the
+/// handle's enumeration position (NTFS order: `.`, `..`, then entries).
+/// `ERROR_NO_MORE_FILES` once the listing is exhausted.
+fn native_directory_information(handle: u64, layout: DirectoryInfoLayout, output: *mut u8, size: u32) -> i32 {
+    let Some(context) = fs_ctx() else {
+        native_set_last_error(6);
+        return 0;
+    };
+    let Ok(mut ctx) = context.lock() else {
+        native_set_last_error(6);
+        return 0;
+    };
+    let Some(file) = ctx.handles.get(&handle) else {
+        native_set_last_error(6); // ERROR_INVALID_HANDLE
+        return 0;
+    };
+    let path = file.path.clone();
+    let start = if layout.restart { 0 } else { file.offset };
+    if !ctx.fs.is_dir(&path) {
+        native_set_last_error(267); // ERROR_DIRECTORY
+        return 0;
+    }
+    let Ok(children) = ctx.fs.list_dir(&path) else {
+        native_set_last_error(3);
+        return 0;
+    };
+    let base = path.trim_end_matches('\\');
+    let parent = match base.rsplit_once('\\') {
+        Some((parent, _)) if parent.ends_with(':') => format!("{parent}\\"),
+        Some((parent, _)) => parent.to_string(),
+        None => path.clone(),
+    };
+    let mut entries = vec![(".".to_string(), path.clone()), ("..".to_string(), parent)];
+    entries.extend(children.into_iter().map(|name| {
+        let full = format!("{base}\\{name}");
+        (name, full)
+    }));
+    if start >= entries.len() {
+        native_set_last_error(18); // ERROR_NO_MORE_FILES
+        return 0;
+    }
+    let mut written = 0usize;
+    let mut previous: Option<usize> = None;
+    let mut index = start;
+    while let Some((name, entry_path)) = entries.get(index) {
+        let encoded: Vec<u16> = name.encode_utf16().collect();
+        let used = layout.name_offset + encoded.len() * 2;
+        if written + used > size as usize {
+            if written == 0 {
+                native_set_last_error(234); // ERROR_MORE_DATA
+                return 0;
+            }
+            break;
+        }
+        let metadata = ctx.fs.file_metadata(entry_path);
+        let directory = ctx.fs.is_dir(entry_path);
+        let mut attributes = metadata.attributes;
+        if directory {
+            attributes = (attributes & !0x80) | 0x10;
+        } else if attributes == 0 {
+            attributes = 0x80; // FILE_ATTRIBUTE_NORMAL
+        }
+        let length = if directory { 0 } else { ctx.fs.file_len(entry_path).unwrap_or(0) };
+        let file_id = ctx.fs.file_id(entry_path).unwrap_or(0);
+        unsafe {
+            let record = output.add(written);
+            ptr::write_bytes(record, 0, layout.name_offset);
+            for (offset, time) in [
+                (8, metadata.creation_time),
+                (16, metadata.access_time),
+                (24, metadata.write_time),
+                (32, metadata.write_time), // ChangeTime
+            ] {
+                record.add(offset).cast::<u64>().write_unaligned(time);
+            }
+            record.add(40).cast::<u64>().write_unaligned(length);
+            record.add(48).cast::<u64>().write_unaligned(length.div_ceil(4096) * 4096);
+            record.add(56).cast::<u32>().write_unaligned(attributes);
+            record.add(60).cast::<u32>().write_unaligned((encoded.len() * 2) as u32);
+            if let Some(offset) = layout.file_id_offset {
+                record.add(offset).cast::<u64>().write_unaligned(file_id);
+                if layout.wide_file_id {
+                    record.add(offset + 8).cast::<u64>().write_unaligned(0);
+                }
+            }
+            record
+                .add(layout.name_offset)
+                .cast::<u16>()
+                .copy_from_nonoverlapping(encoded.as_ptr(), encoded.len());
+            if let Some(previous) = previous {
+                output.add(previous).cast::<u32>().write_unaligned((written - previous) as u32);
+            }
+        }
+        previous = Some(written);
+        written += (used + 7) & !7;
+        index += 1;
+    }
+    if let Some(file) = ctx.handles.get_mut(&handle) {
+        file.offset = index;
+    }
+    1
+}
+
 pub(in crate::native::linux_x86_64) extern "win64" fn native_get_file_information_by_handle_ex(
     handle: u64,
     information_class: i32,
@@ -867,6 +1000,9 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_get_file_informatio
     if output.is_null() {
         native_set_last_error(998); // ERROR_NOACCESS
         return 0;
+    }
+    if let Some(layout) = DirectoryInfoLayout::for_class(information_class) {
+        return native_directory_information(handle, layout, output, output_size);
     }
     let Some(context) = fs_ctx() else {
         native_set_last_error(6);

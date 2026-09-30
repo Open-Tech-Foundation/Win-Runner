@@ -741,3 +741,144 @@ pub(super) extern "win64" fn native_nt_query_information_process(
     }
     0xC000_0002 // STATUS_NOT_IMPLEMENTED
 }
+
+/// The path an `OBJECT_ATTRIBUTES` names: `ObjectName`, relative to the
+/// `RootDirectory` handle's path when one is given, with the NT `\??\`
+/// prefix removed.
+fn object_attributes_path(attributes: *const u8) -> Result<String, u32> {
+    const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+    const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+    if attributes.is_null() {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let root = unsafe { attributes.add(8).cast::<u64>().read_unaligned() };
+    let name = unsafe { attributes.add(16).cast::<*const u8>().read_unaligned() };
+    if name.is_null() {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let length = unsafe { name.cast::<u16>().read_unaligned() } as usize / 2;
+    let buffer = unsafe { name.add(8).cast::<*const u16>().read_unaligned() };
+    if buffer.is_null() && length != 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let units = if length == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(buffer, length) } };
+    let relative = String::from_utf16_lossy(units);
+    if root == 0 {
+        let path = relative
+            .strip_prefix(r"\??\")
+            .or_else(|| relative.strip_prefix(r"\\?\"))
+            .unwrap_or(&relative);
+        return Ok(path.to_string());
+    }
+    let context = fs_ctx().ok_or(STATUS_INVALID_HANDLE)?;
+    let ctx = context.lock().map_err(|_| STATUS_INVALID_HANDLE)?;
+    let directory = ctx.handles.get(&root).ok_or(STATUS_INVALID_HANDLE)?.path.clone();
+    Ok(if relative.is_empty() {
+        directory
+    } else {
+        format!("{}\\{relative}", directory.trim_end_matches('\\'))
+    })
+}
+
+/// `NtCreateFile` over `CreateFileW`: NT dispositions and options mapped to
+/// Win32 ones, and the Win32 error mapped back to an NTSTATUS.
+#[allow(clippy::too_many_arguments)]
+pub(super) extern "win64" fn native_nt_create_file(
+    handle: *mut u64,
+    access: u32,
+    attributes: *const u8,
+    io_status: *mut u8,
+    _allocation_size: *const i64,
+    file_attributes: u32,
+    share: u32,
+    disposition: u32,
+    options: u32,
+    _ea_buffer: *const u8,
+    _ea_length: u32,
+) -> u32 {
+    const FILE_DIRECTORY_FILE: u32 = 0x1;
+    const FILE_SYNCHRONOUS_IO_ALERT: u32 = 0x10;
+    const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x20;
+    const FILE_NON_DIRECTORY_FILE: u32 = 0x40;
+    const FILE_DELETE_ON_CLOSE: u32 = 0x1000;
+    const FILE_OPEN_REPARSE_POINT: u32 = 0x20_0000;
+    if handle.is_null() || io_status.is_null() {
+        return 0xC000_000D;
+    }
+    let path = match object_attributes_path(attributes) {
+        Ok(path) => path,
+        Err(status) => return status,
+    };
+    // FILE_SUPERSEDE, OPEN, CREATE, OPEN_IF, OVERWRITE, OVERWRITE_IF.
+    let creation = match disposition {
+        0 | 5 => 2, // CREATE_ALWAYS
+        1 => 3,     // OPEN_EXISTING
+        2 => 1,     // CREATE_NEW
+        3 => 4,     // OPEN_ALWAYS
+        4 => 5,     // TRUNCATE_EXISTING
+        _ => return 0xC000_000D,
+    };
+    let directory = options & FILE_DIRECTORY_FILE != 0;
+    let existed = fs_ctx().and_then(|context| context.lock().ok().map(|ctx| (ctx.fs.exists(&path), ctx.fs.is_dir(&path))));
+    let (exists, is_directory) = existed.unwrap_or((false, false));
+    if exists && directory && !is_directory {
+        return 0xC000_0103; // STATUS_NOT_A_DIRECTORY
+    }
+    if exists && options & FILE_NON_DIRECTORY_FILE != 0 && is_directory {
+        return 0xC000_00BA; // STATUS_FILE_IS_A_DIRECTORY
+    }
+    if directory && !exists && matches!(disposition, 2 | 3) {
+        let wide_path: Vec<u16> = path.encode_utf16().chain([0]).collect();
+        if native_create_directory_w(wide_path.as_ptr(), 0) == 0 {
+            return 0xC000_003A; // STATUS_OBJECT_PATH_NOT_FOUND
+        }
+    }
+    let mut flags = file_attributes & 0xffff | 0x0200_0000; // FILE_FLAG_BACKUP_SEMANTICS
+    if options & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT) == 0 {
+        flags |= 0x4000_0000; // FILE_FLAG_OVERLAPPED
+    }
+    if options & FILE_OPEN_REPARSE_POINT != 0 {
+        flags |= 0x0020_0000; // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    if options & FILE_DELETE_ON_CLOSE != 0 {
+        flags |= 0x0400_0000; // FILE_FLAG_DELETE_ON_CLOSE
+    }
+    let wide_path: Vec<u16> = path.encode_utf16().chain([0]).collect();
+    let creation = if directory && creation != 3 { 3 } else { creation };
+    let opened = native_create_file_w(wide_path.as_ptr(), access, share, 0, creation, flags, 0);
+    if opened == u64::MAX {
+        return match native_get_last_error() {
+            2 => 0xC000_0034,         // STATUS_OBJECT_NAME_NOT_FOUND
+            3 => 0xC000_003A,         // STATUS_OBJECT_PATH_NOT_FOUND
+            5 => 0xC000_0022,         // STATUS_ACCESS_DENIED
+            32 => 0xC000_0043,        // STATUS_SHARING_VIOLATION
+            80 | 183 => 0xC000_0035,  // STATUS_OBJECT_NAME_COLLISION
+            _ => 0xC000_000D,
+        };
+    }
+    // FILE_SUPERSEDED 0, FILE_OPENED 1, FILE_CREATED 2, FILE_OVERWRITTEN 3.
+    let information: u64 = match (exists, disposition) {
+        (false, _) => 2,
+        (true, 0) => 0,
+        (true, 4 | 5) => 3,
+        (true, _) => 1,
+    };
+    unsafe {
+        handle.write(opened);
+        io_status.cast::<u32>().write_unaligned(0);
+        io_status.add(8).cast::<u64>().write_unaligned(information);
+    }
+    0
+}
+
+/// `NtOpenFile`: `NtCreateFile` with `FILE_OPEN`.
+pub(super) extern "win64" fn native_nt_open_file(
+    handle: *mut u64,
+    access: u32,
+    attributes: *const u8,
+    io_status: *mut u8,
+    share: u32,
+    options: u32,
+) -> u32 {
+    native_nt_create_file(handle, access, attributes, io_status, ptr::null(), 0, share, 1, options, ptr::null(), 0)
+}
