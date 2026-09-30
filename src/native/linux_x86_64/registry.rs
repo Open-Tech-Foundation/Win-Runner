@@ -376,6 +376,9 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                 | "RtlLookupFunctionEntry"
                 | "RtlRaiseException"
                 | "RtlRestoreContext"
+                | "RtlAddGrowableFunctionTable"
+                | "RtlGrowFunctionTable"
+                | "RtlDeleteGrowableFunctionTable"
                 | "RtlUnwind"
                 | "RtlUnwindEx"
                 | "RtlVirtualUnwind"
@@ -772,6 +775,13 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
             Some(native_rtl_lookup_function_entry as *const () as usize as u64)
         }
         "RtlVirtualUnwind" => Some(native_rtl_virtual_unwind as *const () as usize as u64),
+        "RtlAddGrowableFunctionTable" => {
+            Some(native_rtl_add_growable_function_table as *const () as usize as u64)
+        }
+        "RtlGrowFunctionTable" => Some(native_rtl_grow_function_table as *const () as usize as u64),
+        "RtlDeleteGrowableFunctionTable" => {
+            Some(native_rtl_delete_growable_function_table as *const () as usize as u64)
+        }
         "RaiseException" => Some(winrun_native_raise_exception as *const () as usize as u64),
         "RtlUnwindEx" => Some(winrun_native_rtl_unwind_ex as *const () as usize as u64),
         "RtlUnwind" => Some(winrun_native_rtl_unwind as *const () as usize as u64),

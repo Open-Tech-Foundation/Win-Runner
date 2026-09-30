@@ -972,6 +972,63 @@ pub(super) extern "win64" fn native_rtl_delete_function_table(
     1
 }
 
+/// `RtlAddGrowableFunctionTable(handle, table, count, maximum, base, end)`:
+/// a sorted table the caller fills in place and extends with
+/// `RtlGrowFunctionTable`; lookups see its first `count` entries. JITs
+/// (V8, CoreCLR) register generated code this way. The table address
+/// doubles as the handle.
+pub(super) extern "win64" fn native_rtl_add_growable_function_table(
+    handle: *mut u64,
+    function_table: *mut NativeRuntimeFunction,
+    entry_count: u32,
+    maximum_entry_count: u32,
+    range_base: u64,
+    range_end: u64,
+) -> u32 {
+    const STATUS_INVALID_PARAMETER: u32 = 0xc000_000d;
+    if handle.is_null()
+        || function_table.is_null()
+        || entry_count > maximum_entry_count
+        || range_base >= range_end
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let Some(process) = process_ctx() else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    let table = function_table as u64;
+    let mut tables = process.dynamic_function_tables.lock().unwrap();
+    if tables.iter().any(|registered| registered.table == table) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    tables.push(NativeDynamicFunctionTable {
+        table,
+        entry_count,
+        base: range_base,
+    });
+    unsafe { handle.write(table) };
+    0 // STATUS_SUCCESS
+}
+
+/// `RtlGrowFunctionTable(handle, count)`: more of the table is valid.
+pub(super) extern "win64" fn native_rtl_grow_function_table(handle: u64, entry_count: u32) {
+    if let Some(process) = process_ctx() {
+        if let Some(table) = process
+            .dynamic_function_tables
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|registered| registered.table == handle)
+        {
+            table.entry_count = entry_count;
+        }
+    }
+}
+
+pub(super) extern "win64" fn native_rtl_delete_growable_function_table(handle: u64) {
+    native_rtl_delete_function_table(handle as *mut NativeRuntimeFunction);
+}
+
 /// Apply the common x64 UNWIND_INFO operations to a Windows CONTEXT.
 pub(super) extern "win64" fn native_rtl_virtual_unwind(
     handler_type: u32,

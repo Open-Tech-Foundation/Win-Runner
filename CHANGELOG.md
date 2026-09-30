@@ -626,6 +626,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add `RtlAddGrowableFunctionTable`, `RtlGrowFunctionTable`, and
+  `RtlDeleteGrowableFunctionTable`, which JITs use to register unwind data
+  for generated code. V8 (in ES-Runtime) calls them unconditionally on
+  Windows 8 and later and crashed through the null pointer
+  `GetProcAddress` returned.
 - Run modern .NET apps: a framework-dependent .NET 10 app now runs through
   Microsoft's apphost, hostfxr, hostpolicy, CoreCLR, and RyuJIT on the
   native backend and prints its output. `LoadLibrary` maps IL-only

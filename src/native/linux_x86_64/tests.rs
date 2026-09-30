@@ -7641,6 +7641,36 @@ mod protection_tests {
     }
 
     #[test]
+    fn growable_function_tables_expose_only_their_grown_entries() {
+        let mut functions = [
+            super::NativeRuntimeFunction { begin_address: 0x100, end_address: 0x180, unwind_data: 0x400 },
+            super::NativeRuntimeFunction { begin_address: 0x200, end_address: 0x280, unwind_data: 0x420 },
+        ];
+        let table = functions.as_mut_ptr();
+        let base = 0x0000_7fff_2000_0000;
+        let mut handle = 0u64;
+        assert_eq!(
+            super::native_rtl_add_growable_function_table(&mut handle, table, 1, 2, base, base + 0x1000),
+            0
+        );
+        let lookup = |pc: u64| {
+            let mut image_base = 0;
+            native_rtl_lookup_function_entry(pc, &mut image_base, std::ptr::null_mut())
+        };
+        assert_eq!(lookup(base + 0x120), table as u64);
+        assert_eq!(lookup(base + 0x240), 0, "not yet grown to the second entry");
+        super::native_rtl_grow_function_table(handle, 2);
+        assert_eq!(lookup(base + 0x240), table as u64 + 12);
+        super::native_rtl_delete_growable_function_table(handle);
+        assert_eq!(lookup(base + 0x120), 0);
+        assert_ne!(
+            super::native_rtl_add_growable_function_table(&mut handle, table, 3, 2, base, base + 0x1000),
+            0,
+            "more entries than the maximum"
+        );
+    }
+
+    #[test]
     fn linux_fault_signals_map_to_windows_exception_records() {
         let write_fault = exception_record_from_linux_signal(
             libc::SIGSEGV,
