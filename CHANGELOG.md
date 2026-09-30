@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Accept executable and copy-on-write file mappings (`PAGE_EXECUTE_READ`
+  and friends, with `SEC_COMMIT`/`SEC_RESERVE`), map views with
+  `FILE_MAP_EXECUTE` as executable, and add `MapViewOfFileEx`. CoreCLR maps
+  managed assemblies this way.
 - Answer `GetLocaleInfoEx` for the NLS data .NET reads (names, parent,
   neutrality, number, currency, and date formats) instead of only
   `LOCALE_SNAME`, and add `GetLocaleInfoW`, `LocaleNameToLCID`,

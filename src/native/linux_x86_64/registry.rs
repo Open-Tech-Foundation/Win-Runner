@@ -878,6 +878,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "CreateFileMappingW" => Some(native_create_file_mapping_w as *const () as usize as u64),
         "CreateFileMappingA" => Some(native_create_file_mapping_a as *const () as usize as u64),
         "MapViewOfFile" => Some(native_map_view_of_file as *const () as usize as u64),
+        "MapViewOfFileEx" => Some(native_map_view_of_file_ex as *const () as usize as u64),
         "FlushViewOfFile" => Some(native_flush_view_of_file as *const () as usize as u64),
         "UnmapViewOfFile" => Some(native_unmap_view_of_file as *const () as usize as u64),
         "CryptAcquireContextW" => Some(native_crypt_acquire_context_w as *const () as usize as u64),

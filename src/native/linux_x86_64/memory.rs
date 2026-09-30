@@ -799,7 +799,26 @@ pub(super) extern "win64" fn native_create_file_mapping_w(
     _name: *const u16,
 ) -> u64 {
     let requested_size = ((size_high as u64) << 32) | size_low as u64;
-    if !matches!(protection, 0x02 | 0x04) || requested_size > usize::MAX as u64 {
+    if native_diagnostic_enabled() {
+        eprintln!("native CreateFileMappingW file={file:#x} protection={protection:#x} size={requested_size:#x}");
+    }
+    // The page protection plus SEC_* attributes. Views are private copies,
+    // so SEC_RESERVE/SEC_COMMIT make no difference, and SEC_IMAGE (and
+    // SEC_LARGE_PAGES and friends) are not supported.
+    const SEC_RESERVE: u32 = 0x0400_0000;
+    const SEC_COMMIT: u32 = 0x0800_0000;
+    let section_flags = protection & !0xff;
+    let protection = protection & 0xff;
+    let executable = matches!(protection, 0x20 | 0x40 | 0x80);
+    if !matches!(protection, 0x02 | 0x04 | 0x08 | 0x20 | 0x40 | 0x80)
+        || section_flags & !(SEC_RESERVE | SEC_COMMIT) != 0
+        || requested_size > usize::MAX as u64
+        // Executable pagefile sections exist to be mapped twice (writable
+        // and executable) onto the same memory, which private views cannot
+        // provide; refusing them lets callers such as CoreCLR's W^X
+        // allocator fall back to single mappings.
+        || (file == u64::MAX && executable)
+    {
         native_set_last_error(87);
         return 0;
     }
@@ -897,6 +916,29 @@ pub(super) extern "win64" fn native_map_view_of_file(
     offset_low: u32,
     bytes: usize,
 ) -> *mut u8 {
+    native_map_view_of_file_ex(mapping, access, offset_high, offset_low, bytes, ptr::null_mut())
+}
+
+/// `MapViewOfFileEx`: a view placed at `base` when it is non-null, failing
+/// with `ERROR_INVALID_ADDRESS` if anything already occupies that range.
+pub(super) extern "win64" fn native_map_view_of_file_ex(
+    mapping: u64,
+    access: u32,
+    offset_high: u32,
+    offset_low: u32,
+    bytes: usize,
+    base: *mut c_void,
+) -> *mut u8 {
+    if native_diagnostic_enabled() {
+        eprintln!(
+            "native MapViewOfFile mapping={mapping:#x} access={access:#x} offset={:#x} bytes={bytes:#x} base={base:?}",
+            ((offset_high as u64) << 32) | offset_low as u64
+        );
+    }
+    if !base.is_null() && base as usize % 0x10000 != 0 {
+        native_set_last_error(487); // ERROR_INVALID_ADDRESS
+        return ptr::null_mut();
+    }
     let Some(process) = process_ctx() else {
         return ptr::null_mut();
     };
@@ -923,26 +965,38 @@ pub(super) extern "win64" fn native_map_view_of_file(
         native_set_last_error(87);
         return ptr::null_mut();
     };
-    if length == 0 || end > mapping.length || (access & 0x2 != 0 && mapping.protection != 0x04) {
+    if length == 0 || end > mapping.length {
         native_set_last_error(87);
+        return ptr::null_mut();
+    }
+    const FILE_MAP_WRITE: u32 = 0x2;
+    const FILE_MAP_EXECUTE: u32 = 0x20;
+    if (access & FILE_MAP_WRITE != 0 && !matches!(mapping.protection, 0x04 | 0x40))
+        || (access & FILE_MAP_EXECUTE != 0 && !matches!(mapping.protection, 0x20 | 0x40 | 0x80))
+    {
+        native_set_last_error(5); // ERROR_ACCESS_DENIED
         return ptr::null_mut();
     }
     let Ok(mapped_length) = page_len(length) else {
         native_set_last_error(8);
         return ptr::null_mut();
     };
+    let fixed = if base.is_null() { 0 } else { MAP_FIXED_NOREPLACE };
     let result = unsafe {
         mmap(
-            ptr::null_mut(),
+            base,
             mapped_length,
             PROT_READ | PROT_WRITE,
-            MAP_PRIVATE | MAP_ANONYMOUS,
+            MAP_PRIVATE | MAP_ANONYMOUS | fixed,
             -1,
             0,
         )
     };
-    if result == MAP_FAILED {
-        native_set_last_error(8);
+    if result == MAP_FAILED || (!base.is_null() && result != base) {
+        if result != MAP_FAILED {
+            unsafe { munmap(result, mapped_length) };
+        }
+        native_set_last_error(if base.is_null() { 8 } else { 487 });
         return ptr::null_mut();
     }
     let view = result.cast::<u8>();
@@ -975,7 +1029,7 @@ pub(super) extern "win64" fn native_map_view_of_file(
         PROT_READ
     } else {
         linux_protection(mapping.protection).unwrap_or(PROT_READ)
-    };
+    } | if access & FILE_MAP_EXECUTE != 0 { PROT_EXEC } else { 0 };
     if unsafe { mprotect(result, mapped_length, host_protection) } != 0 {
         unsafe { munmap(result, mapped_length) };
         native_set_last_error(87);
