@@ -674,6 +674,9 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Record the Windows `path_names` transcript
+  (`tests/oracle/golden/path_names.txt`), which the `windows-oracle` workflow
+  showed Win-Runner matching line for line.
 - Record the first Windows transcript (`tests/oracle/golden/fs_paths.txt`,
   from `windows-latest`), which Win-Runner now matches line for line; make
   oracle lengths and offsets relative so transcripts do not depend on the

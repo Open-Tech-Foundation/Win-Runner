@@ -1,0 +1,26 @@
+probe path_names
+setup.mkdir: ok
+setup.chdir: ok
+setup.one: ok
+setup.subdir: ok
+setup.two: ok
+long.relative: path="Sub Dir\\two.txt"
+long.forward: path="Sub Dir/two.txt"
+long.dotdot: path="Sub Dir\\..\\One.txt"
+long.dot: path="."
+long.trailing_sep: path="Sub Dir\\"
+long.absolute: path="<W>\\Sub Dir\\two.txt"
+long.lower_drive: path="<d>:<W:nodrive>\\Sub Dir\\two.txt"
+long.missing: fail err=2
+long.missing_parent: fail err=3
+long.through_file: fail err=3
+full.lower_drive: len=ok path="<d>:<W:nodrive>\\One.txt" file=last
+full.lower_drive_relative: len=ok path="<W>\\One.txt" file=last
+final.lower_drive_open: ok
+final.lower_drive: len=ok path="\\\\?\\<W>\\One.txt"
+cleanup.two: ok
+cleanup.subdir: ok
+cleanup.one: ok
+cleanup.chdir: ok
+cleanup.work: ok
+END
