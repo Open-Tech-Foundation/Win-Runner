@@ -402,3 +402,110 @@ pub(super) extern "win64" fn native_get_locale_info_ex(
 pub(super) extern "win64" fn native_are_file_apis_ansi() -> i32 {
     1
 }
+
+/// The UCRT's `_locale_t` for the "C" locale: callers only hand it back to
+/// `_l` functions and `_free_locale`, so one shared object serves every
+/// `_create_locale`.
+static C_LOCALE: [u64; 2] = [0, 0];
+
+pub(super) extern "win64" fn native_crt_create_locale(category: i32, name: *const u8) -> *const u64 {
+    // LC_ALL..LC_TIME are 0..5; the "C" locale is the only one supported.
+    if !(0..=5).contains(&category) || name.is_null() {
+        return ptr::null();
+    }
+    let mut bytes = Vec::new();
+    for index in 0..64 {
+        match unsafe { name.add(index).read() } {
+            0 => break,
+            byte => bytes.push(byte),
+        }
+    }
+    if bytes != b"C" && !bytes.is_empty() {
+        return ptr::null();
+    }
+    C_LOCALE.as_ptr()
+}
+
+pub(super) extern "win64" fn native_crt_free_locale(_locale: *const u64) {}
+
+/// `___lc_codepage_func`: the "C" locale's code page, the ANSI one.
+pub(super) extern "win64" fn native_crt_lc_codepage() -> u32 {
+    native_get_acp()
+}
+
+pub(super) extern "win64" fn native_crt_mb_cur_max() -> i32 {
+    1
+}
+
+/// `___lc_locale_name_func`: per-category locale names, all null for "C".
+static LOCALE_NAMES: [u64; 6] = [0; 6];
+
+pub(super) extern "win64" fn native_crt_lc_locale_name() -> *const u64 {
+    LOCALE_NAMES.as_ptr()
+}
+
+pub(super) extern "win64" fn native_crt_lock_locales() {}
+
+/// The "C" locale character-class table `_pctype` points at: `_UPPER` 1,
+/// `_LOWER` 2, `_DIGIT` 4, `_SPACE` 8, `_PUNCT` 0x10, `_CONTROL` 0x20,
+/// `_BLANK` 0x40, `_HEX` 0x80, plus `_ALPHA` 0x100 on letters.
+static C_CTYPE: [u16; 256] = {
+    let mut table = [0u16; 256];
+    let mut index = 0;
+    while index < 256 {
+        let byte = index as u8;
+        let mut flags = 0u16;
+        if byte.is_ascii_uppercase() {
+            flags |= 0x1 | 0x100;
+        }
+        if byte.is_ascii_lowercase() {
+            flags |= 0x2 | 0x100;
+        }
+        if byte.is_ascii_digit() {
+            flags |= 0x4;
+        }
+        if matches!(byte, b' ' | 0x09..=0x0d) {
+            flags |= 0x8;
+        }
+        if byte.is_ascii_punctuation() {
+            flags |= 0x10;
+        }
+        if byte < 0x20 || byte == 0x7f {
+            flags |= 0x20;
+        }
+        if byte == b' ' || byte == b'\t' {
+            flags |= 0x40;
+        }
+        if byte.is_ascii_hexdigit() {
+            flags |= 0x80;
+        }
+        table[index] = flags;
+        index += 1;
+    }
+    table
+};
+
+pub(super) extern "win64" fn native_crt_pctype() -> *const u16 {
+    C_CTYPE.as_ptr()
+}
+
+#[cfg(test)]
+mod c_locale_tests {
+    use super::*;
+
+    #[test]
+    fn c_locale_reports_the_ansi_code_page_and_ascii_classes() {
+        assert!(!native_crt_create_locale(0, b"C\0".as_ptr()).is_null());
+        assert!(native_crt_create_locale(0, b"fr-FR\0".as_ptr()).is_null());
+        assert_eq!(native_crt_lc_codepage(), native_get_acp());
+        let table = native_crt_pctype();
+        let class = |byte: u8| unsafe { *table.add(byte as usize) };
+        assert_eq!(class(b'A'), 0x181);
+        assert_eq!(class(b'z'), 0x102);
+        assert_eq!(class(b'7'), 0x84);
+        assert_eq!(class(b' '), 0x48);
+        assert_eq!(class(b'\n'), 0x28);
+        assert_eq!(class(b'!'), 0x10);
+        assert!(unsafe { (*native_crt_lc_locale_name()) == 0 });
+    }
+}

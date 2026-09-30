@@ -2467,6 +2467,39 @@ fn crt_format_wide(format: *const u16, arguments: *mut c_void) -> Option<Vec<u16
     None
 }
 
+/// `__stdio_common_vfwprintf`: wide formatting written to a narrow stream
+/// as UTF-8. Returns the number of wide characters formatted.
+pub(super) extern "win64" fn native_crt_stdio_common_vfwprintf(
+    _options: u64,
+    stream: *mut u8,
+    format: *const u16,
+    _locale: *mut c_void,
+    arguments: *mut c_void,
+) -> i32 {
+    let Some(units) = crt_format_wide(format, arguments) else {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+        return -1;
+    };
+    let text = String::from_utf16_lossy(&units);
+    if native_crt_fwrite(text.as_ptr(), 1, text.len(), stream) != text.len() {
+        return -1;
+    }
+    units.len().min(i32::MAX as usize) as i32
+}
+
+/// `fputwc`: one wide character to a narrow stream as UTF-8; returns the
+/// character, or `WEOF` (0xFFFF) on failure.
+pub(super) extern "win64" fn native_crt_fputwc(character: u16, stream: *mut u8) -> u16 {
+    let text = char::from_u32(u32::from(character))
+        .unwrap_or(char::REPLACEMENT_CHARACTER)
+        .to_string();
+    if native_crt_fwrite(text.as_ptr(), 1, text.len(), stream) == text.len() {
+        character
+    } else {
+        0xffff
+    }
+}
+
 pub(super) extern "win64" fn native_crt_stdio_common_vfprintf(
     _options: u64,
     stream: *mut u8,

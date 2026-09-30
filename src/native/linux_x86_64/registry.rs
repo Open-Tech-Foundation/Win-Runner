@@ -95,6 +95,19 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                     | "__stdio_common_vsprintf"
                     | "__stdio_common_vswprintf"
                     | "__stdio_common_vsnwprintf_s"
+                    | "__stdio_common_vfwprintf"
+                    | "fputwc"
+                    | "_create_locale"
+                    | "_free_locale"
+                    | "___lc_codepage_func"
+                    | "___mb_cur_max_func"
+                    | "___lc_locale_name_func"
+                    | "__pctype_func"
+                    | "_lock_locales"
+                    | "_unlock_locales"
+                    | "_gmtime64_s"
+                    | "gmtime_s"
+                    | "wcsftime"
                     | "acos"
                     | "acosf"
                     | "acosh"
@@ -468,6 +481,19 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         }
         "SignalObjectAndWait" => Some(native_signal_object_and_wait as *const () as usize as u64),
         "OpenEventW" => Some(native_open_event_w as *const () as usize as u64),
+        "_gmtime64_s" => Some(native_crt_gmtime64_s as *const () as usize as u64),
+        "gmtime_s" => Some(native_crt_gmtime64_s as *const () as usize as u64),
+        "wcsftime" => Some(native_crt_wcsftime as *const () as usize as u64),
+        "_create_locale" => Some(native_crt_create_locale as *const () as usize as u64),
+        "_free_locale" => Some(native_crt_free_locale as *const () as usize as u64),
+        "___lc_codepage_func" => Some(native_crt_lc_codepage as *const () as usize as u64),
+        "___mb_cur_max_func" => Some(native_crt_mb_cur_max as *const () as usize as u64),
+        "___lc_locale_name_func" => Some(native_crt_lc_locale_name as *const () as usize as u64),
+        "__pctype_func" => Some(native_crt_pctype as *const () as usize as u64),
+        "_lock_locales" => Some(native_crt_lock_locales as *const () as usize as u64),
+        "_unlock_locales" => Some(native_crt_lock_locales as *const () as usize as u64),
+        "__stdio_common_vfwprintf" => Some(native_crt_stdio_common_vfwprintf as *const () as usize as u64),
+        "fputwc" => Some(native_crt_fputwc as *const () as usize as u64),
         "__stdio_common_vsnwprintf_s" => {
             Some(native_crt_stdio_common_vsnwprintf_s as *const () as usize as u64)
         }

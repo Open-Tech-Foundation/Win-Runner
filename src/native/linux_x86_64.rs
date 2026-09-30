@@ -28,6 +28,9 @@ pub(super) use registry::supports_import;
 #[path = "linux_x86_64/advapi_registry.rs"]
 mod advapi_registry;
 use advapi_registry::*;
+#[path = "linux_x86_64/crt_time.rs"]
+mod crt_time;
+use crt_time::*;
 #[path = "linux_x86_64/crt_math.rs"]
 mod crt_math;
 use crt_math::*;
