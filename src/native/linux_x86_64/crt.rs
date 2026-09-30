@@ -2641,6 +2641,23 @@ pub(super) extern "win64" fn native_crt_stdio_common_vsnwprintf_s(
     )
 }
 
+pub(super) extern "win64" fn native_crt_stdio_common_vsnprintf_s(
+    _options: u64,
+    output: *mut u8,
+    buffer_count: usize,
+    max_count: usize,
+    format: *const u8,
+    _locale: *mut c_void,
+    arguments: *mut c_void,
+) -> i32 {
+    crt_secure_print(
+        crt_format_narrow(format, arguments),
+        output,
+        buffer_count,
+        max_count,
+    )
+}
+
 pub(super) extern "win64" fn native_crt_stdio_common_vsprintf_s(
     _options: u64,
     output: *mut u8,
@@ -3526,4 +3543,48 @@ mod startup_tests {
             r"C:\工具\run.exe"
         );
     }
+}
+
+/// `_beginthreadex(security, stack_size, start, argument, flags, thread_id)`:
+/// a `CreateThread` whose start routine has the same `unsigned (void*)`
+/// shape; 0 with `errno = EAGAIN` when the thread cannot be created.
+pub(super) extern "win64" fn native_crt_beginthreadex(
+    security: u64,
+    stack_size: u32,
+    start: u64,
+    argument: u64,
+    flags: u32,
+    thread_id: *mut u32,
+) -> u64 {
+    if start == 0 {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(22)); // EINVAL
+        return 0;
+    }
+    let handle = native_create_thread(security, stack_size as usize, start, argument, flags, thread_id);
+    if handle == 0 {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(11)); // EAGAIN
+    }
+    handle
+}
+
+/// `_fileno(stream)`: 0-2 for the standard streams; a file opened with
+/// `fopen` gets the descriptor already bound to its handle, or a new one.
+pub(super) extern "win64" fn native_crt_fileno(stream: *mut u8) -> i32 {
+    if let Some(index) = native_crt_standard_stream_index(stream) {
+        return index as i32;
+    }
+    let (Some(file), Some(process)) = (native_crt_file(stream), process_ctx()) else {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+        return -1;
+    };
+    let handle = unsafe { (*file).handle };
+    let Ok(mut fds) = process.crt_fds.lock() else {
+        return -1;
+    };
+    if let Some((&fd, _)) = fds.iter().find(|(_, &bound)| bound == handle) {
+        return fd;
+    }
+    let fd = process.crt_fd_next.fetch_add(1, Ordering::AcqRel);
+    fds.insert(fd, handle);
+    fd
 }

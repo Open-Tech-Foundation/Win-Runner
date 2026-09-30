@@ -612,6 +612,8 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add CRT `_beginthreadex`, `_fileno`, and `__stdio_common_vsnprintf_s`, and
+  resolve `_write` from the UCRT API sets.
 - Add `RoInitialize`, `CoGetContextToken`, `GetErrorInfo`/`SetErrorInfo`
   (oleaut32 ordinals 200/201), `DisableThreadLibraryCalls`,
   `SetThreadDescription`, `GetSystemTimePreciseAsFileTime`, and

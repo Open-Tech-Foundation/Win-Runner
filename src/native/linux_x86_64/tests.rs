@@ -962,6 +962,31 @@ mod protection_tests {
         assert_eq!(super::native_wait_for_single_object(signal, 0), 0);
     }
 
+    static BEGINTHREADEX_ARGUMENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    extern "win64" fn beginthreadex_start(argument: u64) -> u32 {
+        BEGINTHREADEX_ARGUMENT.store(argument, std::sync::atomic::Ordering::Release);
+        7
+    }
+
+    #[test]
+    fn beginthreadex_runs_the_start_routine_on_a_waitable_thread() {
+        let mut thread_id = 0u32;
+        let handle = super::native_crt_beginthreadex(
+            0,
+            0,
+            beginthreadex_start as *const () as usize as u64,
+            0x5eed,
+            0,
+            &mut thread_id,
+        );
+        assert_ne!(handle, 0);
+        assert_ne!(thread_id, 0);
+        assert_eq!(super::native_wait_for_single_object(handle, 5000), 0);
+        assert_eq!(BEGINTHREADEX_ARGUMENT.load(std::sync::atomic::Ordering::Acquire), 0x5eed);
+        assert_eq!(super::native_crt_beginthreadex(0, 0, 0, 0, 0, std::ptr::null_mut()), 0);
+    }
+
     #[test]
     fn open_event_finds_named_events_of_the_process() {
         let name: Vec<u16> = "winrun-open-event-test".encode_utf16().chain([0]).collect();
@@ -2328,12 +2353,22 @@ mod protection_tests {
         let append_mode = b"ab\0";
         let file = super::native_crt_fopen(path.as_ptr(), append_mode.as_ptr());
         assert!(!file.is_null());
-        assert_eq!(super::native_crt_fwrite(b"gh".as_ptr(), 2, 1, file), 1);
+        assert_eq!(super::native_crt_fwrite(b"g".as_ptr(), 1, 1, file), 1);
+        // _write goes straight to the handle behind the stream's descriptor.
+        let fd = super::native_crt_fileno(file);
+        assert_eq!(super::native_crt_write(fd, b"h".as_ptr(), 1), 1);
         assert_eq!(super::native_crt_fclose(file), 0);
 
         let read_mode = b"rb\0";
         let file = super::native_crt_fopen(path.as_ptr(), read_mode.as_ptr());
         assert!(!file.is_null());
+        // _fileno binds one descriptor to the file's handle.
+        let fd = super::native_crt_fileno(file);
+        assert!(fd > 2);
+        assert_eq!(super::native_crt_fileno(file), fd);
+        assert_ne!(super::native_crt_get_osfhandle(fd), u64::MAX);
+        assert_eq!(super::native_crt_fileno(super::native_crt_acrt_iob_func(2)), 2);
+        assert_eq!(super::native_crt_write(9999, b"x".as_ptr(), 1), -1, "EBADF");
         assert_eq!(super::native_crt_fgetc(file), b'a' as i32);
         assert_eq!(super::native_crt_ungetc(b'Z' as i32, file), b'Z' as i32);
         assert_eq!(super::native_crt_ungetc(b'Y' as i32, file), -1);
@@ -2892,6 +2927,37 @@ mod protection_tests {
         assert!(super::native_crt_acrt_iob_func(3).is_null());
         assert!(super::supports_import("UCRTBASE.DLL", "__acrt_iob_func"));
         assert!(!super::supports_import("MSVCRT.DLL", "__acrt_iob_func"));
+    }
+
+    #[test]
+    fn ucrt_common_vsnprintf_s_truncates_to_the_count_or_buffer() {
+        let format = b"value=%d\0";
+        let mut arguments = [12345u64];
+        let mut print = |output: &mut [u8], max_count: usize| {
+            super::native_crt_stdio_common_vsnprintf_s(
+                0,
+                output.as_mut_ptr(),
+                output.len(),
+                max_count,
+                format.as_ptr(),
+                std::ptr::null_mut(),
+                arguments.as_mut_ptr().cast(),
+            )
+        };
+        let mut output = [0xa5u8; 32];
+        assert_eq!(print(&mut output, usize::MAX), 11);
+        assert_eq!(&output[..12], b"value=12345\0");
+        // _TRUNCATE cuts the text to the buffer and reports -1.
+        let mut small = [0xa5u8; 8];
+        assert_eq!(print(&mut small, usize::MAX), -1);
+        assert_eq!(&small, b"value=1\0");
+        // An explicit count smaller than the text truncates to that count.
+        assert_eq!(print(&mut output, 5), -1);
+        assert_eq!(&output[..6], b"value\0");
+        assert!(super::supports_import(
+            "api-ms-win-crt-stdio-l1-1-0.dll",
+            "__stdio_common_vsnprintf_s"
+        ));
     }
 
     #[test]

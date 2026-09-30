@@ -100,6 +100,9 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                     | "_stricmp"
                     | "_strnicmp"
                     | "_errno"
+                    | "_beginthreadex"
+                    | "_fileno"
+                    | "_write"
                     | "getenv"
                     | "_wgetenv"
                     | "_putenv"
@@ -110,6 +113,7 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                     | "__stdio_common_vsprintf"
                     | "__stdio_common_vswprintf"
                     | "__stdio_common_vsnwprintf_s"
+                    | "__stdio_common_vsnprintf_s"
                     | "__stdio_common_vfwprintf"
                     | "fputwc"
                     | "_create_locale"
@@ -407,6 +411,8 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "__p__fmode" => Some(native_crt_p_fmode as *const () as usize as u64),
         "__p__commode" => Some(native_crt_p_commode as *const () as usize as u64),
         "_errno" => Some(native_crt_errno as *const () as usize as u64),
+        "_fileno" => Some(native_crt_fileno as *const () as usize as u64),
+        "_beginthreadex" => Some(native_crt_beginthreadex as *const () as usize as u64),
         "getenv" => Some(native_crt_getenv as *const () as usize as u64),
         "_wgetenv" => Some(native_crt_wgetenv as *const () as usize as u64),
         "_putenv" => Some(native_crt_putenv as *const () as usize as u64),
@@ -608,6 +614,9 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "_unlock_locales" => Some(native_crt_lock_locales as *const () as usize as u64),
         "__stdio_common_vfwprintf" => Some(native_crt_stdio_common_vfwprintf as *const () as usize as u64),
         "fputwc" => Some(native_crt_fputwc as *const () as usize as u64),
+        "__stdio_common_vsnprintf_s" => {
+            Some(native_crt_stdio_common_vsnprintf_s as *const () as usize as u64)
+        }
         "__stdio_common_vsnwprintf_s" => {
             Some(native_crt_stdio_common_vsnwprintf_s as *const () as usize as u64)
         }
