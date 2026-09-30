@@ -113,6 +113,10 @@ pub(super) struct NativeMemoryBasicInformation {
     pub(super) kind: u32,
 }
 
+/// `MEMORYSTATUSEX.ullTotalVirtual` on x64 Windows: the user-mode range up
+/// to 0x7FFF_FFFE_FFFF.
+const X64_USER_ADDRESS_SPACE: u64 = 0x7fff_fffe_0000;
+
 pub(super) extern "win64" fn native_global_memory_status_ex(
     status: *mut NativeMemoryStatus,
 ) -> i32 {
@@ -124,8 +128,10 @@ pub(super) extern "win64" fn native_global_memory_status_ex(
         native_set_last_error(87); // ERROR_INVALID_PARAMETER
         return 0;
     }
-    // Keep the reported budget consistent with the guest's finite WinFS
-    // process model rather than exposing an arbitrary host memory size.
+    // Keep the reported physical budget consistent with the guest's finite
+    // WinFS process model rather than exposing an arbitrary host memory
+    // size. The virtual address space is the x64 user range Windows reports
+    // (128 TiB): runtimes such as CoreCLR size their GC reservation from it.
     let budget = 512 * 1024 * 1024u64;
     let available = budget / 2;
     let value = NativeMemoryStatus {
@@ -135,8 +141,8 @@ pub(super) extern "win64" fn native_global_memory_status_ex(
         available_physical: available,
         total_page_file: budget,
         available_page_file: available,
-        total_virtual: budget,
-        available_virtual: available,
+        total_virtual: X64_USER_ADDRESS_SPACE,
+        available_virtual: X64_USER_ADDRESS_SPACE - 0x1_0000_0000,
         available_extended_virtual: 0,
     };
     unsafe { status.write_unaligned(value) };
@@ -244,8 +250,102 @@ pub(super) extern "win64" fn native_virtual_query(
             return information_size;
         }
     }
-    native_set_last_error(487); // ERROR_INVALID_ADDRESS
-    0
+    // Everything else in the user address space is either memory winrun
+    // or the host mapped (reported as a reserved region) or free.
+    match host_region(query) {
+        Some(result) => {
+            unsafe { information.write_unaligned(result) };
+            information_size
+        }
+        None => {
+            native_set_last_error(87); // above the user address space
+            0
+        }
+    }
+}
+
+/// Lowest address Windows hands out to user mode.
+const LOWEST_USER_ADDRESS: u64 = 0x1_0000;
+
+/// Occupied host address ranges from `/proc/self/maps`, sorted.
+fn host_mappings() -> Vec<(u64, u64)> {
+    let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else {
+        return Vec::new();
+    };
+    let mut ranges: Vec<(u64, u64)> = maps
+        .lines()
+        .filter_map(|line| {
+            let range = line.split_whitespace().next()?;
+            let (start, end) = range.split_once('-')?;
+            Some((
+                u64::from_str_radix(start, 16).ok()?,
+                u64::from_str_radix(end, 16).ok()?,
+            ))
+        })
+        .collect();
+    ranges.sort_unstable();
+    ranges
+}
+
+/// `VirtualQuery` for an address winrun does not track: inside a host
+/// mapping it is a reserved region (merged across adjacent mappings); in a
+/// gap it is `MEM_FREE` up to the next mapping, as on Windows.
+fn host_region(query: u64) -> Option<NativeMemoryBasicInformation> {
+    if query >= X64_USER_ADDRESS_SPACE {
+        return None;
+    }
+    let page = query & !4095;
+    let ranges = host_mappings();
+    if let Some(index) = ranges.iter().position(|&(start, end)| query >= start && query < end) {
+        let (mut start, mut end) = ranges[index];
+        for &(next_start, next_end) in &ranges[index + 1..] {
+            if next_start != end {
+                break;
+            }
+            end = next_end;
+        }
+        for &(previous_start, previous_end) in ranges[..index].iter().rev() {
+            if previous_end != start {
+                break;
+            }
+            start = previous_start;
+        }
+        return Some(NativeMemoryBasicInformation {
+            base_address: page,
+            allocation_base: start,
+            allocation_protection: 0x01,
+            partition_id: 0,
+            region_size: end - page,
+            state: 0x2000, // MEM_RESERVE: in use, not the guest's to touch
+            protection: 0,
+            kind: 0x20000, // MEM_PRIVATE
+        });
+    }
+    let free_start = ranges
+        .iter()
+        .filter(|(_, end)| *end <= query)
+        .map(|(_, end)| *end)
+        .max()
+        .unwrap_or(LOWEST_USER_ADDRESS)
+        .max(LOWEST_USER_ADDRESS);
+    let free_end = ranges
+        .iter()
+        .map(|(start, _)| *start)
+        .filter(|start| *start > query)
+        .min()
+        .unwrap_or(X64_USER_ADDRESS_SPACE)
+        .min(X64_USER_ADDRESS_SPACE);
+    let base = page.max(free_start);
+    Some(NativeMemoryBasicInformation {
+        base_address: base,
+        allocation_base: 0,
+        allocation_protection: 0,
+        partition_id: 0,
+        region_size: free_end.saturating_sub(base),
+        state: 0x10000, // MEM_FREE
+        protection: 0x01, // PAGE_NOACCESS
+        kind: 0,
+    })
 }
 
 pub(super) extern "win64" fn native_heap_alloc(heap: u64, flags: u32, size: usize) -> u64 {
@@ -1102,9 +1202,11 @@ mod virtual_memory_tests {
                 &mut information,
                 std::mem::size_of_val(&information),
             ),
-            0,
-            "released memory no longer has a queryable region"
+            std::mem::size_of_val(&information),
         );
+        // Released pages are no longer a guest region: they read as free
+        // (or as a host mapping if another thread reused the range).
+        assert_ne!(information.state, 0x1000, "released memory is no longer committed");
         assert_eq!(
             native_virtual_query(base.cast::<c_void>(), &mut information, 47),
             0,

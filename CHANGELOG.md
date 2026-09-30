@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Report the x64 user address space from `GlobalMemoryStatusEx`'s virtual
+  fields instead of the physical budget, and answer `VirtualQuery` for
+  addresses outside guest allocations: gaps read as `MEM_FREE` and host
+  mappings as reserved. CoreCLR's GC sizes and places its heap from these and
+  previously failed with `E_OUTOFMEMORY`.
 - Report each `FindFirstFileExW`/`FindNextFileW` result's attributes (with
   `FILE_ATTRIBUTE_DIRECTORY` for directories), timestamps, and size instead of
   only its name, so programs that walk directories, such as the .NET host

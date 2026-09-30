@@ -5896,6 +5896,35 @@ mod protection_tests {
         assert_eq!(native_global_memory_status_ex(&mut status), 1);
         assert_eq!(status.total_physical, 512 * 1024 * 1024);
         assert_eq!(status.available_physical, 256 * 1024 * 1024);
+        // The x64 user address space, not the physical budget.
+        assert_eq!(status.total_virtual, 0x7fff_fffe_0000);
+        assert!(status.available_virtual > 0x7000_0000_0000);
+    }
+
+    #[test]
+    fn virtual_query_reports_free_and_host_owned_regions_outside_guest_memory() {
+        let size = std::mem::size_of::<super::NativeMemoryBasicInformation>();
+        let query = |address: u64| {
+            let mut info = std::mem::MaybeUninit::<super::NativeMemoryBasicInformation>::zeroed();
+            let written = super::native_virtual_query(address as *const _, info.as_mut_ptr(), size);
+            (written, unsafe { info.assume_init() })
+        };
+        // A host mapping (this test's own stack) is in use, not free.
+        let local = 0u8;
+        let (written, info) = query(&local as *const u8 as u64);
+        assert_eq!(written, size);
+        assert_eq!(info.state, 0x2000);
+        // A reservation that is then released leaves a free region there.
+        let reserved = super::native_virtual_alloc(std::ptr::null_mut(), 0x10000, 0x2000, 1);
+        assert!(!reserved.is_null());
+        assert_eq!(super::native_virtual_free(reserved, 0, 0x8000), 1);
+        let (written, info) = query(reserved as u64 + 0x100);
+        assert_eq!(written, size);
+        assert_eq!(info.state, 0x10000, "MEM_FREE");
+        assert_eq!(info.base_address, reserved as u64);
+        assert!(info.region_size >= 0x10000);
+        // Beyond the user address space the query fails.
+        assert_eq!(query(0x8000_0000_0000).0, 0);
     }
 
     #[test]
