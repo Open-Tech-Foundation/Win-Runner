@@ -317,6 +317,13 @@ pub(super) extern "win64" fn native_close_handle(h: u64) -> i32 {
     if h == PROCESS_TOKEN_HANDLE {
         return 1;
     }
+    if is_afd_handle(h) {
+        if close_afd_device(h) {
+            return 1;
+        }
+        native_set_last_error(6);
+        return 0;
+    }
     let process = process_ctx();
     if let Some(job) = process.as_ref().and_then(|process| {
         process

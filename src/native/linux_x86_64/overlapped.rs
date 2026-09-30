@@ -60,6 +60,33 @@ pub(super) extern "win64" fn native_create_io_completion_port(
         native_set_last_error(87);
         return 0;
     }
+    if is_afd_handle(file) {
+        let (handle, port) = if existing_port != 0 {
+            let Some(port) = process
+                .completion_ports
+                .lock()
+                .ok()
+                .and_then(|ports| ports.get(&existing_port).cloned())
+            else {
+                native_set_last_error(6);
+                return 0;
+            };
+            (existing_port, port)
+        } else {
+            let handle = process.completion_next.fetch_add(1, Ordering::AcqRel);
+            let port = Arc::new(NativeCompletionPort::new());
+            let Ok(mut ports) = process.completion_ports.lock() else {
+                return 0;
+            };
+            ports.insert(handle, port.clone());
+            (handle, port)
+        };
+        if !associate_afd_device(file, port, completion_key) {
+            native_set_last_error(6);
+            return 0;
+        }
+        return handle;
+    }
     if file & 0xffff_ffff_0000_0000 == SOCKET_HANDLE_TAG {
         let (handle, port) = if existing_port != 0 {
             let Some(port) = process
@@ -153,6 +180,10 @@ pub(super) extern "win64" fn native_set_file_completion_notification_modes(
     if modes & !0x3 != 0 {
         native_set_last_error(87);
         return 0;
+    }
+    if is_afd_handle(handle) {
+        // Completions always go to the port; there is no event to skip.
+        return 1;
     }
     if let Some(process) = process_ctx() {
         if let Ok(mut fs) = process.fs.lock() {

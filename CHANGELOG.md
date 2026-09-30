@@ -654,6 +654,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Emulate the AFD socket-polling driver (`\Device\Afd`): `NtCreateFile`
+  opens it, `CreateIoCompletionPort` associates it, `IOCTL_AFD_POLL` through
+  `NtDeviceIoControlFile` completes on the port when the socket is ready
+  (from host `poll`), and `NtCancelIoFileEx` cancels a pending poll. Tokio
+  (mio) drives all socket I/O this way on Windows.
 - Add `tests/esrun_native.rs`, which runs ES-Runtime's `esrun.exe` (set
   `WINRUN_ESRUN_EXE`) through Windows path cases: forward slashes, `C:/`,
   `..`, case-insensitive names, `realPath`, and recursive removal.

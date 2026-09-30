@@ -474,6 +474,8 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                 | "RtlRaiseException"
                 | "NtCreateFile"
                 | "NtOpenFile"
+                | "NtCancelIoFileEx"
+                | "NtDeviceIoControlFile"
                 | "RtlRestoreContext"
                 | "RtlAddGrowableFunctionTable"
                 | "RtlGrowFunctionTable"
@@ -931,6 +933,10 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         }
         "NtCreateFile" => Some(native_nt_create_file as *const () as usize as u64),
         "NtOpenFile" => Some(native_nt_open_file as *const () as usize as u64),
+        "NtCancelIoFileEx" => Some(native_nt_cancel_io_file_ex as *const () as usize as u64),
+        "NtDeviceIoControlFile" => {
+            Some(native_nt_device_io_control_file as *const () as usize as u64)
+        }
         "RtlVirtualUnwind" => Some(native_rtl_virtual_unwind as *const () as usize as u64),
         "RtlAddGrowableFunctionTable" => {
             Some(native_rtl_add_growable_function_table as *const () as usize as u64)

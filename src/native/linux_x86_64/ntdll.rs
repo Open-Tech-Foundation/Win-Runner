@@ -3,17 +3,20 @@
 use super::*;
 
 pub(super) extern "win64" fn native_nt_device_io_control_file(
-    _file: u64,
+    file: u64,
     _event: u64,
     _apc_routine: u64,
-    _apc_context: u64,
+    apc_context: u64,
     io_status: *mut u8,
-    _control_code: u32,
-    _input: *const u8,
-    _input_len: u32,
-    _output: *mut u8,
-    _output_len: u32,
+    control_code: u32,
+    input: *const u8,
+    input_len: u32,
+    output: *mut u8,
+    output_len: u32,
 ) -> u32 {
+    if is_afd_handle(file) {
+        return afd_device_io_control(file, apc_context, io_status, control_code, input, input_len, output, output_len);
+    }
     const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
     if !io_status.is_null() {
         unsafe {
@@ -809,6 +812,19 @@ pub(super) extern "win64" fn native_nt_create_file(
         Ok(path) => path,
         Err(status) => return status,
     };
+    if native_diagnostic_enabled() {
+        eprintln!(
+            "native NtCreateFile path={path} access={access:#x} disposition={disposition} options={options:#x}"
+        );
+    }
+    if is_afd_path(&path) {
+        unsafe {
+            handle.write(open_afd_device());
+            io_status.cast::<u32>().write_unaligned(0);
+            io_status.add(8).cast::<u64>().write_unaligned(1); // FILE_OPENED
+        }
+        return 0;
+    }
     // FILE_SUPERSEDE, OPEN, CREATE, OPEN_IF, OVERWRITE, OVERWRITE_IF.
     let creation = match disposition {
         0 | 5 => 2, // CREATE_ALWAYS
@@ -881,4 +897,23 @@ pub(super) extern "win64" fn native_nt_open_file(
     options: u32,
 ) -> u32 {
     native_nt_create_file(handle, access, attributes, io_status, ptr::null(), 0, share, 1, options, ptr::null(), 0)
+}
+
+/// `NtCancelIoFileEx(handle, io_status, cancel_status)`: cancels a pending
+/// AFD poll (or all of the handle's, for a null `io_status`).
+pub(super) extern "win64" fn native_nt_cancel_io_file_ex(handle: u64, io_status: u64, cancel_status: *mut u8) -> u32 {
+    let status = if is_afd_handle(handle) {
+        afd_cancel(handle, io_status)
+    } else if native_cancel_io_ex(handle, io_status) != 0 {
+        0
+    } else {
+        0xC000_0225 // STATUS_NOT_FOUND
+    };
+    if !cancel_status.is_null() {
+        unsafe {
+            cancel_status.cast::<u32>().write_unaligned(status);
+            cancel_status.add(8).cast::<u64>().write_unaligned(0);
+        }
+    }
+    status
 }
