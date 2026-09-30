@@ -108,6 +108,9 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                     | "_gmtime64_s"
                     | "gmtime_s"
                     | "wcsftime"
+                    | "_controlfp_s"
+                    | "_callnewh"
+                    | "_invalid_parameter_noinfo"
                     | "acos"
                     | "acosf"
                     | "acosh"
@@ -263,7 +266,15 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
         "WINMM.DLL" => func == "timeGetTime",
         "USERENV.DLL" => func == "GetUserProfileDirectoryW",
         "BCRYPTPRIMITIVES.DLL" => func == "ProcessPrng",
-        "OLE32.DLL" => func == "CoInitialize",
+        "OLE32.DLL" => matches!(
+            func,
+            "CoInitialize"
+                | "CoInitializeEx"
+                | "CoUninitialize"
+                | "CoTaskMemAlloc"
+                | "CoTaskMemFree"
+                | "CoCreateGuid"
+        ),
         "SHELL32.DLL" => func == "SHGetFolderPathW",
         "ADVAPI32.DLL" => matches!(
             func,
@@ -288,6 +299,16 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                 | "RegEnumValueW"
                 | "RegQueryInfoKeyW"
                 | "RegCloseKey"
+                | "OpenThreadToken"
+                | "RevertToSelf"
+                | "SetThreadToken"
+                | "GetTokenInformation"
+                | "GetSidSubAuthorityCount"
+                | "GetSidSubAuthority"
+                | "RegisterEventSourceW"
+                | "ReportEventW"
+                | "DeregisterEventSource"
+                | "EventWrite"
                 | "LookupPrivilegeValueW"
                 | "AdjustTokenPrivileges"
                 | "OpenProcessToken"
@@ -323,7 +344,7 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                 | "WSASend"
                 | "listen"
         ),
-        "USER32.DLL" => matches!(func, "GetSystemMetrics" | "MessageBeep"),
+        "USER32.DLL" => matches!(func, "GetSystemMetrics" | "MessageBeep" | "LoadStringW"),
         "IPHLPAPI.DLL" => func == "GetAdaptersAddresses",
         "NTDLL.DLL" => matches!(
             func,
@@ -473,6 +494,72 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "fmaf" => Some(native_crt_fmaf as *const () as usize as u64),
         "modf" => Some(native_crt_modf as *const () as usize as u64),
         "modff" => Some(native_crt_modff as *const () as usize as u64),
+        "GetActiveProcessorGroupCount" => Some(native_get_active_processor_group_count as *const () as usize as u64),
+        "GetProcessGroupAffinity" => Some(native_get_process_group_affinity as *const () as usize as u64),
+        "GetThreadGroupAffinity" => Some(native_get_thread_group_affinity as *const () as usize as u64),
+        "SetThreadGroupAffinity" => Some(native_set_thread_group_affinity as *const () as usize as u64),
+        "SetThreadAffinityMask" => Some(native_set_thread_affinity_mask as *const () as usize as u64),
+        "GetCurrentProcessorNumberEx" => Some(native_get_current_processor_number_ex as *const () as usize as u64),
+        "GetThreadIdealProcessorEx" => Some(native_get_thread_ideal_processor_ex as *const () as usize as u64),
+        "SetThreadIdealProcessorEx" => Some(native_set_thread_ideal_processor_ex as *const () as usize as u64),
+        "GetNumaHighestNodeNumber" => Some(native_get_numa_highest_node_number as *const () as usize as u64),
+        "GetNumaProcessorNodeEx" => Some(native_get_numa_processor_node_ex as *const () as usize as u64),
+        "GetLogicalProcessorInformationEx" => Some(native_get_logical_processor_information_ex as *const () as usize as u64),
+        "GetSystemDefaultLCID" => Some(native_get_default_lcid as *const () as usize as u64),
+        "GetUserDefaultLCID" => Some(native_get_default_lcid as *const () as usize as u64),
+        "GetThreadLocale" => Some(native_get_default_lcid as *const () as usize as u64),
+        "GetUserDefaultLocaleName" => Some(native_get_user_default_locale_name as *const () as usize as u64),
+        "GetThreadPriority" => Some(native_get_thread_priority as *const () as usize as u64),
+        "SetThreadPriority" => Some(native_set_thread_priority as *const () as usize as u64),
+        "SetThreadErrorMode" => Some(native_set_thread_error_mode as *const () as usize as u64),
+        "SleepEx" => Some(native_sleep_ex as *const () as usize as u64),
+        "WaitForSingleObjectEx" => Some(native_wait_for_single_object_ex as *const () as usize as u64),
+        "CreateSemaphoreW" => Some(native_create_semaphore_w as *const () as usize as u64),
+        "CreateSemaphoreExW" => Some(native_create_semaphore_ex_w as *const () as usize as u64),
+        "HeapCreate" => Some(native_heap_create as *const () as usize as u64),
+        "HeapDestroy" => Some(native_heap_destroy as *const () as usize as u64),
+        "GetLargePageMinimum" => Some(native_get_large_page_minimum as *const () as usize as u64),
+        "VirtualUnlock" => Some(native_virtual_unlock as *const () as usize as u64),
+        "FlushProcessWriteBuffers" => Some(native_flush_process_write_buffers as *const () as usize as u64),
+        "FlushInstructionCache" => Some(native_flush_instruction_cache as *const () as usize as u64),
+        "GetFileSize" => Some(native_get_file_size as *const () as usize as u64),
+        "IsProcessInJob" => Some(native_is_process_in_job as *const () as usize as u64),
+        "GetEnabledXStateFeatures" => Some(native_get_enabled_xstate_features as *const () as usize as u64),
+        "LocateXStateFeature" => Some(native_locate_xstate_feature as *const () as usize as u64),
+        "SetXStateFeaturesMask" => Some(native_set_xstate_features_mask as *const () as usize as u64),
+        "InitializeContext" => Some(native_initialize_context as *const () as usize as u64),
+        "CopyContext" => Some(native_copy_context as *const () as usize as u64),
+        "RtlPcToFileHeader" => Some(native_rtl_pc_to_file_header as *const () as usize as u64),
+        "RtlInstallFunctionTableCallback" => Some(native_rtl_install_function_table_callback as *const () as usize as u64),
+        "WerRegisterRuntimeExceptionModule" => Some(native_wer_register_runtime_exception_module as *const () as usize as u64),
+        "UnhandledExceptionFilter" => Some(native_unhandled_exception_filter as *const () as usize as u64),
+        "RaiseFailFastException" => Some(native_raise_fail_fast_exception as *const () as usize as u64),
+        "DebugBreak" => Some(native_debug_break as *const () as usize as u64),
+        "RegisterEventSourceW" => Some(native_register_event_source_w as *const () as usize as u64),
+        "ReportEventW" => Some(native_report_event_w as *const () as usize as u64),
+        "DeregisterEventSource" => Some(native_deregister_event_source as *const () as usize as u64),
+        "EventWrite" => Some(native_event_write as *const () as usize as u64),
+        "CoInitializeEx" => Some(native_co_initialize_ex as *const () as usize as u64),
+        "CoUninitialize" => Some(native_co_uninitialize as *const () as usize as u64),
+        "CoTaskMemAlloc" => Some(native_co_task_mem_alloc as *const () as usize as u64),
+        "CoTaskMemFree" => Some(native_co_task_mem_free as *const () as usize as u64),
+        "CoCreateGuid" => Some(native_co_create_guid as *const () as usize as u64),
+        "LoadStringW" => Some(native_load_string_w as *const () as usize as u64),
+        "_controlfp_s" => Some(native_crt_controlfp_s as *const () as usize as u64),
+        "_callnewh" => Some(native_crt_callnewh as *const () as usize as u64),
+        "_invalid_parameter_noinfo" => Some(native_crt_invalid_parameter_noinfo as *const () as usize as u64),
+        "CreateMemoryResourceNotification" => {
+            Some(native_create_memory_resource_notification as *const () as usize as u64)
+        }
+        "QueryMemoryResourceNotification" => {
+            Some(native_query_memory_resource_notification as *const () as usize as u64)
+        }
+        "OpenThreadToken" => Some(native_open_thread_token as *const () as usize as u64),
+        "RevertToSelf" => Some(native_revert_to_self as *const () as usize as u64),
+        "SetThreadToken" => Some(native_set_thread_token as *const () as usize as u64),
+        "GetTokenInformation" => Some(native_get_token_information as *const () as usize as u64),
+        "GetSidSubAuthorityCount" => Some(native_get_sid_sub_authority_count as *const () as usize as u64),
+        "GetSidSubAuthority" => Some(native_get_sid_sub_authority as *const () as usize as u64),
         "WaitForMultipleObjects" => {
             Some(native_wait_for_multiple_objects as *const () as usize as u64)
         }
@@ -481,6 +568,9 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         }
         "SignalObjectAndWait" => Some(native_signal_object_and_wait as *const () as usize as u64),
         "OpenEventW" => Some(native_open_event_w as *const () as usize as u64),
+        "QueryInformationJobObject" => {
+            Some(native_query_information_job_object as *const () as usize as u64)
+        }
         "_gmtime64_s" => Some(native_crt_gmtime64_s as *const () as usize as u64),
         "gmtime_s" => Some(native_crt_gmtime64_s as *const () as usize as u64),
         "wcsftime" => Some(native_crt_wcsftime as *const () as usize as u64),

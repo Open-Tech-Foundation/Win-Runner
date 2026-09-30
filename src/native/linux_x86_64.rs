@@ -28,6 +28,12 @@ pub(super) use registry::supports_import;
 #[path = "linux_x86_64/advapi_registry.rs"]
 mod advapi_registry;
 use advapi_registry::*;
+#[path = "linux_x86_64/topology.rs"]
+mod topology;
+use topology::*;
+#[path = "linux_x86_64/runtime_support.rs"]
+mod runtime_support;
+use runtime_support::*;
 #[path = "linux_x86_64/crt_time.rs"]
 mod crt_time;
 use crt_time::*;

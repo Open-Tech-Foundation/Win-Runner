@@ -613,6 +613,9 @@ All notable changes to this project will be documented in this file.
   for named events.
 - Add CRT `_gmtime64_s`, `wcsftime`, C-locale `_create_locale` and ctype
   queries, `__stdio_common_vfwprintf`, and `fputwc`.
+- Add the processor topology, NUMA, thread priority/affinity, job, token,
+  XState/context, event-log, and COM task-memory queries CoreCLR makes during
+  startup, answering for a single-group, single-node machine.
 - Added guest-disk installation for Chocolatey's `7zip.install`: the verified
   package is extracted into WinFS, its silent installer runs through the
   native backend, and `7z` remains available after snapshot reload.
