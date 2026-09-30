@@ -6,6 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Allocate child process and thread handles outside the semaphore and event
+  handle ranges; a wait on a child thread could instead find a signaled
+  event with the same handle value.
 - Give each thread its own fiber-local storage values and hand out distinct
   `FlsAlloc` indices (with callbacks run on `FlsFree` and thread exit).
   Every index was 0 and shared one process-wide value, so the statically

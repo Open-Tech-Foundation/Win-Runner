@@ -513,8 +513,10 @@ pub(super) struct NativeProcessTable {
 impl NativeProcessTable {
     pub(super) fn new() -> Self {
         Self {
-            next_handle: 0x6000_0000,
-            next_thread_handle: 0x6100_0000,
+            // Distinct from the semaphore (0x6000_0000) and event
+            // (0x6100_0000) ranges: waits look handles up by value.
+            next_handle: 0x6800_0000,
+            next_thread_handle: 0x6900_0000,
             next_process_id: 2,
             children: HashMap::new(),
             primary_threads: HashMap::new(),
