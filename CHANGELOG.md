@@ -604,6 +604,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Implement x64 C++ exception unwinding: `RaiseException` captures the
+  caller's real context, and `RtlUnwindEx`, `RtlUnwind`, and
+  `RtlRestoreContext` (including `STATUS_UNWIND_CONSOLIDATE` catch callbacks)
+  unwind guest frames and resume at the target, so MSVC `try`/`catch` and
+  rethrow work in guest DLLs such as the .NET host.
 - Added guest-disk installation for Chocolatey's `7zip.install`: the verified
   package is extracted into WinFS, its silent installer runs through the
   native backend, and `7z` remains available after snapshot reload.

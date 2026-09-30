@@ -483,12 +483,24 @@ fn dispatch_exception(
     false
 }
 
+thread_local! {
+    /// Where a stack walk continues when it reaches winrun's own frames,
+    /// innermost last: while a language handler runs, the context of the
+    /// exception being dispatched (as Windows continues through
+    /// `KiUserExceptionDispatcher` to the raising frame); while a C++ catch
+    /// block runs from a consolidation, the context of the frame that holds
+    /// it (as Windows continues through `RcConsolidateFrames`).
+    static BOUNDARY_CONTEXTS: std::cell::RefCell<Vec<NativeExceptionContext>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 pub(super) fn dispatch_frame_exception_handlers(
     record: &mut NativeExceptionRecord,
     context: &mut NativeExceptionContext,
 ) -> bool {
     const MAX_EXCEPTION_FRAMES: usize = 128;
     let mut walk_context = *context;
+    let mut boundary = BOUNDARY_CONTEXTS.with(|contexts| contexts.borrow().len());
     for _ in 0..MAX_EXCEPTION_FRAMES {
         let control_pc = context_register(&walk_context, 16).unwrap_or(0);
         let stack_pointer = context_register(&walk_context, 4).unwrap_or(0);
@@ -501,7 +513,14 @@ pub(super) fn dispatch_frame_exception_handlers(
             native_rtl_lookup_function_entry(control_pc, &mut image_base, std::ptr::null_mut())
                 as *const NativeRuntimeFunction;
         if function_entry.is_null() && !is_guest_image_address(control_pc) {
-            break;
+            // winrun's frames: continue outside them, leaving the stack of
+            // boundaries as it is, since this is only a search.
+            if boundary == 0 {
+                break;
+            }
+            boundary -= 1;
+            walk_context = BOUNDARY_CONTEXTS.with(|contexts| contexts.borrow()[boundary]);
+            continue;
         }
         let mut frame_context = walk_context;
         let mut handler_data = std::ptr::null_mut();
@@ -518,13 +537,16 @@ pub(super) fn dispatch_frame_exception_handlers(
         );
 
         if language_handler != 0 {
+            // As in RtlDispatchException, the dispatcher context carries the
+            // caller's (unwound) context; the handler's own argument is the
+            // original exception context.
             let mut dispatcher_context = NativeDispatcherContext {
                 control_pc,
                 image_base,
                 function_entry,
                 establisher_frame,
                 target_ip: 0,
-                context_record: context,
+                context_record: &mut frame_context,
                 language_handler,
                 handler_data,
                 history_table: std::ptr::null_mut(),
@@ -536,7 +558,10 @@ pub(super) fn dispatch_frame_exception_handlers(
                 *mut NativeExceptionContext,
                 *mut NativeDispatcherContext,
             ) -> u32 = unsafe { std::mem::transmute(language_handler as usize) };
-            match handler(record, establisher_frame, context, &mut dispatcher_context) {
+            BOUNDARY_CONTEXTS.with(|contexts| contexts.borrow_mut().push(*context));
+            let disposition = handler(record, establisher_frame, context, &mut dispatcher_context);
+            BOUNDARY_CONTEXTS.with(|contexts| contexts.borrow_mut().pop());
+            match disposition {
                 0 if record.flags & 1 == 0 => return true, // ExceptionContinueExecution
                 0 => return false, // Noncontinuable exceptions cannot resume.
                 1 => {}            // ExceptionContinueSearch
@@ -557,7 +582,9 @@ pub(super) fn dispatch_frame_exception_handlers(
 
 fn is_guest_image_address(address: u64) -> bool {
     process_ctx().is_some_and(|process| {
-        process.loaded_modules.lock().is_ok_and(|modules| {
+        (address >= process.image_base
+            && address < process.image_base.saturating_add(u64::from(process.image_size)))
+            || process.loaded_modules.lock().is_ok_and(|modules| {
             modules.values().any(|module| {
                 address >= module.base
                     && address < module.base.saturating_add(u64::from(module.size_of_image))
@@ -566,21 +593,26 @@ fn is_guest_image_address(address: u64) -> bool {
     })
 }
 
-pub(super) extern "win64" fn native_raise_exception(
+/// `RaiseException` continued from its assembly entry, with the caller's
+/// captured context: the handler search starts at the raising function.
+#[no_mangle]
+extern "win64" fn winrun_raise_exception_with_context(
     code: u32,
     flags: u32,
     argument_count: u32,
     arguments: *const u64,
+    context: *mut NativeExceptionContext,
 ) {
-    if argument_count > 15 || (argument_count != 0 && arguments.is_null()) {
+    if argument_count > 15 || (argument_count != 0 && arguments.is_null()) || context.is_null() {
         native_set_last_error(87); // ERROR_INVALID_PARAMETER
         return;
     }
+    let context = unsafe { &mut *context };
     let mut record = NativeExceptionRecord {
         code,
-        flags,
+        flags: flags & 1, // EXCEPTION_NONCONTINUABLE
         nested_record: 0,
-        address: 0,
+        address: context_register(context, 16).unwrap_or(0),
         parameter_count: argument_count,
         information: [0; 15],
     };
@@ -593,10 +625,174 @@ pub(super) extern "win64" fn native_raise_exception(
             );
         }
     }
-    let mut context = NativeExceptionContext::software_exception();
-    if !dispatch_exception(&mut record, &mut context) {
+    if !dispatch_exception(&mut record, context) {
         native_exit_process(code)
     }
+}
+
+const EXCEPTION_UNWINDING: u32 = 0x2;
+const EXCEPTION_EXIT_UNWIND: u32 = 0x4;
+const EXCEPTION_TARGET_UNWIND: u32 = 0x20;
+const EXCEPTION_COLLIDED_UNWIND: u32 = 0x40;
+const STATUS_UNWIND: u32 = 0xc000_0027;
+const STATUS_UNWIND_CONSOLIDATE: u32 = 0x8000_0029;
+
+/// `RtlUnwindEx`/`RtlUnwind` continued from their assembly entry with the
+/// caller's context: call each frame's unwind handler up to `target_frame`
+/// (whose own handler sees `EXCEPTION_TARGET_UNWIND`), then resume in the
+/// target frame at `target_ip` with `Rax = return_value`. A
+/// `STATUS_UNWIND_CONSOLIDATE` record instead runs the callback in
+/// `ExceptionInformation[0]` (how MSVC C++ runs a catch block) and resumes
+/// where it returns.
+#[no_mangle]
+extern "win64" fn winrun_rtl_unwind_with_context(
+    target_frame: u64,
+    target_ip: u64,
+    record: *mut NativeExceptionRecord,
+    return_value: u64,
+    original_context: *mut NativeExceptionContext,
+    current: *mut NativeExceptionContext,
+) {
+    const MAX_UNWIND_FRAMES: usize = 1024;
+    let mut context = unsafe { current.read() };
+    let mut local_record = NativeExceptionRecord {
+        code: STATUS_UNWIND,
+        flags: 0,
+        nested_record: 0,
+        address: context_register(&context, 16).unwrap_or(0),
+        parameter_count: 0,
+        information: [0; 15],
+    };
+    let record = if record.is_null() {
+        &mut local_record
+    } else {
+        unsafe { &mut *record }
+    };
+    let mut flags = record.flags | EXCEPTION_UNWINDING;
+    if target_frame == 0 {
+        flags |= EXCEPTION_EXIT_UNWIND;
+    }
+    let mut reached_target = false;
+    for _ in 0..MAX_UNWIND_FRAMES {
+        let control_pc = context_register(&context, 16).unwrap_or(0);
+        let stack_pointer = context_register(&context, 4).unwrap_or(0);
+        if control_pc == 0 || stack_pointer == 0 {
+            break;
+        }
+        let mut image_base = 0;
+        let function_entry =
+            native_rtl_lookup_function_entry(control_pc, &mut image_base, std::ptr::null_mut())
+                as *const NativeRuntimeFunction;
+        if function_entry.is_null() && !is_guest_image_address(control_pc) {
+            // winrun's own frames, which this unwind abandons: continue from
+            // the innermost boundary context.
+            match BOUNDARY_CONTEXTS.with(|contexts| contexts.borrow_mut().pop()) {
+                Some(raised) => {
+                    context = raised;
+                    continue;
+                }
+                None => break,
+            }
+        }
+        let mut previous = context;
+        let mut handler_data = std::ptr::null_mut();
+        let mut establisher_frame = 0;
+        let handler = native_rtl_virtual_unwind(
+            2, // UNW_FLAG_UHANDLER
+            image_base,
+            control_pc,
+            function_entry,
+            &mut previous,
+            &mut handler_data,
+            &mut establisher_frame,
+            std::ptr::null_mut(),
+        );
+        if native_diagnostic_enabled() {
+            eprintln!(
+                "native unwind frame pc={control_pc:#x} sp={stack_pointer:#x} entry={} establisher={establisher_frame:#x} target={target_frame:#x} handler={handler:#x}",
+                !function_entry.is_null()
+            );
+        }
+        if target_frame != 0 && establisher_frame > target_frame {
+            break; // STATUS_INVALID_UNWIND_TARGET
+        }
+        if handler != 0 {
+            if establisher_frame == target_frame {
+                flags |= EXCEPTION_TARGET_UNWIND;
+            }
+            record.flags = flags;
+            context_set_register(&mut context, 0, return_value);
+            let original = if original_context.is_null() {
+                &mut context as *mut NativeExceptionContext
+            } else {
+                original_context
+            };
+            let mut dispatcher_context = NativeDispatcherContext {
+                control_pc,
+                image_base,
+                function_entry,
+                establisher_frame,
+                target_ip,
+                context_record: &mut context,
+                language_handler: handler,
+                handler_data,
+                history_table: std::ptr::null_mut(),
+                scope_index: 0,
+            };
+            let handler: extern "win64" fn(
+                *mut NativeExceptionRecord,
+                u64,
+                *mut NativeExceptionContext,
+                *mut NativeDispatcherContext,
+            ) -> u32 = unsafe { std::mem::transmute(handler as usize) };
+            handler(record, establisher_frame, original, &mut dispatcher_context);
+            flags &= !(EXCEPTION_TARGET_UNWIND | EXCEPTION_COLLIDED_UNWIND);
+        }
+        if establisher_frame == target_frame {
+            reached_target = true;
+            break;
+        }
+        let next_stack = context_register(&previous, 4).unwrap_or(0);
+        if next_stack <= stack_pointer {
+            break;
+        }
+        context = previous;
+    }
+    record.flags = flags;
+    if !reached_target {
+        native_write_to_handle(
+            STD_HANDLE_BASE + 2,
+            format!(
+                "winrun: unwind to frame 0x{target_frame:x} did not reach its target (exception 0x{:08x})\r\n",
+                record.code
+            )
+            .as_bytes(),
+        );
+        native_exit_process(record.code);
+    }
+    context_set_register(&mut context, 0, return_value);
+    if record.code != STATUS_UNWIND_CONSOLIDATE {
+        context_set_register(&mut context, 16, target_ip);
+    }
+    native_rtl_restore_context(&mut context, record);
+}
+
+/// `RtlRestoreContext`: continue at `context`, first running a
+/// `STATUS_UNWIND_CONSOLIDATE` record's callback for the resume address.
+pub(super) extern "win64" fn native_rtl_restore_context(
+    context: *mut NativeExceptionContext,
+    record: *mut NativeExceptionRecord,
+) -> ! {
+    let context = unsafe { &mut *context };
+    if !record.is_null() && unsafe { (*record).code } == STATUS_UNWIND_CONSOLIDATE {
+        let callback: extern "win64" fn(*mut NativeExceptionRecord) -> u64 =
+            unsafe { std::mem::transmute((*record).information[0] as usize) };
+        BOUNDARY_CONTEXTS.with(|contexts| contexts.borrow_mut().push(*context));
+        let resume = callback(record);
+        BOUNDARY_CONTEXTS.with(|contexts| contexts.borrow_mut().pop());
+        context_set_register(context, 16, resume);
+    }
+    unsafe { winrun_native_rtl_restore_context(context.bytes.as_mut_ptr()) }
 }
 
 pub(super) extern "win64" fn native_rtl_raise_exception(record: *mut NativeExceptionRecord) -> u32 {

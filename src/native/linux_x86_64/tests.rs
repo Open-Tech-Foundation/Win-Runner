@@ -31,7 +31,7 @@ mod protection_tests {
         native_launch_spec, native_lc_map_string_w, native_leave_critical_section,
         native_listen_socket, native_multi_byte_to_wide_char,
         native_need_current_directory_for_exe_path_w, native_process_prng,
-        native_query_depth_slist, native_query_performance_frequency, native_raise_exception,
+        native_query_depth_slist, native_query_performance_frequency,
         native_release_srw_lock_exclusive, native_release_srw_lock_shared,
         native_remove_vectored_exception_handler, native_resolve_code_page,
         native_rtl_add_function_table, native_rtl_delete_function_table,
@@ -7189,11 +7189,15 @@ mod protection_tests {
     static RAISED_EXCEPTION_CODE: std::sync::atomic::AtomicU32 =
         std::sync::atomic::AtomicU32::new(0);
 
+    static RAISED_EXCEPTION_ADDRESS: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
     extern "win64" fn handle_raised_exception(
         pointers: *mut super::NativeExceptionPointers,
     ) -> i32 {
         let record = unsafe { &*(*pointers).record };
         RAISED_EXCEPTION_CODE.store(record.code, std::sync::atomic::Ordering::Release);
+        RAISED_EXCEPTION_ADDRESS.store(record.address, std::sync::atomic::Ordering::Release);
         -1 // EXCEPTION_CONTINUE_EXECUTION
     }
 
@@ -7205,10 +7209,16 @@ mod protection_tests {
             handle_raised_exception as *const () as usize as u64,
         );
         assert_ne!(handle, 0);
-        native_raise_exception(0xe123_4567, 0, 0, std::ptr::null());
+        unsafe { super::winrun_native_raise_exception(0xe123_4567, 0, 0, std::ptr::null()) };
         assert_eq!(
             RAISED_EXCEPTION_CODE.load(std::sync::atomic::Ordering::Acquire),
             0xe123_4567
+        );
+        // The record carries the raising call's return address, captured
+        // with the caller's context.
+        assert_ne!(
+            RAISED_EXCEPTION_ADDRESS.load(std::sync::atomic::Ordering::Acquire),
+            0
         );
         let mut record = super::NativeExceptionRecord {
             code: 0xe765_4321,

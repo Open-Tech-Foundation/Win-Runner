@@ -320,6 +320,9 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                 | "RtlDispatchException"
                 | "RtlLookupFunctionEntry"
                 | "RtlRaiseException"
+                | "RtlRestoreContext"
+                | "RtlUnwind"
+                | "RtlUnwindEx"
                 | "RtlVirtualUnwind"
                 | "RtlGetVersion"
                 | "RtlNtStatusToDosError"
@@ -612,7 +615,10 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
             Some(native_rtl_lookup_function_entry as *const () as usize as u64)
         }
         "RtlVirtualUnwind" => Some(native_rtl_virtual_unwind as *const () as usize as u64),
-        "RaiseException" => Some(native_raise_exception as *const () as usize as u64),
+        "RaiseException" => Some(winrun_native_raise_exception as *const () as usize as u64),
+        "RtlUnwindEx" => Some(winrun_native_rtl_unwind_ex as *const () as usize as u64),
+        "RtlUnwind" => Some(winrun_native_rtl_unwind as *const () as usize as u64),
+        "RtlRestoreContext" => Some(native_rtl_restore_context as *const () as usize as u64),
         "RtlRaiseException" => Some(native_rtl_raise_exception as *const () as usize as u64),
         // Winsock's stable ordinal exports for byte-order conversion.
         "#8" | "#14" => Some(native_network_u32 as *const () as usize as u64),
