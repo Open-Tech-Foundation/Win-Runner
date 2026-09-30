@@ -59,6 +59,9 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Record the modern .NET milestone and its known gaps (stack guard pages,
+  fault translation on secondary threads, W^X double mapping, locales) in
+  `COMPATIBILITY_BACKLOG.md`.
 - Run the modern .NET host chain on the native backend: a framework-dependent
   .NET 10 app's apphost now finds the runtime in `C:\Program Files\dotnet`,
   loads `hostfxr.dll` and `hostpolicy.dll`, and loads `coreclr.dll`. Guest

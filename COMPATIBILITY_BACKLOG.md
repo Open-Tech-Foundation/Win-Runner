@@ -235,8 +235,25 @@ Items remain open until implementation and relevant verification are complete.
   - [ ] Host `hostfxr.dll`, `hostpolicy.dll`, and `coreclr.dll` using the
     supported native hosting interfaces; cover shared, app-local, and
     self-contained runtime layouts, then add single-file apps.
+    - [x] Run a framework-dependent app's apphost against the shared runtime
+      in `C:\Program Files\dotnet` (`tests/dotnet_native.rs`).
+    - [x] Map IL-only assemblies from `LoadLibrary` (PE32/PE32+, EXE or DLL)
+      on the 64 KiB allocation granularity, as CoreCLR's loaded layout needs.
+    - [ ] Self-contained and single-file layouts; `dotnet.exe app.dll`.
+    - [ ] Share memory between file-mapping views (memfd) so CoreCLR's W^X
+      double mapping works instead of falling back to single mappings.
+    - [ ] `RtlAddGrowableFunctionTable` and friends for JIT-code unwinding;
+      `version.dll` file-version queries.
   - [ ] Complete SEH dispatch and stack unwinding, including native fault
     translation required by CoreCLR.
+    - [x] C++ exceptions: `RaiseException` with the caller's context,
+      `RtlUnwindEx`/`RtlUnwind`, `RtlRestoreContext` with catch-block
+      consolidation, and unwinds that cross winrun's own frames.
+    - [ ] Report thread stacks from `VirtualQuery` with a `PAGE_GUARD` page;
+      CoreCLR's unhandled-exception path checks for one and otherwise
+      reports "Stack overflow." instead of the exception.
+    - [ ] Translate faults on `CreateThread` threads, not only the main
+      thread, so managed null references there become exceptions.
   - [ ] Complete virtual memory semantics used by the GC/JIT: reserve versus
     commit, guard pages, and writable/executable protection transitions.
     - [x] Track committed pages inside reserved allocations; reject
@@ -255,8 +272,13 @@ Items remain open until implementation and relevant verification are complete.
     Linux signal-based stop/resume protocol.
   - [ ] Complete thread/TLS/FLS, events/waits, timers, and thread-pool support
     required by CoreCLR.
+    - [x] Per-thread FLS with distinct indices and callbacks;
+      `WaitForMultipleObjects`, `SignalObjectAndWait`, `OpenEventW`.
   - [ ] Install an official redistributable CoreCLR package into guest WinFS
     and validate first with a minimal modern .NET app, then `pwsh.exe`.
+    - [x] A minimal .NET 10 console app runs (output, arguments, exit code).
+    - [ ] Globalization beyond `en-US`/invariant NLS data (ICU or more
+      locales), then `pwsh.exe`.
   - [ ] Leave old .NET Framework unsupported with the clear diagnostic above;
     consider routing `_CorExeMain` to CoreCLR only as a later compatibility
     experiment. NativeAOT remains ordinary native PE execution.
