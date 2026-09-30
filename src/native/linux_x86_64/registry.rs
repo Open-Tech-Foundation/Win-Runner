@@ -429,6 +429,38 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                 | "WSARecv"
                 | "WSASend"
                 | "listen"
+                | "#1"
+                | "#16"
+                | "#17"
+                | "#20"
+                | "accept"
+                | "bind"
+                | "closesocket"
+                | "connect"
+                | "getpeername"
+                | "getsockname"
+                | "getsockopt"
+                | "setsockopt"
+                | "ioctlsocket"
+                | "inet_addr"
+                | "send"
+                | "recv"
+                | "recvfrom"
+                | "sendto"
+                | "shutdown"
+                | "socket"
+                | "gethostname"
+                | "htonl"
+                | "htons"
+                | "ntohl"
+                | "ntohs"
+                | "WSAStartup"
+                | "WSACleanup"
+                | "WSAGetLastError"
+                | "WSASetLastError"
+                | "WSASocketW"
+                | "getaddrinfo"
+                | "freeaddrinfo"
         ),
         "USER32.DLL" => matches!(func, "GetSystemMetrics" | "MessageBeep" | "LoadStringW"),
         "IPHLPAPI.DLL" => func == "GetAdaptersAddresses",
@@ -913,31 +945,38 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "RtlRestoreContext" => Some(native_rtl_restore_context as *const () as usize as u64),
         "RtlRaiseException" => Some(native_rtl_raise_exception as *const () as usize as u64),
         // Winsock's stable ordinal exports for byte-order conversion.
-        "#8" | "#14" => Some(native_network_u32 as *const () as usize as u64),
-        "#9" | "#15" => Some(native_network_u16 as *const () as usize as u64),
-        "#10" => Some(native_ioctlsocket as *const () as usize as u64),
-        "#11" => Some(native_wsa_inet_addr as *const () as usize as u64),
-        "#4" => Some(native_connect_socket as *const () as usize as u64),
-        "#2" => Some(native_bind_socket as *const () as usize as u64),
+        "#8" | "#14" | "htonl" | "ntohl" => Some(native_network_u32 as *const () as usize as u64),
+        "#9" | "#15" | "htons" | "ntohs" => Some(native_network_u16 as *const () as usize as u64),
+        "#10" | "ioctlsocket" => Some(native_ioctlsocket as *const () as usize as u64),
+        "#11" | "inet_addr" => Some(native_wsa_inet_addr as *const () as usize as u64),
+        "#4" | "connect" => Some(native_connect_socket as *const () as usize as u64),
+        "#2" | "bind" => Some(native_bind_socket as *const () as usize as u64),
         "#13" | "listen" => Some(native_listen_socket as *const () as usize as u64),
-        "#19" => Some(native_send_socket as *const () as usize as u64),
-        "#22" => Some(native_shutdown_socket as *const () as usize as u64),
-        "#5" => Some(native_getpeername as *const () as usize as u64),
-        "#6" => Some(native_getsockname as *const () as usize as u64),
-        "#21" => Some(native_setsockopt as *const () as usize as u64),
-        "#57" => Some(native_wsa_get_host_name as *const () as usize as u64),
+        "#19" | "send" => Some(native_send_socket as *const () as usize as u64),
+        "#22" | "shutdown" => Some(native_shutdown_socket as *const () as usize as u64),
+        "#5" | "getpeername" => Some(native_getpeername as *const () as usize as u64),
+        "#6" | "getsockname" => Some(native_getsockname as *const () as usize as u64),
+        "#21" | "setsockopt" => Some(native_setsockopt as *const () as usize as u64),
+        "#57" | "gethostname" => Some(native_wsa_get_host_name as *const () as usize as u64),
         "GetAddrInfoW" => Some(native_get_addr_info_w as *const () as usize as u64),
         "FreeAddrInfoW" => Some(native_free_addr_info_w as *const () as usize as u64),
-        "#115" => Some(native_wsa_startup as *const () as usize as u64),
-        "#116" => Some(native_wsa_cleanup as *const () as usize as u64),
-        "#23" => Some(native_socket as *const () as usize as u64),
-        "#3" => Some(native_close_socket as *const () as usize as u64),
-        "#7" => Some(native_getsockopt as *const () as usize as u64),
+        "#115" | "WSAStartup" => Some(native_wsa_startup as *const () as usize as u64),
+        "#116" | "WSACleanup" => Some(native_wsa_cleanup as *const () as usize as u64),
+        "#23" | "socket" => Some(native_socket as *const () as usize as u64),
+        "#3" | "closesocket" => Some(native_close_socket as *const () as usize as u64),
+        "#7" | "getsockopt" => Some(native_getsockopt as *const () as usize as u64),
         "WSAIoctl" => Some(native_wsa_ioctl as *const () as usize as u64),
+        "#1" | "accept" => Some(native_accept_socket as *const () as usize as u64),
+        "#16" | "recv" => Some(native_recv_socket as *const () as usize as u64),
+        "#17" | "recvfrom" => Some(native_recvfrom_socket as *const () as usize as u64),
+        "#20" | "sendto" => Some(native_sendto_socket as *const () as usize as u64),
+        "WSASocketW" => Some(native_wsa_socket_w as *const () as usize as u64),
+        "getaddrinfo" => Some(native_getaddrinfo as *const () as usize as u64),
+        "freeaddrinfo" => Some(native_free_addr_info_w as *const () as usize as u64),
         "WSARecv" => Some(native_wsa_recv as *const () as usize as u64),
         "WSASend" => Some(native_wsa_send as *const () as usize as u64),
-        "#111" => Some(native_wsa_get_last_error as *const () as usize as u64),
-        "#112" => Some(native_wsa_set_last_error as *const () as usize as u64),
+        "#111" | "WSAGetLastError" => Some(native_wsa_get_last_error as *const () as usize as u64),
+        "#112" | "WSASetLastError" => Some(native_wsa_set_last_error as *const () as usize as u64),
         "GetSystemMetrics" => Some(native_get_system_metrics as *const () as usize as u64),
         "MessageBeep" => Some(native_message_beep as *const () as usize as u64),
         "CompareStringOrdinal" => Some(native_compare_string_ordinal as *const () as usize as u64),

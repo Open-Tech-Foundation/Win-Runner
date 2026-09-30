@@ -7,7 +7,6 @@ thread_local! {
         const { std::cell::RefCell::new([(0, 0); 64]) };
     pub(super) static THREAD_FLS_VALUES: std::cell::RefCell<Vec<(u64, u64)>> =
         const { std::cell::RefCell::new(Vec::new()) };
-    pub(super) static THREAD_WSA_ERROR: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
     pub(super) static THREAD_NATIVE_HANDLE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     pub(super) static THREAD_NATIVE_PROCESS: std::cell::RefCell<Option<Arc<NativeProcessContext>>> =
         const { std::cell::RefCell::new(None) };

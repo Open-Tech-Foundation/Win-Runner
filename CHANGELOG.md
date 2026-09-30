@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Resolve Winsock imports by name as well as by ordinal (`WSAStartup`,
+  `socket`, `connect`, `send`, and the rest), as Rust's std, mio, and
+  socket2 import them, and add `accept`, `recv`, `recvfrom`, `sendto`,
+  `WSASocketW`, `getaddrinfo`/`freeaddrinfo`, and `WSAIoctl`'s
+  `SIO_BASE_HANDLE`, `SIO_BSP_HANDLE*`, and `SIO_KEEPALIVE_VALS`. Winsock
+  errors are now the thread's last error, as on Windows, so a non-blocking
+  `connect` reports `WSAEWOULDBLOCK` through `GetLastError` instead of a
+  stale code. ES-Runtime's `esdev create` stopped at "unsupported native
+  import called: ws2_32.dll!WSAStartup".
 - Record the canonical path of a file opened with `CreateFileW` (`\`
   separators, `.` and `..` resolved, on-disk casing), as Windows does, so
   `GetFinalPathNameByHandleW` no longer echoes `C:\proj\data/one.txt`.
