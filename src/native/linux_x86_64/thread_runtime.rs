@@ -354,37 +354,140 @@ pub(super) extern "win64" fn native_tls_set_value(index: u32, value: u64) -> i32
     1
 }
 
-pub(super) extern "win64" fn native_fls_alloc(_callback: u64) -> u32 {
-    0
+/// FLS_MAXIMUM_AVAILABLE on current Windows.
+const FLS_MAXIMUM_AVAILABLE: usize = 4080;
+const FLS_OUT_OF_INDEXES: u32 = u32::MAX;
+
+/// `FlsAlloc(callback)`: a fresh index whose value is empty on every thread.
+/// Index 0 is never handed out, so a zeroed index variable is never valid.
+pub(super) extern "win64" fn native_fls_alloc(callback: u64) -> u32 {
+    let Some(process) = process_ctx() else {
+        return FLS_OUT_OF_INDEXES;
+    };
+    let Ok(mut slots) = process.fls.lock() else {
+        return FLS_OUT_OF_INDEXES;
+    };
+    if slots.callbacks.is_empty() {
+        slots.callbacks.push(None);
+        slots.generation.push(0);
+    }
+    let index = match slots.callbacks.iter().skip(1).position(Option::is_none) {
+        Some(free) => free + 1,
+        None if slots.callbacks.len() < FLS_MAXIMUM_AVAILABLE => {
+            slots.callbacks.push(None);
+            slots.generation.push(0);
+            slots.callbacks.len() - 1
+        }
+        None => {
+            native_set_last_error(259); // ERROR_NO_MORE_ITEMS
+            return FLS_OUT_OF_INDEXES;
+        }
+    };
+    slots.callbacks[index] = Some(callback);
+    slots.generation[index] = slots.generation[index].wrapping_add(1);
+    index as u32
 }
+
+/// The allocated index's generation and callback, or `None` (with
+/// `ERROR_INVALID_PARAMETER`) for an index that is not allocated.
+fn fls_slot(process: &NativeProcessContext, index: u32) -> Option<(u64, u64)> {
+    let slots = process.fls.lock().ok()?;
+    match slots.callbacks.get(index as usize) {
+        Some(Some(callback)) if index != 0 => Some((slots.generation[index as usize], *callback)),
+        _ => {
+            native_set_last_error(87);
+            None
+        }
+    }
+}
+
+/// Take this thread's live value for `index`, leaving it empty.
+fn take_thread_fls_value(index: usize, generation: u64) -> u64 {
+    THREAD_FLS_VALUES.with(|values| {
+        let mut values = values.borrow_mut();
+        match values.get_mut(index) {
+            Some(slot) if slot.0 == generation => std::mem::take(slot).1,
+            _ => 0,
+        }
+    })
+}
+
+fn call_fls_callback(callback: u64, value: u64) {
+    if callback != 0 && value != 0 {
+        // SAFETY: FlsAlloc's caller supplied this guest PFLS_CALLBACK_FUNCTION.
+        let callback: unsafe extern "win64" fn(u64) = unsafe { std::mem::transmute(callback as usize) };
+        unsafe { callback(value) };
+    }
+}
+
+/// `FlsFree(index)`: runs the index's callback for the calling thread's
+/// value, then releases the index. Other threads' values are dropped
+/// without a callback.
 pub(super) extern "win64" fn native_fls_free(index: u32) -> i32 {
-    if index != 0 {
+    let Some(process) = process_ctx() else {
         return 0;
-    }
-    if let Some(process) = process_ctx() {
-        process.fls_value.store(0, Ordering::Release);
-    }
+    };
+    let Some((generation, callback)) = fls_slot(&process, index) else {
+        return 0;
+    };
+    call_fls_callback(callback, take_thread_fls_value(index as usize, generation));
+    let Ok(mut slots) = process.fls.lock() else {
+        return 0;
+    };
+    slots.callbacks[index as usize] = None;
+    slots.generation[index as usize] = slots.generation[index as usize].wrapping_add(1);
     1
 }
+
 pub(super) extern "win64" fn native_fls_get_value(index: u32) -> u64 {
-    if index == 0 {
-        process_ctx()
-            .map(|process| process.fls_value.load(Ordering::Acquire))
-            .unwrap_or(0)
-    } else {
-        0
-    }
+    let Some(process) = process_ctx() else {
+        return 0;
+    };
+    let Some((generation, _)) = fls_slot(&process, index) else {
+        return 0;
+    };
+    let value = THREAD_FLS_VALUES.with(|values| match values.borrow().get(index as usize) {
+        Some(&(slot_generation, value)) if slot_generation == generation => value,
+        _ => 0,
+    });
+    native_set_last_error(0);
+    value
 }
+
 pub(super) extern "win64" fn native_fls_set_value(index: u32, value: u64) -> i32 {
-    if index != 0 {
+    let Some(process) = process_ctx() else {
         return 0;
-    }
-    if let Some(process) = process_ctx() {
-        process.fls_value.store(value, Ordering::Release);
-    } else {
+    };
+    let Some((generation, _)) = fls_slot(&process, index) else {
         return 0;
-    }
+    };
+    THREAD_FLS_VALUES.with(|values| {
+        let mut values = values.borrow_mut();
+        if values.len() <= index as usize {
+            values.resize(index as usize + 1, (0, 0));
+        }
+        values[index as usize] = (generation, value);
+    });
     1
+}
+
+/// Run the FLS callbacks for the exiting thread's values, as Windows does
+/// when a thread ends.
+pub(super) fn run_thread_fls_callbacks(process: &NativeProcessContext) {
+    let live: Vec<(usize, u64, u64)> = {
+        let Ok(slots) = process.fls.lock() else {
+            return;
+        };
+        slots
+            .callbacks
+            .iter()
+            .enumerate()
+            .filter_map(|(index, callback)| Some((index, slots.generation[index], (*callback)?)))
+            .collect()
+    };
+    for (index, generation, callback) in live {
+        call_fls_callback(callback, take_thread_fls_value(index, generation));
+    }
 }
 
 #[cfg(test)]
@@ -482,5 +585,63 @@ mod tls_callback_tests {
                 [5, 6, 0, 0]
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod fls_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    static FREED_VALUES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+    extern "win64" fn record_freed_value(value: u64) {
+        FREED_VALUES.lock().unwrap().push(value);
+    }
+
+    #[test]
+    fn fls_indices_are_distinct_and_values_are_per_thread() {
+        let first = native_fls_alloc(0);
+        let second = native_fls_alloc(0);
+        assert_ne!(first, FLS_OUT_OF_INDEXES);
+        assert_ne!(first, 0);
+        assert_ne!(first, second);
+        assert_eq!(native_fls_set_value(first, 0x1111), 1);
+        assert_eq!(native_fls_set_value(second, 0x2222), 1);
+        assert_eq!(native_fls_get_value(first), 0x1111);
+        assert_eq!(native_fls_get_value(second), 0x2222);
+        // Another thread starts with empty values for the same indices.
+        let other = AtomicU64::new(u64::MAX);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                other.store(native_fls_get_value(first), Ordering::Relaxed);
+                native_fls_set_value(first, 0x3333);
+            });
+        });
+        assert_eq!(other.load(Ordering::Relaxed), 0);
+        assert_eq!(native_fls_get_value(first), 0x1111);
+        assert_eq!(native_fls_free(first), 1);
+        assert_eq!(native_fls_free(second), 1);
+        assert_eq!(native_fls_get_value(first), 0, "a freed index is invalid");
+        assert_eq!(native_fls_set_value(0, 1), 0, "index 0 is never allocated");
+    }
+
+    #[test]
+    fn fls_callbacks_run_on_free_and_thread_exit() {
+        let callback = record_freed_value as *const () as usize as u64;
+        let index = native_fls_alloc(callback);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                native_fls_set_value(index, 0xbeef);
+                run_thread_fls_callbacks(&super::super::TEST_PROCESS);
+                // The value was consumed; a second exit pass does nothing.
+                run_thread_fls_callbacks(&super::super::TEST_PROCESS);
+            });
+        });
+        native_fls_set_value(index, 0xcafe);
+        assert_eq!(native_fls_free(index), 1);
+        let freed = FREED_VALUES.lock().unwrap().clone();
+        assert_eq!(freed.iter().filter(|&&value| value == 0xbeef).count(), 1);
+        assert_eq!(freed.iter().filter(|&&value| value == 0xcafe).count(), 1);
     }
 }

@@ -223,7 +223,7 @@ pub(super) struct NativeProcessContext {
     pub(super) duplicate_next: AtomicU64,
     pub(super) timer_next: AtomicU64,
     pub(super) state_fd: AtomicU32,
-    pub(super) fls_value: AtomicU64,
+    pub(super) fls: Mutex<FlsSlots>,
     pub(super) unhandled_exception_filter: AtomicU64,
     pub(super) vectored_exception_handlers: Mutex<Vec<NativeVectoredExceptionHandler>>,
     pub(super) vectored_exception_handler_next: AtomicU64,
@@ -470,6 +470,16 @@ impl NativeCompletion {
             status: u64::from_le_bytes(packet[20..28].try_into().ok()?),
         })
     }
+}
+
+/// Fiber-local storage indices. Values live per thread (in
+/// `THREAD_FLS_VALUES`) tagged with the index's generation, so a freed and
+/// reallocated index reads as empty.
+#[derive(Default)]
+pub(super) struct FlsSlots {
+    /// `Some(callback)` for an allocated index; a zero callback means none.
+    pub(super) callbacks: Vec<Option<u64>>,
+    pub(super) generation: Vec<u64>,
 }
 
 pub(super) struct DynamicTlsSlots {

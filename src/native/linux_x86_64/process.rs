@@ -479,6 +479,7 @@ pub(super) extern "win64" fn native_create_thread(
         let entry: unsafe extern "win64" fn(u64) -> u32 = unsafe { std::mem::transmute(start) };
         let exit_code = unsafe { entry(parameter) };
         thread_runtime::notify_guest_thread_modules(&thread_process, false);
+        thread_runtime::run_thread_fls_callbacks(&thread_process);
         exit_code
     });
     let Ok(join) = spawned else {

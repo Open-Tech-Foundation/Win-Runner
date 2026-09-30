@@ -546,7 +546,7 @@ fn run_rust_baseline_argv_with_fs_impl(
             duplicate_next: AtomicU64::new(0xa000_0000),
             timer_next: AtomicU64::new(0x7000_0000),
             state_fd: AtomicU32::new(u32::MAX),
-            fls_value: AtomicU64::new(0),
+            fls: Mutex::new(FlsSlots::default()),
             unhandled_exception_filter: AtomicU64::new(0),
             vectored_exception_handlers: Mutex::new(Vec::new()),
             vectored_exception_handler_next: AtomicU64::new(0xe100_0000),

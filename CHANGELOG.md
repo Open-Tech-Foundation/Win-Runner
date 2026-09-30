@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Give each thread its own fiber-local storage values and hand out distinct
+  `FlsAlloc` indices (with callbacks run on `FlsFree` and thread exit).
+  Every index was 0 and shared one process-wide value, so the statically
+  linked C++ runtimes of several DLLs (the .NET host, CoreCLR) read each
+  other's per-thread data and terminated in C++ exception handling.
 - Report the x64 user address space from `GlobalMemoryStatusEx`'s virtual
   fields instead of the physical budget, and answer `VirtualQuery` for
   addresses outside guest allocations: gaps read as `MEM_FREE` and host
