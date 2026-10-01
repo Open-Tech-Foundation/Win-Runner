@@ -6,6 +6,16 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Load Node.js native addons built with napi-rs, such as vite 8's rolldown
+  bundler, so `npm run dev` and `npm run build` work in a create-vite project:
+  - A worker now keeps the executable's export table, so `GetProcAddress`
+    finds N-API in `node.exe` (it lost the exports when the image was
+    handed to the worker, and the addon panicked).
+  - The TEB is full-size (0x2000 bytes), and `TlsAlloc` values live in its
+    `TlsSlots` and `TlsExpansionSlots`, as on Windows, with all 1088 indices.
+    mimalloc reads them there directly; it read past a 4 KiB TEB and crashed
+    with SIGSEGV.
+  - `TlsFree` clears the slot on every thread, as Windows does.
 - Give every guest process an id unique across its whole process tree: a
   worker's id is its host pid, and a child that runs inside its parent (the
   PowerShell child) gets an id above every host pid. Each process used to

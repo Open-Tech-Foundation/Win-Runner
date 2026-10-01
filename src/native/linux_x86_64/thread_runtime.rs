@@ -5,7 +5,7 @@ use super::*;
 pub(super) fn put64(dst: &mut [u8], off: usize, value: u64) {
     dst[off..off + 8].copy_from_slice(&value.to_le_bytes());
 }
-pub(super) fn set_teb_stack_bounds(teb: &mut [u8; 0x1000]) {
+pub(super) fn set_teb_stack_bounds(teb: &mut [u8; TEB_SIZE]) {
     let marker = 0u8;
     let stack_pointer = (&marker as *const u8) as usize;
     if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
@@ -40,7 +40,7 @@ pub(super) fn set_teb_stack_bounds(teb: &mut [u8; 0x1000]) {
         }
     }
 }
-pub(super) fn install_thread_teb(teb: &mut [u8; 0x1000]) -> bool {
+pub(super) fn install_thread_teb(teb: &mut [u8; TEB_SIZE]) -> bool {
     set_teb_stack_bounds(teb);
     let base = teb.as_ptr() as u64;
     if !unsafe { set_gs(base) } {
@@ -174,6 +174,8 @@ pub(super) extern "win64" fn native_set_thread_stack_guarantee(size: *mut u32) -
     (!size.is_null()) as i32
 }
 
+/// `TlsAlloc`: the lowest free index, 0-1087 as on Windows. Its value is
+/// empty on every thread (slots are cleared when freed).
 pub(super) extern "win64" fn native_tls_alloc() -> u32 {
     let Some(process) = process_ctx() else {
         return u32::MAX;
@@ -183,7 +185,7 @@ pub(super) extern "win64" fn native_tls_alloc() -> u32 {
     };
     let Some(index) = slots.active.iter().position(|active| !active) else {
         native_set_last_error(8);
-        return u32::MAX;
+        return u32::MAX; // TLS_OUT_OF_INDEXES
     };
     slots.active[index] = true;
     slots.reserved[index] = false;
@@ -194,27 +196,61 @@ pub(super) extern "win64" fn native_tls_free(index: u32) -> i32 {
     let Some(process) = process_ctx() else {
         return 0;
     };
+    {
+        let Ok(slots) = process.dynamic_tls.lock() else {
+            return 0;
+        };
+        let reserved = slots.reserved.get(index as usize).copied().unwrap_or(false)
+            || (index == 0 && slots.reserved_static);
+        if !slots.active.get(index as usize).copied().unwrap_or(false) || reserved {
+            native_set_last_error(87);
+            return 0;
+        }
+    }
+    // Like Windows, clear the value on every thread before the index can be
+    // handed out again.
+    clear_tls_index(&process, index as usize);
     let Ok(mut slots) = process.dynamic_tls.lock() else {
         return 0;
     };
-    let reserved = slots.reserved.get(index as usize).copied().unwrap_or(false)
-        || (index == 0 && slots.reserved_static);
-    let Some(active) = slots.active.get_mut(index as usize) else {
-        native_set_last_error(87);
-        return 0;
-    };
-    if !*active || reserved {
-        native_set_last_error(87);
-        return 0;
-    }
-    *active = false;
+    slots.active[index as usize] = false;
     slots.generation[index as usize] = slots.generation[index as usize].wrapping_add(1);
     1
 }
 
+/// The TEB cell of `TlsAlloc` index `index` for the thread whose TEB is at
+/// `teb`: `TlsSlots[index]`, or `TlsExpansionSlots[index - 64]`.
+fn teb_tls_cell(teb: u64, index: usize) -> Option<*mut u64> {
+    if index < 64 {
+        return Some((teb + (TEB_TLS_SLOTS + index * 8) as u64) as *mut u64);
+    }
+    if index >= TLS_INDEXES {
+        return None;
+    }
+    let expansion =
+        unsafe { ((teb + TEB_TLS_EXPANSION_SLOTS as u64) as *const u64).read_unaligned() };
+    (expansion != 0).then(|| (expansion + ((index - 64) * 8) as u64) as *mut u64)
+}
+
+fn clear_tls_index(process: &NativeProcessContext, index: usize) {
+    let blocks = process.tls_blocks.lock().map_or_else(
+        |_| Vec::new(),
+        |blocks| blocks.values().filter_map(std::sync::Weak::upgrade).collect(),
+    );
+    for block in blocks {
+        if let Ok(mut block) = block.lock() {
+            let teb = block.teb.as_mut_ptr() as u64;
+            if let Some(cell) = teb_tls_cell(teb, index) {
+                unsafe { cell.write_unaligned(0) };
+            }
+        }
+    }
+}
+
 pub(super) fn reserve_module_tls_slot(process: &NativeProcessContext) -> Option<u32> {
     let mut slots = process.dynamic_tls.lock().ok()?;
-    let index = slots.active.iter().position(|active| !active)?;
+    // Module static TLS indexes the 64-entry ThreadLocalStoragePointer array.
+    let index = slots.active[..64].iter().position(|active| !active)?;
     slots.active[index] = true;
     slots.reserved[index] = true;
     slots.generation[index] = slots.generation[index].wrapping_add(1);
@@ -325,15 +361,16 @@ pub(super) extern "win64" fn native_tls_get_value(index: u32) -> u64 {
         native_set_last_error(87);
         return 0;
     }
-    let generation = slots.generation[index as usize];
-    let value = THREAD_TLS_VALUES.with(|values| {
-        let (slot_generation, value) = values.borrow()[index as usize];
-        if slot_generation == generation {
-            value
-        } else {
-            0
-        }
-    });
+    let teb = THREAD_TEB_BASE.get();
+    let value = if teb != 0 {
+        teb_tls_cell(teb, index as usize).map_or(0, |cell| unsafe { cell.read_unaligned() })
+    } else {
+        let generation = slots.generation[index as usize];
+        THREAD_TLS_VALUES.with(|values| match values.borrow().get(index as usize) {
+            Some(&(slot_generation, value)) if slot_generation == generation => value,
+            _ => 0,
+        })
+    };
     native_set_last_error(0);
     value
 }
@@ -348,8 +385,23 @@ pub(super) extern "win64" fn native_tls_set_value(index: u32, value: u64) -> i32
         native_set_last_error(87);
         return 0;
     }
-    let generation = slots.generation[index as usize];
-    THREAD_TLS_VALUES.with(|values| values.borrow_mut()[index as usize] = (generation, value));
+    let teb = THREAD_TEB_BASE.get();
+    if teb != 0 {
+        let Some(cell) = teb_tls_cell(teb, index as usize) else {
+            native_set_last_error(87);
+            return 0;
+        };
+        unsafe { cell.write_unaligned(value) };
+    } else {
+        let generation = slots.generation[index as usize];
+        THREAD_TLS_VALUES.with(|values| {
+            let mut values = values.borrow_mut();
+            if values.len() <= index as usize {
+                values.resize(index as usize + 1, (0, 0));
+            }
+            values[index as usize] = (generation, value);
+        });
+    }
     native_set_last_error(0);
     1
 }
@@ -643,5 +695,49 @@ mod fls_tests {
         let freed = FREED_VALUES.lock().unwrap().clone();
         assert_eq!(freed.iter().filter(|&&value| value == 0xbeef).count(), 1);
         assert_eq!(freed.iter().filter(|&&value| value == 0xcafe).count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod teb_tls_tests {
+    use super::*;
+
+    fn teb_u64(tls: &NativeTls, offset: usize) -> u64 {
+        u64::from_le_bytes(tls.teb[offset..offset + 8].try_into().unwrap())
+    }
+
+    #[test]
+    fn tls_values_live_where_programs_read_the_teb() {
+        // mimalloc and others read TlsSlots (gs:0x1480) and the
+        // TlsExpansionSlots array (gs:0x1780) directly.
+        let mut tls = NativeTls::new(0x1400_0000);
+        let teb = tls.teb.as_mut_ptr() as u64;
+        assert!(TEB_SIZE > TEB_TLS_EXPANSION_SLOTS + 8);
+        assert_eq!(
+            teb_u64(&tls, TEB_TLS_EXPANSION_SLOTS),
+            tls.tls_expansion.as_ptr() as u64
+        );
+        let low = teb_tls_cell(teb, 5).unwrap();
+        assert_eq!(low as u64, teb + 0x1480 + 5 * 8);
+        let high = teb_tls_cell(teb, 64 + 1023).unwrap();
+        assert_eq!(high as u64, tls.tls_expansion.as_ptr() as u64 + 1023 * 8);
+        assert!(teb_tls_cell(teb, TLS_INDEXES).is_none());
+
+        unsafe {
+            low.write_unaligned(0x1111);
+            high.write_unaligned(0x2222);
+        }
+        assert_eq!(teb_u64(&tls, 0x1480 + 5 * 8), 0x1111);
+        assert_eq!(tls.tls_expansion[1023], 0x2222);
+
+        // A new thread starts with every value empty and its own array.
+        let next = tls.clone_for_thread();
+        assert_eq!(teb_u64(&next, 0x1480 + 5 * 8), 0);
+        assert_eq!(next.tls_expansion[1023], 0);
+        assert_eq!(
+            teb_u64(&next, TEB_TLS_EXPANSION_SLOTS),
+            next.tls_expansion.as_ptr() as u64
+        );
+        assert_eq!(teb_u64(&next, 0x30), next.teb.as_ptr() as u64); // NT_TIB.Self
     }
 }

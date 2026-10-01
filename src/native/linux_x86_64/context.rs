@@ -3,8 +3,9 @@
 use super::*;
 
 thread_local! {
-    pub(super) static THREAD_TLS_VALUES: std::cell::RefCell<[(u64, u64); 64]> =
-        const { std::cell::RefCell::new([(0, 0); 64]) };
+    /// `TlsAlloc` values of a thread without a TEB (host threads in tests).
+    pub(super) static THREAD_TLS_VALUES: std::cell::RefCell<Vec<(u64, u64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     pub(super) static THREAD_FLS_VALUES: std::cell::RefCell<Vec<(u64, u64)>> =
         const { std::cell::RefCell::new(Vec::new()) };
     pub(super) static THREAD_NATIVE_HANDLE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -137,12 +138,12 @@ pub(super) fn random_pointer_cookie() -> u64 {
 }
 impl DynamicTlsSlots {
     pub(super) fn new(static_tls: bool) -> Self {
-        let mut active = [false; 64];
+        let mut active = vec![false; TLS_INDEXES];
         active[0] = static_tls;
         Self {
             active,
-            generation: [0; 64],
-            reserved: [false; 64],
+            generation: vec![0; TLS_INDEXES],
+            reserved: vec![false; TLS_INDEXES],
             reserved_static: static_tls,
         }
     }

@@ -1,6 +1,6 @@
 //! Request protocol for clean, exec-based Linux native guest workers.
 
-use crate::pe::{Import, PeImage, TlsDir};
+use crate::pe::{Export, Import, PeImage, TlsDir};
 use std::path::{Path, PathBuf};
 
 pub(crate) fn write_image(image: &PeImage, directory: &Path) -> Result<PathBuf, String> {
@@ -34,6 +34,20 @@ pub(crate) fn write_image(image: &PeImage, directory: &Path) -> Result<PathBuf, 
         "entry_rva": image.entry_rva,
         "size_of_image": image.size_of_image,
         "imports": imports(&image.imports),
+        // The executable's own exports: Node.js addons look up N-API in
+        // node.exe with GetProcAddress.
+        "exports": image
+            .exports
+            .iter()
+            .map(|export| {
+                serde_json::json!({
+                    "ordinal": export.ordinal,
+                    "name": export.name,
+                    "target_rva": export.target_rva,
+                    "forwarder": export.forwarder,
+                })
+            })
+            .collect::<Vec<_>>(),
         "unsupported": imports(&image.unsupported),
         "tls": tls,
         "code_ranges": image.code_ranges,
@@ -128,7 +142,24 @@ pub(crate) fn read_image(directory: &Path) -> Result<PeImage, String> {
         image: std::fs::read(directory.join("image.bin"))
             .map_err(|error| format!("cannot read native worker image: {error}"))?,
         imports: imports("imports")?,
-        exports: vec![],
+        exports: metadata
+            .get("exports")
+            .and_then(serde_json::Value::as_array)
+            .map(|exports| {
+                exports
+                    .iter()
+                    .map(|value| {
+                        Ok(Export {
+                            ordinal: number(value, "ordinal")? as u32,
+                            name: value["name"].as_str().map(str::to_owned),
+                            target_rva: number(value, "target_rva")? as u32,
+                            forwarder: value["forwarder"].as_str().map(str::to_owned),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()
+            })
+            .transpose()?
+            .unwrap_or_default(),
         unsupported: imports("unsupported")?,
         tls,
         code_ranges,
@@ -301,4 +332,53 @@ pub(crate) fn execute_request(path: &Path) -> Result<u32, String> {
         unsafe { libc::write(result_fd, bytes.as_ptr().cast(), bytes.len()) };
     }
     Ok(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_worker_image_keeps_the_executables_exports() {
+        let directory = std::env::temp_dir().join(format!(
+            "winrun-worker-image-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let image = PeImage {
+            is_dll: false,
+            image_base: 0x1_4000_0000,
+            entry_rva: 0x1000,
+            size_of_image: 0x2000,
+            image: vec![0; 0x2000],
+            imports: Vec::new(),
+            exports: vec![
+                Export {
+                    ordinal: 1,
+                    name: Some("napi_create_int32".to_string()),
+                    target_rva: 0x1234,
+                    forwarder: None,
+                },
+                Export {
+                    ordinal: 2,
+                    name: None,
+                    target_rva: 0x1800,
+                    forwarder: Some("OTHER.Function".to_string()),
+                },
+            ],
+            unsupported: Vec::new(),
+            tls: None,
+            code_ranges: Vec::new(),
+            relocations: Vec::new(),
+            page_protections: Default::default(),
+        };
+        write_image(&image, &directory).unwrap();
+        let read = read_image(&directory).unwrap();
+        assert_eq!(read.exports.len(), 2);
+        assert_eq!(read.exports[0].name.as_deref(), Some("napi_create_int32"));
+        assert_eq!(read.exports[0].target_rva, 0x1234);
+        assert_eq!(read.exports[1].ordinal, 2);
+        assert_eq!(read.exports[1].forwarder.as_deref(), Some("OTHER.Function"));
+        std::fs::remove_dir_all(directory).ok();
+    }
 }

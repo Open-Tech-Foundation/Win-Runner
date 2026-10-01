@@ -63,17 +63,30 @@ pub(super) struct NativeFind {
     pub(super) names: Vec<String>,
     pub(super) index: usize,
 }
+/// The size of an x64 TEB, which runs to `TlsExpansionSlots` (0x1780) and
+/// beyond; programs read its TLS fields directly through `gs`.
+pub(super) const TEB_SIZE: usize = 0x2000;
+/// `TEB.TlsSlots`: `TlsAlloc` indices 0-63.
+pub(super) const TEB_TLS_SLOTS: usize = 0x1480;
+/// `TEB.TlsExpansionSlots`: a pointer to the values of indices 64 and up.
+pub(super) const TEB_TLS_EXPANSION_SLOTS: usize = 0x1780;
+/// `TLS_MINIMUM_AVAILABLE` + `TLS_EXPANSION_SLOTS`: Windows' `TlsAlloc` indices.
+pub(super) const TLS_INDEXES: usize = 64 + 1024;
+
 pub(super) struct NativeTls {
-    pub(super) teb: Box<[u8; 0x1000]>,
+    pub(super) teb: Box<[u8; TEB_SIZE]>,
     pub(super) slots: Box<[u64; 64]>,
+    /// The thread's `TlsExpansionSlots` array.
+    pub(super) tls_expansion: Box<[u64; 1024]>,
     pub(super) static_tls_data: Vec<Option<Box<[u8]>>>,
     pub(super) _ldr: Box<[u8; 64]>,
 }
 impl NativeTls {
     pub(super) fn new(image_base: u64) -> Self {
         let mut out = Self {
-            teb: Box::new([0; 0x1000]),
+            teb: Box::new([0; TEB_SIZE]),
             slots: Box::new([0; 64]),
+            tls_expansion: Box::new([0; 1024]),
             static_tls_data: (0..64).map(|_| None).collect(),
             _ldr: Box::new([0; 64]),
         };
@@ -83,6 +96,11 @@ impl NativeTls {
         super::thread_runtime::put64(&mut out.teb[..], 0x60, teb + 0x800);
         super::thread_runtime::put64(&mut out.teb[..], 0x800 + 0x10, image_base);
         super::thread_runtime::put64(&mut out.teb[..], 0x800 + 0x20, out._ldr.as_ptr() as u64);
+        super::thread_runtime::put64(
+            &mut out.teb[..],
+            TEB_TLS_EXPANSION_SLOTS,
+            out.tls_expansion.as_ptr() as u64,
+        );
         out
     }
 
@@ -111,6 +129,7 @@ impl NativeTls {
         let mut out = Self {
             teb: self.teb.clone(),
             slots: Box::new([0; 64]),
+            tls_expansion: Box::new([0; 1024]),
             static_tls_data: self.static_tls_data.clone(),
             _ldr: self._ldr.clone(),
         };
@@ -122,6 +141,13 @@ impl NativeTls {
             out.slots[index] = data.as_ref().map(|data| data.as_ptr() as u64).unwrap_or(0);
         }
         put64(&mut out.teb[..], 0x800 + 0x20, out._ldr.as_ptr() as u64);
+        // A new thread starts with every TlsAlloc value empty.
+        out.teb[TEB_TLS_SLOTS..TEB_TLS_SLOTS + 64 * 8].fill(0);
+        put64(
+            &mut out.teb[..],
+            TEB_TLS_EXPANSION_SLOTS,
+            out.tls_expansion.as_ptr() as u64,
+        );
         out
     }
 }
@@ -489,10 +515,11 @@ pub(super) struct FlsSlots {
     pub(super) generation: Vec<u64>,
 }
 
+/// `TlsAlloc` indices, shared with module static TLS indices (below 64).
 pub(super) struct DynamicTlsSlots {
-    pub(super) active: [bool; 64],
-    pub(super) generation: [u64; 64],
-    pub(super) reserved: [bool; 64],
+    pub(super) active: Vec<bool>,
+    pub(super) generation: Vec<u64>,
+    pub(super) reserved: Vec<bool>,
     pub(super) reserved_static: bool,
 }
 

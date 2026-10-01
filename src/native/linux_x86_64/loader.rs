@@ -705,9 +705,9 @@ mod module_export_tests {
         let old_slots = {
             let slots = process.dynamic_tls.lock().unwrap();
             DynamicTlsSlots {
-                active: slots.active,
-                generation: slots.generation,
-                reserved: slots.reserved,
+                active: slots.active.clone(),
+                generation: slots.generation.clone(),
+                reserved: slots.reserved.clone(),
                 reserved_static: slots.reserved_static,
             }
         };
