@@ -1967,6 +1967,7 @@ fn create_exec_worker_child(
         return Err(87);
     }
     let monitor_child = Arc::clone(&child);
+    let monitor_program = launch.application.clone();
     let monitor_fs = Arc::clone(&parent.fs);
     let state_path_for_monitor = state_path.clone();
     std::thread::Builder::new()
@@ -1994,19 +1995,62 @@ fn create_exec_worker_child(
             drop(directory_guard);
             if let Ok(mut state) = monitor_child.state.lock() {
                 if state.is_none() {
-                    *state = Some(
-                        status
-                            .ok()
-                            .and_then(|status| status.code())
-                            .map(|code| code as u32)
-                            .unwrap_or(1),
-                    );
+                    *state = Some(match status {
+                        Ok(status) => worker_exit_code(status, &monitor_program),
+                        Err(_) => 1,
+                    });
                 }
                 monitor_child.exited.notify_all();
             }
         })
         .map_err(|_| 8u32)?;
     Ok(())
+}
+
+/// The Windows exit code of a guest process whose worker ended with
+/// `status`. A worker killed by a fault signal exits with the exception
+/// code Windows reports for a crashed process (an access violation is
+/// 0xC0000005), and the crash is noted on stderr, where Windows would show
+/// its error report.
+fn worker_exit_code(status: std::process::ExitStatus, program: &str) -> u32 {
+    use std::os::unix::process::ExitStatusExt;
+    if let Some(code) = status.code() {
+        return code as u32;
+    }
+    let Some(signal) = status.signal() else {
+        return 1;
+    };
+    let code = crash_exit_code(signal);
+    if code != 1 {
+        eprintln!(
+            "winrun: {program} crashed ({}); exit code {code:#010X}",
+            signal_name(signal)
+        );
+    }
+    code
+}
+
+/// The exception code of a crash by host `signal`; 1 for a process that
+/// was stopped (killed, terminated) rather than crashed.
+fn crash_exit_code(signal: i32) -> u32 {
+    match signal {
+        libc::SIGSEGV | libc::SIGBUS => 0xC000_0005, // STATUS_ACCESS_VIOLATION
+        libc::SIGILL => 0xC000_001D,                 // STATUS_ILLEGAL_INSTRUCTION
+        libc::SIGFPE => 0xC000_0094,                 // STATUS_INTEGER_DIVIDE_BY_ZERO
+        libc::SIGABRT => 3,                          // abort()
+        _ => 1,
+    }
+}
+
+fn signal_name(signal: i32) -> &'static str {
+    match signal {
+        libc::SIGSEGV => "SIGSEGV",
+        libc::SIGBUS => "SIGBUS",
+        libc::SIGILL => "SIGILL",
+        libc::SIGFPE => "SIGFPE",
+        libc::SIGABRT => "SIGABRT",
+        _ => "signal",
+    }
 }
 
 pub(super) extern "win64" fn native_exit_process(code: u32) -> ! {
@@ -2294,5 +2338,27 @@ pub(super) extern "win64" fn native_free_library_and_exit_thread(_module: u64, _
     // force-unwind across PE and Rust frames and abort the guest process.
     unsafe {
         core::arch::asm!("syscall", in("rax") 60u64, in("rdi") _code as u64, options(noreturn))
+    }
+}
+
+#[cfg(test)]
+mod exit_code_tests {
+    use super::{crash_exit_code, worker_exit_code};
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+
+    #[test]
+    fn a_crashed_worker_exits_with_the_windows_exception_code() {
+        // Raw wait statuses: an exit code is in bits 8-15, a signal in 0-6.
+        assert_eq!(worker_exit_code(ExitStatus::from_raw(7 << 8), "C:\\a.exe"), 7);
+        assert_eq!(
+            worker_exit_code(ExitStatus::from_raw(libc::SIGSEGV), "C:\\a.exe"),
+            0xC000_0005
+        );
+        assert_eq!(crash_exit_code(libc::SIGILL), 0xC000_001D);
+        assert_eq!(crash_exit_code(libc::SIGFPE), 0xC000_0094);
+        assert_eq!(crash_exit_code(libc::SIGABRT), 3);
+        // Killed or terminated, not crashed.
+        assert_eq!(worker_exit_code(ExitStatus::from_raw(libc::SIGKILL), "C:\\a.exe"), 1);
     }
 }

@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- A guest process that crashes (a fault signal in its worker) exits with
+  the Windows exception code, `0xC0000005` for an access violation, instead
+  of 1, and the crash is noted on stderr, so a crash in a nested process
+  (node under cmd under npm) is no longer silent.
 - Closing a listening socket completes its pending `AcceptEx` operations as
   aborted, as on Windows, so a Node.js server's process exits after
   `server.close()` instead of waiting forever, and the port is free as soon
