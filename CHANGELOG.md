@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Implement line-mode `ReadConsoleW` for a console stdin, so npm's
+  "Ok to proceed? (y)" prompt (`npm create vite@latest`) reads the answer
+  instead of stopping at an unsupported `KERNEL32.dll!ReadConsoleW` import.
+  Lines end in `\r\n` as on Windows, and a line longer than the caller's
+  buffer is returned over several calls.
 - Implement `QueueUserWorkItem`, which libuv uses for console line reads,
   so `npm create vite@latest` no longer stops at an unsupported
   `KERNEL32.dll!QueueUserWorkItem` import. Each work item runs on its own

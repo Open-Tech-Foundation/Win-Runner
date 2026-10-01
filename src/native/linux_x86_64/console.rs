@@ -280,6 +280,157 @@ pub(super) extern "win64" fn native_write_console_output_a(
     1
 }
 
+/// UTF-16 units of the last console line that did not fit the caller's buffer.
+static CONSOLE_PENDING_INPUT: Mutex<std::collections::VecDeque<u16>> =
+    Mutex::new(std::collections::VecDeque::new());
+
+/// Read one cooked console line through `read_more` and queue it as UTF-16,
+/// ending in `\r\n` like Windows line input. Returns false on end of input.
+fn queue_console_line(
+    pending: &mut std::collections::VecDeque<u16>,
+    mut read_more: impl FnMut(&mut [u8]) -> isize,
+) -> Result<bool, u32> {
+    let mut line = Vec::new();
+    let mut chunk = [0u8; 4096];
+    while line.last() != Some(&b'\n') {
+        match read_more(&mut chunk) {
+            count if count > 0 => line.extend_from_slice(&chunk[..count as usize]),
+            0 => break,
+            _ => return Err(6), // ERROR_INVALID_HANDLE
+        }
+    }
+    if line.is_empty() {
+        return Ok(false);
+    }
+    if line.last() == Some(&b'\n') && line.iter().rev().nth(1) != Some(&b'\r') {
+        line.pop();
+        line.extend_from_slice(b"\r\n");
+    }
+    pending.extend(String::from_utf8_lossy(&line).encode_utf16());
+    Ok(true)
+}
+
+fn read_console_units(
+    output: &mut [u16],
+    read_more: impl FnMut(&mut [u8]) -> isize,
+) -> Result<usize, u32> {
+    let Ok(mut pending) = CONSOLE_PENDING_INPUT.lock() else {
+        return Err(6);
+    };
+    if pending.is_empty() && !output.is_empty() && !queue_console_line(&mut pending, read_more)? {
+        return Ok(0);
+    }
+    let count = output.len().min(pending.len());
+    for (slot, unit) in output.iter_mut().zip(pending.drain(..count)) {
+        *slot = unit;
+    }
+    Ok(count)
+}
+
+/// `ReadConsoleW(handle, buffer, chars, read, control)` in line-input mode:
+/// the host terminal stays cooked, so one `read` returns an edited line.
+pub(super) extern "win64" fn native_read_console_w(
+    handle: u64,
+    buffer: *mut u16,
+    chars: u32,
+    read_count: *mut u32,
+    _control: u64,
+) -> i32 {
+    let Some(fd) = host_standard_fd(handle).filter(|fd| *fd == 0) else {
+        native_set_last_error(6);
+        return 0;
+    };
+    if buffer.is_null() && chars != 0 {
+        native_set_last_error(998); // ERROR_NOACCESS
+        return 0;
+    }
+    let output: &mut [u16] = if chars == 0 {
+        &mut []
+    } else {
+        unsafe { std::slice::from_raw_parts_mut(buffer, chars as usize) }
+    };
+    match read_console_units(output, |chunk| unsafe {
+        read(fd, chunk.as_mut_ptr().cast(), chunk.len())
+    }) {
+        Ok(count) => {
+            if !read_count.is_null() {
+                unsafe { read_count.write(count as u32) };
+            }
+            1
+        }
+        Err(error) => {
+            native_set_last_error(error);
+            0
+        }
+    }
+}
+
+#[cfg(test)]
+mod read_console_tests {
+    use super::queue_console_line;
+    use std::collections::VecDeque;
+
+    fn feed(chunks: &[&[u8]]) -> impl FnMut(&mut [u8]) -> isize {
+        let mut chunks: VecDeque<Vec<u8>> = chunks.iter().map(|c| c.to_vec()).collect();
+        move |out: &mut [u8]| match chunks.pop_front() {
+            Some(chunk) => {
+                out[..chunk.len()].copy_from_slice(&chunk);
+                chunk.len() as isize
+            }
+            None => 0,
+        }
+    }
+
+    fn units(text: &str) -> Vec<u16> {
+        text.encode_utf16().collect()
+    }
+
+    #[test]
+    fn a_cooked_line_ends_in_crlf_like_windows_line_input() {
+        let mut pending = VecDeque::new();
+        assert_eq!(queue_console_line(&mut pending, feed(&[b"y\n"])), Ok(true));
+        assert_eq!(Vec::from(pending), units("y\r\n"));
+    }
+
+    #[test]
+    fn a_line_split_across_reads_and_utf8_is_joined_and_decoded() {
+        let mut pending = VecDeque::new();
+        let text = "h\u{e9}llo \u{1f600}\r\n".as_bytes();
+        let (head, tail) = text.split_at(2); // splits the two-byte é
+        assert_eq!(queue_console_line(&mut pending, feed(&[head, tail])), Ok(true));
+        assert_eq!(Vec::from(pending), units("h\u{e9}llo \u{1f600}\r\n"));
+    }
+
+    #[test]
+    fn end_of_input_reads_zero_and_a_partial_last_line_is_kept() {
+        let mut pending = VecDeque::new();
+        assert_eq!(queue_console_line(&mut pending, feed(&[])), Ok(false));
+        assert_eq!(queue_console_line(&mut pending, feed(&[b"no"])), Ok(true));
+        assert_eq!(Vec::from(pending), units("no"));
+    }
+
+    #[test]
+    fn a_line_longer_than_the_buffer_is_returned_across_calls() {
+        let mut source = feed(&[b"yes\n"]);
+        let mut read = |len: usize| {
+            let mut output = vec![0u16; len];
+            let count = super::read_console_units(&mut output, &mut source).unwrap();
+            String::from_utf16(&output[..count]).unwrap()
+        };
+        assert_eq!(read(2), "ye");
+        assert_eq!(read(0), "");
+        assert_eq!(read(2), "s\r");
+        assert_eq!(read(8), "\n");
+        assert_eq!(read(8), ""); // the source is at end of input
+    }
+
+    #[test]
+    fn a_failed_read_reports_an_invalid_handle() {
+        let mut pending = VecDeque::new();
+        assert_eq!(queue_console_line(&mut pending, |_: &mut [u8]| -1), Err(6));
+    }
+}
+
 pub(super) extern "win64" fn native_get_number_of_console_input_events(
     handle: u64,
     count: *mut u32,

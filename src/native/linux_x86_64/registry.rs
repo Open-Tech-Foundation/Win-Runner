@@ -1012,6 +1012,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "FreeLibraryAndExitThread" => {
             Some(native_free_library_and_exit_thread as *const () as usize as u64)
         }
+        "ReadConsoleW" => Some(native_read_console_w as *const () as usize as u64),
         "GetNumberOfConsoleInputEvents" => {
             Some(native_get_number_of_console_input_events as *const () as usize as u64)
         }

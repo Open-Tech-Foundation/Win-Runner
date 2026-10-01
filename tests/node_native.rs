@@ -553,3 +553,50 @@ fn collect_files(root: &Path, output: &mut Vec<PathBuf>) {
         }
     }
 }
+
+/// npm's "Ok to proceed? (y)" prompt reads a line from a console stdin
+/// through libuv's `ReadConsoleW` line reader on a `QueueUserWorkItem`
+/// thread. `script` gives the guest a real pseudo-terminal.
+#[test]
+#[cfg(unix)]
+fn official_windows_node_reads_a_prompt_answer_from_a_terminal() {
+    let Ok(node) = std::env::var("WINRUN_NODE_EXE") else {
+        return;
+    };
+    if Command::new("script").arg("--version").output().is_err() {
+        return;
+    }
+    let node = Path::new(&node)
+        .canonicalize()
+        .expect("Windows node.exe exists");
+    let source = "const rl=require('readline').createInterface({input:process.stdin,output:process.stdout});\
+        rl.question('Ok to proceed? (y) ',a=>{console.log('ANSWER='+JSON.stringify(a)+' tty='+process.stdin.isTTY);rl.close()})";
+    let command = format!(
+        "'{}' '{}' -e \"{}\"",
+        env!("CARGO_BIN_EXE_winrun"),
+        node.display(),
+        source
+    );
+    let mut child = Command::new("script")
+        .args(["-qec", &command, "/dev/null"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start Windows node on a pseudo-terminal");
+    let mut stdin = child.stdin.take().unwrap();
+    let writer = thread::spawn(move || {
+        // Let node reach the prompt before the terminal sees the answer.
+        thread::sleep(Duration::from_secs(3));
+        let _ = stdin.write_all(b"y\n");
+        thread::sleep(Duration::from_secs(30));
+    });
+    let output = child.wait_with_output().expect("read node output");
+    drop(writer);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("ANSWER=\"y\" tty=true"),
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
