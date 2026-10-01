@@ -19,7 +19,7 @@
 //! ([`sweep_stale_temporaries`]). Deletion is tied to the owner's pid, so a
 //! forked child never removes its parent's files.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -36,15 +36,21 @@ static AT_EXIT: Once = Once::new();
 /// Session directories this process owns, removed at exit.
 static OWNED_SESSIONS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 const COPY_CHUNK: usize = 1024 * 1024;
+/// Open host files kept per process. A session can hold any number of
+/// blobs (an npm install writes thousands); descriptors stay bounded.
+const OPEN_FILE_LIMIT: usize = 64;
 
 pub(crate) struct BlobStore {
     dir: PathBuf,
     /// Set when this process created the session and may delete from it.
     owner: bool,
     owner_pid: u32,
-    /// Blobs open in this process, so each id has one `Blob` (and one file
-    /// descriptor) however many guest paths or lookups refer to it.
+    /// Blobs in use in this process, so each id has one `Blob` however many
+    /// guest paths or lookups refer to it.
     open: Mutex<HashMap<String, Weak<Blob>>>,
+    /// Recently used host files, most recent first, at most
+    /// [`OPEN_FILE_LIMIT`]. A blob holds no descriptor of its own.
+    files: Mutex<VecDeque<(String, Arc<File>)>>,
 }
 
 impl std::fmt::Debug for BlobStore {
@@ -58,7 +64,6 @@ impl std::fmt::Debug for BlobStore {
 
 pub(crate) struct Blob {
     id: String,
-    file: File,
     store: Arc<BlobStore>,
 }
 
@@ -89,6 +94,7 @@ impl BlobStore {
             owner: true,
             owner_pid: std::process::id(),
             open: Mutex::new(HashMap::new()),
+            files: Mutex::new(VecDeque::new()),
         }))
     }
 
@@ -102,6 +108,7 @@ impl BlobStore {
             owner: false,
             owner_pid: 0,
             open: Mutex::new(HashMap::new()),
+            files: Mutex::new(VecDeque::new()),
         }))
     }
 
@@ -122,7 +129,8 @@ impl BlobStore {
             .create_new(true)
             .open(self.dir.join(&id))
             .map_err(|e| format!("cannot create WinFS blob {id}: {e}"))?;
-        Ok(self.register(id, file))
+        self.cache_file(&id, Arc::new(file));
+        Ok(self.register(id))
     }
 
     /// The blob `id`, which this or another process of the session created.
@@ -133,15 +141,13 @@ impl BlobStore {
         if let Some(blob) = self.lock_open().get(id).and_then(Weak::upgrade) {
             return Ok(blob);
         }
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(self.dir.join(id))
-            .map_err(|e| format!("cannot open WinFS blob {id}: {e}"))?;
-        Ok(self.register(id.to_string(), file))
+        if !self.dir.join(id).is_file() {
+            return Err(format!("cannot open WinFS blob {id}: not found"));
+        }
+        Ok(self.register(id.to_string()))
     }
 
-    fn register(self: &Arc<Self>, id: String, file: File) -> Arc<Blob> {
+    fn register(self: &Arc<Self>, id: String) -> Arc<Blob> {
         let mut open = self.lock_open();
         // Another thread may have opened the same id meanwhile.
         if let Some(blob) = open.get(&id).and_then(Weak::upgrade) {
@@ -149,7 +155,6 @@ impl BlobStore {
         }
         let blob = Arc::new(Blob {
             id: id.clone(),
-            file,
             store: Arc::clone(self),
         });
         open.insert(id, Arc::downgrade(&blob));
@@ -158,6 +163,38 @@ impl BlobStore {
 
     fn lock_open(&self) -> std::sync::MutexGuard<'_, HashMap<String, Weak<Blob>>> {
         lock(&self.open)
+    }
+
+    /// The open host file of blob `id`, reopened if it was evicted.
+    fn file(&self, id: &str) -> Result<Arc<File>, String> {
+        let mut files = lock(&self.files);
+        if let Some(index) = files.iter().position(|(cached, _)| cached == id) {
+            let entry = files.remove(index).expect("index is in range");
+            let file = Arc::clone(&entry.1);
+            files.push_front(entry);
+            return Ok(file);
+        }
+        drop(files);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(self.dir.join(id))
+            .map_err(|e| format!("cannot open WinFS blob {id}: {e}"))?;
+        let file = Arc::new(file);
+        self.cache_file(id, Arc::clone(&file));
+        Ok(file)
+    }
+
+    fn cache_file(&self, id: &str, file: Arc<File>) {
+        let mut files = lock(&self.files);
+        files.retain(|(cached, _)| cached != id);
+        files.push_front((id.to_string(), file));
+        // An evicted descriptor closes once no operation still uses it.
+        files.truncate(OPEN_FILE_LIMIT);
+    }
+
+    fn forget_file(&self, id: &str) {
+        lock(&self.files).retain(|(cached, _)| cached != id);
     }
 
     /// Whether this process may delete from the session.
@@ -232,8 +269,12 @@ impl Blob {
         &self.id
     }
 
+    fn file(&self) -> Result<Arc<File>, String> {
+        self.store.file(&self.id)
+    }
+
     pub(crate) fn len(&self) -> Result<u64, String> {
-        self.file
+        self.file()?
             .metadata()
             .map(|metadata| metadata.len())
             .map_err(|e| format!("cannot stat WinFS blob {}: {e}", self.id))
@@ -248,7 +289,7 @@ impl Blob {
         let count = usize::try_from((size - offset).min(length as u64))
             .map_err(|_| "WinFS read is too large".to_string())?;
         let mut bytes = vec![0; count];
-        self.file
+        self.file()?
             .read_exact_at(&mut bytes, offset)
             .map_err(|e| format!("cannot read WinFS blob {}: {e}", self.id))?;
         Ok(bytes)
@@ -262,13 +303,13 @@ impl Blob {
 
     /// Write `bytes` at `offset`; a gap past the end reads as zeros.
     pub(crate) fn write_at(&self, offset: u64, bytes: &[u8]) -> Result<(), String> {
-        self.file
+        self.file()?
             .write_all_at(bytes, offset)
             .map_err(|e| format!("cannot write WinFS blob {}: {e}", self.id))
     }
 
     pub(crate) fn set_len(&self, length: u64) -> Result<(), String> {
-        self.file
+        self.file()?
             .set_len(length)
             .map_err(|e| format!("cannot resize WinFS blob {}: {e}", self.id))
     }
@@ -302,7 +343,10 @@ impl Blob {
     /// Changes whenever the contents may have, including writes by other
     /// processes of the session.
     pub(crate) fn version(&self) -> u64 {
-        self.file.metadata().map_or(0, |metadata| {
+        let Ok(file) = self.file() else {
+            return 0;
+        };
+        file.metadata().map_or(0, |metadata| {
             let modified = (metadata.mtime() as u64)
                 .wrapping_mul(1_000_000_000)
                 .wrapping_add(metadata.mtime_nsec() as u64);
@@ -318,6 +362,7 @@ impl Drop for Blob {
             open.remove(&self.id);
         }
         drop(open);
+        self.store.forget_file(&self.id);
         if self.store.deletes() {
             let _ = std::fs::remove_file(self.store.dir.join(&self.id));
         }
@@ -412,6 +457,31 @@ mod tests {
         assert_eq!(blob.read_at(5, 4).unwrap(), Vec::<u8>::new());
         blob.write_at(4, b"z").unwrap();
         assert_eq!(blob.read_all().unwrap(), [7, 7, 0, 0, b'z']);
+    }
+
+    fn open_descriptors() -> usize {
+        std::fs::read_dir("/proc/self/fd").unwrap().count()
+    }
+
+    #[test]
+    fn thousands_of_blobs_keep_open_descriptors_bounded() {
+        // Installing Node.js writes thousands of files; a descriptor per
+        // file ran past the usual limit of 1024 (EMFILE).
+        let store = BlobStore::create_session().unwrap();
+        let before = open_descriptors();
+        let blobs: Vec<_> = (0..3000)
+            .map(|index| {
+                let blob = store.create().unwrap();
+                blob.replace(format!("file {index}").as_bytes()).unwrap();
+                blob
+            })
+            .collect();
+        // Other tests run in parallel and open files too.
+        assert!(open_descriptors() < before + OPEN_FILE_LIMIT + 200);
+        assert_eq!(blobs[0].read_all().unwrap(), b"file 0");
+        blobs[1].write_at(5, b"X").unwrap();
+        assert_eq!(blobs[1].read_all().unwrap(), b"file X");
+        assert_eq!(blobs[2999].read_all().unwrap(), b"file 2999");
     }
 
     #[test]

@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Keep WinFS's open host files bounded (at most 64 per process, least
+  recently used closed first) instead of one per written file, so writing
+  thousands of files no longer fails with `Too many open files`
+  (`wpkg install nodejs` under the usual limit of 1024).
 - Add `GetModuleHandleExA`, which `vite build` calls while loading its
   native bundler, instead of stopping at an unsupported import.
 - Rebuild WinFS's writable storage so a session's disk use stays proportional
