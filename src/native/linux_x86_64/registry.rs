@@ -1305,6 +1305,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "GetModuleFileNameW" => Some(native_get_module_file_name_w as *const () as usize as u64),
         "GetModuleHandleW" => Some(native_get_module_handle_w as *const () as usize as u64),
         "GetModuleHandleExW" => Some(native_get_module_handle_ex_w as *const () as usize as u64),
+        "GetModuleHandleExA" => Some(native_get_module_handle_ex_a as *const () as usize as u64),
         "GetEnvironmentStringsW" => {
             Some(native_get_environment_strings_w as *const () as usize as u64)
         }

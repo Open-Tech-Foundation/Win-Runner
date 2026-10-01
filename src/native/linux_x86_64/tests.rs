@@ -7273,6 +7273,29 @@ mod protection_tests {
     }
 
     #[test]
+    fn module_handle_ex_a_widens_names_and_passes_addresses_through() {
+        let mut main = 0;
+        assert_eq!(super::native_get_module_handle_ex_a(0, std::ptr::null(), &mut main), 1);
+        assert_eq!(main, 0x0001_4000_0000);
+        let mut kernel32 = 0;
+        assert_eq!(
+            super::native_get_module_handle_ex_a(0, c"kernel32.dll".as_ptr().cast(), &mut kernel32),
+            1
+        );
+        assert_eq!(kernel32, API_SET_MODULE);
+        let mut from_address = 0;
+        assert_eq!(
+            super::native_get_module_handle_ex_a(
+                4, // GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                0x0001_4000_0010usize as *const u8,
+                &mut from_address,
+            ),
+            super::native_get_module_handle_ex_w(4, 0x0001_4000_0010usize as *const u16, &mut main)
+        );
+        assert_eq!(from_address, main);
+    }
+
+    #[test]
     fn resolves_supported_dynamic_api_set_exports() {
         assert_ne!(
             native_get_proc_address(API_SET_MODULE, c"CompareStringEx".as_ptr().cast()),

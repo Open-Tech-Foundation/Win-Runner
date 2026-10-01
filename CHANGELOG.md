@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Add `GetModuleHandleExA`, which `vite build` calls while loading its
+  native bundler, instead of stopping at an unsupported import.
 - Rebuild WinFS's writable storage so a session's disk use stays proportional
   to its live files. Each written file now lives in its own host file (a
   blob) in a session directory, written in place with `pwrite`, truncated with

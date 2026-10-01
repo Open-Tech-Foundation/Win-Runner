@@ -1000,6 +1000,25 @@ pub(super) extern "win64" fn native_load_library_ex_a(
     })
 }
 
+/// `GetModuleHandleExA`: the W form with the name widened. With
+/// `GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS`, `name` is an address, not text.
+pub(super) extern "win64" fn native_get_module_handle_ex_a(
+    flags: u32,
+    name: *const u8,
+    output: *mut u64,
+) -> i32 {
+    const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x0000_0004;
+    if name.is_null() || flags & GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS != 0 {
+        return native_get_module_handle_ex_w(flags, name.cast(), output);
+    }
+    let Some(text) = (unsafe { ascii_z(name) }) else {
+        native_set_last_error(126); // ERROR_MOD_NOT_FOUND
+        return 0;
+    };
+    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    native_get_module_handle_ex_w(flags, wide.as_ptr(), output)
+}
+
 pub(super) extern "win64" fn native_get_module_handle_a(name: *const u8) -> u64 {
     match unsafe { ascii_z(name) } {
         Some(value) => module_handle_by_name(value).unwrap_or(0),
