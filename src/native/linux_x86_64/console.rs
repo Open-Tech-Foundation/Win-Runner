@@ -536,6 +536,9 @@ fn scan_code(virtual_key: u16) -> u16 {
         0x26 => 0x48,
         0x27 => 0x4d,
         0x28 => 0x50,
+        0x70..=0x79 => virtual_key - 0x70 + 0x3b, // F1-F10
+        0x7a => 0x57,                            // F11
+        0x7b => 0x58,                            // F12
         _ => 0,
     }
 }
@@ -959,7 +962,9 @@ mod read_console_tests {
         assert_eq!(native_map_virtual_key_w(0x41, 0), 0x1e); // 'A'
         assert_eq!(native_map_virtual_key_w(0x1c, 1), 0x0d);
         assert_eq!(native_map_virtual_key_w(0x30, 2), b'0' as u32);
-        assert_eq!(native_map_virtual_key_w(0x70, 0), 0); // unmapped F1
+        assert_eq!(native_map_virtual_key_w(0x70, 0), 0x3b); // F1
+        assert_eq!(native_map_virtual_key_w(0x58, 1), 0x7b); // F12
+        assert_eq!(native_map_virtual_key_w(0x2a3, 0), 0); // not a virtual key
         assert_eq!(native_map_virtual_key_w(0, 1), 0);
         assert_eq!(native_map_virtual_key_w(0x0d, 9), 0);
     }

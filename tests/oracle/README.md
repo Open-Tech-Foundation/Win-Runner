@@ -26,6 +26,9 @@ with `guests/build-oracle.sh` (rustc and rust-lld only). A probe:
 | Probe | Covers |
 | --- | --- |
 | `fs_paths` | path normalization, `CreateFileW` outcomes, final paths, directory listings, file-operation error codes |
+| `path_names` | path spellings from `GetLongPathNameW`, `GetFullPathNameW`, and final paths |
+| `links` | `CreateSymbolicLinkW`, what a handle names with and without `FILE_FLAG_OPEN_REPARSE_POINT`, `FSCTL_GET_REPARSE_POINT` data |
+| `pool_console` | `QueueUserWorkItem`, `MapVirtualKeyW`, console input functions on a non-console handle |
 
 Add a probe for an area of the API, not for a program: when an application
 misbehaves, find the Win32 behavior behind it and add cases that pin that

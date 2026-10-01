@@ -707,6 +707,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Windows-oracle probes `links` (symbolic-link creation, final paths through
+  links, reparse data) and `pool_console` (`QueueUserWorkItem`,
+  `MapVirtualKeyW`, console input functions on a non-console handle), so the
+  `windows-oracle` workflow checks this behavior against real Windows.
+  `MapVirtualKeyW` also maps F1-F12.
 - Record the Windows `path_names` transcript
   (`tests/oracle/golden/path_names.txt`), which the `windows-oracle` workflow
   showed Win-Runner matching line for line.
