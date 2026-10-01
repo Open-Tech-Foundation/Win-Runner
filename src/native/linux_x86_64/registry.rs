@@ -462,7 +462,10 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                 | "getaddrinfo"
                 | "freeaddrinfo"
         ),
-        "USER32.DLL" => matches!(func, "GetSystemMetrics" | "MessageBeep" | "LoadStringW"),
+        "USER32.DLL" => matches!(
+            func,
+            "GetSystemMetrics" | "MessageBeep" | "LoadStringW" | "MapVirtualKeyW"
+        ),
         "IPHLPAPI.DLL" => func == "GetAdaptersAddresses",
         "NTDLL.DLL" => matches!(
             func,
@@ -985,6 +988,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "#112" | "WSASetLastError" => Some(native_wsa_set_last_error as *const () as usize as u64),
         "GetSystemMetrics" => Some(native_get_system_metrics as *const () as usize as u64),
         "MessageBeep" => Some(native_message_beep as *const () as usize as u64),
+        "MapVirtualKeyW" => Some(native_map_virtual_key_w as *const () as usize as u64),
         "CompareStringOrdinal" => Some(native_compare_string_ordinal as *const () as usize as u64),
         "GetLocaleInfoEx" => Some(native_get_locale_info_ex as *const () as usize as u64),
         "GetLocaleInfoW" => Some(native_get_locale_info_w as *const () as usize as u64),
@@ -1013,6 +1017,12 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
             Some(native_free_library_and_exit_thread as *const () as usize as u64)
         }
         "ReadConsoleW" => Some(native_read_console_w as *const () as usize as u64),
+        "WriteConsoleInputW" => {
+            Some(native_write_console_input_w as *const () as usize as u64)
+        }
+        "ReadConsoleInputW" => {
+            Some(native_read_console_input_w as *const () as usize as u64)
+        }
         "GetNumberOfConsoleInputEvents" => {
             Some(native_get_number_of_console_input_events as *const () as usize as u64)
         }

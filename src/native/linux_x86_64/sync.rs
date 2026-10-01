@@ -848,7 +848,11 @@ pub(super) extern "win64" fn native_register_wait_for_single_object(
     let Some(process) = process_ctx() else {
         return 0;
     };
-    let Some(child) = child_process(&process, object) else {
+    let target = if host_standard_fd(object) == Some(0) {
+        NativeWaitTarget::ConsoleInput
+    } else if let Some(child) = child_process(&process, object) {
+        NativeWaitTarget::Child(child)
+    } else {
         native_set_last_error(6);
         return 0;
     };
@@ -856,7 +860,7 @@ pub(super) extern "win64" fn native_register_wait_for_single_object(
     let registration = Arc::new(NativeWaitRegistration {
         callback,
         context,
-        child,
+        target,
         cancelled: Arc::new(AtomicBool::new(false)),
         execute_once: flags & 0x8 != 0,
     });
@@ -869,17 +873,18 @@ pub(super) extern "win64" fn native_register_wait_for_single_object(
     }
     let worker_process = Arc::clone(&process);
     if std::thread::Builder::new()
-        .name("winrun-process-wait".into())
+        .name("winrun-object-wait".into())
         .spawn(move || {
             loop {
                 if registration.cancelled.load(Ordering::Acquire) {
                     break;
                 }
-                let signaled = registration
-                    .child
-                    .state
-                    .lock()
-                    .is_ok_and(|state| state.is_some());
+                let signaled = match &registration.target {
+                    NativeWaitTarget::Child(child) => {
+                        child.state.lock().is_ok_and(|state| state.is_some())
+                    }
+                    NativeWaitTarget::ConsoleInput => console_input_ready(0),
+                };
                 if signaled {
                     let invocation = Box::new(NativeWaitCallbackInvocation {
                         callback: registration.callback,

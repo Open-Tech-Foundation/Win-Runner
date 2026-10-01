@@ -168,6 +168,9 @@ fn run_exec_worker(
             fs,
         ));
     }
+    // The guest may put the shared terminal into raw mode for a prompt;
+    // put it back however the worker ends.
+    let terminal = TerminalSettings::save();
     let worker_start = std::time::Instant::now();
     let mut child = match Command::new(executable)
         .arg("__native-worker")
@@ -225,7 +228,9 @@ fn run_exec_worker(
     for reader in readers {
         let _ = reader.join();
     }
-    let status = match child.wait() {
+    let status = child.wait();
+    drop(terminal);
+    let status = match status {
         Ok(status) => status,
         Err(error) => {
             return Err(failed(
@@ -925,6 +930,27 @@ fn run_rust_baseline_argv_with_fs_impl(
                 recovery_fs.take().unwrap_or_else(WinFs::new)
             };
             Err(super::super::NativeExecutionFailure { message, fs })
+        }
+    }
+}
+
+/// Host stdin terminal settings, restored on drop.
+struct TerminalSettings(Option<libc::termios>);
+
+impl TerminalSettings {
+    fn save() -> Self {
+        if unsafe { libc::isatty(0) } != 1 {
+            return Self(None);
+        }
+        let mut settings: libc::termios = unsafe { std::mem::zeroed() };
+        Self((unsafe { libc::tcgetattr(0, &mut settings) } == 0).then_some(settings))
+    }
+}
+
+impl Drop for TerminalSettings {
+    fn drop(&mut self) {
+        if let Some(settings) = &self.0 {
+            unsafe { libc::tcsetattr(0, libc::TCSANOW, settings) };
         }
     }
 }

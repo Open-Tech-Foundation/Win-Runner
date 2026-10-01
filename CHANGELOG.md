@@ -6,6 +6,16 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Support raw-mode console input, so `npm create vite@latest`'s prompts
+  (project name, framework and variant menus, yes/no) work with typing, arrow
+  keys, and Enter instead of failing with `Error: read UNKNOWN`.
+  `SetConsoleMode` on stdin now switches the host terminal between canonical
+  and raw mode (line, echo, and Ctrl+C processing follow the Windows flags),
+  and `GetConsoleMode` reports it. `RegisterWaitForSingleObject` accepts the
+  console input handle, `ReadConsoleInputW` returns typed keys as key events,
+  `WriteConsoleInputW` injects keys (and ends a pending line read, which is
+  how libuv leaves line mode), and `MapVirtualKeyW` maps US-layout keys. The
+  terminal is restored when the guest exits, even if it exits in raw mode.
 - Implement line-mode `ReadConsoleW` for a console stdin, so npm's
   "Ok to proceed? (y)" prompt (`npm create vite@latest`) reads the answer
   instead of stopping at an unsupported `KERNEL32.dll!ReadConsoleW` import.

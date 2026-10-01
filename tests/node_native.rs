@@ -600,3 +600,60 @@ fn official_windows_node_reads_a_prompt_answer_from_a_terminal() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// create-vite's prompts switch stdin between line and raw mode. Raw mode
+/// reads keys through `RegisterWaitForSingleObject` on the console handle
+/// and `ReadConsoleInputW`; leaving raw mode starts a line read that the
+/// next switch cancels with an injected Enter (`WriteConsoleInputW`).
+#[test]
+#[cfg(unix)]
+fn official_windows_node_reads_raw_keys_across_terminal_mode_switches() {
+    let Ok(node) = std::env::var("WINRUN_NODE_EXE") else {
+        return;
+    };
+    if Command::new("script").arg("--version").output().is_err() {
+        return;
+    }
+    let node = Path::new(&node)
+        .canonicalize()
+        .expect("Windows node.exe exists");
+    // Read a line, then start a line read and switch to raw mode while it
+    // waits. The Enter that cancels it must not reach the raw keys.
+    let source = "const rl=require('readline');\
+        const i=rl.createInterface({input:process.stdin,output:process.stdout});\
+        i.question('name? ',n=>{i.close();let got='';\
+        process.stdin.setRawMode(false);process.stdin.resume();\
+        setTimeout(()=>process.stdin.setRawMode(true),500);\
+        process.stdin.on('data',d=>{got+=d.toString();\
+        if(got.includes('\\r')){process.stdin.setRawMode(false);\
+        console.log('LINE='+JSON.stringify(n)+' RAW='+JSON.stringify(got));process.exit(0)}})})";
+    let command = format!(
+        "'{}' '{}' -e \"{}\"",
+        env!("CARGO_BIN_EXE_winrun"),
+        node.display(),
+        source
+    );
+    let mut child = Command::new("script")
+        .args(["-qec", &command, "/dev/null"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start Windows node on a pseudo-terminal");
+    let mut stdin = child.stdin.take().unwrap();
+    let writer = thread::spawn(move || {
+        thread::sleep(Duration::from_secs(3));
+        let _ = stdin.write_all(b"app\n");
+        thread::sleep(Duration::from_secs(2));
+        let _ = stdin.write_all(b"y\x1b[B\r");
+        thread::sleep(Duration::from_secs(30));
+    });
+    let output = child.wait_with_output().expect("read node output");
+    drop(writer);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(r#"LINE="app" RAW="y\u001b[B\r""#),
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

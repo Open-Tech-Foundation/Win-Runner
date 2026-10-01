@@ -2019,6 +2019,7 @@ pub(super) extern "win64" fn native_exit_process(code: u32) -> ! {
     if native_diagnostic_enabled() {
         eprintln!("native ExitProcess code={code:#x}");
     }
+    restore_console_input_mode();
     // Closing stdout lets the parent drain console output before the
     // snapshot pipe can block on a large guest disk image.
     unsafe { close(1) };

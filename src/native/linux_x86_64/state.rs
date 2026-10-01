@@ -273,10 +273,17 @@ pub(super) struct NativeJobObject {
     pub(super) members: std::collections::HashSet<u64>,
 }
 
+/// What a `RegisterWaitForSingleObject` registration waits on.
+pub(super) enum NativeWaitTarget {
+    Child(Arc<NativeChildProcess>),
+    /// The console input handle, signaled while input is available.
+    ConsoleInput,
+}
+
 pub(super) struct NativeWaitRegistration {
     pub(super) callback: u64,
     pub(super) context: u64,
-    pub(super) child: Arc<NativeChildProcess>,
+    pub(super) target: NativeWaitTarget,
     pub(super) cancelled: Arc<AtomicBool>,
     pub(super) execute_once: bool,
 }
