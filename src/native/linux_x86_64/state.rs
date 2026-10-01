@@ -500,7 +500,10 @@ pub(super) struct DynamicTlsSlots {
 // registry; they are already consumed by the process-handle APIs.
 #[allow(dead_code)]
 pub(super) struct NativeChildProcess {
-    pub(super) process_id: u32,
+    /// The guest process id: the worker's host pid once it is spawned, so
+    /// ids are unique across the whole process tree (see
+    /// [`NativeProcessTable::allocate`]).
+    pub(super) process_id: AtomicU32,
     pub(super) parent_process_id: u32,
     pub(super) host_pid: AtomicI32,
     pub(super) termination_code: Mutex<Option<u32>>,
@@ -508,10 +511,24 @@ pub(super) struct NativeChildProcess {
     pub(super) exited: Condvar,
 }
 
+/// The id of a guest process that runs inside this one (the PowerShell
+/// child). Worker processes use their host pid as their guest id; these ids
+/// lie above every Linux pid (at most 2^22) and are derived from this
+/// process's own pid, so no two processes of the tree share an id.
+pub(super) fn in_process_child_id(sequence: u32) -> u32 {
+    0x4000_0000 + (std::process::id() % (1 << 22)) * 64 + sequence % 64
+}
+
+impl NativeChildProcess {
+    pub(super) fn process_id(&self) -> u32 {
+        self.process_id.load(Ordering::Acquire)
+    }
+}
+
 pub(super) struct NativeProcessTable {
     pub(super) next_handle: u64,
     pub(super) next_thread_handle: u64,
-    pub(super) next_process_id: u32,
+    pub(super) next_in_process_child: u32,
     pub(super) children: HashMap<u64, Arc<NativeChildProcess>>,
     pub(super) primary_threads: HashMap<u64, Arc<NativeChildProcess>>,
 }
@@ -524,7 +541,7 @@ impl NativeProcessTable {
             // (0x6100_0000) ranges: waits look handles up by value.
             next_handle: 0x6800_0000,
             next_thread_handle: 0x6900_0000,
-            next_process_id: 2,
+            next_in_process_child: 0,
             children: HashMap::new(),
             primary_threads: HashMap::new(),
         }
@@ -539,14 +556,14 @@ impl NativeProcessTable {
         let thread_handle = self.next_thread_handle;
         self.next_thread_handle += 1;
         let child = Arc::new(NativeChildProcess {
-            process_id: self.next_process_id,
+            process_id: AtomicU32::new(in_process_child_id(self.next_in_process_child)),
             parent_process_id,
             host_pid: AtomicI32::new(0),
             termination_code: Mutex::new(None),
             state: Mutex::new(None),
             exited: Condvar::new(),
         });
-        self.next_process_id += 1;
+        self.next_in_process_child = self.next_in_process_child.wrapping_add(1);
         self.children.insert(handle, Arc::clone(&child));
         self.primary_threads
             .insert(thread_handle, Arc::clone(&child));

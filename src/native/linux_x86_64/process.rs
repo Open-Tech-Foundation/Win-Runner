@@ -305,7 +305,7 @@ pub(super) fn native_create_powershell_shell_child(
         })
     };
     let args = launch.arguments.into_iter().skip(1).collect::<Vec<_>>();
-    let child_process_id = child.process_id;
+    let child_process_id = child.process_id();
     if !write_process_information(
         process_information,
         process_handle,
@@ -661,10 +661,7 @@ pub(super) extern "win64" fn native_get_current_thread_id() -> u32 {
 }
 pub(super) extern "win64" fn native_get_current_process_id() -> u32 {
     process_ctx()
-        .map(|process| {
-            debug_assert!(process.parent_process_id <= process.process_id);
-            process.process_id
-        })
+        .map(|process| process.process_id)
         .unwrap_or(0)
 }
 pub(super) extern "win64" fn native_get_current_process() -> u64 {
@@ -1906,7 +1903,7 @@ fn create_exec_worker_child(
         "args": launch.arguments.get(1..).unwrap_or(&[]),
         "command_line": launch.command_line,
         "environment": environment,
-        "process_id": child.process_id,
+        // The worker's guest process id is its own host pid.
         "parent_process_id": parent.process_id,
         "std_handles": worker_std_handles,
         "native_fs": encode_worker_native_fs(&child_fs, &completion_port_ids).map_err(|_| 8u32)?,
@@ -1958,11 +1955,12 @@ fn create_exec_worker_child(
     // the inherited standard pipe endpoints after a successful spawn.
     drop(stdio);
     child.host_pid.store(worker.id() as i32, Ordering::Release);
+    child.process_id.store(worker.id(), Ordering::Release);
     if !write_process_information(
         process_information,
         process_handle,
         thread_handle,
-        child.process_id,
+        child.process_id(),
     ) {
         let _ = worker.kill();
         let _ = worker.wait();

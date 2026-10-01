@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Give every guest process an id unique across its whole process tree: a
+  worker's id is its host pid, and a child that runs inside its parent (the
+  PowerShell child) gets an id above every host pid. Each process used to
+  number its children from 2, so nested processes (npm → cmd → node → npm)
+  shared ids, which npm uses for temp-file names, and debug builds panicked
+  (`parent_process_id <= process_id`) when create-vite started its dev
+  server.
 - Keep WinFS's open host files bounded (at most 64 per process, least
   recently used closed first) instead of one per written file, so writing
   thousands of files no longer fails with `Too many open files`

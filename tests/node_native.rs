@@ -657,3 +657,74 @@ fn official_windows_node_reads_raw_keys_across_terminal_mode_switches() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// Guest process ids must be unique across a process tree: npm and its
+/// cache name temp files after `process.pid`. Each process used to number
+/// its children from 2, so nested processes shared ids (and debug builds
+/// panicked on a child id below its parent's).
+#[test]
+fn official_windows_node_processes_nested_three_deep_have_distinct_ids() {
+    let Ok(node) = std::env::var("WINRUN_NODE_EXE") else {
+        return;
+    };
+    let node = Path::new(&node)
+        .canonicalize()
+        .expect("Windows node.exe exists");
+    // Each level prints its pid, then runs the next level and prints its
+    // output. Two siblings at the deepest level run one after the other.
+    let scripts = std::env::temp_dir().join(format!("winrun-nested-ids-{}", std::process::id()));
+    std::fs::create_dir_all(&scripts).unwrap();
+    // Inherited stdio, as npm runs its children.
+    let run = "const run=f=>require('node:child_process')\
+        .spawnSync('C:\\\\bin\\\\node.exe',['C:\\\\bin\\\\'+f],{stdio:'inherit'});";
+    std::fs::write(scripts.join("leaf.js"), "console.log(process.pid)").unwrap();
+    std::fs::write(
+        scripts.join("middle.js"),
+        format!("{run}console.log(process.pid);run('leaf.js');run('leaf.js')"),
+    )
+    .unwrap();
+    std::fs::write(
+        scripts.join("top.js"),
+        format!("{run}console.log(process.pid);run('middle.js')"),
+    )
+    .unwrap();
+    let mut script = format!("@seed {} C:\\bin\\node.exe\n", node.display());
+    for name in ["top.js", "middle.js", "leaf.js"] {
+        script.push_str(&format!(
+            "@seed {} C:\\bin\\{name}\n",
+            scripts.join(name).display()
+        ));
+    }
+    script.push_str("C:\\bin\\node.exe C:\\bin\\top.js\nexit\n");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_winrun"))
+        .arg("shell")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start native Win-Runner shell");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .expect("send the nested process probe");
+    let output = child.wait_with_output().expect("read nested output");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let pids: Vec<u32> = stdout
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .collect();
+    assert_eq!(
+        pids.len(),
+        4,
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut unique = pids.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), 4, "process ids repeat: {pids:?}");
+    assert!(!stdout.contains("panicked"), "{stdout}");
+    std::fs::remove_dir_all(scripts).ok();
+}

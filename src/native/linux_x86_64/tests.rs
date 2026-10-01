@@ -6323,7 +6323,10 @@ mod protection_tests {
             .allocate(process.process_id);
         assert_eq!(child.parent_process_id, 1);
         assert_ne!(handle, thread_handle);
-        assert!(child.process_id >= 2);
+        // In-process children take ids no host pid (worker id) can have.
+        assert!(child.process_id() >= 0x4000_0000);
+        let (_, _, sibling) = process.children.lock().unwrap().allocate(process.process_id);
+        assert_ne!(sibling.process_id(), child.process_id());
         let mut exit_code = 0;
         assert_eq!(native_get_exit_code_process(handle, &mut exit_code), 1);
         assert_eq!(exit_code, 259); // STILL_ACTIVE

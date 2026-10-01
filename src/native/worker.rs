@@ -227,10 +227,12 @@ pub(crate) fn execute_request(path: &Path) -> Result<u32, String> {
             .ok_or_else(|| "native worker request is missing environment".to_string())?,
     )
     .map_err(|error| format!("invalid native worker environment: {error}"))?;
+    // A guest process's id is its worker's host pid: unique among the live
+    // processes of the whole tree, however deeply they nest.
     let process_id = request
         .get("process_id")
         .and_then(serde_json::Value::as_u64)
-        .unwrap_or(1);
+        .unwrap_or(u64::from(std::process::id()));
     let parent_process_id = request
         .get("parent_process_id")
         .and_then(serde_json::Value::as_u64)
