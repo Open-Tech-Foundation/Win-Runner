@@ -868,30 +868,14 @@ fn native_file_io_worker(queue: Arc<NativeFileIoQueue>) {
                     Err(_) => Err(STATUS_UNSUCCESSFUL),
                 },
                 NativeFileIoOperation::Write { data } => match job.process.fs.lock() {
-                    Ok(mut fs) => match fs.fs.read_file(&job.file.path) {
-                        Ok(mut content) => match job.offset.checked_add(data.len()) {
-                            Some(end)
-                                if content
-                                    .try_reserve(end.saturating_sub(content.len()))
-                                    .is_ok() =>
-                            {
-                                if job.request.cancelled.load(Ordering::Acquire) {
-                                    Err(STATUS_CANCELLED)
-                                } else {
-                                    if content.len() < end {
-                                        content.resize(end, 0);
-                                    }
-                                    content[job.offset..end].copy_from_slice(&data);
-                                    fs.fs
-                                        .write_file(&job.file.path, content)
-                                        .map(|_| data.len() as u32)
-                                        .map_err(|_| STATUS_UNSUCCESSFUL)
-                                }
-                            }
-                            _ => Err(STATUS_UNSUCCESSFUL),
-                        },
-                        Err(_) => Err(STATUS_UNSUCCESSFUL),
-                    },
+                    Ok(_) if job.request.cancelled.load(Ordering::Acquire) => {
+                        Err(STATUS_CANCELLED)
+                    }
+                    Ok(mut fs) => fs
+                        .fs
+                        .write_at(&job.file.path, job.offset as u64, &data)
+                        .map(|_| data.len() as u32)
+                        .map_err(|_| STATUS_UNSUCCESSFUL),
                     Err(_) => Err(STATUS_UNSUCCESSFUL),
                 },
             }

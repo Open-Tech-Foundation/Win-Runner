@@ -2432,3 +2432,40 @@ fn test_shell_unknown_and_bad_exit() {
     );
     assert!(stderr.contains("exit: bad code"), "stderr: {stderr}");
 }
+
+/// Win-Runner's disk lives in temporaries (a session directory of written
+/// files, worker request directories). A shell that ran a guest program,
+/// which wrote and deleted files through a native worker, must leave none
+/// behind, and a later start removes those of a killed instance.
+#[test]
+fn a_finished_shell_leaves_no_temporaries_and_stale_ones_are_swept() {
+    let temp = tmp_path("winrun-temp-clean");
+    std::fs::create_dir_all(&temp).unwrap();
+    // A killed instance's leftovers (pid 999999999 does not exist).
+    std::fs::create_dir_all(temp.join("winrun-session-999999999-1")).unwrap();
+    std::fs::write(temp.join("winrun-disk-999999999-1.tmp"), b"old").unwrap();
+    let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/artifacts/exe/oracle_pool_console.exe");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_winrun"))
+        .arg("shell")
+        .env("TMPDIR", &temp)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start the winrun shell");
+    let commands = format!(
+        "New-Item C:\\oracle-run -ItemType Directory\ncd C:\\oracle-run\n\"{}\"\nexit\n",
+        probe.display()
+    );
+    child.stdin.take().unwrap().write_all(commands.as_bytes()).unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("setup.input: ok") && stdout.contains("END"), "{stdout}");
+    let left: Vec<String> = std::fs::read_dir(&temp)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(left.is_empty(), "left behind: {left:?}");
+    std::fs::remove_dir_all(&temp).ok();
+}

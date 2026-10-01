@@ -437,12 +437,7 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_set_end_of_file(han
     };
     let path = file.path.clone();
     let offset = file.offset;
-    let Ok(mut contents) = ctx.fs.read_file(&path) else {
-        native_set_last_error(6);
-        return 0;
-    };
-    contents.resize(offset, 0);
-    match ctx.fs.write_file(&path, contents) {
+    match ctx.fs.set_len(&path, offset as u64) {
         Ok(()) => 1,
         Err(_) => {
             native_set_last_error(5);

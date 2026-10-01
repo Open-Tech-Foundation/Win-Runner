@@ -6,6 +6,23 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Rebuild WinFS's writable storage so a session's disk use stays proportional
+  to its live files. Each written file now lives in its own host file (a
+  blob) in a session directory, written in place with `pwrite`, truncated with
+  `ftruncate`, and freed when deleted. Before, every `WriteFile`,
+  `NtWriteFile`, overlapped write, or `SetEndOfFile` re-stored the whole
+  file in an append-only overlay that was never reclaimed, so a file written
+  in chunks used space quadratic in its size (16 MiB written in 64 KiB calls
+  took 2 GiB) and `npm install` filled `/tmp` and failed with `EEXIST`.
+  Workers now share the session, so file contents are visible across guest
+  processes as on Windows, and their change journals name blobs instead of
+  carrying copies of file contents. A copy is journaled as its own contents,
+  never as a copy to repeat. Snapshot files stay read-only extents until
+  their first write.
+- Stop leaking temporary files: worker processes no longer create disk files
+  they cannot delete on exit, a session directory is removed when `winrun`
+  exits, a child worker's request directory is removed before its exit is
+  reported, and temporaries left by killed instances are swept at startup.
 - Read symbolic links the way Node.js does: `DeviceIoControl` with
   `FSCTL_GET_REPARSE_POINT` returns a link's `REPARSE_DATA_BUFFER`, so
   `fs.readlink`, `fs.lstat`, and `fs.realpath` work on links such as

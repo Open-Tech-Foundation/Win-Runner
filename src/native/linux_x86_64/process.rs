@@ -1988,6 +1988,12 @@ fn create_exec_worker_child(
                     }
                 }
             }
+            if let Ok(native_fs) = monitor_fs.lock() {
+                native_fs.fs.collect_garbage();
+            }
+            // Remove the request directory before publishing the exit: a
+            // waiting worker may `_exit` as soon as it sees it.
+            drop(directory_guard);
             if let Ok(mut state) = monitor_child.state.lock() {
                 if state.is_none() {
                     *state = Some(
@@ -2000,7 +2006,6 @@ fn create_exec_worker_child(
                 }
                 monitor_child.exited.notify_all();
             }
-            drop(directory_guard);
         })
         .map_err(|_| 8u32)?;
     Ok(())
@@ -2197,12 +2202,7 @@ pub(super) fn native_flush_instance_state() {
     let Ok(ctx) = context.lock() else {
         return;
     };
-    let encoded =
-        if std::env::var_os("WINRUN_NATIVE_WORKER").as_deref() == Some(std::ffi::OsStr::new("1")) {
-            crate::snapshot::encode_portable_changes(&ctx.fs)
-        } else {
-            crate::snapshot::encode_changes(&ctx.fs)
-        };
+    let encoded = crate::snapshot::encode_changes(&ctx.fs);
     let Ok(encoded) = encoded else {
         return;
     };

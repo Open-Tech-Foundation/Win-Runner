@@ -276,6 +276,9 @@ fn run_exec_worker(
             ))
         }
     }
+    // The worker has exited: its written files that nothing refers to now
+    // (replaced, deleted, or never journaled) can go.
+    fs.collect_garbage();
     if std::env::var_os("WINRUN_TIMINGS").is_some() {
         let state_bytes = std::fs::metadata(&state_path)
             .map(|metadata| metadata.len())

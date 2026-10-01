@@ -96,6 +96,7 @@ winrun --snapshot=tools.winfs --save shell
 
 `--save` writes changes back to the loaded snapshot when the shell exits; run `snapshot save` inside the shell to save sooner.
 Snapshots are indexed, seekable WinFS disks and contain C: only.
+While a session runs, each file a program writes lives in its own file in a session directory under the temp directory (`$TMPDIR`, default `/tmp`), shared by all of the session's guest processes. A write costs only what it writes, and deleting a file frees its space. The session directory is removed when `winrun` exits; one left by a killed instance is removed the next time `winrun` starts.
 Explicitly mounted host directories appear as separate guest drives (for example, Z:).
 
 ## Shell and packages

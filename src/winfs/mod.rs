@@ -1,8 +1,9 @@
 //! WinFS: indexed Windows-style filesystem with seekable disk-backed guest
 //! files and optional live host-directory drives.
 //!
-//! - C: guest files use an append-only backing store; snapshots retain file
-//!   extents and load file bytes only when opened.
+//! - C: guest files are read-only extents of a snapshot disk until written;
+//!   a written file lives in its own host file (a blob, see [`blob`]), so a
+//!   write costs what it writes and deleting a file frees its space.
 //! - Optional host directories can be mounted as separate guest drives.
 //! - Case-insensitive lookup, original casing preserved for listings.
 //! - Supports `C:\`, `C:\test\a.txt`, relative paths, `.` and `..`.
@@ -14,23 +15,19 @@ use std::{
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
-    },
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
+mod blob;
 pub mod full_path;
 mod win_path;
+use blob::{Blob, BlobStore};
 use win_path::{is_extended_path, windows_name_key};
 pub(crate) use win_path::{parse as parse_win_path, DosDevicePath, ParsedWinPath};
 
-static NEXT_DISK_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Seekable backing storage for WinFS file contents. Snapshot files and the
-/// session's temporary write area share this interface; only file metadata
-/// stays resident in the directory index.
+/// A seekable snapshot disk: an index plus file extents that guest files read
+/// in place. Only file metadata stays resident in the directory index.
 #[derive(Debug)]
 pub(crate) struct DiskStore {
     file: Mutex<File>,
@@ -62,23 +59,6 @@ impl DiskStore {
         Ok(Arc::new(Self {
             file: Mutex::new(file),
             path: path.to_path_buf(),
-            remove_on_drop: true,
-        }))
-    }
-
-    fn temporary() -> Option<Arc<Self>> {
-        let id = NEXT_DISK_ID.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("winrun-disk-{}-{id}.tmp", std::process::id()));
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .ok()?;
-        Some(Arc::new(Self {
-            file: Mutex::new(file),
-            path,
             remove_on_drop: true,
         }))
     }
@@ -120,6 +100,33 @@ impl DiskStore {
         file.write_all(bytes)
             .map_err(|e| format!("cannot write WinFS disk: {e}"))?;
         Ok(offset)
+    }
+
+    /// Append `length` bytes read in chunks from `read`; returns their offset.
+    pub(crate) fn append_chunks(
+        &self,
+        length: u64,
+        mut read: impl FnMut(u64, usize) -> Result<Vec<u8>, String>,
+    ) -> Result<u64, String> {
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| "WinFS disk lock is poisoned".to_string())?;
+        let start = file
+            .seek(SeekFrom::End(0))
+            .map_err(|e| format!("cannot seek WinFS disk: {e}"))?;
+        let mut done = 0u64;
+        while done < length {
+            let chunk = (length - done).min(1024 * 1024) as usize;
+            let bytes = read(done, chunk)?;
+            if bytes.len() != chunk {
+                return Err("short read while saving a WinFS file".to_string());
+            }
+            file.write_all(&bytes)
+                .map_err(|e| format!("cannot write WinFS disk: {e}"))?;
+            done += chunk as u64;
+        }
+        Ok(start)
     }
 
     pub(crate) fn write_at(&self, offset: u64, bytes: &[u8]) -> Result<(), String> {
@@ -207,12 +214,17 @@ impl Drop for DiskStore {
 
 #[derive(Debug, Clone)]
 enum FileData {
+    /// In memory, for a filesystem without a blob session.
     Bytes(Vec<u8>),
+    /// A read-only extent of a snapshot disk.
     Disk {
         store: Arc<DiskStore>,
         offset: u64,
         length: u64,
     },
+    /// A writable host file shared by every name and process that refers
+    /// to it.
+    Blob(Arc<Blob>),
 }
 
 #[derive(Debug, Clone)]
@@ -243,7 +255,7 @@ impl SnapshotFile {
 
     pub(crate) fn disk_location(&self) -> Option<(Arc<DiskStore>, u64, u64)> {
         match &self.data {
-            FileData::Bytes(_) => None,
+            FileData::Bytes(_) | FileData::Blob(_) => None,
             FileData::Disk {
                 store,
                 offset,
@@ -255,6 +267,11 @@ impl SnapshotFile {
     pub(crate) fn append_to(&self, output: &DiskStore) -> Result<(u64, u64), String> {
         match &self.data {
             FileData::Bytes(bytes) => Ok((output.append(bytes)?, bytes.len() as u64)),
+            FileData::Blob(blob) => {
+                let length = blob.len()?;
+                let offset = output.append_chunks(length, |at, count| blob.read_at(at, count))?;
+                Ok((offset, length))
+            }
             FileData::Disk {
                 store,
                 offset,
@@ -266,12 +283,36 @@ impl SnapshotFile {
         }
     }
 
+    /// The blob holding this file, which a worker opens by id.
+    pub(crate) fn blob_id(&self) -> Option<&str> {
+        match &self.data {
+            FileData::Blob(blob) => Some(blob.id()),
+            _ => None,
+        }
+    }
+
     pub(crate) fn is_stored_in(&self, path: &Path) -> bool {
         match &self.data {
-            FileData::Bytes(_) => false,
+            FileData::Bytes(_) | FileData::Blob(_) => false,
             FileData::Disk { store, .. } => same_file_path(store.path(), path),
         }
     }
+}
+
+fn journal_data(data: &FileData) -> Result<WriteData, String> {
+    Ok(match data {
+        FileData::Bytes(bytes) => WriteData::Bytes(bytes.clone()),
+        FileData::Blob(blob) => WriteData::Blob(blob.id().to_string()),
+        FileData::Disk {
+            store,
+            offset,
+            length,
+        } => WriteData::Extent {
+            disk: store.path().to_path_buf(),
+            offset: *offset,
+            length: *length,
+        },
+    })
 }
 
 fn same_file_path(left: &Path, right: &Path) -> bool {
@@ -285,11 +326,13 @@ impl FileData {
         match self {
             Self::Bytes(bytes) => bytes.len() as u64,
             Self::Disk { length, .. } => *length,
+            Self::Blob(blob) => blob.len().unwrap_or(0),
         }
     }
     fn read(&self) -> Result<Vec<u8>, String> {
         match self {
             Self::Bytes(bytes) => Ok(bytes.clone()),
+            Self::Blob(blob) => blob.read_all(),
             Self::Disk {
                 store,
                 offset,
@@ -310,6 +353,7 @@ impl FileData {
             .map_err(|_| "guest read is too large".to_string())?;
         match self {
             Self::Bytes(bytes) => Ok(bytes[offset as usize..offset as usize + count].to_vec()),
+            Self::Blob(blob) => blob.read_at(offset, count),
             Self::Disk {
                 store,
                 offset: start,
@@ -321,6 +365,7 @@ impl FileData {
     fn version(&self) -> u64 {
         match self {
             Self::Disk { offset, length, .. } => offset.rotate_left(17) ^ length,
+            Self::Blob(blob) => blob.version(),
             Self::Bytes(bytes) => bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
                 (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3)
             }),
@@ -365,9 +410,9 @@ pub struct WinFs {
     /// Windows remembers a separate working directory for each drive.
     drive_cwds: HashMap<char, Vec<String>>,
     strict_max_path: bool,
-    /// Append-only staging area for writes made after a disk image was opened.
-    /// It keeps large guest files out of the host process heap.
-    overlay: Option<Arc<DiskStore>>,
+    /// Where written files live (see [`blob`]). Without one, written files
+    /// stay in memory.
+    blobs: Option<Arc<BlobStore>>,
     /// Host directory mounts are session-only drives (for example `Z:`).
     /// Their file contents remain in the host filesystem and never enter a
     /// C-drive snapshot.
@@ -487,10 +532,10 @@ impl HostMount {
 #[derive(Debug, Clone)]
 pub(crate) enum FsChange {
     Mkdir(String),
+    /// `path` now holds `data` (for every hard link to it).
     Write {
         path: String,
-        offset: Option<(u64, u64)>,
-        bytes: Vec<u8>,
+        data: WriteData,
     },
     Remove {
         path: String,
@@ -499,11 +544,6 @@ pub(crate) enum FsChange {
     Move {
         source: String,
         target: String,
-    },
-    Copy {
-        source: String,
-        target: String,
-        overwrite: bool,
     },
     SetCwd(String),
     SetMetadata {
@@ -518,6 +558,21 @@ pub(crate) enum FsChange {
     HardLink {
         path: String,
         target: String,
+    },
+}
+
+/// File contents in a change journal. Blob contents are live: a later
+/// write to the same blob is visible through it, so the journal names the
+/// blob instead of copying bytes, and a copy is journaled as its own blob.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WriteData {
+    Bytes(Vec<u8>),
+    Blob(String),
+    /// A read-only extent of a snapshot disk.
+    Extent {
+        disk: PathBuf,
+        offset: u64,
+        length: u64,
     },
 }
 
@@ -572,6 +627,29 @@ impl Default for WinFs {
 
 impl WinFs {
     pub fn new() -> Self {
+        Self::with_blobs(BlobStore::create_session().ok())
+    }
+
+    /// A filesystem for a worker process whose written files belong to the
+    /// session `dir` of the instance that started it (in memory without one).
+    pub(crate) fn attached(dir: Option<&Path>) -> Result<Self, String> {
+        Ok(Self::with_blobs(dir.map(BlobStore::attach).transpose()?))
+    }
+
+    /// The session directory written files live in.
+    pub(crate) fn blob_dir(&self) -> Option<&Path> {
+        self.blobs.as_ref().map(|store| store.dir())
+    }
+
+    /// Delete written files that no process can refer to any more; call it
+    /// once a worker's changes are applied (see [`BlobStore::collect_garbage`]).
+    pub(crate) fn collect_garbage(&self) {
+        if let Some(store) = &self.blobs {
+            store.collect_garbage();
+        }
+    }
+
+    fn with_blobs(blobs: Option<Arc<BlobStore>>) -> Self {
         let mut drives = HashMap::new();
         drives.insert(
             'C',
@@ -586,7 +664,7 @@ impl WinFs {
             cwd_parts: Vec::new(),
             drive_cwds: HashMap::from([('C', Vec::new())]),
             strict_max_path: false,
-            overlay: DiskStore::temporary(),
+            blobs,
             mounts: HashMap::new(),
             file_ids: HashMap::new(),
             next_file_id: 1,
@@ -864,6 +942,19 @@ impl WinFs {
         Ok(())
     }
 
+    /// Add `path` as the session blob `id`, as a worker manifest lists it.
+    pub(crate) fn open_blob_file(&mut self, path: &str, id: &str) -> Result<(), String> {
+        let store = self
+            .blobs
+            .clone()
+            .ok_or("WinFS blob session is unavailable")?;
+        let blob = store.open(id)?;
+        let record = std::mem::replace(&mut self.record_changes, false);
+        let result = self.bind(path, FileData::Blob(blob));
+        self.record_changes = record;
+        result
+    }
+
     pub(crate) fn mark_snapshot_file(
         &mut self,
         path: &str,
@@ -893,81 +984,19 @@ impl WinFs {
         &self.changes
     }
 
-    /// The bytes a journaled overlay write stored, even if the file was
-    /// later deleted or renamed.
-    pub(crate) fn overlay_bytes(&self, offset: u64, length: u64) -> Result<Vec<u8>, String> {
-        let store = self
-            .overlay
-            .as_ref()
-            .ok_or("WinFS disk overlay is unavailable")?;
-        let length = usize::try_from(length).map_err(|_| "WinFS write is too large")?;
-        store.read_at(offset, length)
-    }
-
     pub(crate) fn apply_changes(&mut self, changes: &[FsChange]) -> Result<(), String> {
+        let mut disks = HashMap::<PathBuf, Arc<DiskStore>>::new();
         let result = (|| {
             for change in changes {
                 match change {
                     FsChange::Mkdir(path) => self.mkdir(path)?,
-                    FsChange::Write {
-                        path,
-                        offset: Some((offset, length)),
-                        ..
-                    } => {
-                        let p = self.normalize(path)?;
-                        if p.drive != 'C' {
-                            continue;
-                        }
-                        let file_id = self.file_id(&p.display()).ok();
-                        let parent = self.parent_of(&p);
-                        self.mkdir(&parent.display())?;
-                        let store = self
-                            .overlay
-                            .as_ref()
-                            .cloned()
-                            .ok_or("WinFS disk overlay is unavailable")?;
-                        let parent_node = self
-                            .get_node_mut(&parent)
-                            .ok_or_else(|| format!("write parent missing: {}", parent.display()))?;
-                        let Node::Dir { children, .. } = parent_node else {
-                            return Err(format!("write parent is a file: {}", parent.display()));
-                        };
-                        let leaf = p.parts.last().unwrap().clone();
-                        let stored = FileData::Disk {
-                            store,
-                            offset: *offset,
-                            length: *length,
-                        };
-                        children.insert(
-                            windows_name_key(&leaf),
-                            Node::File {
-                                name: leaf,
-                                data: stored.clone(),
-                            },
-                        );
-                        if let Some(file_id) = file_id {
-                            self.replace_linked_file_data(file_id, stored);
-                        }
-                        if self.record_changes {
-                            self.changes.push(FsChange::Write {
-                                path: p.display(),
-                                offset: Some((*offset, *length)),
-                                bytes: Vec::new(),
-                            });
-                        }
-                    }
-                    FsChange::Write { path, bytes, .. } => self.write_file(path, bytes.clone())?,
+                    FsChange::Write { path, data } => self.apply_write(path, data, &mut disks)?,
                     FsChange::Remove { path, recursive } => {
                         if self.exists(path) {
                             self.remove(path, *recursive)?;
                         }
                     }
                     FsChange::Move { source, target } => self.move_path(source, target)?,
-                    FsChange::Copy {
-                        source,
-                        target,
-                        overwrite,
-                    } => self.copy_path(source, target, !*overwrite)?,
                     FsChange::SetCwd(path) => self.set_cwd(path)?,
                     FsChange::SetMetadata { path, metadata } => {
                         self.set_file_metadata(path, *metadata)?;
@@ -993,41 +1022,177 @@ impl WinFs {
         result
     }
 
-    fn record_write(&mut self, path: &str) -> Result<(), String> {
-        if !self.record_changes {
-            return Ok(());
-        }
-        let p = self.normalize(path)?;
-        if p.drive != 'C' {
-            return Ok(());
-        }
-        let Some(Node::File { data, .. }) = self.get_node(&p) else {
-            return Ok(());
-        };
-        let change = match data {
-            FileData::Disk {
-                store,
+    fn apply_write(
+        &mut self,
+        path: &str,
+        data: &WriteData,
+        disks: &mut HashMap<PathBuf, Arc<DiskStore>>,
+    ) -> Result<(), String> {
+        let data = match data {
+            WriteData::Bytes(bytes) => return self.write_file(path, bytes.clone()),
+            WriteData::Blob(id) => {
+                let store = self
+                    .blobs
+                    .clone()
+                    .ok_or("WinFS blob session is unavailable")?;
+                FileData::Blob(store.open(id)?)
+            }
+            WriteData::Extent {
+                disk,
                 offset,
                 length,
-            } if self
-                .overlay
-                .as_ref()
-                .is_some_and(|overlay| Arc::ptr_eq(overlay, store)) =>
-            {
-                FsChange::Write {
-                    path: p.display(),
-                    offset: Some((*offset, *length)),
-                    bytes: Vec::new(),
+            } => {
+                let store = match disks.get(disk) {
+                    Some(store) => Arc::clone(store),
+                    None => {
+                        let store = DiskStore::open(disk)?;
+                        disks.insert(disk.clone(), Arc::clone(&store));
+                        store
+                    }
+                };
+                if offset.checked_add(*length).is_none_or(|end| end > store.len().unwrap_or(0)) {
+                    return Err(format!("journaled extent is out of bounds: {path}"));
+                }
+                FileData::Disk {
+                    store,
+                    offset: *offset,
+                    length: *length,
                 }
             }
-            _ => FsChange::Write {
-                path: p.display(),
-                offset: None,
-                bytes: data.read()?,
-            },
         };
-        self.changes.push(change);
+        self.bind(path, data)
+    }
+
+    /// Point C-drive file `path` at `data`, creating it (and its parents) or
+    /// replacing what it held for every hard link to it.
+    fn bind(&mut self, path: &str, data: FileData) -> Result<(), String> {
+        let p = self.normalize(path)?;
+        if p.drive != 'C' || p.parts.is_empty() {
+            return Ok(());
+        }
+        match self.get_node(&p) {
+            Some(Node::File { .. }) => self.set_data(&p, data)?,
+            Some(Node::Dir { .. }) => return Err(format!("path is a directory: {}", p.display())),
+            None => {
+                let parent = self.parent_of(&p);
+                self.mkdir(&parent.display())?;
+                self.insert_file(&p, data)?;
+            }
+        }
+        self.record_data(&p)
+    }
+
+    /// Add a new file node with a new file id.
+    fn insert_file(&mut self, p: &WinPath, data: FileData) -> Result<(), String> {
+        let parent = self.parent_of(p);
+        let leaf = p.parts.last().ok_or("cannot write to root")?.clone();
+        match self.get_node_mut(&parent) {
+            Some(Node::Dir { children, .. }) => {
+                children.insert(windows_name_key(&leaf), Node::File { name: leaf, data });
+            }
+            Some(Node::File { .. }) => return Err("parent is a file".to_string()),
+            None => return Err(format!("parent not found: {}", parent.display())),
+        }
+        let file_id = self.next_file_id;
+        self.next_file_id = self.next_file_id.wrapping_add(1).max(1);
+        self.file_ids.insert(p.key(), file_id);
         Ok(())
+    }
+
+    /// Replace an existing file's contents for every hard link to it.
+    fn set_data(&mut self, p: &WinPath, stored: FileData) -> Result<(), String> {
+        let file_id = self.file_id(&p.display()).ok();
+        match self.get_node_mut(p) {
+            Some(Node::File { data, .. }) => *data = stored.clone(),
+            Some(Node::Dir { .. }) => return Err(format!("path is a directory: {}", p.display())),
+            None => return Err(format!("file not found: {}", p.display())),
+        }
+        if let Some(file_id) = file_id {
+            self.replace_linked_file_data(file_id, stored);
+        }
+        Ok(())
+    }
+
+    /// Journal what C-drive file `p` holds now.
+    fn record_data(&mut self, p: &WinPath) -> Result<(), String> {
+        if !self.record_changes || p.drive != 'C' {
+            return Ok(());
+        }
+        let Some(Node::File { data, .. }) = self.get_node(p) else {
+            return Ok(());
+        };
+        let data = journal_data(data)?;
+        self.changes.push(FsChange::Write {
+            path: p.display(),
+            data,
+        });
+        Ok(())
+    }
+
+    /// Journal a copied tree at `p`: its directories and what each file holds.
+    fn record_tree(&mut self, p: &WinPath) -> Result<(), String> {
+        fn visit(
+            node: &Node,
+            path: String,
+            out: &mut Vec<FsChange>,
+        ) -> Result<(), String> {
+            match node {
+                Node::File { data, .. } => out.push(FsChange::Write {
+                    path,
+                    data: journal_data(data)?,
+                }),
+                Node::Dir { children, .. } => {
+                    out.push(FsChange::Mkdir(path.clone()));
+                    for child in children.values() {
+                        visit(child, format!("{path}\\{}", child.name()), out)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        if !self.record_changes || p.drive != 'C' {
+            return Ok(());
+        }
+        let Some(node) = self.get_node(p) else {
+            return Ok(());
+        };
+        let mut changes = Vec::new();
+        visit(node, p.display(), &mut changes)?;
+        self.changes.extend(changes);
+        Ok(())
+    }
+
+    /// A private, writable copy of `data`.
+    fn copy_up(&self, data: &FileData) -> Result<FileData, String> {
+        match &self.blobs {
+            Some(store) => {
+                let blob = store.create()?;
+                blob.copy_from(data.len(), |offset, count| data.read_range(offset, count))?;
+                Ok(FileData::Blob(blob))
+            }
+            None => Ok(FileData::Bytes(data.read()?)),
+        }
+    }
+
+    /// `node` with every file's contents copied, for a copy of it.
+    fn duplicate_node(&self, node: &Node) -> Result<Node, String> {
+        Ok(match node {
+            Node::File { name, data } => Node::File {
+                name: name.clone(),
+                data: match data {
+                    FileData::Blob(_) => self.copy_up(data)?,
+                    // Snapshot extents and in-memory bytes never change in place.
+                    other => other.clone(),
+                },
+            },
+            Node::Dir { name, children } => Node::Dir {
+                name: name.clone(),
+                children: children
+                    .iter()
+                    .map(|(key, child)| Ok((key.clone(), self.duplicate_node(child)?)))
+                    .collect::<Result<_, String>>()?,
+            },
+        })
     }
 
     fn is_host_drive(&self, drive: char) -> bool {
@@ -1818,6 +1983,7 @@ impl WinFs {
         }
     }
 
+    /// Replace a file's contents, creating it if needed (its parent must exist).
     pub fn write_file(&mut self, path: &str, data: Vec<u8>) -> Result<(), String> {
         let p = self.normalize(path)?;
         if p.parts.is_empty() {
@@ -1829,44 +1995,102 @@ impl WinFs {
             return std::fs::write(&host, data)
                 .map_err(|e| format!("cannot write mounted file {}: {e}", p.display()));
         }
-        let stored = self.store_file(data)?;
-        if self.get_node(&p).is_some() {
-            let file_id = self.file_id(&p.display()).ok();
-            match self.get_node_mut(&p) {
-                Some(Node::File { data, .. }) => *data = stored.clone(),
-                Some(Node::Dir { .. }) => {
-                    return Err(format!("path is a directory: {}", p.display()))
-                }
-                None => return Err(format!("file not found: {}", p.display())),
+        match self.get_node(&p) {
+            // In place: every name and process sharing the blob sees it.
+            Some(Node::File {
+                data: FileData::Blob(blob),
+                ..
+            }) => blob.replace(&data),
+            Some(Node::File { .. }) => {
+                let stored = self.store_file(data)?;
+                self.set_data(&p, stored)?;
+                self.record_data(&p)
             }
-            if let Some(file_id) = file_id {
-                self.replace_linked_file_data(file_id, stored);
-            }
-            self.record_write(&p.display())
-        } else {
-            // create; parent must exist
-            let parent = self.parent_of(&p);
-            let parent_node = self
-                .get_node_mut(&parent)
-                .ok_or_else(|| format!("parent not found: {}", parent.display()))?;
-            match parent_node {
-                Node::Dir { children, .. } => {
-                    let leaf = p.parts.last().unwrap().clone();
-                    children.insert(
-                        windows_name_key(&leaf),
-                        Node::File {
-                            name: leaf,
-                            data: stored,
-                        },
-                    );
-                    let file_id = self.next_file_id;
-                    self.next_file_id = self.next_file_id.wrapping_add(1).max(1);
-                    self.file_ids.insert(p.key(), file_id);
-                    self.record_write(&p.display())
-                }
-                Node::File { .. } => Err("parent is a file".to_string()),
+            Some(Node::Dir { .. }) => Err(format!("path is a directory: {}", p.display())),
+            None => {
+                let stored = self.store_file(data)?;
+                self.insert_file(&p, stored)?;
+                self.record_data(&p)
             }
         }
+    }
+
+    /// Write `bytes` at `offset` of an existing file, extending it (with
+    /// zeros over any gap) as needed. Costs what it writes: a snapshot file
+    /// is copied into a blob once, then written in place.
+    pub fn write_at(&mut self, path: &str, offset: u64, bytes: &[u8]) -> Result<(), String> {
+        let p = self.normalize(path)?;
+        if self.is_host_drive(p.drive) {
+            self.ensure_writable_mount(p.drive)?;
+            let host = self.host_path(&p, false)?;
+            let file = OpenOptions::new()
+                .write(true)
+                .open(&host)
+                .map_err(|e| format!("cannot open mounted file {}: {e}", p.display()))?;
+            return std::os::unix::fs::FileExt::write_all_at(&file, bytes, offset)
+                .map_err(|e| format!("cannot write mounted file {}: {e}", p.display()));
+        }
+        self.modify(&p, |data| match data {
+            FileData::Blob(blob) => blob.write_at(offset, bytes),
+            FileData::Bytes(contents) => {
+                let start = usize::try_from(offset).map_err(|_| "write offset is too large")?;
+                let end = start.checked_add(bytes.len()).ok_or("write is too large")?;
+                if contents.len() < end {
+                    contents.resize(end, 0);
+                }
+                contents[start..end].copy_from_slice(bytes);
+                Ok(())
+            }
+            FileData::Disk { .. } => unreachable!("modify copies snapshot extents first"),
+        })
+    }
+
+    /// Truncate or extend (with zeros) an existing file to `length` bytes.
+    pub fn set_len(&mut self, path: &str, length: u64) -> Result<(), String> {
+        let p = self.normalize(path)?;
+        if self.is_host_drive(p.drive) {
+            self.ensure_writable_mount(p.drive)?;
+            let host = self.host_path(&p, false)?;
+            return OpenOptions::new()
+                .write(true)
+                .open(&host)
+                .and_then(|file| file.set_len(length))
+                .map_err(|e| format!("cannot resize mounted file {}: {e}", p.display()));
+        }
+        self.modify(&p, |data| match data {
+            FileData::Blob(blob) => blob.set_len(length),
+            FileData::Bytes(contents) => {
+                contents.resize(
+                    usize::try_from(length).map_err(|_| "file length is too large")?,
+                    0,
+                );
+                Ok(())
+            }
+            FileData::Disk { .. } => unreachable!("modify copies snapshot extents first"),
+        })
+    }
+
+    /// Apply `change` to an existing file's writable contents. A blob
+    /// changes in place; anything else is first copied into a new blob (or
+    /// memory), which then replaces the file for all its hard links.
+    fn modify(
+        &mut self,
+        p: &WinPath,
+        change: impl FnOnce(&mut FileData) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let data = match self.get_node(p) {
+            Some(Node::File { data, .. }) => data.clone(),
+            Some(Node::Dir { .. }) => return Err(format!("path is a directory: {}", p.display())),
+            None => return Err(format!("file not found: {}", p.display())),
+        };
+        if let FileData::Blob(_) = data {
+            let mut data = data;
+            return change(&mut data);
+        }
+        let mut copy = self.copy_up(&data)?;
+        change(&mut copy)?;
+        self.set_data(p, copy)?;
+        self.record_data(p)
     }
 
     fn replace_linked_file_data(&mut self, file_id: u64, data: FileData) {
@@ -1899,51 +2123,13 @@ impl WinFs {
                 .write_all(data)
                 .map_err(|e| format!("cannot append mounted file {}: {e}", p.display()));
         }
-        if self.get_node(&p).is_some() {
-            let old = match self.get_node(&p) {
-                Some(Node::File { data, .. }) => data.clone(),
-                Some(Node::Dir { .. }) => {
-                    return Err(format!("path is a directory: {}", p.display()))
-                }
-                None => unreachable!(),
-            };
-            let stored = match (&old, &self.overlay) {
-                (
-                    FileData::Disk {
-                        store,
-                        offset,
-                        length,
-                    },
-                    Some(overlay),
-                ) => {
-                    let new_offset = overlay.append_from(store, *offset, *length)?;
-                    overlay.append(data)?;
-                    FileData::Disk {
-                        store: Arc::clone(overlay),
-                        offset: new_offset,
-                        length: *length + data.len() as u64,
-                    }
-                }
-                _ => {
-                    let mut contents = old.read()?;
-                    contents.extend_from_slice(data);
-                    self.store_file(contents)?
-                }
-            };
-            let file_id = self.file_id(&p.display()).ok();
-            match self.get_node_mut(&p) {
-                Some(Node::File { data: target, .. }) => *target = stored.clone(),
-                Some(Node::Dir { .. }) => {
-                    return Err(format!("path is a directory: {}", p.display()))
-                }
-                None => return Err(format!("file not found: {}", p.display())),
+        match self.get_node(&p) {
+            Some(Node::File { data: existing, .. }) => {
+                let end = existing.len();
+                self.write_at(path, end, data)
             }
-            if let Some(file_id) = file_id {
-                self.replace_linked_file_data(file_id, stored);
-            }
-            self.record_write(&p.display())
-        } else {
-            self.write_file(path, data.to_vec())
+            Some(Node::Dir { .. }) => Err(format!("path is a directory: {}", p.display())),
+            None => self.write_file(path, data.to_vec()),
         }
     }
 
@@ -1999,16 +2185,15 @@ impl WinFs {
         }
     }
 
+    /// New contents in a new blob (or memory, without a blob session).
     fn store_file(&self, bytes: Vec<u8>) -> Result<FileData, String> {
-        if let Some(store) = &self.overlay {
-            let offset = store.append(&bytes)?;
-            Ok(FileData::Disk {
-                store: Arc::clone(store),
-                offset,
-                length: bytes.len() as u64,
-            })
-        } else {
-            Ok(FileData::Bytes(bytes))
+        match &self.blobs {
+            Some(store) => {
+                let blob = store.create()?;
+                blob.replace(&bytes)?;
+                Ok(FileData::Blob(blob))
+            }
+            None => Ok(FileData::Bytes(bytes)),
         }
     }
 
@@ -2279,24 +2464,14 @@ impl WinFs {
                     if dst_node.is_dir() {
                         return Err(format!("destination is a directory: {}", d.display()));
                     }
-                    // overwrite preserving dst casing? use existing name
-                    let data = match node {
-                        Node::File { data, .. } => data,
-                        _ => unreachable!(),
+                    // The destination keeps its name and takes a copy of
+                    // the source's contents.
+                    let Node::File { data, .. } = self.duplicate_node(&node)? else {
+                        unreachable!();
                     };
-                    let dst_mut = self.get_node_mut(&d).unwrap();
-                    if let Node::File { data: dd, .. } = dst_mut {
-                        *dd = data;
-                        if self.record_changes {
-                            self.changes.push(FsChange::Copy {
-                                source: s.display(),
-                                target: d.display(),
-                                overwrite: true,
-                            });
-                        }
-                        self.set_file_metadata(&d.display(), source_metadata)?;
-                        return Ok(());
-                    }
+                    self.set_data(&d, data)?;
+                    self.record_data(&d)?;
+                    self.set_file_metadata(&d.display(), source_metadata)?;
                     return Ok(());
                 }
                 return Err(format!("destination exists: {}", d.display()));
@@ -2305,7 +2480,7 @@ impl WinFs {
         if d.parts.is_empty() {
             return Err("cannot copy to root".to_string());
         }
-        let mut copied = node;
+        let mut copied = self.duplicate_node(&node)?;
         let leaf = d.parts.last().unwrap().clone();
         match &mut copied {
             Node::Dir { name, .. } => *name = leaf.clone(),
@@ -2317,14 +2492,16 @@ impl WinFs {
             .ok_or_else(|| format!("destination parent not found: {}", dparent.display()))?;
         match dp {
             Node::Dir { children, .. } => {
+                let is_file = copied.is_file();
                 children.insert(windows_name_key(&leaf), copied);
-                if self.record_changes {
-                    self.changes.push(FsChange::Copy {
-                        source: s.display(),
-                        target: d.display(),
-                        overwrite: false,
-                    });
+                if is_file {
+                    let file_id = self.next_file_id;
+                    self.next_file_id = self.next_file_id.wrapping_add(1).max(1);
+                    self.file_ids.insert(d.key(), file_id);
                 }
+                // Journal what the copy holds, never "copy again": a source
+                // blob may change after this.
+                self.record_tree(&d)?;
                 self.set_file_metadata(&d.display(), source_metadata)?;
                 Ok(())
             }
@@ -2436,6 +2613,78 @@ mod canonical_path_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Distinct names for the host directories tests create.
+    static NEXT_DISK_ID: AtomicU64 = AtomicU64::new(1);
+
+    fn session_bytes(fs: &WinFs) -> u64 {
+        std::fs::read_dir(fs.blob_dir().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap().len())
+            .sum()
+    }
+
+    #[test]
+    fn chunked_writes_store_a_file_once_and_deleting_it_frees_the_space() {
+        // A guest writing 4 MiB in 64 KiB WriteFile calls once stored a whole
+        // copy of the file per call (quadratic growth).
+        let mut fs = WinFs::ephemeral_runner();
+        fs.write_file(r"C:\big.bin", Vec::new()).unwrap();
+        let chunk = vec![0x5a; 64 * 1024];
+        for index in 0..64u64 {
+            fs.write_at(r"C:\big.bin", index * chunk.len() as u64, &chunk)
+                .unwrap();
+        }
+        assert_eq!(fs.file_len(r"C:\big.bin").unwrap(), 4 * 1024 * 1024);
+        assert_eq!(session_bytes(&fs), 4 * 1024 * 1024);
+        fs.append_file(r"C:\big.bin", b"tail").unwrap();
+        fs.set_len(r"C:\big.bin", 10).unwrap();
+        assert_eq!(fs.read_file(r"C:\big.bin").unwrap(), vec![0x5a; 10]);
+        assert_eq!(session_bytes(&fs), 10);
+        fs.delete_file(r"C:\big.bin").unwrap();
+        assert_eq!(session_bytes(&fs), 0);
+    }
+
+    #[test]
+    fn writes_to_a_snapshot_file_copy_it_once_and_hard_links_follow() {
+        let root = std::env::temp_dir().join(format!(
+            "winfs-copy-up-{}-{}",
+            std::process::id(),
+            NEXT_DISK_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let disk_path = root.join("disk.bin");
+        std::fs::write(&disk_path, b"0123456789").unwrap();
+        let disk = DiskStore::open(&disk_path).unwrap();
+        let mut fs = WinFs::ephemeral_runner();
+        fs.open_snapshot_file(r"C:\data.txt", Arc::clone(&disk), 2, 5).unwrap();
+        fs.create_hard_link(r"C:\link.txt", r"C:\data.txt").unwrap();
+        fs.write_at(r"C:\data.txt", 1, b"xy").unwrap();
+        fs.write_at(r"C:\data.txt", 4, b"!").unwrap();
+        assert_eq!(fs.read_file(r"C:\data.txt").unwrap(), b"2xy5!");
+        assert_eq!(fs.read_file(r"C:\link.txt").unwrap(), b"2xy5!");
+        // The snapshot disk itself is never written.
+        assert_eq!(std::fs::read(&disk_path).unwrap(), b"0123456789");
+        assert_eq!(session_bytes(&fs), 5);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_copy_keeps_its_contents_when_the_source_changes_later() {
+        let mut fs = WinFs::ephemeral_runner();
+        fs.write_file(r"C:\a.txt", b"first".to_vec()).unwrap();
+        fs.clear_changes();
+        fs.copy_path(r"C:\a.txt", r"C:\b.txt", true).unwrap();
+        fs.write_at(r"C:\a.txt", 0, b"FIRST").unwrap();
+        assert_eq!(fs.read_file(r"C:\b.txt").unwrap(), b"first");
+        // Replaying the journal elsewhere must not copy the changed source.
+        let journal = fs.changes().to_vec();
+        let mut replay = WinFs::attached(fs.blob_dir()).unwrap();
+        replay.write_file(r"C:\a.txt", b"other".to_vec()).unwrap();
+        replay.apply_changes(&journal).unwrap();
+        assert_eq!(replay.read_file(r"C:\b.txt").unwrap(), b"first");
+    }
 
     #[test]
     fn file_ids_match_case_variants_and_distinguish_paths() {

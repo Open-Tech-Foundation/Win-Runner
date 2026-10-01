@@ -206,22 +206,17 @@ pub(super) extern "win64" fn native_nt_write_file(
     let Ok(offset) = usize::try_from(offset) else {
         return finish(STATUS_INVALID_PARAMETER, 0);
     };
-    let Ok(mut contents) = fs.fs.read_file(&path) else {
-        return finish(STATUS_INVALID_HANDLE, 0);
-    };
     let count = length as usize;
     let Some(end) = offset.checked_add(count) else {
         return finish(STATUS_INVALID_PARAMETER, 0);
     };
-    if contents.len() < end {
-        if contents.try_reserve(end - contents.len()).is_err() {
-            return finish(0xC000_0017, 0); // STATUS_NO_MEMORY
-        }
-        contents.resize(end, 0);
-    }
-    unsafe { ptr::copy_nonoverlapping(buffer, contents.as_mut_ptr().add(offset), count) };
-    if fs.fs.write_file(&path, contents).is_err() {
-        return finish(0xC000_0001, 0);
+    let data = if count == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(buffer, count) }
+    };
+    if fs.fs.write_at(&path, offset as u64, data).is_err() {
+        return finish(0xC000_007F, 0); // STATUS_DISK_FULL
     }
     if let Some(item) = fs.handles.get_mut(&file) {
         item.offset = end;
@@ -430,10 +425,9 @@ pub(super) extern "win64" fn native_nt_set_information_file(
         if information.is_null() || length < 8 {
             return finish(STATUS_INVALID_PARAMETER, 0);
         }
-        let end = unsafe { information.cast::<i64>().read_unaligned() };
-        if end < 0 {
+        let Ok(end) = u64::try_from(unsafe { information.cast::<i64>().read_unaligned() }) else {
             return finish(STATUS_INVALID_PARAMETER, 0);
-        }
+        };
         let Some(context) = fs_ctx() else {
             return finish(STATUS_INVALID_HANDLE, 0);
         };
@@ -455,19 +449,14 @@ pub(super) extern "win64" fn native_nt_set_information_file(
                 })
             })
             .unwrap_or(false);
-        let mut contents = match context.fs.read_file(&path) {
-            Ok(contents) => contents,
-            Err(_) => return finish(STATUS_OBJECT_NAME_NOT_FOUND, 0),
+        let Ok(size) = context.fs.file_len(&path) else {
+            return finish(STATUS_OBJECT_NAME_NOT_FOUND, 0);
         };
-        if (end as usize) < contents.len() && mapped {
+        if end < size && mapped {
             return finish(STATUS_ACCESS_DENIED, 0);
         }
-        let Ok(end) = usize::try_from(end) else {
-            return finish(STATUS_INVALID_PARAMETER, 0);
-        };
-        contents.resize(end, 0);
-        return match context.fs.write_file(&path, contents) {
-            Ok(()) => finish(STATUS_SUCCESS, end as u64),
+        return match context.fs.set_len(&path, end) {
+            Ok(()) => finish(STATUS_SUCCESS, end),
             Err(_) => finish(STATUS_ACCESS_DENIED, 0),
         };
     }

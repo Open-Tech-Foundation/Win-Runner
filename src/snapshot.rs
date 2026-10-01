@@ -116,6 +116,10 @@ pub(crate) fn save_worker_manifest(fs: &WinFs, directory: &Path) -> Result<PathB
     let mut inline_offset = 0u64;
     let mut files = Vec::new();
     for file in fs.snapshot_files() {
+        if let Some(id) = file.blob_id() {
+            files.push(serde_json::json!({"path": file.path, "blob": id}));
+            continue;
+        }
         let (store, offset, length) = if let Some((store, offset, length)) = file.disk_location() {
             (store.path().to_string_lossy().into_owned(), offset, length)
         } else {
@@ -156,6 +160,7 @@ pub(crate) fn save_worker_manifest(fs: &WinFs, directory: &Path) -> Result<PathB
         .collect::<Vec<_>>();
     let links = fs.snapshot_symlinks();
     let manifest = serde_json::json!({
+        "blob_dir": fs.blob_dir(),
         "directories": fs.snapshot_directories(),
         "files": files,
         "metadata": metadata,
@@ -180,7 +185,10 @@ pub(crate) fn load_worker_manifest(path: &Path) -> Result<WinFs, String> {
             .map_err(|error| format!("cannot read worker filesystem manifest: {error}"))?,
     )
     .map_err(|error| format!("invalid worker filesystem manifest: {error}"))?;
-    let mut fs = WinFs::new();
+    // The worker writes into its starter's session and never owns storage:
+    // it exits without unwinding.
+    let blob_dir = manifest["blob_dir"].as_str().map(Path::new);
+    let mut fs = WinFs::attached(blob_dir)?;
     for directory in manifest["directories"]
         .as_array()
         .ok_or("invalid worker directories")?
@@ -193,6 +201,15 @@ pub(crate) fn load_worker_manifest(path: &Path) -> Result<WinFs, String> {
     let mut stores = HashMap::<String, Arc<DiskStore>>::new();
     for entry in manifest["files"].as_array().ok_or("invalid worker files")? {
         let guest = entry["path"].as_str().ok_or("invalid worker file path")?;
+        if let Some(id) = entry["blob"].as_str() {
+            let parent = guest
+                .rsplit_once('\\')
+                .map(|(parent, _)| parent)
+                .unwrap_or("C:");
+            fs.mkdir(parent)?;
+            fs.open_blob_file(guest, id)?;
+            continue;
+        }
         let source = entry["store"]
             .as_str()
             .ok_or("invalid worker disk path")?
@@ -517,74 +534,48 @@ fn take_index_path(bytes: &[u8], cursor: &mut usize) -> Result<String, String> {
 }
 
 /// Encode only the guest filesystem operations performed by one process.
-/// File writes point at extents in the shared temporary disk; bytes are not
-/// copied through the parent/child state pipe.
+/// Encode the journal of a process's filesystem changes for the process that
+/// started it. Written files are named by their session blob, so no file
+/// contents pass through the journal.
 pub(crate) fn encode_changes(fs: &WinFs) -> Result<Vec<u8>, String> {
-    encode_change_records(fs, false)
-}
-
-/// Encode a self-contained journal for a process with an independent disk
-/// overlay. Disk offsets are local to one WinFS process and cannot be replayed
-/// by an exec worker, so materialize those writes as the bytes they stored;
-/// the file itself may since have been deleted or renamed.
-pub(crate) fn encode_portable_changes(fs: &WinFs) -> Result<Vec<u8>, String> {
-    encode_change_records(fs, true)
-}
-
-fn encode_change_records(fs: &WinFs, portable: bool) -> Result<Vec<u8>, String> {
-    use crate::winfs::FsChange;
-    let changes = if portable {
-        fs.changes()
-            .iter()
-            .map(|change| match change {
-                FsChange::Write {
-                    path,
-                    offset: Some((offset, length)),
-                    ..
-                } => Ok(FsChange::Write {
-                    path: path.clone(),
-                    offset: None,
-                    bytes: fs.overlay_bytes(*offset, *length)?,
-                }),
-                other => Ok(other.clone()),
-            })
-            .collect::<Result<Vec<_>, String>>()?
-    } else {
-        fs.changes().to_vec()
-    };
+    use crate::winfs::{FsChange, WriteData};
+    let changes = fs.changes();
     let count = u32::try_from(changes.len()).map_err(|_| "too many WinFS changes")?;
     let mut out = Vec::new();
     out.extend_from_slice(CHANGE_MAGIC);
     out.extend_from_slice(&count.to_le_bytes());
-    for change in &changes {
+    for change in changes {
         match change {
             FsChange::Mkdir(path) => {
                 out.push(0);
                 push_string(&mut out, path)?;
             }
-            FsChange::Write {
-                path,
-                offset: Some((offset, length)),
-                ..
-            } => {
+            FsChange::Write { path, data } => {
                 out.push(1);
                 push_string(&mut out, path)?;
-                out.push(1);
-                out.extend_from_slice(&offset.to_le_bytes());
-                out.extend_from_slice(&length.to_le_bytes());
-            }
-            FsChange::Write {
-                path,
-                offset: None,
-                bytes,
-            } => {
-                out.push(1);
-                push_string(&mut out, path)?;
-                out.push(0);
-                let len =
-                    u64::try_from(bytes.len()).map_err(|_| "WinFS file write is too large")?;
-                out.extend_from_slice(&len.to_le_bytes());
-                out.extend_from_slice(bytes);
+                match data {
+                    WriteData::Bytes(bytes) => {
+                        out.push(0);
+                        let len = u64::try_from(bytes.len())
+                            .map_err(|_| "WinFS file write is too large")?;
+                        out.extend_from_slice(&len.to_le_bytes());
+                        out.extend_from_slice(bytes);
+                    }
+                    WriteData::Blob(id) => {
+                        out.push(1);
+                        push_string(&mut out, id)?;
+                    }
+                    WriteData::Extent {
+                        disk,
+                        offset,
+                        length,
+                    } => {
+                        out.push(2);
+                        push_string(&mut out, &disk.to_string_lossy())?;
+                        out.extend_from_slice(&offset.to_le_bytes());
+                        out.extend_from_slice(&length.to_le_bytes());
+                    }
+                }
             }
             FsChange::Remove { path, recursive } => {
                 out.push(2);
@@ -595,16 +586,6 @@ fn encode_change_records(fs: &WinFs, portable: bool) -> Result<Vec<u8>, String> 
                 out.push(3);
                 push_string(&mut out, source)?;
                 push_string(&mut out, target)?;
-            }
-            FsChange::Copy {
-                source,
-                target,
-                overwrite,
-            } => {
-                out.push(4);
-                push_string(&mut out, source)?;
-                push_string(&mut out, target)?;
-                out.push(u8::from(*overwrite));
             }
             FsChange::SetCwd(path) => {
                 out.push(5);
@@ -639,7 +620,7 @@ fn encode_change_records(fs: &WinFs, portable: bool) -> Result<Vec<u8>, String> 
 }
 
 pub(crate) fn apply_changes(bytes: &[u8], fs: &mut WinFs) -> Result<(), String> {
-    use crate::winfs::FsChange;
+    use crate::winfs::{FsChange, WriteData};
     if bytes.len() < 12 || &bytes[..8] != CHANGE_MAGIC {
         return Err("invalid WinFS change stream".to_string());
     }
@@ -654,33 +635,30 @@ pub(crate) fn apply_changes(bytes: &[u8], fs: &mut WinFs) -> Result<(), String> 
             0 => changes.push(FsChange::Mkdir(take_string(bytes, &mut cursor)?)),
             1 => {
                 let path = take_string(bytes, &mut cursor)?;
-                if take_u8(bytes, &mut cursor)? != 0 {
-                    changes.push(FsChange::Write {
-                        path,
-                        offset: Some((
-                            take_u64(bytes, &mut cursor)?,
-                            take_u64(bytes, &mut cursor)?,
-                        )),
-                        bytes: Vec::new(),
-                    });
-                } else {
-                    let length = take_u64(bytes, &mut cursor)?;
-                    let length =
-                        usize::try_from(length).map_err(|_| "WinFS change payload is too large")?;
-                    let end = cursor
-                        .checked_add(length)
-                        .ok_or("WinFS change payload overflow")?;
-                    let payload = bytes
-                        .get(cursor..end)
-                        .ok_or("truncated WinFS change payload")?
-                        .to_vec();
-                    cursor = end;
-                    changes.push(FsChange::Write {
-                        path,
-                        offset: None,
-                        bytes: payload,
-                    });
-                }
+                let data = match take_u8(bytes, &mut cursor)? {
+                    0 => {
+                        let length = take_u64(bytes, &mut cursor)?;
+                        let length = usize::try_from(length)
+                            .map_err(|_| "WinFS change payload is too large")?;
+                        let end = cursor
+                            .checked_add(length)
+                            .ok_or("WinFS change payload overflow")?;
+                        let payload = bytes
+                            .get(cursor..end)
+                            .ok_or("truncated WinFS change payload")?
+                            .to_vec();
+                        cursor = end;
+                        WriteData::Bytes(payload)
+                    }
+                    1 => WriteData::Blob(take_string(bytes, &mut cursor)?),
+                    2 => WriteData::Extent {
+                        disk: PathBuf::from(take_string(bytes, &mut cursor)?),
+                        offset: take_u64(bytes, &mut cursor)?,
+                        length: take_u64(bytes, &mut cursor)?,
+                    },
+                    kind => return Err(format!("unknown WinFS write kind {kind}")),
+                };
+                changes.push(FsChange::Write { path, data });
             }
             2 => changes.push(FsChange::Remove {
                 path: take_string(bytes, &mut cursor)?,
@@ -689,11 +667,6 @@ pub(crate) fn apply_changes(bytes: &[u8], fs: &mut WinFs) -> Result<(), String> 
             3 => changes.push(FsChange::Move {
                 source: take_string(bytes, &mut cursor)?,
                 target: take_string(bytes, &mut cursor)?,
-            }),
-            4 => changes.push(FsChange::Copy {
-                source: take_string(bytes, &mut cursor)?,
-                target: take_string(bytes, &mut cursor)?,
-                overwrite: take_u8(bytes, &mut cursor)? != 0,
             }),
             5 => changes.push(FsChange::SetCwd(take_string(bytes, &mut cursor)?)),
             6 => changes.push(FsChange::SetMetadata {
@@ -946,6 +919,12 @@ mod tests {
             .unwrap();
         save_file(&mut fs, output.to_str().unwrap()).unwrap();
         let first_size = std::fs::metadata(&output).unwrap().len();
+        // Saved files now read from the disk; their session blobs are gone.
+        let session = fs.blob_dir().unwrap().to_path_buf();
+        assert_eq!(std::fs::read_dir(&session).unwrap().count(), 0);
+        // Writing a saved file copies its extent into a blob again.
+        fs.write_at(r"C:\tools\node.exe", 0, b"N").unwrap();
+        assert_eq!(std::fs::read_dir(&session).unwrap().count(), 1);
 
         fs.write_file(r"C:\tools\curl.exe", b"curl-data".to_vec())
             .unwrap();
@@ -955,7 +934,7 @@ mod tests {
         let loaded = load_file(output.to_str().unwrap()).unwrap();
         assert_eq!(
             loaded.read_file(r"C:\tools\node.exe").unwrap(),
-            b"node-data"
+            b"Node-data"
         );
         assert_eq!(
             loaded.read_file(r"C:\tools\curl.exe").unwrap(),
@@ -1016,11 +995,12 @@ mod tests {
     }
 
     #[test]
-    fn portable_journals_keep_changes_around_deleted_and_renamed_files() {
+    fn worker_journals_keep_changes_around_deleted_and_renamed_files() {
         // A worker process writes a temp file and deletes it, and renames a
-        // file after writing it; its other changes must still reach the
-        // parent, whose disk overlay is separate.
-        let mut child = WinFs::ephemeral_runner();
+        // file after writing it; its other changes must reach the parent.
+        let mut parent = WinFs::ephemeral_runner();
+        let mut child = WinFs::attached(parent.blob_dir()).unwrap();
+        child.mkdir(r"C:\Users").unwrap();
         child.clear_changes();
         child.write_file(r"C:\kept.txt", b"kept".to_vec()).unwrap();
         child
@@ -1031,16 +1011,17 @@ mod tests {
             .write_file(r"C:\draft.txt", b"final".to_vec())
             .unwrap();
         child.move_path(r"C:\draft.txt", r"C:\renamed.txt").unwrap();
-        assert!(child.changes().iter().any(|change| matches!(
+        // Written files are named by blob; no contents pass through.
+        assert!(child.changes().iter().all(|change| !matches!(
             change,
             crate::winfs::FsChange::Write {
-                offset: Some(_),
+                data: crate::winfs::WriteData::Bytes(_),
                 ..
             }
         )));
 
-        let journal = encode_portable_changes(&child).unwrap();
-        let mut parent = WinFs::ephemeral_runner();
+        let journal = encode_changes(&child).unwrap();
+        assert!(journal.len() < 512, "journal carries file contents");
         apply_changes(&journal, &mut parent).unwrap();
         assert_eq!(parent.read_file(r"C:\kept.txt").unwrap(), b"kept");
         assert!(!parent.exists(r"C:\temp.txt"));

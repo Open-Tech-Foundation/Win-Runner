@@ -318,23 +318,12 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_write_file(
         } else {
             unsafe { std::slice::from_raw_parts(buf, len as usize) }
         };
-        let mut content = match ctx.fs.read_file(&path) {
-            Ok(v) => v,
-            Err(_) => return 0,
-        };
         let end = match offset.checked_add(data.len()) {
             Some(v) => v,
             None => return 0,
         };
-        if content.len() < end {
-            if content.try_reserve(end - content.len()).is_err() {
-                native_set_last_error(8); // ERROR_NOT_ENOUGH_MEMORY
-                return 0;
-            }
-            content.resize(end, 0);
-        }
-        content[offset..end].copy_from_slice(data);
-        if ctx.fs.write_file(&path, content).is_err() {
+        if ctx.fs.write_at(&path, offset as u64, data).is_err() {
+            native_set_last_error(112); // ERROR_DISK_FULL
             return 0;
         }
         if let Some(file) = ctx.handles.get_mut(&handle) {
