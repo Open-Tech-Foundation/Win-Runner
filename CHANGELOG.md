@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Read symbolic links the way Node.js does: `DeviceIoControl` with
+  `FSCTL_GET_REPARSE_POINT` returns a link's `REPARSE_DATA_BUFFER`, so
+  `fs.readlink`, `fs.lstat`, and `fs.realpath` work on links such as
+  `C:\Program Files\nodejs\current` instead of stopping at an unsupported
+  `KERNEL32.dll!DeviceIoControl` import. A handle opened through a link now
+  names the link's target, as on Windows (so `GetFinalPathNameByHandleW` and
+  `fs.realpathSync.native` resolve it), unless it was opened with
+  `FILE_FLAG_OPEN_REPARSE_POINT`.
 - `wpkg install nodejs` puts `npm`, `npx`, and `corepack` on the `PATH`, so
   cmd.exe and programs that spawn them (create-vite's `npm install`) find
   them. Batch-file commands in `C:\ProgramData\wpkg\bin` are one-line

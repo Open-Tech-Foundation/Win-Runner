@@ -1416,6 +1416,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "SetFileInformationByHandle" => {
             Some(native_set_file_information_by_handle as *const () as usize as u64)
         }
+        "DeviceIoControl" => Some(native_device_io_control as *const () as usize as u64),
         "GetFinalPathNameByHandleW" => {
             Some(native_get_final_path_name_by_handle_w as *const () as usize as u64)
         }

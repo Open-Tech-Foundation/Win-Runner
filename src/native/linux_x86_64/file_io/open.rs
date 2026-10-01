@@ -150,6 +150,13 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_create_file_w(
     }
     let h = ctx.next;
     ctx.next += 1;
+    // A handle names the file a link leads to, unless the caller opened the
+    // link itself with FILE_FLAG_OPEN_REPARSE_POINT (to read its target).
+    let path = if flags & 0x0020_0000 == 0 {
+        ctx.fs.resolve_links(&path).unwrap_or(path)
+    } else {
+        path
+    };
     // Windows records the canonical path of an opened file, so
     // GetFinalPathNameByHandle never echoes `/`, `..`, or the caller's casing.
     let path = ctx.fs.canonical_path(&path).unwrap_or(path);
@@ -889,6 +896,83 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_get_final_path_name
     unsafe { output.copy_from_nonoverlapping(encoded.as_ptr(), encoded.len()) };
     (encoded.len() - 1) as u32
 }
+/// The `REPARSE_DATA_BUFFER` of a symbolic link to the absolute `target`:
+/// an NT `\??\` substitute name and the plain print name, as
+/// `CreateSymbolicLinkW` stores them.
+pub(in crate::native::linux_x86_64) fn symlink_reparse_data(target: &str) -> Vec<u8> {
+    const IO_REPARSE_TAG_SYMLINK: u32 = 0xa000_000c;
+    let substitute: Vec<u16> = format!(r"\??\{target}").encode_utf16().collect();
+    let print: Vec<u16> = target.encode_utf16().collect();
+    let substitute_bytes = (substitute.len() * 2) as u16;
+    let print_bytes = (print.len() * 2) as u16;
+    let mut data = Vec::new();
+    data.extend_from_slice(&IO_REPARSE_TAG_SYMLINK.to_le_bytes());
+    data.extend_from_slice(&(12 + substitute_bytes + print_bytes).to_le_bytes());
+    data.extend_from_slice(&0u16.to_le_bytes());
+    data.extend_from_slice(&0u16.to_le_bytes()); // SubstituteNameOffset
+    data.extend_from_slice(&substitute_bytes.to_le_bytes());
+    data.extend_from_slice(&substitute_bytes.to_le_bytes()); // PrintNameOffset
+    data.extend_from_slice(&print_bytes.to_le_bytes());
+    data.extend_from_slice(&0u32.to_le_bytes()); // Flags: absolute
+    for unit in substitute.iter().chain(&print) {
+        data.extend_from_slice(&unit.to_le_bytes());
+    }
+    data
+}
+
+/// `DeviceIoControl` on a file handle. `FSCTL_GET_REPARSE_POINT` reads a
+/// symbolic link's target; libuv's `readlink`, `lstat`, and `realpath` use it
+/// on handles opened with `FILE_FLAG_OPEN_REPARSE_POINT`.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::native::linux_x86_64) extern "win64" fn native_device_io_control(
+    handle: u64,
+    code: u32,
+    _input: *const u8,
+    _input_len: u32,
+    output: *mut u8,
+    output_len: u32,
+    returned: *mut u32,
+    overlapped: u64,
+) -> i32 {
+    const FSCTL_GET_REPARSE_POINT: u32 = 0x0009_00a8;
+    if code != FSCTL_GET_REPARSE_POINT || overlapped != 0 {
+        native_set_last_error(1); // ERROR_INVALID_FUNCTION
+        return 0;
+    }
+    let Some(context) = fs_ctx() else {
+        native_set_last_error(6);
+        return 0;
+    };
+    let Ok(ctx) = context.lock() else {
+        native_set_last_error(6);
+        return 0;
+    };
+    let Some(file) = ctx.handles.get(&handle) else {
+        native_set_last_error(6); // ERROR_INVALID_HANDLE
+        return 0;
+    };
+    let Some(target) = ctx.fs.symlink_target(&file.path) else {
+        native_set_last_error(4390); // ERROR_NOT_A_REPARSE_POINT
+        return 0;
+    };
+    let data = symlink_reparse_data(&target);
+    // The 8-byte header alone reports ERROR_MORE_DATA with its length.
+    let copied = data.len().min(output_len as usize);
+    if copied < 8 || output.is_null() {
+        native_set_last_error(122); // ERROR_INSUFFICIENT_BUFFER
+        return 0;
+    }
+    unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), output, copied) };
+    if !returned.is_null() {
+        unsafe { returned.write(copied as u32) };
+    }
+    if copied < data.len() {
+        native_set_last_error(234); // ERROR_MORE_DATA
+        return 0;
+    }
+    1
+}
+
 pub(in crate::native::linux_x86_64) extern "win64" fn native_get_file_information_by_handle(
     handle: u64,
     output: *mut u8,
@@ -1719,5 +1803,30 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_copy_file_w(
             });
             0
         }
+    }
+}
+
+#[cfg(test)]
+mod reparse_tests {
+    use super::symlink_reparse_data;
+
+    fn name(data: &[u8], offset: usize, length: usize) -> String {
+        let units: Vec<u16> = data[20 + offset..20 + offset + length]
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        String::from_utf16(&units).unwrap()
+    }
+
+    #[test]
+    fn a_symlink_reparse_buffer_holds_the_nt_and_print_names() {
+        let target = r"C:\Program Files\nodejs\24.21.0";
+        let data = symlink_reparse_data(target);
+        let u16_at = |at: usize| u16::from_le_bytes([data[at], data[at + 1]]) as usize;
+        assert_eq!(&data[0..4], &0xa000_000cu32.to_le_bytes());
+        assert_eq!(8 + u16_at(4), data.len());
+        assert_eq!(name(&data, u16_at(8), u16_at(10)), format!(r"\??\{target}"));
+        assert_eq!(name(&data, u16_at(12), u16_at(14)), target);
+        assert_eq!(&data[16..20], &0u32.to_le_bytes()); // absolute
     }
 }
