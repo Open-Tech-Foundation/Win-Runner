@@ -270,81 +270,190 @@ pub(super) extern "win64" fn native_accept_ex(
     if native_diagnostic_enabled() {
         eprintln!("native AcceptEx listen={listen_socket:#x} accept={accept_socket:#x} overlapped={overlapped:#x}");
     }
-    if std::thread::Builder::new()
+    // The thread waits on its own descriptor for the listening socket, so
+    // closing the guest's handle (and the number being reused) cannot point
+    // it at another file.
+    let watched = unsafe { dup(listener) };
+    if watched < 0 {
+        native_wsa_set_last_error(10038); // WSAENOTSOCK
+        return 0;
+    }
+    let pending = Arc::new(PendingAccept {
+        completed: AtomicBool::new(false),
+        overlapped,
+    });
+    let listener_state = pending_accepts_of(listen_socket);
+    if let Ok(mut state) = listener_state.accepts.lock() {
+        state.retain(|other| !other.completed.load(Ordering::Acquire));
+        state.push(Arc::clone(&pending));
+    }
+    *listener_state.threads.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+    let thread_state = Arc::clone(&listener_state);
+    let thread_pending = Arc::clone(&pending);
+    let spawned = std::thread::Builder::new()
         .name("winrun-accept-ex".into())
-        .spawn(move || loop {
-            let mut descriptor = NativePollFd {
-                fd: listener,
-                events: 1,
-                revents: 0,
-            };
-            let result = unsafe { poll(&mut descriptor, 1, 250) };
-            if result < 0 {
-                let error = std::io::Error::last_os_error().raw_os_error().unwrap_or(9);
-                if error == 4 {
-                    continue;
-                }
-                return;
-            }
-            if result == 0 {
-                continue;
-            }
-            if native_diagnostic_enabled() {
-                eprintln!("native AcceptEx listener became readable");
-            }
-            let mut peer = [0u8; 128];
-            let mut peer_length = peer.len() as u32;
-            let connection = unsafe { accept(listener, peer.as_mut_ptr(), &mut peer_length) };
-            if connection < 0 {
-                let error = std::io::Error::last_os_error().raw_os_error().unwrap_or(9);
-                if matches!(error, 4 | 11 | 35) {
-                    continue;
-                }
-                return;
-            }
-            if native_diagnostic_enabled() {
-                eprintln!("native AcceptEx accepted fd={connection}");
-            }
-            if unsafe { dup2(connection, accepted) } < 0 {
-                unsafe { close(connection) };
-                return;
-            }
-            unsafe { close(connection) };
-            let mut local = [0u8; 128];
-            let mut local_length = local.len() as u32;
-            let mut peer = [0u8; 128];
-            let mut peer_length = peer.len() as u32;
-            if unsafe { getsockname(accepted, local.as_mut_ptr(), &mut local_length) } != 0
-                || unsafe { getpeername(accepted, peer.as_mut_ptr(), &mut peer_length) } != 0
-            {
-                return;
-            }
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    local.as_ptr(),
-                    (output + address_offsets.0) as *mut u8,
-                    16,
-                );
-                ptr::copy_nonoverlapping(
-                    peer.as_ptr(),
-                    (output + address_offsets.1) as *mut u8,
-                    16,
-                );
-            }
-            native_post_pending_socket_completion(listen_socket, overlapped, 0);
-            if native_diagnostic_enabled() {
-                eprintln!("native AcceptEx completion posted");
-            }
-            break;
-        })
-        .is_err()
-    {
+        .spawn(move || {
+            accept_ex_wait(watched, accepted, output, address_offsets, &thread_pending, listen_socket);
+            unsafe { close(watched) };
+            let mut threads = thread_state.threads.lock().unwrap_or_else(|e| e.into_inner());
+            *threads -= 1;
+            thread_state.exited.notify_all();
+        });
+    if spawned.is_err() {
+        unsafe { close(watched) };
+        *listener_state.threads.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+        pending.completed.store(true, Ordering::Release);
         native_wsa_set_last_error(10055); // WSAENOBUFS
         return 0;
     }
     native_wsa_set_last_error(997); // WSA_IO_PENDING
     native_set_last_error(997); // ERROR_IO_PENDING
     0
+}
+
+/// One `AcceptEx` that has not completed yet.
+struct PendingAccept {
+    /// Set by whichever finishes it first: a connection or a cancellation.
+    completed: AtomicBool,
+    overlapped: u64,
+}
+
+/// A listening socket's pending `AcceptEx` operations and the threads that
+/// wait for their connections.
+#[derive(Default)]
+struct ListenerAccepts {
+    accepts: Mutex<Vec<Arc<PendingAccept>>>,
+    threads: Mutex<usize>,
+    exited: Condvar,
+}
+
+static PENDING_ACCEPTS: LazyLock<Mutex<HashMap<u64, Arc<ListenerAccepts>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn pending_accepts_of(listener: u64) -> Arc<ListenerAccepts> {
+    let mut all = PENDING_ACCEPTS.lock().unwrap_or_else(|e| e.into_inner());
+    Arc::clone(all.entry(listener).or_default())
+}
+
+/// Wait on `watched` (a duplicate of the listening socket) for a connection
+/// and complete `pending` with it; give up once `pending` was cancelled.
+fn accept_ex_wait(
+    watched: i32,
+    accepted: i32,
+    output: usize,
+    address_offsets: (usize, usize),
+    pending: &PendingAccept,
+    listen_socket: u64,
+) {
+    loop {
+        if pending.completed.load(Ordering::Acquire) {
+            return;
+        }
+        let mut descriptor = NativePollFd {
+            fd: watched,
+            events: 1,
+            revents: 0,
+        };
+        let result = unsafe { poll(&mut descriptor, 1, 250) };
+        if result <= 0 {
+            continue; // timeout or EINTR: check for cancellation again
+        }
+        if pending.completed.load(Ordering::Acquire) {
+            return;
+        }
+        if native_diagnostic_enabled() {
+            eprintln!("native AcceptEx listener became readable");
+        }
+        let mut peer = [0u8; 128];
+        let mut peer_length = peer.len() as u32;
+        let connection =
+            unsafe { libc::accept4(watched, peer.as_mut_ptr().cast(), &mut peer_length, libc::SOCK_NONBLOCK) };
+        if connection < 0 {
+            let error = std::io::Error::last_os_error().raw_os_error().unwrap_or(9);
+            if matches!(error, libc::EINTR | libc::EAGAIN | libc::ECONNABORTED) {
+                continue; // another AcceptEx took it, or the client left
+            }
+            // The listener was shut down: its close cancels this operation.
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            continue;
+        }
+        // Blocking like a socket from `socket()`; the guest's ioctlsocket
+        // decides otherwise.
+        unsafe {
+            let flags = libc::fcntl(connection, libc::F_GETFL);
+            libc::fcntl(connection, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+        }
+        if pending.completed.swap(true, Ordering::AcqRel) {
+            unsafe { close(connection) }; // cancelled meanwhile
+            return;
+        }
+        if native_diagnostic_enabled() {
+            eprintln!("native AcceptEx accepted fd={connection}");
+        }
+        if unsafe { dup2(connection, accepted) } < 0 {
+            unsafe { close(connection) };
+            native_post_socket_failure(listen_socket, pending.overlapped, STATUS_CANCELLED);
+            return;
+        }
+        unsafe { close(connection) };
+        write_accept_addresses(accepted, output, address_offsets);
+        native_post_pending_socket_completion(listen_socket, pending.overlapped, 0);
+        if native_diagnostic_enabled() {
+            eprintln!("native AcceptEx completion posted");
+        }
+        return;
+    }
+}
+
+/// Write the accepted socket's local and peer addresses where
+/// `GetAcceptExSockaddrs` reads them, as Windows `sockaddr`s.
+fn write_accept_addresses(accepted: i32, output: usize, offsets: (usize, usize)) {
+    for (offset, peer) in [(offsets.0, false), (offsets.1, true)] {
+        let mut address = [0u8; 128];
+        let mut length = address.len() as u32;
+        let found = unsafe {
+            if peer {
+                getpeername(accepted, address.as_mut_ptr(), &mut length)
+            } else {
+                getsockname(accepted, address.as_mut_ptr(), &mut length)
+            }
+        } == 0;
+        if !found {
+            continue;
+        }
+        // The slot holds a SOCKADDR_STORAGE-sized address (the slot is
+        // `address_length - 16` bytes; libuv passes sizeof(sockaddr_storage)).
+        let length = (length as usize).min(28);
+        let target = (output + offset) as *mut u8;
+        unsafe { ptr::copy_nonoverlapping(address.as_ptr(), target, length) };
+        guest_sockaddr_family(target, length as u32);
+    }
+}
+
+/// Complete every pending `AcceptEx` on `listener` with `STATUS_CANCELLED`
+/// (`ERROR_OPERATION_ABORTED`), as closing a listening socket does on
+/// Windows, and wait for their threads to let go of the socket.
+fn cancel_pending_accepts(listener: u64) {
+    let Some(state) = PENDING_ACCEPTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&listener)
+    else {
+        return;
+    };
+    let accepts = std::mem::take(&mut *state.accepts.lock().unwrap_or_else(|e| e.into_inner()));
+    for pending in accepts {
+        if !pending.completed.swap(true, Ordering::AcqRel) {
+            native_post_socket_failure(listener, pending.overlapped, STATUS_CANCELLED);
+        }
+    }
+    // Wake the threads (their poll reports the shutdown), so the port is
+    // free once closesocket returns.
+    unsafe { shutdown(listener as i32, 2) };
+    let threads = state.threads.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = state
+        .exited
+        .wait_timeout_while(threads, std::time::Duration::from_secs(2), |threads| *threads != 0);
 }
 
 pub(super) extern "win64" fn native_get_accept_ex_sockaddrs(
@@ -1113,6 +1222,9 @@ pub(super) extern "win64" fn native_close_socket(handle: u64) -> i32 {
         native_wsa_set_last_error(10038); // WSAENOTSOCK
         return -1;
     }
+    // Pending AcceptEx operations complete as aborted, through the
+    // completion port the socket is still associated with.
+    cancel_pending_accepts(handle);
     if let Some(process) = process_ctx() {
         if let Ok(mut sockets) = process.socket_handles.lock() {
             sockets.remove(&handle);

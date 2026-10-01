@@ -47,7 +47,6 @@ unsafe extern "C" {
     pub(super) fn ioctl(fd: i32, request: usize, argp: *mut c_void) -> i32;
     pub(super) fn bind(fd: i32, address: *const u8, length: u32) -> i32;
     pub(super) fn listen(fd: i32, backlog: i32) -> i32;
-    pub(super) fn accept(fd: i32, address: *mut u8, length: *mut u32) -> i32;
     pub(super) fn connect(fd: i32, address: *const u8, length: u32) -> i32;
     pub(super) fn send(fd: i32, buffer: *const c_void, length: usize, flags: i32) -> isize;
     pub(super) fn recv(fd: i32, buffer: *mut c_void, length: usize, flags: i32) -> isize;

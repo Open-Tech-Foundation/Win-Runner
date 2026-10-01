@@ -728,3 +728,57 @@ fn official_windows_node_processes_nested_three_deep_have_distinct_ids() {
     assert!(!stdout.contains("panicked"), "{stdout}");
     std::fs::remove_dir_all(scripts).ok();
 }
+
+/// A server on IPv6 loopback (where `localhost` resolves first, as vite
+/// listens) answers the host, reports the peer as IPv6, and once closed
+/// lets Node exit: closing a listener aborts libuv's pending AcceptEx
+/// operations, which otherwise keep the event loop alive forever.
+#[test]
+#[cfg(unix)]
+fn official_windows_node_ipv6_server_answers_and_exits_after_close() {
+    let Ok(node) = std::env::var("WINRUN_NODE_EXE") else {
+        return;
+    };
+    let node = Path::new(&node)
+        .canonicalize()
+        .expect("Windows node.exe exists");
+    let reservation = TcpListener::bind(("::1", 0)).expect("reserve an IPv6 loopback port");
+    let port = reservation.local_addr().unwrap().port();
+    drop(reservation);
+    let source = format!(
+        "const s=require('node:http').createServer((q,r)=>{{r.end(q.socket.remoteFamily+' '+q.socket.remoteAddress);s.close()}});s.listen({port},'::1')"
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_winrun"))
+        .arg(&node)
+        .args(["-e", &source])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start the IPv6 server");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut stream = loop {
+        match TcpStream::connect(("::1", port)) {
+            Ok(stream) => break stream,
+            Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(100)),
+            Err(error) => panic!("server did not listen: {error}"),
+        }
+    };
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.ends_with("IPv6 ::1"), "{response}");
+    // The closed server must let the process exit on its own.
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "{status}");
+            break;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("Node did not exit after closing its server");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}

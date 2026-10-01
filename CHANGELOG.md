@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Closing a listening socket completes its pending `AcceptEx` operations as
+  aborted, as on Windows, so a Node.js server's process exits after
+  `server.close()` instead of waiting forever, and the port is free as soon
+  as `closesocket` returns. Each pending accept waits on its own duplicate of
+  the socket, so a reused descriptor number is never mistaken for it.
+  Accepted IPv6 connections report full addresses with the Windows family,
+  so servers on `::1` (where `localhost` resolves first, as vite listens)
+  see the right peer.
 - Load Node.js native addons built with napi-rs, such as vite 8's rolldown
   bundler, so `npm run dev` and `npm run build` work in a create-vite project:
   - A worker now keeps the executable's export table, so `GetProcAddress`

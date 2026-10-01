@@ -212,6 +212,28 @@ pub(super) extern "win64" fn native_set_file_completion_notification_modes(
 pub(super) fn native_post_socket_completion(socket: u64, overlapped: u64, bytes: u32) {
     native_post_socket_completion_inner(socket, overlapped, bytes, false);
 }
+/// Complete a pending socket operation with a failure `status` (an
+/// NTSTATUS), through the socket's completion port.
+pub(super) fn native_post_socket_failure(socket: u64, overlapped: u64, status: u64) {
+    if overlapped == 0 {
+        return;
+    }
+    let Some(process) = process_ctx() else { return };
+    let association = process
+        .socket_completion_ports
+        .lock()
+        .ok()
+        .and_then(|associations| associations.get(&socket).cloned());
+    native_set_overlapped_status(overlapped, status, 0);
+    if let Some((port, key)) = association {
+        port.post(NativeCompletion {
+            key,
+            overlapped,
+            bytes: 0,
+            status,
+        });
+    }
+}
 pub(super) fn native_post_pending_socket_completion(socket: u64, overlapped: u64, bytes: u32) {
     native_post_socket_completion_inner(socket, overlapped, bytes, true);
 }
