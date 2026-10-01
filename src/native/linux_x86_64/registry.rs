@@ -1416,6 +1416,9 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "FindNextFileW" => Some(native_find_next_file_w as *const () as usize as u64),
         "FindClose" => Some(native_find_close as *const () as usize as u64),
         "CreateThread" => Some(native_create_thread as *const () as usize as u64),
+        "QueueUserWorkItem" => {
+            Some(native_queue_user_work_item as *const () as usize as u64)
+        }
         "ResumeThread" => Some(native_resume_thread as *const () as usize as u64),
         "WaitForSingleObject" => Some(native_wait_for_single_object as *const () as usize as u64),
         "CreateEventW" => Some(native_create_event_w as *const () as usize as u64),

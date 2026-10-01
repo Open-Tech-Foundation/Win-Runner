@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Implement `QueueUserWorkItem`, which libuv uses for console line reads,
+  so `npm create vite@latest` no longer stops at an unsupported
+  `KERNEL32.dll!QueueUserWorkItem` import. Each work item runs on its own
+  guest thread.
 - Match Windows in the file APIs the `fs_paths` oracle probe checks:
   `ERROR_PATH_NOT_FOUND` (not `ERROR_FILE_NOT_FOUND`) when a parent is
   missing or is a file, `ERROR_DIRECTORY` for `file.txt\` and for

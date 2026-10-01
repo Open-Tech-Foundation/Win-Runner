@@ -988,6 +988,35 @@ mod protection_tests {
         assert_eq!(super::native_crt_beginthreadex(0, 0, 0, 0, 0, std::ptr::null_mut()), 0);
     }
 
+    static QUEUED_WORK_EVENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static QUEUED_WORK_CONTEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    extern "win64" fn queued_work_item(context: u64) -> u32 {
+        QUEUED_WORK_CONTEXT.store(context, std::sync::atomic::Ordering::Release);
+        super::native_set_event(QUEUED_WORK_EVENT.load(std::sync::atomic::Ordering::Acquire));
+        0
+    }
+
+    #[test]
+    fn queue_user_work_item_runs_the_callback_on_a_worker_thread() {
+        let done = super::native_create_event_w(0, 1, 0, std::ptr::null());
+        assert_ne!(done, 0);
+        QUEUED_WORK_EVENT.store(done, std::sync::atomic::Ordering::Release);
+        // WT_EXECUTELONGFUNCTION, as libuv's console line reader passes it.
+        assert_eq!(
+            super::native_queue_user_work_item(
+                queued_work_item as *const () as usize as u64,
+                0xc0ffee,
+                0x10,
+            ),
+            1
+        );
+        assert_eq!(super::native_wait_for_single_object(done, 5000), 0);
+        assert_eq!(QUEUED_WORK_CONTEXT.load(std::sync::atomic::Ordering::Acquire), 0xc0ffee);
+        assert_eq!(super::native_queue_user_work_item(0, 0, 0), 0);
+        assert_eq!(super::native_get_last_error(), 87);
+    }
+
     #[test]
     fn open_event_finds_named_events_of_the_process() {
         let name: Vec<u16> = "winrun-open-event-test".encode_utf16().chain([0]).collect();

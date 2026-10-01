@@ -511,6 +511,26 @@ pub(super) extern "win64" fn native_create_thread(
     }
     result
 }
+/// `QueueUserWorkItem(function, context, flags)`: run `function(context)`
+/// on a worker guest thread. libuv queues its console line reader this way
+/// (`WT_EXECUTELONGFUNCTION`), so every item gets its own guest thread with
+/// TEB/TLS set up by `CreateThread`; the caller never sees a handle.
+pub(super) extern "win64" fn native_queue_user_work_item(
+    function: u64,
+    context: u64,
+    _flags: u32,
+) -> i32 {
+    if function == 0 {
+        native_set_last_error(87);
+        return 0;
+    }
+    let handle = native_create_thread(0, 0, function, context, 0, std::ptr::null_mut());
+    if handle == 0 {
+        return 0;
+    }
+    native_close_handle(handle);
+    1
+}
 pub(super) extern "win64" fn native_resume_thread(handle: u64) -> u32 {
     let Some(suspension) = process_ctx().and_then(|process| {
         process.threads.lock().ok().and_then(|threads| {
