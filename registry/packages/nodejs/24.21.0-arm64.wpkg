@@ -3,4 +3,4 @@ version = "24.21.0"
 arch = "arm64"
 url = "https://nodejs.org/download/release/v24.21.0/node-v24.21.0-win-arm64.zip"
 sha256 = "8779b1bde1d39f8d420e3b57aa657b39891af434d3de44a919044cec06785921"
-bin = ["node-v24.21.0-win-arm64/node.exe"]
+bin = ["node-v24.21.0-win-arm64/node.exe", "node-v24.21.0-win-arm64/npm.cmd", "node-v24.21.0-win-arm64/npx.cmd", "node-v24.21.0-win-arm64/corepack.cmd"]

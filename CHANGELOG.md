@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- `wpkg install nodejs` puts `npm`, `npx`, and `corepack` on the `PATH`, so
+  cmd.exe and programs that spawn them (create-vite's `npm install`) find
+  them. Batch-file commands in `C:\ProgramData\wpkg\bin` are one-line
+  forwarding shims instead of links, because a batch file finds its own
+  files through `%~dp0`. Node.js installed before this change needs
+  `wpkg remove nodejs` and `wpkg install nodejs` (from the cache) to get them.
 - Support raw-mode console input, so `npm create vite@latest`'s prompts
   (project name, framework and variant menus, yes/no) work with typing, arrow
   keys, and Enter instead of failing with `Error: read UNKNOWN`.

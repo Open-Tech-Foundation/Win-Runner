@@ -3190,6 +3190,38 @@ IF EXIST \"%NPM_PREFIX_NPM_CLI_JS%\" (\r
     }
 
     #[test]
+    fn a_wpkg_shim_on_path_runs_npm_cmd_from_its_own_directory() {
+        let mut host = FakeHost::new();
+        let node_dir = r"C:\Program Files\nodejs\current\node-v24";
+        host.file(&format!(r"{node_dir}\npm.cmd"), NPM_CMD);
+        host.program(&format!(r"{node_dir}\node.exe"), 0, b"C:\\nowhere\r\n");
+        host.file(&format!(r"{node_dir}\node_modules\npm\bin\npm-cli.js"), "");
+        host.fs.mkdir(r"C:\ProgramData\wpkg\bin").unwrap();
+        host.file(
+            r"C:\ProgramData\wpkg\bin\npm.cmd",
+            &format!("@\"{node_dir}\\npm.cmd\" %*\r\n"),
+        );
+        let code = run_command_line(
+            &mut host,
+            r#"cmd /d /s /c "npm install""#,
+            vec![
+                ("PATH".to_string(), r"C:\Windows;C:\ProgramData\wpkg\bin".to_string()),
+                ("PATHEXT".to_string(), ".COM;.EXE;.BAT;.CMD".to_string()),
+            ],
+            r"C:\Users\runner".to_string(),
+        );
+        assert_eq!(code, 0);
+        let lines: Vec<&str> = host.runs.iter().map(|run| run.command_line.as_str()).collect();
+        assert_eq!(
+            lines,
+            [
+                r#""C:\Program Files\nodejs\current\node-v24\\node.exe" "C:\Program Files\nodejs\current\node-v24\\node_modules\npm\bin\npm-prefix.js""#,
+                r#""C:\Program Files\nodejs\current\node-v24\\node.exe" "C:\Program Files\nodejs\current\node-v24\\node_modules\npm\bin\npm-cli.js" install"#,
+            ]
+        );
+    }
+
+    #[test]
     fn subroutines_shift_setlocal_and_exit_b() {
         let mut host = FakeHost::new();
         host.file(

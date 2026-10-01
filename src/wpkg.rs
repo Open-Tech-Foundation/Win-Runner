@@ -1078,18 +1078,49 @@ fn set_default(
     for executable in &entry.bin {
         let exposed = expose_path(executable)?;
         let target = format!(r"{}\{}", current, executable.replace('/', "\\"));
-        fs.create_symlink(&exposed, &target, false)
-            .map_err(|error| format!("wpkg: cannot expose {executable}: {error}"))?;
+        // A batch file finds its own files through `%~dp0`, which names the
+        // link's directory, so batch commands get a forwarding shim instead.
+        let exposed_result = if is_batch(executable) {
+            fs.write_file(&exposed, shim_contents(&target))
+        } else {
+            fs.create_symlink(&exposed, &target, false)
+        };
+        exposed_result.map_err(|error| format!("wpkg: cannot expose {executable}: {error}"))?;
     }
     package.default = version.to_string();
     Ok(())
 }
 
-/// Command links this package may replace: links into its own directory.
+/// Command links and shims this package may replace: those that lead into
+/// its own directory.
 fn owns_link(fs: &WinFs, name: &str, path: &str) -> bool {
     let prefix = format!(r"{}\", package_dir(name)).to_ascii_lowercase();
-    fs.symlink_target(path)
-        .is_some_and(|target| target.to_ascii_lowercase().starts_with(&prefix))
+    let target = if fs.is_symlink(path) {
+        fs.symlink_target(path)
+    } else if is_batch(path) {
+        fs.read_file(path).ok().and_then(|data| shim_target(&data))
+    } else {
+        None
+    };
+    target.is_some_and(|target| target.to_ascii_lowercase().starts_with(&prefix))
+}
+
+fn is_batch(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".cmd") || lower.ends_with(".bat")
+}
+
+/// A one-line batch file that runs `target` with the same arguments. Control
+/// passes to `target` without `call`, so its exit code is the shim's.
+fn shim_contents(target: &str) -> Vec<u8> {
+    format!("@\"{target}\" %*\r\n").into_bytes()
+}
+
+/// The target of a shim written by [`shim_contents`].
+fn shim_target(data: &[u8]) -> Option<String> {
+    let line = std::str::from_utf8(data).ok()?.trim_end();
+    let target = line.strip_prefix("@\"")?.strip_suffix("\" %*")?;
+    (!target.contains('"') && !target.contains('\n')).then(|| target.to_string())
 }
 
 fn check_bin_conflicts(fs: &WinFs, name: &str, bins: &[String]) -> Result<(), String> {
@@ -1108,11 +1139,18 @@ fn check_bin_conflicts(fs: &WinFs, name: &str, bins: &[String]) -> Result<(), St
 
 fn remove_owned_links(fs: &mut WinFs, name: &str) -> Result<(), String> {
     let bin_prefix = format!(r"{BIN}\").to_ascii_lowercase();
+    let shims = fs
+        .list_dir(BIN)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|file| format!(r"{BIN}\{file}"))
+        .filter(|path| is_batch(path) && !fs.is_symlink(path));
     let owned: Vec<String> = fs
         .snapshot_symlinks()
         .into_iter()
         .map(|(path, _, _)| path)
         .filter(|path| path.to_ascii_lowercase().starts_with(&bin_prefix))
+        .chain(shims)
         .filter(|path| owns_link(fs, name, path))
         .collect();
     for path in owned {
@@ -1444,7 +1482,7 @@ fn validate_bin(path: &str) -> Result<(), String> {
         || normalized
             .split('/')
             .any(|part| part.is_empty() || part == "." || part == ".." || part.trim().is_empty())
-        || !normalized.to_ascii_lowercase().ends_with(".exe")
+        || !(normalized.to_ascii_lowercase().ends_with(".exe") || is_batch(&normalized))
     {
         return Err(format!("wpkg: unsafe or non-executable bin path: {path}"));
     }
@@ -1783,6 +1821,46 @@ mod tests {
         );
         let output = run(&mut fs, &repo, &["install", "python@3.14.0"]);
         assert!(output.contains("is already installed"), "{output}");
+    }
+
+    #[test]
+    fn batch_commands_are_exposed_as_shims_that_keep_their_own_directory() {
+        let mut repo = MemoryRepo::default();
+        repo.package("nodejs", "24.21.0", "x64", &["node/node.exe", "node/npm.cmd"], &[]);
+        let mut fs = WinFs::ephemeral_runner();
+        run(&mut fs, &repo, &["install", "nodejs"]);
+        let shim = r"C:\ProgramData\wpkg\bin\npm.cmd";
+        assert!(!fs.is_symlink(shim));
+        // `%~dp0` inside npm.cmd must name the Node.js directory, so the shim
+        // runs the batch file at its own path instead of linking to it.
+        assert_eq!(
+            fs.read_file(shim).unwrap(),
+            b"@\"C:\\Program Files\\nodejs\\current\\node\\npm.cmd\" %*\r\n"
+        );
+        assert!(fs.is_symlink(r"C:\ProgramData\wpkg\bin\node.exe"));
+
+        // Another package cannot take over the shim; removing nodejs removes it.
+        repo.package("other", "1.0.0", "x64", &["npm.cmd"], &[]);
+        let error = execute(&mut fs, &repo, "x64", &args(&["install", "other"])).unwrap_err();
+        assert!(error.contains(r"binary path already exists"), "{error}");
+        run(&mut fs, &repo, &["remove", "nodejs"]);
+        assert!(!fs.exists(shim));
+        run(&mut fs, &repo, &["install", "other"]);
+        assert_eq!(
+            fs.read_file(shim).unwrap(),
+            b"@\"C:\\Program Files\\other\\current\\npm.cmd\" %*\r\n"
+        );
+    }
+
+    #[test]
+    fn shim_targets_round_trip_and_reject_other_batch_files() {
+        let target = r"C:\Program Files\nodejs\current\npm.cmd";
+        assert_eq!(super::shim_target(&super::shim_contents(target)).as_deref(), Some(target));
+        assert_eq!(super::shim_target(b"@echo off\r\nnode %*\r\n"), None);
+        assert_eq!(super::shim_target(b"@\"a\" b\" %*"), None);
+        assert!(super::validate_bin("bin/tool.cmd").is_ok());
+        assert!(super::validate_bin("bin/tool.BAT").is_ok());
+        assert!(super::validate_bin("bin/tool.ps1").is_err());
     }
 
     #[test]
