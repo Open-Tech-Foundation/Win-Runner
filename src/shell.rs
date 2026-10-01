@@ -1042,14 +1042,22 @@ impl Shell {
         sink: Option<&backend::OutputSink>,
     ) -> Result<(), String> {
         let repository = wpkg::EmbeddedRepository::new()?;
+        // Live output to a terminal redraws the download bar in place;
+        // captured or piped output keeps only the finished lines.
+        let terminal = sink.is_some() && std::io::IsTerminal::is_terminal(&std::io::stdout());
+        let mut status = crate::progress::StatusWriter::new(terminal);
+        let emit = |text: &str, out: &mut Vec<u8>| {
+            if text.is_empty() {
+                return;
+            }
+            if let Some(sink) = sink {
+                sink(backend::OutputChannel::Stdout, text.as_bytes());
+            } else {
+                out.extend_from_slice(text.as_bytes());
+            }
+        };
         let result = {
-            let mut report = |message: &str| {
-                if let Some(sink) = sink {
-                    sink(backend::OutputChannel::Stdout, message.as_bytes());
-                } else {
-                    out.extend_from_slice(message.as_bytes());
-                }
-            };
+            let mut report = |message: &str| emit(&status.render(message), out);
             wpkg::execute_with_progress(
                 &mut self.fs,
                 &repository,
@@ -1058,6 +1066,7 @@ impl Shell {
                 &mut report,
             )
         };
+        emit(&status.finish(), out);
         let output = result.map_err(|error| format!("❌ wpkg failed: {error}"))?;
         out.extend_from_slice(&output);
         self.last_code = 0;

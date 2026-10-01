@@ -11,7 +11,7 @@
 //! command through it, so switching the default rewrites one link and never
 //! leaves a command pointing at removed files.
 
-use crate::{install, winfs::WinFs};
+use crate::{install, install::DownloadProgress, progress, winfs::WinFs};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
@@ -44,10 +44,13 @@ pub trait Repository {
     fn fetch_with_progress(
         &self,
         path_or_url: &str,
-        progress: &mut dyn FnMut(u8),
+        progress: &mut dyn FnMut(DownloadProgress),
     ) -> Result<Vec<u8>, String> {
         let bytes = self.fetch(path_or_url)?;
-        progress(100);
+        progress(DownloadProgress {
+            received: bytes.len() as u64,
+            total: Some(bytes.len() as u64),
+        });
         Ok(bytes)
     }
 }
@@ -91,13 +94,18 @@ impl Repository for EmbeddedRepository {
     fn fetch_with_progress(
         &self,
         path_or_url: &str,
-        progress: &mut dyn FnMut(u8),
+        progress: &mut dyn FnMut(DownloadProgress),
     ) -> Result<Vec<u8>, String> {
         if path_or_url.starts_with("https://") || path_or_url.starts_with("http://") {
             return install::fetch_url_with_progress(path_or_url, 300, progress)
                 .map_err(|error| format!("wpkg: {error}"));
         }
-        self.fetch(path_or_url).inspect(|_| progress(100))
+        self.fetch(path_or_url).inspect(|bytes| {
+            progress(DownloadProgress {
+                received: bytes.len() as u64,
+                total: Some(bytes.len() as u64),
+            })
+        })
     }
 }
 
@@ -130,7 +138,7 @@ impl Repository for HttpRepository {
     fn fetch_with_progress(
         &self,
         path_or_url: &str,
-        progress: &mut dyn FnMut(u8),
+        progress: &mut dyn FnMut(DownloadProgress),
     ) -> Result<Vec<u8>, String> {
         let url = if path_or_url.starts_with("https://") || path_or_url.starts_with("http://") {
             path_or_url.to_string()
@@ -573,6 +581,107 @@ fn install_recursive(
     Ok(kept_default.map(|default| (default, manifest.version)))
 }
 
+/// Download and verify a package archive, showing a progress bar.
+fn download_archive(
+    repository: &dyn Repository,
+    manifest: &Manifest,
+    progress: &mut dyn FnMut(&str),
+) -> Result<Vec<u8>, String> {
+    progress(&format!(
+        "⬇️ Downloading {} {}\n",
+        manifest.name, manifest.version
+    ));
+    let started = std::time::Instant::now();
+    let mut finished = false;
+    let archive = repository.fetch_with_progress(&manifest.url, &mut |status| {
+        if finished {
+            return;
+        }
+        let seconds = started.elapsed().as_secs_f64();
+        let rate = (seconds > 0.25).then(|| status.received as f64 / seconds);
+        finished = status.total == Some(status.received);
+        let bar = progress::download_bar(status.received, status.total, rate);
+        // A transient line until the download ends; the full bar stays.
+        progress(&format!("{bar}{}", if finished { "\n" } else { "\r" }));
+    })?;
+    progress(&format!(
+        "🔎 Verifying {} {}...\n",
+        manifest.name, manifest.version
+    ));
+    let actual = install::sha256_hex(&archive);
+    if !actual.eq_ignore_ascii_case(&manifest.sha256) {
+        return Err(format!(
+            "wpkg: SHA-256 mismatch for {} {} (expected {}, got {actual})",
+            manifest.name, manifest.version, manifest.sha256
+        ));
+    }
+    Ok(archive)
+}
+
+/// Verified archives shared by every session on this machine, named by
+/// SHA-256, so a new disk installs a package without downloading it again.
+/// `WINRUN_CACHE_DIR` moves it; the default follows the XDG cache directory.
+fn host_cache_dir() -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    {
+        TEST_HOST_CACHE.with(|dir| dir.borrow().clone())
+    }
+    #[cfg(not(test))]
+    {
+        let non_empty = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty());
+        if let Some(dir) = non_empty("WINRUN_CACHE_DIR") {
+            return Some(std::path::PathBuf::from(dir).join("wpkg"));
+        }
+        if let Some(dir) =
+            non_empty("XDG_CACHE_HOME").filter(|dir| std::path::Path::new(dir).is_absolute())
+        {
+            return Some(std::path::PathBuf::from(dir).join("winrun").join("wpkg"));
+        }
+        non_empty("HOME").map(|home| {
+            std::path::PathBuf::from(home)
+                .join(".cache")
+                .join("winrun")
+                .join("wpkg")
+        })
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_HOST_CACHE: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn host_cache_key(sha256: &str) -> Option<String> {
+    (sha256.len() == 64 && sha256.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| sha256.to_ascii_lowercase())
+}
+
+/// The cached archive with this SHA-256, re-verified.
+fn read_host_cache(sha256: &str) -> Option<Vec<u8>> {
+    let path = host_cache_dir()?.join(host_cache_key(sha256)?);
+    std::fs::read(path)
+        .ok()
+        .filter(|bytes| install::sha256_hex(bytes).eq_ignore_ascii_case(sha256))
+}
+
+/// Keep a verified archive; written to a temporary name, then renamed, so a
+/// reader never sees a partial file.
+fn write_host_cache(sha256: &str, archive: &[u8]) -> Result<(), String> {
+    let Some(dir) = host_cache_dir() else {
+        return Ok(());
+    };
+    let key = host_cache_key(sha256).ok_or("invalid SHA-256")?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let partial = dir.join(format!(".{key}.{}.part", std::process::id()));
+    std::fs::write(&partial, archive)
+        .and_then(|_| std::fs::rename(&partial, dir.join(&key)))
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&partial);
+            format!("cannot write {}: {e}", dir.display())
+        })
+}
+
 /// Extract one verified version into its own directory. The first version
 /// of a package becomes its default; later ones leave the default alone and
 /// return it so the caller can tell the user how to switch.
@@ -596,29 +705,24 @@ fn install_version(
             archive
         }
         None => {
-            progress(&format!(
-                "⬇️ Downloading {} {}...\n",
-                manifest.name, manifest.version
-            ));
-            let archive = repository.fetch_with_progress(&manifest.url, &mut |percent| {
-                if percent == 100 || percent.is_multiple_of(10) {
+            let archive = match read_host_cache(&manifest.sha256) {
+                Some(archive) => {
                     progress(&format!(
-                        "⬇️ Downloading {} {}: {percent}%\n",
-                        manifest.name, manifest.version
+                        "📦 Using downloaded {} {} from {}\n",
+                        manifest.name,
+                        manifest.version,
+                        host_cache_dir().map_or_else(String::new, |dir| dir.display().to_string())
                     ));
+                    archive
                 }
-            })?;
-            progress(&format!(
-                "🔎 Verifying {} {}...\n",
-                manifest.name, manifest.version
-            ));
-            let actual = install::sha256_hex(&archive);
-            if !actual.eq_ignore_ascii_case(&manifest.sha256) {
-                return Err(format!(
-                    "wpkg: SHA-256 mismatch for {} {} (expected {}, got {actual})",
-                    manifest.name, manifest.version, manifest.sha256
-                ));
-            }
+                None => {
+                    let archive = download_archive(repository, manifest, progress)?;
+                    if let Err(error) = write_host_cache(&manifest.sha256, &archive) {
+                        progress(&format!("⚠️ Not kept for later installs: {error}\n"));
+                    }
+                    archive
+                }
+            };
             // Only a verified archive is cached; a stale or damaged copy is
             // replaced.
             fs.mkdir(CACHE)
@@ -1965,7 +2069,13 @@ mod tests {
         )
         .unwrap();
         assert!(progress[0].contains("⬇️ Downloading tool 1.0"));
-        assert!(progress.iter().any(|message| message.contains("100%")));
+        // The finished bar is a permanent line; updates before it are
+        // transient (`\r`).
+        let bar = progress
+            .iter()
+            .find(|message| message.ends_with('\n') && message.contains('█'))
+            .expect("a finished download bar");
+        assert!(crate::progress::strip_ansi(bar).contains(&"█".repeat(30)), "{bar:?}");
         assert!(progress
             .iter()
             .any(|message| message.contains("🔎 Verifying")));
@@ -2239,6 +2349,58 @@ mod tests {
             fs.read_file(r"C:\ProgramData\wpkg\bin\tool.exe").unwrap(),
             b"MZ 1.0"
         );
+    }
+
+    /// Point the shared download cache at a fresh directory for this test.
+    fn with_host_cache() -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let dir = std::env::temp_dir().join(format!(
+            "wpkg-host-cache-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        super::TEST_HOST_CACHE.with(|cache| *cache.borrow_mut() = Some(dir.clone()));
+        dir
+    }
+
+    #[test]
+    fn a_new_disk_installs_from_the_shared_download_cache() {
+        let host = with_host_cache();
+        let mut repo = MemoryRepo::default();
+        repo.package("tool", "1.0", "x64", &["tool.exe"], &[]);
+        let url = "https://packages.invalid/tool-1.0-x64.zip";
+        let archive = repo.files[url].clone();
+        let mut first = WinFs::ephemeral_runner();
+        let progress = install_with_progress(&mut first, &repo, "tool");
+        assert!(progress[0].contains("Downloading tool 1.0"), "{progress:?}");
+        let key = install::sha256_hex(&archive).to_ascii_lowercase();
+        assert_eq!(std::fs::read(host.join(&key)).unwrap(), archive);
+        assert_eq!(std::fs::read_dir(&host).unwrap().count(), 1); // no partial file
+
+        // A fresh disk (a new session) with the network gone.
+        repo.files.remove(url);
+        let mut second = WinFs::ephemeral_runner();
+        let progress = install_with_progress(&mut second, &repo, "tool");
+        assert!(progress[0].starts_with("📦 Using downloaded tool 1.0"), "{progress:?}");
+        assert!(!progress.iter().any(|line| line.contains("Downloading")));
+        assert_eq!(
+            second.read_file(r"C:\ProgramData\wpkg\bin\tool.exe").unwrap(),
+            b"MZ 1.0"
+        );
+        // The disk's own cache is filled too, for snapshots and offline use.
+        assert_eq!(
+            second.read_file(r"C:\ProgramData\wpkg\cache\tool#1.0#x64.zip").unwrap(),
+            archive
+        );
+
+        // A damaged shared copy is ignored and replaced by a new download.
+        std::fs::write(host.join(&key), b"damaged").unwrap();
+        repo.add(url, archive.clone());
+        let mut third = WinFs::ephemeral_runner();
+        let progress = install_with_progress(&mut third, &repo, "tool");
+        assert!(progress[0].contains("Downloading tool 1.0"), "{progress:?}");
+        assert_eq!(std::fs::read(host.join(&key)).unwrap(), archive);
+        std::fs::remove_dir_all(host).ok();
     }
 
     #[test]

@@ -7,6 +7,7 @@ pub mod install;
 pub mod instance;
 pub mod native;
 pub mod pe;
+pub mod progress;
 pub mod protocol;
 pub mod ps1;
 pub mod reg_command;

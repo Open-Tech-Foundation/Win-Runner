@@ -730,6 +730,13 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Share downloaded wpkg archives across sessions: verified archives are kept
+  on the host by SHA-256 (`$XDG_CACHE_HOME/winrun/wpkg`, or
+  `$WINRUN_CACHE_DIR/wpkg`), so a new disk installs a package it has seen
+  before without downloading it again. Each copy is verified before use.
+- Show wpkg downloads as a colored, winget-style progress bar with the bytes
+  received, total size, and speed, redrawn in place on a terminal (plain,
+  with only the finished bar, when piped; `NO_COLOR` turns colors off).
 - Windows-oracle probes `links` (symbolic-link creation, final paths through
   links, reparse data) and `pool_console` (`QueueUserWorkItem`,
   `MapVirtualKeyW`, console input functions on a non-console handle), so the

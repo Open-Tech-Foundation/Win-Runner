@@ -391,14 +391,15 @@ fn process_alive(pid: u32) -> bool {
 }
 
 /// The owning process of a Win-Runner temporary in the temp directory:
-/// session directories, worker request directories, and the single-file
-/// disks of earlier versions.
+/// session directories, worker request directories, download header files,
+/// and the single-file disks of earlier versions.
 fn temporary_owner(name: &str) -> Option<u32> {
     let rest = [
         SESSION_PREFIX,
         "winrun-child-worker-",
         "winrun-worker-",
         "winrun-disk-",
+        "winrun-download-",
     ]
     .iter()
     .find_map(|prefix| name.strip_prefix(prefix))?;
@@ -542,6 +543,7 @@ mod tests {
         assert_eq!(temporary_owner("winrun-session-77-1"), Some(77));
         assert_eq!(temporary_owner("winrun-worker-5-2"), Some(5));
         assert_eq!(temporary_owner("winrun-child-worker-6-3"), Some(6));
+        assert_eq!(temporary_owner("winrun-download-8-1.tmp"), Some(8));
         assert_eq!(temporary_owner("winrun-disk-x"), None);
         assert_eq!(temporary_owner("other-1-2"), None);
 

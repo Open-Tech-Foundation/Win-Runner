@@ -1,9 +1,6 @@
 //! Shared HTTPS, ZIP, and checksum helpers for guest package data and snapshots.
 
-use std::{
-    io::{BufRead, BufReader, Read},
-    process::Stdio,
-};
+use std::{io::Read, process::Stdio};
 
 /// Download bytes over HTTPS via `curl`. Clear error when curl is missing.
 pub fn fetch_url(url: &str, max_time_secs: u64) -> Result<Vec<u8>, String> {
@@ -34,16 +31,40 @@ pub fn fetch_url(url: &str, max_time_secs: u64) -> Result<Vec<u8>, String> {
     Ok(out.stdout)
 }
 
-/// Download bytes over HTTPS while forwarding curl's progress meter as
-/// monotonically increasing whole percentages.
+/// How much of a download has arrived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DownloadProgress {
+    pub received: u64,
+    /// The final response's `Content-Length`, when the server sends one.
+    pub total: Option<u64>,
+}
+
+/// Download bytes over HTTPS, reporting the bytes received as they stream
+/// in (at most every 100 ms, and once at the end).
 pub fn fetch_url_with_progress(
     url: &str,
     max_time_secs: u64,
-    mut progress: impl FnMut(u8),
+    mut progress: impl FnMut(DownloadProgress),
 ) -> Result<Vec<u8>, String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_DOWNLOAD: AtomicU64 = AtomicU64::new(1);
+    // curl writes each response's headers here before its body, so the
+    // final response's length is known once body bytes arrive.
+    let headers = std::env::temp_dir().join(format!(
+        "winrun-download-{}-{}.tmp",
+        std::process::id(),
+        NEXT_DOWNLOAD.fetch_add(1, Ordering::Relaxed)
+    ));
+    struct RemoveOnDrop<'a>(&'a std::path::Path);
+    impl Drop for RemoveOnDrop<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(self.0);
+        }
+    }
+    let _headers_guard = RemoveOnDrop(&headers);
     let mut child = std::process::Command::new("curl")
         .args([
-            "--progress-bar",
+            "--silent",
             "--show-error",
             "--fail",
             "--location",
@@ -51,56 +72,56 @@ pub fn fetch_url_with_progress(
             &max_time_secs.to_string(),
             "-A",
             "winrun/0.1.0",
-            url,
+            "--dump-header",
         ])
+        .arg(&headers)
+        .arg(url)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|_| "cannot run curl: install it to use remote sources".to_string())?;
-
-    let stdout = child
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "curl did not provide an error stream".to_string())?;
+    let stderr_reader = std::thread::spawn(move || {
+        let mut message = Vec::new();
+        let _ = stderr.read_to_end(&mut message);
+        message
+    });
+    let mut stdout = child
         .stdout
         .take()
         .ok_or_else(|| "curl did not provide a download stream".to_string())?;
-    let stdout_reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let result = BufReader::new(stdout).read_to_end(&mut bytes);
-        (result, bytes)
-    });
-
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "curl did not provide a progress stream".to_string())?;
-    let mut stderr_reader = BufReader::new(stderr);
-    let mut stderr_message = Vec::new();
-    let mut progress_line = Vec::new();
-    let mut last_percent = 0;
+    let mut bytes = Vec::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    let mut total = None;
+    let mut reported = std::time::Instant::now();
     loop {
-        progress_line.clear();
-        let read = stderr_reader
-            .read_until(b'\r', &mut progress_line)
-            .map_err(|error| format!("cannot read curl progress: {error}"))?;
-        if read == 0 {
-            break;
+        let read = match stdout.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(format!("cannot read curl download: {error}")),
+        };
+        bytes.extend_from_slice(&chunk[..read]);
+        if total.is_none() {
+            total = std::fs::read_to_string(&headers)
+                .ok()
+                .and_then(|text| final_content_length(&text));
         }
-        if let Some(percent) = curl_progress_percent(&progress_line) {
-            if percent > last_percent {
-                last_percent = percent;
-                progress(percent);
-            }
-        } else {
-            stderr_message.extend_from_slice(&progress_line);
+        if reported.elapsed() >= std::time::Duration::from_millis(100) {
+            reported = std::time::Instant::now();
+            progress(DownloadProgress {
+                received: bytes.len() as u64,
+                total,
+            });
         }
     }
-
     let status = child
         .wait()
         .map_err(|error| format!("cannot wait for curl: {error}"))?;
-    let (stdout_result, bytes) = stdout_reader
-        .join()
-        .map_err(|_| "curl download reader stopped unexpectedly".to_string())?;
-    stdout_result.map_err(|error| format!("cannot read curl download: {error}"))?;
+    let stderr_message = stderr_reader.join().unwrap_or_default();
     if !status.success() {
         let tail = String::from_utf8_lossy(&stderr_message);
         return Err(format!(
@@ -112,29 +133,26 @@ pub fn fetch_url_with_progress(
             }
         ));
     }
-    if last_percent < 100 {
-        progress(100);
-    }
+    progress(DownloadProgress {
+        received: bytes.len() as u64,
+        total: Some(bytes.len() as u64),
+    });
     Ok(bytes)
 }
 
-fn curl_progress_percent(line: &[u8]) -> Option<u8> {
-    let percent_index = line.iter().rposition(|byte| *byte == b'%')?;
-    let number_end = percent_index;
-    let mut number_start = number_end;
-    while number_start > 0
-        && (line[number_start - 1].is_ascii_digit() || line[number_start - 1] == b'.')
-    {
-        number_start -= 1;
-    }
-    let number = std::str::from_utf8(&line[number_start..number_end])
-        .ok()?
-        .parse::<f32>()
-        .ok()?;
-    if !(0.0..=100.0).contains(&number) {
-        return None;
-    }
-    Some(number.round() as u8)
+/// The `Content-Length` of the last response in a `curl --dump-header`
+/// file, which lists every redirect's headers before the final ones.
+fn final_content_length(headers: &str) -> Option<u64> {
+    let last = headers
+        .split("\r\n\r\n")
+        .filter(|block| block.trim_start().starts_with("HTTP/"))
+        .last()?;
+    last.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse().ok())?
+    })
 }
 
 /// One ZIP local-header entry (directories end in `/`).
@@ -398,11 +416,16 @@ mod tests {
     }
 
     #[test]
-    fn parses_curl_progress_bar_percentages() {
-        assert_eq!(curl_progress_percent(b"################ 25.0%\r"), Some(25));
-        assert_eq!(curl_progress_percent(b"100.0%\r"), Some(100));
-        assert_eq!(curl_progress_percent(b"curl: (22) 404 not found\n"), None);
-        assert_eq!(curl_progress_percent(b""), None);
+    fn reads_the_final_responses_length_after_redirects() {
+        let headers = "HTTP/1.1 302 Found\r\nLocation: /x\r\nContent-Length: 5\r\n\r\n\
+            HTTP/2 200\r\ncontent-type: application/zip\r\ncontent-length: 33554432\r\n\r\n";
+        assert_eq!(final_content_length(headers), Some(33_554_432));
+        // Not yet received, or no length (chunked).
+        assert_eq!(final_content_length(""), None);
+        assert_eq!(
+            final_content_length("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"),
+            None
+        );
     }
 
     #[test]
