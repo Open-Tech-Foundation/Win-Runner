@@ -28,10 +28,10 @@ fn run_shell(rg: &Path, commands: &str) -> Output {
 }
 
 #[test]
+#[ignore = "requires WINRUN_RG_EXE; run explicitly with --ignored"]
 fn windows_ripgrep_runs_version_and_searches_guest_files() {
-    let Some(rg) = rg_path() else {
-        return;
-    };
+    let rg =
+        rg_path().expect("configure the fixture environment variable before running this test");
     let version = Command::new(env!("CARGO_BIN_EXE_winrun"))
         .arg(&rg)
         .arg("--version")
@@ -73,10 +73,10 @@ fn windows_ripgrep_runs_version_and_searches_guest_files() {
 }
 
 #[test]
+#[ignore = "requires WINRUN_RG_EXE; run explicitly with --ignored"]
 fn windows_ripgrep_lists_files_filters_globs_and_reports_missing_paths() {
-    let Some(rg) = rg_path() else {
-        return;
-    };
+    let rg =
+        rg_path().expect("configure the fixture environment variable before running this test");
     let listing = run_shell(&rg, "New-Item C:\\data -ItemType Directory\nSet-Content C:\\data\\one.txt 'error: one'\nSet-Content C:\\data\\two.log 'error: two'\n{rg} --color never --files C:\\data\nexit\n");
     assert_eq!(
         listing.status.code(),

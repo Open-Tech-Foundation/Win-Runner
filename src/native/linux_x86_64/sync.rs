@@ -25,142 +25,181 @@ pub(super) extern "win64" fn native_initialize_critical_section_and_spin_count(
 pub(super) extern "win64" fn native_initialize_critical_section(section: *mut u8) {
     let _ = native_initialize_critical_section_ex(section, 0, 0);
 }
-pub(super) extern "win64" fn native_initialize_srw_lock(lock: *mut u64) {
-    if !lock.is_null() {
-        unsafe { lock.write_unaligned(0) };
-    }
-}
-// The guard fields are held for their lock lifetime and released by Drop.
-#[allow(dead_code)]
-enum HeldSrwLock {
-    Shared(std::sync::RwLockReadGuard<'static, ()>),
-    Exclusive(std::sync::RwLockWriteGuard<'static, ()>),
-}
-thread_local! {
-    static HELD_SRW_LOCKS: std::cell::RefCell<Vec<(usize, HeldSrwLock)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-fn native_srw_lock(lock: *mut u64) -> Option<&'static std::sync::RwLock<()>> {
-    if lock.is_null() || (lock as usize) % std::mem::align_of::<AtomicU64>() != 0 {
+// Windows stores these synchronization objects in one pointer-sized word and
+// requires no destructor. Keep state inline; Linux futex queues exist only
+// while a thread is waiting, so object churn never allocates permanent locks.
+fn sync_word<'a>(ptr: *mut u64) -> Option<&'a AtomicU64> {
+    if ptr.is_null() || (ptr as usize) % 8 != 0 {
         return None;
     }
-    let slot = unsafe { &*(lock as *const AtomicU64) };
-    let mut value = slot.load(Ordering::Acquire);
-    if value == 0 {
-        let created = Box::into_raw(Box::new(std::sync::RwLock::new(()))) as u64;
-        match slot.compare_exchange(0, created, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => value = created,
-            Err(existing) => {
-                unsafe { drop(Box::from_raw(created as *mut std::sync::RwLock<()>)) };
-                value = existing;
-            }
-        }
-    }
-    (value != 0).then(|| unsafe { &*(value as *const std::sync::RwLock<()>) })
+    Some(unsafe { &*ptr.cast::<AtomicU64>() })
 }
-pub(super) extern "win64" fn native_acquire_srw_lock_exclusive(lock: *mut u64) {
-    if let Some(host) = native_srw_lock(lock) {
-        let guard = host.write().unwrap_or_else(|poison| poison.into_inner());
-        HELD_SRW_LOCKS.with(|held| {
-            held.borrow_mut()
-                .push((lock as usize, HeldSrwLock::Exclusive(guard)))
-        });
+fn wake_word(word: &AtomicU64, all: bool) {
+    unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            word as *const AtomicU64,
+            libc::FUTEX_WAKE | libc::FUTEX_PRIVATE_FLAG,
+            if all { i32::MAX } else { 1 },
+        );
     }
 }
-pub(super) extern "win64" fn native_acquire_srw_lock_shared(lock: *mut u64) {
-    if let Some(host) = native_srw_lock(lock) {
-        let guard = host.read().unwrap_or_else(|poison| poison.into_inner());
-        HELD_SRW_LOCKS.with(|held| {
-            held.borrow_mut()
-                .push((lock as usize, HeldSrwLock::Shared(guard)))
-        });
-    }
-}
-pub(super) extern "win64" fn native_try_acquire_srw_lock_exclusive(lock: *mut u64) -> i32 {
-    let Some(host) = native_srw_lock(lock) else {
-        return 0;
-    };
-    let Ok(guard) = host.try_write() else {
-        return 0;
-    };
-    HELD_SRW_LOCKS.with(|held| {
-        held.borrow_mut()
-            .push((lock as usize, HeldSrwLock::Exclusive(guard)))
+fn wait_word(word: &AtomicU64, value: u64, timeout: Option<std::time::Duration>) {
+    let ts = timeout.map(|t| libc::timespec {
+        tv_sec: t.as_secs() as _,
+        tv_nsec: t.subsec_nanos() as _,
     });
-    1
+    let time = ts
+        .as_ref()
+        .map_or(std::ptr::null(), |t| t as *const libc::timespec);
+    unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            word as *const AtomicU64,
+            libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG,
+            value as u32,
+            time,
+        );
+    }
 }
-pub(super) extern "win64" fn native_try_acquire_srw_lock_shared(lock: *mut u64) -> i32 {
-    let Some(host) = native_srw_lock(lock) else {
+pub(super) extern "win64" fn native_initialize_srw_lock(ptr: *mut u64) {
+    if let Some(word) = sync_word(ptr) {
+        word.store(0, Ordering::Release);
+    }
+}
+fn try_srw(ptr: *mut u64, exclusive: bool) -> i32 {
+    let Some(word) = sync_word(ptr) else {
         return 0;
     };
-    let Ok(guard) = host.try_read() else { return 0 };
-    HELD_SRW_LOCKS.with(|held| {
-        held.borrow_mut()
-            .push((lock as usize, HeldSrwLock::Shared(guard)))
-    });
-    1
-}
-fn take_srw_lock(lock: *mut u64, exclusive: bool) -> Option<HeldSrwLock> {
-    HELD_SRW_LOCKS.with(|held| {
-        let mut held = held.borrow_mut();
-        held.iter()
-            .rposition(|(address, guard)| {
-                *address == lock as usize
-                    && matches!(
-                        (exclusive, guard),
-                        (true, HeldSrwLock::Exclusive(_)) | (false, HeldSrwLock::Shared(_))
-                    )
-            })
-            .map(|index| held.remove(index).1)
+    if exclusive {
+        return word
+            .compare_exchange(0, u64::MAX, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok() as i32;
+    }
+    word.fetch_update(Ordering::Acquire, Ordering::Relaxed, |value| {
+        (value < u32::MAX as u64 - 1).then(|| value + 1)
     })
+    .is_ok() as i32
 }
-fn native_release_srw_lock(lock: *mut u64, exclusive: bool) {
-    drop(take_srw_lock(lock, exclusive));
-}
-pub(super) extern "win64" fn native_release_srw_lock_exclusive(lock: *mut u64) {
-    native_release_srw_lock(lock, true);
-}
-pub(super) extern "win64" fn native_release_srw_lock_shared(lock: *mut u64) {
-    native_release_srw_lock(lock, false);
-}
-struct NativeConditionVariable {
-    generation: Mutex<u64>,
-    ready: Condvar,
-}
-struct NativeInitOnce {
-    state: Mutex<InitOnceState>,
-    ready: Condvar,
-}
-enum InitOnceState {
-    Uninitialized,
-    Running,
-    Complete(u64),
-}
-fn native_init_once(ptr: *mut u64) -> Option<&'static NativeInitOnce> {
-    if ptr.is_null() || (ptr as usize) % std::mem::align_of::<AtomicU64>() != 0 {
-        return None;
+fn acquire_srw(ptr: *mut u64, exclusive: bool) {
+    let Some(word) = sync_word(ptr) else {
+        return;
+    };
+    loop {
+        if try_srw(ptr, exclusive) != 0 {
+            return;
+        }
+        // Observe the blocking state after the failed acquisition. Waiting
+        // on an earlier zero can miss an unlock between the CAS and futex.
+        let value = word.load(Ordering::Acquire);
+        if value == 0 || (!exclusive && value != u64::MAX) {
+            continue;
+        }
+        wait_word(word, value, None);
     }
-    let slot = unsafe { &*(ptr as *const AtomicU64) };
-    let mut value = slot.load(Ordering::Acquire);
-    if value == 0 {
-        let created = Box::into_raw(Box::new(NativeInitOnce {
-            state: Mutex::new(InitOnceState::Uninitialized),
-            ready: Condvar::new(),
-        })) as u64;
-        match slot.compare_exchange(0, created, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => value = created,
-            Err(existing) => {
-                unsafe { drop(Box::from_raw(created as *mut NativeInitOnce)) };
-                value = existing;
-            }
+}
+pub(super) extern "win64" fn native_acquire_srw_lock_exclusive(ptr: *mut u64) {
+    acquire_srw(ptr, true);
+}
+pub(super) extern "win64" fn native_acquire_srw_lock_shared(ptr: *mut u64) {
+    acquire_srw(ptr, false);
+}
+pub(super) extern "win64" fn native_try_acquire_srw_lock_exclusive(ptr: *mut u64) -> i32 {
+    try_srw(ptr, true)
+}
+pub(super) extern "win64" fn native_try_acquire_srw_lock_shared(ptr: *mut u64) -> i32 {
+    try_srw(ptr, false)
+}
+pub(super) extern "win64" fn native_release_srw_lock_exclusive(ptr: *mut u64) {
+    if let Some(word) = sync_word(ptr) {
+        word.store(0, Ordering::Release);
+        wake_word(word, true);
+    }
+}
+pub(super) extern "win64" fn native_release_srw_lock_shared(ptr: *mut u64) {
+    if let Some(word) = sync_word(ptr) {
+        if word.fetch_sub(1, Ordering::Release) == 1 {
+            wake_word(word, true);
         }
     }
-    (value != 0).then(|| unsafe { &*(value as *const NativeInitOnce) })
 }
 pub(super) extern "win64" fn native_init_once_initialize(ptr: *mut u64) {
-    if !ptr.is_null() {
-        unsafe { ptr.write_unaligned(0) };
+    native_initialize_srw_lock(ptr);
+}
+pub(super) extern "win64" fn native_init_once_begin_initialize(
+    once: *mut u64,
+    flags: u32,
+    pending: *mut i32,
+    context: *mut u64,
+) -> i32 {
+    let Some(word) = sync_word(once) else {
+        native_set_last_error(87);
+        return 0;
+    };
+    if pending.is_null() || flags & !3 != 0 || flags == 3 {
+        native_set_last_error(87);
+        return 0;
     }
+    loop {
+        let value = word.load(Ordering::Acquire);
+        if value & 3 == 2 {
+            unsafe {
+                pending.write(0);
+                if !context.is_null() {
+                    context.write(value & !3);
+                }
+            }
+            return 1;
+        }
+        if flags & 1 != 0 {
+            native_set_last_error(31);
+            return 0;
+        }
+        let running = if flags & 2 != 0 { 3 } else { 1 };
+        if value == 0 {
+            if word
+                .compare_exchange(0, running, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                continue;
+            }
+        } else if value != running {
+            native_set_last_error(87);
+            return 0;
+        } else if running == 1 {
+            wait_word(word, value, None);
+            continue;
+        }
+        unsafe {
+            pending.write(1);
+        }
+        return 1;
+    }
+}
+pub(super) extern "win64" fn native_init_once_complete(
+    once: *mut u64,
+    flags: u32,
+    context: u64,
+) -> i32 {
+    let Some(word) = sync_word(once) else {
+        native_set_last_error(87);
+        return 0;
+    };
+    if flags & !6 != 0 || context & 3 != 0 || (flags & 4 != 0 && (context != 0 || flags & 2 != 0)) {
+        native_set_last_error(87);
+        return 0;
+    }
+    let running = if flags & 2 != 0 { 3 } else { 1 };
+    let completed = if flags & 4 != 0 { 0 } else { context | 2 };
+    if word
+        .compare_exchange(running, completed, Ordering::Release, Ordering::Relaxed)
+        .is_err()
+    {
+        native_set_last_error(87);
+        return 0;
+    }
+    wake_word(word, true);
+    1
 }
 pub(super) extern "win64" fn native_init_once_execute_once(
     once: *mut u64,
@@ -172,159 +211,65 @@ pub(super) extern "win64" fn native_init_once_execute_once(
         native_set_last_error(87);
         return 0;
     }
-    let Some(init) = native_init_once(once) else {
-        native_set_last_error(87);
+    let mut pending = 0;
+    if native_init_once_begin_initialize(once, 0, &mut pending, context_out) == 0 {
         return 0;
-    };
-    loop {
-        let Ok(mut state) = init.state.lock() else {
-            return 0;
-        };
-        match *state {
-            InitOnceState::Complete(context) => {
-                if !context_out.is_null() {
-                    unsafe { context_out.write_unaligned(context) };
-                }
-                return 1;
-            }
-            InitOnceState::Running => {
-                drop(init.ready.wait(state));
-            }
-            InitOnceState::Uninitialized => {
-                *state = InitOnceState::Running;
-                drop(state);
-                let mut context = 0u64;
-                let callback: unsafe extern "win64" fn(*mut u64, u64, *mut u64) -> i32 =
-                    unsafe { std::mem::transmute(callback) };
-                let success = unsafe { callback(once, parameter, &mut context) } != 0;
-                let Ok(mut state) = init.state.lock() else {
-                    return 0;
-                };
-                *state = if success {
-                    InitOnceState::Complete(context)
-                } else {
-                    InitOnceState::Uninitialized
-                };
-                init.ready.notify_all();
-                if success && !context_out.is_null() {
-                    unsafe { context_out.write_unaligned(context) };
-                }
-                return success as i32;
-            }
+    }
+    if pending == 0 {
+        return 1;
+    }
+    let mut context = 0;
+    let callback: unsafe extern "win64" fn(*mut u64, u64, *mut u64) -> i32 =
+        unsafe { std::mem::transmute(callback) };
+    let success = unsafe { callback(once, parameter, &mut context) } != 0;
+    if native_init_once_complete(
+        once,
+        if success { 0 } else { 4 },
+        if success { context } else { 0 },
+    ) == 0
+    {
+        return 0;
+    }
+    if success && !context_out.is_null() {
+        unsafe {
+            context_out.write(context);
         }
     }
-}
-pub(super) extern "win64" fn native_init_once_begin_initialize(
-    once: *mut u64,
-    flags: u32,
-    pending: *mut i32,
-    context_out: *mut u64,
-) -> i32 {
-    if pending.is_null() || flags & !0x3 != 0 {
-        native_set_last_error(87);
-        return 0;
-    }
-    let Some(init) = native_init_once(once) else {
-        native_set_last_error(87);
-        return 0;
-    };
-    loop {
-        let Ok(mut state) = init.state.lock() else {
-            return 0;
-        };
-        match *state {
-            InitOnceState::Complete(context) => {
-                unsafe { pending.write(0) };
-                if !context_out.is_null() {
-                    unsafe { context_out.write(context) };
-                }
-                return 1;
-            }
-            InitOnceState::Uninitialized => {
-                unsafe { pending.write(1) };
-                if flags & 1 == 0 {
-                    *state = InitOnceState::Running;
-                }
-                return 1;
-            }
-            InitOnceState::Running => {
-                if flags & 1 != 0 {
-                    unsafe { pending.write(1) };
-                    return 1;
-                }
-                drop(init.ready.wait(state));
-            }
-        }
-    }
-}
-pub(super) extern "win64" fn native_init_once_complete(
-    once: *mut u64,
-    flags: u32,
-    context: u64,
-) -> i32 {
-    if flags & !0x6 != 0 || (flags & 4 != 0 && context != 0) {
-        native_set_last_error(87);
-        return 0;
-    }
-    let Some(init) = native_init_once(once) else {
-        native_set_last_error(87);
-        return 0;
-    };
-    let Ok(mut state) = init.state.lock() else {
-        return 0;
-    };
-    if !matches!(*state, InitOnceState::Running) {
-        native_set_last_error(87);
-        return 0;
-    }
-    *state = if flags & 4 != 0 {
-        InitOnceState::Uninitialized
-    } else {
-        InitOnceState::Complete(context)
-    };
-    init.ready.notify_all();
-    1
-}
-fn native_condition_variable(ptr: *mut u64) -> Option<&'static NativeConditionVariable> {
-    if ptr.is_null() || (ptr as usize) % std::mem::align_of::<AtomicU64>() != 0 {
-        return None;
-    }
-    let slot = unsafe { &*(ptr as *const AtomicU64) };
-    let mut value = slot.load(Ordering::Acquire);
-    if value == 0 {
-        let created = Box::into_raw(Box::new(NativeConditionVariable {
-            generation: Mutex::new(0),
-            ready: Condvar::new(),
-        })) as u64;
-        match slot.compare_exchange(0, created, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => value = created,
-            Err(existing) => {
-                unsafe { drop(Box::from_raw(created as *mut NativeConditionVariable)) };
-                value = existing;
-            }
-        }
-    }
-    (value != 0).then(|| unsafe { &*(value as *const NativeConditionVariable) })
+    success as i32
 }
 pub(super) extern "win64" fn native_initialize_condition_variable(ptr: *mut u64) {
-    if !ptr.is_null() {
-        unsafe { ptr.write_unaligned(0) };
-    }
+    native_initialize_srw_lock(ptr);
 }
 pub(super) extern "win64" fn native_wake_condition_variable(ptr: *mut u64) {
-    if let Some(cv) = native_condition_variable(ptr) {
-        if let Ok(mut generation) = cv.generation.lock() {
-            *generation = generation.wrapping_add(1);
-            cv.ready.notify_one();
-        }
+    if let Some(word) = sync_word(ptr) {
+        word.fetch_add(1, Ordering::Release);
+        wake_word(word, false);
     }
 }
 pub(super) extern "win64" fn native_wake_all_condition_variable(ptr: *mut u64) {
-    if let Some(cv) = native_condition_variable(ptr) {
-        if let Ok(mut generation) = cv.generation.lock() {
-            *generation = generation.wrapping_add(1);
-            cv.ready.notify_all();
+    if let Some(word) = sync_word(ptr) {
+        word.fetch_add(1, Ordering::Release);
+        wake_word(word, true);
+    }
+}
+fn wait_condition(word: &AtomicU64, before: u64, milliseconds: u32) -> i32 {
+    let start = std::time::Instant::now();
+    loop {
+        if word.load(Ordering::Acquire) != before {
+            return 1;
         }
+        let timeout = if milliseconds == u32::MAX {
+            None
+        } else {
+            let Some(remaining) =
+                std::time::Duration::from_millis(milliseconds as u64).checked_sub(start.elapsed())
+            else {
+                native_set_last_error(1460);
+                return 0;
+            };
+            Some(remaining)
+        };
+        wait_word(word, before, timeout);
     }
 }
 pub(super) extern "win64" fn native_sleep_condition_variable_srw(
@@ -333,89 +278,42 @@ pub(super) extern "win64" fn native_sleep_condition_variable_srw(
     milliseconds: u32,
     flags: u32,
 ) -> i32 {
-    if flags & !1 != 0 {
-        native_set_last_error(87);
-        return 0;
-    }
-    let shared = flags & 1 != 0;
-    let Some(cv) = native_condition_variable(condition) else {
+    let Some(word) = sync_word(condition) else {
         native_set_last_error(87);
         return 0;
     };
-    let Ok(generation) = cv.generation.lock() else {
-        return 0;
-    };
-    let before = *generation;
-    let Some(guard) = take_srw_lock(lock, !shared) else {
+    if flags & !1 != 0 || sync_word(lock).is_none() {
         native_set_last_error(87);
         return 0;
-    };
-    drop(guard);
-    let awakened = if milliseconds == u32::MAX {
-        cv.ready
-            .wait_while(generation, |value| *value == before)
-            .is_ok()
-    } else {
-        cv.ready
-            .wait_timeout_while(
-                generation,
-                std::time::Duration::from_millis(milliseconds as u64),
-                |value| *value == before,
-            )
-            .map(|(value, _)| *value != before)
-            .unwrap_or(false)
-    };
-    if shared {
-        native_acquire_srw_lock_shared(lock);
-    } else {
-        native_acquire_srw_lock_exclusive(lock);
     }
-    if awakened {
-        1
+    let before = word.load(Ordering::Acquire);
+    if flags & 1 != 0 {
+        native_release_srw_lock_shared(lock);
     } else {
-        native_set_last_error(1460);
-        0
+        native_release_srw_lock_exclusive(lock);
     }
+    let result = wait_condition(word, before, milliseconds);
+    acquire_srw(lock, flags & 1 == 0);
+    result
 }
 pub(super) extern "win64" fn native_sleep_condition_variable_cs(
     condition: *mut u64,
-    critical_section: *mut u8,
+    section: *mut u8,
     milliseconds: u32,
 ) -> i32 {
-    if critical_section.is_null() {
-        native_set_last_error(87);
-        return 0;
-    }
-    let Some(cv) = native_condition_variable(condition) else {
+    let Some(word) = sync_word(condition) else {
         native_set_last_error(87);
         return 0;
     };
-    let Ok(generation) = cv.generation.lock() else {
+    if section.is_null() {
+        native_set_last_error(87);
         return 0;
-    };
-    let before = *generation;
-    native_leave_critical_section(critical_section);
-    let awakened = if milliseconds == u32::MAX {
-        cv.ready
-            .wait_while(generation, |value| *value == before)
-            .is_ok()
-    } else {
-        cv.ready
-            .wait_timeout_while(
-                generation,
-                std::time::Duration::from_millis(milliseconds as u64),
-                |value| *value == before,
-            )
-            .map(|(value, _)| *value != before)
-            .unwrap_or(false)
-    };
-    native_enter_critical_section(critical_section);
-    if awakened {
-        1
-    } else {
-        native_set_last_error(1460);
-        0
     }
+    let before = word.load(Ordering::Acquire);
+    native_leave_critical_section(section);
+    let result = wait_condition(word, before, milliseconds);
+    native_enter_critical_section(section);
+    result
 }
 
 pub(super) extern "win64" fn native_wait_for_single_object(handle: u64, milliseconds: u32) -> u32 {
@@ -652,7 +550,11 @@ pub(super) extern "win64" fn native_create_event_w(
 }
 /// `OpenEventW`: a new handle to an existing named event of this process,
 /// or `ERROR_FILE_NOT_FOUND`.
-pub(super) extern "win64" fn native_open_event_w(_access: u32, _inherit: i32, name: *const u16) -> u64 {
+pub(super) extern "win64" fn native_open_event_w(
+    _access: u32,
+    _inherit: i32,
+    name: *const u16,
+) -> u64 {
     let Some(process) = process_ctx() else {
         return 0;
     };
@@ -1353,4 +1255,71 @@ pub(super) extern "win64" fn native_signal_object_and_wait(
         return WAIT_FAILED;
     }
     native_wait_for_single_object(wait, milliseconds)
+}
+
+#[cfg(test)]
+mod inline_sync_tests {
+    use super::*;
+
+    #[test]
+    fn srw_churn_returns_to_zero_and_contended_writers_preserve_updates() {
+        for _ in 0..10000 {
+            let mut lock = 0;
+            native_acquire_srw_lock_exclusive(&mut lock);
+            native_release_srw_lock_exclusive(&mut lock);
+            assert_eq!(lock, 0);
+            native_acquire_srw_lock_shared(&mut lock);
+            native_release_srw_lock_shared(&mut lock);
+            assert_eq!(lock, 0);
+        }
+        let lock = AtomicU64::new(0);
+        let value = AtomicU64::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    let ptr = (&lock as *const AtomicU64).cast_mut().cast();
+                    for _ in 0..1000 {
+                        native_acquire_srw_lock_exclusive(ptr);
+                        value.store(value.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+                        native_release_srw_lock_exclusive(ptr);
+                    }
+                });
+            }
+        });
+        assert_eq!(value.load(Ordering::Relaxed), 8000);
+        assert_eq!(lock.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn concurrent_init_once_publishes_context_and_runs_callback_once() {
+        unsafe extern "win64" fn initialize(_: *mut u64, parameter: u64, context: *mut u64) -> i32 {
+            unsafe {
+                (*(parameter as *const AtomicU64)).fetch_add(1, Ordering::Relaxed);
+                context.write(0x1000);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            1
+        }
+        let once = AtomicU64::new(0);
+        let calls = AtomicU64::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    let mut context = 0;
+                    assert_eq!(
+                        native_init_once_execute_once(
+                            (&once as *const AtomicU64).cast_mut().cast(),
+                            initialize as *const () as u64,
+                            &calls as *const AtomicU64 as u64,
+                            &mut context
+                        ),
+                        1
+                    );
+                    assert_eq!(context, 0x1000);
+                });
+            }
+        });
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(once.load(Ordering::Relaxed), 0x1002);
+    }
 }

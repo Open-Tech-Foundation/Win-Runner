@@ -29,10 +29,10 @@ await step("gone", async () => (await readDir(".")).map((e) => e.name).includes(
 "#;
 
 #[test]
+#[ignore = "requires WINRUN_ESRUN_EXE; run explicitly with --ignored"]
 fn esrun_handles_windows_paths_in_its_sandbox() {
-    let Some(esrun) = esrun_path() else {
-        return;
-    };
+    let esrun =
+        esrun_path().expect("configure the fixture environment variable before running this test");
     let esrun = esrun.canonicalize().expect("WINRUN_ESRUN_EXE exists");
     let script = std::env::temp_dir().join(format!("winrun-esrun-{}.js", std::process::id()));
     std::fs::write(&script, SCRIPT).unwrap();
@@ -48,7 +48,12 @@ fn esrun_handles_windows_paths_in_its_sandbox() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("start the winrun shell");
-    child.stdin.take().unwrap().write_all(commands.as_bytes()).unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(commands.as_bytes())
+        .unwrap();
     let output = child.wait_with_output().unwrap();
     let _ = std::fs::remove_file(&script);
     let stdout = String::from_utf8_lossy(&output.stdout);

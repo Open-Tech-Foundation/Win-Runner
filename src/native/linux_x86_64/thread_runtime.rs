@@ -275,9 +275,11 @@ pub(super) fn invoke_tls_callbacks(base: u64, callbacks: &[u32], reason: u32) {
             continue;
         };
         // SAFETY: PE parsing verifies callback RVAs point into executable image sections.
-        let callback: unsafe extern "win64" fn(u64, u32, u64) =
-            unsafe { std::mem::transmute(address as usize) };
-        unsafe { callback(base, reason, 0) };
+        if let Err(code) = unsafe {
+            super::exceptions::invoke_guest_with_arguments(address, [base, reason as u64, 0])
+        } {
+            native_exit_process(code);
+        }
     }
 }
 
@@ -311,16 +313,26 @@ pub(super) fn notify_guest_thread_modules(process: &NativeProcessContext, attach
             invoke_tls_callbacks(base, &callbacks, reason);
             if let Some(entry_point) = entry_point {
                 // SAFETY: DLL entry points were validated by the PE loader.
-                let dll_main: unsafe extern "win64" fn(u64, u32, u64) -> i32 =
-                    unsafe { std::mem::transmute(entry_point as usize) };
-                let _ = unsafe { dll_main(base, reason, 0) };
+                if let Err(code) = unsafe {
+                    super::exceptions::invoke_guest_with_arguments(
+                        entry_point,
+                        [base, reason as u64, 0],
+                    )
+                } {
+                    native_exit_process(code);
+                }
             }
         } else {
             if let Some(entry_point) = entry_point {
                 // SAFETY: DLL entry points were validated by the PE loader.
-                let dll_main: unsafe extern "win64" fn(u64, u32, u64) -> i32 =
-                    unsafe { std::mem::transmute(entry_point as usize) };
-                let _ = unsafe { dll_main(base, reason, 0) };
+                if let Err(code) = unsafe {
+                    super::exceptions::invoke_guest_with_arguments(
+                        entry_point,
+                        [base, reason as u64, 0],
+                    )
+                } {
+                    native_exit_process(code);
+                }
             }
             invoke_tls_callbacks(base, &callbacks, reason);
         }

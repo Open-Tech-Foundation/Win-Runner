@@ -476,8 +476,10 @@ pub(super) extern "win64" fn native_create_thread(
         THREAD_TEB_BASE.set(tls.teb.as_ptr() as u64);
         drop(tls);
         thread_runtime::notify_guest_thread_modules(&thread_process, true);
-        let entry: unsafe extern "win64" fn(u64) -> u32 = unsafe { std::mem::transmute(start) };
-        let exit_code = unsafe { entry(parameter) };
+        let exit_code = match unsafe { super::exceptions::invoke_guest_with_arguments(start, [parameter, 0, 0]) } {
+            Ok(code) => code,
+            Err(code) => native_exit_process(code),
+        };
         thread_runtime::notify_guest_thread_modules(&thread_process, false);
         thread_runtime::run_thread_fls_callbacks(&thread_process);
         exit_code

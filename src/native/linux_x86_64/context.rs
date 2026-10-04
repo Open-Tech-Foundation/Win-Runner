@@ -25,7 +25,11 @@ pub(super) static NATIVE_PROCESS: Mutex<Option<Arc<NativeProcessContext>>> = Mut
 pub(super) static NATIVE_GUEST_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 #[cfg(test)]
-pub(super) static TEST_PROCESS: LazyLock<Arc<NativeProcessContext>> = LazyLock::new(|| {
+pub(super) static TEST_PROCESS: LazyLock<Arc<NativeProcessContext>> =
+    LazyLock::new(new_test_process);
+
+#[cfg(test)]
+fn new_test_process() -> Arc<NativeProcessContext> {
     Arc::new(NativeProcessContext {
         image_base: 0x0001_4000_0000,
         image_size: 0x10000,
@@ -106,15 +110,15 @@ pub(super) static TEST_PROCESS: LazyLock<Arc<NativeProcessContext>> = LazyLock::
         loaded_modules: Mutex::new(HashMap::new()),
         module_next: AtomicU64::new(1),
     })
-});
+}
 
 pub(super) fn process_ctx() -> Option<Arc<NativeProcessContext>> {
+    if let Some(process) = THREAD_NATIVE_PROCESS.with(|active| active.borrow().clone()) {
+        return Some(process);
+    }
     #[cfg(test)]
     if !NATIVE_GUEST_ACTIVE.load(Ordering::Acquire) {
         return Some(Arc::clone(&TEST_PROCESS));
-    }
-    if let Some(process) = THREAD_NATIVE_PROCESS.with(|active| active.borrow().clone()) {
-        return Some(process);
     }
     if let Some(process) = NATIVE_PROCESS.lock().ok()?.as_ref().cloned() {
         return Some(process);
@@ -146,5 +150,20 @@ impl DynamicTlsSlots {
             reserved: vec![false; TLS_INDEXES],
             reserved_static: static_tls,
         }
+    }
+}
+
+#[cfg(test)]
+pub(super) struct TestProcessGuard(Option<Arc<NativeProcessContext>>);
+#[cfg(test)]
+impl TestProcessGuard {
+    pub(super) fn new() -> Self {
+        Self(THREAD_NATIVE_PROCESS.with(|active| active.replace(Some(new_test_process()))))
+    }
+}
+#[cfg(test)]
+impl Drop for TestProcessGuard {
+    fn drop(&mut self) {
+        THREAD_NATIVE_PROCESS.with(|active| active.replace(self.0.take()));
     }
 }

@@ -2224,7 +2224,15 @@ fn headless_control_session_streams_shell_output_and_exits_cleanly() {
     drop(scan);
     let invalid_token = format!("{origin}/control/not-the-session-token");
     assert!(tungstenite::connect(invalid_token).is_err());
-    let (mut socket, _) = tungstenite::connect(endpoint).expect("connect control socket");
+    let idle = std::net::TcpStream::connect(address).unwrap();
+    let mut partial = std::net::TcpStream::connect(address).unwrap();
+    partial.write_all(b"GET /control/").unwrap();
+    let started = std::time::Instant::now();
+    let stream = std::net::TcpStream::connect(address).unwrap();
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(1))).unwrap();
+    let (mut socket, _) = tungstenite::client(endpoint, stream).expect("idle peers must not block authentication");
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    drop((idle, partial));
 
     let connected: serde_json::Value = match socket.read().unwrap() {
         tungstenite::Message::Text(message) => serde_json::from_str(&message).unwrap(),

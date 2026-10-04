@@ -30,7 +30,10 @@ fn build_snapshot(fixture: &Path) -> PathBuf {
     let root = std::env::temp_dir().join(format!("winrun-dotnet-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let stage = root.join("stage");
-    copy_tree(&fixture.join("dotnet"), &stage.join("C/Program Files/dotnet"));
+    copy_tree(
+        &fixture.join("dotnet"),
+        &stage.join("C/Program Files/dotnet"),
+    );
     copy_tree(&fixture.join("hello"), &stage.join("C/Users/runner/hello"));
     let snapshot = root.join("dotnet.winfs");
     let status = Command::new(env!("CARGO_BIN_EXE_winrun"))
@@ -44,10 +47,10 @@ fn build_snapshot(fixture: &Path) -> PathBuf {
 }
 
 #[test]
+#[ignore = "requires WINRUN_DOTNET_FIXTURE; run explicitly with --ignored"]
 fn framework_dependent_app_runs_on_the_windows_coreclr() {
-    let Some(fixture) = fixture() else {
-        return;
-    };
+    let fixture =
+        fixture().expect("configure the fixture environment variable before running this test");
     let snapshot = build_snapshot(&fixture);
     let run = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_winrun"))

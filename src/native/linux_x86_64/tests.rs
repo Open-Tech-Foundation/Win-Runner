@@ -1749,9 +1749,11 @@ mod protection_tests {
             context.lock().unwrap().fs.read_file(path).unwrap(),
             b"aZcdef\0\0\0"
         );
-        let view = super::native_map_view_of_file(extended, 0x2, 0, 6, 3);
+        assert!(super::native_map_view_of_file(extended, 0x2, 0, 6, 3).is_null());
+        assert_eq!(super::native_get_last_error(), 1132);
+        let view = super::native_map_view_of_file(extended, 0x2, 0, 0, 9);
         assert!(!view.is_null());
-        unsafe { std::ptr::copy_nonoverlapping(b"xyz".as_ptr(), view, 3) };
+        unsafe { std::ptr::copy_nonoverlapping(b"xyz".as_ptr(), view.add(6), 3) };
         assert_eq!(super::native_unmap_view_of_file(view.cast()), 1);
         assert_eq!(
             context.lock().unwrap().fs.read_file(path).unwrap(),
@@ -7468,7 +7470,7 @@ mod protection_tests {
                 }
             );
         }
-        assert_eq!(native_get_file_type(0x100), 0);
+        assert_eq!(native_get_file_type(0xdead_beef_dead_beef), 0);
     }
 
     #[test]

@@ -240,6 +240,8 @@ mod module_export_tests {
 
     #[test]
     fn module_initialization_orders_dependencies_and_groups_cycles_by_load_order() {
+        let _isolation = super::NATIVE_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _process = super::context::TestProcessGuard::new();
         let modules = std::collections::HashMap::from([
             (0x1000, pending_module(0x1000, 1, vec![0x2000])),
             (0x2000, pending_module(0x2000, 2, vec![0x1000])),
@@ -367,6 +369,8 @@ mod module_export_tests {
 
     #[test]
     fn get_proc_address_resolves_named_and_ordinal_dll_exports() {
+        let _isolation = super::NATIVE_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _process = super::context::TestProcessGuard::new();
         let handle = 0x7a00_0000;
         let module = NativeLoadedModule {
             path: r"C:\bin\sample.dll".to_string(),
@@ -389,7 +393,7 @@ mod module_export_tests {
             mapping: None,
             initialized: true,
         };
-        let process = &*super::TEST_PROCESS;
+        let process = &*super::process_ctx().unwrap();
         process
             .loaded_modules
             .lock()
@@ -409,6 +413,8 @@ mod module_export_tests {
 
     #[test]
     fn get_proc_address_follows_system_module_forwarder() {
+        let _isolation = super::NATIVE_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _process = super::context::TestProcessGuard::new();
         let handle = 0x7a00_1000;
         let module = NativeLoadedModule {
             path: r"C:\bin\forwarder.dll".to_string(),
@@ -431,7 +437,7 @@ mod module_export_tests {
             mapping: None,
             initialized: true,
         };
-        let process = &*super::TEST_PROCESS;
+        let process = &*super::process_ctx().unwrap();
         process
             .loaded_modules
             .lock()
@@ -445,6 +451,8 @@ mod module_export_tests {
 
     #[test]
     fn a_guest_dll_loads_when_system_imports_it_never_calls_are_missing() {
+        let _isolation = super::NATIVE_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _process = super::context::TestProcessGuard::new();
         // CoreCLR and the .NET host import far more than a program uses;
         // unimplemented system functions become call-time stubs.
         let bytes = dll_fixture(
@@ -456,7 +464,7 @@ mod module_export_tests {
             None,
             0x0000_5009_0000_0000,
         );
-        let process = &*super::TEST_PROCESS;
+        let process = &*super::process_ctx().unwrap();
         let path = r"C:\loader-tests\missing-system-imports.dll";
         {
             let mut native_fs = process.fs.lock().unwrap();
@@ -482,9 +490,11 @@ mod module_export_tests {
 
     #[test]
     fn load_library_maps_a_guest_dll_from_winfs() {
+        let _isolation = super::NATIVE_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _process = super::context::TestProcessGuard::new();
         let bytes = dll_fixture(&[], None, 0x0000_5000_0000_0000);
 
-        let process = &*super::TEST_PROCESS;
+        let process = &*super::process_ctx().unwrap();
         let path = r"C:\loader-tests\sample-runtime.dll";
         {
             let mut native_fs = process.fs.lock().unwrap();
@@ -519,7 +529,9 @@ mod module_export_tests {
 
     #[test]
     fn final_free_library_runs_process_detach_and_unmaps_the_image() {
-        let process = &*super::TEST_PROCESS;
+        let _isolation = super::NATIVE_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _process = super::context::TestProcessGuard::new();
+        let process = &*super::process_ctx().unwrap();
         let image =
             crate::pe::load_lenient(&dll_fixture(&[], None, 0x0000_5004_0000_0000)).unwrap();
         let mapping = super::map(&image).expect("test image maps");
@@ -551,7 +563,9 @@ mod module_export_tests {
 
     #[test]
     fn load_library_resolves_recursive_guest_dll_imports() {
-        let process = &*super::TEST_PROCESS;
+        let _isolation = super::NATIVE_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _process = super::context::TestProcessGuard::new();
+        let process = &*super::process_ctx().unwrap();
         let dependency_path = r"C:\loader-tests\dependency.dll";
         let consumer_path = r"C:\loader-tests\consumer.dll";
         {
@@ -615,7 +629,9 @@ mod module_export_tests {
 
     #[test]
     fn load_library_resolves_cyclic_guest_dll_imports() {
-        let process = &*super::TEST_PROCESS;
+        let _isolation = super::NATIVE_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _process = super::context::TestProcessGuard::new();
+        let process = &*super::process_ctx().unwrap();
         let path_a = r"C:\loader-tests\cycle-a.dll";
         let path_b = r"C:\loader-tests\cycle-b.dll";
         let image_a = dll_fixture(
@@ -684,10 +700,12 @@ mod module_export_tests {
 
     #[test]
     fn load_library_installs_static_tls_template_and_zero_fill() {
+        let _isolation = super::NATIVE_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _process = super::context::TestProcessGuard::new();
         use crate::native::linux_x86_64::state::DynamicTlsSlots;
         use crate::native::linux_x86_64::state::NativeTls;
 
-        let process = &*super::TEST_PROCESS;
+        let process = &*super::process_ctx().unwrap();
         let path = r"C:\loader-tests\static-tls.dll";
         let bytes = add_static_tls(
             dll_fixture(&[], None, 0x0000_5003_0000_0000),
@@ -797,22 +815,19 @@ mod module_export_tests {
     }
 }
 
-pub(super) fn protect_exec(mapping: &Mapping) -> Result<(), String> {
-    // PE sections need individual protections. Until the native mapper
-    // carries section characteristics, keep the image RWX so CRT startup
-    // can initialize `.data`; the guest still runs in a forked child.
-    if unsafe {
-        mprotect(
-            mapping.ptr.cast(),
-            mapping.len,
-            PROT_READ | PROT_WRITE | PROT_EXEC,
-        )
-    } != 0
-    {
-        let e = std::io::Error::last_os_error();
-        return Err(format!(
-            "native backend could not mark image executable: {e}"
-        ));
+pub(super) fn protect_exec(mapping: &Mapping, image: &PeImage) -> Result<(), String> {
+    if image.page_protections.len() != mapping.len / 4096 {
+        return Err("native image has an invalid page protection table".to_string());
+    }
+    for (page, protection) in image.page_protections.iter().enumerate() {
+        let host =
+            super::memory::linux_protection(*protection).ok_or("invalid image page protection")?;
+        if unsafe { mprotect(mapping.ptr.add(page * 4096).cast(), 4096, host) } != 0 {
+            return Err(format!(
+                "cannot apply image section protection: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
     }
     Ok(())
 }
@@ -1393,7 +1408,6 @@ fn load_guest_module_inner(
                 Err(_) => return None,
             }
         };
-        protect_exec(&mapping).ok()?;
         let base = mapping.ptr as u64;
         let static_tls_template = match image.tls.as_ref() {
             Some(tls) => Some(super::thread_runtime::tls_template_from_mapping(
@@ -1504,6 +1518,7 @@ fn load_guest_module_inner(
                 return None;
             }
         }
+        protect_exec(&mapping, &image).ok()?;
         {
             let mut modules = process.loaded_modules.lock().ok()?;
             let loaded = modules.get_mut(&handle)?;

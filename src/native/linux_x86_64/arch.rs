@@ -15,6 +15,10 @@ std::arch::global_asm!(
     "push r14",
     "push r15",
     "sub rsp, 40",
+    // Seventh SysV argument: the three Win64 register arguments. Keep its
+    // pointer above the 32-byte shadow space across sigsetjmp.
+    "mov rax, [rsp + 112]",
+    "mov [rsp + 32], rax",
     "mov r13, rdi",
     "mov r14, rsi",
     "mov r12, rdx",
@@ -26,6 +30,10 @@ std::arch::global_asm!(
     "call __sigsetjmp@PLT",
     "test eax, eax",
     "jnz 1f",
+    "mov rax, [rsp + 32]",
+    "mov rcx, [rax]",
+    "mov rdx, [rax + 8]",
+    "mov r8, [rax + 16]",
     "call r13",
     "mov dword ptr [r12], eax",
     "xor eax, eax",
@@ -258,5 +266,6 @@ unsafe extern "C" {
         fault_dispatcher: extern "C" fn(*const core::ffi::c_void) -> i32,
         fault_slot: *const core::ffi::c_void,
         linux_context: *const core::ffi::c_void,
+        arguments: *const u64,
     ) -> i32;
 }

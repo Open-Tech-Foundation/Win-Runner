@@ -153,3 +153,83 @@ fn native_error_mode_returns_previous_process_flags() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn guest_thread_faults_reach_vectored_handlers_and_preserve_the_parameter() {
+    let mut asm = Asm::new();
+    // EXCEPTION_POINTERS.ContextRecord -> Rip += sizeof(ud2), CONTINUE_EXECUTION.
+    let handler = asm.add_data(vec![
+        0x48, 0x8b, 0x41, 0x08, 0x48, 0x83, 0x80, 0xf8, 0, 0, 0, 2, 0xb8, 0xff, 0xff, 0xff, 0xff,
+        0xc3,
+    ]);
+    let thread = asm.add_data(vec![0x0f, 0x0b, 0xc7, 0x01, 42, 0, 0, 0, 0x31, 0xc0, 0xc3]); // ud2; *parameter = 42; return 0
+    let result = asm.add_zeroed(4);
+    asm.sub_rsp(0x58);
+    asm.mov_ecx_imm(1);
+    asm.lea_reg_rip(2, handler);
+    asm.call_import(0);
+    asm.mov_ecx_imm(0);
+    asm.mov_edx_imm(0);
+    asm.lea_reg_rip(8, thread);
+    asm.lea_reg_rip(9, result);
+    asm.mov_rspoff_imm32(0x20, 0);
+    asm.mov_rspoff_imm32(0x28, 0);
+    asm.mov_rspoff_imm32(0x2c, 0);
+    asm.call_import(1);
+    asm.mov_rspoff_rax(0x40);
+    asm.mov_rcx_rax();
+    asm.mov_edx_imm(5000);
+    asm.call_import(2);
+    asm.mov_eax_mem_rip(result);
+    asm.mov_rcx_rax();
+    asm.call_import(3);
+    let output = run_guest(
+        &build(
+            asm,
+            &[
+                ("KERNEL32.dll", "AddVectoredExceptionHandler"),
+                ("KERNEL32.dll", "CreateThread"),
+                ("KERNEL32.dll", "WaitForSingleObject"),
+                ("KERNEL32.dll", "ExitProcess"),
+            ],
+        ),
+        true,
+        false,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(42),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn image_headers_are_read_only_and_nonexecutable_sections_cannot_run() {
+    let mut asm = Asm::new();
+    asm.mov_rax_imm64(winrun::pe::builder::IMAGE_BASE);
+    asm.emit(&[0xc6, 0x00, 0x7b]); // write to read-only DOS header
+    asm.xor_eax();
+    asm.ret();
+    let output = run_guest(&build(asm, &[]), true, false);
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut asm = Asm::new();
+    asm.xor_eax();
+    asm.ret();
+    let mut image = build(asm, &[]);
+    let pe = u32::from_le_bytes(image[0x3c..0x40].try_into().unwrap()) as usize;
+    let section = pe + 24 + 0xf0;
+    image[section + 36..section + 40].copy_from_slice(&0xc0000040u32.to_le_bytes());
+    let output = run_guest(&image, true, false);
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

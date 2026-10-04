@@ -956,19 +956,13 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_device_io_control(
         return 0;
     };
     let data = symlink_reparse_data(&target);
-    // The 8-byte header alone reports ERROR_MORE_DATA with its length.
-    let copied = data.len().min(output_len as usize);
-    if copied < 8 || output.is_null() {
-        native_set_last_error(122); // ERROR_INSUFFICIENT_BUFFER
+    if output.is_null() || (output_len as usize) < data.len() {
+        native_set_last_error(122); // ERROR_INSUFFICIENT_BUFFER (Windows oracle)
         return 0;
     }
-    unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), output, copied) };
+    unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), output, data.len()) };
     if !returned.is_null() {
-        unsafe { returned.write(copied as u32) };
-    }
-    if copied < data.len() {
-        native_set_last_error(234); // ERROR_MORE_DATA
-        return 0;
+        unsafe { returned.write(data.len() as u32) };
     }
     1
 }

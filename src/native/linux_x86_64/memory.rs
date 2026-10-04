@@ -1,6 +1,8 @@
 //! Linux host-backed heap, virtual-memory, and file-mapping APIs.
 
 use super::*;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::FileExt;
 
 pub(super) fn page_len(len: usize) -> Result<usize, String> {
     len.checked_add(4095)
@@ -64,8 +66,13 @@ pub(super) fn consume_guard_page_fault(address: u64) -> bool {
 
 /// The mapped PE image (main image or loaded DLL) holding `[start, end)`,
 /// as its base and `SizeOfImage`.
-pub(super) fn image_containing(process: &NativeProcessContext, start: u64, end: u64) -> Option<(u64, u32)> {
-    let inside = |base: u64, size: u32| start >= base && end <= base.saturating_add(u64::from(size));
+pub(super) fn image_containing(
+    process: &NativeProcessContext,
+    start: u64,
+    end: u64,
+) -> Option<(u64, u32)> {
+    let inside =
+        |base: u64, size: u32| start >= base && end <= base.saturating_add(u64::from(size));
     if process.image_base != 0 && inside(process.image_base, process.image_size) {
         return Some((process.image_base, process.image_size));
     }
@@ -228,8 +235,7 @@ pub(super) extern "win64" fn native_virtual_query(
                         )
                     });
             let pages = image_pages.unwrap_or_else(|| vec![0x40; page_count]);
-            let page_index =
-                ((query - module.0) as usize / 4096).min(page_count.saturating_sub(1));
+            let page_index = ((query - module.0) as usize / 4096).min(page_count.saturating_sub(1));
             let protection = pages.get(page_index).copied().unwrap_or(0x40);
             let mut first = page_index;
             while first > 0 && pages[first - 1] == protection {
@@ -299,7 +305,10 @@ fn host_region(query: u64) -> Option<NativeMemoryBasicInformation> {
     }
     let page = query & !4095;
     let ranges = host_mappings();
-    if let Some(index) = ranges.iter().position(|&(start, end)| query >= start && query < end) {
+    if let Some(index) = ranges
+        .iter()
+        .position(|&(start, end)| query >= start && query < end)
+    {
         let (mut start, mut end) = ranges[index];
         for &(next_start, next_end) in &ranges[index + 1..] {
             if next_start != end {
@@ -345,7 +354,7 @@ fn host_region(query: u64) -> Option<NativeMemoryBasicInformation> {
         allocation_protection: 0,
         partition_id: 0,
         region_size: free_end.saturating_sub(base),
-        state: 0x10000, // MEM_FREE
+        state: 0x10000,   // MEM_FREE
         protection: 0x01, // PAGE_NOACCESS
         kind: 0,
     })
@@ -796,22 +805,17 @@ pub(super) extern "win64" fn native_create_file_mapping_w(
     if native_diagnostic_enabled() {
         eprintln!("native CreateFileMappingW file={file:#x} protection={protection:#x} size={requested_size:#x}");
     }
-    // The page protection plus SEC_* attributes. Views are private copies,
-    // so SEC_RESERVE/SEC_COMMIT make no difference, and SEC_IMAGE (and
-    // SEC_LARGE_PAGES and friends) are not supported.
-    const SEC_RESERVE: u32 = 0x0400_0000;
+    // Reserved sections need shared per-page commit tracking in VirtualAlloc.
+    // Reject them explicitly until that is available, allowing CoreCLR to
+    // select its supported single-mapping allocator. Committed executable
+    // sections do support coherent writable/executable views.
+    // SEC_IMAGE and large-page sections remain unsupported.
     const SEC_COMMIT: u32 = 0x0800_0000;
     let section_flags = protection & !0xff;
     let protection = protection & 0xff;
-    let executable = matches!(protection, 0x20 | 0x40 | 0x80);
     if !matches!(protection, 0x02 | 0x04 | 0x08 | 0x20 | 0x40 | 0x80)
-        || section_flags & !(SEC_RESERVE | SEC_COMMIT) != 0
+        || section_flags & !SEC_COMMIT != 0
         || requested_size > usize::MAX as u64
-        // Executable pagefile sections exist to be mapped twice (writable
-        // and executable) onto the same memory, which private views cannot
-        // provide; refusing them lets callers such as CoreCLR's W^X
-        // allocator fall back to single mappings.
-        || (file == u64::MAX && executable)
     {
         native_set_last_error(87);
         return 0;
@@ -868,11 +872,42 @@ pub(super) extern "win64" fn native_create_file_mapping_w(
         }
         (Some(path), size)
     };
+    // All views keep the same kernel-backed section alive, even after its
+    // Windows handle closes. Private mappings implement FILE_MAP_COPY.
+    let fd = unsafe { libc::memfd_create(c"winrun-section".as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        native_set_last_error(8);
+        return 0;
+    }
+    let storage = Arc::new(unsafe { std::fs::File::from_raw_fd(fd) });
+    if storage.set_len(size as u64).is_err() {
+        native_set_last_error(8);
+        return 0;
+    }
+    if let Some(path) = &path {
+        let Some(context) = fs_ctx() else {
+            return 0;
+        };
+        let Ok(ctx) = context.lock() else {
+            return 0;
+        };
+        let Ok(contents) = ctx.fs.read_file(path) else {
+            return 0;
+        };
+        if storage
+            .write_all_at(&contents[..contents.len().min(size)], 0)
+            .is_err()
+        {
+            native_set_last_error(8);
+            return 0;
+        }
+    }
     let handle = process.mapping_next.fetch_add(1, Ordering::AcqRel);
     let result = if let Ok(mut values) = process.file_mappings.lock() {
         values.insert(
             handle,
             NativeFileMapping {
+                storage,
                 length: size,
                 protection,
                 path,
@@ -910,7 +945,14 @@ pub(super) extern "win64" fn native_map_view_of_file(
     offset_low: u32,
     bytes: usize,
 ) -> *mut u8 {
-    native_map_view_of_file_ex(mapping, access, offset_high, offset_low, bytes, ptr::null_mut())
+    native_map_view_of_file_ex(
+        mapping,
+        access,
+        offset_high,
+        offset_low,
+        bytes,
+        ptr::null_mut(),
+    )
 }
 
 /// `MapViewOfFileEx`: a view placed at `base` when it is non-null, failing
@@ -950,6 +992,10 @@ pub(super) extern "win64" fn native_map_view_of_file_ex(
         native_set_last_error(87);
         return ptr::null_mut();
     };
+    if offset % 0x10000 != 0 {
+        native_set_last_error(1132); // ERROR_MAPPED_ALIGNMENT
+        return ptr::null_mut();
+    }
     let length = if bytes == 0 {
         mapping.length.saturating_sub(offset)
     } else {
@@ -975,15 +1021,23 @@ pub(super) extern "win64" fn native_map_view_of_file_ex(
         native_set_last_error(8);
         return ptr::null_mut();
     };
-    let fixed = if base.is_null() { 0 } else { MAP_FIXED_NOREPLACE };
+    let fixed = if base.is_null() {
+        0
+    } else {
+        MAP_FIXED_NOREPLACE
+    };
     let result = unsafe {
         mmap(
             base,
             mapped_length,
             PROT_READ | PROT_WRITE,
-            MAP_PRIVATE | MAP_ANONYMOUS | fixed,
-            -1,
-            0,
+            (if access & 3 == 1 {
+                MAP_PRIVATE
+            } else {
+                libc::MAP_SHARED
+            }) | fixed,
+            mapping.storage.as_raw_fd(),
+            offset as isize,
         )
     };
     if result == MAP_FAILED || (!base.is_null() && result != base) {
@@ -993,37 +1047,19 @@ pub(super) extern "win64" fn native_map_view_of_file_ex(
         native_set_last_error(if base.is_null() { 8 } else { 487 });
         return ptr::null_mut();
     }
-    let view = result.cast::<u8>();
-    if let Some(path) = mapping.path.as_deref() {
-        let Some(context) = fs_ctx() else {
-            unsafe { munmap(result, mapped_length) };
-            native_set_last_error(6);
-            return ptr::null_mut();
-        };
-        let Ok(ctx) = context.lock() else {
-            unsafe { munmap(result, mapped_length) };
-            native_set_last_error(6);
-            return ptr::null_mut();
-        };
-        let Ok(contents) = ctx.fs.read_file(path) else {
-            unsafe { munmap(result, mapped_length) };
-            native_set_last_error(6);
-            return ptr::null_mut();
-        };
-        if offset < contents.len() {
-            let count = length.min(contents.len() - offset);
-            unsafe { ptr::copy_nonoverlapping(contents.as_ptr().add(offset), view, count) };
-        }
-    }
     let writable = access & 0x2 != 0;
-    let copy_on_write = access & 0x1 != 0;
+    let copy_on_write = access & 0x3 == 1;
     let host_protection = if writable || copy_on_write {
         PROT_READ | PROT_WRITE
     } else if access & 0x4 != 0 {
         PROT_READ
     } else {
         linux_protection(mapping.protection).unwrap_or(PROT_READ)
-    } | if access & FILE_MAP_EXECUTE != 0 { PROT_EXEC } else { 0 };
+    } | if access & FILE_MAP_EXECUTE != 0 {
+        PROT_EXEC
+    } else {
+        0
+    };
     if unsafe { mprotect(result, mapped_length, host_protection) } != 0 {
         unsafe { munmap(result, mapped_length) };
         native_set_last_error(87);
@@ -1033,6 +1069,7 @@ pub(super) extern "win64" fn native_map_view_of_file_ex(
         views.insert(
             result as u64,
             NativeMappingView {
+                _storage: Arc::clone(&mapping.storage),
                 length: mapped_length,
                 view_length: length,
                 backing: mapping.path.map(|path| (path, offset)),
@@ -1081,14 +1118,12 @@ pub(super) extern "win64" fn native_flush_view_of_file(
         native_set_last_error(6);
         return 0;
     };
-    let Some(view) = process.mapping_views.lock().ok().and_then(|values| {
-        values.get(&(address as u64)).map(|view| NativeMappingView {
-            length: view.length,
-            view_length: view.view_length,
-            backing: view.backing.clone(),
-            writable: view.writable,
-        })
-    }) else {
+    let Some(view) = process
+        .mapping_views
+        .lock()
+        .ok()
+        .and_then(|values| values.get(&(address as u64)).cloned())
+    else {
         native_set_last_error(487);
         return 0;
     };
@@ -1254,11 +1289,93 @@ mod virtual_memory_tests {
         );
         // Released pages are no longer a guest region: they read as free
         // (or as a host mapping if another thread reused the range).
-        assert_ne!(information.state, 0x1000, "released memory is no longer committed");
+        assert_ne!(
+            information.state, 0x1000,
+            "released memory is no longer committed"
+        );
         assert_eq!(
             native_virtual_query(base.cast::<c_void>(), &mut information, 47),
             0,
             "a short MEMORY_BASIC_INFORMATION buffer is rejected"
         );
+    }
+}
+
+#[cfg(test)]
+mod shared_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn views_share_writes_copy_on_write_is_private_and_handle_can_close_first() {
+        let _process = super::context::TestProcessGuard::new();
+        assert_eq!(
+            native_create_file_mapping_w(u64::MAX, 0, 0x04000040, 0, 65536, ptr::null()),
+            0
+        );
+        assert_eq!(
+            native_get_last_error(),
+            87,
+            "SEC_RESERVE must not falsely claim commit support"
+        );
+        let mapping = native_create_file_mapping_w(u64::MAX, 0, 0x40, 0, 65536, ptr::null());
+        assert_ne!(
+            mapping, 0,
+            "executable shared sections support JIT double mapping"
+        );
+        let write = native_map_view_of_file(mapping, 0xf001f, 0, 0, 0); // FILE_MAP_ALL_ACCESS is shared, not COPY
+        let execute = native_map_view_of_file(mapping, 0x24, 0, 0, 0);
+        let copy = native_map_view_of_file(mapping, 1, 0, 0, 0);
+        assert!(!write.is_null() && !execute.is_null() && !copy.is_null());
+        assert_eq!(native_close_handle(mapping), 1);
+        unsafe {
+            write.write_volatile(42);
+            assert_eq!(execute.read_volatile(), 42);
+            assert_eq!(copy.read_volatile(), 42);
+            copy.write_volatile(7);
+            write.write_volatile(99);
+            assert_eq!(execute.read_volatile(), 99);
+            assert_eq!(copy.read_volatile(), 7);
+        }
+        for view in [copy, execute, write] {
+            assert_eq!(native_unmap_view_of_file(view.cast()), 1);
+        }
+    }
+
+    #[test]
+    fn flushing_another_view_preserves_the_latest_shared_bytes() {
+        let _process = super::context::TestProcessGuard::new();
+        let path = r"C:\shared-map.txt";
+        fs_ctx()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .fs
+            .write_file(path, b"abc".to_vec())
+            .unwrap();
+        let name: Vec<u16> = path.encode_utf16().chain([0]).collect();
+        let file = native_create_file_w(name.as_ptr(), 0xc0000000, 3, 0, 3, 0, 0);
+        let mapping = native_create_file_mapping_w(file, 0, 4, 0, 0, ptr::null());
+        let first = native_map_view_of_file(mapping, 2, 0, 0, 0);
+        let second = native_map_view_of_file(mapping, 2, 0, 0, 0);
+        assert!(!first.is_null() && !second.is_null());
+        unsafe {
+            first.write_volatile(b'X');
+            second.add(1).write_volatile(b'Y');
+        }
+        assert_eq!(native_flush_view_of_file(first.cast(), 0), 1);
+        assert_eq!(native_unmap_view_of_file(second.cast()), 1);
+        assert_eq!(
+            fs_ctx()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .fs
+                .read_file(path)
+                .unwrap(),
+            b"XYc"
+        );
+        assert_eq!(native_unmap_view_of_file(first.cast()), 1);
+        assert_eq!(native_close_handle(mapping), 1);
+        assert_eq!(native_close_handle(file), 1);
     }
 }

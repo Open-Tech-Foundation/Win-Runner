@@ -7,10 +7,13 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 #[test]
+#[ignore = "requires WINRUN_TEST_CHOCO; run explicitly with --ignored"]
 fn choco_install_nodejs_then_node_and_npm_report_pinned_versions() {
-    if std::env::var("WINRUN_TEST_CHOCO").as_deref() != Ok("1") {
-        return;
-    }
+    assert_eq!(
+        std::env::var("WINRUN_TEST_CHOCO").as_deref(),
+        Ok("1"),
+        "set WINRUN_TEST_CHOCO=1 for this live test"
+    );
     let script = "powershell -c \"irm https://community.chocolatey.org/install.ps1|iex\"\nchoco install nodejs --version=\"24.21.0\"\nnode -v\nnpm -v\nexit\n";
     let mut child = Command::new(env!("CARGO_BIN_EXE_winrun"))
         .arg("shell")
@@ -72,10 +75,13 @@ fn choco_install_nodejs_then_node_and_npm_report_pinned_versions() {
 }
 
 #[test]
+#[ignore = "requires WINRUN_TEST_CHOCO; run explicitly with --ignored"]
 fn choco_7zip_install_runs_and_survives_snapshot_reload() {
-    if std::env::var("WINRUN_TEST_CHOCO").as_deref() != Ok("1") {
-        return;
-    }
+    assert_eq!(
+        std::env::var("WINRUN_TEST_CHOCO").as_deref(),
+        Ok("1"),
+        "set WINRUN_TEST_CHOCO=1 for this live test"
+    );
     let snapshot = std::env::temp_dir().join(format!("winrun-7zip-{}.snap", std::process::id()));
     let script = "choco install 7zip.install -y\n7z -h\nexit\n";
     let mut install = Command::new(env!("CARGO_BIN_EXE_winrun"))

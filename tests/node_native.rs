@@ -21,10 +21,9 @@ unsafe extern "C" {
 }
 
 #[test]
+#[ignore = "requires WINRUN_NODE_EXE; run explicitly with --ignored"]
 fn official_windows_node_runs_version_and_javascript_natively() {
-    let Ok(path) = std::env::var("WINRUN_NODE_EXE") else {
-        return;
-    };
+    let path = std::env::var("WINRUN_NODE_EXE").expect("set WINRUN_NODE_EXE for this fixture test");
     let path = Path::new(&path);
     let bytes = std::fs::read(path).expect("read WINRUN_NODE_EXE");
     let report = winrun::inspect::inspect_pe(&bytes).expect("parse Windows node.exe");
@@ -63,11 +62,10 @@ fn official_windows_node_runs_version_and_javascript_natively() {
 }
 
 #[test]
+#[ignore = "requires WINRUN_NODE_EXE; run explicitly with --ignored"]
 #[cfg(unix)]
 fn official_windows_node_serves_an_http_request_natively() {
-    let Ok(node) = std::env::var("WINRUN_NODE_EXE") else {
-        return;
-    };
+    let node = std::env::var("WINRUN_NODE_EXE").expect("set WINRUN_NODE_EXE for this fixture test");
     let node = Path::new(&node)
         .canonicalize()
         .expect("Windows node.exe exists");
@@ -145,10 +143,9 @@ fn official_windows_node_serves_an_http_request_natively() {
 }
 
 #[test]
+#[ignore = "requires WINRUN_NODE_EXE; run explicitly with --ignored"]
 fn official_windows_node_receives_winfs_directory_changes_natively() {
-    let Ok(node) = std::env::var("WINRUN_NODE_EXE") else {
-        return;
-    };
+    let node = std::env::var("WINRUN_NODE_EXE").expect("set WINRUN_NODE_EXE for this fixture test");
     let node = Path::new(&node)
         .canonicalize()
         .expect("Windows node.exe exists");
@@ -171,10 +168,9 @@ fn official_windows_node_receives_winfs_directory_changes_natively() {
 }
 
 #[test]
+#[ignore = "requires WINRUN_NODE_EXE; run explicitly with --ignored"]
 fn official_windows_node_relative_file_remains_visible_to_shell_dir() {
-    let Ok(node) = std::env::var("WINRUN_NODE_EXE") else {
-        return;
-    };
+    let node = std::env::var("WINRUN_NODE_EXE").expect("set WINRUN_NODE_EXE for this fixture test");
     let node = Path::new(&node)
         .canonicalize()
         .expect("Windows node.exe exists");
@@ -208,16 +204,17 @@ fn official_windows_node_relative_file_remains_visible_to_shell_dir() {
         "Node did not see its file: {stdout}"
     );
     assert!(
-        stdout.lines().any(|line| line.trim() == "node-test.txt"),
+        stdout
+            .lines()
+            .any(|line| line.split_whitespace().last() == Some("node-test.txt")),
         "Win-Runner dir did not list Node's retained file: {stdout}"
     );
 }
 
 #[test]
+#[ignore = "requires WINRUN_NODE_EXE; run explicitly with --ignored"]
 fn official_windows_node_reads_guest_file_metadata_and_contents() {
-    let Ok(node) = std::env::var("WINRUN_NODE_EXE") else {
-        return;
-    };
+    let node = std::env::var("WINRUN_NODE_EXE").expect("set WINRUN_NODE_EXE for this fixture test");
     let node = Path::new(&node)
         .canonicalize()
         .expect("Windows node.exe exists");
@@ -253,10 +250,9 @@ fn official_windows_node_reads_guest_file_metadata_and_contents() {
 }
 
 #[test]
+#[ignore = "requires WINRUN_NODE_EXE; run explicitly with --ignored"]
 fn official_windows_node_exec_file_sync_captures_powershell_output() {
-    let Ok(node) = std::env::var("WINRUN_NODE_EXE") else {
-        return;
-    };
+    let node = std::env::var("WINRUN_NODE_EXE").expect("set WINRUN_NODE_EXE for this fixture test");
     let node = Path::new(&node)
         .canonicalize()
         .expect("Windows node.exe exists");
@@ -295,10 +291,9 @@ fn official_windows_node_exec_file_sync_captures_powershell_output() {
 }
 
 #[test]
+#[ignore = "requires WINRUN_NODE_EXE; run explicitly with --ignored"]
 fn official_windows_node_starts_nested_node_in_an_exec_worker() {
-    let Ok(node) = std::env::var("WINRUN_NODE_EXE") else {
-        return;
-    };
+    let node = std::env::var("WINRUN_NODE_EXE").expect("set WINRUN_NODE_EXE for this fixture test");
     let node = Path::new(&node)
         .canonicalize()
         .expect("Windows node.exe exists");
@@ -341,19 +336,19 @@ fn official_windows_node_starts_nested_node_in_an_exec_worker() {
 }
 
 #[test]
+#[ignore = "requires WINRUN_NODE_EXE; run explicitly with --ignored"]
 fn official_windows_node_runs_the_staged_npm_cli_natively() {
-    let Ok(node) = std::env::var("WINRUN_NODE_EXE") else {
-        return;
-    };
+    let node = std::env::var("WINRUN_NODE_EXE").expect("set WINRUN_NODE_EXE for this fixture test");
     let node = Path::new(&node)
         .canonicalize()
         .expect("Windows node.exe exists");
     let npm = std::env::var_os("WINRUN_NPM_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| node.parent().unwrap().join("npm-stage/C/npm"));
-    if !npm.join("bin/npm-cli.js").is_file() {
-        return;
-    }
+    assert!(
+        npm.join("bin/npm-cli.js").is_file(),
+        "set WINRUN_NPM_ROOT to a staged npm distribution"
+    );
     let npm = npm.canonicalize().expect("npm root exists");
     let expected_version = std::fs::read_to_string(npm.join("package.json"))
         .expect("read npm package metadata")
@@ -411,19 +406,19 @@ fn official_windows_node_runs_the_staged_npm_cli_natively() {
 }
 
 #[test]
+#[ignore = "requires WINRUN_NODE_EXE; run explicitly with --ignored"]
 fn official_windows_node_installs_and_runs_a_real_npm_package_natively() {
-    let Ok(node) = std::env::var("WINRUN_NODE_EXE") else {
-        return;
-    };
+    let node = std::env::var("WINRUN_NODE_EXE").expect("set WINRUN_NODE_EXE for this fixture test");
     let node = Path::new(&node)
         .canonicalize()
         .expect("Windows node.exe exists");
     let npm = std::env::var_os("WINRUN_NPM_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| node.parent().unwrap().join("npm-stage/C/npm"));
-    if !npm.join("bin/npm-cli.js").is_file() {
-        return;
-    }
+    assert!(
+        npm.join("bin/npm-cli.js").is_file(),
+        "set WINRUN_NPM_ROOT to a staged npm distribution"
+    );
     let npm = npm.canonicalize().expect("npm root exists");
     let artifacts = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/artifacts/node");
     let mut files = Vec::new();
@@ -478,22 +473,24 @@ fn official_windows_node_installs_and_runs_a_real_npm_package_natively() {
 }
 
 #[test]
+#[ignore = "requires WINRUN_NODE_EXE; run explicitly with --ignored"]
 fn official_windows_node_installs_from_the_live_npm_registry_natively() {
-    if std::env::var("WINRUN_TEST_LIVE_NPM").as_deref() != Ok("1") {
-        return;
-    }
-    let Ok(node) = std::env::var("WINRUN_NODE_EXE") else {
-        return;
-    };
+    assert_eq!(
+        std::env::var("WINRUN_TEST_LIVE_NPM").as_deref(),
+        Ok("1"),
+        "set WINRUN_TEST_LIVE_NPM=1 for this live test"
+    );
+    let node = std::env::var("WINRUN_NODE_EXE").expect("set WINRUN_NODE_EXE for this fixture test");
     let node = Path::new(&node)
         .canonicalize()
         .expect("Windows node.exe exists");
     let npm = std::env::var_os("WINRUN_NPM_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| node.parent().unwrap().join("npm-stage/C/npm"));
-    if !npm.join("bin/npm-cli.js").is_file() {
-        return;
-    }
+    assert!(
+        npm.join("bin/npm-cli.js").is_file(),
+        "set WINRUN_NPM_ROOT to a staged npm distribution"
+    );
     let npm = npm.canonicalize().expect("npm root exists");
     let probe =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/artifacts/node/is-number-probe.js");
@@ -558,14 +555,14 @@ fn collect_files(root: &Path, output: &mut Vec<PathBuf>) {
 /// through libuv's `ReadConsoleW` line reader on a `QueueUserWorkItem`
 /// thread. `script` gives the guest a real pseudo-terminal.
 #[test]
+#[ignore = "requires WINRUN_NODE_EXE; run explicitly with --ignored"]
 #[cfg(unix)]
 fn official_windows_node_reads_a_prompt_answer_from_a_terminal() {
-    let Ok(node) = std::env::var("WINRUN_NODE_EXE") else {
-        return;
-    };
-    if Command::new("script").arg("--version").output().is_err() {
-        return;
-    }
+    let node = std::env::var("WINRUN_NODE_EXE").expect("set WINRUN_NODE_EXE for this fixture test");
+    assert!(
+        Command::new("script").arg("--version").output().is_ok(),
+        "install util-linux script for terminal fixture tests"
+    );
     let node = Path::new(&node)
         .canonicalize()
         .expect("Windows node.exe exists");
@@ -606,14 +603,14 @@ fn official_windows_node_reads_a_prompt_answer_from_a_terminal() {
 /// and `ReadConsoleInputW`; leaving raw mode starts a line read that the
 /// next switch cancels with an injected Enter (`WriteConsoleInputW`).
 #[test]
+#[ignore = "requires WINRUN_NODE_EXE; run explicitly with --ignored"]
 #[cfg(unix)]
 fn official_windows_node_reads_raw_keys_across_terminal_mode_switches() {
-    let Ok(node) = std::env::var("WINRUN_NODE_EXE") else {
-        return;
-    };
-    if Command::new("script").arg("--version").output().is_err() {
-        return;
-    }
+    let node = std::env::var("WINRUN_NODE_EXE").expect("set WINRUN_NODE_EXE for this fixture test");
+    assert!(
+        Command::new("script").arg("--version").output().is_ok(),
+        "install util-linux script for terminal fixture tests"
+    );
     let node = Path::new(&node)
         .canonicalize()
         .expect("Windows node.exe exists");
@@ -663,10 +660,9 @@ fn official_windows_node_reads_raw_keys_across_terminal_mode_switches() {
 /// its children from 2, so nested processes shared ids (and debug builds
 /// panicked on a child id below its parent's).
 #[test]
+#[ignore = "requires WINRUN_NODE_EXE; run explicitly with --ignored"]
 fn official_windows_node_processes_nested_three_deep_have_distinct_ids() {
-    let Ok(node) = std::env::var("WINRUN_NODE_EXE") else {
-        return;
-    };
+    let node = std::env::var("WINRUN_NODE_EXE").expect("set WINRUN_NODE_EXE for this fixture test");
     let node = Path::new(&node)
         .canonicalize()
         .expect("Windows node.exe exists");
@@ -734,11 +730,10 @@ fn official_windows_node_processes_nested_three_deep_have_distinct_ids() {
 /// lets Node exit: closing a listener aborts libuv's pending AcceptEx
 /// operations, which otherwise keep the event loop alive forever.
 #[test]
+#[ignore = "requires WINRUN_NODE_EXE; run explicitly with --ignored"]
 #[cfg(unix)]
 fn official_windows_node_ipv6_server_answers_and_exits_after_close() {
-    let Ok(node) = std::env::var("WINRUN_NODE_EXE") else {
-        return;
-    };
+    let node = std::env::var("WINRUN_NODE_EXE").expect("set WINRUN_NODE_EXE for this fixture test");
     let node = Path::new(&node)
         .canonicalize()
         .expect("Windows node.exe exists");

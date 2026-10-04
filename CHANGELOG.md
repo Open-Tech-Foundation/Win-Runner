@@ -6,6 +6,25 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Keep idle or partial unauthenticated WebSocket handshakes from blocking
+  control clients; expire pending handshakes and bound their count.
+- Share file-mapping views through kernel-backed sections, preserving
+  copy-on-write isolation and view lifetime after handle closure. Reject
+  unaligned offsets and unsupported reserved sections explicitly.
+- Translate faults on native exec workers, guest threads, and TLS/thread
+  callbacks, and apply PE section permissions after import/TLS initialization.
+- Store SRW lock, condition-variable, and InitOnce state inline with futex
+  waits, eliminating their permanent host allocations.
+- Isolate DLL-loader tests from shared process state and preferred-address
+  collisions. Report optional real-binary tests as ignored, fail explicitly
+  requested tests with missing fixtures, and run Node/npm and CoreCLR in CI.
+- Match Windows oracle errors for undersized reparse buffers (122) and
+  console reads on ordinary file handles (87), retaining error 6 for console
+  write/query operations on those handles.
+- Duplicate named-pipe endpoints with independent handle lifetimes so nested
+  Node processes can open their inherited stdout. Correct the .NET fixture
+  assembly name and a stale Node directory-listing assertion.
+
 - A guest process that crashes (a fault signal in its worker) exits with
   the Windows exception code, `0xC0000005` for an access violation, instead
   of 1, and the crash is noted on stderr, so a crash in a nested process

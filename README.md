@@ -154,6 +154,20 @@ Run the test suite with `cargo test --offline`; native changes should also be ex
 
 See [CHANGELOG.md](CHANGELOG.md) for release notes and [COMPATIBILITY_BACKLOG.md](COMPATIBILITY_BACKLOG.md) for tracked compatibility work.
 
+Fixture-dependent tests are reported as **ignored** in the default suite. Run
+these explicitly with their fixture environment variables and `-- --ignored`;
+missing fixtures then fail instead of reporting a pass. For example:
+
+```bash
+WINRUN_NODE_EXE=/path/to/node.exe WINRUN_NPM_ROOT=/path/to/node_modules/npm \
+  WINRUN_TEST_LIVE_NPM=1 cargo test --test node_native -- --ignored
+bash scripts/fetch-dotnet-fixture.sh
+WINRUN_DOTNET_FIXTURE=target/dotnet-fixture cargo test --test dotnet_native -- --ignored
+WINRUN_RG_EXE=/path/to/rg.exe cargo test --test rg_native -- --ignored
+```
+
+CI runs the default suite plus dedicated Node/npm and CoreCLR fixture jobs.
+
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE); see [NOTICE](NOTICE).

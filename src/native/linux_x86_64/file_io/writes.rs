@@ -474,6 +474,25 @@ mod named_pipe_tests {
     }
 
     #[test]
+    fn duplicated_pipe_survives_source_close_and_preserves_io() {
+        let _process = crate::native::linux_x86_64::context::TestProcessGuard::new();
+        let server = server("duplicate-lifetime", 3);
+        let client = client("duplicate-lifetime", 0xc000_0000, 0);
+        let mut duplicate = 0;
+        assert_eq!(native_duplicate_handle(u64::MAX, client, u64::MAX, &mut duplicate, 0, 0, 2), 1);
+        assert_ne!(duplicate, client);
+        assert_eq!(native_close_handle(client), 1);
+        assert_eq!(native_get_file_type(duplicate), 3);
+        let mut count = 0;
+        assert_eq!(native_write_file(server, b"x".as_ptr(), 1, &mut count, 0), 1);
+        let mut byte = 0;
+        assert_eq!(native_read_file(duplicate, &mut byte, 1, &mut count, 0), 1);
+        assert_eq!((byte, count), (b'x', 1));
+        assert_eq!(native_close_handle(duplicate), 1);
+        assert_eq!(native_close_handle(server), 1);
+    }
+
+    #[test]
     fn named_pipe_pair_connects_and_transfers_duplex_bytes() {
         let name = format!("uv\\winrun-unit-{}", std::process::id());
         let server = server(&name, 3);

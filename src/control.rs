@@ -16,8 +16,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
-use tungstenite::{accept_hdr, Error as WsError, Message, WebSocket};
+use std::time::{Duration, Instant};
+use tungstenite::{accept_hdr, handshake::HandshakeError, Error as WsError, Message, WebSocket};
 
 #[repr(C)]
 struct SharedTerminalSize {
@@ -176,7 +176,8 @@ fn serve(
         return;
     }
     let mut pending = Vec::new();
-    let mut socket = loop {
+    let mut handshakes = Vec::new();
+    let mut socket = 'accept: loop {
         loop {
             match receiver.try_recv() {
                 Ok(event) => {
@@ -189,34 +190,51 @@ fn serve(
                 Err(TryRecvError::Disconnected) => return,
             }
         }
-        match listener.accept() {
-            Ok((stream, _)) => match accept_hdr(
-                stream,
-                |request: &tungstenite::handshake::server::Request, response| {
-                    if constant_time_eq(request.uri().path().as_bytes(), expected_path.as_bytes()) {
-                        Ok(response)
-                    } else {
-                        Err(tungstenite::http::Response::builder()
-                            .status(401)
-                            .body(Some("invalid control token".to_string()))
-                            .expect("valid unauthorized response"))
+        // Drive each handshake without blocking the accept loop. A slow or idle
+        // unauthenticated peer cannot monopolize the control endpoint.
+        if let Ok((stream, _)) = listener.accept() {
+            if handshakes.len() < 64 && stream.set_nonblocking(true).is_ok() {
+                let path = expected_path.clone();
+                match accept_hdr(
+                    stream,
+                    move |request: &tungstenite::handshake::server::Request, response| {
+                        if constant_time_eq(request.uri().path().as_bytes(), path.as_bytes()) {
+                            Ok(response)
+                        } else {
+                            Err(tungstenite::http::Response::builder()
+                                .status(401)
+                                .body(Some("invalid control token".to_string()))
+                                .expect("valid response"))
+                        }
+                    },
+                ) {
+                    Ok(socket) => break socket,
+                    Err(HandshakeError::Interrupted(handshake)) => {
+                        handshakes.push((Instant::now(), handshake))
                     }
-                },
-            ) {
-                Ok(socket) => break socket,
-                Err(error) => {
-                    eprintln!("winrun: rejected control connection: {error}");
+                    Err(HandshakeError::Failure(_)) => {}
                 }
-            },
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => {
-                eprintln!("winrun: control accept failed: {error}");
-                thread::sleep(Duration::from_millis(20));
             }
         }
+        let mut remaining = Vec::new();
+        for (started, handshake) in handshakes.drain(..) {
+            if started.elapsed() >= Duration::from_secs(2) {
+                continue;
+            }
+            match handshake.handshake() {
+                Ok(socket) => break 'accept socket,
+                Err(HandshakeError::Interrupted(handshake)) => remaining.push((started, handshake)),
+                Err(HandshakeError::Failure(_)) => {}
+            }
+        }
+        handshakes = remaining;
+        thread::sleep(Duration::from_millis(10));
     };
+    drop(handshakes);
+    let _ = socket.get_ref().set_nonblocking(false);
+    let _ = socket
+        .get_ref()
+        .set_write_timeout(Some(Duration::from_secs(2)));
     let _ = socket
         .get_ref()
         .set_read_timeout(Some(Duration::from_millis(20)));

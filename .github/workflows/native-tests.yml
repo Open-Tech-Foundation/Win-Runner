@@ -1,0 +1,42 @@
+name: native-tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --locked --no-fail-fast
+  node:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch pinned official Node distribution
+        run: |
+          mkdir -p target/node-fixture
+          cd target/node-fixture
+          curl -fsSLO https://nodejs.org/dist/v24.21.0/node-v24.21.0-win-x64.zip
+          curl -fsSLO https://nodejs.org/dist/v24.21.0/SHASUMS256.txt
+          grep ' node-v24.21.0-win-x64.zip$' SHASUMS256.txt | sha256sum -c -
+          unzip -q node-v24.21.0-win-x64.zip
+      - name: Native Node and npm integration tests
+        env:
+          WINRUN_NODE_EXE: ${{ github.workspace }}/target/node-fixture/node-v24.21.0-win-x64/node.exe
+          WINRUN_NPM_ROOT: ${{ github.workspace }}/target/node-fixture/node-v24.21.0-win-x64/node_modules/npm
+          WINRUN_TEST_LIVE_NPM: '1'
+        run: cargo test --locked --test node_native -- --ignored
+  dotnet:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/fetch-dotnet-fixture.sh target/dotnet-fixture
+      - name: Native CoreCLR integration test
+        env:
+          WINRUN_DOTNET_FIXTURE: ${{ github.workspace }}/target/dotnet-fixture
+        run: cargo test --locked --test dotnet_native -- --ignored

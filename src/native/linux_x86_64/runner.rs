@@ -21,7 +21,7 @@ pub fn run_import_free(img: &PeImage) -> Result<u32, String> {
         return Err("native entry point lies outside the loaded image".to_string());
     }
     let mapping = map(img)?;
-    protect_exec(&mapping)?;
+    protect_exec(&mapping, img)?;
     // SAFETY: `entry` lies in the RX mapping just created. The caller is
     // limited to bring-up PE fixtures that implement this ABI and return;
     // arbitrary Windows entry points require the planned process sandbox.
@@ -613,7 +613,8 @@ fn run_rust_baseline_argv_with_fs_impl(
                     std::path::Path::new(&request_path),
                 )?;
             }
-            protect_exec(&mapping)?;
+            super::exceptions::install_guest_fault_signal_handlers()?;
+            protect_exec(&mapping, img)?;
             let guest_process = Arc::clone(&process);
             let code = std::thread::Builder::new()
                 .name("winrun-native-guest".to_string())
@@ -636,9 +637,10 @@ fn run_rust_baseline_argv_with_fs_impl(
                         &tls_callbacks,
                         1,
                     );
-                    let guest: unsafe extern "win64" fn() -> u32 =
-                        unsafe { std::mem::transmute(entry) };
-                    let code = unsafe { guest() as i32 };
+                    let code = match unsafe { super::exceptions::invoke_guest_with_fault_translation(entry) } {
+                        Ok(code) => code as i32,
+                        Err(code) => native_exit_process(code),
+                    };
                     native_wait_file_io(&guest_process);
                     code
                 })
@@ -729,7 +731,7 @@ fn run_rust_baseline_argv_with_fs_impl(
             process
                 .state_fd
                 .store(state_fds[1] as u32, Ordering::Release);
-            if protect_exec(&mapping).is_err() {
+            if protect_exec(&mapping, img).is_err() {
                 unsafe { _exit(127) };
             }
             // Launcher threads can have 64 KiB stacks. V8 needs a larger

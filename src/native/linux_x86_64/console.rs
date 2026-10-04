@@ -682,6 +682,17 @@ fn console_stdin(handle: u64) -> bool {
 
 /// `ReadConsoleW(handle, buffer, chars, read, control)`. In line-input mode
 /// the host terminal stays cooked and returns whole edited lines.
+// Windows distinguishes a disk-file handle from an invalid console handle
+// for the two console read APIs; the write/query APIs retain error 6.
+fn console_read_handle_error(handle: u64) -> u32 {
+    let file = fs_ctx().and_then(|ctx| ctx.lock().ok().map(|fs| fs.handles.contains_key(&handle)));
+    if file == Some(true) {
+        87
+    } else {
+        6
+    }
+}
+
 pub(super) extern "win64" fn native_read_console_w(
     handle: u64,
     buffer: *mut u16,
@@ -690,7 +701,7 @@ pub(super) extern "win64" fn native_read_console_w(
     _control: u64,
 ) -> i32 {
     if !console_stdin(handle) {
-        native_set_last_error(6);
+        native_set_last_error(console_read_handle_error(handle));
         return 0;
     }
     if buffer.is_null() && chars != 0 {
@@ -725,7 +736,7 @@ pub(super) extern "win64" fn native_read_console_input_w(
     read_count: *mut u32,
 ) -> i32 {
     if !console_stdin(handle) {
-        native_set_last_error(6);
+        native_set_last_error(console_read_handle_error(handle));
         return 0;
     }
     if (records.is_null() && length != 0) || read_count.is_null() {

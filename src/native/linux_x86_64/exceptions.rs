@@ -368,7 +368,23 @@ extern "C" fn dispatch_linux_guest_fault(slot_pointer: *const std::ffi::c_void) 
 }
 
 pub(super) unsafe fn invoke_guest_with_fault_translation(entry: u64) -> Result<u32, u32> {
+    unsafe { invoke_guest_with_arguments(entry, [0; 3]) }
+}
+
+pub(super) unsafe fn invoke_guest_with_arguments(
+    entry: u64,
+    arguments: [u64; 3],
+) -> Result<u32, u32> {
     let thread_id = unsafe { linux_current_thread_id() };
+    // Nested DLL/TLS callbacks are already inside this thread's recovery gate.
+    if NATIVE_FAULT_SLOTS
+        .iter()
+        .any(|slot| slot.thread_id.load(Ordering::Acquire) == thread_id)
+    {
+        let callback: unsafe extern "win64" fn(u64, u64, u64) -> u32 =
+            unsafe { std::mem::transmute(entry) };
+        return Ok(unsafe { callback(arguments[0], arguments[1], arguments[2]) });
+    }
     let Some(slot) = NATIVE_FAULT_SLOTS.iter().find(|slot| {
         slot.thread_id
             .compare_exchange(0, thread_id, Ordering::AcqRel, Ordering::Relaxed)
@@ -385,6 +401,7 @@ pub(super) unsafe fn invoke_guest_with_fault_translation(entry: u64) -> Result<u
             dispatch_linux_guest_fault,
             (slot as *const NativeFaultSlot).cast(),
             slot.context.get().cast(),
+            arguments.as_ptr(),
         )
     };
     slot.thread_id.store(0, Ordering::Release);

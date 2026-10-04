@@ -394,11 +394,14 @@ pub(super) struct NativeDynamicFunctionTable {
 }
 #[derive(Clone)]
 pub(super) struct NativeFileMapping {
+    pub(super) storage: Arc<std::fs::File>,
     pub(super) length: usize,
     pub(super) protection: u32,
     pub(super) path: Option<String>,
 }
+#[derive(Clone)]
 pub(super) struct NativeMappingView {
+    pub(super) _storage: Arc<std::fs::File>,
     pub(super) length: usize,
     pub(super) view_length: usize,
     pub(super) backing: Option<(String, usize)>,

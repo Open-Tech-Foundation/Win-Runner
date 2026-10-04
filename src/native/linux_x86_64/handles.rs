@@ -223,6 +223,23 @@ pub(super) extern "win64" fn native_duplicate_handle(
         .ok()
         .and_then(|values| values.get(&source_handle).copied())
         .unwrap_or(source_handle);
+    // A pipe duplicate owns another reference to the endpoint. It must be
+    // present in the pipe table so IOCP, cancellation and close work normally.
+    if let Ok(mut pipes) = process.named_pipes.lock() {
+        if let Some(mut pipe) = pipes.handles.get(&original).cloned() {
+            let duplicate = pipes.next;
+            pipes.next += 1;
+            pipe.inheritable = inherit != 0;
+            pipes.handles.insert(duplicate, pipe);
+            if options & 1 != 0 {
+                pipes.handles.remove(&original);
+            }
+            unsafe {
+                target_handle.write(duplicate);
+            }
+            return 1;
+        }
+    }
     let valid = matches!(original, u64::MAX | 0xffff_ffff_ffff_fffe)
         || host_standard_fd(original).is_some()
         || native_device(original).is_some()

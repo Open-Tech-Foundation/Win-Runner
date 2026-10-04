@@ -178,8 +178,7 @@ Items remain open until implementation and relevant verification are complete.
   - [x] Install synchronous Linux fault capture around the native image entry
     point, dispatch registered vectored handlers and the unhandled exception
     filter with the captured guest context, and resume when a handler edits it.
-  - [ ] Extend fault recovery to TLS callbacks and guest-created threads; they
-    currently do not have registered recovery slots.
+  - [x] Extend fault recovery to TLS callbacks and guest-created threads.
   - [x] Walk mapped guest x64 frames during exception dispatch, call language
     handlers returned by `RtlVirtualUnwind`, and honor continue-execution and
     continue-search dispositions.
@@ -240,8 +239,10 @@ Items remain open until implementation and relevant verification are complete.
     - [x] Map IL-only assemblies from `LoadLibrary` (PE32/PE32+, EXE or DLL)
       on the 64 KiB allocation granularity, as CoreCLR's loaded layout needs.
     - [ ] Self-contained and single-file layouts; `dotnet.exe app.dll`.
-    - [ ] Share memory between file-mapping views (memfd) so CoreCLR's W^X
-      double mapping works instead of falling back to single mappings.
+    - [x] Share committed file-mapping views through memfd, including
+      executable aliases and isolated copy-on-write views.
+    - [ ] Implement SEC_RESERVE sections and shared per-page commitment;
+      these fail explicitly, so CoreCLR retains its single-mapping fallback.
     - [ ] `RtlAddGrowableFunctionTable` and friends for JIT-code unwinding;
       `version.dll` file-version queries.
   - [ ] Complete SEH dispatch and stack unwinding, including native fault
@@ -252,8 +253,8 @@ Items remain open until implementation and relevant verification are complete.
     - [ ] Report thread stacks from `VirtualQuery` with a `PAGE_GUARD` page;
       CoreCLR's unhandled-exception path checks for one and otherwise
       reports "Stack overflow." instead of the exception.
-    - [ ] Translate faults on `CreateThread` threads, not only the main
-      thread, so managed null references there become exceptions.
+    - [x] Translate synchronous faults on native exec workers and
+      `CreateThread` threads through Windows exception handlers.
   - [ ] Complete virtual memory semantics used by the GC/JIT: reserve versus
     commit, guard pages, and writable/executable protection transitions.
     - [x] Track committed pages inside reserved allocations; reject
@@ -265,8 +266,7 @@ Items remain open until implementation and relevant verification are complete.
       clear the guard modifier, and restore the requested protection.
     - [x] Track per-page `VirtualProtect` changes and guard flags for mapped PE
       images, and return split protection regions from `VirtualQuery`.
-    - [ ] Apply PE section characteristics when initially mapping images;
-      current mappings still start RWX for CRT initialization.
+    - [x] Apply PE section characteristics after loader writes complete.
   - [ ] Implement GC thread suspension/context APIs (`SuspendThread`,
     `GetThreadContext`, `SetThreadContext`, `FlushProcessWriteBuffers`) with a
     Linux signal-based stop/resume protocol.
