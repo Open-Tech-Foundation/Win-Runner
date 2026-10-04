@@ -1034,6 +1034,20 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "ConnectNamedPipe" => Some(native_connect_named_pipe as *const () as usize as u64),
         "WaitNamedPipeW" => Some(native_wait_named_pipe_w as *const () as usize as u64),
         "WaitNamedPipeA" => Some(native_wait_named_pipe_a as *const () as usize as u64),
+        "CreatePipe" => Some(native_create_pipe as *const () as usize as u64),
+        "GetProcessTimes" => Some(native_get_process_times as *const () as usize as u64),
+        "InitializeProcThreadAttributeList" => {
+            Some(native_initialize_proc_thread_attribute_list as *const () as usize as u64)
+        }
+        "UpdateProcThreadAttribute" => {
+            Some(native_update_proc_thread_attribute as *const () as usize as u64)
+        }
+        "DeleteProcThreadAttributeList" => {
+            Some(native_delete_proc_thread_attribute_list as *const () as usize as u64)
+        }
+        "GetVolumeInformationByHandleW" => {
+            Some(native_get_volume_information_by_handle_w as *const () as usize as u64)
+        }
         "CreateNamedPipeW" => Some(native_create_named_pipe_w as *const () as usize as u64),
         "CreateNamedPipeA" => Some(native_create_named_pipe_a as *const () as usize as u64),
         "CreateFileA" => Some(native_create_file_a as *const () as usize as u64),

@@ -161,6 +161,20 @@ pub(super) extern "win64" fn native_set_handle_information(
         native_set_last_error(87);
         return 0;
     }
+    if let Some(process) = process_ctx() {
+        if let Ok(mut pipes) = process.named_pipes.lock() {
+            if let Some(pipe) = pipes.handles.get_mut(&handle) {
+                if mask & flags & 2 != 0 {
+                    native_set_last_error(50); // Protect-from-close is unsupported.
+                    return 0;
+                }
+                if mask & 1 != 0 {
+                    pipe.inheritable = flags & 1 != 0;
+                }
+                return 1;
+            }
+        }
+    }
     if handle & 0xffff_ffff_0000_0000 == SOCKET_HANDLE_TAG {
         let fd = handle as i32;
         let descriptor_flags = unsafe { fcntl(fd, 1) }; // F_GETFD
@@ -203,6 +217,39 @@ pub(super) extern "win64" fn native_duplicate_handle(
     inherit: i32,
     options: u32,
 ) -> i32 {
+    let close_source = options & 1 != 0
+        && process_ctx().is_some_and(|process| source_process == process.process_handle);
+    if close_source && target_process == 0 && target_handle.is_null() {
+        return native_close_handle(source_handle);
+    }
+    let result = native_duplicate_handle_impl(
+        source_process,
+        source_handle,
+        target_process,
+        target_handle,
+        desired_access,
+        inherit,
+        options & !1,
+    );
+    if close_source {
+        // Windows closes the source even when duplication fails. Preserve
+        // the duplication error rather than a close operation's last error.
+        let error = native_get_last_error();
+        native_close_handle(source_handle);
+        native_set_last_error(error);
+    }
+    result
+}
+
+fn native_duplicate_handle_impl(
+    source_process: u64,
+    source_handle: u64,
+    target_process: u64,
+    target_handle: *mut u64,
+    desired_access: u32,
+    inherit: i32,
+    options: u32,
+) -> i32 {
     if native_diagnostic_enabled() {
         eprintln!("native DuplicateHandle source_process={source_process:#x} source={source_handle:#x} target_process={target_process:#x} desired={desired_access:#x} inherit={inherit} options={options:#x}");
     }
@@ -231,9 +278,6 @@ pub(super) extern "win64" fn native_duplicate_handle(
             pipes.next += 1;
             pipe.inheritable = inherit != 0;
             pipes.handles.insert(duplicate, pipe);
-            if options & 1 != 0 {
-                pipes.handles.remove(&original);
-            }
             unsafe {
                 target_handle.write(duplicate);
             }
@@ -268,11 +312,6 @@ pub(super) extern "win64" fn native_duplicate_handle(
         Err(_) => return 0,
     }
     unsafe { target_handle.write(duplicate) };
-    if options & 1 != 0 && source_handle != original {
-        if let Ok(mut values) = process.duplicate_handles.lock() {
-            values.remove(&source_handle);
-        }
-    }
     1
 }
 

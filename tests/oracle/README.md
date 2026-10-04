@@ -29,6 +29,16 @@ with `guests/build-oracle.sh` (rustc and rust-lld only). A probe:
 | `path_names` | path spellings from `GetLongPathNameW`, `GetFullPathNameW`, and final paths |
 | `links` | `CreateSymbolicLinkW`, what a handle names with and without `FILE_FLAG_OPEN_REPARSE_POINT`, `FSCTL_GET_REPARSE_POINT` data |
 | `pool_console` | `QueueUserWorkItem`, `MapVirtualKeyW`, console input functions on a non-console handle |
+| `process_runtime` | anonymous pipe access, duplication and EOF, startup handle-list filtering and child output/timestamps, volume metadata, error mode and WER flags, system-directory buffer sizing, priority boost, continuation dispatch, timer deadlines/reset/cancel/errors, shared clocks and PEB, read/write console devices and VT modes |
+
+`process_runtime` covers the native APIs added for Micro and its background linter
+jobs. The existing `links` and `pool_console` probes cover the recent reparse
+buffer and non-console error fixes. Application behavior such as `reload`,
+PowerShell installers, and npm launchers remains covered by their shell and
+real-binary E2E tests; `reload` is a Win-Runner command with no Windows API
+equivalent. Unsupported desktop clipboard/provider catalog services and
+asynchronous thread suspension are tested locally for explicit failure.
+No Windows golden is recorded for a new probe until Windows CI produces it.
 
 Add a probe for an area of the API, not for a program: when an application
 misbehaves, find the Win32 behavior behind it and add cases that pin that

@@ -50,6 +50,8 @@ try:
     os.write(master, b"micro -clipboard internal " + path + b"\n")
     wait_for(b"\x1b[?25l")
     drain(0.5)
+    if mode == "job":
+        wait_for(b"complete")
     # UTF-8, backspace, left-arrow, insertion, and delete must round-trip.
     if mode == "edit":
         os.write(master, "Hello café 界!X".encode())
@@ -61,7 +63,7 @@ try:
         wait_for(b"\x1b[30;", before_resize)
     elif mode == "reopen":
         os.write(master, b"\x1b[HReopened: ")
-    else:
+    elif mode == "save-error":
         os.write(master, b"unsaved text")
     drain(0.3)
     before_save = len(output)

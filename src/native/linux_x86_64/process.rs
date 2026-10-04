@@ -321,6 +321,10 @@ pub(super) fn native_create_powershell_shell_child(
     if std::thread::Builder::new()
         .name("winrun-powershell-shell-link".to_string())
         .spawn(move || {
+            let mut started_usage: libc::rusage = unsafe { std::mem::zeroed() };
+            unsafe {
+                libc::getrusage(libc::RUSAGE_THREAD, &mut started_usage);
+            }
             let _ = powershell_fs.set_cwd(&launch.current_directory);
             let (code, stdout, stderr) = execute_powershell_shell_link(&mut powershell_fs, &args);
             let state = crate::snapshot::encode_changes(&powershell_fs);
@@ -355,6 +359,7 @@ pub(super) fn native_create_powershell_shell_child(
                 }
             }
             if let Ok(mut state) = worker_child.state.lock() {
+                worker_child.times.finish_thread_since(&started_usage);
                 *state = Some(if stdout_ok && stderr_ok { code } else { 1 });
             }
             worker_child.exited.notify_all();
@@ -1714,11 +1719,20 @@ fn create_exec_worker_child(
     mut child_fs: NativeFs,
     child_std_handles: [u64; 3],
     inherit_handles: bool,
+    handle_list: Option<&[u64]>,
     environment: &[(String, String)],
     process_information: u64,
 ) -> Result<(), u32> {
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
+
+    if let Some(handles) = handle_list {
+        let allowed = |handle: &u64| handles.contains(handle);
+        child_fs.handles.retain(|handle, _| allowed(handle));
+        child_fs.devices.retain(|handle, _| allowed(handle));
+        child_fs.file_access.retain(|handle, _| allowed(handle));
+        child_fs.file_shares.retain(|handle, _| allowed(handle));
+    }
 
     let executable = std::env::var_os("WINRUN_NATIVE_WORKER_EXE").ok_or(120u32)?;
     let pipes = parent.named_pipes.lock().map_err(|_| 6u32)?;
@@ -1733,7 +1747,10 @@ fn create_exec_worker_child(
     let transferable_pipes = pipes
         .handles
         .iter()
-        .filter(|(handle, pipe)| std_set.contains(handle) || (inherit_handles && pipe.inheritable))
+        .filter(|(handle, pipe)| {
+            (std_set.contains(handle) || (inherit_handles && pipe.inheritable))
+                && handle_list.is_none_or(|handles| handles.contains(handle))
+        })
         .map(|(handle, pipe)| (*handle, pipe.clone()))
         .collect::<Vec<_>>();
     drop(pipes);
@@ -1751,7 +1768,10 @@ fn create_exec_worker_child(
         .copied()
         .filter(|handle| {
             let flags = unsafe { fcntl(*handle as i32, 1) };
-            inherit_handles && flags >= 0 && flags & 1 == 0
+            inherit_handles
+                && flags >= 0
+                && flags & 1 == 0
+                && handle_list.is_none_or(|handles| handles.contains(handle))
         })
         .collect::<Vec<_>>();
     let socket_handles_to_close = all_socket_handles
@@ -1975,7 +1995,7 @@ fn create_exec_worker_child(
     std::thread::Builder::new()
         .name("winrun-native-worker-child".to_string())
         .spawn(move || {
-            let status = worker.wait();
+            let status = wait_worker_with_times(&mut worker, &monitor_child.times);
             if let Ok(encoded) = std::fs::read(&state_path_for_monitor) {
                 if !encoded.is_empty() {
                     if let Ok(mut native_fs) = monitor_fs.lock() {
@@ -2082,7 +2102,7 @@ pub(super) extern "win64" fn native_create_process_w(
     _process_attributes: u64,
     _thread_attributes: u64,
     inherit_handles: i32,
-    _creation_flags: u32,
+    creation_flags: u32,
     environment: u64,
     current_directory: *const u16,
     startup_info: u64,
@@ -2092,6 +2112,13 @@ pub(super) extern "win64" fn native_create_process_w(
         native_set_last_error(87); // ERROR_INVALID_PARAMETER
         return 0;
     }
+    let handle_list = match startup_handle_list(startup_info, creation_flags, inherit_handles != 0) {
+        Ok(handles) => handles,
+        Err(error) => {
+            native_set_last_error(error);
+            return 0;
+        }
+    };
     let Some(context) = fs_ctx() else {
         native_set_last_error(6); // ERROR_INVALID_HANDLE
         return 0;
@@ -2217,6 +2244,7 @@ pub(super) extern "win64" fn native_create_process_w(
         child_fs,
         child_std_handles,
         inherit_handles != 0,
+        handle_list.as_deref(),
         &environment,
         process_information,
     ) {

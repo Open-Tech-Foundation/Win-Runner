@@ -15,6 +15,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Implement anonymous `CreatePipe` endpoints, startup handle-list attributes,
+  process CPU/timing queries, and volume metadata for background child jobs.
+  Preserve directional access, handle inheritance, duplicate lifetimes,
+  captured output, and EOF when `DuplicateHandle` closes its source. Add a
+  real Micro plugin job test and Windows oracle coverage for pipes, child
+  processes, timers, process flags, shared clocks, and console compatibility.
+
 - Support Windows Go startup and clocks with read-only shared system data,
   real waitable-timer deadlines, process flags, PEB queries, and vectored
   continuation handlers. Recognize read/write console device handles,

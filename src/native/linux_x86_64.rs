@@ -23,6 +23,12 @@ use loader::*;
 #[path = "linux_x86_64/process.rs"]
 mod process;
 use process::*;
+#[path = "linux_x86_64/process_attributes.rs"]
+mod process_attributes;
+use process_attributes::*;
+#[path = "linux_x86_64/process_times.rs"]
+mod process_times;
+use process_times::*;
 #[path = "linux_x86_64/registry.rs"]
 mod registry;
 use registry::baseline_trampoline;

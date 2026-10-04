@@ -31,9 +31,18 @@ fn transcript(probe: &Path) -> String {
         .stderr(Stdio::piped())
         .spawn()
         .expect("start the winrun shell");
+    let executable =
+        if probe.file_stem().and_then(|name| name.to_str()) == Some("oracle_process_runtime") {
+            format!(
+            "@seed \"{}\" C:\\oracle-run\\process_runtime.exe\nC:\\oracle-run\\process_runtime.exe",
+            probe.display()
+        )
+        } else {
+            format!("\"{}\"", probe.display())
+        };
     let commands = format!(
-        "New-Item C:\\oracle-run -ItemType Directory\ncd C:\\oracle-run\n\"{}\"\nexit\n",
-        probe.display()
+        "New-Item C:\\oracle-run -ItemType Directory\ncd C:\\oracle-run\n{}\nexit\n",
+        executable
     );
     child
         .stdin
@@ -67,6 +76,32 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
             "{name} did not finish:\n{actual}"
         );
         assert!(!actual.contains("PANIC"), "{name} panicked:\n{actual}");
+        if name == "process_runtime" {
+            assert!(
+                !actual.contains("wrong") && !actual.contains("unavailable"),
+                "{name}: native behavior checks failed:\n{actual}"
+            );
+            for line in [
+                "pipe.eof: fail err=109",
+                "pipe.write_reader: fail err=5",
+                "pipe.read_writer: fail err=5",
+                "continue.dispatched: 1",
+                "timer.expires: 0",
+                "timer.auto_reset: 258",
+                "timer.periodic_second: 0",
+                "console.vt_preserved: ok",
+                "volume.serial_consistent: ok",
+                "startup.child_wait: 0",
+                "startup.child_times: ok",
+                "startup.time_order: ok",
+                "startup.output: ok",
+            ] {
+                assert!(
+                    actual.lines().any(|actual| actual == line),
+                    "{name}: missing native behavior result {line:?}\n{actual}"
+                );
+            }
+        }
         // Error codes captured by the Windows CI oracle. Keep these covered
         // even before complete transcripts for these probes are checked in.
         let required: &[&str] = match name.as_str() {

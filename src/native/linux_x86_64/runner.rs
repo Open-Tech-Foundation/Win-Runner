@@ -495,6 +495,7 @@ fn run_rust_baseline_argv_with_fs_impl(
             .and_then(|value| serde_json::from_str::<[u64; 3]>(&value).ok())
             .unwrap_or([STD_HANDLE_BASE, STD_HANDLE_BASE + 1, STD_HANDLE_BASE + 2]);
         let process = Arc::new(NativeProcessContext {
+            times: NativeProcessTimes::new(),
             image_base: img.image_base,
             image_size: img.size_of_image,
             module_path: prog.to_string(),

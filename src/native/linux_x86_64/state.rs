@@ -194,6 +194,7 @@ pub(super) enum NativeDevice {
 
 /// Mutable state owned by one Windows guest process.
 pub(super) struct NativeProcessContext {
+    pub(super) times: NativeProcessTimes,
     pub(super) image_base: u64,
     pub(super) image_size: u32,
     pub(super) module_path: String,
@@ -535,6 +536,7 @@ pub(super) struct DynamicTlsSlots {
 // registry; they are already consumed by the process-handle APIs.
 #[allow(dead_code)]
 pub(super) struct NativeChildProcess {
+    pub(super) times: NativeProcessTimes,
     /// The guest process id: the worker's host pid once it is spawned, so
     /// ids are unique across the whole process tree (see
     /// [`NativeProcessTable::allocate`]).
@@ -591,6 +593,7 @@ impl NativeProcessTable {
         let thread_handle = self.next_thread_handle;
         self.next_thread_handle += 1;
         let child = Arc::new(NativeChildProcess {
+            times: NativeProcessTimes::new(),
             process_id: AtomicU32::new(in_process_child_id(self.next_in_process_child)),
             parent_process_id,
             host_pid: AtomicI32::new(0),

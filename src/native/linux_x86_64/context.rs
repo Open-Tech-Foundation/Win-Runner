@@ -31,6 +31,7 @@ pub(super) static TEST_PROCESS: LazyLock<Arc<NativeProcessContext>> =
 #[cfg(test)]
 pub(super) fn new_test_process() -> Arc<NativeProcessContext> {
     Arc::new(NativeProcessContext {
+        times: NativeProcessTimes::new(),
         image_base: 0x0001_4000_0000,
         image_size: 0x10000,
         module_path: r"C:\winrun\winrun.exe".to_string(),

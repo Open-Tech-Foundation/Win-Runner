@@ -97,5 +97,37 @@ fn wpkg_micro_edits_unicode_resizes_and_persists_a_snapshot() {
             );
         }
     }
+    let plugin_snapshot = directory.join("plugin.snap");
+    let job_snapshot = directory.join("job.snap");
+    let mut fs = winrun::snapshot::load_file(initial.to_str().unwrap()).unwrap();
+    fs.mkdir(r"C:\Users\runner\.config\micro\plug\jobfixture")
+        .unwrap();
+    fs.write_file(
+        r"C:\Users\runner\.config\micro\plug\jobfixture\jobfixture.lua",
+        include_bytes!("artifacts/micro/jobfixture.lua").to_vec(),
+    )
+    .unwrap();
+    winrun::snapshot::save_file(&mut fs, plugin_snapshot.to_str().unwrap()).unwrap();
+    let terminal = Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/artifacts/micro/pty_driver.py"
+        ))
+        .arg(env!("CARGO_BIN_EXE_winrun"))
+        .arg(&plugin_snapshot)
+        .arg(&job_snapshot)
+        .arg("job")
+        .output()
+        .unwrap();
+    assert!(
+        terminal.status.success(),
+        "plugin job: {}",
+        String::from_utf8_lossy(&terminal.stderr)
+    );
+    let fs = winrun::snapshot::load_file(job_snapshot.to_str().unwrap()).unwrap();
+    assert_eq!(
+        fs.read_file(r"C:\job-output.txt").unwrap(),
+        b"lint-probe\r\n"
+    );
     std::fs::remove_dir_all(directory).unwrap();
 }

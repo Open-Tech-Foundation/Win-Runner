@@ -1,5 +1,81 @@
 use super::*;
 
+/// Anonymous byte pipes use the same endpoints as named-pipe I/O and child
+/// stdio, without a name, connection handshake, or overlapped operations.
+pub(in crate::native::linux_x86_64) extern "win64" fn native_create_pipe(
+    read_handle: *mut u64,
+    write_handle: *mut u64,
+    security: *const u8,
+    _size: u32,
+) -> i32 {
+    if read_handle.is_null() || write_handle.is_null() {
+        native_set_last_error(87);
+        return 0;
+    }
+    let inheritable = if security.is_null() {
+        false
+    } else {
+        if unsafe { security.cast::<u32>().read_unaligned() } < 24 {
+            native_set_last_error(87);
+            return 0;
+        }
+        unsafe { security.add(16).cast::<i32>().read_unaligned() != 0 }
+    };
+    let Some(process) = process_ctx() else {
+        native_set_last_error(6);
+        return 0;
+    };
+    let Ok(mut pipes) = process.named_pipes.lock() else {
+        native_set_last_error(6);
+        return 0;
+    };
+    let mut fds = [-1; 2];
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+            fds.as_mut_ptr(),
+        )
+    } != 0
+    {
+        native_set_last_error(8);
+        return 0;
+    }
+    // Each endpoint is unidirectional. EOF follows the last writer's close.
+    unsafe {
+        libc::shutdown(fds[0], libc::SHUT_WR);
+        libc::shutdown(fds[1], libc::SHUT_RD);
+    }
+    let handles = [pipes.next, pipes.next + 1];
+    pipes.next += 2;
+    for (index, access) in [0x8000_0000, 0x4000_0000].into_iter().enumerate() {
+        pipes.handles.insert(
+            handles[index],
+            NativePipeHandle {
+                endpoint: Arc::new(NativePipeEndpoint {
+                    fd: fds[index],
+                    name: String::new(),
+                    server: false,
+                    access,
+                }),
+                pending_client: None,
+                overlapped: false,
+                inheritable,
+                access,
+                mode: 0,
+                completion: None,
+                completion_modes: 0,
+            },
+        );
+    }
+    unsafe {
+        read_handle.write(handles[0]);
+        write_handle.write(handles[1]);
+    }
+    1
+}
+
 pub(in crate::native::linux_x86_64) extern "win64" fn native_create_file_w(
     path: *const u16,
     access: u32,
@@ -1128,6 +1204,53 @@ fn native_directory_information(handle: u64, layout: DirectoryInfoLayout, output
     1
 }
 
+pub(in crate::native::linux_x86_64) extern "win64" fn native_get_volume_information_by_handle_w(
+    handle: u64,
+    volume_name: *mut u16,
+    volume_capacity: u32,
+    serial: *mut u32,
+    maximum_component: *mut u32,
+    flags: *mut u32,
+    filesystem_name: *mut u16,
+    filesystem_capacity: u32,
+) -> i32 {
+    if !fs_ctx().is_some_and(|context| {
+        context
+            .lock()
+            .is_ok_and(|fs| fs.handles.contains_key(&handle))
+    }) {
+        native_set_last_error(6);
+        return 0;
+    }
+    let name: Vec<u16> = "WinFS".encode_utf16().chain([0]).collect();
+    if (!volume_name.is_null() && volume_capacity < name.len() as u32)
+        || (!filesystem_name.is_null() && filesystem_capacity < name.len() as u32)
+    {
+        native_set_last_error(234);
+        return 0;
+    }
+    unsafe {
+        if !volume_name.is_null() {
+            volume_name.copy_from_nonoverlapping(name.as_ptr(), name.len());
+        }
+        if !filesystem_name.is_null() {
+            filesystem_name.copy_from_nonoverlapping(name.as_ptr(), name.len());
+        }
+        // Match BY_HANDLE_FILE_INFORMATION's stable guest volume serial.
+        if !serial.is_null() {
+            serial.write(0x5743_4c49);
+        }
+        if !maximum_component.is_null() {
+            maximum_component.write(255);
+        }
+        // Case-preserved Unicode names and reparse points; no object-ID API.
+        if !flags.is_null() {
+            flags.write(0x86);
+        }
+    }
+    1
+}
+
 pub(in crate::native::linux_x86_64) extern "win64" fn native_get_file_information_by_handle_ex(
     handle: u64,
     information_class: i32,
@@ -1809,5 +1932,188 @@ mod reparse_tests {
         assert_eq!(name(&data, u16_at(8), u16_at(10)), format!(r"\??\{target}"));
         assert_eq!(name(&data, u16_at(12), u16_at(14)), target);
         assert_eq!(&data[16..20], &0u32.to_le_bytes()); // absolute
+    }
+}
+
+#[cfg(test)]
+mod anonymous_pipe_tests {
+    use super::*;
+
+    #[test]
+    fn anonymous_pipes_transfer_enforce_access_and_preserve_duplicate_lifetime() {
+        let mut reader = 0;
+        let mut writer = 0;
+        assert_eq!(
+            native_create_pipe(&mut reader, &mut writer, std::ptr::null(), 0),
+            1
+        );
+        assert_eq!(native_get_file_type(reader), 3);
+        let mut count = 0;
+        assert_eq!(
+            native_write_file(writer, b"pipe".as_ptr(), 4, &mut count, 0),
+            1
+        );
+        assert_eq!(count, 4);
+        let mut buffer = [0u8; 4];
+        assert_eq!(
+            native_read_file(reader, buffer.as_mut_ptr(), 4, &mut count, 0),
+            1
+        );
+        assert_eq!(&buffer, b"pipe");
+        assert_eq!(
+            native_write_file(reader, b"x".as_ptr(), 1, &mut count, 0),
+            0
+        );
+        assert_eq!(native_get_last_error(), 5);
+        assert_eq!(
+            native_read_file(writer, buffer.as_mut_ptr(), 1, &mut count, 0),
+            0
+        );
+        assert_eq!(native_get_last_error(), 5);
+        let mut duplicate = 0;
+        assert_eq!(
+            native_duplicate_handle(u64::MAX, writer, u64::MAX, &mut duplicate, 0, 0, 2),
+            1
+        );
+        assert_eq!(native_close_handle(writer), 1);
+        assert_eq!(
+            native_write_file(duplicate, b"x".as_ptr(), 1, &mut count, 0),
+            1
+        );
+        assert_eq!(
+            native_read_file(reader, buffer.as_mut_ptr(), 1, &mut count, 0),
+            1
+        );
+        assert_eq!(buffer[0], b'x');
+        assert_eq!(native_close_handle(duplicate), 1);
+        assert_eq!(
+            native_read_file(reader, buffer.as_mut_ptr(), 1, &mut count, 0),
+            0
+        );
+        assert_eq!(native_get_last_error(), 109);
+        assert_eq!(native_close_handle(reader), 1);
+    }
+
+    #[test]
+    fn anonymous_pipe_security_and_invalid_arguments() {
+        let mut reader = 17;
+        let mut writer = 18;
+        assert_eq!(
+            native_create_pipe(std::ptr::null_mut(), &mut writer, std::ptr::null(), 0),
+            0
+        );
+        assert_eq!(native_get_last_error(), 87);
+        assert_eq!(writer, 18);
+        let mut security = [0u8; 24];
+        assert_eq!(
+            native_create_pipe(&mut reader, &mut writer, security.as_ptr(), 0),
+            0
+        );
+        assert_eq!(native_get_last_error(), 87);
+        assert_eq!(reader, 17);
+        security[..4].copy_from_slice(&24u32.to_le_bytes());
+        security[16..20].copy_from_slice(&1i32.to_le_bytes());
+        assert_eq!(
+            native_create_pipe(&mut reader, &mut writer, security.as_ptr(), 1024),
+            1
+        );
+        {
+            let process = process_ctx().unwrap();
+            let pipes = process.named_pipes.lock().unwrap();
+            assert!(pipes.handles[&reader].inheritable);
+            assert!(pipes.handles[&writer].inheritable);
+            assert!(!pipes.handles[&reader].overlapped);
+        }
+        assert_eq!(native_set_handle_information(reader, 1, 0), 1);
+        assert!(!process_ctx().unwrap().named_pipes.lock().unwrap().handles[&reader].inheritable);
+        assert_eq!(native_close_handle(reader), 1);
+        assert_eq!(native_close_handle(writer), 1);
+    }
+
+    #[test]
+    fn close_source_duplication_closes_even_when_the_target_is_invalid() {
+        for target in [0, 42] {
+            let mut reader = 0;
+            let mut writer = 0;
+            assert_eq!(
+                native_create_pipe(&mut reader, &mut writer, std::ptr::null(), 0),
+                1
+            );
+            let result =
+                native_duplicate_handle(u64::MAX, writer, target, std::ptr::null_mut(), 0, 0, 1);
+            if target == 0 {
+                assert_eq!(result, 1);
+            } else {
+                assert_eq!(result, 0);
+                assert_eq!(native_get_last_error(), 87);
+            }
+            let mut byte = 0;
+            let mut count = 0;
+            assert_eq!(native_read_file(reader, &mut byte, 1, &mut count, 0), 0);
+            assert_eq!(native_get_last_error(), 109);
+            assert_eq!(native_close_handle(reader), 1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod volume_information_tests {
+    use super::*;
+    #[test]
+    fn volume_information_validates_handles_buffers_and_optional_outputs() {
+        let path: Vec<u16> = r"C:\".encode_utf16().chain([0]).collect();
+        let handle = native_create_file_w(path.as_ptr(), 0x80000000, 7, 0, 3, 0x02000000, 0);
+        assert_ne!(handle, u64::MAX);
+        let mut serial = 0;
+        let mut maximum = 0;
+        let mut flags = 0;
+        let mut name = [0u16; 16];
+        assert_eq!(
+            native_get_volume_information_by_handle_w(
+                handle,
+                name.as_mut_ptr(),
+                16,
+                &mut serial,
+                &mut maximum,
+                &mut flags,
+                std::ptr::null_mut(),
+                0
+            ),
+            1
+        );
+        assert_eq!(String::from_utf16(&name[..5]).unwrap(), "WinFS");
+        assert_eq!(name[5], 0);
+        assert_eq!(serial, 0x57434c49);
+        assert_eq!(maximum, 255);
+        assert_eq!(flags, 0x86);
+        assert_eq!(
+            native_get_volume_information_by_handle_w(
+                handle,
+                name.as_mut_ptr(),
+                1,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0
+            ),
+            0
+        );
+        assert_eq!(native_get_last_error(), 234);
+        assert_eq!(native_close_handle(handle), 1);
+        assert_eq!(
+            native_get_volume_information_by_handle_w(
+                handle,
+                std::ptr::null_mut(),
+                0,
+                &mut serial,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0
+            ),
+            0
+        );
+        assert_eq!(native_get_last_error(), 6);
     }
 }
