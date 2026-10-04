@@ -858,6 +858,10 @@ fn native_module_name_supported(name: &str) -> bool {
         || matches!(
             module.as_str(),
             "kernel32"
+                | "ucrtbase"
+                | "ucrtbase.dll"
+                | "msvcrt"
+                | "msvcrt.dll"
                 | "kernel32.dll"
                 | "kernelbase"
                 | "kernelbase.dll"

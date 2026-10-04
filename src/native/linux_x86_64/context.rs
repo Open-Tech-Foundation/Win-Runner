@@ -45,6 +45,7 @@ pub(super) fn new_test_process() -> Arc<NativeProcessContext> {
         crt_startup: Mutex::new(None),
         crt_exit_functions: Mutex::new(Vec::new()),
         crt_new_mode: AtomicI32::new(0),
+        crt_invalid_parameter_handler: AtomicU64::new(0),
         std_handles: [
             AtomicU64::new(STD_HANDLE_BASE),
             AtomicU64::new(STD_HANDLE_BASE + 1),
@@ -91,6 +92,8 @@ pub(super) fn new_test_process() -> Arc<NativeProcessContext> {
         wait_registrations: Mutex::new(HashMap::new()),
         completion_ports: Mutex::new(HashMap::new()),
         socket_handles: Mutex::new(std::collections::HashSet::new()),
+        socket_events: Mutex::new(HashMap::new()),
+        socket_errors: Mutex::new(HashMap::new()),
         socket_completion_ports: Mutex::new(HashMap::new()),
         socket_completion_modes: Mutex::new(HashMap::new()),
         completion_next: AtomicU64::new(0x9000_0000),

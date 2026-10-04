@@ -21,6 +21,14 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Support UCRT invalid-parameter handlers, secure C-locale conversions,
+  descriptor/stream file operations, and ANSI module filenames on the native
+  backend. Add Winsock event selection and Windows fd-set readiness, preserving
+  pending connection errors across host readiness checks and send probes.
+  Official Windows curl now starts, displays help, and downloads HTTP files;
+  add pinned real-binary E2E tests and CRT/socket Windows oracle probes.
+  Expose SSPI initialization with explicit errors for unavailable providers.
+
 - Make PowerShell aliases with parameters and pipelines reach the script
   interpreter, and execute guest `.ps1` files as scripts. List the current
   directory by default, support recursive copies and filtered listings,

@@ -3018,6 +3018,11 @@ pub(super) extern "win64" fn native_crt_fclose(stream: *mut u8) -> i32 {
     let handle = unsafe { (*file).handle };
     unsafe { (*file).signature = 0 };
     unsafe { free(file.cast()) };
+    if let Some(process) = process_ctx() {
+        if let Ok(mut fds) = process.crt_fds.lock() {
+            fds.retain(|_, bound| *bound != handle);
+        }
+    }
     if native_close_handle(handle) != 0 {
         0
     } else {
@@ -3587,4 +3592,269 @@ pub(super) extern "win64" fn native_crt_fileno(stream: *mut u8) -> i32 {
     let fd = process.crt_fd_next.fetch_add(1, Ordering::AcqRel);
     fds.insert(fd, handle);
     fd
+}
+
+fn crt_fd_handle(fd: i32) -> Option<u64> {
+    let process = process_ctx()?;
+    if (0..3).contains(&fd) {
+        return Some(process.std_handles[fd as usize].load(Ordering::Acquire));
+    }
+    let handle = process.crt_fds.lock().ok()?.get(&fd).copied();
+    handle
+}
+
+#[cfg(test)]
+mod fd_tests {
+    use super::*;
+    #[test]
+    fn descriptor_streams_share_positions_metadata_and_close_lifetime() {
+        let process = new_test_process();
+        let previous = THREAD_NATIVE_PROCESS.with(|slot| slot.replace(Some(Arc::clone(&process))));
+        let mut fd = -1;
+        assert_eq!(
+            native_crt_sopen_s(&mut fd, c"C:\\fd.bin".as_ptr().cast(), 0x8302, 0x40, 0x180),
+            0
+        );
+        assert!(native_crt_fdopen(fd, c"wJUNK".as_ptr().cast()).is_null());
+        let stream = native_crt_fdopen(fd, c"w+b".as_ptr().cast());
+        assert!(!stream.is_null());
+        assert_eq!(native_crt_fwrite(c"data".as_ptr().cast(), 1, 4, stream), 4);
+        assert_eq!(native_crt_lseeki64(fd, 0, 0), 0);
+        let mut data = [0; 4];
+        assert_eq!(native_crt_fread(data.as_mut_ptr(), 1, 4, stream), 4);
+        assert_eq!(&data, b"data");
+        let mut stat = [0u8; 56];
+        assert_eq!(native_crt_fstat64(fd, stat.as_mut_ptr()), 0);
+        assert_eq!(
+            unsafe { stat.as_ptr().add(24).cast::<i64>().read_unaligned() },
+            4
+        );
+        assert_eq!(native_crt_fclose(stream), 0);
+        assert_eq!(native_crt_lseeki64(fd, 0, 0), -1);
+        assert_eq!(
+            native_crt_sopen_s(&mut fd, c"C:\\missing".as_ptr().cast(), 0x8000, 0x40, 0),
+            2
+        );
+        assert_eq!(fd, -1);
+        let stream = native_crt_fsopen(c"C:\\fd.bin".as_ptr().cast(), c"ab".as_ptr().cast(), 0x40);
+        assert!(!stream.is_null());
+        assert_eq!(native_crt_fwrite(c"!".as_ptr().cast(), 1, 1, stream), 1);
+        assert_eq!(native_crt_fclose(stream), 0);
+        assert_eq!(
+            process
+                .fs
+                .lock()
+                .unwrap()
+                .fs
+                .read_file("C:\\fd.bin")
+                .unwrap(),
+            b"data!"
+        );
+        THREAD_NATIVE_PROCESS.with(|slot| slot.replace(previous));
+    }
+}
+
+pub(super) extern "win64" fn native_crt_sopen_s(
+    output: *mut i32,
+    path: *const u8,
+    flags: i32,
+    sharing: i32,
+    _mode: i32,
+) -> i32 {
+    if !output.is_null() {
+        unsafe {
+            output.write_unaligned(-1);
+        }
+    }
+    if output.is_null() || path.is_null() || flags & 3 == 3 || flags & !0xf7ff != 0 {
+        native_crt_invalid_parameter_noinfo();
+        THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+        return 22;
+    }
+    let share = match sharing {
+        0x10 => 0,
+        0x20 => 1,
+        0x30 => 2,
+        0x40 => 3,
+        _ => {
+            native_crt_invalid_parameter_noinfo();
+            THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+            return 22;
+        }
+    };
+    let Some(path) = native_ansi_path(path) else {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+        return 22;
+    };
+    let access = match flags & 3 {
+        0 => 0x8000_0000,
+        1 => 0x4000_0000,
+        _ => 0xc000_0000,
+    };
+    let creation = if flags & 0x100 != 0 {
+        if flags & 0x400 != 0 {
+            1
+        } else if flags & 0x200 != 0 {
+            2
+        } else {
+            4
+        }
+    } else if flags & 0x200 != 0 {
+        5
+    } else {
+        3
+    };
+    let handle = native_create_file_w(
+        path.as_ptr(),
+        access,
+        share,
+        0,
+        creation,
+        if flags & 0x40 != 0 { 0x0400_0000 } else { 0 },
+        0,
+    );
+    if handle == u64::MAX {
+        let error = match native_get_last_error() {
+            2 | 3 => 2,
+            5 | 32 => 13,
+            80 | 183 => 17,
+            _ => 22,
+        };
+        THREAD_CRT_ERRNO.with(|errno| errno.set(error));
+        return error;
+    }
+    if flags & 8 != 0 {
+        native_set_file_pointer_ex(handle, 0, ptr::null_mut(), 2);
+    }
+    let Some(process) = process_ctx() else {
+        native_close_handle(handle);
+        return 22;
+    };
+    let fd = process.crt_fd_next.fetch_add(1, Ordering::AcqRel);
+    let Ok(mut fds) = process.crt_fds.lock() else {
+        native_close_handle(handle);
+        return 22;
+    };
+    fds.insert(fd, handle);
+    unsafe {
+        output.write_unaligned(fd);
+    }
+    0
+}
+
+pub(super) extern "win64" fn native_crt_fdopen(fd: i32, mode: *const u8) -> *mut u8 {
+    let (Some(handle), Some(mode)) = (crt_fd_handle(fd), native_crt_read_mode_a(mode)) else {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(9));
+        return ptr::null_mut();
+    };
+    let first = mode[0];
+    if !matches!(first, b'r' | b'w' | b'a')
+        || mode[1..]
+            .iter()
+            .any(|flag| !matches!(flag, b'+' | b'b' | b't' | b'c' | b'n' | b'S' | b'R'))
+    {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+        return ptr::null_mut();
+    }
+    let file = unsafe { malloc(std::mem::size_of::<NativeCrtFile>()) }.cast::<NativeCrtFile>();
+    if file.is_null() {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(12));
+        return ptr::null_mut();
+    }
+    unsafe {
+        file.write(NativeCrtFile {
+            signature: NATIVE_CRT_FILE_SIGNATURE,
+            handle,
+            readable: u8::from(first == b'r' || mode.contains(&b'+')),
+            writable: u8::from(first != b'r' || mode.contains(&b'+')),
+            append: u8::from(first == b'a'),
+            reserved: [0; 45],
+        });
+    }
+    file.cast()
+}
+
+pub(super) extern "win64" fn native_crt_fsopen(
+    path: *const u8,
+    mode: *const u8,
+    sharing: i32,
+) -> *mut u8 {
+    let Some(bytes) = native_crt_read_mode_a(mode) else {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+        return ptr::null_mut();
+    };
+    let mut flags = match bytes[0] {
+        b'r' => 0,
+        b'w' => 1 | 0x100 | 0x200,
+        b'a' => 1 | 0x100 | 8,
+        _ => {
+            THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+            return ptr::null_mut();
+        }
+    };
+    if bytes.contains(&b'+') {
+        flags = (flags & !3) | 2;
+    }
+    if bytes.contains(&b'x') {
+        flags |= 0x400;
+    }
+    flags |= if bytes.contains(&b'b') {
+        0x8000
+    } else {
+        0x4000
+    };
+    let mut fd = -1;
+    if native_crt_sopen_s(&mut fd, path, flags, sharing, 0x180) != 0 {
+        return ptr::null_mut();
+    }
+    let stream = native_crt_fdopen(fd, mode);
+    if stream.is_null() {
+        if let Some(process) = process_ctx() {
+            let handle = process
+                .crt_fds
+                .lock()
+                .ok()
+                .and_then(|mut fds| fds.remove(&fd));
+            if let Some(handle) = handle {
+                native_close_handle(handle);
+            }
+        }
+    }
+    stream
+}
+
+pub(super) extern "win64" fn native_crt_lseeki64(fd: i32, offset: i64, origin: i32) -> i64 {
+    let Some(handle) = crt_fd_handle(fd) else {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(9));
+        return -1;
+    };
+    let mut position = 0;
+    if !(0..=2).contains(&origin)
+        || native_set_file_pointer_ex(handle, offset, &mut position, origin as u32) == 0
+    {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+        return -1;
+    }
+    position as i64
+}
+
+pub(super) extern "win64" fn native_crt_fstat64(fd: i32, output: *mut u8) -> i32 {
+    if output.is_null() {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+        return -1;
+    }
+    let path = crt_fd_handle(fd).and_then(|handle| {
+        fs_ctx().and_then(|fs| {
+            fs.lock()
+                .ok()?
+                .handles
+                .get(&handle)
+                .map(|handle| handle.path.clone())
+        })
+    });
+    let Some(path) = path else {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(9));
+        return -1;
+    };
+    native_crt_stat64_path(&path, output)
 }

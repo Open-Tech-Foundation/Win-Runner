@@ -585,13 +585,175 @@ pub(super) extern "win64" fn native_crt_callnewh(_size: usize) -> i32 {
     0
 }
 
-pub(super) extern "win64" fn native_crt_invalid_parameter_noinfo() -> ! {
+thread_local! {
+    // A weak process identity prevents a host thread reused by another
+    // guest process from inheriting its predecessor's CRT callback.
+    static CRT_THREAD_INVALID_HANDLER: std::cell::RefCell<Option<(std::sync::Weak<NativeProcessContext>, u64)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(super) extern "win64" fn native_crt_set_invalid_parameter_handler(handler: u64) -> u64 {
+    process_ctx().map_or(0, |process| {
+        process
+            .crt_invalid_parameter_handler
+            .swap(handler, Ordering::AcqRel)
+    })
+}
+
+pub(super) extern "win64" fn native_crt_get_invalid_parameter_handler() -> u64 {
+    process_ctx().map_or(0, |process| {
+        process
+            .crt_invalid_parameter_handler
+            .load(Ordering::Acquire)
+    })
+}
+
+pub(super) extern "win64" fn native_crt_get_thread_local_invalid_parameter_handler() -> u64 {
+    let Some(process) = process_ctx() else {
+        return 0;
+    };
+    CRT_THREAD_INVALID_HANDLER.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|(owner, _)| {
+                owner
+                    .upgrade()
+                    .is_some_and(|owner| Arc::ptr_eq(&owner, &process))
+            })
+            .map_or(0, |(_, handler)| *handler)
+    })
+}
+
+pub(super) extern "win64" fn native_crt_set_thread_local_invalid_parameter_handler(
+    handler: u64,
+) -> u64 {
+    let previous = native_crt_get_thread_local_invalid_parameter_handler();
+    if let Some(process) = process_ctx() {
+        CRT_THREAD_INVALID_HANDLER
+            .with(|slot| *slot.borrow_mut() = Some((Arc::downgrade(&process), handler)));
+    }
+    previous
+}
+
+pub(super) extern "win64" fn native_crt_invalid_parameter(
+    expression: u64,
+    function: u64,
+    file: u64,
+    line: u32,
+    reserved: u64,
+) {
+    let local = native_crt_get_thread_local_invalid_parameter_handler();
+    let handler = if local != 0 {
+        local
+    } else {
+        native_crt_get_invalid_parameter_handler()
+    };
+    if handler == 0 {
+        native_crt_invoke_watson(expression, function, file, line, reserved);
+    }
+    let callback: extern "win64" fn(u64, u64, u64, u32, u64) =
+        unsafe { std::mem::transmute(handler as usize) };
+    callback(expression, function, file, line, reserved);
+}
+
+pub(super) extern "win64" fn native_crt_invalid_parameter_noinfo() {
+    native_crt_invalid_parameter(0, 0, 0, 0, 0)
+}
+
+pub(super) extern "win64" fn native_crt_invalid_parameter_noinfo_noreturn() -> ! {
+    native_crt_invalid_parameter_noinfo();
     native_crt_invoke_watson(0, 0, 0, 0, 0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! { static INVALID_CALLS: std::cell::RefCell<Vec<(u32, [u64; 5])>> = const { std::cell::RefCell::new(Vec::new()) }; }
+    extern "win64" fn global_invalid(
+        expression: u64,
+        function: u64,
+        file: u64,
+        line: u32,
+        reserved: u64,
+    ) {
+        INVALID_CALLS.with(|calls| {
+            calls
+                .borrow_mut()
+                .push((1, [expression, function, file, line as u64, reserved]))
+        });
+    }
+    extern "win64" fn local_invalid(
+        expression: u64,
+        function: u64,
+        file: u64,
+        line: u32,
+        reserved: u64,
+    ) {
+        INVALID_CALLS.with(|calls| {
+            calls
+                .borrow_mut()
+                .push((2, [expression, function, file, line as u64, reserved]))
+        });
+    }
+
+    #[test]
+    fn invalid_parameter_handlers_roundtrip_dispatch_and_respect_thread_precedence() {
+        let process = new_test_process();
+        let previous = THREAD_NATIVE_PROCESS.with(|slot| slot.replace(Some(Arc::clone(&process))));
+        let global = global_invalid as *const () as usize as u64;
+        let local = local_invalid as *const () as usize as u64;
+        assert_eq!(native_crt_get_invalid_parameter_handler(), 0);
+        assert_eq!(native_crt_set_invalid_parameter_handler(global), 0);
+        assert_eq!(native_crt_get_invalid_parameter_handler(), global);
+        native_crt_invalid_parameter(11, 12, 13, 14, 15);
+        assert_eq!(
+            native_crt_set_thread_local_invalid_parameter_handler(local),
+            0
+        );
+        native_crt_invalid_parameter_noinfo();
+        assert_eq!(
+            native_crt_set_thread_local_invalid_parameter_handler(0),
+            local
+        );
+        native_crt_invalid_parameter_noinfo();
+        INVALID_CALLS.with(|calls| {
+            assert_eq!(
+                *calls.borrow(),
+                vec![(1, [11, 12, 13, 14, 15]), (2, [0; 5]), (1, [0; 5])]
+            )
+        });
+        assert_eq!(native_crt_set_invalid_parameter_handler(0), global);
+        THREAD_NATIVE_PROCESS.with(|slot| slot.replace(previous));
+    }
+
+    #[test]
+    fn invalid_parameter_handler_state_is_isolated_between_threads_and_processes() {
+        let process = new_test_process();
+        let previous = THREAD_NATIVE_PROCESS.with(|slot| slot.replace(Some(Arc::clone(&process))));
+        let global = global_invalid as *const () as usize as u64;
+        let local = local_invalid as *const () as usize as u64;
+        native_crt_set_invalid_parameter_handler(global);
+        native_crt_set_thread_local_invalid_parameter_handler(local);
+        std::thread::spawn(move || {
+            THREAD_NATIVE_PROCESS.with(|slot| slot.replace(Some(process)));
+            assert_eq!(native_crt_get_invalid_parameter_handler(), global);
+            assert_eq!(native_crt_get_thread_local_invalid_parameter_handler(), 0);
+            native_crt_set_thread_local_invalid_parameter_handler(global);
+            native_crt_invalid_parameter_noinfo();
+            INVALID_CALLS.with(|calls| assert_eq!(*calls.borrow(), vec![(1, [0; 5])]));
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            native_crt_get_thread_local_invalid_parameter_handler(),
+            local
+        );
+        THREAD_NATIVE_PROCESS.with(|slot| slot.replace(Some(new_test_process())));
+        assert_eq!(native_crt_get_invalid_parameter_handler(), 0);
+        assert_eq!(native_crt_get_thread_local_invalid_parameter_handler(), 0);
+        THREAD_NATIVE_PROCESS.with(|slot| slot.replace(previous));
+    }
 
     #[test]
     fn locale_and_context_helpers_follow_the_windows_buffer_protocol() {

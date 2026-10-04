@@ -339,6 +339,11 @@ pub(super) extern "win64" fn native_wait_for_single_object(handle: u64, millisec
             .ok()
             .and_then(|events| events.get(&handle).cloned())
     }) {
+        if let Some(process) = process.as_ref() {
+            if let Some(result) = socket_event_wait(process, handle, &event, milliseconds) {
+                return result;
+            }
+        }
         return native_wait_event(&event, milliseconds);
     }
     if let Some(timer) = process
@@ -471,7 +476,7 @@ pub(super) extern "win64" fn native_wait_for_single_object(handle: u64, millisec
         }
     }
 }
-fn native_wait_event(event: &NativeEvent, milliseconds: u32) -> u32 {
+pub(super) fn native_wait_event(event: &NativeEvent, milliseconds: u32) -> u32 {
     let Ok(mut signaled) = event.signaled.lock() else {
         return u32::MAX;
     };

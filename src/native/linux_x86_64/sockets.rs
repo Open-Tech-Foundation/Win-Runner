@@ -116,6 +116,7 @@ pub(super) extern "win64" fn native_connect_socket(
         }
     }
     if unsafe { connect(socket as i32, translated.as_ptr(), length as u32) } == 0 {
+        socket_event_connect(socket);
         return 0;
     }
     if native_diagnostic_enabled() {
@@ -132,6 +133,9 @@ pub(super) extern "win64" fn native_connect_socket(
         Some(101) => 10051,            // WSAENETUNREACH
         _ => 10022,                    // WSAEINVAL
     });
+    if native_wsa_get_last_error() == 10035 {
+        socket_event_connect(socket);
+    }
     -1
 }
 
@@ -202,9 +206,27 @@ pub(super) extern "win64" fn native_send_socket(
     }
     let result = unsafe { send(socket as i32, buffer.cast(), length as usize, flags) };
     if result < 0 {
-        native_wsa_set_last_error(errno_to_wsa(
-            std::io::Error::last_os_error().raw_os_error().unwrap_or(9),
-        ));
+        let error = std::io::Error::last_os_error().raw_os_error().unwrap_or(9);
+        if error == libc::EAGAIN {
+            socket_event_rearm(socket, 2);
+        }
+        // Linux can consume a pending connection error even on a zero-byte
+        // send probe. Keep it available to the guest's subsequent SO_ERROR.
+        if matches!(
+            error,
+            libc::ECONNREFUSED
+                | libc::ECONNRESET
+                | libc::ETIMEDOUT
+                | libc::ENETUNREACH
+                | libc::EHOSTUNREACH
+        ) {
+            if let Some(process) = process_ctx() {
+                if let Ok(mut errors) = process.socket_errors.lock() {
+                    errors.insert(socket, errno_to_wsa(error));
+                }
+            }
+        }
+        native_wsa_set_last_error(errno_to_wsa(error));
         -1
     } else {
         result.min(i32::MAX as isize) as i32
@@ -598,11 +620,13 @@ pub(super) extern "win64" fn native_setsockopt(
     }
 }
 
-fn errno_to_wsa(errno: i32) -> i32 {
+pub(super) fn errno_to_wsa(errno: i32) -> i32 {
     match errno {
         4 => 10004,
         9 => 10009,
         11 | 114 | 115 => 10035,
+        32 | 104 => 10054,
+        107 => 10057,
         98 => 10048,
         99 => 10049,
         101 => 10051,
@@ -1190,6 +1214,32 @@ pub(super) extern "win64" fn native_free_addr_info_w(mut result: *mut u8) {
     }
 }
 
+pub(super) extern "win64" fn native_wsa_create_event() -> u64 {
+    native_create_event_w(0, 1, 0, ptr::null())
+}
+
+pub(super) extern "win64" fn native_wsa_close_event(event: u64) -> i32 {
+    native_close_handle(event)
+}
+
+pub(super) extern "win64" fn native_wsa_reset_event(event: u64) -> i32 {
+    native_reset_event(event)
+}
+
+pub(super) extern "win64" fn native_wsa_wait_for_multiple_events(
+    count: u32,
+    events: *const u64,
+    wait_all: i32,
+    milliseconds: u32,
+    alertable: i32,
+) -> u32 {
+    if count == 0 || count > 64 || events.is_null() {
+        native_wsa_set_last_error(10022);
+        return u32::MAX;
+    }
+    native_wait_for_multiple_objects_ex(count, events, wait_all, milliseconds, alertable)
+}
+
 pub(super) extern "win64" fn native_socket(domain: i32, kind: i32, protocol: i32) -> u64 {
     let host_domain = match domain {
         2 => 2,   // AF_INET
@@ -1228,6 +1278,12 @@ pub(super) extern "win64" fn native_close_socket(handle: u64) -> i32 {
     if let Some(process) = process_ctx() {
         if let Ok(mut sockets) = process.socket_handles.lock() {
             sockets.remove(&handle);
+        }
+        if let Ok(mut events) = process.socket_events.lock() {
+            events.remove(&handle);
+        }
+        if let Ok(mut errors) = process.socket_errors.lock() {
+            errors.remove(&handle);
         }
         if let Ok(mut associations) = process.socket_completion_ports.lock() {
             associations.remove(&handle);
@@ -1287,7 +1343,28 @@ pub(super) extern "win64" fn native_getsockopt(
             return -1;
         }
     };
+    if level == 0xffff && option == 0x1007 {
+        if value.is_null() || length.is_null() || unsafe { length.read_unaligned() } < 4 {
+            native_wsa_set_last_error(10014);
+            return -1;
+        }
+        if let Some(error) = socket_event_take_error(handle) {
+            unsafe {
+                value.cast::<i32>().write_unaligned(error);
+                length.write_unaligned(4);
+            }
+            return 0;
+        }
+    }
     let result = unsafe { getsockopt(handle as i32, host_level, host_option, value, length) };
+    if result == 0 && level == 0xffff && option == 0x1007 {
+        let error = unsafe { value.cast::<i32>().read_unaligned() };
+        if error != 0 {
+            unsafe {
+                value.cast::<i32>().write_unaligned(errno_to_wsa(error));
+            }
+        }
+    }
     if result != 0 {
         native_wsa_set_last_error(10042);
     }
@@ -1359,6 +1436,7 @@ fn register_socket(fd: i32) -> u64 {
 
 /// `accept(socket, address, length)`: a new non-inheritable socket.
 pub(super) extern "win64" fn native_accept_socket(socket: u64, address: *mut u8, length: *mut i32) -> u64 {
+    socket_event_rearm(socket, 8);
     if !is_socket(socket) {
         native_wsa_set_last_error(10038); // WSAENOTSOCK
         return u64::MAX;
@@ -1396,6 +1474,7 @@ pub(super) extern "win64" fn native_recvfrom_socket(
     from: *mut u8,
     from_length: *mut i32,
 ) -> i32 {
+    socket_event_rearm(socket, 1 | 4);
     if !is_socket(socket) {
         native_wsa_set_last_error(10038);
         return -1;

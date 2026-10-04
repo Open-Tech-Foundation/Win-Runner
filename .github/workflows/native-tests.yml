@@ -50,3 +50,13 @@ jobs:
         env:
           WINRUN_MICRO_FIXTURE: ${{ github.workspace }}/target/micro-fixture
         run: cargo test --locked --test micro_native -- --ignored
+  curl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/fetch-curl-fixture.sh target/curl-fixture
+      - name: Native Windows curl integration tests
+        env:
+          WINRUN_CURL_EXE: ${{ github.workspace }}/target/curl-fixture/curl-8.22.0_2-win64-mingw/bin/curl.exe
+        run: cargo test --locked --test curl_native -- --ignored --test-threads=1

@@ -2307,6 +2307,74 @@ pub(super) extern "win64" fn native_get_command_line_a() -> u64 {
         .unwrap_or(0)
 }
 
+pub(super) extern "win64" fn native_get_module_file_name_a(
+    module: u64,
+    output: *mut u8,
+    output_len: u32,
+) -> u32 {
+    if output.is_null() || output_len == 0 {
+        native_set_last_error(87);
+        return 0;
+    }
+    let Some(process) = process_ctx() else {
+        native_set_last_error(6);
+        return 0;
+    };
+    let path = if module == 0 || module == process.image_base {
+        process.module_path.clone()
+    } else {
+        match process
+            .loaded_modules
+            .lock()
+            .ok()
+            .and_then(|modules| modules.get(&module).map(|module| module.path.clone()))
+        {
+            Some(path) => path,
+            None => {
+                native_set_last_error(6);
+                return 0;
+            }
+        }
+    };
+    let wide: Vec<u16> = path.encode_utf16().collect();
+    let length = native_wide_char_to_multi_byte(
+        0,
+        0,
+        wide.as_ptr(),
+        wide.len() as i32,
+        ptr::null_mut(),
+        0,
+        ptr::null(),
+        ptr::null_mut(),
+    );
+    if length <= 0 {
+        return 0;
+    }
+    let mut encoded = vec![0; length as usize];
+    native_wide_char_to_multi_byte(
+        0,
+        0,
+        wide.as_ptr(),
+        wide.len() as i32,
+        encoded.as_mut_ptr(),
+        length,
+        ptr::null(),
+        ptr::null_mut(),
+    );
+    let capacity = output_len as usize;
+    let copied = encoded.len().min(capacity - 1);
+    unsafe {
+        output.copy_from_nonoverlapping(encoded.as_ptr(), copied);
+        output.add(copied).write(0);
+    }
+    if encoded.len() >= capacity {
+        native_set_last_error(122);
+        output_len
+    } else {
+        copied as u32
+    }
+}
+
 pub(super) extern "win64" fn native_get_module_file_name_w(
     _module: u64,
     output: *mut u16,
@@ -2326,6 +2394,33 @@ pub(super) extern "win64" fn native_get_module_file_name_w(
         unsafe { output.add(copied).write(0) };
     }
     copied as u32
+}
+
+#[cfg(test)]
+mod module_filename_tests {
+    use super::*;
+    #[test]
+    fn narrow_module_filename_uses_acp_terminates_and_rejects_unknown_modules() {
+        let mut process = new_test_process();
+        Arc::get_mut(&mut process).unwrap().module_path = "C:\\café.exe".into();
+        let previous = THREAD_NATIVE_PROCESS.with(|slot| slot.replace(Some(process)));
+        let mut output = [0; 64];
+        assert_eq!(
+            native_get_module_file_name_a(0, output.as_mut_ptr(), 64),
+            11
+        );
+        assert_eq!(&output[..12], b"C:\\caf\xe9.exe\0");
+        assert_eq!(native_get_module_file_name_a(0, output.as_mut_ptr(), 3), 3);
+        assert_eq!(&output[..3], b"C:\0");
+        assert_eq!(native_get_last_error(), 122);
+        assert_eq!(
+            native_get_module_file_name_a(0xdead, output.as_mut_ptr(), 64),
+            0
+        );
+        assert_eq!(native_get_last_error(), 6);
+        assert_eq!(native_get_module_file_name_a(0, ptr::null_mut(), 0), 0);
+        THREAD_NATIVE_PROCESS.with(|slot| slot.replace(previous));
+    }
 }
 
 pub(super) extern "win64" fn native_get_error_mode() -> u32 {

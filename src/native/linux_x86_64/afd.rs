@@ -117,7 +117,12 @@ fn linux_events(requested: u32) -> i16 {
 
 /// The AFD events a host `poll` result reports for `fd`, and the NTSTATUS
 /// of a failed connection.
-fn afd_events(fd: i32, revents: i16) -> (u32, u32) {
+fn afd_events(
+    process: Option<&NativeProcessContext>,
+    socket: u64,
+    fd: i32,
+    revents: i16,
+) -> (u32, u32) {
     if revents & libc::POLLNVAL != 0 {
         return (AFD_POLL_LOCAL_CLOSE, STATUS_SUCCESS);
     }
@@ -144,6 +149,21 @@ fn afd_events(fd: i32, revents: i16) -> (u32, u32) {
         let mut error = 0i32;
         let mut size = 4u32;
         unsafe { libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_ERROR, (&mut error as *mut i32).cast(), &mut size) };
+        // Linux consumes SO_ERROR when queried. Preserve it for the guest's
+        // later getsockopt, including after a readiness registration is removed.
+        if error != 0 {
+            if let Some(process) = process {
+                if process
+                    .socket_handles
+                    .lock()
+                    .is_ok_and(|sockets| sockets.contains(&socket))
+                {
+                    if let Ok(mut errors) = process.socket_errors.lock() {
+                        errors.insert(socket, super::sockets::errno_to_wsa(error));
+                    }
+                }
+            }
+        }
         // A socket that never connected reports its connect failure; an
         // established one was reset.
         let mut peer = [0u8; 128];
@@ -229,6 +249,7 @@ pub(super) fn afd_device_io_control(
         std::time::Instant::now() + std::time::Duration::from_nanos((timeout.unsigned_abs()).saturating_mul(100))
     });
     let (io_status, output) = (io_status as usize, output as usize);
+    let process = process_ctx();
     std::thread::spawn(move || {
         let fd = socket as u32 as i32;
         let (events, status) = loop {
@@ -252,7 +273,7 @@ pub(super) fn afd_device_io_control(
             if ready == 0 {
                 break (0, STATUS_SUCCESS); // timed out with nothing ready
             }
-            let (events, status) = afd_events(fd, fds[0].revents);
+            let (events, status) = afd_events(process.as_deref(), socket, fd, fds[0].revents);
             let reported = events & (requested | AFD_POLL_LOCAL_CLOSE);
             if reported != 0 {
                 break (reported, status);
@@ -343,6 +364,50 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "no completion packet");
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn afd_connection_failure_preserves_the_guest_socket_error() {
+        let process = new_test_process();
+        let previous = THREAD_NATIVE_PROCESS.with(|slot| slot.replace(Some(Arc::clone(&process))));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let socket = native_socket(2, 1, 6);
+        let fd = socket as i32;
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) },
+            0
+        );
+        let mut address = [0u8; 16];
+        address[..2].copy_from_slice(&2u16.to_le_bytes());
+        address[2..4].copy_from_slice(&port.to_be_bytes());
+        address[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        assert_eq!(native_connect_socket(socket, address.as_ptr(), 16), -1);
+        let mut poll = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut poll, 1, 1000) }, 1);
+        let (events, status) = afd_events(Some(&process), socket, fd, poll.revents);
+        assert_ne!(events & AFD_POLL_CONNECT_FAIL, 0);
+        assert_eq!(status, 0xc000_0236);
+        let mut error = 0i32;
+        let mut size = 4u32;
+        assert_eq!(
+            native_getsockopt(
+                socket,
+                0xffff,
+                0x1007,
+                (&mut error as *mut i32).cast(),
+                &mut size
+            ),
+            0
+        );
+        assert_eq!(error, 10061);
+        native_close_socket(socket);
+        THREAD_NATIVE_PROCESS.with(|slot| slot.replace(previous));
     }
 
     #[test]

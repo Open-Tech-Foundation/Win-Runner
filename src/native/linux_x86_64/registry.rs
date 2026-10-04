@@ -87,6 +87,7 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                     | "realloc"
                     | "free"
                     | "memcmp"
+                    | "memchr"
                     | "memcpy"
                     | "memmove"
                     | "memset"
@@ -124,6 +125,15 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                     | "div"
                     | "rand_s"
                     | "strerror_s"
+                    | "strerror"
+                    | "_sopen_s"
+                    | "_fdopen"
+                    | "_fsopen"
+                    | "_lseeki64"
+                    | "_fstat64"
+                    | "strcspn"
+                    | "strspn"
+                    | "strpbrk"
                     | "feclearexcept"
                     | "_wassert"
                     | "setvbuf"
@@ -176,6 +186,12 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                     | "_controlfp_s"
                     | "_callnewh"
                     | "_invalid_parameter_noinfo"
+                    | "_invalid_parameter_noinfo_noreturn"
+                    | "_invalid_parameter"
+                    | "_set_invalid_parameter_handler"
+                    | "_get_invalid_parameter_handler"
+                    | "_set_thread_local_invalid_parameter_handler"
+                    | "_get_thread_local_invalid_parameter_handler"
                     | "acos"
                     | "acosf"
                     | "acosh"
@@ -274,7 +290,9 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                     | "toupper"
                     | "strncpy"
                     | "mbstowcs"
+                    | "mbstowcs_s"
                     | "wcstombs"
+                    | "wcstombs_s"
                     | "_stat64"
                     | "_wstat64"
                     | "_access"
@@ -347,6 +365,15 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                     | "__current_exception_context"
             )
         }
+        "SECUR32.DLL" | "SSPICLI.DLL" => matches!(
+            func,
+            "InitSecurityInterfaceA"
+                | "InitSecurityInterfaceW"
+                | "QuerySecurityPackageInfoA"
+                | "QuerySecurityPackageInfoW"
+                | "EnumerateSecurityPackagesA"
+                | "EnumerateSecurityPackagesW"
+        ),
         "WINMM.DLL" => func == "timeGetTime",
         "USERENV.DLL" => func == "GetUserProfileDirectoryW",
         "BCRYPTPRIMITIVES.DLL" => func == "ProcessPrng",
@@ -402,7 +429,17 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
         ),
         "WS2_32.DLL" => matches!(
             func,
-            "#2" | "#3"
+            "select"
+                | "__WSAFDIsSet"
+                | "inet_pton"
+                | "WSACreateEvent"
+                | "WSACloseEvent"
+                | "WSAResetEvent"
+                | "WSAWaitForMultipleEvents"
+                | "WSAEventSelect"
+                | "WSAEnumNetworkEvents"
+                | "#2"
+                | "#3"
                 | "#4"
                 | "#13"
                 | "#19"
@@ -515,6 +552,17 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
 
 pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
     match name {
+        "WSACreateEvent" => Some(native_wsa_create_event as *const () as usize as u64),
+        "select" => Some(native_select as *const () as usize as u64),
+        "__WSAFDIsSet" => Some(native_wsa_fd_is_set as *const () as usize as u64),
+        "inet_pton" => Some(native_inet_pton as *const () as usize as u64),
+        "WSAEventSelect" => Some(native_wsa_event_select as *const () as usize as u64),
+        "WSAEnumNetworkEvents" => Some(native_wsa_enum_network_events as *const () as usize as u64),
+        "WSACloseEvent" => Some(native_wsa_close_event as *const () as usize as u64),
+        "WSAResetEvent" => Some(native_wsa_reset_event as *const () as usize as u64),
+        "WSAWaitForMultipleEvents" => {
+            Some(native_wsa_wait_for_multiple_events as *const () as usize as u64)
+        }
         "__set_app_type" => Some(native_crt_set_app_type as *const () as usize as u64),
         "__p__fmode" => Some(native_crt_p_fmode as *const () as usize as u64),
         "__p__commode" => Some(native_crt_p_commode as *const () as usize as u64),
@@ -543,6 +591,15 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "div" => Some(native_crt_div as *const () as usize as u64),
         "rand_s" => Some(native_crt_rand_s as *const () as usize as u64),
         "strerror_s" => Some(native_crt_strerror_s as *const () as usize as u64),
+        "strerror" => Some(native_crt_strerror as *const () as usize as u64),
+        "_sopen_s" => Some(native_crt_sopen_s as *const () as usize as u64),
+        "_fdopen" => Some(native_crt_fdopen as *const () as usize as u64),
+        "_fsopen" => Some(native_crt_fsopen as *const () as usize as u64),
+        "_lseeki64" => Some(native_crt_lseeki64 as *const () as usize as u64),
+        "_fstat64" => Some(native_crt_fstat64 as *const () as usize as u64),
+        "strcspn" => Some(native_crt_strcspn as *const () as usize as u64),
+        "strspn" => Some(native_crt_strspn as *const () as usize as u64),
+        "strpbrk" => Some(native_crt_strpbrk as *const () as usize as u64),
         "feclearexcept" => Some(native_crt_feclearexcept as *const () as usize as u64),
         "_wassert" => Some(native_crt_wassert as *const () as usize as u64),
         "setvbuf" => Some(native_crt_setvbuf as *const () as usize as u64),
@@ -741,7 +798,34 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "LoadStringW" => Some(native_load_string_w as *const () as usize as u64),
         "_controlfp_s" => Some(native_crt_controlfp_s as *const () as usize as u64),
         "_callnewh" => Some(native_crt_callnewh as *const () as usize as u64),
-        "_invalid_parameter_noinfo" => Some(native_crt_invalid_parameter_noinfo as *const () as usize as u64),
+        "InitSecurityInterfaceA" | "InitSecurityInterfaceW" => {
+            Some(native_init_security_interface as *const () as usize as u64)
+        }
+        "QuerySecurityPackageInfoA" | "QuerySecurityPackageInfoW" => {
+            Some(native_query_security_package_info as *const () as usize as u64)
+        }
+        "EnumerateSecurityPackagesA" | "EnumerateSecurityPackagesW" => {
+            Some(native_enumerate_security_packages as *const () as usize as u64)
+        }
+        "_invalid_parameter_noinfo" => {
+            Some(native_crt_invalid_parameter_noinfo as *const () as usize as u64)
+        }
+        "_invalid_parameter_noinfo_noreturn" => {
+            Some(native_crt_invalid_parameter_noinfo_noreturn as *const () as usize as u64)
+        }
+        "_invalid_parameter" => Some(native_crt_invalid_parameter as *const () as usize as u64),
+        "_set_invalid_parameter_handler" => {
+            Some(native_crt_set_invalid_parameter_handler as *const () as usize as u64)
+        }
+        "_get_invalid_parameter_handler" => {
+            Some(native_crt_get_invalid_parameter_handler as *const () as usize as u64)
+        }
+        "_set_thread_local_invalid_parameter_handler" => {
+            Some(native_crt_set_thread_local_invalid_parameter_handler as *const () as usize as u64)
+        }
+        "_get_thread_local_invalid_parameter_handler" => {
+            Some(native_crt_get_thread_local_invalid_parameter_handler as *const () as usize as u64)
+        }
         "CreateMemoryResourceNotification" => {
             Some(native_create_memory_resource_notification as *const () as usize as u64)
         }
@@ -866,7 +950,9 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "toupper" => Some(native_crt_toupper as *const () as usize as u64),
         "strncpy" => Some(native_crt_strncpy as *const () as usize as u64),
         "mbstowcs" => Some(native_crt_mbstowcs as *const () as usize as u64),
+        "mbstowcs_s" => Some(native_crt_mbstowcs_s as *const () as usize as u64),
         "wcstombs" => Some(native_crt_wcstombs as *const () as usize as u64),
+        "wcstombs_s" => Some(native_crt_wcstombs_s as *const () as usize as u64),
         "_stat64" => Some(native_crt_stat64 as *const () as usize as u64),
         "_wstat64" => Some(native_crt_wstat64 as *const () as usize as u64),
         "_access" => Some(native_crt_access as *const () as usize as u64),
@@ -1352,6 +1438,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "DuplicateHandle" => Some(native_duplicate_handle as *const () as usize as u64),
         "GetFileType" => Some(native_get_file_type as *const () as usize as u64),
         "GetModuleFileNameW" => Some(native_get_module_file_name_w as *const () as usize as u64),
+        "GetModuleFileNameA" => Some(native_get_module_file_name_a as *const () as usize as u64),
         "GetModuleHandleW" => Some(native_get_module_handle_w as *const () as usize as u64),
         "GetModuleHandleExW" => Some(native_get_module_handle_ex_w as *const () as usize as u64),
         "GetModuleHandleExA" => Some(native_get_module_handle_ex_a as *const () as usize as u64),

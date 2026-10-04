@@ -31,6 +31,14 @@ with `guests/build-oracle.sh` (rustc and rust-lld only). A probe:
 | `pool_console` | `QueueUserWorkItem`, `MapVirtualKeyW`, console input functions on a non-console handle |
 | `process_runtime` | anonymous pipe access, duplication and EOF, startup handle-list filtering and child output/timestamps, volume metadata, error mode and WER flags, system-directory buffer sizing, priority boost, continuation dispatch, timer deadlines/reset/cancel/errors, shared clocks and PEB, read/write console devices and VT modes |
 
+`crt_runtime` checks global/thread-local invalid-parameter handlers, callback
+metadata, CRT strings and secure conversions, descriptor/stream file I/O,
+ANSI module-name truncation, and
+SSPI table initialization with an unknown package. Installed SSPI authentication
+providers are not implemented by Win-Runner and are outside this comparison.
+`socket_events` checks loopback TCP, Windows fd-set layout, event reset and
+read rearming, peer closure, and cancellation. Neither probe needs the internet.
+
 `process_runtime` covers the native APIs added for Micro and its background linter
 jobs. The existing `links` and `pool_console` probes cover the recent reparse
 buffer and non-console error fixes. Application behavior such as `reload`,

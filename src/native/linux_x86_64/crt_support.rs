@@ -8,6 +8,107 @@ const EINVAL: i32 = 22;
 const ERANGE: i32 = 34;
 const EILSEQ: i32 = 42;
 
+fn secure_ascii_conversion(
+    converted: *mut usize,
+    size: usize,
+    query: bool,
+    input_null: bool,
+    count: usize,
+    read: impl Fn(usize) -> u16,
+    write: impl Fn(usize, u16),
+) -> i32 {
+    if !converted.is_null() {
+        unsafe {
+            converted.write_unaligned(0);
+        }
+    }
+    if !query && size != 0 {
+        write(0, 0);
+    }
+    if input_null || (query && size != 0) || (!query && size == 0) {
+        native_crt_invalid_parameter_noinfo();
+        set_errno(EINVAL);
+        return EINVAL;
+    }
+    let limit = if query {
+        32768
+    } else if count == usize::MAX {
+        size.saturating_sub(1).min(32768)
+    } else {
+        count.min(size).min(32768)
+    };
+    let mut values = Vec::new();
+    while values.len() < limit {
+        let character = read(values.len());
+        if character == 0 {
+            break;
+        }
+        if character > 127 {
+            set_errno(EILSEQ);
+            return EILSEQ;
+        }
+        values.push(character);
+    }
+    if !query && values.len() >= size {
+        native_crt_invalid_parameter_noinfo();
+        set_errno(ERANGE);
+        return ERANGE;
+    }
+    let truncated =
+        !query && count == usize::MAX && values.len() == limit && read(values.len()) != 0;
+    if !query {
+        for (index, character) in values.iter().enumerate() {
+            write(index, *character);
+        }
+        write(values.len(), 0);
+    }
+    if !converted.is_null() {
+        unsafe {
+            converted.write_unaligned(values.len() + 1);
+        }
+    }
+    if truncated {
+        80
+    } else {
+        0
+    }
+}
+
+pub(super) extern "win64" fn native_crt_mbstowcs_s(
+    converted: *mut usize,
+    output: *mut u16,
+    size: usize,
+    input: *const u8,
+    count: usize,
+) -> i32 {
+    secure_ascii_conversion(
+        converted,
+        size,
+        output.is_null(),
+        input.is_null(),
+        count,
+        |index| unsafe { input.add(index).read() as u16 },
+        |index, character| unsafe { output.add(index).write(character) },
+    )
+}
+pub(super) extern "win64" fn native_crt_wcstombs_s(
+    converted: *mut usize,
+    output: *mut u8,
+    size: usize,
+    input: *const u16,
+    count: usize,
+) -> i32 {
+    secure_ascii_conversion(
+        converted,
+        size,
+        output.is_null(),
+        input.is_null(),
+        count,
+        |index| unsafe { input.add(index).read() },
+        |index, character| unsafe { output.add(index).write(character as u8) },
+    )
+}
+
 fn set_errno(value: i32) {
     THREAD_CRT_ERRNO.with(|errno| errno.set(value));
 }
@@ -314,6 +415,30 @@ fn error_text(errnum: i32) -> &'static str {
     }
 }
 
+thread_local! {
+    static CRT_ERROR_TEXT: std::cell::RefCell<[u8; 128]> = const { std::cell::RefCell::new([0; 128]) };
+}
+
+pub(super) extern "win64" fn native_crt_strcspn(text: *const u8, reject: *const u8) -> usize {
+    unsafe { libc::strcspn(text.cast(), reject.cast()) }
+}
+pub(super) extern "win64" fn native_crt_strspn(text: *const u8, accept: *const u8) -> usize {
+    unsafe { libc::strspn(text.cast(), accept.cast()) }
+}
+pub(super) extern "win64" fn native_crt_strpbrk(text: *const u8, accept: *const u8) -> *mut u8 {
+    unsafe { libc::strpbrk(text.cast(), accept.cast()).cast() }
+}
+
+pub(super) extern "win64" fn native_crt_strerror(errnum: i32) -> *mut u8 {
+    CRT_ERROR_TEXT.with(|buffer| {
+        let mut buffer = buffer.borrow_mut();
+        let text = error_text(errnum).as_bytes();
+        buffer[..text.len()].copy_from_slice(text);
+        buffer[text.len()] = 0;
+        buffer.as_mut_ptr()
+    })
+}
+
 /// `strerror_s(buffer, size, errnum)`: the text, truncated to fit.
 pub(super) extern "win64" fn native_crt_strerror_s(output: *mut u8, size: usize, errnum: i32) -> i32 {
     if output.is_null() || size == 0 {
@@ -462,6 +587,122 @@ pub(super) extern "win64" fn native_current_exception_context() -> *mut u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn string_spans_and_error_buffers_follow_crt_contracts() {
+        let text = b"ab12cd\0";
+        assert_eq!(native_crt_strcspn(text.as_ptr(), c"123".as_ptr().cast()), 2);
+        assert_eq!(native_crt_strspn(text.as_ptr(), c"ab".as_ptr().cast()), 2);
+        assert_eq!(
+            native_crt_strpbrk(text.as_ptr(), c"123".as_ptr().cast()),
+            unsafe { text.as_ptr().add(2).cast_mut() }
+        );
+        assert!(native_crt_strpbrk(text.as_ptr(), c"z".as_ptr().cast()).is_null());
+        assert_eq!(
+            native_crt_strcspn(c"".as_ptr().cast(), c"z".as_ptr().cast()),
+            0
+        );
+        let pointer = native_crt_strerror(22);
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(pointer.cast()) }.to_bytes(),
+            b"Invalid argument"
+        );
+        assert_eq!(pointer, native_crt_strerror(-1));
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(pointer.cast()) }.to_bytes(),
+            b"Unknown error"
+        );
+    }
+
+    #[test]
+    fn secure_conversions_query_terminate_truncate_and_report_encoding_errors() {
+        let mut converted = 0;
+        assert_eq!(
+            native_crt_mbstowcs_s(
+                &mut converted,
+                ptr::null_mut(),
+                0,
+                c"abc".as_ptr().cast(),
+                usize::MAX
+            ),
+            0
+        );
+        assert_eq!(converted, 4);
+        let mut wide = [0; 4];
+        assert_eq!(
+            native_crt_mbstowcs_s(
+                &mut converted,
+                wide.as_mut_ptr(),
+                4,
+                c"abc".as_ptr().cast(),
+                3
+            ),
+            0
+        );
+        assert_eq!(wide, [97, 98, 99, 0]);
+        let mut short = [0; 2];
+        assert_eq!(
+            native_crt_mbstowcs_s(
+                &mut converted,
+                short.as_mut_ptr(),
+                2,
+                c"abc".as_ptr().cast(),
+                usize::MAX
+            ),
+            80
+        );
+        assert_eq!((converted, short), (2, [97, 0]));
+        let mut bytes = [0; 4];
+        assert_eq!(
+            native_crt_wcstombs_s(
+                &mut converted,
+                bytes.as_mut_ptr(),
+                4,
+                wide.as_ptr(),
+                usize::MAX
+            ),
+            0
+        );
+        assert_eq!(bytes, *b"abc\0");
+        assert_eq!(
+            native_crt_wcstombs_s(
+                &mut converted,
+                bytes.as_mut_ptr(),
+                4,
+                [0x20acu16, 0].as_ptr(),
+                usize::MAX
+            ),
+            EILSEQ
+        );
+        assert_eq!((converted, bytes[0]), (0, 0));
+    }
+
+    #[test]
+    fn secure_conversion_validation_calls_handler_and_clears_outputs() {
+        extern "win64" fn recover(_: u64, _: u64, _: u64, _: u32, _: u64) {}
+        let previous = THREAD_NATIVE_PROCESS.with(|slot| slot.replace(Some(new_test_process())));
+        native_crt_set_invalid_parameter_handler(recover as *const () as u64);
+        let mut converted = 99;
+        let mut output = [77u16; 2];
+        assert_eq!(
+            native_crt_mbstowcs_s(&mut converted, output.as_mut_ptr(), 2, ptr::null(), 1),
+            EINVAL
+        );
+        assert_eq!((converted, output[0]), (0, 0));
+        output[0] = 77;
+        assert_eq!(
+            native_crt_mbstowcs_s(
+                &mut converted,
+                output.as_mut_ptr(),
+                2,
+                c"abc".as_ptr().cast(),
+                3
+            ),
+            ERANGE
+        );
+        assert_eq!((converted, output[0]), (0, 0));
+        THREAD_NATIVE_PROCESS.with(|slot| slot.replace(previous));
+    }
 
     #[test]
     fn restartable_conversions_use_single_byte_c_characters() {

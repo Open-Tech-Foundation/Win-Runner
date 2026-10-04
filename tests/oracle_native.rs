@@ -76,11 +76,16 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
             "{name} did not finish:\n{actual}"
         );
         assert!(!actual.contains("PANIC"), "{name} panicked:\n{actual}");
-        if name == "process_runtime" {
+        if matches!(
+            name.as_str(),
+            "process_runtime" | "crt_runtime" | "socket_events"
+        ) {
             assert!(
                 !actual.contains("wrong") && !actual.contains("unavailable"),
                 "{name}: native behavior checks failed:\n{actual}"
             );
+        }
+        if name == "process_runtime" {
             for line in [
                 "pipe.eof: fail err=109",
                 "pipe.write_reader: fail err=5",
@@ -105,6 +110,21 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
         // Error codes captured by the Windows CI oracle. Keep these covered
         // even before complete transcripts for these probes are checked in.
         let required: &[&str] = match name.as_str() {
+            "crt_runtime" => &[
+                "invalid.global_dispatch: ok",
+                "invalid.local_dispatch: ok",
+                "convert.truncate: ok",
+                "module.truncated: ok",
+                "security.unknown_package: ok",
+                "fd.stat: ok",
+                "fd.missing: ok",
+            ],
+            "socket_events" => &[
+                "select.empty: ok",
+                "event.rearmed: ok",
+                "event.close_record: ok",
+                "event.cancel: ok",
+            ],
             "links" => &[
                 "reparse.dirlink_small: fail err=122",
                 "reparse.dirlink_tiny: fail err=122",
