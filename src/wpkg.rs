@@ -2558,8 +2558,16 @@ mod tests {
         let names = repository_names(&repo).unwrap();
         assert_eq!(
             names,
-            ["7zip", "curl", "git", "nodejs", "python", "ripgrep"]
+            ["7zip", "curl", "git", "micro", "nodejs", "python", "ripgrep"]
         );
+        let micro = resolve_version(&repo, "micro", None, "x64").unwrap();
+        assert_eq!(micro.version, "2.0.15");
+        assert_eq!(micro.bin, ["micro-2.0.15/micro.exe"]);
+        assert_eq!(
+            micro.sha256,
+            "90635c53c11aa2a0d997f5e3ed43528877740725500207640b29551cef18479b"
+        );
+        assert!(resolve_manifest(&repo, "micro", "2.0.15", "arm64").is_err());
         let seven_zip = resolve_manifest(&repo, "7zip", "26.03", "x64").unwrap();
         assert_eq!(seven_zip.bin, ["x64/7za.exe"]);
         assert!(resolve_manifest(&repo, "7zip", "26.03", "arm64").is_err());

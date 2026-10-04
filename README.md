@@ -114,6 +114,18 @@ Explicitly mounted host directories appear as separate guest drives (for example
 
 The shell includes `wpkg`, which installs SHA-256-verified ZIP and 7z packages into the guest C: drive without running installers or package scripts. Its text registry is bundled in the binary; package archives download only when installed.
 
+For a terminal text editor on Linux x86-64, install the Windows build of Micro:
+
+```powershell
+wpkg install micro
+micro -clipboard internal notes.txt
+```
+
+Use Ctrl-S to save and Ctrl-Q to quit. Micro edits files in the guest drive,
+including files restored from snapshots. The `internal` clipboard setting
+keeps copy and paste inside the editor; the guest has no desktop clipboard.
+Micro 2.0.15 is pinned in the registry and runs through the native PE backend.
+
 ```text
 wpkg search <query> | info <package[@version]>
 wpkg install <package[@version]> | list [package] | default <package> [version]

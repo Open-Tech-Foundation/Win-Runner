@@ -6560,11 +6560,14 @@ mod protection_tests {
 
     #[test]
     fn reports_a_basic_console_mode_for_standard_output() {
+        let previous = super::THREAD_NATIVE_PROCESS
+            .with(|slot| slot.replace(Some(super::context::new_test_process())));
         let mut mode = 0;
         assert_eq!(native_get_console_mode(1, &mut mode), 1);
         assert_eq!(mode, 1);
         assert_eq!(native_get_console_mode(99, &mut mode), 0);
         assert_eq!(native_get_console_mode(1, std::ptr::null_mut()), 0);
+        super::THREAD_NATIVE_PROCESS.with(|slot| slot.replace(previous));
     }
 
     #[test]
@@ -6926,13 +6929,46 @@ mod protection_tests {
     }
 
     #[test]
-    fn creates_an_immediately_signaled_waitable_timer() {
+    fn waitable_timers_expire_reset_repeat_and_cancel() {
         let timer = native_create_waitable_timer_ex_w(std::ptr::null(), std::ptr::null(), 0, 0);
         assert_ne!(timer, 0);
+        assert_eq!(native_wait_for_single_object(timer, 0), 258);
         assert_eq!(
             native_set_waitable_timer(timer, std::ptr::null(), 0, 0, 0, 0),
-            1
+            0
         );
+        assert_eq!(native_get_last_error(), 87);
+        let relative = -200_000; // 20 ms in 100 ns units
+        assert_eq!(native_set_waitable_timer(timer, &relative, 0, 0, 0, 0), 1);
+        assert_eq!(native_wait_for_single_object(timer, 0), 258);
+        assert_eq!(native_wait_for_single_object(timer, 1000), 0);
+        assert_eq!(native_wait_for_single_object(timer, 0), 258);
+        let immediate = 0;
+        assert_eq!(native_set_waitable_timer(timer, &immediate, 10, 0, 0, 0), 1);
+        assert_eq!(native_wait_for_single_object(timer, 0), 0);
+        assert_eq!(native_wait_for_single_object(timer, 1000), 0);
+        assert_eq!(super::native_cancel_waitable_timer(timer), 1);
+        assert_eq!(native_wait_for_single_object(timer, 30), 258);
+        assert_eq!(native_close_handle(timer), 1);
+        assert_eq!(super::native_cancel_waitable_timer(timer), 0);
+        assert_eq!(native_get_last_error(), 6);
+
+        let manual = super::native_create_waitable_timer_a(std::ptr::null(), 1, std::ptr::null());
+        assert_eq!(native_set_waitable_timer(manual, &immediate, 0, 0, 0, 0), 1);
+        // Cancellation preserves a timer that has already become signaled.
+        assert_eq!(super::native_cancel_waitable_timer(manual), 1);
+        assert_eq!(native_wait_for_single_object(manual, 0), 0);
+        assert_eq!(native_wait_for_single_object(manual, 0), 0);
+        assert_eq!(native_set_waitable_timer(manual, &relative, 0, 0, 0, 0), 1);
+        assert_eq!(native_wait_for_single_object(manual, 0), 258);
+        assert_eq!(native_close_handle(manual), 1);
+        assert_eq!(
+            native_create_waitable_timer_ex_w(std::ptr::null(), std::ptr::null(), 4, 0),
+            0
+        );
+        assert_eq!(native_get_last_error(), 87);
+        assert_eq!(native_set_waitable_timer(timer, &immediate, -1, 0, 0, 0), 0);
+        assert_eq!(native_get_last_error(), 87);
     }
 
     #[test]
@@ -8952,5 +8988,132 @@ mod protection_tests {
             ),
             2
         );
+    }
+}
+
+#[cfg(test)]
+mod editor_runtime_tests {
+    use super::*;
+
+    struct IsolatedProcess(Option<Arc<NativeProcessContext>>);
+    impl IsolatedProcess {
+        fn new() -> Self {
+            Self(
+                THREAD_NATIVE_PROCESS
+                    .with(|slot| slot.replace(Some(super::context::new_test_process()))),
+            )
+        }
+    }
+    impl Drop for IsolatedProcess {
+        fn drop(&mut self) {
+            THREAD_NATIVE_PROCESS.with(|slot| slot.replace(self.0.take()));
+        }
+    }
+
+    #[test]
+    fn go_process_flags_validate_handles_and_preserve_values() {
+        let _scope = IsolatedProcess::new();
+        assert_eq!(native_get_error_mode(), 0);
+        assert_eq!(native_set_error_mode(3), 0);
+        assert_eq!(native_get_error_mode(), 3);
+        assert_eq!(native_wer_set_flags(2), 0);
+        let mut flags = 0;
+        assert_eq!(native_wer_get_flags(u64::MAX, &mut flags), 0);
+        assert_eq!(flags, 2);
+        assert_eq!(native_wer_get_flags(42, &mut flags), 0x8007_0006);
+        assert_eq!(
+            native_wer_get_flags(u64::MAX, std::ptr::null_mut()),
+            0x8007_0057
+        );
+        assert_eq!(native_set_process_priority_boost(u64::MAX, 1), 1);
+        assert!(process_ctx()
+            .unwrap()
+            .priority_boost_disabled
+            .load(Ordering::Acquire));
+        assert_eq!(native_set_process_priority_boost(42, 0), 0);
+        assert_eq!(native_get_last_error(), 6);
+        assert_eq!(native_suspend_thread(native_get_current_thread()), u32::MAX);
+        assert_eq!(native_get_last_error(), 50);
+    }
+
+    #[test]
+    fn system_directory_a_reports_required_capacity_without_writing() {
+        let required = native_get_system_directory_a(std::ptr::null_mut(), 0);
+        let mut buffer = vec![0xcc; required as usize];
+        assert_eq!(
+            native_get_system_directory_a(buffer.as_mut_ptr(), required - 1),
+            required
+        );
+        assert!(buffer.iter().all(|byte| *byte == 0xcc));
+        assert_eq!(
+            native_get_system_directory_a(buffer.as_mut_ptr(), required),
+            required - 1
+        );
+        assert_eq!(
+            &buffer[..buffer.len() - 1],
+            crate::system_profile::SYSTEM32.as_bytes()
+        );
+        assert_eq!(buffer.last(), Some(&0));
+    }
+
+    #[test]
+    fn read_write_console_devices_preserve_output_modes_and_reject_bad_fills() {
+        let _scope = IsolatedProcess::new();
+        for name in ["CONIN$", "CONOUT$"] {
+            let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
+            let handle = native_create_file_w(wide.as_ptr(), 0xc000_0000, 3, 0, 3, 0, 0);
+            assert_ne!(handle, u64::MAX);
+            let mut mode = 0;
+            assert_eq!(native_get_console_mode(handle, &mut mode), 1);
+            if name == "CONOUT$" {
+                assert_eq!(native_set_console_mode(handle, 7), 1);
+                assert_eq!(native_get_console_mode(handle, &mut mode), 1);
+                assert_eq!(mode, 7);
+                let mut written = 99;
+                assert_eq!(
+                    native_fill_console_output_character_w(handle, 32, 1, u32::MAX, &mut written),
+                    0
+                );
+                assert_eq!(native_get_last_error(), 87);
+                assert_eq!(written, 0);
+            }
+            assert_eq!(native_close_handle(handle), 1);
+        }
+        assert_eq!(
+            native_fill_console_output_character_w(42, 32, 1, 0, std::ptr::null_mut()),
+            0
+        );
+        assert_eq!(native_get_last_error(), 6);
+    }
+
+    #[test]
+    fn optional_desktop_and_provider_services_fail_explicitly() {
+        assert_eq!(native_is_clipboard_format_available(13), 0);
+        assert_eq!(native_open_clipboard(0), 0);
+        assert_eq!(native_get_last_error(), 50);
+        assert_eq!(native_close_clipboard(), 0);
+        assert_eq!(native_get_last_error(), 1418);
+        assert_eq!(native_empty_clipboard(), 0);
+        assert_eq!(native_get_clipboard_data(13), 0);
+        assert_eq!(native_set_clipboard_data(13, 1), 0);
+        assert_eq!(native_get_last_error(), 1418);
+        assert_eq!(
+            native_wsa_enum_protocols_w(
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut()
+            ),
+            -1
+        );
+        assert_eq!(native_wsa_get_last_error(), 10045);
+    }
+
+    #[test]
+    fn rtl_current_peb_reads_the_current_teb() {
+        let mut teb = [0u8; 128];
+        teb[0x60..0x68].copy_from_slice(&0x1234_5678u64.to_le_bytes());
+        let previous = THREAD_TEB_BASE.with(|base| base.replace(teb.as_ptr() as u64));
+        assert_eq!(native_rtl_get_current_peb(), 0x1234_5678);
+        THREAD_TEB_BASE.with(|base| base.set(previous));
     }
 }

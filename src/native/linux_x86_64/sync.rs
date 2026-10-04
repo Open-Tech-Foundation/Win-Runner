@@ -320,6 +320,17 @@ pub(super) extern "win64" fn native_wait_for_single_object(handle: u64, millisec
     if native_diagnostic_enabled() {
         eprintln!("native WaitForSingleObject handle={handle:#x} timeout={milliseconds}");
     }
+    if console_fd(handle) == Some(0) {
+        return if console_input_ready(if milliseconds == u32::MAX {
+            -1
+        } else {
+            milliseconds.min(i32::MAX as u32) as i32
+        }) {
+            0
+        } else {
+            258
+        };
+    }
     let process = process_ctx();
     if let Some(event) = process.as_ref().and_then(|process| {
         process
@@ -329,6 +340,12 @@ pub(super) extern "win64" fn native_wait_for_single_object(handle: u64, millisec
             .and_then(|events| events.get(&handle).cloned())
     }) {
         return native_wait_event(&event, milliseconds);
+    }
+    if let Some(timer) = process
+        .as_ref()
+        .and_then(|p| p.timers.lock().ok().and_then(|t| t.get(&handle).cloned()))
+    {
+        return wait_timer(&timer, milliseconds);
     }
     if let Some(semaphore) = process.as_ref().and_then(|process| {
         process
@@ -414,7 +431,6 @@ pub(super) extern "win64" fn native_wait_for_single_object(handle: u64, millisec
         }
     }
     match handle {
-        0x7000_0000..0x8000_0000 => 0,
         _ => {
             let Some(process) = process else {
                 native_set_last_error(6);
@@ -750,7 +766,7 @@ pub(super) extern "win64" fn native_register_wait_for_single_object(
     let Some(process) = process_ctx() else {
         return 0;
     };
-    let target = if host_standard_fd(object) == Some(0) {
+    let target = if console_fd(object) == Some(0) {
         NativeWaitTarget::ConsoleInput
     } else if let Some(child) = child_process(&process, object) {
         NativeWaitTarget::Child(child)
@@ -998,22 +1014,149 @@ pub(super) extern "win64" fn native_wake_by_address_single(address: *const u8) {
 pub(super) extern "win64" fn native_create_waitable_timer_ex_w(
     _attributes: *const u8,
     _name: *const u16,
-    _flags: u32,
+    flags: u32,
     _access: u32,
 ) -> u64 {
-    process_ctx()
-        .map(|process| process.timer_next.fetch_add(1, Ordering::AcqRel))
-        .unwrap_or(0)
+    if flags & !3 != 0 {
+        native_set_last_error(87);
+        return 0;
+    }
+    let Some(process) = process_ctx() else {
+        native_set_last_error(6);
+        return 0;
+    };
+    let handle = process.timer_next.fetch_add(1, Ordering::AcqRel);
+    process.timers.lock().unwrap().insert(
+        handle,
+        Arc::new(NativeWaitableTimer {
+            manual_reset: flags & 1 != 0,
+            state: Mutex::new(NativeTimerState {
+                deadline: None,
+                period: 0,
+                signaled: false,
+            }),
+            changed: Condvar::new(),
+        }),
+    );
+    handle
+}
+pub(super) extern "win64" fn native_create_waitable_timer_a(
+    attributes: *const u8,
+    manual: i32,
+    name: *const u8,
+) -> u64 {
+    let name = unsafe { ascii_z(name) }.map(|s| s.encode_utf16().chain([0]).collect::<Vec<_>>());
+    native_create_waitable_timer_ex_w(
+        attributes,
+        name.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+        u32::from(manual != 0),
+        0x1f0003,
+    )
 }
 pub(super) extern "win64" fn native_set_waitable_timer(
     handle: u64,
-    _due_time: *const i64,
-    _period: i32,
-    _completion: u64,
+    due_time: *const i64,
+    period: i32,
+    completion: u64,
     _arg: u64,
     _resume: i32,
 ) -> i32 {
-    (0x7000_0000..0x8000_0000).contains(&handle) as i32
+    if due_time.is_null() || period < 0 {
+        native_set_last_error(87);
+        return 0;
+    }
+    if completion != 0 {
+        native_set_last_error(50);
+        return 0;
+    }
+    let Some(timer) =
+        process_ctx().and_then(|p| p.timers.lock().ok().and_then(|t| t.get(&handle).cloned()))
+    else {
+        native_set_last_error(6);
+        return 0;
+    };
+    let due = unsafe { due_time.read_unaligned() };
+    let ticks = if due < 0 {
+        due.unsigned_abs()
+    } else {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            / 100
+            + 116_444_736_000_000_000;
+        (due as u64).saturating_sub(now as u64)
+    };
+    let Some(nanos) = ticks.checked_mul(100) else {
+        native_set_last_error(87);
+        return 0;
+    };
+    let Some(deadline) =
+        std::time::Instant::now().checked_add(std::time::Duration::from_nanos(nanos))
+    else {
+        native_set_last_error(87);
+        return 0;
+    };
+    let mut state = timer.state.lock().unwrap();
+    state.deadline = Some(deadline);
+    state.period = period as u32;
+    state.signaled = false;
+    timer.changed.notify_all();
+    1
+}
+pub(super) extern "win64" fn native_cancel_waitable_timer(handle: u64) -> i32 {
+    let Some(timer) =
+        process_ctx().and_then(|p| p.timers.lock().ok().and_then(|t| t.get(&handle).cloned()))
+    else {
+        native_set_last_error(6);
+        return 0;
+    };
+    let mut state = timer.state.lock().unwrap();
+    update_timer_state(&mut state);
+    state.deadline = None;
+    timer.changed.notify_all();
+    1
+}
+fn update_timer_state(state: &mut NativeTimerState) {
+    let now = std::time::Instant::now();
+    if state.deadline.is_some_and(|deadline| deadline <= now) {
+        state.signaled = true;
+        state.deadline = if state.period != 0 {
+            Some(now + std::time::Duration::from_millis(state.period as u64))
+        } else {
+            None
+        };
+    }
+}
+
+fn wait_timer(timer: &NativeWaitableTimer, milliseconds: u32) -> u32 {
+    let expires = (milliseconds != u32::MAX)
+        .then(|| std::time::Instant::now() + std::time::Duration::from_millis(milliseconds as u64));
+    let mut state = timer.state.lock().unwrap();
+    loop {
+        let now = std::time::Instant::now();
+        update_timer_state(&mut state);
+        if state.signaled {
+            state.signaled = timer.manual_reset;
+            return 0;
+        }
+        if expires.is_some_and(|expires| expires <= now) {
+            return 258;
+        }
+        let wake = match (expires, state.deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        state = if let Some(wake) = wake {
+            timer
+                .changed
+                .wait_timeout(state, wake.saturating_duration_since(now))
+                .unwrap()
+                .0
+        } else {
+            timer.changed.wait(state).unwrap()
+        };
+    }
 }
 
 fn native_critical_section(section: *mut u8) -> Option<Arc<NativeCriticalSection>> {

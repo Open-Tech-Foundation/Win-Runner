@@ -6,10 +6,21 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add Micro 2.0.15 (Windows x64) to `wpkg`, with a verified archive and native
+  terminal E2E coverage for Unicode editing, navigation, resize, save, quit,
+  terminal restoration, and snapshot persistence.
+
 - Add the shell `reload` command to refresh saved guest environment variables
   and PATH immediately, preserving shell variables, functions, and files.
 
 ### Fixed
+
+- Support Windows Go startup and clocks with read-only shared system data,
+  real waitable-timer deadlines, process flags, PEB queries, and vectored
+  continuation handlers. Recognize read/write console device handles,
+  preserve VT output modes, translate terminal navigation keys, and deliver
+  window resize records. Return explicit errors for unavailable desktop
+  clipboard, Winsock provider catalog, and asynchronous thread suspension.
 
 - Put the active Windows Node distribution and per-user npm command folder
   on the guest PATH so global npm launchers work immediately, after version

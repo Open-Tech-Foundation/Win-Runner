@@ -397,6 +397,12 @@ pub(super) extern "win64" fn native_close_handle(h: u64) -> i32 {
     }) {
         return 1;
     }
+    if process
+        .as_ref()
+        .is_some_and(|p| p.timers.lock().is_ok_and(|mut t| t.remove(&h).is_some()))
+    {
+        return 1;
+    }
     if process.as_ref().is_some_and(|process| {
         process
             .events

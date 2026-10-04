@@ -753,3 +753,12 @@ mod teb_tls_tests {
         assert_eq!(teb_u64(&next, 0x30), next.teb.as_ptr() as u64); // NT_TIB.Self
     }
 }
+
+pub(super) extern "win64" fn native_rtl_get_current_peb() -> u64 {
+    let teb = THREAD_TEB_BASE.get();
+    if teb != 0 {
+        unsafe { ((teb + 0x60) as *const u64).read_unaligned() }
+    } else {
+        0
+    }
+}

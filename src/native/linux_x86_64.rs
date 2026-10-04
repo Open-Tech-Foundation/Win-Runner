@@ -10,6 +10,8 @@ use std::sync::{Arc, Condvar, LazyLock, Mutex, Weak};
 
 #[path = "linux_x86_64/runtime.rs"]
 mod runtime;
+#[path = "linux_x86_64/shared_data.rs"]
+mod shared_data;
 use runtime::*;
 #[path = "linux_host.rs"]
 mod host;

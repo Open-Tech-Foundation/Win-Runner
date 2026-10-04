@@ -1623,3 +1623,13 @@ mod named_socket_tests {
         native_free_addr_info_w(result);
     }
 }
+
+/// The Linux socket backend has no Windows Winsock provider catalog.
+pub(super) extern "win64" fn native_wsa_enum_protocols_w(
+    _protocols: *const i32,
+    _buffer: *mut u8,
+    _length: *mut u32,
+) -> i32 {
+    native_wsa_set_last_error(10045); // WSAEOPNOTSUPP
+    -1
+}

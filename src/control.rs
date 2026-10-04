@@ -32,6 +32,16 @@ static CONTROL_SESSION: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 pub fn terminal_size() -> (usize, usize) {
     let shared = TERMINAL_SIZE.load(Ordering::Acquire);
     if shared.is_null() {
+        #[cfg(unix)]
+        for fd in [1, 0, 2] {
+            let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+            if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut size) } == 0
+                && size.ws_col > 0
+                && size.ws_row > 0
+            {
+                return (size.ws_col as usize, size.ws_row as usize);
+            }
+        }
         return (80, 25);
     }
     // SAFETY: this mapping is created before guest processes fork and remains

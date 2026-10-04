@@ -338,3 +338,15 @@ pub(super) extern "win64" fn native_get_user_profile_directory_w(
     };
     1
 }
+
+pub(super) extern "win64" fn native_get_system_directory_a(output: *mut u8, capacity: u32) -> u32 {
+    let path = system_profile::SYSTEM32.as_bytes();
+    if output.is_null() || capacity as usize <= path.len() {
+        return path.len() as u32 + 1;
+    }
+    unsafe {
+        output.copy_from_nonoverlapping(path.as_ptr(), path.len());
+        output.add(path.len()).write(0);
+    }
+    path.len() as u32
+}

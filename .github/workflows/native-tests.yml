@@ -40,3 +40,13 @@ jobs:
         env:
           WINRUN_DOTNET_FIXTURE: ${{ github.workspace }}/target/dotnet-fixture
         run: cargo test --locked --test dotnet_native -- --ignored
+  micro:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/fetch-micro-fixture.sh target/micro-fixture
+      - name: Native Micro package and terminal integration test
+        env:
+          WINRUN_MICRO_FIXTURE: ${{ github.workspace }}/target/micro-fixture
+        run: cargo test --locked --test micro_native -- --ignored

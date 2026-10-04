@@ -3,16 +3,28 @@
 use super::*;
 use std::collections::VecDeque;
 
+pub(super) fn console_fd(handle: u64) -> Option<i32> {
+    host_standard_fd(handle).or_else(|| match native_device(handle)?.0 {
+        NativeDevice::Console { output, .. } | NativeDevice::ConsoleOut(output) => {
+            host_standard_fd(output)
+        }
+        NativeDevice::ConsoleIn(input) => host_standard_fd(input),
+        _ => None,
+    })
+}
+
 pub(super) extern "win64" fn native_get_console_mode(handle: u64, mode: *mut u32) -> i32 {
-    if host_standard_fd(handle).is_none() || mode.is_null() {
+    if console_fd(handle).is_none() || mode.is_null() {
         return 0;
     }
-    // ENABLE_PROCESSED_OUTPUT. The native child exposes only its three
-    // standard descriptors as consoles; stdin reports its input mode.
-    let value = if host_standard_fd(handle) == Some(0) {
+    // Console devices share modes with the corresponding standard stream.
+    let value = if console_fd(handle) == Some(0) {
         console_input_mode()
     } else {
-        1
+        let fd = console_fd(handle).unwrap();
+        process_ctx()
+            .map(|p| p.console_output_modes[(fd - 1) as usize].load(Ordering::Acquire))
+            .unwrap_or(1)
     };
     unsafe { mode.write(value) };
     1
@@ -21,7 +33,7 @@ pub(super) extern "win64" fn native_get_console_output_cp() -> u32 {
     native_get_acp()
 }
 pub(super) extern "win64" fn native_get_console_cursor_info(handle: u64, output: *mut u8) -> i32 {
-    if host_standard_fd(handle).is_none() || output.is_null() {
+    if console_fd(handle).is_none() || output.is_null() {
         return 0;
     }
     // CONSOLE_CURSOR_INFO is { DWORD size; BOOL visible; }.
@@ -32,7 +44,7 @@ pub(super) extern "win64" fn native_get_console_cursor_info(handle: u64, output:
     1
 }
 pub(super) extern "win64" fn native_set_console_cursor_info(handle: u64, input: *const u8) -> i32 {
-    if host_standard_fd(handle).is_none() || input.is_null() {
+    if console_fd(handle).is_none() || input.is_null() {
         native_set_last_error(87);
         return 0;
     }
@@ -42,11 +54,20 @@ pub(super) extern "win64" fn native_set_console_cursor_info(handle: u64, input: 
         native_set_last_error(87);
         return 0;
     }
-    // Cursor visibility and shape are owned by the host terminal.
-    1
+    let Some(fd @ (1 | 2)) = console_fd(handle) else {
+        native_set_last_error(6);
+        return 0;
+    };
+    let sequence = if visible == 0 {
+        b"\x1b[?25l"
+    } else {
+        b"\x1b[?25h"
+    };
+    (unsafe { write(fd, sequence.as_ptr().cast(), sequence.len()) } == sequence.len() as isize)
+        as i32
 }
 pub(super) extern "win64" fn native_set_console_cursor_position(handle: u64, position: u32) -> i32 {
-    let Some(fd @ (1 | 2)) = host_standard_fd(handle) else {
+    let Some(fd @ (1 | 2)) = console_fd(handle) else {
         native_set_last_error(6);
         return 0;
     };
@@ -71,7 +92,7 @@ pub(super) extern "win64" fn native_get_console_screen_buffer_info(
     handle: u64,
     output: *mut u8,
 ) -> i32 {
-    if host_standard_fd(handle).is_none() || output.is_null() {
+    if console_fd(handle).is_none() || output.is_null() {
         return 0;
     }
     let (columns, rows) = crate::control::terminal_size();
@@ -90,19 +111,24 @@ pub(super) extern "win64" fn native_get_console_screen_buffer_info(
     1
 }
 pub(super) extern "win64" fn native_set_console_mode(handle: u64, mode: u32) -> i32 {
-    match host_standard_fd(handle) {
+    match console_fd(handle) {
         Some(0) => {
             set_console_input_mode(mode);
             1
         }
-        Some(_) => 1,
-        None => 0,
+        Some(fd @ (1 | 2)) => {
+            if let Some(p) = process_ctx() {
+                p.console_output_modes[(fd - 1) as usize].store(mode, Ordering::Release);
+            }
+            1
+        }
+        _ => 0,
     }
 }
 pub(super) extern "win64" fn native_set_console_screen_buffer_size(handle: u64, size: u32) -> i32 {
     let width = size as u16 as i16;
     let height = (size >> 16) as u16 as i16;
-    if host_standard_fd(handle).is_none() || width <= 0 || height <= 0 {
+    if console_fd(handle).is_none() || width <= 0 || height <= 0 {
         native_set_last_error(87);
         return 0;
     }
@@ -115,7 +141,7 @@ pub(super) extern "win64" fn native_set_console_window_info(
     _absolute: i32,
     rect: *const u8,
 ) -> i32 {
-    if host_standard_fd(handle).is_none() || rect.is_null() {
+    if console_fd(handle).is_none() || rect.is_null() {
         native_set_last_error(87);
         return 0;
     }
@@ -132,7 +158,7 @@ pub(super) extern "win64" fn native_set_console_window_info(
     1
 }
 pub(super) extern "win64" fn native_set_console_active_screen_buffer(handle: u64) -> i32 {
-    if host_standard_fd(handle).is_some() {
+    if console_fd(handle).is_some() {
         1
     } else {
         native_set_last_error(6);
@@ -154,7 +180,7 @@ pub(super) extern "win64" fn native_write_console_w(
     written: *mut u32,
     _reserved: u64,
 ) -> i32 {
-    if !matches!(host_standard_fd(handle), Some(1 | 2)) || (text.is_null() && len != 0) {
+    if !matches!(console_fd(handle), Some(1 | 2)) || (text.is_null() && len != 0) {
         return 0;
     }
     let units = if len == 0 {
@@ -163,7 +189,7 @@ pub(super) extern "win64" fn native_write_console_w(
         unsafe { std::slice::from_raw_parts(text, len as usize) }
     };
     let encoded = String::from_utf16_lossy(units);
-    let Some(fd) = host_standard_fd(handle) else {
+    let Some(fd) = console_fd(handle) else {
         return 0;
     };
     if unsafe { write(fd, encoded.as_ptr().cast(), encoded.len()) } < 0 {
@@ -182,7 +208,7 @@ pub(super) extern "win64" fn native_write_console_output_a(
     source: u32,
     region: *mut u8,
 ) -> i32 {
-    let Some(fd @ (1 | 2)) = host_standard_fd(handle) else {
+    let Some(fd @ (1 | 2)) = console_fd(handle) else {
         native_set_last_error(6);
         return 0;
     };
@@ -302,6 +328,7 @@ const INPUT_RECORD_SIZE: usize = 20;
 const KEY_EVENT: u16 = 1;
 
 /// Console stdin shared by line reads, key-record reads, and waits.
+#[derive(Clone)]
 pub(super) struct ConsoleInput {
     mode: u32,
     /// UTF-16 units ready to return to a read.
@@ -312,6 +339,9 @@ pub(super) struct ConsoleInput {
     line: Vec<u8>,
     /// A read reached end of input; the next read reports it once.
     eof: bool,
+    size: Option<(usize, usize)>,
+    resize: Option<(usize, usize)>,
+    escape_started: Option<std::time::Instant>,
 }
 
 impl ConsoleInput {
@@ -322,6 +352,9 @@ impl ConsoleInput {
             partial: Vec::new(),
             line: Vec::new(),
             eof: false,
+            size: None,
+            resize: None,
+            escape_started: None,
         }
     }
 
@@ -424,16 +457,105 @@ impl ConsoleInput {
         Some(count)
     }
 
-    /// Ready key records for a `ReadConsoleInputW`, or None to keep waiting.
+    fn observe_size(&mut self, size: (usize, usize)) {
+        if self.mode & 8 != 0 && self.size.is_some_and(|previous| previous != size) {
+            self.resize = Some(size);
+        }
+        self.size = Some(size);
+    }
+
+    fn record_count(&mut self) -> usize {
+        // ANSI key sequences consume several UTF-16 units but produce one
+        // Windows record. Consumers use this count to issue blocking reads.
+        let mut preview = self.clone();
+        let count = preview
+            .take_records(usize::MAX)
+            .and_then(Result::ok)
+            .map_or(0, |records| records.len());
+        self.escape_started = preview.escape_started;
+        count
+    }
+
+    /// Ready key and window records for a `ReadConsoleInputW`.
     fn take_records(&mut self, length: usize) -> Option<Result<Vec<[u8; INPUT_RECORD_SIZE]>, u32>> {
         if length == 0 {
             return Some(Ok(Vec::new()));
         }
+        if let Some((columns, rows)) = self.resize.take() {
+            let mut record = [0; INPUT_RECORD_SIZE];
+            record[0..2].copy_from_slice(&4u16.to_le_bytes());
+            record[4..6].copy_from_slice(&(columns as u16).to_le_bytes());
+            record[6..8].copy_from_slice(&(rows as u16).to_le_bytes());
+            return Some(Ok(vec![record]));
+        }
         if self.units.is_empty() {
             return std::mem::take(&mut self.eof).then_some(Err(38)); // ERROR_HANDLE_EOF
         }
-        let count = length.min(self.units.len());
-        Some(Ok(self.units.drain(..count).map(key_event_record).collect()))
+        let mut records = Vec::new();
+        while records.len() < length && !self.units.is_empty() {
+            if self.units[0] == 0x1b {
+                let sequences: &[(&[u8], u16)] = &[
+                    (b"\x1b[A", 0x26),
+                    (b"\x1b[B", 0x28),
+                    (b"\x1b[C", 0x27),
+                    (b"\x1b[D", 0x25),
+                    (b"\x1b[H", 0x24),
+                    (b"\x1b[F", 0x23),
+                    (b"\x1bOH", 0x24),
+                    (b"\x1bOF", 0x23),
+                    (b"\x1bOP", 0x70),
+                    (b"\x1bOQ", 0x71),
+                    (b"\x1bOR", 0x72),
+                    (b"\x1bOS", 0x73),
+                    (b"\x1b[2~", 0x2d),
+                    (b"\x1b[3~", 0x2e),
+                    (b"\x1b[5~", 0x21),
+                    (b"\x1b[6~", 0x22),
+                    (b"\x1b[15~", 0x74),
+                    (b"\x1b[17~", 0x75),
+                    (b"\x1b[18~", 0x76),
+                    (b"\x1b[19~", 0x77),
+                    (b"\x1b[20~", 0x78),
+                    (b"\x1b[21~", 0x79),
+                    (b"\x1b[23~", 0x7a),
+                    (b"\x1b[24~", 0x7b),
+                ];
+                if let Some((sequence, key)) = sequences.iter().find(|(sequence, _)| {
+                    sequence.len() <= self.units.len()
+                        && sequence
+                            .iter()
+                            .zip(&self.units)
+                            .all(|(a, b)| *a as u16 == *b)
+                }) {
+                    self.units.drain(..sequence.len());
+                    let mut record = key_event_record(0);
+                    record[10..12].copy_from_slice(&key.to_le_bytes());
+                    record[12..14].copy_from_slice(&scan_code(*key).to_le_bytes());
+                    records.push(record);
+                    self.escape_started = None;
+                    continue;
+                }
+                let incomplete = sequences.iter().any(|(sequence, _)| {
+                    self.units.len() < sequence.len()
+                        && sequence
+                            .iter()
+                            .zip(&self.units)
+                            .all(|(a, b)| *a as u16 == *b)
+                });
+                if incomplete
+                    && self
+                        .escape_started
+                        .get_or_insert_with(std::time::Instant::now)
+                        .elapsed()
+                        < std::time::Duration::from_millis(25)
+                {
+                    break;
+                }
+            }
+            self.escape_started = None;
+            records.push(key_event_record(self.units.pop_front().unwrap()));
+        }
+        (!records.is_empty()).then_some(Ok(records))
     }
 }
 
@@ -476,6 +598,7 @@ fn termios_for_console_mode(original: &libc::termios, mode: u32) -> libc::termio
 fn set_console_input_mode(mode: u32) {
     if let Ok(mut input) = CONSOLE_INPUT.lock() {
         input.mode = mode;
+        input.size = Some(crate::control::terminal_size());
     }
     if unsafe { libc::isatty(0) } != 1 {
         return;
@@ -629,6 +752,7 @@ fn wait_for_console_input<T>(
             let Ok(mut input) = CONSOLE_INPUT.lock() else {
                 return Err(6);
             };
+            input.observe_size(crate::control::terminal_size());
             if let Some(value) = take(&mut input) {
                 return Ok(value);
             }
@@ -656,7 +780,7 @@ fn wait_for_console_input<T>(
             },
         ];
         // The timeout only bounds a missed wake-up between two readers.
-        unsafe { poll(descriptors.as_mut_ptr(), 2, 200) };
+        unsafe { poll(descriptors.as_mut_ptr(), 2, 25) };
         if descriptors[1].revents != 0 {
             let mut drained = [0u8; 64];
             while unsafe { read(wake, drained.as_mut_ptr().cast(), drained.len()) } > 0 {}
@@ -667,17 +791,31 @@ fn wait_for_console_input<T>(
 /// Whether a wait on the console input handle is satisfied: input is ready
 /// or the terminal has bytes (or end of input) to read.
 pub(super) fn console_input_ready(timeout_ms: i32) -> bool {
-    if CONSOLE_INPUT
-        .try_lock()
-        .is_ok_and(|input| !input.units.is_empty() || input.eof)
-    {
-        return true;
+    let deadline = (timeout_ms >= 0)
+        .then(|| std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64));
+    loop {
+        if CONSOLE_INPUT.try_lock().is_ok_and(|mut input| {
+            input.observe_size(crate::control::terminal_size());
+            input.record_count() != 0 || input.eof
+        }) || host_stdin_readable(0)
+        {
+            return true;
+        }
+        let remaining =
+            deadline.map(|end| end.saturating_duration_since(std::time::Instant::now()));
+        if remaining.is_some_and(|time| time.is_zero()) {
+            return false;
+        }
+        // Window-size changes and an isolated Escape key have no fd wakeup.
+        let wait = remaining.map_or(25, |time| time.as_millis().min(25) as i32);
+        if host_stdin_readable(wait) {
+            return true;
+        }
     }
-    host_stdin_readable(timeout_ms)
 }
 
 fn console_stdin(handle: u64) -> bool {
-    host_standard_fd(handle) == Some(0)
+    console_fd(handle) == Some(0)
 }
 
 /// `ReadConsoleW(handle, buffer, chars, read, control)`. In line-input mode
@@ -819,7 +957,8 @@ pub(super) extern "win64" fn native_get_number_of_console_input_events(
             input.queue_bytes(&chunk[..read as usize]);
         }
     }
-    unsafe { count.write(input.units.len() as u32) };
+    input.observe_size(crate::control::terminal_size());
+    unsafe { count.write(input.record_count() as u32) };
     1
 }
 
@@ -925,16 +1064,49 @@ mod read_console_tests {
     }
 
     #[test]
-    fn raw_reads_return_an_arrow_key_sequence_as_key_records() {
+    fn raw_reads_decode_navigation_and_split_escape_sequences() {
         let mut input = raw_input();
-        input.queue_bytes(b"\x1b[A\r");
-        let chars = |records: Vec<[u8; 20]>| -> Vec<u16> {
-            records.iter().map(|r| record_fields(r).5).collect()
-        };
-        assert_eq!(chars(input.take_records(2).unwrap().unwrap()), vec![0x1b, b'[' as u16]);
-        assert_eq!(chars(input.take_records(8).unwrap().unwrap()), vec![b'A' as u16, 0x0d]);
+        input.queue_bytes(b"\x1b[");
+        assert_eq!(input.take_records(2), None);
+        input.queue_bytes(b"D\x1b[3~\r");
+        assert_eq!(input.record_count(), 3);
+        let records = input.take_records(2).unwrap().unwrap();
+        assert_eq!(record_fields(&records[0]).3, 0x25); // VK_LEFT
+        assert_eq!(record_fields(&records[0]).5, 0);
+        assert_eq!(record_fields(&records[1]).3, 0x2e); // VK_DELETE
+        assert_eq!(
+            record_fields(&input.take_records(1).unwrap().unwrap()[0]).5,
+            0x0d
+        );
+        assert_eq!(input.record_count(), 0);
         assert_eq!(input.take_records(1), None);
+        input.queue_bytes(b"\x1b");
+        assert_eq!(input.take_records(1), None);
+        input.escape_started =
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(30));
+        assert_eq!(
+            record_fields(&input.take_records(1).unwrap().unwrap()[0]).5,
+            0x1b
+        );
+    }
+
+    #[test]
+    fn resize_records_follow_window_input_mode_and_coalesce() {
+        let mut input = raw_input();
+        input.observe_size((80, 24));
+        assert_eq!(input.take_records(1), None);
+        input.observe_size((100, 30));
+        input.observe_size((120, 40));
+        assert_eq!(input.record_count(), 1);
         assert_eq!(input.take_records(0), Some(Ok(Vec::new())));
+        let record = input.take_records(1).unwrap().unwrap()[0];
+        assert_eq!(u16::from_le_bytes(record[0..2].try_into().unwrap()), 4);
+        assert_eq!(u16::from_le_bytes(record[4..6].try_into().unwrap()), 120);
+        assert_eq!(u16::from_le_bytes(record[6..8].try_into().unwrap()), 40);
+        assert_eq!(input.take_records(1), None);
+        input.mode = 0;
+        input.observe_size((80, 24));
+        assert_eq!(input.take_records(1), None);
     }
 
     #[test]
@@ -1004,4 +1176,85 @@ pub(super) extern "win64" fn native_set_console_ctrl_handler(_handler: u64, _add
     // Registration succeeds so applications can install their handler;
     // Linux signals still terminate the isolated guest process normally.
     1
+}
+
+// Attribute-only edits to a Windows screen buffer require a shadow screen;
+// VT-based clients can operate directly without this legacy capability.
+pub(super) extern "win64" fn native_fill_console_output_attribute(
+    _handle: u64,
+    _attribute: u16,
+    _length: u32,
+    _position: u32,
+    written: *mut u32,
+) -> i32 {
+    if !written.is_null() {
+        unsafe { written.write(0) };
+    }
+    native_set_last_error(50);
+    0
+}
+pub(super) extern "win64" fn native_fill_console_output_character_w(
+    handle: u64,
+    character: u16,
+    length: u32,
+    position: u32,
+    written: *mut u32,
+) -> i32 {
+    if !written.is_null() {
+        unsafe { written.write(0) };
+    }
+    let Some(fd @ (1 | 2)) = console_fd(handle) else {
+        native_set_last_error(6);
+        return 0;
+    };
+    let (columns, rows) = crate::control::terminal_size();
+    let x = position as u16 as usize;
+    let y = (position >> 16) as u16 as usize;
+    if x >= columns || y >= rows || columns == 0 {
+        native_set_last_error(87);
+        return 0;
+    }
+    let count = (length as usize).min(columns * rows - y * columns - x);
+    // FillConsoleOutputCharacter does not change the cursor position.
+    unsafe { write(fd, b"\x1b7".as_ptr().cast(), 2) };
+    let mut done = 0;
+    while done < count {
+        let offset = y * columns + x + done;
+        let take = (columns - offset % columns).min(count - done);
+        if native_set_console_cursor_position(
+            handle,
+            (offset % columns) as u32 | ((offset / columns) as u32) << 16,
+        ) == 0
+        {
+            unsafe { write(fd, b"\x1b8".as_ptr().cast(), 2) };
+            return 0;
+        }
+        let text = vec![character; take];
+        if native_write_console_w(handle, text.as_ptr(), take as u32, std::ptr::null_mut(), 0) == 0
+        {
+            unsafe { write(fd, b"\x1b8".as_ptr().cast(), 2) };
+            return 0;
+        }
+        done += take;
+    }
+    unsafe { write(fd, b"\x1b8".as_ptr().cast(), 2) };
+    if !written.is_null() {
+        unsafe { written.write(done as u32) };
+    }
+    1
+}
+
+pub(super) extern "win64" fn native_set_console_text_attribute(
+    handle: u64,
+    attributes: u16,
+) -> i32 {
+    let Some(fd @ (1 | 2)) = console_fd(handle) else {
+        native_set_last_error(6);
+        return 0;
+    };
+    let ansi = |value: u16| ((value & 4) >> 2) | (value & 2) | ((value & 1) << 2);
+    let fg = ansi(attributes & 7) + if attributes & 8 != 0 { 90 } else { 30 };
+    let bg = ansi((attributes >> 4) & 7) + if attributes & 0x80 != 0 { 100 } else { 40 };
+    let text = format!("\x1b[0;{fg};{bg}m");
+    (unsafe { write(fd, text.as_ptr().cast(), text.len()) } == text.len() as isize) as i32
 }

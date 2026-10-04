@@ -47,24 +47,11 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_create_file_w(
                 output: process.std_handles[1].load(Ordering::Acquire),
             })
         }
-        Some(crate::winfs::DosDevicePath::ConsoleIn) => {
-            if access & 0x4000_0000 != 0 {
-                native_set_last_error(5); // ERROR_ACCESS_DENIED
-                return u64::MAX;
-            }
-            process_ctx().map(|process| {
-                NativeDevice::ConsoleIn(process.std_handles[0].load(Ordering::Acquire))
-            })
-        }
-        Some(crate::winfs::DosDevicePath::ConsoleOut) => {
-            if access & 0x8000_0000 != 0 {
-                native_set_last_error(5); // ERROR_ACCESS_DENIED
-                return u64::MAX;
-            }
-            process_ctx().map(|process| {
-                NativeDevice::ConsoleOut(process.std_handles[1].load(Ordering::Acquire))
-            })
-        }
+        Some(crate::winfs::DosDevicePath::ConsoleIn) => process_ctx()
+            .map(|process| NativeDevice::ConsoleIn(process.std_handles[0].load(Ordering::Acquire))),
+        Some(crate::winfs::DosDevicePath::ConsoleOut) => process_ctx().map(|process| {
+            NativeDevice::ConsoleOut(process.std_handles[1].load(Ordering::Acquire))
+        }),
         Some(crate::winfs::DosDevicePath::Reserved) => {
             native_set_last_error(123); // ERROR_INVALID_NAME
             return u64::MAX;

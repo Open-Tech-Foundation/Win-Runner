@@ -456,6 +456,7 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                 | "ntohs"
                 | "WSAStartup"
                 | "WSACleanup"
+                | "WSAEnumProtocolsW"
                 | "WSAGetLastError"
                 | "WSASetLastError"
                 | "WSASocketW"
@@ -984,6 +985,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "freeaddrinfo" => Some(native_free_addr_info_w as *const () as usize as u64),
         "WSARecv" => Some(native_wsa_recv as *const () as usize as u64),
         "WSASend" => Some(native_wsa_send as *const () as usize as u64),
+        "WSAEnumProtocolsW" => Some(native_wsa_enum_protocols_w as *const () as usize as u64),
         "#111" | "WSAGetLastError" => Some(native_wsa_get_last_error as *const () as usize as u64),
         "#112" | "WSASetLastError" => Some(native_wsa_set_last_error as *const () as usize as u64),
         "GetSystemMetrics" => Some(native_get_system_metrics as *const () as usize as u64),
@@ -1129,6 +1131,39 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "GetCommandLineA" => Some(native_get_command_line_a as *const () as usize as u64),
         "GetLastError" => Some(native_get_last_error as *const () as usize as u64),
         "SetLastError" => Some(native_set_last_error as *const () as usize as u64),
+        "WerGetFlags" => Some(native_wer_get_flags as *const () as usize as u64),
+        "WerSetFlags" => Some(native_wer_set_flags as *const () as usize as u64),
+        "SetProcessPriorityBoost" => {
+            Some(native_set_process_priority_boost as *const () as usize as u64)
+        }
+        "GetSystemDirectoryA" => Some(native_get_system_directory_a as *const () as usize as u64),
+        "AddVectoredContinueHandler" => {
+            Some(native_add_vectored_continue_handler as *const () as usize as u64)
+        }
+        "RemoveVectoredContinueHandler" => {
+            Some(native_remove_vectored_continue_handler as *const () as usize as u64)
+        }
+        "RtlGetCurrentPeb" => Some(native_rtl_get_current_peb as *const () as usize as u64),
+        "IsClipboardFormatAvailable" => {
+            Some(native_is_clipboard_format_available as *const () as usize as u64)
+        }
+        "OpenClipboard" => Some(native_open_clipboard as *const () as usize as u64),
+        "CloseClipboard" => Some(native_close_clipboard as *const () as usize as u64),
+        "EmptyClipboard" => Some(native_empty_clipboard as *const () as usize as u64),
+        "GetClipboardData" => Some(native_get_clipboard_data as *const () as usize as u64),
+        "SetClipboardData" => Some(native_set_clipboard_data as *const () as usize as u64),
+        "CreateWaitableTimerA" => Some(native_create_waitable_timer_a as *const () as usize as u64),
+        "CancelWaitableTimer" => Some(native_cancel_waitable_timer as *const () as usize as u64),
+        "SetConsoleTextAttribute" => {
+            Some(native_set_console_text_attribute as *const () as usize as u64)
+        }
+        "FillConsoleOutputAttribute" => {
+            Some(native_fill_console_output_attribute as *const () as usize as u64)
+        }
+        "FillConsoleOutputCharacterW" => {
+            Some(native_fill_console_output_character_w as *const () as usize as u64)
+        }
+        "GetErrorMode" => Some(native_get_error_mode as *const () as usize as u64),
         "SetErrorMode" => Some(native_set_error_mode as *const () as usize as u64),
         "GetStartupInfoW" => Some(native_get_startup_info_w as *const () as usize as u64),
         "GetStartupInfoA" => Some(native_get_startup_info_a as *const () as usize as u64),
@@ -1432,6 +1467,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "QueueUserWorkItem" => {
             Some(native_queue_user_work_item as *const () as usize as u64)
         }
+        "SuspendThread" => Some(native_suspend_thread as *const () as usize as u64),
         "ResumeThread" => Some(native_resume_thread as *const () as usize as u64),
         "WaitForSingleObject" => Some(native_wait_for_single_object as *const () as usize as u64),
         "CreateEventW" => Some(native_create_event_w as *const () as usize as u64),

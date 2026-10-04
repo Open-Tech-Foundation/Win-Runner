@@ -2300,6 +2300,12 @@ pub(super) extern "win64" fn native_get_module_file_name_w(
     copied as u32
 }
 
+pub(super) extern "win64" fn native_get_error_mode() -> u32 {
+    process_ctx()
+        .map(|process| process.error_mode.load(Ordering::Acquire))
+        .unwrap_or(0)
+}
+
 pub(super) extern "win64" fn native_set_error_mode(mode: u32) -> u32 {
     process_ctx()
         .map(|process| process.error_mode.swap(mode, Ordering::AcqRel))
@@ -2363,4 +2369,48 @@ mod exit_code_tests {
         // Killed or terminated, not crashed.
         assert_eq!(worker_exit_code(ExitStatus::from_raw(libc::SIGKILL), "C:\\a.exe"), 1);
     }
+}
+
+/// WER UI is absent on the Linux backend; retain the process reporting flags.
+pub(super) extern "win64" fn native_wer_get_flags(handle: u64, flags: *mut u32) -> u32 {
+    if flags.is_null() {
+        return 0x8007_0057;
+    }
+    let Some(process) = process_ctx() else {
+        return 0x8007_0006;
+    };
+    if handle != u64::MAX && handle != process.process_handle {
+        return 0x8007_0006;
+    }
+    unsafe { flags.write(process.wer_flags.load(Ordering::Acquire)) };
+    0
+}
+pub(super) extern "win64" fn native_wer_set_flags(flags: u32) -> u32 {
+    let Some(process) = process_ctx() else {
+        return 0x8007_0006;
+    };
+    process.wer_flags.store(flags, Ordering::Release);
+    0
+}
+pub(super) extern "win64" fn native_set_process_priority_boost(handle: u64, disabled: i32) -> i32 {
+    let Some(process) = process_ctx() else {
+        native_set_last_error(6);
+        return 0;
+    };
+    if handle != u64::MAX && handle != process.process_handle {
+        native_set_last_error(6);
+        return 0;
+    }
+    // Linux does not apply Windows' dynamic IO/GUI priority boosts.
+    process
+        .priority_boost_disabled
+        .store(disabled != 0, Ordering::Release);
+    1
+}
+
+/// Running host threads cannot yet be safely suspended for context injection.
+/// Report the unsupported operation so Go can use cooperative preemption.
+pub(super) extern "win64" fn native_suspend_thread(_handle: u64) -> u32 {
+    native_set_last_error(50); // ERROR_NOT_SUPPORTED
+    u32::MAX
 }

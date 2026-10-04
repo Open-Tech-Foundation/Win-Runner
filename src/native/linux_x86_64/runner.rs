@@ -519,7 +519,10 @@ fn run_rust_baseline_argv_with_fs_impl(
             crt_fd_next: AtomicI32::new(3),
             fs,
             named_pipes: Mutex::new(NativeNamedPipeTable::new()),
+            console_output_modes: [AtomicU32::new(1), AtomicU32::new(1)],
             error_mode: AtomicU32::new(0),
+            wer_flags: AtomicU32::new(0),
+            priority_boost_disabled: AtomicBool::new(false),
             pointer_cookie: random_pointer_cookie(),
             heap_allocations: Mutex::new(HashMap::new()),
             virtual_allocations: Mutex::new(HashMap::new()),
@@ -558,11 +561,13 @@ fn run_rust_baseline_argv_with_fs_impl(
             duplicate_handles: Mutex::new(HashMap::new()),
             duplicate_next: AtomicU64::new(0xa000_0000),
             timer_next: AtomicU64::new(0x7000_0000),
+            timers: Mutex::new(HashMap::new()),
             state_fd: AtomicU32::new(u32::MAX),
             fls: Mutex::new(FlsSlots::default()),
             unhandled_exception_filter: AtomicU64::new(0),
             vectored_exception_handlers: Mutex::new(Vec::new()),
             vectored_exception_handler_next: AtomicU64::new(0xe100_0000),
+            vectored_continue_handlers: Mutex::new(Vec::new()),
             dynamic_function_tables: Mutex::new(Vec::new()),
             exit_status: AtomicU32::new(259), // STILL_ACTIVE
             exited: AtomicBool::new(false),
@@ -596,6 +601,7 @@ fn run_rust_baseline_argv_with_fs_impl(
             )])),
             module_next: AtomicU64::new(1),
         });
+        super::shared_data::initialize()?;
         recovery_process = Some(Arc::clone(&process));
         if let Ok(mut context) = NATIVE_PROCESS.lock() {
             *context = Some(Arc::clone(&process));

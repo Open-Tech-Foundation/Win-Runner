@@ -29,7 +29,7 @@ pub(super) static TEST_PROCESS: LazyLock<Arc<NativeProcessContext>> =
     LazyLock::new(new_test_process);
 
 #[cfg(test)]
-fn new_test_process() -> Arc<NativeProcessContext> {
+pub(super) fn new_test_process() -> Arc<NativeProcessContext> {
     Arc::new(NativeProcessContext {
         image_base: 0x0001_4000_0000,
         image_size: 0x10000,
@@ -64,7 +64,10 @@ fn new_test_process() -> Arc<NativeProcessContext> {
             next: 0x100,
         })),
         named_pipes: Mutex::new(NativeNamedPipeTable::new()),
+        console_output_modes: [AtomicU32::new(1), AtomicU32::new(1)],
         error_mode: AtomicU32::new(0),
+        wer_flags: AtomicU32::new(0),
+        priority_boost_disabled: AtomicBool::new(false),
         pointer_cookie: random_pointer_cookie(),
         heap_allocations: Mutex::new(HashMap::new()),
         virtual_allocations: Mutex::new(HashMap::new()),
@@ -98,11 +101,13 @@ fn new_test_process() -> Arc<NativeProcessContext> {
         duplicate_handles: Mutex::new(HashMap::new()),
         duplicate_next: AtomicU64::new(0xa000_0000),
         timer_next: AtomicU64::new(0x7000_0000),
+        timers: Mutex::new(HashMap::new()),
         state_fd: AtomicU32::new(u32::MAX),
         fls: Mutex::new(FlsSlots::default()),
         unhandled_exception_filter: AtomicU64::new(0),
         vectored_exception_handlers: Mutex::new(Vec::new()),
         vectored_exception_handler_next: AtomicU64::new(0xe100_0000),
+        vectored_continue_handlers: Mutex::new(Vec::new()),
         dynamic_function_tables: Mutex::new(Vec::new()),
         exit_status: AtomicU32::new(259),
         exited: AtomicBool::new(false),

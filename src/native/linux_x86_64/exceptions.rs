@@ -462,6 +462,61 @@ pub(super) extern "win64" fn native_remove_vectored_exception_handler(handle: u6
     }
 }
 
+pub(super) extern "win64" fn native_add_vectored_continue_handler(
+    first: u32,
+    callback: u64,
+) -> u64 {
+    if callback == 0 {
+        native_set_last_error(87);
+        return 0;
+    }
+    let Some(process) = process_ctx() else {
+        return 0;
+    };
+    let handle = process
+        .vectored_exception_handler_next
+        .fetch_add(8, Ordering::AcqRel);
+    let registration = NativeVectoredExceptionHandler { handle, callback };
+    let mut handlers = process.vectored_continue_handlers.lock().unwrap();
+    if first != 0 {
+        handlers.insert(0, registration);
+    } else {
+        handlers.push(registration);
+    }
+    handle
+}
+pub(super) extern "win64" fn native_remove_vectored_continue_handler(handle: u64) -> u32 {
+    let Some(process) = process_ctx() else {
+        return 0;
+    };
+    let mut handlers = process.vectored_continue_handlers.lock().unwrap();
+    if let Some(index) = handlers.iter().position(|item| item.handle == handle) {
+        handlers.remove(index);
+        1
+    } else {
+        0
+    }
+}
+fn dispatch_continue_handlers(pointers: &mut NativeExceptionPointers) {
+    let Some(process) = process_ctx() else {
+        return;
+    };
+    let callbacks: Vec<u64> = process
+        .vectored_continue_handlers
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|handler| handler.callback)
+        .collect();
+    for callback in callbacks {
+        let callback: extern "win64" fn(*mut NativeExceptionPointers) -> i32 =
+            unsafe { std::mem::transmute(callback as usize) };
+        if callback(pointers) == -1 {
+            break;
+        }
+    }
+}
+
 fn dispatch_exception(
     record: &mut NativeExceptionRecord,
     context: &mut NativeExceptionContext,
@@ -492,21 +547,29 @@ fn dispatch_exception(
         let callback: extern "win64" fn(*mut NativeExceptionPointers) -> i32 =
             unsafe { std::mem::transmute(callback as usize) };
         match callback(&mut pointers) as u32 {
-            0xffff_ffff => return true, // EXCEPTION_CONTINUE_EXECUTION
-            0 => {}                     // EXCEPTION_CONTINUE_SEARCH
-            _ => {}                     // VEH does not accept EXECUTE_HANDLER.
+            0xffff_ffff => {
+                dispatch_continue_handlers(&mut pointers);
+                return true;
+            } // EXCEPTION_CONTINUE_EXECUTION
+            0 => {} // EXCEPTION_CONTINUE_SEARCH
+            _ => {} // VEH does not accept EXECUTE_HANDLER.
         }
     }
     if context_register(context, 16).is_some_and(|control_pc| control_pc != 0)
         && dispatch_frame_exception_handlers(record, context)
     {
+        dispatch_continue_handlers(&mut pointers);
         return true;
     }
     let filter = process.unhandled_exception_filter.load(Ordering::Acquire);
     if filter != 0 {
         let filter: extern "win64" fn(*mut NativeExceptionPointers) -> i32 =
             unsafe { std::mem::transmute(filter as usize) };
-        return filter(&mut pointers) as u32 == 0xffff_ffff;
+        let continued = filter(&mut pointers) as u32 == 0xffff_ffff;
+        if continued {
+            dispatch_continue_handlers(&mut pointers);
+        }
+        return continued;
     }
     false
 }
@@ -1818,4 +1881,37 @@ fn mapped_exception_directory(module: &NativeLoadedModule) -> Option<(u32, u32)>
     let end = rva.checked_add(directory_size)?;
     (rva != 0 && directory_size >= 12 && directory_size % 12 == 0 && end as usize <= size)
         .then_some((rva, directory_size))
+}
+
+#[cfg(test)]
+mod continue_handler_tests {
+    use super::*;
+    static CALLS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+    extern "win64" fn first(_: *mut NativeExceptionPointers) -> i32 {
+        CALLS.lock().unwrap().push(1);
+        0
+    }
+    extern "win64" fn last(_: *mut NativeExceptionPointers) -> i32 {
+        CALLS.lock().unwrap().push(2);
+        -1
+    }
+    #[test]
+    fn continuation_handlers_run_in_order_and_can_be_removed() {
+        let previous = THREAD_NATIVE_PROCESS
+            .with(|slot| slot.replace(Some(super::super::context::new_test_process())));
+        assert_eq!(native_add_vectored_continue_handler(0, 0), 0);
+        assert_eq!(native_get_last_error(), 87);
+        let tail = native_add_vectored_continue_handler(0, last as *const () as u64);
+        let head = native_add_vectored_continue_handler(1, first as *const () as u64);
+        let mut pointers = NativeExceptionPointers {
+            record: std::ptr::null_mut(),
+            context: std::ptr::null_mut(),
+        };
+        dispatch_continue_handlers(&mut pointers);
+        assert_eq!(*CALLS.lock().unwrap(), [1, 2]);
+        assert_eq!(native_remove_vectored_continue_handler(head), 1);
+        assert_eq!(native_remove_vectored_continue_handler(head), 0);
+        assert_eq!(native_remove_vectored_continue_handler(tail), 1);
+        THREAD_NATIVE_PROCESS.with(|slot| slot.replace(previous));
+    }
 }

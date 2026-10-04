@@ -212,7 +212,10 @@ pub(super) struct NativeProcessContext {
     pub(super) crt_fd_next: AtomicI32,
     pub(super) fs: Arc<Mutex<NativeFs>>,
     pub(super) named_pipes: Mutex<NativeNamedPipeTable>,
+    pub(super) console_output_modes: [AtomicU32; 2],
     pub(super) error_mode: AtomicU32,
+    pub(super) wer_flags: AtomicU32,
+    pub(super) priority_boost_disabled: AtomicBool,
     pub(super) pointer_cookie: u64,
     pub(super) heap_allocations: Mutex<HashMap<u64, usize>>,
     pub(super) virtual_allocations: Mutex<HashMap<u64, NativeVirtualAllocation>>,
@@ -248,11 +251,13 @@ pub(super) struct NativeProcessContext {
     pub(super) duplicate_handles: Mutex<HashMap<u64, u64>>,
     pub(super) duplicate_next: AtomicU64,
     pub(super) timer_next: AtomicU64,
+    pub(super) timers: Mutex<HashMap<u64, Arc<NativeWaitableTimer>>>,
     pub(super) state_fd: AtomicU32,
     pub(super) fls: Mutex<FlsSlots>,
     pub(super) unhandled_exception_filter: AtomicU64,
     pub(super) vectored_exception_handlers: Mutex<Vec<NativeVectoredExceptionHandler>>,
     pub(super) vectored_exception_handler_next: AtomicU64,
+    pub(super) vectored_continue_handlers: Mutex<Vec<NativeVectoredExceptionHandler>>,
     pub(super) dynamic_function_tables: Mutex<Vec<NativeDynamicFunctionTable>>,
     pub(super) exit_status: AtomicU32,
     pub(super) exited: AtomicBool,
@@ -599,4 +604,15 @@ impl NativeProcessTable {
             .insert(thread_handle, Arc::clone(&child));
         (handle, thread_handle, child)
     }
+}
+
+pub(super) struct NativeWaitableTimer {
+    pub(super) manual_reset: bool,
+    pub(super) state: Mutex<NativeTimerState>,
+    pub(super) changed: Condvar,
+}
+pub(super) struct NativeTimerState {
+    pub(super) deadline: Option<std::time::Instant>,
+    pub(super) period: u32,
+    pub(super) signaled: bool,
 }
