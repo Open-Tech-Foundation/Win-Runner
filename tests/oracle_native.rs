@@ -31,15 +31,18 @@ fn transcript(probe: &Path) -> String {
         .stderr(Stdio::piped())
         .spawn()
         .expect("start the winrun shell");
-    let executable =
-        if probe.file_stem().and_then(|name| name.to_str()) == Some("oracle_process_runtime") {
-            format!(
+    let executable = if probe.file_stem().and_then(|name| name.to_str())
+        == Some("oracle_process_runtime")
+    {
+        format!(
             "@seed \"{}\" C:\\oracle-run\\process_runtime.exe\nC:\\oracle-run\\process_runtime.exe",
             probe.display()
         )
-        } else {
-            format!("\"{}\"", probe.display())
-        };
+    } else if probe.file_stem().and_then(|name| name.to_str()) == Some("oracle_dll_search") {
+        format!("New-Item C:\\oracle-run\\app -ItemType Directory\n@seed \"{}\" C:\\oracle-run\\app\\oracle_dll_search.exe\nC:\\oracle-run\\app\\oracle_dll_search.exe", probe.display())
+    } else {
+        format!("\"{}\"", probe.display())
+    };
     let commands = format!(
         "New-Item C:\\oracle-run -ItemType Directory\ncd C:\\oracle-run\n{}\nexit\n",
         executable
@@ -78,7 +81,7 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
         assert!(!actual.contains("PANIC"), "{name} panicked:\n{actual}");
         if matches!(
             name.as_str(),
-            "process_runtime" | "crt_runtime" | "socket_events" | "file_locks"
+            "process_runtime" | "crt_runtime" | "socket_events" | "file_locks" | "dll_search"
         ) {
             assert!(
                 !actual.contains("wrong") && !actual.contains("unavailable"),
@@ -107,8 +110,8 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
                 );
             }
         }
-        // Error codes captured by the Windows CI oracle. Keep these covered
-        // even before complete transcripts for these probes are checked in.
+        // Require important behavior cases even before complete transcripts
+        // are checked in. Windows CI compares every new probe with Windows.
         let required: &[&str] = match name.as_str() {
             "crt_runtime" => &[
                 "invalid.global_dispatch: ok",
@@ -133,6 +136,17 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
                 "lock.large_range: ok",
                 "async.granted: ok",
                 "async.cancel_result: ok",
+            ],
+            "dll_search" => &[
+                "module.loaded_paths: ok",
+                "module.truncated: ok",
+                "directory.missing: ok",
+                "search.loaded_extensionless: ok",
+                "search.absolute_distinct: ok",
+                "search.removed_missing: ok",
+                "dependency.dll_load_dir_recursive: ok",
+                "dependency.application_before_user: ok",
+                "defaults.removed_missing: ok",
             ],
             "links" => &[
                 "reparse.dirlink_small: fail err=122",

@@ -269,6 +269,7 @@ pub(super) struct NativeProcessContext {
     /// Real PE DLLs loaded through LoadLibrary in this guest process.
     pub(super) loaded_modules: Mutex<HashMap<u64, NativeLoadedModule>>,
     pub(super) module_next: AtomicU64,
+    pub(super) dll_search: Mutex<NativeDllSearch>,
 }
 
 pub(super) struct NativeLoadedModule {

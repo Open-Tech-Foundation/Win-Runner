@@ -161,9 +161,6 @@ pub(super) extern "win64" fn native_get_version() -> u32 {
     // Windows 10.0, build 19045, encoded using the legacy GetVersion layout.
     (system_profile::OS_BUILD_NUMBER << 16) | 0x0a00
 }
-pub(super) extern "win64" fn native_set_default_dll_directories(_flags: u32) -> i32 {
-    1
-}
 pub(super) extern "win64" fn native_set_file_apis_to_oem() {}
 pub(super) extern "win64" fn native_co_initialize(_reserved: *mut u8) -> i32 {
     0 // S_OK

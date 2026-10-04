@@ -118,6 +118,7 @@ pub(super) fn new_test_process() -> Arc<NativeProcessContext> {
         children: Mutex::new(NativeProcessTable::new()),
         loaded_modules: Mutex::new(HashMap::new()),
         module_next: AtomicU64::new(1),
+        dll_search: Mutex::new(NativeDllSearch::default()),
     })
 }
 

@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add native `AddDllDirectory`, `RemoveDllDirectory`, `SetDllDirectoryW`,
+  and `GetDllDirectoryW`, with per-process search configuration and a real
+  PE DLL search oracle covering cookies, directory buffers, duplicate names,
+  recursive dependencies, and invalid flags.
+
 - Add everyday PowerShell commands for rename, clearing file content, path
   resolution/splitting, command/alias/help discovery, text search, file/tee
   output, sorting, unique lines, and text counts, with shell completion.
@@ -20,6 +25,13 @@ All notable changes to this project will be documented in this file.
   and PATH immediately, preserving shell variables, functions, and files.
 
 ### Fixed
+
+- Honor `SetDefaultDllDirectories` and `LoadLibraryExW/A` search flags,
+  including DLL-load-directory and altered dependency search. Search only
+  configured Windows directories instead of scanning the entire guest disk.
+  Keep separately loaded absolute paths distinct and reuse loaded names.
+  Report the correct loaded DLL path from `GetModuleFileNameW`, with Windows
+  truncation and invalid-handle errors, so runtime-relative dependencies load.
 
 - Make the CRT Windows oracle trigger invalid-parameter callbacks through
   exported `mbstowcs_s` validation instead of requiring internal dispatch

@@ -7544,6 +7544,7 @@ mod protection_tests {
 
     #[test]
     fn exposes_a_synthetic_windows_module_path() {
+        let _guard = crate::native::linux_x86_64::TestProcessGuard::new();
         let mut path = [0; 32];
         let len = native_get_module_file_name_w(0, path.as_mut_ptr(), path.len() as u32);
         assert_eq!(
@@ -7552,7 +7553,8 @@ mod protection_tests {
         );
         let mut short = [0; 3];
         assert_eq!(native_get_module_file_name_w(0, short.as_mut_ptr(), 3), 3);
-        assert_eq!(short, ['C' as u16, ':' as u16, '\\' as u16]);
+        assert_eq!(short, ['C' as u16, ':' as u16, 0]);
+        assert_eq!(native_get_last_error(), 122);
     }
 
     #[test]

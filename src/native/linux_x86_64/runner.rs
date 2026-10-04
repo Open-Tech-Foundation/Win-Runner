@@ -604,6 +604,7 @@ fn run_rust_baseline_argv_with_fs_impl(
                 },
             )])),
             module_next: AtomicU64::new(1),
+            dll_search: Mutex::new(NativeDllSearch::default()),
         });
         super::shared_data::initialize()?;
         recovery_process = Some(Arc::clone(&process));

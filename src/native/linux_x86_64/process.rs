@@ -2376,29 +2376,81 @@ pub(super) extern "win64" fn native_get_module_file_name_a(
 }
 
 pub(super) extern "win64" fn native_get_module_file_name_w(
-    _module: u64,
+    module: u64,
     output: *mut u16,
     output_len: u32,
 ) -> u32 {
-    if output.is_null() || output_len == 0 {
+    if output_len == 0 {
+        native_set_last_error(122);
         return 0;
     }
-    let module_path = process_ctx()
-        .map(|process| process.module_path.clone())
-        .unwrap_or_else(|| r"C:\winrun\winrun.exe".to_string());
-    let encoded: Vec<u16> = module_path.encode_utf16().collect();
-    let capacity = output_len as usize;
-    let copied = encoded.len().min(capacity);
-    unsafe { std::ptr::copy_nonoverlapping(encoded.as_ptr(), output, copied) };
-    if copied < capacity {
-        unsafe { output.add(copied).write(0) };
+    if output.is_null() {
+        native_set_last_error(87);
+        return 0;
     }
-    copied as u32
+    let Some(process) = process_ctx() else {
+        native_set_last_error(6);
+        return 0;
+    };
+    let path = if module == 0 || module == process.image_base {
+        process.module_path.clone()
+    } else {
+        let path = process
+            .loaded_modules
+            .lock()
+            .ok()
+            .and_then(|modules| modules.get(&module).map(|module| module.path.clone()));
+        let Some(path) = path else {
+            native_set_last_error(126);
+            return 0;
+        };
+        path
+    };
+    let encoded: Vec<u16> = path.encode_utf16().collect();
+    let capacity = output_len as usize;
+    let copied = encoded.len().min(capacity - 1);
+    unsafe {
+        output.copy_from_nonoverlapping(encoded.as_ptr(), copied);
+        output.add(copied).write(0);
+    }
+    if encoded.len() >= capacity {
+        native_set_last_error(122);
+        output_len
+    } else {
+        native_set_last_error(0);
+        copied as u32
+    }
 }
 
 #[cfg(test)]
 mod module_filename_tests {
     use super::*;
+    #[test]
+    fn wide_module_filename_preserves_unicode_and_terminates_small_buffers() {
+        let _guard = TestProcessGuard::new();
+        let mut process = new_test_process();
+        Arc::get_mut(&mut process).unwrap().module_path = r"C:\café\𝄞.exe".into();
+        THREAD_NATIVE_PROCESS.with(|slot| slot.replace(Some(process.clone())));
+        let expected: Vec<u16> = process.module_path.encode_utf16().chain([0]).collect();
+        let mut output = vec![0xffff; expected.len() + 1];
+        assert_eq!(
+            native_get_module_file_name_w(0, output.as_mut_ptr(), output.len() as u32),
+            expected.len() as u32 - 1
+        );
+        assert_eq!(&output[..expected.len()], &expected);
+        assert_eq!(native_get_module_file_name_w(0, output.as_mut_ptr(), 1), 1);
+        assert_eq!(output[0], 0);
+        assert_eq!(native_get_last_error(), 122);
+        assert_eq!(native_get_module_file_name_w(0, output.as_mut_ptr(), 3), 3);
+        assert_eq!(&output[..2], &expected[..2]);
+        assert_eq!(output[2], 0);
+        assert_eq!(
+            native_get_module_file_name_w(0xdead, output.as_mut_ptr(), 64),
+            0
+        );
+        assert_eq!(native_get_last_error(), 126);
+        assert_eq!(native_get_module_file_name_w(0, ptr::null_mut(), 0), 0);
+    }
     #[test]
     fn narrow_module_filename_uses_acp_terminates_and_rejects_unknown_modules() {
         let mut process = new_test_process();

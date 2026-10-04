@@ -21,6 +21,12 @@ Get-ChildItem (Join-Path $root 'tests\artifacts\exe') -Filter 'oracle_*.exe' | F
     try {
         $start = New-Object System.Diagnostics.ProcessStartInfo
         $start.FileName = $_.FullName
+        if ($name -eq 'dll_search') {
+            $app = Join-Path $run 'app'
+            New-Item -ItemType Directory -Path $app | Out-Null
+            $start.FileName = Join-Path $app 'oracle_dll_search.exe'
+            Copy-Item $_.FullName $start.FileName
+        }
         $start.WorkingDirectory = $run
         $start.UseShellExecute = $false
         $start.RedirectStandardOutput = $true

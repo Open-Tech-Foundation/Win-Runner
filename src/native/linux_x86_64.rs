@@ -19,6 +19,9 @@ use host::*;
 
 #[path = "linux_x86_64/loader.rs"]
 mod loader;
+#[path = "linux_x86_64/dll_search.rs"]
+mod dll_search;
+use dll_search::*;
 use loader::*;
 #[path = "linux_x86_64/process.rs"]
 mod process;

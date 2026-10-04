@@ -29,8 +29,16 @@ with `guests/build-oracle.sh` (rustc and rust-lld only). A probe:
 | `path_names` | path spellings from `GetLongPathNameW`, `GetFullPathNameW`, and final paths |
 | `links` | `CreateSymbolicLinkW`, what a handle names with and without `FILE_FLAG_OPEN_REPARSE_POINT`, `FSCTL_GET_REPARSE_POINT` data |
 | `pool_console` | `QueueUserWorkItem`, `MapVirtualKeyW`, console input functions on a non-console handle |
+| `dll_search` | directory cookies and removal, Set/Get DLL directory buffers, search flags and defaults, loaded-name reuse, distinct absolute paths, recursive dependencies, loaded module filenames and truncation |
 | `file_locks` | shared/exclusive byte ranges, contention, read/write exclusion, exact unlock, close cleanup, 64-bit offsets, async grants and cancellation |
 | `process_runtime` | anonymous pipe access, duplication and EOF, startup handle-list filtering and child output/timestamps, volume metadata, error mode and WER flags, system-directory buffer sizing, priority boost, continuation dispatch, timer deadlines/reset/cancel/errors, shared clocks and PEB, read/write console devices and VT modes |
+
+`dll_search` embeds four small real DLLs, built from the `dll_*_support.rs`
+fixtures. The runners place its executable in an application subdirectory,
+separate from the current directory and added user directory. It checks search
+order with two different implementations of the same DLL and a parent/middle
+import chain. Resource-only loading and signed-image policy flags are not
+implemented and return an explicit unsupported error locally.
 
 `crt_runtime` checks global/thread-local invalid-parameter handlers, callback
 metadata and recovery through public `mbstowcs_s` validation (without relying

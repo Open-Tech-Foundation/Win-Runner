@@ -25,6 +25,42 @@ mkdir -p "$OUT" "$ART"
     "/OUT:$OUT/oracle_kernel32.lib" \
     /MACHINE:x64
 
+# Small real DLLs embedded by the DLL-search probe. Two copies export distinct
+# values; a parent/middle chain exercises recursive dependency lookup.
+mkdir -p "$ROOT/tests/artifacts/dll"
+for variant in app user; do
+    config=()
+    [[ "$variant" == user ]] && config=(--cfg user_directory)
+    rustc --target "$TARGET" --crate-type lib --emit obj -C panic=abort -C opt-level=2 --edition 2021 \
+        "${config[@]}" "$ROOT/guests/oracle/dll_value_support.rs" -o "$OUT/dll_value_$variant.o"
+    base=0x500700000000
+    [[ "$variant" == user ]] && base=0x500800000000
+    "$LLD" -flavor link /DLL /NOENTRY /NODEFAULTLIB /DYNAMICBASE "/BASE:$base" \
+        "/OUT:$ROOT/tests/artifacts/dll/oracle_search_$variant.dll" /EXPORT:OracleSearchValue "/IMPLIB:$OUT/oracle_search_$variant.lib" \
+        "$OUT/dll_value_$variant.o" "$RLIB"/libcore-*.rlib "$RLIB"/libcompiler_builtins-*.rlib
+done
+cat > "$OUT/oracle_search_value.def" <<'DEF'
+LIBRARY oracle_search_value.dll
+EXPORTS
+OracleSearchValue
+DEF
+"$LLD" -flavor link "/DEF:$OUT/oracle_search_value.def" "/OUT:$OUT/oracle_search_value.lib" /MACHINE:x64
+for kind in middle parent; do
+    rustc --target "$TARGET" --crate-type lib --emit obj -C panic=abort -C opt-level=2 --edition 2021 \
+        "$ROOT/guests/oracle/dll_${kind}_support.rs" -o "$OUT/dll_$kind.o"
+    export_name=OracleSearchMiddle
+    dependency=oracle_search_value
+    base=0x500900000000
+    if [[ "$kind" == parent ]]; then
+        export_name=OracleSearchParent
+        dependency=oracle_search_middle
+        base=0x500a00000000
+    fi
+    "$LLD" -flavor link /DLL /NOENTRY /NODEFAULTLIB /DYNAMICBASE "/BASE:$base" \
+        "/OUT:$ROOT/tests/artifacts/dll/oracle_search_$kind.dll" "/IMPLIB:$OUT/oracle_search_$kind.lib" "/EXPORT:$export_name" \
+        "$OUT/dll_$kind.o" "$OUT/$dependency.lib" "$RLIB"/libcore-*.rlib "$RLIB"/libcompiler_builtins-*.rlib
+done
+
 for probe in "$ROOT"/guests/oracle/*.rs; do
     name="$(basename "$probe" .rs)"
     # Shared code, included by the probes.

@@ -469,6 +469,7 @@ mod module_export_tests {
         {
             let mut native_fs = process.fs.lock().unwrap();
             native_fs.fs.mkdir(r"C:\loader-tests").unwrap();
+            native_fs.fs.set_cwd(r"C:\loader-tests").unwrap();
             native_fs.fs.write_file(path, bytes).unwrap();
         }
         let name: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
@@ -499,6 +500,7 @@ mod module_export_tests {
         {
             let mut native_fs = process.fs.lock().unwrap();
             native_fs.fs.mkdir(r"C:\loader-tests").unwrap();
+            native_fs.fs.set_cwd(r"C:\loader-tests").unwrap();
             native_fs.fs.write_file(path, bytes).unwrap();
         }
         let name: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
@@ -571,6 +573,7 @@ mod module_export_tests {
         {
             let mut native_fs = process.fs.lock().unwrap();
             native_fs.fs.mkdir(r"C:\loader-tests").unwrap();
+            native_fs.fs.set_cwd(r"C:\loader-tests").unwrap();
             native_fs
                 .fs
                 .write_file(
@@ -647,6 +650,7 @@ mod module_export_tests {
         {
             let mut native_fs = process.fs.lock().unwrap();
             native_fs.fs.mkdir(r"C:\loader-tests").unwrap();
+            native_fs.fs.set_cwd(r"C:\loader-tests").unwrap();
             native_fs.fs.write_file(path_a, image_a.clone()).unwrap();
             native_fs.fs.write_file(path_b, image_b.clone()).unwrap();
         }
@@ -745,6 +749,7 @@ mod module_export_tests {
         {
             let mut native_fs = process.fs.lock().unwrap();
             native_fs.fs.mkdir(r"C:\loader-tests").unwrap();
+            native_fs.fs.set_cwd(r"C:\loader-tests").unwrap();
             native_fs.fs.write_file(path, bytes.clone()).unwrap();
         }
 
@@ -979,13 +984,25 @@ pub(super) unsafe fn ascii_z(ptr: *const u8) -> Option<&'static str> {
 
 pub(super) extern "win64" fn native_load_library_ex_w(
     path: *const u16,
-    _file: u64,
+    file: u64,
     flags: u32,
 ) -> u64 {
     let Some(path) = wide(path) else {
         native_set_last_error(126);
         return 0;
     };
+    if file != 0 {
+        native_set_last_error(87);
+        return 0;
+    }
+    let plan = match dll_search_plan(&path, flags) {
+        Ok(plan) => plan,
+        Err(error) => {
+            native_set_last_error(error);
+            return 0;
+        }
+    };
+    let _search = DllSearchScope::new(plan);
     let module = load_guest_module(&path).unwrap_or_else(|| {
         native_set_last_error(126); // ERROR_MOD_NOT_FOUND
         0
@@ -1006,17 +1023,14 @@ pub(super) extern "win64" fn native_load_library_a(path: *const u8) -> u64 {
 
 pub(super) extern "win64" fn native_load_library_ex_a(
     path: *const u8,
-    _file: u64,
-    _flags: u32,
+    file: u64,
+    flags: u32,
 ) -> u64 {
-    let Some(path) = (unsafe { ascii_z(path) }) else {
+    let Some(path) = native_ansi_path(path) else {
         native_set_last_error(126);
         return 0;
     };
-    load_guest_module(path).unwrap_or_else(|| {
-        native_set_last_error(126);
-        0
-    })
+    native_load_library_ex_w(path.as_ptr(), file, flags)
 }
 
 /// `GetModuleHandleExA`: the W form with the name widened. With
@@ -1049,6 +1063,13 @@ pub(super) extern "win64" fn native_get_module_handle_a(name: *const u8) -> u64 
 }
 
 fn module_handle_by_name(name: &str) -> Option<u64> {
+    let name_with_extension;
+    let name = if module_basename(name).contains('.') {
+        name
+    } else {
+        name_with_extension = format!("{name}.dll");
+        &name_with_extension
+    };
     if native_module_name_supported(name) {
         return Some(API_SET_MODULE);
     }
@@ -1061,11 +1082,14 @@ fn module_handle_by_name(name: &str) -> Option<u64> {
     let modules = process.loaded_modules.lock().ok()?;
     modules
         .values()
-        .find(|module| {
-            module.name.eq_ignore_ascii_case(name)
-                || module.name.eq_ignore_ascii_case(&module_basename(name))
-                || module.path.eq_ignore_ascii_case(name)
+        .filter(|module| {
+            if name.contains(['\\', '/', ':']) {
+                module.path.eq_ignore_ascii_case(name)
+            } else {
+                module.name.eq_ignore_ascii_case(name)
+            }
         })
+        .min_by_key(|module| module.load_order)
         .map(|module| module.base)
 }
 
@@ -1073,36 +1097,54 @@ fn module_basename(path: &str) -> String {
     path.rsplit(['\\', '/']).next().unwrap_or(path).to_string()
 }
 
+thread_local! { static DLL_SEARCH_PLANS: std::cell::RefCell<Vec<DllSearchPlan>> = const { std::cell::RefCell::new(Vec::new()) }; }
+struct DllSearchScope;
+impl DllSearchScope {
+    fn new(plan: DllSearchPlan) -> Self {
+        DLL_SEARCH_PLANS.with(|plans| plans.borrow_mut().push(plan));
+        Self
+    }
+}
+impl Drop for DllSearchScope {
+    fn drop(&mut self) {
+        DLL_SEARCH_PLANS.with(|plans| {
+            plans.borrow_mut().pop();
+        });
+    }
+}
 fn guest_module_path(name: &str) -> Option<(String, Vec<u8>)> {
     let process = process_ctx()?;
+    let plan = DLL_SEARCH_PLANS
+        .with(|plans| plans.borrow().last().cloned())
+        .or_else(|| dll_search_plan(name, 0).ok())?;
+    let path_env = process
+        .environment
+        .lock()
+        .ok()?
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+        .map(|(_, value)| value.clone())
+        .unwrap_or_default();
     let fs = process.fs.lock().ok()?;
-    let path = locate_guest_module(&fs.fs, &process.module_path, name)?;
+    let path = locate_dll(&fs.fs, &process.module_path, name, &plan, &path_env)?;
     let bytes = fs.fs.read_file(&path).ok()?;
     Some((path, bytes))
 }
-
-/// Windows searches the application directory first, so a DLL shipped
-/// beside the EXE wins over a same-named copy elsewhere on the disk (for
-/// example another installed version of the same package).
+#[cfg(test)]
 fn locate_guest_module(fs: &crate::winfs::WinFs, module_path: &str, name: &str) -> Option<String> {
-    let suffixed = if name.rsplit(['\\', '/']).next()?.contains('.') {
-        name.to_string()
-    } else {
-        format!("{name}.dll")
-    };
-    if !suffixed.contains(['\\', '/', ':']) {
-        if let Some((directory, _)) = module_path.rsplit_once(['\\', '/']) {
-            let beside = format!(r"{directory}\{suffixed}");
-            if fs.is_file(&beside) {
-                return Some(beside);
-            }
-        }
-    }
-    if fs.exists(&suffixed) {
-        Some(suffixed)
-    } else {
-        fs.find_file_path_suffix(&format!("\\{}", module_basename(&suffixed)))
-    }
+    locate_dll(
+        fs,
+        module_path,
+        name,
+        &DllSearchPlan {
+            flags: None,
+            directory: None,
+            added: Vec::new(),
+            dll_directory: None,
+            altered: false,
+        },
+        "",
+    )
 }
 
 #[cfg(test)]
@@ -1126,12 +1168,11 @@ mod guest_module_search_tests {
     }
 
     #[test]
-    fn falls_back_to_a_disk_search_when_the_application_directory_lacks_it() {
+    fn does_not_search_unconfigured_directories_on_the_disk() {
         let mut fs = WinFs::ephemeral_runner();
         fs.mkdir(r"C:\libs").unwrap();
         fs.write_file(r"C:\libs\only.dll", b"x".to_vec()).unwrap();
-        let found = locate_guest_module(&fs, r"C:\apps\tool.exe", "only.dll").unwrap();
-        assert!(found.eq_ignore_ascii_case(r"C:\libs\only.dll"), "{found}");
+        assert!(locate_guest_module(&fs, r"C:\apps\tool.exe", "only.dll").is_none());
         assert!(locate_guest_module(&fs, r"C:\apps\tool.exe", "missing.dll").is_none());
     }
 }
@@ -1378,10 +1419,7 @@ fn load_guest_module_inner(
             .lock()
             .ok()?
             .values()
-            .find(|module| {
-                module.path.eq_ignore_ascii_case(&path)
-                    || module.name.eq_ignore_ascii_case(&module_basename(&path))
-            })
+            .find(|module| module.path.eq_ignore_ascii_case(&path))
             .map(|module| module.base);
     }
     let mut provisional_module = None;
@@ -1466,10 +1504,10 @@ fn load_guest_module_inner(
         }
         {
             let mut modules = process.loaded_modules.lock().ok()?;
-            if let Some(existing) = modules.values().find(|loaded| {
-                loaded.path.eq_ignore_ascii_case(&path)
-                    || loaded.name.eq_ignore_ascii_case(&module.name)
-            }) {
+            if let Some(existing) = modules
+                .values()
+                .find(|loaded| loaded.path.eq_ignore_ascii_case(&path))
+            {
                 if let Some(index) = tls_index {
                     super::thread_runtime::release_module_tls_slot(&process, index);
                 }

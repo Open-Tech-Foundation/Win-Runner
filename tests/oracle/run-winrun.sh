@@ -15,6 +15,8 @@ for exe in "$ROOT"/tests/artifacts/exe/oracle_*.exe; do
     name="${name#oracle_}"
     if [[ "$name" == process_runtime ]]; then
         commands=$(printf 'New-Item C:\\oracle-run -ItemType Directory\ncd C:\\oracle-run\n@seed "%s" C:\\oracle-run\\process_runtime.exe\nC:\\oracle-run\\process_runtime.exe\nexit\n' "$exe")
+    elif [[ "$name" == dll_search ]]; then
+        commands=$(printf 'New-Item C:\\oracle-run\\app -ItemType Directory\ncd C:\\oracle-run\n@seed "%s" C:\\oracle-run\\app\\oracle_dll_search.exe\nC:\\oracle-run\\app\\oracle_dll_search.exe\nexit\n' "$exe")
     else
         commands=$(printf 'New-Item C:\\oracle-run -ItemType Directory\ncd C:\\oracle-run\n"%s"\nexit\n' "$exe")
     fi
