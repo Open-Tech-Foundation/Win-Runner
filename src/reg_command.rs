@@ -306,7 +306,7 @@ mod tests {
         let output = reg(&mut fs, &words(r"query HKCU\Environment")).unwrap();
         assert_eq!(
             output,
-            "\nHKEY_CURRENT_USER\\Environment\n    Path    REG_EXPAND_SZ    %USERPROFILE%\\AppData\\Local\\Microsoft\\WindowsApps;\n    TEMP    REG_EXPAND_SZ    %USERPROFILE%\\AppData\\Local\\Temp\n    TMP    REG_EXPAND_SZ    %USERPROFILE%\\AppData\\Local\\Temp\n\n"
+            "\nHKEY_CURRENT_USER\\Environment\n    Path    REG_EXPAND_SZ    %USERPROFILE%\\AppData\\Local\\Microsoft\\WindowsApps;%APPDATA%\\npm;\n    TEMP    REG_EXPAND_SZ    %USERPROFILE%\\AppData\\Local\\Temp\n    TMP    REG_EXPAND_SZ    %USERPROFILE%\\AppData\\Local\\Temp\n\n"
         );
         let key_with_space = [
             "query",

@@ -566,7 +566,7 @@ impl Registry {
             &[
                 (
                     "Path",
-                    expand(r"%USERPROFILE%\AppData\Local\Microsoft\WindowsApps;"),
+                    expand(r"%USERPROFILE%\AppData\Local\Microsoft\WindowsApps;%APPDATA%\npm;"),
                 ),
                 ("TEMP", expand(r"%USERPROFILE%\AppData\Local\Temp")),
                 ("TMP", expand(r"%USERPROFILE%\AppData\Local\Temp")),
@@ -873,8 +873,9 @@ mod tests {
         assert_eq!(
             path.iter()
                 .position(|entry| entry.ends_with(r"Microsoft\WindowsApps")),
-            Some(path.len() - 2)
+            Some(path.len() - 3)
         );
+        assert_eq!(path[path.len() - 2], format!(r"{}\npm", profile::APP_DATA));
         let names: Vec<_> = environment
             .iter()
             .map(|(name, _)| name.to_ascii_uppercase())

@@ -2477,3 +2477,30 @@ fn a_finished_shell_leaves_no_temporaries_and_stale_ones_are_swept() {
     assert!(left.is_empty(), "left behind: {left:?}");
     std::fs::remove_dir_all(&temp).ok();
 }
+
+#[test]
+fn shell_reload_makes_saved_path_and_environment_visible_to_commands() {
+    let script = r"New-Item -ItemType Directory -Force C:\tools | Out-Null
+Set-Content C:\tools\tsr.cmd '@echo tsr-from-reloaded-path'
+[Environment]::SetEnvironmentVariable('Path', 'C:\tools', 'User')
+[Environment]::SetEnvironmentVariable('RELOAD_E2E', 'machine-value', 'Machine')
+$keep = retained
+cd C:\tools
+reload
+tsr --version
+cmd /c echo %RELOAD_E2E%
+echo $keep
+pwd
+exit
+";
+    let (code, stdout, stderr) = run_shell_env(script, &[]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stderr.is_empty(), "{stderr}");
+    let output = stdout.replace("\r\n", "\n");
+    assert!(
+        output.contains(
+            "Environment reloaded.\ntsr-from-reloaded-path\nmachine-value\nretained\nC:\\tools\n"
+        ),
+        "{stdout}"
+    );
+}

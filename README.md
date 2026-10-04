@@ -88,6 +88,17 @@ reg delete HKCU\Software\Vendor /f
 
 `set` and `$env:NAME = value` change only the current session; `setx`, `reg`, and the `User`/`Machine` targets persist and apply from the next session, as on Windows. Where Windows `reg` would prompt before overwriting or deleting, add `/f`.
 
+Run `reload` to apply saved environment changes, including PATH, immediately:
+
+```text
+reload
+tsr --version
+```
+
+`reload` rebuilds the environment from the guest registry and restores the active
+Node/npm command paths. It replaces temporary environment overrides while keeping
+shell variables, functions, the current directory, and files.
+
 Use a WinFS snapshot to keep files and installed programs between runs.
 
 ```bash

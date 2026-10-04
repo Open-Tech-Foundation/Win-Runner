@@ -1631,6 +1631,37 @@ mod protection_tests {
     }
 
     #[test]
+    fn nt_directory_disposition_reports_not_empty_and_then_deletes() {
+        let path = r"C:\nt_disposition_nonempty";
+        let child = format!(r"{path}\child.txt");
+        let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+        let context = super::fs_ctx().unwrap();
+        {
+            let mut context = context.lock().unwrap();
+            context.fs.mkdir(path).unwrap();
+            context.fs.write_file(&child, b"keep".to_vec()).unwrap();
+        }
+        let handle = super::native_create_file_w(wide.as_ptr(), 0x0001_0000, 7, 0, 3, 0x0200_0000, 0);
+        assert_ne!(handle, u64::MAX);
+        let mut io = [0u8; 16];
+        for class in [13, 64] {
+            let flags = 1u32.to_le_bytes();
+            let length = if class == 13 { 1 } else { 4 };
+            let status = super::native_nt_set_information_file(handle, io.as_mut_ptr(), flags.as_ptr(), length, class);
+            assert_eq!(status, 0xC000_0101);
+            assert_eq!(u32::from_le_bytes(io[..4].try_into().unwrap()), status);
+            assert_eq!(super::native_rtl_nt_status_to_dos_error(status), 145);
+            assert!(context.lock().unwrap().fs.exists(&child));
+        }
+        assert_eq!(super::native_nt_set_information_file(handle, io.as_mut_ptr(), std::ptr::null(), 0, 64), 0xC000_000D);
+        context.lock().unwrap().fs.delete_file(&child).unwrap();
+        let flags = 1u32.to_le_bytes();
+        assert_eq!(super::native_nt_set_information_file(handle, io.as_mut_ptr(), flags.as_ptr(), 4, 64), 0);
+        assert!(!context.lock().unwrap().fs.exists(path));
+        assert_eq!(super::native_close_handle(handle), 1);
+    }
+
+    #[test]
     fn nt_set_file_rename_information_renames_by_open_handle() {
         let source = r"C:\winfs_compat_rename_source.txt";
         let destination = r"C:\winfs_compat_rename_destination.txt";

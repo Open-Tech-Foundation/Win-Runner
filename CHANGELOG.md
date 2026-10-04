@@ -4,7 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Add the shell `reload` command to refresh saved guest environment variables
+  and PATH immediately, preserving shell variables, functions, and files.
+
 ### Fixed
+
+- Put the active Windows Node distribution and per-user npm command folder
+  on the guest PATH so global npm launchers work immediately, after version
+  selection, and on restored snapshots. Return the nonempty-directory NT
+  status during deletion so npm upgrades can recursively clean old packages.
 
 - Run remote PowerShell installers through `irm | iex`: support web-request
   response objects and redirect URIs, `-UseBasicParsing`, regex replacement,

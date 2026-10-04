@@ -129,6 +129,7 @@ const SHELL_COMMANDS: &[&str] = &[
     "path",
     "mount",
     "snapshot",
+    "reload",
     "wpkg",
     "powershell",
     "inspect",
@@ -327,6 +328,7 @@ pub struct Shell {
     last_code: i32,
     backend: Result<&'static dyn backend::ExecutionBackend, String>,
     snapshot_path: Option<std::path::PathBuf>,
+    node_path_entry: Option<(String, bool)>,
 }
 
 impl Default for Shell {
@@ -371,13 +373,16 @@ impl Shell {
             );
         }
         let environment = logon_environment(&fs);
-        Shell {
+        let mut shell = Shell {
             fs,
             sess: ps1::Session::with_environment(environment),
             last_code: 0,
             backend,
             snapshot_path,
-        }
+            node_path_entry: None,
+        };
+        shell.refresh_node_path();
+        shell
     }
 
     /// Windows working directory visible to the shell prompt and tests.
@@ -432,6 +437,56 @@ impl Shell {
             &name,
             value.as_deref().unwrap_or_default(),
         );
+    }
+
+    /// The standalone Windows Node distribution installs global npm launchers
+    /// beside node.exe. Keep the active distribution on PATH, including disks
+    /// restored from snapshots and changes to wpkg's selected version.
+    fn refresh_node_path(&mut self) {
+        let node = format!(r"{}\node.exe", wpkg::BIN);
+        let directory = self
+            .fs
+            .is_file(&node)
+            .then(|| self.guest_image_path(&node))
+            .and_then(|path| path.rsplit_once('\\').map(|(dir, _)| dir.to_string()));
+        if directory.as_deref() == self.node_path_entry.as_ref().map(|(path, _)| path.as_str()) {
+            return;
+        }
+        let mut entries: Vec<String> = self
+            .environment_value("PATH")
+            .unwrap_or("")
+            .split(';')
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_string)
+            .collect();
+        let matches = |entry: &str, path: &str| {
+            entry
+                .trim()
+                .trim_matches('"')
+                .trim_end_matches('\\')
+                .eq_ignore_ascii_case(path.trim_end_matches('\\'))
+        };
+        if let Some((old, added)) = self.node_path_entry.take() {
+            if added {
+                entries.retain(|entry| !matches(entry, &old));
+            }
+        }
+        if let Some(directory) = directory {
+            let npm = format!(
+                r"{}\npm",
+                self.environment_value("APPDATA")
+                    .unwrap_or(system_profile::APP_DATA)
+            );
+            if !entries.iter().any(|entry| matches(entry, &npm)) {
+                entries.push(npm);
+            }
+            let added = !entries.iter().any(|entry| matches(entry, &directory));
+            if added {
+                entries.push(directory.clone());
+            }
+            self.node_path_entry = Some((directory, added));
+        }
+        self.set_environment_value("PATH".to_string(), Some(entries.join(";")));
     }
 
     fn expand_environment_references(&self, input: &str) -> String {
@@ -625,6 +680,7 @@ impl Shell {
         out: &mut Vec<u8>,
         sink: Option<backend::OutputSink>,
     ) -> Result<ShellFlow, String> {
+        self.refresh_node_path();
         let argv = split_line(line);
         if argv.is_empty() {
             return Ok(ShellFlow::Continue);
@@ -652,6 +708,19 @@ impl Shell {
                 self.seed_host_file(host, guest)?;
                 Ok(ShellFlow::Continue)
             }
+            "reload" => {
+                if argv.len() != 1 {
+                    return Err("usage: reload".to_string());
+                }
+                let registry =
+                    winreg::Registry::load(&self.fs).map_err(|error| format!("reload: {error}"))?;
+                self.sess.environment = winreg::login_environment(&registry);
+                self.node_path_entry = None;
+                self.refresh_node_path();
+                self.last_code = 0;
+                out.extend_from_slice(b"Environment reloaded.\n");
+                Ok(ShellFlow::Continue)
+            }
             "snapshot" => {
                 self.do_snapshot(&argv[1..], out)?;
                 Ok(ShellFlow::Continue)
@@ -677,7 +746,7 @@ impl Shell {
                 Ok(ShellFlow::Continue)
             }
             "help" => {
-                out.extend_from_slice(b"Built-in commands: cd, pwd, dir, type, copy, move, del, mkdir, rmdir, cls, set, setx, reg, path, mount, wpkg, powershell, snapshot, inspect, exit\n");
+                out.extend_from_slice(b"Built-in commands: cd, pwd, dir, type, copy, move, del, mkdir, rmdir, cls, set, setx, reg, path, mount, wpkg, powershell, snapshot, reload, inspect, exit\n");
                 Ok(ShellFlow::Continue)
             }
             "cd" | "chdir" => {
@@ -1068,6 +1137,7 @@ impl Shell {
             )
         };
         emit(&status.finish(), out);
+        self.refresh_node_path();
         let output = result.map_err(|error| format!("❌ wpkg failed: {error}"))?;
         out.extend_from_slice(&output);
         self.last_code = 0;
@@ -1959,6 +2029,102 @@ mod tests {
         assert!(shell
             .exec_line("winget --version", &mut Vec::new())
             .is_err());
+    }
+
+    #[test]
+    fn active_node_global_commands_follow_version_selection_and_restore() {
+        let mut fs = WinFs::ephemeral_runner();
+        let bin = format!(r"{}\node.exe", wpkg::BIN);
+        let old = r"C:\Program Files\nodejs\24\node.exe";
+        let new = r"C:\Program Files\nodejs\26\node.exe";
+        fs.mkdir(wpkg::BIN).unwrap();
+        for path in [old, new] {
+            fs.mkdir(path.rsplit_once('\\').unwrap().0).unwrap();
+            fs.write_file(path, vec![0]).unwrap();
+        }
+        fs.create_symlink(&bin, old, false).unwrap();
+        let mut shell = Shell::with_fs(fs);
+        let path = shell.environment_value("PATH").unwrap();
+        assert!(path
+            .split(';')
+            .any(|entry| entry == r"C:\Program Files\nodejs\24"));
+        assert!(path
+            .split(';')
+            .any(|entry| entry == r"C:\Users\runner\AppData\Roaming\npm"));
+        let mut out = Vec::new();
+        shell
+            .fs
+            .write_file(
+                r"C:\Program Files\nodejs\24\global-cli.cmd",
+                b"@echo old %*\r\n".to_vec(),
+            )
+            .unwrap();
+        shell.exec_line("global-cli works", &mut out).unwrap();
+        assert_eq!(out, b"old works\r\n");
+        shell.fs.delete_file(&bin).unwrap();
+        shell.fs.create_symlink(&bin, new, false).unwrap();
+        shell
+            .fs
+            .write_file(
+                r"C:\Program Files\nodejs\26\global-cli.cmd",
+                b"@echo new %*\r\n".to_vec(),
+            )
+            .unwrap();
+        out.clear();
+        shell.exec_line("global-cli switched", &mut out).unwrap();
+        assert_eq!(out, b"new switched\r\n");
+        shell.exec_line("reload", &mut out).unwrap();
+        shell.exec_line("reload", &mut out).unwrap();
+        let path = shell.environment_value("PATH").unwrap();
+        assert!(!path.contains(r"nodejs\24"));
+        assert_eq!(
+            path.split(';')
+                .filter(|entry| entry.ends_with(r"nodejs\26"))
+                .count(),
+            1
+        );
+        shell.exec_line(r"set PATH=C:\custom", &mut out).unwrap();
+        shell.exec_line("echo unchanged", &mut out).unwrap();
+        assert_eq!(shell.environment_value("PATH"), Some(r"C:\custom"));
+        shell.fs.delete_file(&bin).unwrap();
+        shell.refresh_node_path();
+        assert_eq!(shell.environment_value("PATH"), Some(r"C:\custom"));
+    }
+
+    #[test]
+    fn reload_refreshes_saved_environment_and_preserves_shell_state() {
+        let mut shell = Shell::new();
+        let mut out = Vec::new();
+        shell.exec_line("$keep = retained", &mut out).unwrap();
+        shell
+            .exec_line("function Keep { echo function-retained }", &mut out)
+            .unwrap();
+        shell.exec_line(r"cd C:\Windows", &mut out).unwrap();
+        shell
+            .exec_line("set TEMPORARY_ONLY=removed", &mut out)
+            .unwrap();
+        shell.exec_line("setx RELOAD_TEST saved", &mut out).unwrap();
+        assert_eq!(shell.environment_value("RELOAD_TEST"), None);
+        out.clear();
+        let before = shell.sess.environment.clone();
+        assert_eq!(
+            shell.exec_line("reload extra", &mut out).unwrap_err(),
+            "usage: reload"
+        );
+        assert_eq!(shell.sess.environment, before);
+        assert!(out.is_empty());
+        shell.last_code = 7;
+        shell.exec_line("reload", &mut out).unwrap();
+        assert_eq!(out, b"Environment reloaded.\n");
+        assert_eq!(shell.environment_value("RELOAD_TEST"), Some("saved"));
+        assert_eq!(shell.environment_value("TEMPORARY_ONLY"), None);
+        assert_eq!(shell.cwd(), r"C:\Windows");
+        assert_eq!(shell.last_code(), 0);
+        out.clear();
+        shell.exec_line("echo $keep", &mut out).unwrap();
+        shell.exec_line("Keep", &mut out).unwrap();
+        assert_eq!(out, b"retained\nfunction-retained\n");
+        assert!(SHELL_COMMANDS.contains(&"reload"));
     }
 
     #[test]

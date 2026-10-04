@@ -546,6 +546,9 @@ pub(super) extern "win64" fn native_nt_set_information_file(
     match status {
         Ok(()) => finish(STATUS_SUCCESS, 0),
         Err(_) if !context.fs.exists(&path) => finish(STATUS_OBJECT_NAME_NOT_FOUND, 0),
+        Err(error) if error.starts_with("directory not empty:") => {
+            finish(0xC000_0101, 0) // STATUS_DIRECTORY_NOT_EMPTY
+        }
         Err(_) => finish(STATUS_ACCESS_DENIED, 0),
     }
 }

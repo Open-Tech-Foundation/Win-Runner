@@ -777,3 +777,86 @@ fn official_windows_node_ipv6_server_answers_and_exits_after_close() {
         thread::sleep(Duration::from_millis(100));
     }
 }
+
+#[test]
+#[ignore = "requires WINRUN_NODE_EXE and WINRUN_NPM_ROOT; run explicitly with --ignored"]
+fn official_windows_npm_global_launchers_run_and_upgrade_without_cleanup_errors() {
+    let node = PathBuf::from(std::env::var_os("WINRUN_NODE_EXE").expect("set WINRUN_NODE_EXE"));
+    let npm = PathBuf::from(std::env::var_os("WINRUN_NPM_ROOT").expect("set WINRUN_NPM_ROOT"));
+    let root = r"C:\Program Files\nodejs\24.21.0\node-v24.21.0-win-x64";
+    let mut fs = winrun::winfs::WinFs::ephemeral_runner();
+    fs.mkdir(root).unwrap();
+    fs.mkdir(winrun::wpkg::BIN).unwrap();
+    let node_path = format!(r"{root}\node.exe");
+    fs.write_file(&node_path, std::fs::read(node).unwrap())
+        .unwrap();
+    fs.create_symlink(
+        &format!(r"{}\node.exe", winrun::wpkg::BIN),
+        &node_path,
+        false,
+    )
+    .unwrap();
+    let mut files = Vec::new();
+    collect_files(&npm, &mut files);
+    for file in files {
+        let relative = file
+            .strip_prefix(&npm)
+            .unwrap()
+            .to_string_lossy()
+            .replace('/', "\\");
+        let dest = format!(r"{root}\node_modules\npm\{relative}");
+        fs.mkdir(dest.rsplit_once('\\').unwrap().0).unwrap();
+        fs.write_file(&dest, std::fs::read(file).unwrap()).unwrap();
+    }
+    fs.mkdir(r"C:\fixtures").unwrap();
+    for version in [1, 2] {
+        let host = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("tests/artifacts/node/global-cli/v{version}.tgz"));
+        fs.write_file(
+            &format!(r"C:\fixtures\v{version}.tgz"),
+            std::fs::read(host).unwrap(),
+        )
+        .unwrap();
+    }
+    let snapshot =
+        std::env::temp_dir().join(format!("winrun-global-npm-{}.snap", std::process::id()));
+    winrun::snapshot::save_file(&mut fs, snapshot.to_str().unwrap()).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_winrun"))
+        .arg(format!("--snapshot={}", snapshot.display()))
+        .arg("shell")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let script = format!(
+        r#"npm install -g C:\fixtures\v1.tgz --offline --no-update-notifier --no-audit --no-fund --ignore-scripts
+global-cli JavaScript FTW!
+npm install -g C:\fixtures\v2.tgz --offline --no-update-notifier --no-audit --no-fund --ignore-scripts
+global-cli upgraded
+cmd /c global-cli child
+node -e "const fs=require('fs');const p=String.raw`{root}\node_modules`;if(fs.readdirSync(p).some(n=>n.startsWith('.winrun-global-cli-')))throw Error('retired package remains');console.log('cleanup verified')"
+exit
+"#
+    );
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    std::fs::remove_file(snapshot).unwrap();
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{out}\n{err}");
+    assert!(err.is_empty(), "{out}\n{err}");
+    for expected in [
+        "global-cli v1: JavaScript FTW!",
+        "global-cli v2: upgraded",
+        "global-cli v2: child",
+        "cleanup verified",
+    ] {
+        assert!(out.contains(expected), "missing {expected}: {out}\n{err}");
+    }
+}

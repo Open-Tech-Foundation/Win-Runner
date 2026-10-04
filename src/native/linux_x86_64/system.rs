@@ -88,6 +88,7 @@ pub(super) extern "win64" fn native_rtl_nt_status_to_dos_error(status: u32) -> u
         0xC000_0017 => 8,   // STATUS_NO_MEMORY
         0xC000_0022 => 5,   // STATUS_ACCESS_DENIED
         0xC000_0034 => 2,   // STATUS_OBJECT_NAME_NOT_FOUND
+        0xC000_0101 => 145, // STATUS_DIRECTORY_NOT_EMPTY
         0xC000_0120 => 995, // STATUS_CANCELLED
         0xC000_014B => 109, // STATUS_PIPE_BROKEN
         _ => 317,           // ERROR_MR_MID_NOT_FOUND
