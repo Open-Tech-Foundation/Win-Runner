@@ -4,6 +4,17 @@ use std::{io::Read, process::Stdio};
 
 /// Download bytes over HTTPS via `curl`. Clear error when curl is missing.
 pub fn fetch_url(url: &str, max_time_secs: u64) -> Result<Vec<u8>, String> {
+    Ok(fetch_response(url, max_time_secs)?.body)
+}
+
+/// HTTP response after redirects, including the effective URI.
+pub struct HttpResponse {
+    pub body: Vec<u8>,
+    pub url: String,
+    pub status: u16,
+}
+
+pub fn fetch_response(url: &str, max_time_secs: u64) -> Result<HttpResponse, String> {
     let out = std::process::Command::new("curl")
         .args([
             "-sSL",
@@ -12,6 +23,9 @@ pub fn fetch_url(url: &str, max_time_secs: u64) -> Result<Vec<u8>, String> {
             &max_time_secs.to_string(),
             "-A",
             "winrun/0.1.0",
+            "--write-out",
+            "\n%{http_code}\n%{url_effective}",
+            "--url",
             url,
         ])
         .output()
@@ -28,7 +42,19 @@ pub fn fetch_url(url: &str, max_time_secs: u64) -> Result<Vec<u8>, String> {
             }
         ));
     }
-    Ok(out.stdout)
+    let mut parts = out.stdout.rsplitn(3, |byte| *byte == b'\n');
+    let effective = parts.next().ok_or("missing response URI")?;
+    let status = parts.next().ok_or("missing HTTP status")?;
+    let body = parts.next().ok_or("missing response body")?;
+    let body_len = body.len();
+    let url = String::from_utf8(effective.to_vec()).map_err(|_| "invalid response URI")?;
+    let status = std::str::from_utf8(status)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or("invalid HTTP status")?;
+    let mut body = out.stdout;
+    body.truncate(body_len);
+    Ok(HttpResponse { body, url, status })
 }
 
 /// How much of a download has arrived.

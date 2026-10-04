@@ -6,9 +6,10 @@
 //! `pushd`/`popd`), Start-Sleep, Join-Path, Expand-Archive, Get-FileHash
 //! (+ Write-Host/Write-Output/echo as pass-through for scripts),
 //! text pipelines (`a | b`, fed as text), Invoke-RestMethod (`irm`,
-//! HTTPS GET via host curl), Invoke-Expression (`iex`, runs text
+//! HTTPS GET via host curl), Invoke-WebRequest (`iwr`, response objects or
+//! `-OutFile`, with redirect URI metadata), Invoke-Expression (`iex`, runs text
 //! as code in the same session), and `$name = value` variables
-//! (`$env:`/`$HOME`/`$null` read from the host, session-persisted).
+//! (`$env:`/`$HOME` read from the guest environment, session-persisted).
 //! Double-quoted strings interpolate (`$x`, `${x}`, `$(...)`);
 //! single-quoted strings stay verbatim. Multi-line `if`/`elseif`/`else`
 //! blocks work with truthiness, `-not`, and `-eq`/`-ne` conditions
@@ -28,7 +29,7 @@
 //! round-trip); pipelines carry `ForEach-Object`/`%`, `Where-Object` /
 //! `where`/`?` (conditions), and `Select-Object -First` over text or
 //! JSON lines with `$_` binding; `-match` runs a documented regex
-//! subset; `(...)` groups evaluate capturing output; bare collections
+//! subset, also used by `-replace` with literal replacements; `(...)` groups evaluate capturing output; bare collections
 //! enumerate. `-ErrorAction`/`-ErrorVariable` are universal no-ops
 //! (every error terminates).
 //! `try`/`catch`/`finally` run the first error handler with `finally`
@@ -633,14 +634,14 @@ impl<'a> Interpreter<'a> {
                 let mut sub = self.sub(&mut buf);
                 sub.exec_statement(seg, input.as_deref())
             };
-            match flow? {
-                Flow::Next => {}
-                f => return Ok(f),
-            }
             if i + 1 == segments.len() {
                 self.out.extend_from_slice(&buf);
             } else {
                 input = Some(String::from_utf8_lossy(&buf).into_owned());
+            }
+            match flow? {
+                Flow::Next => {}
+                f => return Ok(f),
             }
         }
         Ok(Flow::Next)
@@ -768,6 +769,12 @@ impl<'a> Interpreter<'a> {
                 self.emit(&joined);
                 return Ok(Flow::Next);
             }
+        }
+        if toks.len() >= 3 && !toks[1].verbatim() && toks[1].text().eq_ignore_ascii_case("-replace")
+        {
+            let value = self.eval_replace(&toks)?;
+            self.emit(&value);
+            return Ok(Flow::Next);
         }
         // Expand variables per token; single-quoted spans stay verbatim.
         let mut args = Vec::with_capacity(toks.len());
@@ -1169,14 +1176,21 @@ impl<'a> Interpreter<'a> {
                 return Ok((lines_value(lines), Flow::Next));
             }
             if is_builtin_command(&fname) {
-                // Get-FileHash in value position yields its object form
-                // (`@{Algorithm, Hash, Path}`) so `.Hash` member access works.
-                if fname == "get-filehash" {
+                // Preserve command response objects for member access in
+                // value position rather than capturing their display text.
+                if matches!(
+                    fname.as_str(),
+                    "get-filehash" | "invoke-webrequest" | "iwr" | "wget"
+                ) {
                     let mut argvals = Vec::with_capacity(vals.len().saturating_sub(1));
                     for tok in vals.iter().skip(1) {
                         argvals.push(self.expand_token(tok)?);
                     }
-                    let v = self.get_filehash_value(&argvals)?;
+                    let v = if fname == "get-filehash" {
+                        self.get_filehash_value(&argvals)?
+                    } else {
+                        self.webrequest_value(&argvals)?
+                    };
                     return Ok((v, Flow::Next));
                 }
                 let mut argvals = Vec::with_capacity(vals.len().saturating_sub(1));
@@ -1231,6 +1245,10 @@ impl<'a> Interpreter<'a> {
                     return Ok((v, Flow::Next));
                 }
             }
+        }
+        if vals.len() >= 3 && !vals[1].verbatim() && vals[1].text().eq_ignore_ascii_case("-replace")
+        {
+            return Ok((Value::Str(self.eval_replace(vals)?), Flow::Next));
         }
         if vals.len() != 1 {
             return Err("unexpected tokens after assignment value".to_string());
@@ -1599,6 +1617,12 @@ impl<'a> Interpreter<'a> {
                 match split_static_call(&tail)? {
                     Some((typ, method, inner, rest2)) => {
                         if let Some(v) = self.eval_static(&typ, &method, &inner)? {
+                            if rest2.starts_with('.') {
+                                let value = self.apply_member_rest(Value::Str(v), &rest2)?;
+                                out.push_str(&value_string(&value));
+                                i = cs.len();
+                                continue;
+                            }
                             out.push_str(&v);
                         }
                         i += tail.chars().count() - rest2.chars().count();
@@ -1811,7 +1835,7 @@ impl<'a> Interpreter<'a> {
             cur = match cur {
                 Value::Map(m) => m
                     .into_iter()
-                    .find(|(k, _)| k == &seg.to_lowercase())
+                    .find(|(k, _)| k.eq_ignore_ascii_case(seg))
                     .map(|(_, v)| v)?,
                 Value::Arr(a) => {
                     if rest.is_empty()
@@ -2449,28 +2473,62 @@ impl<'a> Interpreter<'a> {
     }
 
     fn cmd_invoke_webrequest(&mut self, args: &[String]) -> Result<(), String> {
-        let (named, pos) = parse_params(args, &["uri", "outfile"])?;
+        let value = self.webrequest_value(args)?;
+        if let Value::Map(fields) = value {
+            if let Some(Value::Str(content)) = fields.get("Content") {
+                self.out.extend_from_slice(content.as_bytes());
+                self.out.push(b'\n');
+            }
+        }
+        Ok(())
+    }
+
+    fn webrequest_value(&mut self, args: &[String]) -> Result<Value, String> {
+        let (named, pos) = parse_params(args, &["uri", "outfile", "usebasicparsing"])?;
         let url = named
             .get("uri")
             .cloned()
             .or_else(|| pos.first().cloned())
-            .ok_or_else(|| "usage: Invoke-WebRequest -Uri <url> -OutFile <path>".to_string())?;
+            .ok_or_else(|| "usage: Invoke-WebRequest -Uri <url> [-OutFile <path>]".to_string())?;
         let dest = named
             .get("outfile")
             .cloned()
-            .or_else(|| pos.get(1).cloned())
-            .ok_or_else(|| "usage: Invoke-WebRequest -Uri <url> -OutFile <path>".to_string())?;
-        let bytes =
-            crate::install::fetch_url(&url, 300).map_err(|e| format!("Invoke-WebRequest: {e}"))?;
-        if let Some(parent) = parent_of(&dest) {
-            if !parent.is_empty() && !self.fs.exists(&parent) {
-                self.ensure_dir(&parent)?;
-            }
-        }
-        self.fs
-            .write_file(&dest, bytes)
+            .or_else(|| pos.get(1).cloned());
+        let response = crate::install::fetch_response(&url, 300)
             .map_err(|e| format!("Invoke-WebRequest: {e}"))?;
-        Ok(())
+        if let Some(dest) = dest {
+            if let Some(parent) = parent_of(&dest) {
+                if !parent.is_empty() && !self.fs.exists(&parent) {
+                    self.ensure_dir(&parent)?;
+                }
+            }
+            self.fs
+                .write_file(&dest, response.body)
+                .map_err(|e| format!("Invoke-WebRequest: {e}"))?;
+            return Ok(Value::Str(String::new()));
+        }
+        let uri = Value::Map(HashMap::from([(
+            "AbsoluteUri".to_string(),
+            Value::Str(response.url),
+        )]));
+        let base = Value::Map(HashMap::from([
+            ("ResponseUri".to_string(), uri.clone()),
+            (
+                "RequestMessage".to_string(),
+                Value::Map(HashMap::from([("RequestUri".to_string(), uri)])),
+            ),
+        ]));
+        Ok(Value::Map(HashMap::from([
+            (
+                "Content".to_string(),
+                Value::Str(String::from_utf8_lossy(&response.body).into_owned()),
+            ),
+            (
+                "StatusCode".to_string(),
+                Value::Str(response.status.to_string()),
+            ),
+            ("BaseResponse".to_string(), base),
+        ])))
     }
 
     fn cmd_expand_archive(&mut self, args: &[String]) -> Result<(), String> {
@@ -2609,8 +2667,43 @@ impl<'a> Interpreter<'a> {
         Ok(elems.join(&sep))
     }
 
+    fn eval_replace(&mut self, toks: &[Token]) -> Result<String, String> {
+        let text = self.expand_token(&toks[0])?;
+        let mut operands = vec![Token {
+            chars: Vec::new(),
+            quoted: true,
+            commas: Vec::new(),
+        }];
+        for tok in &toks[2..] {
+            if !operands.last().unwrap().chars.is_empty() && tok.commas.first() != Some(&0) {
+                operands.last_mut().unwrap().chars.push((' ', false));
+            }
+            for (i, ch) in tok.chars.iter().enumerate() {
+                if tok.commas.contains(&i) {
+                    operands.push(Token {
+                        chars: Vec::new(),
+                        quoted: true,
+                        commas: Vec::new(),
+                    });
+                } else {
+                    operands.last_mut().unwrap().chars.push(*ch);
+                }
+            }
+        }
+        if operands.len() > 2 {
+            return Err("-replace expects a pattern and an optional replacement".to_string());
+        }
+        let pattern = self.expand_token(&operands[0])?;
+        let replacement = if operands.len() == 2 {
+            self.expand_token(&operands[1])?
+        } else {
+            String::new()
+        };
+        regex_replace(&pattern, &text, &replacement)
+    }
+
     /// `(...)` inner to a value: nested parens recurse, `X -split Y`
-    /// splits to an array, bare `Get-FileHash` yields its object form,
+    /// splits to an array, web requests and file hashes yield response objects,
     /// anything else runs as code with output captured to lines.
     fn eval_paren_inner(&mut self, inner: &str) -> Result<(Value, Flow), String> {
         let t = inner.trim();
@@ -2629,6 +2722,10 @@ impl<'a> Interpreter<'a> {
             }
         }
         let toks = tokenize(t)?;
+        if toks.len() >= 3 && !toks[1].verbatim() && toks[1].text().eq_ignore_ascii_case("-replace")
+        {
+            return Ok((Value::Str(self.eval_replace(&toks)?), Flow::Next));
+        }
         if toks.len() == 3 && !toks[1].verbatim() && toks[1].text() == "+" {
             let v = self.eval_plus(&toks)?;
             return Ok((v, Flow::Next));
@@ -2644,13 +2741,20 @@ impl<'a> Interpreter<'a> {
         }
         if !toks.is_empty()
             && !toks[0].verbatim()
-            && toks[0].text().eq_ignore_ascii_case("get-filehash")
+            && matches!(
+                toks[0].text().to_lowercase().as_str(),
+                "get-filehash" | "invoke-webrequest" | "iwr" | "wget"
+            )
         {
             let mut argvals = Vec::with_capacity(toks.len().saturating_sub(1));
             for tok in toks.iter().skip(1) {
                 argvals.push(self.expand_token(tok)?);
             }
-            let v = self.get_filehash_value(&argvals)?;
+            let v = if toks[0].text().eq_ignore_ascii_case("get-filehash") {
+                self.get_filehash_value(&argvals)?
+            } else {
+                self.webrequest_value(&argvals)?
+            };
             return Ok((v, Flow::Next));
         }
         let mut buf = Vec::new();
@@ -3120,6 +3224,39 @@ fn regex_split(pattern: &str, text: &str) -> Result<Vec<String>, String> {
     }
     pieces.push(orig[start..].iter().collect());
     Ok(pieces)
+}
+
+/// Literal replacement over the supported regex subset. Capture substitutions
+/// are rejected because this matcher does not retain capture groups.
+fn regex_replace(pattern: &str, text: &str, replacement: &str) -> Result<String, String> {
+    if replacement.contains('$') {
+        return Err("regex replacement substitutions are not supported".to_string());
+    }
+    let (nodes, root) = parse_regex(pattern)?;
+    let orig: Vec<char> = text.chars().collect();
+    let mut matcher = RxMatcher {
+        nodes,
+        t: orig
+            .iter()
+            .map(|c| c.to_lowercase().next().unwrap())
+            .collect(),
+        fuel: 1_000_000,
+    };
+    let mut result = String::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i <= orig.len() {
+        if let Some(end) = matcher.seq_from(root, i)?.into_iter().max() {
+            result.extend(orig[start..i].iter());
+            result.push_str(replacement);
+            start = end;
+            i = if end > i { end } else { i + 1 };
+        } else {
+            i += 1;
+        }
+    }
+    result.extend(orig[start..].iter());
+    Ok(result)
 }
 
 /// AST node for the `-match` subset (indices into [`RxParser::nodes`]).
@@ -4398,6 +4535,11 @@ fn split_assignment(args: &[Token]) -> Result<Option<(String, AssignOp, Vec<Toke
             vals.push(Token {
                 chars: tail.to_vec(),
                 quoted: false,
+                commas: args[0]
+                    .commas
+                    .iter()
+                    .filter_map(|i| i.checked_sub(eq + 1))
+                    .collect(),
             });
         }
         vals.extend_from_slice(&args[1..]);
@@ -4500,6 +4642,7 @@ fn is_count_probe(text: &str) -> bool {
 struct Token {
     chars: Vec<(char, bool)>,
     quoted: bool,
+    commas: Vec<usize>,
 }
 
 impl Token {
@@ -4523,6 +4666,7 @@ fn tokenize(s: &str) -> Result<Vec<Token>, String> {
     let mut in_tok = false;
     let mut quoted = false;
     let mut pdepth = 0usize;
+    let mut commas = Vec::new();
     for c in s.chars() {
         match c {
             '\'' if !dq => {
@@ -4558,11 +4702,15 @@ fn tokenize(s: &str) -> Result<Vec<Token>, String> {
                     toks.push(Token {
                         chars: std::mem::take(&mut cur),
                         quoted: std::mem::replace(&mut quoted, false),
+                        commas: std::mem::take(&mut commas),
                     });
                     in_tok = false;
                 }
             }
             _ => {
+                if c == ',' && !sq && !dq && pdepth == 0 {
+                    commas.push(cur.len());
+                }
                 cur.push((c, !sq));
                 in_tok = true;
             }
@@ -4572,7 +4720,11 @@ fn tokenize(s: &str) -> Result<Vec<Token>, String> {
         return Err("unterminated quote".to_string());
     }
     if in_tok {
-        toks.push(Token { chars: cur, quoted });
+        toks.push(Token {
+            chars: cur,
+            quoted,
+            commas,
+        });
     }
     Ok(toks)
 }
@@ -4695,6 +4847,47 @@ mod tests {
             Err(_) => -1,
         };
         (code, out, r)
+    }
+
+    #[test]
+    fn replace_operator_in_assignments_statements_and_subexpressions() {
+        let (_, out, result) = run(r#"
+$uri = 'https://example.invalid/tag/v1'
+$version = $uri -replace '.*/tag/', ''
+$version
+'ABC abc' -replace 'abc', 'x'
+$x = 'a,b' -replace 'a,b', 'c,d'
+$x
+$x = 'a,b' -replace "a,b" , "c,d"
+$x
+$x = ('prefix/tag/v2' -replace '.*/tag/', '')
+$x
+$x = 'abc' -replace 'b'
+$x
+"#);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(out, b"v1\nx x\nc,d\nc,d\nv2\nac\n");
+        assert_eq!(regex_replace("^|$", "ab", "_").unwrap(), "_ab_");
+        assert_eq!(regex_replace("b", "abc", "x").unwrap(), "axc");
+        assert!(regex_replace("[", "abc", "x").is_err());
+        assert!(regex_replace("(a)", "a", "$1").is_err());
+        assert!(run("$x = 'a' -replace 'a', 'b', 'c'").2.is_err());
+    }
+
+    #[test]
+    fn static_guid_calls_apply_format_methods() {
+        let (_, out, result) = run("$g = [System.Guid]::NewGuid().ToString('N')\n$g");
+        assert!(result.is_ok(), "{result:?}");
+        let guid = String::from_utf8(out).unwrap();
+        assert_eq!(guid.trim().len(), 32);
+        assert!(guid.trim().chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn pipeline_preserves_final_stage_output_before_error() {
+        let (_, out, result) = run("echo \"Write-Host started; throw 'failed'\" | iex");
+        assert_eq!(out, b"started\n");
+        assert_eq!(result.unwrap_err(), "failed");
     }
 
     #[test]
@@ -4903,9 +5096,9 @@ mod tests {
     }
 
     #[test]
-    fn invoke_webrequest_needs_outfile() {
+    fn invoke_webrequest_needs_uri() {
         // Usage error surfaces before any network fetch.
-        let (_, _, r) = run("Invoke-WebRequest https://example.com/x.zip");
+        let (_, _, r) = run("Invoke-WebRequest -UseBasicParsing");
         assert!(r.unwrap_err().contains("usage"));
     }
 

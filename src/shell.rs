@@ -884,9 +884,10 @@ impl Shell {
                 self.last_code = code;
                 Ok(ShellFlow::Continue)
             }
-            Err(_) => Err(format!(
-                "nothing to run: {target} (no such file; try `wpkg install {target}`)"
-            )),
+            Err(error) if error == format!("unknown command: {}", target.to_lowercase()) => Err(
+                format!("nothing to run: {target} (no such file; try `wpkg install {target}`)"),
+            ),
+            Err(error) => Err(format!("script error: {error}")),
         }
     }
 

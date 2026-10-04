@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Run remote PowerShell installers through `irm | iex`: support web-request
+  response objects and redirect URIs, `-UseBasicParsing`, regex replacement,
+  and chained GUID formatting. Preserve installer output and script errors
+  instead of reporting an installed PowerShell command as a missing program.
+
 - Keep idle or partial unauthenticated WebSocket handshakes from blocking
   control clients; expire pending handshakes and bound their count.
 - Share file-mapping views through kernel-backed sections, preserving
