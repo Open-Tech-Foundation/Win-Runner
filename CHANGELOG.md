@@ -21,6 +21,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Make the CRT Windows oracle trigger invalid-parameter callbacks through
+  exported `mbstowcs_s` validation instead of requiring internal dispatch
+  symbols absent from Windows UCRT. Keep global/thread-local precedence,
+  release callback metadata, and recoverable-error checks in the comparison.
+
 - Implement native `LockFileEx` and `UnlockFileEx` with shared/exclusive
   byte ranges, immediate conflicts, blocking acquisition, cancellable
   overlapped requests, and event/completion-port notifications. Enforce locks

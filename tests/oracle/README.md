@@ -33,7 +33,8 @@ with `guests/build-oracle.sh` (rustc and rust-lld only). A probe:
 | `process_runtime` | anonymous pipe access, duplication and EOF, startup handle-list filtering and child output/timestamps, volume metadata, error mode and WER flags, system-directory buffer sizing, priority boost, continuation dispatch, timer deadlines/reset/cancel/errors, shared clocks and PEB, read/write console devices and VT modes |
 
 `crt_runtime` checks global/thread-local invalid-parameter handlers, callback
-metadata, CRT strings and secure conversions, descriptor/stream file I/O,
+metadata and recovery through public `mbstowcs_s` validation (without relying
+on internal dispatch exports), CRT strings and secure conversions, descriptor/stream file I/O,
 ANSI module-name truncation, and
 SSPI table initialization with an unknown package. Installed SSPI authentication
 providers are not implemented by Win-Runner and are outside this comparison.

@@ -113,6 +113,8 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
             "crt_runtime" => &[
                 "invalid.global_dispatch: ok",
                 "invalid.local_dispatch: ok",
+                "invalid.metadata: ok",
+                "invalid.recovery: ok",
                 "convert.truncate: ok",
                 "module.truncated: ok",
                 "security.unknown_package: ok",

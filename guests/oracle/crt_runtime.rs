@@ -16,7 +16,7 @@ extern "system" fn global_handler(
     reserved: usize,
 ) {
     GLOBAL.fetch_add(1, Ordering::SeqCst);
-    if [expression, function, file, line as usize, reserved] == [11, 12, 13, 14, 15] {
+    if [expression, function, file, line as usize, reserved] == [0, 0, 0, 0, 0] {
         METADATA.store(1, Ordering::SeqCst);
     }
 }
@@ -50,32 +50,51 @@ macro_rules! resolve {
 fn callbacks(module: usize) {
     type Set = unsafe extern "system" fn(usize) -> usize;
     type Get = unsafe extern "system" fn() -> usize;
-    type Invalid = unsafe extern "system" fn(usize, usize, usize, u32, usize);
-    type NoInfo = unsafe extern "system" fn();
+    type Convert = unsafe extern "system" fn(*mut usize, *mut u16, usize, *const u8, usize) -> i32;
     let set = resolve!(module, "_set_invalid_parameter_handler", Set);
     let get = resolve!(module, "_get_invalid_parameter_handler", Get);
     let set_local = resolve!(module, "_set_thread_local_invalid_parameter_handler", Set);
     let get_local = resolve!(module, "_get_thread_local_invalid_parameter_handler", Get);
-    let invalid = resolve!(module, "_invalid_parameter", Invalid);
-    let noinfo = resolve!(module, "_invalid_parameter_noinfo", NoInfo);
+    // Dispatch helpers are CRT implementation details and are not exported
+    // by every Windows UCRT. Trigger validation through a public secure API.
+    let convert = resolve!(module, "mbstowcs_s", Convert);
+    let trigger = || {
+        let mut converted = 99;
+        let mut destination = [77u16; 2];
+        let error = unsafe {
+            convert(
+                &mut converted,
+                destination.as_mut_ptr(),
+                2,
+                core::ptr::null(),
+                1,
+            )
+        };
+        error == 22 && converted == 0 && destination[0] == 0
+    };
     unsafe {
         let previous = set(global_handler as *const () as usize);
+        let previous_local = set_local(0);
         boolean(
             "invalid.global_get",
             get() == global_handler as *const () as usize,
         );
-        invalid(11, 12, 13, 14, 15);
-        let previous_local = set_local(local_handler as *const () as usize);
+        let global_recovered = trigger();
+        set_local(local_handler as *const () as usize);
         boolean(
             "invalid.local_get",
             get_local() == local_handler as *const () as usize,
         );
-        noinfo();
+        let local_recovered = trigger();
         boolean(
             "invalid.local_previous",
             set_local(0) == local_handler as *const () as usize,
         );
-        noinfo();
+        let fallback_recovered = trigger();
+        boolean(
+            "invalid.recovery",
+            global_recovered && local_recovered && fallback_recovered,
+        );
         boolean("invalid.metadata", METADATA.load(Ordering::SeqCst) == 1);
         boolean(
             "invalid.global_dispatch",
