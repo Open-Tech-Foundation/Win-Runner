@@ -40,6 +40,13 @@ equivalent. Unsupported desktop clipboard/provider catalog services and
 asynchronous thread suspension are tested locally for explicit failure.
 No Windows golden is recorded for a new probe until Windows CI produces it.
 
+`powershell_essentials.ps1` additionally runs unchanged in real PowerShell
+on Windows and the guest interpreter. Its transcript compares rename and
+collision handling, directory rename, content clearing/reads, path tests,
+filename listing/splitting, text search, and UTF-8 output/append. Local E2E
+tests check native results while Windows CI supplies the authoritative
+comparison; cmdlet objects and help-table formatting are outside this probe.
+
 Add a probe for an area of the API, not for a program: when an application
 misbehaves, find the Win32 behavior behind it and add cases that pin that
 behavior down.

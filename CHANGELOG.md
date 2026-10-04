@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add everyday PowerShell commands for rename, clearing file content, path
+  resolution/splitting, command/alias/help discovery, text search, file/tee
+  output, sorting, unique lines, and text counts, with shell completion.
+  Add a shared script to compare essential file operations with real
+  PowerShell in Windows oracle CI.
+
 - Add Micro 2.0.15 (Windows x64) to `wpkg`, with a verified archive and native
   terminal E2E coverage for Unicode editing, navigation, resize, save, quit,
   terminal restoration, and snapshot persistence.
@@ -14,6 +20,13 @@ All notable changes to this project will be documented in this file.
   and PATH immediately, preserving shell variables, functions, and files.
 
 ### Fixed
+
+- Make PowerShell aliases with parameters and pipelines reach the script
+  interpreter, and execute guest `.ps1` files as scripts. List the current
+  directory by default, support recursive copies and filtered listings,
+  raw/head/tail content reads, literal paths, pipeline
+  content writes, file/directory path tests, and directory destinations for
+  copy/move. Preserve files on rename collisions and `-WhatIf` previews.
 
 - Implement anonymous `CreatePipe` endpoints, startup handle-list attributes,
   process CPU/timing queries, and volume metadata for background child jobs.

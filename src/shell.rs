@@ -152,6 +152,8 @@ impl ShellHelper {
             .iter()
             .map(|name| (*name).to_string())
             .collect();
+        self.commands
+            .extend(ps1::COMMAND_NAMES.iter().map(|name| (*name).to_string()));
 
         let mut search_dirs = vec![self.cwd.clone(), r"C:\".to_string()];
         search_dirs.extend(
@@ -685,6 +687,21 @@ impl Shell {
         if argv.is_empty() {
             return Ok(ShellFlow::Continue);
         }
+        let command = argv[0].to_ascii_lowercase();
+        // PowerShell aliases with parameters or pipelines must reach the
+        // interpreter instead of the shell's simpler DOS-style handlers.
+        if ps1::is_builtin_command(&command)
+            && (command == "ren"
+                || !SHELL_COMMANDS.contains(&command.as_str())
+                || argv
+                    .iter()
+                    .skip(1)
+                    .any(|arg| arg.starts_with('-') || arg == "|"))
+        {
+            self.last_code = ps1::run_ps1_session(&mut self.sess, &mut self.fs, line, out)
+                .map_err(|error| format!("script error: {error}"))?;
+            return Ok(ShellFlow::Continue);
+        }
         match argv[0].to_lowercase().as_str() {
             "exit" | "quit" => {
                 let code = match argv.get(1) {
@@ -900,6 +917,20 @@ impl Shell {
         }
         if self.fs.is_file(target) && is_batch_file(target) {
             return self.run_batch(target, &argv[1..], out, sink);
+        }
+        if self.fs.is_file(target) && target.to_ascii_lowercase().ends_with(".ps1") {
+            if argv.len() != 1 {
+                return Err("script parameters are not supported for .ps1 files".into());
+            }
+            let data = self
+                .fs
+                .read_file(target)
+                .map_err(|error| format!("cannot read {target}: {error}"))?;
+            let script = String::from_utf8(data)
+                .map_err(|error| format!("cannot read {target}: {error}"))?;
+            self.last_code = ps1::run_ps1_session(&mut self.sess, &mut self.fs, &script, out)
+                .map_err(|error| format!("script error: {error}"))?;
+            return Ok(ShellFlow::Continue);
         }
         if self.fs.is_file(target) {
             let file_read_started = std::time::Instant::now();
@@ -1963,6 +1994,10 @@ mod tests {
         assert!(command_candidates
             .iter()
             .any(|candidate| candidate.replacement == "wpkg"));
+        let (_, ps_candidates) = helper.complete_line("Rename-I", 8);
+        assert!(ps_candidates
+            .iter()
+            .any(|candidate| candidate.replacement == "rename-item"));
 
         let (_, path_candidates) = helper.complete_line("cd Doc", 6);
         assert!(path_candidates

@@ -112,6 +112,28 @@ Explicitly mounted host directories appear as separate guest drives (for example
 
 ## Shell and packages
 
+The interactive shell implements a PowerShell subset. `Get-Command` lists
+implemented commands and guest programs on PATH; `Get-Alias` lists aliases,
+and `Get-Help Rename-Item` shows the supported syntax. These commands also
+appear in tab completion.
+
+Everyday file commands include `New-Item`, `Get-Item`, `Get-ChildItem`,
+`Copy-Item`, `Move-Item`, `Rename-Item`, `Remove-Item`, `Test-Path`,
+`Get-Content`, `Set-Content`, `Add-Content`, and `Clear-Content`.
+`Rename-Item test.js test.mjs` renames a file in its existing directory;
+`-Force` never replaces a destination during rename. Use `Resolve-Path`,
+`Split-Path`, `Join-Path`, and the location commands for navigation.
+
+Text pipelines support `Select-String`, `Sort-Object`, `Get-Unique`,
+`Measure-Object`, `Out-File`, `Tee-Object`, and the existing
+`Where-Object`, `ForEach-Object`, and `Select-Object -First` operations.
+`Get-Content` supports `-Raw`, `-TotalCount`/`-Head`, and `-Tail`;
+`Get-ChildItem` supports `-Recurse`, `-File`, `-Directory`, `-Filter`,
+and filename `*`/`?` patterns. File output uses UTF-8 without a BOM.
+Pipelines carry text rather than full PowerShell objects. Advanced
+providers, administration cmdlets, and unimplemented parameters remain
+unsupported; this shell is not a complete PowerShell distribution.
+
 The shell includes `wpkg`, which installs SHA-256-verified ZIP and 7z packages into the guest C: drive without running installers or package scripts. Its text registry is bundled in the binary; package archives download only when installed.
 
 For a terminal text editor on Linux x86-64, install the Windows build of Micro:

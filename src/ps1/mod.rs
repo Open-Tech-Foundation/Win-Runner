@@ -1,6 +1,6 @@
 //! Minimal PowerShell-like interpreter for filesystem tests.
 //!
-//! Implements only: New-Item, Set-Content, Add-Content, Get-Content,
+//! Implements a filesystem and text-oriented subset: New-Item, Set-Content, Add-Content, Get-Content,
 //! Get-ChildItem, Remove-Item, Copy-Item, Move-Item, Test-Path, Get-Item,
 //! Get-Location/Set-Location/Push-Location/Pop-Location (`pwd`/`cd`/
 //! `pushd`/`popd`), Start-Sleep, Join-Path, Expand-Archive, Get-FileHash
@@ -35,8 +35,14 @@
 //! `try`/`catch`/`finally` run the first error handler with `finally`
 //! always executing (its own signal wins). Console/script output flushes
 //! before errors report.
+//! Everyday extensions include Rename-Item, Clear-Content, Resolve-Path,
+//! Split-Path, Get-Command/Get-Alias/Get-Help, Select-String, Out-File,
+//! Tee-Object, Sort-Object, Get-Unique, and Measure-Object. Pipelines carry
+//! text, not full PowerShell cmdlet objects; unsupported parameters fail.
 //! All operations go through the exact same [`WinFs`](crate::winfs::WinFs) API
 //! that the EXE shims use.
+
+mod essentials;
 
 use crate::winfs::WinFs;
 use std::collections::HashMap;
@@ -822,10 +828,28 @@ impl<'a> Interpreter<'a> {
         if cmd == "iex" || cmd == "invoke-expression" {
             return self.cmd_iex(rest, pipe_in);
         }
+        let cmd = essentials::canonical_command(cmd);
         match cmd {
+            "rename-item" => self.cmd_rename_item(rest),
+            "clear-content" => self.cmd_clear_content(rest),
+            "resolve-path" => self.cmd_resolve_path(rest),
+            "split-path" => self.cmd_split_path(rest),
+            "get-command" | "get-alias" | "get-help" => self.cmd_discovery(cmd, rest),
+            "out-file" | "tee-object" => self.cmd_out_file(rest, pipe_in, cmd == "tee-object"),
+            "select-string" => self.cmd_select_string(rest, pipe_in),
+            "sort-object" | "get-unique" | "measure-object" => {
+                self.cmd_text_pipeline(cmd, rest, pipe_in)
+            }
+            "clear-host" => {
+                if !rest.is_empty() {
+                    return Err("Clear-Host takes no arguments".into());
+                }
+                self.out.extend_from_slice(b"\x1b[2J\x1b[H");
+                Ok(())
+            }
             "new-item" => self.cmd_new_item(rest),
-            "set-content" => self.cmd_set_content(rest),
-            "add-content" => self.cmd_add_content(rest),
+            "set-content" => self.cmd_set_content(rest, pipe_in),
+            "add-content" => self.cmd_add_content(rest, pipe_in),
             "get-content" => self.cmd_get_content(rest),
             "get-childitem" | "dir" | "ls" | "gci" => self.cmd_get_childitem(rest),
             "remove-item" | "rm" | "del" | "ri" => self.cmd_remove_item(rest),
@@ -2148,17 +2172,28 @@ impl<'a> Interpreter<'a> {
         Ok(())
     }
 
-    fn cmd_set_content(&mut self, args: &[String]) -> Result<(), String> {
-        let (named, pos) = parse_params(args, &["path", "value"])?;
+    fn cmd_set_content(&mut self, args: &[String], input: Option<&str>) -> Result<(), String> {
+        let (named, pos) = parse_params(
+            args,
+            &["path", "literalpath", "value", "nonewline", "encoding"],
+        )?;
+        essentials::validate_utf8_encoding(&named)?;
         let path = named
-            .get("path")
+            .get("literalpath")
+            .or_else(|| named.get("path"))
             .cloned()
             .or_else(|| pos.first().cloned())
             .ok_or_else(|| "Set-Content: missing -Path".to_string())?;
         let value = named
             .get("value")
             .cloned()
-            .or_else(|| pos.get(1).cloned())
+            .or_else(|| {
+                pos.get(usize::from(
+                    !named.contains_key("path") && !named.contains_key("literalpath"),
+                ))
+                .cloned()
+            })
+            .or_else(|| input.map(str::to_string))
             .unwrap_or_default();
         // Set-Content creates parent dirs? PowerShell requires parent; keep strict-ish:
         // create file (parent must exist) — but be lenient and create parents like -Force.
@@ -2171,27 +2206,42 @@ impl<'a> Interpreter<'a> {
             }
         }
         let mut data = value.into_bytes();
-        data.push(b'\n');
+        if !named.contains_key("nonewline") && !data.ends_with(b"\n") {
+            data.push(b'\n');
+        }
         self.fs
             .write_file(&path, data)
             .map_err(|e| format!("Set-Content: {e}"))?;
         Ok(())
     }
 
-    fn cmd_add_content(&mut self, args: &[String]) -> Result<(), String> {
-        let (named, pos) = parse_params(args, &["path", "value"])?;
+    fn cmd_add_content(&mut self, args: &[String], input: Option<&str>) -> Result<(), String> {
+        let (named, pos) = parse_params(
+            args,
+            &["path", "literalpath", "value", "nonewline", "encoding"],
+        )?;
+        essentials::validate_utf8_encoding(&named)?;
         let path = named
-            .get("path")
+            .get("literalpath")
+            .or_else(|| named.get("path"))
             .cloned()
             .or_else(|| pos.first().cloned())
             .ok_or_else(|| "Add-Content: missing -Path".to_string())?;
         let value = named
             .get("value")
             .cloned()
-            .or_else(|| pos.get(1).cloned())
+            .or_else(|| {
+                pos.get(usize::from(
+                    !named.contains_key("path") && !named.contains_key("literalpath"),
+                ))
+                .cloned()
+            })
+            .or_else(|| input.map(str::to_string))
             .unwrap_or_default();
         let mut data = value.into_bytes();
-        data.push(b'\n');
+        if !named.contains_key("nonewline") && !data.ends_with(b"\n") {
+            data.push(b'\n');
+        }
         self.fs
             .append_file(&path, &data)
             .map_err(|e| format!("Add-Content: {e}"))?;
@@ -2199,46 +2249,155 @@ impl<'a> Interpreter<'a> {
     }
 
     fn cmd_get_content(&mut self, args: &[String]) -> Result<(), String> {
-        let (named, pos) = parse_params(args, &["path"])?;
-        let path = named
-            .get("path")
-            .cloned()
-            .or_else(|| pos.first().cloned())
-            .ok_or_else(|| "Get-Content: missing -Path".to_string())?;
+        let (named, pos) = parse_params(
+            args,
+            &[
+                "path",
+                "literalpath",
+                "raw",
+                "totalcount",
+                "head",
+                "tail",
+                "encoding",
+            ],
+        )?;
+        essentials::validate_utf8_encoding(&named)?;
+        let path = essentials::path_arg(&named, &pos, "Get-Content")?;
+        if named.contains_key("raw")
+            && ["totalcount", "head", "tail"]
+                .iter()
+                .any(|k| named.contains_key(*k))
+        {
+            return Err("Get-Content: -Raw cannot be combined with line counts".into());
+        }
+        if named.contains_key("tail")
+            && (named.contains_key("totalcount") || named.contains_key("head"))
+        {
+            return Err("Get-Content: -Tail cannot be combined with -TotalCount".into());
+        }
         let data = self
             .fs
             .read_file(&path)
             .map_err(|e| format!("Get-Content: {e}"))?;
         let text = String::from_utf8_lossy(&data);
-        // print without adding extra newline if content already ends with one
-        let s = text.strip_suffix('\n').unwrap_or(&text);
-        for line in s.split('\n') {
-            self.emit(line);
+        if named.contains_key("raw") {
+            self.out.extend_from_slice(text.as_bytes());
+            return Ok(());
+        }
+        let lines: Vec<_> = text.lines().collect();
+        let count = named
+            .get("tail")
+            .or_else(|| named.get("totalcount"))
+            .or_else(|| named.get("head"))
+            .map(|n| {
+                n.parse::<usize>()
+                    .map_err(|_| "Get-Content: line count must be nonnegative".to_string())
+            })
+            .transpose()?
+            .unwrap_or(lines.len());
+        if named.contains_key("tail") {
+            for line in lines.iter().skip(lines.len().saturating_sub(count)) {
+                self.emit(line);
+            }
+        } else {
+            for line in lines.iter().take(count) {
+                self.emit(line);
+            }
         }
         Ok(())
     }
 
     fn cmd_get_childitem(&mut self, args: &[String]) -> Result<(), String> {
-        let (named, pos) = parse_params(args, &["path"])?;
-        let path = named
-            .get("path")
-            .cloned()
-            .or_else(|| pos.first().cloned())
-            .unwrap_or_else(|| String::from("C:\\"));
-        let names = self
+        let (named, pos) = parse_params(
+            args,
+            &[
+                "path",
+                "literalpath",
+                "recurse",
+                "file",
+                "directory",
+                "filter",
+                "force",
+            ],
+        )?;
+        if named.contains_key("file") && named.contains_key("directory") {
+            return Err("Get-ChildItem: choose -File or -Directory".into());
+        }
+        let path =
+            if named.contains_key("path") || named.contains_key("literalpath") || !pos.is_empty() {
+                essentials::path_arg(&named, &pos, "Get-ChildItem")?
+            } else {
+                self.fs.cwd()
+            };
+        let path = path.replace('/', "\\");
+        let (directory, pattern) =
+            if !named.contains_key("literalpath") && path.contains(['*', '?']) {
+                let parent = parent_of(&path).unwrap_or_else(|| self.fs.cwd());
+                let leaf = path.rsplit('\\').next().unwrap();
+                (parent, Some(leaf.to_string()))
+            } else {
+                (path.clone(), None)
+            };
+        if self.fs.is_file(&directory) {
+            if !named.contains_key("directory") {
+                self.emit(directory.rsplit('\\').next().unwrap());
+            }
+            return Ok(());
+        }
+        let base = self
             .fs
-            .list_dir(&path)
-            .map_err(|e| format!("Get-ChildItem: {e}"))?;
-        for n in names {
-            self.emit(&n);
+            .normalize(&directory)
+            .map_err(|e| format!("Get-ChildItem: {e}"))?
+            .display();
+        let mut pending = vec![(base, String::new())];
+        let mut visited = std::collections::HashSet::new();
+        while let Some((dir, prefix)) = pending.pop() {
+            let key = self
+                .fs
+                .resolve_links(&dir)
+                .unwrap_or_else(|| dir.clone())
+                .to_lowercase();
+            if !visited.insert(key) {
+                continue;
+            }
+            let names = self
+                .fs
+                .list_dir(&dir)
+                .map_err(|e| format!("Get-ChildItem: {e}"))?;
+            let mut subdirs = Vec::new();
+            for name in names {
+                let full = format!("{}\\{name}", dir.trim_end_matches('\\'));
+                let relative = format!("{prefix}{name}");
+                let is_dir = self.fs.is_dir(&full);
+                if named.contains_key("recurse") && is_dir {
+                    subdirs.push((full, format!("{relative}\\")));
+                }
+                if named.contains_key("file") && is_dir
+                    || named.contains_key("directory") && !is_dir
+                {
+                    continue;
+                }
+                if pattern
+                    .as_ref()
+                    .is_some_and(|p| !essentials::wildcard(p, &name))
+                    || named
+                        .get("filter")
+                        .is_some_and(|p| !essentials::wildcard(p, &name))
+                {
+                    continue;
+                }
+                self.emit(&relative);
+            }
+            pending.extend(subdirs.into_iter().rev());
         }
         Ok(())
     }
 
     fn cmd_remove_item(&mut self, args: &[String]) -> Result<(), String> {
-        let (named, pos) = parse_params(args, &["path", "recurse", "force"])?;
+        let (named, pos) = parse_params(args, &["path", "literalpath", "recurse", "force"])?;
         let path = named
-            .get("path")
+            .get("literalpath")
+            .or_else(|| named.get("path"))
             .cloned()
             .or_else(|| pos.first().cloned())
             .ok_or_else(|| "Remove-Item: missing -Path".to_string())?;
@@ -2251,18 +2410,34 @@ impl<'a> Interpreter<'a> {
     }
 
     fn cmd_copy_item(&mut self, args: &[String]) -> Result<(), String> {
-        let (named, pos) = parse_params(args, &["path", "destination", "force"])?;
+        let (named, pos) = parse_params(
+            args,
+            &["path", "literalpath", "destination", "force", "recurse"],
+        )?;
         let src = named
-            .get("path")
+            .get("literalpath")
+            .or_else(|| named.get("path"))
             .cloned()
             .or_else(|| pos.first().cloned())
             .ok_or_else(|| "Copy-Item: missing -Path".to_string())?;
-        let dst = named
+        let mut dst = named
             .get("destination")
             .cloned()
-            .or_else(|| pos.get(1).cloned())
+            .or_else(|| {
+                pos.get(usize::from(
+                    !named.contains_key("path") && !named.contains_key("literalpath"),
+                ))
+                .cloned()
+            })
             .ok_or_else(|| "Copy-Item: missing -Destination".to_string())?;
-        let force = named.contains_key("force");
+        if self.fs.is_dir(&dst) {
+            let source = self
+                .fs
+                .normalize(&src)
+                .map_err(|e| format!("Copy-Item: {e}"))?;
+            let leaf = source.parts.last().ok_or("Copy-Item: cannot copy a root")?;
+            dst = format!("{}\\{leaf}", dst.trim_end_matches(['\\', '/']));
+        }
         // auto-create dst parents for convenience
         if let Some(parent) = parent_of(&dst) {
             if !parent.is_empty() && !self.fs.exists(&parent) {
@@ -2271,24 +2446,55 @@ impl<'a> Interpreter<'a> {
                     .map_err(|e| format!("Copy-Item: {e}"))?;
             }
         }
+        if self.fs.is_dir(&src) && !named.contains_key("recurse") {
+            self.fs.mkdir(&dst).map_err(|e| format!("Copy-Item: {e}"))?;
+            return Ok(());
+        }
         self.fs
-            .copy_path(&src, &dst, !force)
+            .copy_path(&src, &dst, false)
             .map_err(|e| format!("Copy-Item: {e}"))?;
         Ok(())
     }
 
     fn cmd_move_item(&mut self, args: &[String]) -> Result<(), String> {
-        let (named, pos) = parse_params(args, &["path", "destination", "force"])?;
+        let (named, pos) = parse_params(args, &["path", "literalpath", "destination", "force"])?;
         let src = named
-            .get("path")
+            .get("literalpath")
+            .or_else(|| named.get("path"))
             .cloned()
             .or_else(|| pos.first().cloned())
             .ok_or_else(|| "Move-Item: missing -Path".to_string())?;
-        let dst = named
+        let mut dst = named
             .get("destination")
             .cloned()
-            .or_else(|| pos.get(1).cloned())
+            .or_else(|| {
+                pos.get(usize::from(
+                    !named.contains_key("path") && !named.contains_key("literalpath"),
+                ))
+                .cloned()
+            })
             .ok_or_else(|| "Move-Item: missing -Destination".to_string())?;
+        if self.fs.is_dir(&dst) {
+            let source = self
+                .fs
+                .normalize(&src)
+                .map_err(|e| format!("Move-Item: {e}"))?;
+            let leaf = source.parts.last().ok_or("Move-Item: cannot move a root")?;
+            dst = format!("{}\\{leaf}", dst.trim_end_matches(['\\', '/']));
+        }
+        if named.contains_key("force")
+            && self.fs.is_file(&src)
+            && self.fs.is_file(&dst)
+            && self.fs.normalize(&src)?.key() != self.fs.normalize(&dst)?.key()
+        {
+            self.fs
+                .copy_path(&src, &dst, false)
+                .map_err(|e| format!("Move-Item: {e}"))?;
+            self.fs
+                .remove(&src, false)
+                .map_err(|e| format!("Move-Item: {e}"))?;
+            return Ok(());
+        }
         if let Some(parent) = parent_of(&dst) {
             if !parent.is_empty() && !self.fs.exists(&parent) {
                 self.fs
@@ -2303,26 +2509,30 @@ impl<'a> Interpreter<'a> {
     }
 
     fn cmd_test_path(&mut self, args: &[String]) -> Result<(), String> {
-        let (named, pos) = parse_params(args, &["path"])?;
+        let (named, pos) = parse_params(args, &["path", "literalpath", "pathtype"])?;
         let path = named
-            .get("path")
+            .get("literalpath")
+            .or_else(|| named.get("path"))
             .cloned()
             .or_else(|| pos.first().cloned())
             .ok_or_else(|| "Test-Path: missing -Path".to_string())?;
-        self.emit(if self.fs.test_path(&path) {
-            "True"
-        } else {
-            "False"
-        });
+        let exists = match named.get("pathtype").map(|v| v.to_lowercase()).as_deref() {
+            None | Some("any") => self.fs.test_path(&path),
+            Some("leaf") => self.fs.is_file(&path),
+            Some("container") => self.fs.is_dir(&path),
+            _ => return Err("Test-Path: -PathType must be Any, Leaf, or Container".into()),
+        };
+        self.emit(&bool_string(exists));
         Ok(())
     }
 
     /// Get-Item: emit the normalized path when it names a file or
     /// directory, else fail like the real cmdlet.
     fn cmd_get_item(&mut self, args: &[String]) -> Result<(), String> {
-        let (named, pos) = parse_params(args, &["path"])?;
+        let (named, pos) = parse_params(args, &["path", "literalpath"])?;
         let path = named
-            .get("path")
+            .get("literalpath")
+            .or_else(|| named.get("path"))
             .cloned()
             .or_else(|| pos.first().cloned())
             .ok_or_else(|| "Get-Item: missing -Path".to_string())?;
@@ -4447,62 +4657,110 @@ fn split_clause_head(s: &str) -> Result<(String, String), String> {
 
 /// Plain builtins runnable as statements and capturable in value
 /// position (`$x = Join-Path ...`). Keep in sync with `exec_builtin`.
-fn is_builtin_command(cmd: &str) -> bool {
-    matches!(
-        cmd,
-        "new-item"
-            | "set-content"
-            | "add-content"
-            | "get-content"
-            | "get-childitem"
-            | "dir"
-            | "ls"
-            | "gci"
-            | "remove-item"
-            | "rm"
-            | "del"
-            | "ri"
-            | "copy-item"
-            | "copy"
-            | "cp"
-            | "ci"
-            | "move-item"
-            | "move"
-            | "mv"
-            | "mi"
-            | "test-path"
-            | "get-item"
-            | "get-location"
-            | "pwd"
-            | "gl"
-            | "set-location"
-            | "cd"
-            | "chdir"
-            | "sl"
-            | "push-location"
-            | "pushd"
-            | "pop-location"
-            | "popd"
-            | "start-sleep"
-            | "sleep"
-            | "join-path"
-            | "write-host"
-            | "write-output"
-            | "echo"
-            | "throw"
-            | "irm"
-            | "invoke-restmethod"
-            | "invoke-webrequest"
-            | "iwr"
-            | "wget"
-            | "expand-archive"
-            | "get-filehash"
-            | "iex"
-            | "invoke-expression"
-            | "break"
-            | "continue"
-            | "out-null"
-    )
+pub const COMMAND_NAMES: &[&str] = &[
+    "new-item",
+    "set-content",
+    "add-content",
+    "get-content",
+    "get-childitem",
+    "dir",
+    "ls",
+    "gci",
+    "remove-item",
+    "rm",
+    "del",
+    "ri",
+    "copy-item",
+    "copy",
+    "cp",
+    "ci",
+    "move-item",
+    "move",
+    "mv",
+    "mi",
+    "test-path",
+    "get-item",
+    "get-location",
+    "pwd",
+    "gl",
+    "set-location",
+    "cd",
+    "chdir",
+    "sl",
+    "push-location",
+    "pushd",
+    "pop-location",
+    "popd",
+    "start-sleep",
+    "sleep",
+    "join-path",
+    "write-host",
+    "write-output",
+    "echo",
+    "throw",
+    "irm",
+    "invoke-restmethod",
+    "invoke-webrequest",
+    "iwr",
+    "wget",
+    "expand-archive",
+    "get-filehash",
+    "iex",
+    "invoke-expression",
+    "break",
+    "continue",
+    "out-null",
+    "rename-item",
+    "ren",
+    "rni",
+    "clear-content",
+    "clc",
+    "resolve-path",
+    "rvpa",
+    "split-path",
+    "get-command",
+    "gcm",
+    "get-alias",
+    "gal",
+    "get-help",
+    "out-file",
+    "select-string",
+    "sls",
+    "sort-object",
+    "sort",
+    "get-unique",
+    "gu",
+    "measure-object",
+    "measure",
+    "tee-object",
+    "tee",
+    "clear-host",
+    "cls",
+    "clear",
+    "ni",
+    "sc",
+    "ac",
+    "gc",
+    "type",
+    "cat",
+    "gi",
+    "cpi",
+    "c",
+    "erase",
+    "pushl",
+    "popl",
+    "write",
+    "foreach-object",
+    "%",
+    "where-object",
+    "where",
+    "?",
+    "select-object",
+    "select",
+];
+
+pub fn is_builtin_command(cmd: &str) -> bool {
+    COMMAND_NAMES.contains(&cmd.to_ascii_lowercase().as_str())
 }
 
 /// Split `$name = value` / `$name += value` (spaced or joined) off
@@ -4796,7 +5054,40 @@ fn parse_params(
             }
             if known_set.contains(&key) || known.is_empty() {
                 // value-taking unless boolean flag (force/recurse/usebasicparsing)
-                if key == "force" || key == "recurse" || key == "usebasicparsing" {
+                if matches!(
+                    key.as_str(),
+                    "force"
+                        | "recurse"
+                        | "usebasicparsing"
+                        | "passthru"
+                        | "whatif"
+                        | "relative"
+                        | "resolve"
+                        | "parent"
+                        | "leaf"
+                        | "leafbase"
+                        | "extension"
+                        | "qualifier"
+                        | "noqualifier"
+                        | "isabsolute"
+                        | "append"
+                        | "noclobber"
+                        | "nonewline"
+                        | "simplematch"
+                        | "quiet"
+                        | "list"
+                        | "notmatch"
+                        | "raw"
+                        | "descending"
+                        | "unique"
+                        | "casesensitive"
+                        | "caseinsensitive"
+                        | "line"
+                        | "word"
+                        | "character"
+                        | "file"
+                        | "directory"
+                ) {
                     named.insert(key, "true".to_string());
                     i += 1;
                 } else if i + 1 < args.len() {
