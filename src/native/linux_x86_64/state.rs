@@ -161,7 +161,7 @@ pub(super) struct NativeFs {
     pub(super) finds: HashMap<u64, NativeFind>,
     pub(super) file_completion_modes: HashMap<u64, u8>,
     pub(super) delete_on_close: std::collections::HashSet<u64>,
-    pub(super) file_locks: Vec<(String, u64, u64, u64)>,
+    pub(super) file_locks: Vec<(String, u64, u64, u64, bool)>,
     pub(super) next: u64,
 }
 
@@ -347,6 +347,7 @@ pub(super) struct NativeFileIoJob {
     pub(super) operation: NativeFileIoOperation,
 }
 pub(super) struct NativePendingIo {
+    pub(super) is_lock: bool,
     pub(super) handle: u64,
     pub(super) overlapped: u64,
     pub(super) cancelled: AtomicBool,
@@ -355,6 +356,7 @@ pub(super) struct NativePendingIo {
 pub(super) enum NativeFileIoOperation {
     Read { output: u64, length: u32 },
     Write { data: Vec<u8> },
+    Lock { length: u64, exclusive: bool },
 }
 
 pub(super) struct NativeVirtualAllocation {

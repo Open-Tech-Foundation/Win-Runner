@@ -675,6 +675,9 @@ pub(super) fn native_set_overlapped_status(overlapped: u64, status: u64, bytes: 
     }
 }
 fn native_file_error(status: u64) -> u32 {
+    if status == 0xc000_0054 {
+        return 33;
+    }
     if status == STATUS_END_OF_FILE {
         38
     } else if status == STATUS_CANCELLED {
@@ -729,7 +732,21 @@ fn native_finish_pending_file_io(
         }
     }
 }
+pub(super) fn native_cancel_pending_file_locks(
+    process: &NativeProcessContext,
+    handle: Option<u64>,
+) {
+    if let Ok(pending) = process.pending_requests.lock() {
+        for request in pending.values().filter(|request| {
+            request.is_lock && handle.is_none_or(|handle| request.handle == handle)
+        }) {
+            request.cancelled.store(true, Ordering::Release);
+        }
+    }
+}
 pub(super) fn native_wait_file_io(process: &NativeProcessContext) {
+    // Exit-state draining must not wait forever on a contended lock.
+    native_cancel_pending_file_locks(process, None);
     let Ok(mut guard) = process.io_wait.lock() else {
         return;
     };
@@ -738,6 +755,12 @@ pub(super) fn native_wait_file_io(process: &NativeProcessContext) {
             Ok(guard) => guard,
             Err(_) => return,
         };
+    }
+}
+pub(super) fn native_shutdown_file_io(process: &NativeProcessContext) {
+    native_wait_file_io(process);
+    if let Ok(mut fs) = process.fs.lock() {
+        fs.file_locks.clear();
     }
 }
 fn native_file_io_queue(
@@ -801,6 +824,7 @@ pub(super) fn native_enqueue_file_io(
     }
     let event = native_prepare_overlapped_event(overlapped)?;
     let request = Arc::new(NativePendingIo {
+        is_lock: matches!(&operation, NativeFileIoOperation::Lock { .. }),
         handle,
         overlapped,
         cancelled: AtomicBool::new(false),
@@ -838,11 +862,62 @@ fn native_file_io_worker(queue: Arc<NativeFileIoQueue>) {
             }
             state.jobs.pop_front().unwrap()
         };
+        if let NativeFileIoOperation::Lock { length, exclusive } = &job.operation {
+            let result = if job.request.cancelled.load(Ordering::Acquire) {
+                Err(995u32)
+            } else {
+                job.process
+                    .fs
+                    .lock()
+                    .map_err(|_| 6u32)
+                    .and_then(|mut fs| {
+                        native_try_file_lock(
+                            &mut fs,
+                            job.request.handle,
+                            job.offset as u64,
+                            *length,
+                            *exclusive,
+                        )
+                    })
+                    .map(|_| ())
+            };
+            if result == Err(33) {
+                // Requeue a contended lock so it cannot monopolize the bounded
+                // I/O workers and prevent ordinary file requests from completing.
+                if let Ok(mut state) = queue.state.lock() {
+                    state.jobs.push_back(job);
+                    queue.ready.notify_one();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
+            native_finish_pending_file_io(
+                &job.process,
+                &job.file,
+                job.overlapped,
+                job.event,
+                job.request,
+                result.map(|_| 0).map_err(|_| STATUS_CANCELLED),
+            );
+            continue;
+        }
         let result = if job.request.cancelled.load(Ordering::Acquire) {
             Err(STATUS_CANCELLED)
         } else {
             match job.operation {
                 NativeFileIoOperation::Read { output, length } => match job.process.fs.lock() {
+                    Ok(fs)
+                        if !native_file_lock_allows(
+                            &fs,
+                            job.request.handle,
+                            &job.file.path,
+                            job.offset as u64,
+                            length as u64,
+                            false,
+                        ) =>
+                    {
+                        Err(0xc000_0054)
+                    }
                     Ok(fs) => match fs.fs.file_len(&job.file.path) {
                         Ok(file_len) if job.offset as u64 >= file_len => Err(STATUS_END_OF_FILE),
                         Ok(_) => {
@@ -893,6 +968,18 @@ fn native_file_io_worker(queue: Arc<NativeFileIoQueue>) {
                     Ok(_) if job.request.cancelled.load(Ordering::Acquire) => {
                         Err(STATUS_CANCELLED)
                     }
+                    Ok(fs)
+                        if !native_file_lock_allows(
+                            &fs,
+                            job.request.handle,
+                            &job.file.path,
+                            job.offset as u64,
+                            data.len() as u64,
+                            true,
+                        ) =>
+                    {
+                        Err(0xc000_0054)
+                    }
                     Ok(mut fs) => fs
                         .fs
                         .write_at(&job.file.path, job.offset as u64, &data)
@@ -900,6 +987,7 @@ fn native_file_io_worker(queue: Arc<NativeFileIoQueue>) {
                         .map_err(|_| STATUS_UNSUCCESSFUL),
                     Err(_) => Err(STATUS_UNSUCCESSFUL),
                 },
+                NativeFileIoOperation::Lock { .. } => unreachable!(),
             }
         };
         native_finish_pending_file_io(

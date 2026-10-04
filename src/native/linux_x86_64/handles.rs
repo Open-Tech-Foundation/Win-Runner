@@ -501,6 +501,7 @@ pub(super) extern "win64" fn native_close_handle(h: u64) -> i32 {
     let closed = fs_ctx()
         .and_then(|context| {
             context.lock().ok().map(|mut c| {
+                c.file_locks.retain(|(_, _, _, owner, _)| *owner != h);
                 c.file_completion_modes.remove(&h);
                 c.file_access.remove(&h);
                 c.file_shares.remove(&h);
@@ -519,7 +520,11 @@ pub(super) extern "win64" fn native_close_handle(h: u64) -> i32 {
             })
         })
         .unwrap_or(false);
-    if !closed {
+    if closed {
+        if let Some(process) = process.as_ref() {
+            native_cancel_pending_file_locks(process, Some(h));
+        }
+    } else {
         native_set_last_error(6);
     }
     closed as i32

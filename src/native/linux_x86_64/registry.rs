@@ -1525,6 +1525,8 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "OpenFileById" => Some(native_open_file_by_id as *const () as usize as u64),
         "SetFileValidData" => Some(native_set_file_valid_data as *const () as usize as u64),
         "WriteFileGather" => Some(native_write_file_gather as *const () as usize as u64),
+        "LockFileEx" => Some(native_lock_file_ex as *const () as usize as u64),
+        "UnlockFileEx" => Some(native_unlock_file_ex as *const () as usize as u64),
         "LockFile" => Some(native_lock_file as *const () as usize as u64),
         "UnlockFile" => Some(native_unlock_file as *const () as usize as u64),
         "FindFirstStreamW" => Some(native_find_first_stream_w as *const () as usize as u64),

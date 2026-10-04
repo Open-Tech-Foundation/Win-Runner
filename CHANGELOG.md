@@ -21,6 +21,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Implement native `LockFileEx` and `UnlockFileEx` with shared/exclusive
+  byte ranges, immediate conflicts, blocking acquisition, cancellable
+  overlapped requests, and event/completion-port notifications. Enforce locks
+  in file reads/writes and release them on close and process exit. Add native
+  unit tests and a
+  real Windows oracle probe for contention, sharing, large ranges, and async I/O.
+
 - Support UCRT invalid-parameter handlers, secure C-locale conversions,
   descriptor/stream file operations, and ANSI module filenames on the native
   backend. Add Winsock event selection and Windows fd-set readiness, preserving

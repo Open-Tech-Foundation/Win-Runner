@@ -78,7 +78,7 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
         assert!(!actual.contains("PANIC"), "{name} panicked:\n{actual}");
         if matches!(
             name.as_str(),
-            "process_runtime" | "crt_runtime" | "socket_events"
+            "process_runtime" | "crt_runtime" | "socket_events" | "file_locks"
         ) {
             assert!(
                 !actual.contains("wrong") && !actual.contains("unavailable"),
@@ -124,6 +124,13 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
                 "event.rearmed: ok",
                 "event.close_record: ok",
                 "event.cancel: ok",
+            ],
+            "file_locks" => &[
+                "lock.shared_read: ok",
+                "lock.close_releases: ok",
+                "lock.large_range: ok",
+                "async.granted: ok",
+                "async.cancel_result: ok",
             ],
             "links" => &[
                 "reparse.dirlink_small: fail err=122",

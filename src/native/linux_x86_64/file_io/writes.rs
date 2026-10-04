@@ -275,6 +275,10 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_write_file(
                 return 0;
             }
         };
+        if !native_file_lock_allows(&ctx, handle, &path, offset as u64, len as u64, true) {
+            native_set_last_error(33);
+            return 0;
+        }
         if overlapped != 0
             && ctx.handles.get(&handle).is_some_and(|file| file.overlapped)
             && (overlapped & 7 != 0 || native_overlapped_status(overlapped) == STATUS_PENDING)

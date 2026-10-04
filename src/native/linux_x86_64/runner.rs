@@ -651,7 +651,7 @@ fn run_rust_baseline_argv_with_fs_impl(
                         Ok(code) => code as i32,
                         Err(code) => native_exit_process(code),
                     };
-                    native_wait_file_io(&guest_process);
+                    native_shutdown_file_io(&guest_process);
                     code
                 })
                 .map_err(|error| format!("cannot start native guest thread: {error}"))?
@@ -774,7 +774,7 @@ fn run_rust_baseline_argv_with_fs_impl(
                     } {
                         Ok(code) | Err(code) => code as i32,
                     };
-                    native_wait_file_io(&guest_process);
+                    native_shutdown_file_io(&guest_process);
                     code
                 });
             let code = guest_thread

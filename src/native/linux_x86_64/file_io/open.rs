@@ -1613,6 +1613,10 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_read_file(
             return 0;
         }
     };
+    if !native_file_lock_allows(&ctx, h, &path, offset as u64, n as u64, false) {
+        native_set_last_error(33);
+        return 0;
+    }
     if ov != 0
         && ctx.handles.get(&h).is_some_and(|file| file.overlapped)
         && (ov & 7 != 0 || native_overlapped_status(ov) == STATUS_PENDING)

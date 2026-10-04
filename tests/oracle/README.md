@@ -29,6 +29,7 @@ with `guests/build-oracle.sh` (rustc and rust-lld only). A probe:
 | `path_names` | path spellings from `GetLongPathNameW`, `GetFullPathNameW`, and final paths |
 | `links` | `CreateSymbolicLinkW`, what a handle names with and without `FILE_FLAG_OPEN_REPARSE_POINT`, `FSCTL_GET_REPARSE_POINT` data |
 | `pool_console` | `QueueUserWorkItem`, `MapVirtualKeyW`, console input functions on a non-console handle |
+| `file_locks` | shared/exclusive byte ranges, contention, read/write exclusion, exact unlock, close cleanup, 64-bit offsets, async grants and cancellation |
 | `process_runtime` | anonymous pipe access, duplication and EOF, startup handle-list filtering and child output/timestamps, volume metadata, error mode and WER flags, system-directory buffer sizing, priority boost, continuation dispatch, timer deadlines/reset/cancel/errors, shared clocks and PEB, read/write console devices and VT modes |
 
 `crt_runtime` checks global/thread-local invalid-parameter handlers, callback

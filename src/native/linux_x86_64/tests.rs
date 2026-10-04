@@ -1887,6 +1887,7 @@ mod protection_tests {
             state.jobs.push_back(super::NativeFileIoJob {
                 process: std::sync::Arc::clone(&process),
                 request: std::sync::Arc::new(super::NativePendingIo {
+                    is_lock: false,
                     handle: 0,
                     overlapped: 0,
                     cancelled: super::AtomicBool::new(false),
@@ -1950,6 +1951,7 @@ mod protection_tests {
         let event = super::native_prepare_overlapped_event(pointer).unwrap();
         super::native_set_overlapped_status(pointer, super::STATUS_PENDING, 0);
         let request = std::sync::Arc::new(super::NativePendingIo {
+            is_lock: false,
             handle,
             overlapped: pointer,
             cancelled: super::AtomicBool::new(false),

@@ -1452,7 +1452,7 @@ mod worker_native_fs_tests {
         original.delete_on_close.insert(0x123);
         original
             .file_locks
-            .push((r"C:\data.txt".to_string(), 4, 8, 0x123));
+            .push((r"C:\data.txt".to_string(), 4, 8, 0x123, true));
         original.next = 0x125;
 
         let encoded = encode_worker_native_fs(&original, &HashMap::new()).unwrap();
@@ -2263,7 +2263,7 @@ pub(super) fn native_flush_instance_state() {
     let Some(process) = process_ctx() else {
         return;
     };
-    native_wait_file_io(&process);
+    native_shutdown_file_io(&process);
     let fd = process.state_fd.load(Ordering::Acquire);
     if fd == u32::MAX {
         return;

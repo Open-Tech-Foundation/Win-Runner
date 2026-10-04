@@ -12,3 +12,6 @@ mod search;
 pub(super) use search::*;
 mod writes;
 pub(super) use writes::*;
+
+mod locks;
+pub(super) use locks::*;
