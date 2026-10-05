@@ -14,6 +14,8 @@ pub(super) struct NativeApcQueue {
     pub(super) thread: NativeThreadInfo,
     state: Mutex<NativeApcState>,
     ready: Condvar,
+    alert_pending: Mutex<bool>,
+    alert_ready: Condvar,
 }
 impl NativeApcQueue {
     pub(super) fn post(&self, function: u64, arguments: [u64; 3]) -> bool {
@@ -35,6 +37,38 @@ impl NativeApcQueue {
         }
     }
 }
+pub(super) extern "win64" fn native_nt_alert_thread_by_thread_id(id: u64) -> u32 {
+    if id == native_get_current_thread_id() as u64 { let _ = current_apc_queue(); }
+    let Some(queue) = process_ctx().and_then(|process| process.thread_objects.lock().ok().and_then(|threads| u32::try_from(id).ok().and_then(|id| threads.get(&id)).and_then(Weak::upgrade))) else { return 0xc000000b };
+    if queue.thread.status.lock().map_or(true, |status| status.exit_code.is_some()) { return 0xc000000b }
+    let Ok(mut pending) = queue.alert_pending.lock() else { return 0xc0000001 };
+    *pending = true;
+    queue.alert_ready.notify_one();
+    0
+}
+pub(super) extern "win64" fn native_nt_wait_for_alert_by_thread_id(_address: *const u8, timeout: *const i64) -> u32 {
+    let Some(queue) = current_apc_queue() else { return 0xc000000b };
+    let deadline = if timeout.is_null() { None } else {
+        let ticks = unsafe { timeout.read_unaligned() };
+        if ticks == i64::MIN { None } else {
+            let ticks = if ticks < 0 { ticks.unsigned_abs() } else { (ticks as u64).saturating_sub(native_rtl_get_system_time_precise()) };
+            Instant::now().checked_add(Duration::new(ticks/10_000_000, (ticks%10_000_000) as u32*100))
+        }
+    };
+    let Ok(mut pending) = queue.alert_pending.lock() else { return 0xc0000001 };
+    while !*pending {
+        pending = if let Some(deadline) = deadline {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else { return 0x102 };
+            let Ok((pending, result)) = queue.alert_ready.wait_timeout(pending, remaining) else { return 0xc0000001 };
+            if result.timed_out() && !*pending { return 0x102 } pending
+        } else {
+            let Ok(pending) = queue.alert_ready.wait(pending) else { return 0xc0000001 }; pending
+        };
+    }
+    *pending = false;
+    0x101 // STATUS_ALERTED; this wait does not dispatch user APC callbacks.
+}
+
 #[derive(Clone)]
 pub(super) struct NativeApcHandle {
     pub(super) queue: Arc<NativeApcQueue>,
@@ -691,5 +725,38 @@ mod tests {
             bytes: 0,
             status: 0
         }));
+    }
+}
+
+#[cfg(test)]
+mod nt_alert_tests {
+    use super::*;
+    extern "win64" fn waiter(parameter: u64) -> u32 {
+        let timeout = -10_000_000i64;
+        let status = native_nt_wait_for_alert_by_thread_id(ptr::null(), &timeout);
+        unsafe { (*(parameter as *const AtomicU32)).store(status, Ordering::Release); }
+        0
+    }
+    #[test]
+    fn alerts_wake_native_threads_and_coalesce_without_touching_last_error() {
+        let _guard = TestProcessGuard::new();
+        native_set_last_error(42);
+        let poll = 0i64;
+        assert_eq!(native_nt_wait_for_alert_by_thread_id(ptr::null(), &poll), 0x102);
+        let id = native_get_current_thread_id() as u64;
+        assert_eq!(native_nt_alert_thread_by_thread_id(id), 0);
+        assert_eq!(native_nt_alert_thread_by_thread_id(id), 0);
+        assert_eq!(native_nt_wait_for_alert_by_thread_id(ptr::null(), &poll), 0x101);
+        assert_eq!(native_nt_wait_for_alert_by_thread_id(ptr::null(), &poll), 0x102);
+        assert_eq!(native_get_last_error(), 42);
+        let result = AtomicU32::new(u32::MAX);
+        let mut target = 0;
+        let handle = native_create_thread(0, 0, waiter as *const () as u64, &result as *const _ as u64, 0, &mut target);
+        assert_ne!(handle, 0);
+        assert_eq!(native_nt_alert_thread_by_thread_id(target as u64), 0);
+        assert_eq!(native_wait_for_single_object(handle, 2000), 0);
+        assert_eq!(result.load(Ordering::Acquire), 0x101);
+        native_close_handle(handle);
+        assert_eq!(native_nt_alert_thread_by_thread_id(0), 0xc000000b);
     }
 }

@@ -650,6 +650,7 @@ fn run_rust_baseline_argv_with_fs_impl(
                     std::path::Path::new(&request_path),
                 )?;
             }
+            super::process_journal::start_publisher(&process)?;
             super::exceptions::install_guest_fault_signal_handlers()?;
             protect_exec(&mapping, img)?;
             let guest_process = Arc::clone(&process);

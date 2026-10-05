@@ -380,6 +380,7 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                 | "EnumerateSecurityPackagesA"
                 | "EnumerateSecurityPackagesW"
         ),
+        "CRYPT32.DLL" => matches!(func, "CertOpenStore" | "CertGetEnhancedKeyUsage" | "CertEnumCertificatesInStore" | "CertCloseStore" | "CertFreeCertificateContext" | "CertDuplicateCertificateContext"),
         "PSAPI.DLL" => func == "GetProcessMemoryInfo",
         "WINMM.DLL" => func == "timeGetTime",
         "USERENV.DLL" => func == "GetUserProfileDirectoryW",
@@ -538,6 +539,14 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                 | "RtlVirtualUnwind"
                 | "RtlGetVersion"
                 | "RtlNtStatusToDosError"
+                | "NtWaitForAlertByThreadId"
+                | "NtAlertThreadByThreadId"
+                | "RtlQueryPerformanceCounter"
+                | "RtlQueryPerformanceFrequency"
+                | "RtlGetSystemTimePrecise"
+                | "NtAllocateVirtualMemory"
+                | "NtFreeVirtualMemory"
+                | "NtProtectVirtualMemory"
                 | "NtReadFile"
                 | "NtQueryDirectoryFile"
                 | "NtQueryInformationFile"
@@ -1052,6 +1061,12 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "RtlLookupFunctionEntry" => {
             Some(native_rtl_lookup_function_entry as *const () as usize as u64)
         }
+        "NtWaitForAlertByThreadId" => Some(native_nt_wait_for_alert_by_thread_id as *const () as usize as u64),
+        "NtAlertThreadByThreadId" => Some(native_nt_alert_thread_by_thread_id as *const () as usize as u64),
+        "RtlGetSystemTimePrecise" => Some(native_rtl_get_system_time_precise as *const () as usize as u64),
+        "NtAllocateVirtualMemory" => Some(native_nt_allocate_virtual_memory as *const () as usize as u64),
+        "NtFreeVirtualMemory" => Some(native_nt_free_virtual_memory as *const () as usize as u64),
+        "NtProtectVirtualMemory" => Some(native_nt_protect_virtual_memory as *const () as usize as u64),
         "NtCreateFile" => Some(native_nt_create_file as *const () as usize as u64),
         "NtQueryDirectoryFile" => Some(native_nt_query_directory_file as *const () as usize as u64),
         "NtQueryInformationFile" => Some(native_nt_query_information_file as *const () as usize as u64),
@@ -1154,6 +1169,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "ReadConsoleInputW" => {
             Some(native_read_console_input_w as *const () as usize as u64)
         }
+        "FlushConsoleInputBuffer" => Some(native_flush_console_input_buffer as *const () as usize as u64),
         "GetNumberOfConsoleInputEvents" => {
             Some(native_get_number_of_console_input_events as *const () as usize as u64)
         }
@@ -1219,6 +1235,12 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "MapViewOfFileEx" => Some(native_map_view_of_file_ex as *const () as usize as u64),
         "FlushViewOfFile" => Some(native_flush_view_of_file as *const () as usize as u64),
         "UnmapViewOfFile" => Some(native_unmap_view_of_file as *const () as usize as u64),
+        "CertGetEnhancedKeyUsage" => Some(native_cert_get_enhanced_key_usage as *const () as usize as u64),
+        "CertOpenStore" => Some(native_cert_open_store as *const () as usize as u64),
+        "CertEnumCertificatesInStore" => Some(native_cert_enum_certificates as *const () as usize as u64),
+        "CertCloseStore" => Some(native_cert_close_store as *const () as usize as u64),
+        "CertFreeCertificateContext" => Some(native_cert_free_context as *const () as usize as u64),
+        "CertDuplicateCertificateContext" => Some(native_cert_duplicate_context as *const () as usize as u64),
         "CryptAcquireContextW" => Some(native_crypt_acquire_context_w as *const () as usize as u64),
         "CryptGenRandom" => Some(native_crypt_gen_random as *const () as usize as u64),
         "CryptReleaseContext" => Some(native_crypt_release_context as *const () as usize as u64),
@@ -1365,10 +1387,10 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "LoadLibraryExA" => Some(native_load_library_ex_a as *const () as usize as u64),
         "GetProcAddress" => Some(native_get_proc_address as *const () as usize as u64),
         "FreeLibrary" => Some(native_free_library as *const () as usize as u64),
-        "QueryPerformanceCounter" => {
+        "RtlQueryPerformanceCounter" | "QueryPerformanceCounter" => {
             Some(native_query_performance_counter as *const () as usize as u64)
         }
-        "QueryPerformanceFrequency" => {
+        "RtlQueryPerformanceFrequency" | "QueryPerformanceFrequency" => {
             Some(native_query_performance_frequency as *const () as usize as u64)
         }
         "GetTickCount" => Some(native_get_tick_count as *const () as usize as u64),

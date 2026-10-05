@@ -49,6 +49,7 @@ mod startup_tests {
         assert_ne!(modern, socket);
         for (ordinal, name) in [(10, "ioctlsocket"), (11, "inet_addr"), (12, "inet_ntoa")] {
             let c_name = format!("{name}\0");
+            assert_eq!(native_get_proc_address(modern, c_name.as_ptr()), baseline_trampoline(name).unwrap());
             let expected = baseline_trampoline(name).unwrap();
             assert_eq!(native_get_proc_address(modern, ordinal as *const u8), expected);
             for dll in ["WSOCK32.dll", "WS2_32.dll"] {
@@ -63,6 +64,56 @@ mod startup_tests {
         assert_eq!(native_get_proc_address(socket, 65535usize as *const u8), 0);
         assert_eq!(native_get_last_error(), 127);
     }
+    #[test]
+    fn nt_device_names_round_trip_to_the_same_guest_file() {
+        let _guard = TestProcessGuard::new();
+        let path = r"C:\nt-device.txt";
+        fs_ctx().unwrap().lock().unwrap().fs.write_file(path, b"device-path".to_vec()).unwrap();
+        for (name, expected) in [(r"\Device\HarddiskVolume3\nt-device.txt", path), (r"\device\harddiskvolume3", r"C:\")] {
+            let units: Vec<u16> = name.encode_utf16().collect();
+            let unicode = [units.len() as u64 * 2 | ((units.len() as u64 * 2) << 16), units.as_ptr() as u64];
+            let attributes = [48u64, 0, unicode.as_ptr() as u64, 0, 0, 0];
+            assert_eq!(object_attributes_path(attributes.as_ptr().cast()).unwrap(), expected);
+            let mut info = [0u64;5];
+            assert_eq!(native_nt_query_attributes_file(attributes.as_ptr().cast(), info.as_mut_ptr().cast()), 0);
+        }
+    }
+
+    #[test]
+    fn nt_pipe_access_queries_map_generic_client_rights_and_duplicates() {
+        let _guard = TestProcessGuard::new();
+        let mut read = 0;
+        let mut write = 0;
+        assert_eq!(native_create_pipe(&mut read, &mut write, ptr::null(), 0), 1);
+        let process = process_ctx().unwrap().process_handle;
+        let mut duplicate = 0;
+        assert_eq!(native_duplicate_handle(process, read, process, &mut duplicate, 0, 0, 2), 1);
+        for (handle, expected) in [(read, 1u32), (write, 2), (duplicate, 1)] {
+            let mut access = 0u32;
+            let mut status = [u64::MAX; 2];
+            assert_eq!(native_nt_query_information_file(handle, status.as_mut_ptr().cast(), (&mut access as *mut u32).cast(), 4, 8), 0);
+            assert_eq!(access, expected);
+            assert_eq!(status[0] as u32, 0);
+            assert_eq!(status[1], 4);
+        }
+        let mut overlap_write = [0u64;4];
+        let mut overlap_read = [0u64;4];
+        let mut transferred = 0;
+        assert_eq!(native_write_file(write, b"sync-pipe".as_ptr(), 9, &mut transferred, overlap_write.as_mut_ptr() as u64), 1);
+        assert_eq!(transferred, 9);
+        assert_eq!(overlap_write[1], 9);
+        let mut buffer = [0u8;9];
+        assert_eq!(native_read_file(duplicate, buffer.as_mut_ptr(), 9, &mut transferred, overlap_read.as_mut_ptr() as u64), 1);
+        assert_eq!(buffer, *b"sync-pipe");
+        assert_eq!(overlap_read[1], 9);
+        native_close_handle(write);
+        overlap_read.fill(0);
+        assert_eq!(native_read_file(read, buffer.as_mut_ptr(), 9, &mut transferred, overlap_read.as_mut_ptr() as u64), 0);
+        assert_eq!(native_get_last_error(), 109);
+        assert_eq!(overlap_read[0], 0xc000014b);
+        native_close_handle(read); native_close_handle(duplicate);
+    }
+
     #[test]
     fn duplicated_file_handles_keep_their_file_type() {
         let _guard = TestProcessGuard::new();
@@ -509,8 +560,12 @@ pub(super) extern "win64" fn native_nt_query_information_file(
                 .and_then(|pipes| pipes.handles.get(&original).cloned())
         }) {
             let access = pipe.access;
-            let flags = (if access & 0x1 != 0 { 0x1 } else { 0 })
-                | (if access & 0x2 != 0 { 0x2 } else { 0 });
+            let flags = if pipe.endpoint.server {
+                access & 3 // PIPE_ACCESS_INBOUND/OUTBOUND on server handles
+            } else {
+                (if access & (0x8000_0000 | 0x1000_0000 | 1) != 0 { 1 } else { 0 })
+                    | (if access & (0x4000_0000 | 0x1000_0000 | 2) != 0 { 2 } else { 0 })
+            };
             unsafe { (information as *mut u32).write_unaligned(flags) };
             if !io_status.is_null() {
                 unsafe {
@@ -986,6 +1041,14 @@ fn object_attributes_path(attributes: *const u8) -> Result<String, u32> {
             .strip_prefix(r"\??\")
             .or_else(|| relative.strip_prefix(r"\\?\"))
             .unwrap_or(&relative);
+        let device = r"\Device\HarddiskVolume";
+        if path.get(..device.len()).is_some_and(|prefix| prefix.eq_ignore_ascii_case(device)) {
+            let remainder = &path[device.len()..];
+            let (number, tail) = remainder.split_once('\\').unwrap_or((remainder, ""));
+            let number = number.parse::<u8>().ok().filter(|number| (1..=26).contains(number)).ok_or(0xc0000034u32)?;
+            let drive = (b'A' + number - 1) as char;
+            return Ok(format!("{drive}:\\{tail}"));
+        }
         return Ok(path.to_string());
     }
     let context = fs_ctx().ok_or(STATUS_INVALID_HANDLE)?;

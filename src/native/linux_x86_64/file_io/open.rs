@@ -426,7 +426,7 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_create_named_pipe_w
         return u64::MAX;
     }
     let mut fds = [-1; 2];
-    if unsafe { socketpair(1, 1, 0, fds.as_mut_ptr()) } != 0 {
+    if unsafe { socketpair(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0, fds.as_mut_ptr()) } != 0 {
         native_set_last_error(8); // ERROR_NOT_ENOUGH_MEMORY
         return u64::MAX;
     }
@@ -1496,7 +1496,7 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_read_file(
             native_set_last_error(5);
             return 0;
         }
-        if n == 0 && (!pipe.overlapped || ov == 0) {
+        if n == 0 && ov == 0 {
             if !read_count.is_null() {
                 unsafe { read_count.write(0) };
             }
@@ -1517,7 +1517,7 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_read_file(
                 return 0;
             }
         };
-        if ov != 0 {
+        if ov != 0 && pipe.overlapped {
             let Some(process) = process_ctx() else {
                 return 0;
             };
@@ -1533,18 +1533,21 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_read_file(
             native_set_last_error(997); // ERROR_IO_PENDING
             return 0;
         }
-        let count = unsafe { recv(pipe.endpoint.fd, buf.cast(), n as usize, 0) };
+        let count = if n == 0 { 0 } else { unsafe { recv(pipe.endpoint.fd, buf.cast(), n as usize, 0) } };
         if count < 0 {
+            native_complete_synchronous_pipe_io(&pipe, ov, 0, 0xc000014b, event.as_ref());
             native_set_last_error(109);
             return 0;
         }
         if count == 0 && n != 0 {
+            native_complete_synchronous_pipe_io(&pipe, ov, 0, 0xc000014b, event.as_ref());
             native_set_last_error(109); // ERROR_BROKEN_PIPE
             return 0;
         }
         if !read_count.is_null() {
             unsafe { read_count.write(count as u32) };
         }
+        native_complete_synchronous_pipe_io(&pipe, ov, count as u32, 0, event.as_ref());
         return 1;
     }
     if let Some((device, access)) = native_device(h) {

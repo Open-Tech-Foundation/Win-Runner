@@ -175,7 +175,7 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_write_file(
         } else {
             unsafe { std::slice::from_raw_parts(buf, len as usize).to_vec() }
         };
-        if overlapped != 0 {
+        if overlapped != 0 && pipe.overlapped {
             let Some(process) = process_ctx() else {
                 return 0;
             };
@@ -205,12 +205,14 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_write_file(
             )
         };
         if count < 0 {
+            native_complete_synchronous_pipe_io(&pipe, overlapped, 0, 0xc000014b, event.as_ref());
             native_set_last_error(109);
             return 0;
         }
         if !written.is_null() {
             unsafe { written.write(count as u32) };
         }
+        native_complete_synchronous_pipe_io(&pipe, overlapped, count as u32, 0, event.as_ref());
         return 1;
     }
     if let Some((device, access)) = native_device(handle) {

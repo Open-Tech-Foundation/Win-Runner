@@ -32,6 +32,8 @@ use thread_queries::*;
 #[path = "linux_x86_64/process.rs"]
 mod process;
 use process::*;
+#[path = "linux_x86_64/process_journal.rs"]
+mod process_journal;
 #[path = "linux_x86_64/process_attributes.rs"]
 mod process_attributes;
 use process_attributes::*;
@@ -126,6 +128,9 @@ use ntdll::*;
 #[path = "linux_x86_64/memory.rs"]
 mod memory;
 use memory::*;
+#[path = "linux_x86_64/nt_memory.rs"]
+mod nt_memory;
+use nt_memory::*;
 #[path = "linux_x86_64/system.rs"]
 mod system;
 use system::*;
@@ -141,6 +146,9 @@ use exceptions::*;
 #[path = "linux_x86_64/crypto.rs"]
 mod crypto;
 use crypto::*;
+#[path = "linux_x86_64/certificates.rs"]
+mod certificates;
+use certificates::*;
 #[path = "linux_x86_64/events.rs"]
 mod events;
 use events::*;

@@ -27,6 +27,13 @@ let stderr = ''; child.stderr.on('data', data => stderr += data.toString());
 await wait(child);
 if (stderr !== 'pipe-child') throw Error('detached pipe failed: '+stderr);
 console.log('detached-child.complete');
+child = cp.spawn(process.execPath, ['-e', 'process.stdout.write(await Bun.stdin.text())'], {stdio:['pipe','pipe','pipe']});
+let inputErrors = ''; child.stderr.on('data', data => inputErrors += data.toString());
+let echoed = ''; child.stdout.on('data', data => echoed += data.toString());
+child.stdin.end('native-stdin');
+await wait(child).catch(error => { throw Error(error.message+': '+inputErrors); });
+if (echoed !== 'native-stdin') throw Error('child stdin failed: '+echoed);
+console.log('stdin-child.complete');
 const server = Bun.serve({hostname:'127.0.0.1', port:0, fetch(){return new Response('native-http')}});
 console.log('server.listen');
 try {

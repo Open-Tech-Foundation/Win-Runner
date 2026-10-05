@@ -620,6 +620,12 @@ pub(crate) fn encode_changes(fs: &WinFs) -> Result<Vec<u8>, String> {
 }
 
 pub(crate) fn apply_changes(bytes: &[u8], fs: &mut WinFs) -> Result<(), String> {
+    apply_changes_since(bytes, fs, 0).map(|_| ())
+}
+
+/// Apply only records not previously received from a live child worker.
+/// Decode and validate the complete stream before changing the filesystem.
+pub(crate) fn apply_changes_since(bytes: &[u8], fs: &mut WinFs, applied: usize) -> Result<usize, String> {
     use crate::winfs::{FsChange, WriteData};
     if bytes.len() < 12 || &bytes[..8] != CHANGE_MAGIC {
         return Err("invalid WinFS change stream".to_string());
@@ -693,7 +699,11 @@ pub(crate) fn apply_changes(bytes: &[u8], fs: &mut WinFs) -> Result<(), String> 
     if cursor != bytes.len() {
         return Err("trailing bytes in WinFS change stream".to_string());
     }
-    fs.apply_changes(&changes)
+    if applied > count {
+        return Err("child change journal moved backwards".to_string());
+    }
+    fs.apply_changes(&changes[applied..])?;
+    Ok(count)
 }
 
 fn push_string(out: &mut Vec<u8>, value: &str) -> Result<(), String> {
@@ -959,6 +969,26 @@ mod tests {
         assert!(!loaded.exists(r"Z:\host.txt"));
         std::fs::remove_file(output).ok();
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn live_child_journal_does_not_replay_changes_over_parent_edits() {
+        let mut parent = WinFs::ephemeral_runner();
+        parent.clear_changes();
+        let mut child = parent.clone();
+        child.mkdir(r"C:\first").unwrap();
+        let initial = encode_changes(&child).unwrap();
+        let applied = apply_changes_since(&initial, &mut parent, 0).unwrap();
+        parent.remove(r"C:\first", true).unwrap();
+        child.mkdir(r"C:\second").unwrap();
+        let final_journal = encode_changes(&child).unwrap();
+        let count = apply_changes_since(&final_journal, &mut parent, applied).unwrap();
+        assert!(!parent.exists(r"C:\first"));
+        assert!(parent.exists(r"C:\second"));
+        assert_eq!(apply_changes_since(&final_journal, &mut parent, count).unwrap(), count);
+        assert!(apply_changes_since(&initial, &mut parent, count).is_err());
+        assert!(apply_changes_since(&final_journal[..final_journal.len()-1], &mut parent, 0).is_err());
+        assert!(!parent.exists(r"C:\first"));
     }
 
     #[test]

@@ -993,6 +993,9 @@ pub(super) extern "win64" fn native_load_library_ex_w(
         native_set_last_error(126);
         return 0;
     };
+    if native_diagnostic_enabled() {
+        eprintln!("native LoadLibraryExW requested path={path} file={file:#x} flags={flags:#x}");
+    }
     if file != 0 {
         native_set_last_error(87);
         return 0;

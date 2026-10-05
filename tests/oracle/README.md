@@ -62,6 +62,22 @@ and final `wait4` accounting. Commit charge sums accountable VMAs in `smaps`;
 peak commit is the maximum sampled by queries, not a lifetime kernel counter.
 Extended memory counters beyond `PROCESS_MEMORY_COUNTERS_EX` fail explicitly.
 
+The startup probe also checks child namespace visibility before exit and
+ensures final journals do not undo parent deletions. Child-to-parent namespace
+publication currently polls every 20 ms; changes from a parent into an already
+running child are not broadcast. Shared existing file contents use the same
+blob backing. Certificate checks normalize ROOT-store contents, validate
+certificate/context and EKU buffer layouts, enumerate to the documented end
+error, and retain duplicated contexts across store close. Linux ROOT stores
+use the host CA bundle; writable system stores, personal certificates, registry
+properties and chain verification are outside this implementation. NT memory
+operations cover the current process, with page rounding, protection and release;
+nonzero ZeroBits and operations on other processes remain unsupported. Thread
+alert checks cover pending alerts, coalescing, timeouts and delivery to a newly
+created thread. Console input flushing checks queued input removal and rejection
+of an output handle.
+
+
 `console_runtime` tests code pages 1252 and 65001, the encodings currently
 supported by Win-Runner. Other encodings return an explicit invalid-parameter
 error. Initial Windows console code pages are saved and restored rather than

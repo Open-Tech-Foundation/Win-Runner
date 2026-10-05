@@ -1977,6 +1977,7 @@ fn create_exec_worker_child(
         Err(_) => return Err(8),
     };
     let state_path = directory.join("state.bin");
+    let live_state_path = directory.join("live-state.bin");
     let result_path = directory.join("result.bin");
     let request_path = directory.join("request.json");
     let (process_handle, thread_handle, child) = parent
@@ -1990,6 +1991,7 @@ fn create_exec_worker_child(
         "initially_suspended": initially_suspended,
         "snapshot_path": snapshot_path,
         "state_path": state_path,
+        "live_state_path": live_state_path,
         "result_path": result_path,
         "program": launch.application,
         "args": launch.arguments.get(1..).unwrap_or(&[]),
@@ -2085,20 +2087,12 @@ fn create_exec_worker_child(
     std::thread::Builder::new()
         .name("winrun-native-worker-child".to_string())
         .spawn(move || {
-            let status = wait_worker_with_times(&mut worker, &monitor_child.times);
-            if let Ok(encoded) = std::fs::read(&state_path_for_monitor) {
-                if !encoded.is_empty() {
-                    if let Ok(mut native_fs) = monitor_fs.lock() {
-                        let cwd = native_fs.fs.cwd();
-                        if let Err(error) =
-                            crate::snapshot::apply_changes(&encoded, &mut native_fs.fs)
-                        {
-                            eprintln!("winrun: cannot apply child filesystem changes: {error}");
-                        }
-                        let _ = native_fs.fs.set_cwd(&cwd);
-                    }
-                }
-            }
+            let mut applied = 0;
+            let mut reported_error = None;
+            let status = wait_worker_with_times(&mut worker, &monitor_child.times, || {
+                super::process_journal::receive(&live_state_path, &monitor_fs, &mut applied, &mut reported_error);
+            });
+            super::process_journal::receive(&state_path_for_monitor, &monitor_fs, &mut applied, &mut reported_error);
             if let Ok(native_fs) = monitor_fs.lock() {
                 native_fs.fs.collect_garbage();
             }

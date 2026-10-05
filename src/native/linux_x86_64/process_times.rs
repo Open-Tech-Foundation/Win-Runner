@@ -69,6 +69,7 @@ impl NativeProcessTimes {
 pub(super) fn wait_worker_with_times(
     worker: &mut std::process::Child,
     times: &NativeProcessTimes,
+    mut progress: impl FnMut(),
 ) -> std::io::Result<std::process::ExitStatus> {
     use std::os::unix::process::ExitStatusExt;
     let mut status = 0;
@@ -91,11 +92,16 @@ pub(super) fn wait_worker_with_times(
                 libc::P_PID,
                 worker.id(),
                 &mut info,
-                libc::WEXITED | libc::WNOWAIT,
+                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
             )
         } == 0
         {
-            break;
+            progress();
+            if unsafe { info.si_pid() } != 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            continue;
         }
         let error = std::io::Error::last_os_error();
         if error.kind() != std::io::ErrorKind::Interrupted {
@@ -397,7 +403,7 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = worker.id();
-        let status = wait_worker_with_times(&mut worker, &times).unwrap();
+        let status = wait_worker_with_times(&mut worker, &times, || {}).unwrap();
         assert!(status.success());
         assert!(times.exit.load(Ordering::Acquire) >= creation);
         assert!(times.user.load(Ordering::Acquire) + times.kernel.load(Ordering::Acquire) > 0);

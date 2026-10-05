@@ -294,6 +294,10 @@ pub(crate) fn execute_request(path: &Path) -> Result<u32, String> {
     let result_fd = result_file.into_raw_fd();
     crate::native::set_worker_result_fd(result_fd);
     std::env::set_var("WINRUN_NATIVE_WORKER", "1");
+    match request.get("live_state_path").and_then(serde_json::Value::as_str) {
+        Some(path) => std::env::set_var("WINRUN_NATIVE_LIVE_STATE_PATH", path),
+        None => std::env::remove_var("WINRUN_NATIVE_LIVE_STATE_PATH"),
+    }
     if request.get("native_fs").is_some() {
         std::env::set_var("WINRUN_NATIVE_REQUEST_PATH", path);
     } else {

@@ -6,3 +6,12 @@ NtQueryAttributesFile
 RtlWaitOnAddress
 RtlWakeAddressAll
 RtlWakeAddressSingle
+NtAllocateVirtualMemory
+NtFreeVirtualMemory
+NtProtectVirtualMemory
+RtlGetSystemTimePrecise
+RtlQueryPerformanceCounter
+RtlQueryPerformanceFrequency
+NtQueryInformationFile
+NtWaitForAlertByThreadId
+NtAlertThreadByThreadId

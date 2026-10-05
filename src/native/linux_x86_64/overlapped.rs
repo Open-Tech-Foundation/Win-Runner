@@ -1406,3 +1406,14 @@ pub(super) extern "win64" fn native_get_overlapped_result(
     };
     1
 }
+
+/// Synchronous pipe I/O honors the immediate-success completion-port flag.
+pub(super) fn native_complete_synchronous_pipe_io(pipe: &NativePipeHandle, overlapped: u64, bytes: u32, status: u32, event: Option<&Arc<NativeEvent>>) {
+    if status == 0 && pipe.completion_modes & 1 != 0 {
+        let mut pipe = pipe.clone();
+        pipe.completion = None;
+        native_complete_pipe_io(&pipe, overlapped, bytes, status, event);
+    } else {
+        native_complete_pipe_io(pipe, overlapped, bytes, status, event);
+    }
+}

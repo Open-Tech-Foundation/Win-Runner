@@ -262,3 +262,10 @@ pub(super) extern "win64" fn native_get_system_time_as_file_time(out: *mut u64) 
         .saturating_add(116_444_736_000_000_000);
     unsafe { out.write_unaligned(ticks) };
 }
+
+/// NTDLL's value-returning precise clock shares the Win32 FILETIME source.
+pub(super) extern "win64" fn native_rtl_get_system_time_precise() -> u64 {
+    let mut value = 0;
+    native_get_system_time_as_file_time(&mut value);
+    value
+}

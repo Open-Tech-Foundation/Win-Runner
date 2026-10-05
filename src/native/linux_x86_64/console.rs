@@ -933,6 +933,17 @@ pub(super) extern "win64" fn native_write_console_input_w(
     1
 }
 
+pub(super) extern "win64" fn native_flush_console_input_buffer(handle: u64) -> i32 {
+    if !console_stdin(handle) { native_set_last_error(6); return 0 }
+    let Ok(mut input) = CONSOLE_INPUT.lock() else { native_set_last_error(6); return 0 };
+    if unsafe { libc::isatty(0) } != 0 && unsafe { libc::tcflush(0, libc::TCIFLUSH) } != 0 {
+        native_set_last_error(6); return 0;
+    }
+    input.units.clear(); input.partial.clear(); input.line.clear();
+    input.resize = None; input.escape_started = None; input.eof = false;
+    1
+}
+
 pub(super) extern "win64" fn native_get_number_of_console_input_events(
     handle: u64,
     count: *mut u32,
@@ -1254,4 +1265,30 @@ pub(super) extern "win64" fn native_set_console_text_attribute(
     let bg = ansi((attributes >> 4) & 7) + if attributes & 0x80 != 0 { 100 } else { 40 };
     let text = format!("\x1b[0;{fg};{bg}m");
     (unsafe { write(fd, text.as_ptr().cast(), text.len()) } == text.len() as isize) as i32
+}
+
+#[cfg(test)]
+mod flush_tests {
+    use super::*;
+    #[test]
+    fn flush_discards_pending_input_without_changing_console_mode() {
+        let _guard = TestProcessGuard::new();
+        let saved = CONSOLE_INPUT.lock().unwrap().clone();
+        let mode = saved.mode;
+        {
+            let mut input = CONSOLE_INPUT.lock().unwrap();
+            input.units.push_back(65); input.partial.push(0xc3); input.line.push(66);
+            input.resize = Some((80,25)); input.escape_started = Some(std::time::Instant::now()); input.eof = true;
+        }
+        assert_eq!(native_flush_console_input_buffer(STD_HANDLE_BASE+1), 0);
+        assert_eq!(native_get_last_error(), 6);
+        assert_eq!(native_flush_console_input_buffer(STD_HANDLE_BASE), 1);
+        {
+            let input = CONSOLE_INPUT.lock().unwrap();
+            assert!(input.units.is_empty() && input.partial.is_empty() && input.line.is_empty());
+            assert!(input.resize.is_none() && input.escape_started.is_none() && !input.eof);
+            assert_eq!(input.mode, mode);
+        }
+        *CONSOLE_INPUT.lock().unwrap() = saved;
+    }
 }

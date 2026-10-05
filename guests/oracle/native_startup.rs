@@ -6,6 +6,34 @@ include!("common.rs");
 include!("fs_support.rs");
 extern "system" {
     fn NtClose(handle: usize) -> u32;
+    fn NtWaitForAlertByThreadId(address: usize, timeout: *const i64) -> u32;
+    fn NtAlertThreadByThreadId(id: usize) -> u32;
+    fn NtQueryInformationFile(
+        handle: usize,
+        status: *mut u64,
+        information: *mut u32,
+        size: u32,
+        class: u32,
+    ) -> u32;
+    fn NtAllocateVirtualMemory(
+        process: usize,
+        base: *mut usize,
+        zero: usize,
+        size: *mut usize,
+        kind: u32,
+        protection: u32,
+    ) -> u32;
+    fn NtFreeVirtualMemory(process: usize, base: *mut usize, size: *mut usize, kind: u32) -> u32;
+    fn NtProtectVirtualMemory(
+        process: usize,
+        base: *mut usize,
+        size: *mut usize,
+        protection: u32,
+        previous: *mut u32,
+    ) -> u32;
+    fn RtlGetSystemTimePrecise() -> u64;
+    fn RtlQueryPerformanceCounter(out: *mut u64) -> i32;
+    fn RtlQueryPerformanceFrequency(out: *mut u64) -> i32;
     fn NtQueryDirectoryFile(
         handle: usize,
         event: usize,
@@ -291,6 +319,22 @@ fn files() {
             "file.duplicate_closed",
             NtClose(copy) == 0 && kind(copy) == 0 && kind(handle) == 1,
         );
+        type Final = unsafe extern "system" fn(usize, *mut u16, u32, u32) -> u32;
+        let final_name = api!("device.final_api", "GetFinalPathNameByHandleW", Final);
+        let mut name = [0u16; 512];
+        let length = final_name(handle, name.as_mut_ptr(), 512, 2);
+        let unicode = [
+            length as usize * 2 | ((length as usize * 2) << 16),
+            name.as_ptr() as usize,
+        ];
+        let attributes = [48usize, 0, unicode.as_ptr() as usize, 0x40, 0, 0];
+        let mut basic = [0u64; 5];
+        boolean(
+            "device.attributes_roundtrip",
+            length > 0
+                && length < 512
+                && NtQueryAttributesFile(attributes.as_ptr(), basic.as_mut_ptr()) == 0,
+        );
         boolean("close.success", NtClose(handle) == 0);
         boolean("close.invalid", NtClose(handle) == 0xc0000008);
     }
@@ -393,7 +437,29 @@ fn suspended_child_mode() {
         }
         type Sleep = unsafe extern "system" fn(u32);
         let sleep = api!("child.sleep", "Sleep", Sleep);
-        sleep(50);
+        let create = api!("child.file_api", "CreateFileW", CreateFileWFn);
+        let mut path = [0u16; 64];
+        for (index, byte) in b"child-live.txt".iter().enumerate() {
+            path[index] = *byte as u16;
+        }
+        let file = create(
+            path.as_ptr(),
+            GENERIC_WRITE,
+            SHARE_ALL,
+            0,
+            CREATE_ALWAYS,
+            0,
+            0,
+        );
+        let mut written = 0;
+        if file == INVALID_HANDLE
+            || WriteFile(file, b"live".as_ptr(), 4, &mut written, 0) == 0
+            || written != 4
+        {
+            ExitProcess(24);
+        }
+        NtClose(file);
+        sleep(2000);
         ExitProcess(23);
     }
 }
@@ -456,6 +522,31 @@ fn suspended_process() {
         boolean("suspend.invalid_handle", resume(information[0]) == u32::MAX);
         boolean("suspend.resume", resume(information[1]) == 1);
         boolean("suspend.second_resume", resume(information[1]) == 0);
+        type Sleep = unsafe extern "system" fn(u32);
+        let sleep = api!("live.sleep_api", "Sleep", Sleep);
+        let attributes = api!(
+            "live.attributes_api",
+            "GetFileAttributesW",
+            GetFileAttributesWFn
+        );
+        let remove = api!("live.remove_api", "DeleteFileW", DeleteFileWFn);
+        let mut path = [0u16; 64];
+        for (index, byte) in b"child-live.txt".iter().enumerate() {
+            path[index] = *byte as u16;
+        }
+        let mut visible = false;
+        for _ in 0..50 {
+            if attributes(path.as_ptr()) != u32::MAX {
+                visible = true;
+                break;
+            }
+            sleep(20);
+        }
+        boolean(
+            "live.before_exit",
+            visible && wait(information[0], 0) == 258,
+        );
+        boolean("live.parent_remove", visible && remove(path.as_ptr()) != 0);
         let finished = wait(information[0], 5000) == 0;
         let mut code = 0;
         boolean(
@@ -466,6 +557,10 @@ fn suspended_process() {
         boolean(
             "suspend.final_io",
             io(information[0], counts.as_mut_ptr()) != 0,
+        );
+        boolean(
+            "live.no_final_replay",
+            attributes(path.as_ptr()) == u32::MAX,
         );
         NtClose(information[1]);
         NtClose(information[0]);
@@ -515,6 +610,295 @@ fn resources() {
         );
     }
 }
+fn certificates() {
+    type Load = unsafe extern "system" fn(*const u8) -> usize;
+    let load = api!("cert.load", "LoadLibraryA", Load);
+    let module = unsafe { load(b"CRYPT32.dll\0".as_ptr()) };
+    let open = wsa_api!(
+        module,
+        "CertOpenStore",
+        unsafe extern "system" fn(usize, u32, usize, u32, *const u16) -> usize
+    );
+    let next = wsa_api!(
+        module,
+        "CertEnumCertificatesInStore",
+        unsafe extern "system" fn(usize, usize) -> usize
+    );
+    let duplicate = wsa_api!(
+        module,
+        "CertDuplicateCertificateContext",
+        unsafe extern "system" fn(usize) -> usize
+    );
+    let free = wsa_api!(
+        module,
+        "CertFreeCertificateContext",
+        unsafe extern "system" fn(usize) -> i32
+    );
+    let close = wsa_api!(
+        module,
+        "CertCloseStore",
+        unsafe extern "system" fn(usize, u32) -> i32
+    );
+    let usage = wsa_api!(
+        module,
+        "CertGetEnhancedKeyUsage",
+        unsafe extern "system" fn(usize, u32, *mut u8, *mut u32) -> i32
+    );
+    let root = [82u16, 79, 79, 84, 0];
+    unsafe {
+        let memory = open(2, 0, 0, 0, core::ptr::null());
+        boolean(
+            "cert.memory_empty",
+            memory != 0 && next(memory, 0) == 0 && last_error() == 0x80092004,
+        );
+        boolean("cert.memory_close", close(memory, 0) != 0);
+        let store = open(10, 0, 0, 0x2c000, root.as_ptr());
+        let first = if store != 0 { next(store, 0) } else { 0 };
+        boolean("cert.root_open", store != 0 && first != 0);
+        if first == 0 {
+            if store != 0 {
+                close(store, 0);
+            }
+            return;
+        }
+        let context = first as *const u8;
+        let encoding = (context as *const u32).read_unaligned();
+        let data = (context.add(8) as *const usize).read_unaligned();
+        let encoded_size = (context.add(16) as *const u32).read_unaligned();
+        let info = (context.add(24) as *const usize).read_unaligned();
+        boolean(
+            "cert.root_context",
+            encoding == 1
+                && encoded_size > 100
+                && data != 0
+                && *(data as *const u8) == 48
+                && info != 0
+                && *(info as *const u32) <= 2
+                && *((info + 48) as *const u32) > 0,
+        );
+        let mut size = 0;
+        let queried = usage(first, 0, core::ptr::null_mut(), &mut size) != 0;
+        boolean("cert.usage_size", queried && size >= 16 && size <= 4096);
+        let mut buffer = [0x5555555555555555u64; 512];
+        let mut small = 1;
+        boolean(
+            "cert.usage_small",
+            usage(first, 0, buffer.as_mut_ptr().cast(), &mut small) == 0
+                && last_error() == 234
+                && small == size
+                && buffer[0] == 0x5555555555555555,
+        );
+        let mut capacity = 4096;
+        boolean(
+            "cert.usage_read",
+            usage(first, 0, buffer.as_mut_ptr().cast(), &mut capacity) != 0 && capacity == size,
+        );
+        boolean("cert.duplicate", duplicate(first) == first);
+        let mut current = first;
+        let mut complete = false;
+        for _ in 0..4096 {
+            current = next(store, current);
+            if current == 0 {
+                complete = last_error() == 0x80092004;
+                break;
+            }
+        }
+        boolean("cert.enum_end", complete);
+        boolean(
+            "cert.pending_close",
+            close(store, 2) == 0 && last_error() == 0x8009200f,
+        );
+        boolean(
+            "cert.copy_survives_close",
+            *(data as *const u8) == 48 && (context.add(16) as *const u32).read_unaligned() == encoded_size,
+        );
+        boolean("cert.free", free(first) != 0 && free(0) != 0);
+    }
+}
+
+unsafe extern "system" fn alert_waiter(_: usize) -> u32 {
+    let timeout = -10_000_000i64;
+    NtWaitForAlertByThreadId(0, &timeout)
+}
+fn alerts_and_console_flush() {
+    type Id = unsafe extern "system" fn() -> u32;
+    type Thread = unsafe extern "system" fn(usize, usize, usize, usize, u32, *mut u32) -> usize;
+    type Wait = unsafe extern "system" fn(usize, u32) -> u32;
+    type Code = unsafe extern "system" fn(usize, *mut u32) -> i32;
+    let id = api!("alert.id_api", "GetCurrentThreadId", Id);
+    let create = api!("alert.thread_api", "CreateThread", Thread);
+    let wait = api!("alert.wait_api", "WaitForSingleObject", Wait);
+    let code = api!("alert.code_api", "GetExitCodeThread", Code);
+    unsafe {
+        let poll = 0i64;
+        boolean("alert.timeout", NtWaitForAlertByThreadId(0, &poll) == 0x102);
+        boolean(
+            "alert.pending",
+            NtAlertThreadByThreadId(id() as usize) == 0
+                && NtAlertThreadByThreadId(id() as usize) == 0
+                && NtWaitForAlertByThreadId(0, &poll) == 0x101
+                && NtWaitForAlertByThreadId(0, &poll) == 0x102,
+        );
+        let mut target = 0;
+        let thread = create(0, 0, alert_waiter as *const () as usize, 0, 0, &mut target);
+        let notified = thread != 0 && NtAlertThreadByThreadId(target as usize) == 0;
+        let mut result = 0;
+        boolean(
+            "alert.other_thread",
+            notified
+                && wait(thread, 2000) == 0
+                && code(thread, &mut result) != 0
+                && result == 0x101,
+        );
+        NtClose(thread);
+        type Flush = unsafe extern "system" fn(usize) -> i32;
+        type Inject = unsafe extern "system" fn(usize, *const u8, u32, *mut u32) -> i32;
+        type Count = unsafe extern "system" fn(usize, *mut u32) -> i32;
+        let flush_input = api!("console.flush_api", "FlushConsoleInputBuffer", Flush);
+        let inject = api!("console.inject_api", "WriteConsoleInputW", Inject);
+        let count = api!("console.count_api", "GetNumberOfConsoleInputEvents", Count);
+        let mut record = [0u8; 20];
+        record[0] = 1;
+        record[4] = 1;
+        record[8] = 1;
+        record[14] = 65;
+        let input = GetStdHandle(0xfffffff6);
+        let mut written = 0;
+        let mut remaining = u32::MAX;
+        boolean(
+            "console.flush_input",
+            inject(input, record.as_ptr(), 1, &mut written) != 0
+                && written == 1
+                && flush_input(input) != 0
+                && count(input, &mut remaining) != 0
+                && remaining == 0,
+        );
+        boolean(
+            "console.flush_output",
+            flush_input(GetStdHandle(0xfffffff5)) == 0 && last_error() == 6,
+        );
+    }
+}
+
+fn sync_pipes() {
+    type Pipe = unsafe extern "system" fn(*mut usize, *mut usize, usize, u32) -> i32;
+    type Read = unsafe extern "system" fn(usize, *mut u8, u32, *mut u32, *mut u64) -> i32;
+    let pipe = api!("sync_pipe.api", "CreatePipe", Pipe);
+    let read = api!("sync_pipe.read_api", "ReadFile", Read);
+    let mut reader = 0;
+    let mut writer = 0;
+    unsafe {
+        let created = pipe(&mut reader, &mut writer, 0, 0) != 0;
+        boolean("sync_pipe.created", created);
+        if !created {
+            return;
+        }
+        let mut status = [0u64; 2];
+        let mut access = 0;
+        boolean(
+            "sync_pipe.read_access",
+            NtQueryInformationFile(reader, status.as_mut_ptr(), &mut access, 4, 8) == 0
+                && access & 3 == 1,
+        );
+        boolean(
+            "sync_pipe.write_access",
+            NtQueryInformationFile(writer, status.as_mut_ptr(), &mut access, 4, 8) == 0
+                && access & 3 == 2,
+        );
+        let mut write_overlap = [0u64; 4];
+        let mut read_overlap = [0u64; 4];
+        let mut transferred = 0;
+        boolean(
+            "sync_pipe.write",
+            WriteFile(
+                writer,
+                b"sync".as_ptr(),
+                4,
+                &mut transferred,
+                write_overlap.as_mut_ptr() as usize,
+            ) != 0
+                && transferred == 4,
+        );
+        let mut buffer = [0u8; 4];
+        boolean(
+            "sync_pipe.read",
+            read(
+                reader,
+                buffer.as_mut_ptr(),
+                4,
+                &mut transferred,
+                read_overlap.as_mut_ptr(),
+            ) != 0
+                && transferred == 4
+                && &buffer == b"sync",
+        );
+        NtClose(writer);
+        read_overlap.fill(0);
+        boolean(
+            "sync_pipe.eof",
+            read(
+                reader,
+                buffer.as_mut_ptr(),
+                4,
+                &mut transferred,
+                read_overlap.as_mut_ptr(),
+            ) == 0
+                && last_error() == 109,
+        );
+        NtClose(reader);
+    }
+}
+
+fn nt_memory() {
+    let mut base = 0;
+    let mut size = 3;
+    unsafe {
+        let allocated =
+            NtAllocateVirtualMemory(usize::MAX, &mut base, 0, &mut size, 0x3000, 4) == 0;
+        boolean("nt_memory.allocate", allocated && base != 0 && size == 4096);
+        if !allocated {
+            return;
+        }
+        *(base as *mut u8) = 23;
+        let original = base;
+        base += 1;
+        size = 1;
+        let mut old = 0;
+        boolean(
+            "nt_memory.protect",
+            NtProtectVirtualMemory(usize::MAX, &mut base, &mut size, 2, &mut old) == 0
+                && base == original
+                && size == 4096
+                && old == 4
+                && *(base as *const u8) == 23,
+        );
+        size = 0;
+        boolean(
+            "nt_memory.release",
+            NtFreeVirtualMemory(usize::MAX, &mut base, &mut size, 0x8000) == 0,
+        );
+        type Time = unsafe extern "system" fn(*mut u64);
+        let clock = api!("nt_time.api", "GetSystemTimePreciseAsFileTime", Time);
+        let mut before = 0;
+        let mut after = 0;
+        clock(&mut before);
+        let precise = RtlGetSystemTimePrecise();
+        clock(&mut after);
+        boolean("nt_time.precise", before <= precise && precise <= after);
+        let mut counter1 = 0;
+        let mut counter2 = 0;
+        let mut frequency = 0;
+        boolean(
+            "nt_time.performance",
+            RtlQueryPerformanceFrequency(&mut frequency) != 0
+                && frequency > 0
+                && RtlQueryPerformanceCounter(&mut counter1) != 0
+                && RtlQueryPerformanceCounter(&mut counter2) != 0
+                && counter2 >= counter1,
+        );
+    }
+}
+
 fn waits() {
     let address = 1u32;
     let different = 2u32;
@@ -544,7 +928,11 @@ pub extern "system" fn probe_entry() -> ! {
     files();
     socket_options();
     waits();
+    nt_memory();
+    sync_pipes();
+    alerts_and_console_flush();
     resources();
+    certificates();
     suspended_process();
     out_str("END\n");
     flush();

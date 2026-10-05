@@ -44,6 +44,19 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Publish native child filesystem changes while workers are running, without
+  replaying applied changes at exit. Map NT device-volume paths back to guest
+  drives so extracted native libraries can reopen temporary files. Return
+  correct client-pipe access rights, support synchronous pipe I/O with an
+  OVERLAPPED record, and prevent host pipe descriptors leaking through exec.
+  Add read-only CryptoAPI ROOT-store enumeration backed by the Linux trust
+  bundle, decoded certificate contexts, enhanced-key-usage queries and context
+  lifetime management. Add current-process NT virtual-memory entry points and
+  NTDLL precise/performance clocks over the existing native backends. Support
+  NT thread alerts, pending-alert coalescing and timeouts, plus console input
+  flushing that preserves console modes, with
+  Windows oracle and real Bun stdin regression coverage.
+
 - Return the main PE module for `GetModuleHandleA(NULL)` so embedded
   applications can find their own executable sections. Bind existing NT file
   queries for static imports; add `NtClose`, `NtQueryAttributesFile`,
