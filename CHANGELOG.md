@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add native `QueueUserAPC`, `ReadFileEx`, and `WriteFileEx`, with per-thread
+  callback queues, issuing-thread completion delivery for regular files and
+  named pipes, cancellation, EOF, and ignored overlapped event handles.
+  Add a real Windows oracle for APC ordering, duplicated thread handles,
+  alertable waits, file completion routines, and cancelled pipe reads.
+
 - Add native `AddDllDirectory`, `RemoveDllDirectory`, `SetDllDirectoryW`,
   and `GetDllDirectoryW`, with per-process search configuration and a real
   PE DLL search oracle covering cookies, directory buffers, duplicate names,
@@ -25,6 +31,12 @@ All notable changes to this project will be documented in this file.
   and PATH immediately, preserving shell variables, functions, and files.
 
 ### Fixed
+
+- Honor alertable waits in `SleepEx`, single/multiple-object waits,
+  `SignalObjectAndWait`, `GetOverlappedResultEx`, and completion-port waits.
+  Implement timed overlapped-result waits and wake completion-port waiters
+  on close. Preserve auto-reset events and semaphore counts until a wait-all
+  succeeds; timeouts and APC interruptions no longer consume earlier objects.
 
 - Honor `SetDefaultDllDirectories` and `LoadLibraryExW/A` search flags,
   including DLL-load-directory and altered dependency search. Search only

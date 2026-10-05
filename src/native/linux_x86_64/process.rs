@@ -454,11 +454,20 @@ pub(super) extern "win64" fn native_create_thread(
     let thread_tls = Arc::clone(&tls_block);
     let suspension = Arc::new((Mutex::new((flags & 4 != 0) as u32), Condvar::new()));
     let thread_suspension = Arc::clone(&suspension);
+    let apc = Arc::new(NativeApcQueue::default());
+    let thread_apc = apc.clone();
     let spawned = builder.spawn(move || {
         THREAD_NATIVE_HANDLE.set(handle);
+        if let Ok(mut queues) = thread_process.apc_queues.lock() {
+            queues.insert(std::thread::current().id(), thread_apc.clone());
+        }
         THREAD_NATIVE_PROCESS.with(|active| {
             *active.borrow_mut() = Some(Arc::clone(&thread_process));
         });
+        let _apc_lifetime = NativeThreadApcGuard {
+            queue: thread_apc.clone(),
+            process: thread_process.clone(),
+        };
         let (count, ready) = &*thread_suspension;
         let Ok(mut count) = count.lock() else {
             return 1;
@@ -481,7 +490,10 @@ pub(super) extern "win64" fn native_create_thread(
         THREAD_TEB_BASE.set(tls.teb.as_ptr() as u64);
         drop(tls);
         thread_runtime::notify_guest_thread_modules(&thread_process, true);
-        let exit_code = match unsafe { super::exceptions::invoke_guest_with_arguments(start, [parameter, 0, 0]) } {
+        dispatch_apcs();
+        let exit_code = match unsafe {
+            super::exceptions::invoke_guest_with_arguments(start, [parameter, 0, 0])
+        } {
             Ok(code) => code,
             Err(code) => native_exit_process(code),
         };
@@ -501,6 +513,7 @@ pub(super) extern "win64" fn native_create_thread(
             threads.insert(
                 handle,
                 NativeThread {
+                    apc,
                     join: Some(join),
                     exit_code: None,
                     suspension,
@@ -2509,8 +2522,14 @@ pub(super) extern "win64" fn native_free_library_and_exit_thread(_module: u64, _
     if native_diagnostic_enabled() {
         eprintln!("native FreeLibraryAndExitThread");
     }
+    if let Some(queue) = current_apc_queue() {
+        queue.close();
+    }
     let handle = THREAD_NATIVE_HANDLE.get();
     if let Some(process) = process_ctx() {
+        if let Ok(mut queues) = process.apc_queues.lock() {
+            queues.remove(&std::thread::current().id());
+        }
         if let Ok(mut threads) = process.threads.lock() {
             if let Some(thread) = threads.get_mut(&handle) {
                 thread.exit_code = Some(_code);

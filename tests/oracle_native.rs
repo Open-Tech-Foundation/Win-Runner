@@ -81,7 +81,12 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
         assert!(!actual.contains("PANIC"), "{name} panicked:\n{actual}");
         if matches!(
             name.as_str(),
-            "process_runtime" | "crt_runtime" | "socket_events" | "file_locks" | "dll_search"
+            "process_runtime"
+                | "crt_runtime"
+                | "socket_events"
+                | "file_locks"
+                | "dll_search"
+                | "apc_io"
         ) {
             assert!(
                 !actual.contains("wrong") && !actual.contains("unavailable"),
@@ -136,6 +141,25 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
                 "lock.large_range: ok",
                 "async.granted: ok",
                 "async.cancel_result: ok",
+            ],
+            "apc_io" => &[
+                "apc.fifo: ok",
+                "apc.prestart_delivery: ok",
+                "wait.signal_apc: ok",
+                "apc.thread_owner: ok",
+                "apc.duplicated_owner: ok",
+                "apc.access_denied: ok",
+                "wait.all_preserves_event: ok",
+                "io.write_callback: ok",
+                "io.read_callback: ok",
+                "io.eof_callback: ok",
+                "io.zero_preserves_size: ok",
+                "io.append: ok",
+                "pipe.cancel_result: ok",
+                "port.alertable: ok",
+                "result.timeout: ok",
+                "result.alertable: ok",
+                "io.cancel_callback: ok",
             ],
             "dll_search" => &[
                 "module.loaded_paths: ok",

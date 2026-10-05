@@ -23,6 +23,9 @@ mod loader;
 mod dll_search;
 use dll_search::*;
 use loader::*;
+#[path = "linux_x86_64/apc.rs"]
+mod apc;
+use apc::*;
 #[path = "linux_x86_64/process.rs"]
 mod process;
 use process::*;

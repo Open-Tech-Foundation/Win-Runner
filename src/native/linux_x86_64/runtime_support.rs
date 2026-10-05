@@ -46,19 +46,45 @@ pub(super) extern "win64" fn native_set_thread_error_mode(_mode: u32, previous: 
     1
 }
 
-/// `SleepEx`: no APCs are ever queued to guest threads, so an alertable
-/// sleep always runs to completion.
-pub(super) extern "win64" fn native_sleep_ex(milliseconds: u32, _alertable: i32) -> u32 {
-    native_sleep(milliseconds);
-    0
+pub(super) extern "win64" fn native_sleep_ex(milliseconds: u32, alertable: i32) -> u32 {
+    if alertable == 0 {
+        native_sleep(milliseconds);
+        return 0;
+    }
+    let deadline = wait_deadline(milliseconds);
+    loop {
+        if dispatch_apcs() {
+            return WAIT_IO_COMPLETION;
+        }
+        if wait_expired(deadline) {
+            return 0;
+        }
+        apc_pause();
+    }
 }
 
 pub(super) extern "win64" fn native_wait_for_single_object_ex(
     handle: u64,
     milliseconds: u32,
-    _alertable: i32,
+    alertable: i32,
 ) -> u32 {
-    native_wait_for_single_object(handle, milliseconds)
+    if alertable == 0 {
+        return native_wait_for_single_object(handle, milliseconds);
+    }
+    let deadline = wait_deadline(milliseconds);
+    loop {
+        if dispatch_apcs() {
+            return WAIT_IO_COMPLETION;
+        }
+        let result = native_wait_for_single_object(handle, 0);
+        if result != 258 {
+            return result;
+        }
+        if wait_expired(deadline) {
+            return 258;
+        }
+        apc_pause();
+    }
 }
 
 pub(super) extern "win64" fn native_create_semaphore_w(

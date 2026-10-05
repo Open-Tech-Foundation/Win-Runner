@@ -1,6 +1,6 @@
 use super::*;
 
-pub(in crate::native::linux_x86_64::file_io) fn native_submit_pipe_io(
+pub(in crate::native::linux_x86_64) fn native_submit_pipe_io(
     process: &Arc<NativeProcessContext>,
     handle: u64,
     pipe: NativePipeHandle,
@@ -9,6 +9,7 @@ pub(in crate::native::linux_x86_64::file_io) fn native_submit_pipe_io(
     buffer: usize,
     data: Option<Vec<u8>>,
     length: usize,
+    completion: Option<NativeIoCompletion>,
 ) -> Result<(), u32> {
     let cancelled = Arc::new(AtomicBool::new(false));
     let issuer = std::thread::current().id();
@@ -99,7 +100,12 @@ pub(in crate::native::linux_x86_64::file_io) fn native_submit_pipe_io(
             }
             // Publish completion only after the old request is removed:
             // callers may immediately reuse the same OVERLAPPED address.
-            native_complete_pipe_io(&worker_pipe, overlapped, bytes, status, event.as_ref());
+            if let Some(completion) = completion {
+                native_set_overlapped_status(overlapped, status as u64, bytes);
+                completion.complete(overlapped, bytes, status as u64);
+            } else {
+                native_complete_pipe_io(&worker_pipe, overlapped, bytes, status, event.as_ref());
+            }
         });
     if spawn.is_err() {
         if let Ok(mut pipes) = process.named_pipes.lock() {
@@ -182,6 +188,7 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_write_file(
                 0,
                 Some(payload),
                 len as usize,
+                None,
             ) {
                 native_set_last_error(error);
                 return 0;
@@ -644,6 +651,7 @@ mod named_pipe_tests {
         assert_eq!(completion.status, 0);
         assert_eq!(completion.bytes, payload.len() as u32);
         assert_eq!(&received[..completion.bytes as usize], payload);
+        drop(queue);
         assert_eq!(native_close_handle(client), 1);
         assert_eq!(native_close_handle(server), 1);
         assert_eq!(native_close_handle(port_handle), 1);
@@ -684,6 +692,7 @@ mod named_pipe_tests {
         assert_eq!(completion.key, 0x5678);
         assert_eq!(completion.overlapped, overlapped.as_ptr() as u64);
         assert_eq!(completion.status, 0);
+        drop(queue);
         assert_eq!(native_close_handle(client), 1);
         assert_eq!(native_close_handle(server), 1);
         assert_eq!(native_close_handle(port), 1);

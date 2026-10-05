@@ -483,20 +483,61 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_get_overlapped_resu
     handle: u64,
     overlapped: u64,
     bytes: *mut u32,
-    _timeout: u32,
-    _alertable: i32,
+    timeout: u32,
+    alertable: i32,
 ) -> i32 {
-    let valid_handle = process_ctx().is_some_and(|process| {
+    let valid = process_ctx().is_some_and(|process| {
         process
             .fs
             .lock()
             .is_ok_and(|fs| fs.handles.contains_key(&handle))
+            || process
+                .named_pipes
+                .lock()
+                .is_ok_and(|pipes| pipes.handles.contains_key(&handle))
     });
-    if !valid_handle {
+    if !valid {
         native_set_last_error(6);
         return 0;
     }
-    native_get_overlapped_result(handle, overlapped, bytes, 0)
+    if overlapped == 0 || overlapped & 7 != 0 || bytes.is_null() {
+        native_set_last_error(87);
+        return 0;
+    }
+    let deadline = wait_deadline(timeout);
+    loop {
+        let result = native_get_overlapped_result(handle, overlapped, bytes, 0);
+        if result != 0 || native_get_last_error() != 996 {
+            return result;
+        }
+        if timeout == 0 {
+            return 0;
+        }
+        let event = unsafe { ((overlapped + 24) as *const u64).read_unaligned() } & !1;
+        if event != 0 {
+            let waited = native_wait_for_single_object_ex(event, timeout, alertable);
+            if waited == 0 {
+                return native_get_overlapped_result(handle, overlapped, bytes, 0);
+            }
+            if waited != u32::MAX {
+                native_set_last_error(waited);
+            }
+            return 0;
+        }
+        if alertable != 0 && dispatch_apcs() {
+            native_set_last_error(WAIT_IO_COMPLETION);
+            return 0;
+        }
+        if wait_expired(deadline) {
+            native_set_last_error(258);
+            return 0;
+        }
+        if alertable != 0 {
+            apc_pause();
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
 }
 
 pub(in crate::native::linux_x86_64) fn native_device(handle: u64) -> Option<(NativeDevice, u32)> {

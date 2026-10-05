@@ -246,7 +246,7 @@ pub(super) fn socket_event_connect(socket: u64) {
     }
 }
 
-fn refresh(process: &NativeProcessContext, handle: u64) {
+pub(super) fn refresh_socket_event(process: &NativeProcessContext, handle: u64) {
     let Ok(mut selections) = process.socket_events.lock() else {
         return;
     };
@@ -350,7 +350,7 @@ pub(super) fn socket_event_wait(
     let deadline = (milliseconds != u32::MAX)
         .then(|| std::time::Instant::now() + std::time::Duration::from_millis(milliseconds as u64));
     loop {
-        refresh(process, handle);
+        refresh_socket_event(process, handle);
         if native_wait_event(event, 0) == 0 {
             return Some(0);
         }

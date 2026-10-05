@@ -1522,7 +1522,7 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_read_file(
                 return 0;
             };
             if let Err(error) =
-                native_submit_pipe_io(&process, h, pipe, ov, event, buf as usize, None, n as usize)
+                native_submit_pipe_io(&process, h, pipe, ov, event, buf as usize, None, n as usize, None)
             {
                 native_set_last_error(error);
                 return 0;

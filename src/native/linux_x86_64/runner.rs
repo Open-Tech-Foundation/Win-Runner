@@ -543,6 +543,8 @@ fn run_rust_baseline_argv_with_fs_impl(
             dynamic_tls: Mutex::new(DynamicTlsSlots::new(img.tls.is_some())),
             threads: Mutex::new(HashMap::new()),
             thread_next: AtomicU64::new(0x8000_0000),
+            apc_handles: Mutex::new(HashMap::new()),
+            apc_queues: Mutex::new(HashMap::new()),
             semaphores: Mutex::new(HashMap::new()),
             semaphore_next: AtomicU64::new(0x6000_0000),
             events: Mutex::new(HashMap::new()),

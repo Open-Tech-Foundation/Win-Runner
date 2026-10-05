@@ -1328,14 +1328,14 @@ const WAIT_FAILED: u32 = u32::MAX;
 
 /// `WaitForMultipleObjects(Ex)` over the single-object wait: "any" polls
 /// each handle until one is signaled (returning `WAIT_OBJECT_0 + i` or
-/// `WAIT_ABANDONED_0 + i`); "all" waits on each in turn within the one
-/// timeout. No APCs are ever queued, so alertable waits behave the same.
+/// `WAIT_ABANDONED_0 + i`); "all" consumes object states only when every
+/// object is ready. Alertable waits dispatch callbacks on the calling thread.
 pub(super) extern "win64" fn native_wait_for_multiple_objects_ex(
     count: u32,
     handles: *const u64,
     wait_all: i32,
     milliseconds: u32,
-    _alertable: i32,
+    alertable: i32,
 ) -> u32 {
     if count == 0 || count > 64 || handles.is_null() {
         native_set_last_error(87);
@@ -1355,15 +1355,28 @@ pub(super) extern "win64" fn native_wait_for_multiple_objects_ex(
             .min(u128::from(u32::MAX - 1)) as u32,
     };
     if wait_all != 0 {
-        for handle in &handles {
-            match native_wait_for_single_object(*handle, remaining()) {
-                0 | WAIT_ABANDONED_0 => {}
-                other => return other,
+        loop {
+            if alertable != 0 && dispatch_apcs() {
+                return WAIT_IO_COMPLETION;
+            }
+            let result = poll_wait_all(&handles);
+            if result != WAIT_TIMEOUT {
+                return result;
+            }
+            if remaining() == 0 {
+                return WAIT_TIMEOUT;
+            }
+            if alertable != 0 {
+                apc_pause();
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
         }
-        return 0;
     }
     loop {
+        if alertable != 0 && dispatch_apcs() {
+            return WAIT_IO_COMPLETION;
+        }
         for (index, handle) in handles.iter().enumerate() {
             match native_wait_for_single_object(*handle, 0) {
                 0 => return index as u32,
@@ -1375,8 +1388,133 @@ pub(super) extern "win64" fn native_wait_for_multiple_objects_ex(
         if remaining() == 0 {
             return WAIT_TIMEOUT;
         }
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        if alertable != 0 {
+            apc_pause();
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
+}
+
+// Hold all consuming object states until every object is signaled. An APC or
+// timeout must not consume an earlier auto-reset event or semaphore count.
+enum WaitAllObject {
+    Event(Arc<NativeEvent>),
+    Semaphore(Arc<NativeSemaphore>),
+    Timer(Arc<NativeWaitableTimer>),
+    Other(u64),
+}
+enum WaitAllState<'a> {
+    Event(std::sync::MutexGuard<'a, bool>, bool),
+    Semaphore(std::sync::MutexGuard<'a, i32>),
+    Timer(std::sync::MutexGuard<'a, NativeTimerState>, bool),
+    Other,
+}
+fn poll_wait_all(handles: &[u64]) -> u32 {
+    let Some(process) = process_ctx() else {
+        native_set_last_error(6);
+        return WAIT_FAILED;
+    };
+    let mut sorted = handles.to_vec();
+    sorted.sort_unstable();
+    if sorted.windows(2).any(|pair| pair[0] == pair[1]) {
+        native_set_last_error(87);
+        return WAIT_FAILED;
+    }
+    let mut objects: Vec<_> = sorted
+        .into_iter()
+        .map(|handle| {
+            if let Some(event) = process
+                .events
+                .lock()
+                .ok()
+                .and_then(|objects| objects.get(&handle).cloned())
+            {
+                refresh_socket_event(&process, handle);
+                return WaitAllObject::Event(event);
+            }
+            if let Some(semaphore) = process
+                .semaphores
+                .lock()
+                .ok()
+                .and_then(|objects| objects.get(&handle).cloned())
+            {
+                return WaitAllObject::Semaphore(semaphore);
+            }
+            if let Some(timer) = process
+                .timers
+                .lock()
+                .ok()
+                .and_then(|objects| objects.get(&handle).cloned())
+            {
+                return WaitAllObject::Timer(timer);
+            }
+            WaitAllObject::Other(handle)
+        })
+        .collect();
+    let identity = |object: &WaitAllObject| match object {
+        WaitAllObject::Event(event) => (0, Arc::as_ptr(event) as usize),
+        WaitAllObject::Semaphore(semaphore) => (1, Arc::as_ptr(semaphore) as usize),
+        WaitAllObject::Timer(timer) => (2, Arc::as_ptr(timer) as usize),
+        WaitAllObject::Other(handle) => (3, *handle as usize),
+    };
+    objects.sort_unstable_by_key(identity);
+    if objects
+        .windows(2)
+        .any(|pair| identity(&pair[0]) == identity(&pair[1]))
+    {
+        native_set_last_error(87);
+        return WAIT_FAILED;
+    }
+    let mut states = Vec::new();
+    let mut ready = true;
+    for object in &objects {
+        let state = match object {
+            WaitAllObject::Event(event) => match event.signaled.lock() {
+                Ok(state) => {
+                    ready &= *state;
+                    WaitAllState::Event(state, event.manual_reset)
+                }
+                Err(_) => return WAIT_FAILED,
+            },
+            WaitAllObject::Semaphore(semaphore) => match semaphore.count.lock() {
+                Ok(state) => {
+                    ready &= *state > 0;
+                    WaitAllState::Semaphore(state)
+                }
+                Err(_) => return WAIT_FAILED,
+            },
+            WaitAllObject::Timer(timer) => match timer.state.lock() {
+                Ok(mut state) => {
+                    update_timer_state(&mut state);
+                    ready &= state.signaled;
+                    WaitAllState::Timer(state, timer.manual_reset)
+                }
+                Err(_) => return WAIT_FAILED,
+            },
+            WaitAllObject::Other(handle) => match native_wait_for_single_object(*handle, 0) {
+                0 => WaitAllState::Other,
+                WAIT_TIMEOUT => {
+                    ready = false;
+                    WaitAllState::Other
+                }
+                failed => return failed,
+            },
+        };
+        states.push(state);
+    }
+    if !ready {
+        return WAIT_TIMEOUT;
+    }
+    for state in &mut states {
+        match state {
+            WaitAllState::Event(state, manual) => **state = *manual,
+            WaitAllState::Semaphore(state) => **state -= 1,
+            WaitAllState::Timer(state, manual) => state.signaled = *manual,
+            WaitAllState::Other => {}
+        }
+    }
+    0
 }
 
 pub(super) extern "win64" fn native_wait_for_multiple_objects(
@@ -1394,7 +1532,7 @@ pub(super) extern "win64" fn native_signal_object_and_wait(
     signal: u64,
     wait: u64,
     milliseconds: u32,
-    _alertable: i32,
+    alertable: i32,
 ) -> u32 {
     if native_set_event(signal) == 0
         && native_release_semaphore(signal, 1, std::ptr::null_mut()) == 0
@@ -1402,7 +1540,7 @@ pub(super) extern "win64" fn native_signal_object_and_wait(
         native_set_last_error(6);
         return WAIT_FAILED;
     }
-    native_wait_for_single_object(wait, milliseconds)
+    native_wait_for_single_object_ex(wait, milliseconds, alertable)
 }
 
 #[cfg(test)]

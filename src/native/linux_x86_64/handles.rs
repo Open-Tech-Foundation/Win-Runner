@@ -284,7 +284,28 @@ fn native_duplicate_handle_impl(
             return 1;
         }
     }
-    let valid = matches!(original, u64::MAX | 0xffff_ffff_ffff_fffe)
+    let apc = process
+        .apc_handles
+        .lock()
+        .ok()
+        .and_then(|handles| handles.get(&source_handle).cloned())
+        .or_else(|| {
+            if source_handle == u64::MAX - 1 {
+                current_apc_queue().map(|queue| NativeApcHandle {
+                    queue,
+                    access: 0x1fffff,
+                })
+            } else {
+                process.threads.lock().ok().and_then(|threads| {
+                    threads.get(&original).map(|thread| NativeApcHandle {
+                        queue: thread.apc.clone(),
+                        access: 0x1fffff,
+                    })
+                })
+            }
+        });
+    let valid = apc.is_some()
+        || matches!(original, u64::MAX | 0xffff_ffff_ffff_fffe)
         || host_standard_fd(original).is_some()
         || native_device(original).is_some()
         || process
@@ -310,6 +331,15 @@ fn native_duplicate_handle_impl(
             values.insert(duplicate, original);
         }
         Err(_) => return 0,
+    }
+    if let Some(mut apc) = apc {
+        if options & 2 == 0 {
+            apc.access = desired_access;
+        }
+        let Ok(mut handles) = process.apc_handles.lock() else {
+            return 0;
+        };
+        handles.insert(duplicate, apc);
     }
     unsafe { target_handle.write(duplicate) };
     1
@@ -381,6 +411,11 @@ pub(super) extern "win64" fn native_close_handle(h: u64) -> i32 {
         return 0;
     }
     let process = process_ctx();
+    if let Some(process) = &process {
+        if let Ok(mut handles) = process.apc_handles.lock() {
+            handles.remove(&h);
+        }
+    }
     if let Some(job) = process.as_ref().and_then(|process| {
         process
             .job_objects
@@ -450,12 +485,17 @@ pub(super) extern "win64" fn native_close_handle(h: u64) -> i32 {
     }) {
         return 1;
     }
-    if process.as_ref().is_some_and(|process| {
+    if let Some(port) = process.as_ref().and_then(|process| {
         process
             .completion_ports
             .lock()
-            .is_ok_and(|mut values| values.remove(&h).is_some())
+            .ok()
+            .and_then(|mut ports| ports.remove(&h))
     }) {
+        if let Ok(_guard) = port.queue.lock() {
+            port.closed.store(true, Ordering::Release);
+            port.ready.notify_all();
+        }
         return 1;
     }
     if process.as_ref().is_some_and(|process| {

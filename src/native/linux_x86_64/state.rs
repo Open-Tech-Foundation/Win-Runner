@@ -233,6 +233,8 @@ pub(super) struct NativeProcessContext {
     pub(super) dynamic_tls: Mutex<DynamicTlsSlots>,
     pub(super) threads: Mutex<HashMap<u64, NativeThread>>,
     pub(super) thread_next: AtomicU64,
+    pub(super) apc_handles: Mutex<HashMap<u64, NativeApcHandle>>,
+    pub(super) apc_queues: Mutex<HashMap<std::thread::ThreadId, Arc<NativeApcQueue>>>,
     pub(super) semaphores: Mutex<HashMap<u64, Arc<NativeSemaphore>>>,
     pub(super) semaphore_next: AtomicU64,
     pub(super) events: Mutex<HashMap<u64, Arc<NativeEvent>>>,
@@ -293,6 +295,7 @@ pub(super) struct NativeLoadedModule {
 }
 
 pub(super) struct NativeThread {
+    pub(super) apc: Arc<NativeApcQueue>,
     pub(super) join: Option<std::thread::JoinHandle<u32>>,
     pub(super) exit_code: Option<u32>,
     pub(super) suspension: Arc<(Mutex<u32>, Condvar)>,
@@ -348,6 +351,7 @@ pub(super) struct NativeFileIoJob {
     pub(super) operation: NativeFileIoOperation,
 }
 pub(super) struct NativePendingIo {
+    pub(super) completion: Option<NativeIoCompletion>,
     pub(super) is_lock: bool,
     pub(super) handle: u64,
     pub(super) overlapped: u64,
@@ -420,6 +424,7 @@ pub(super) struct NativeMappingView {
     pub(super) writable: bool,
 }
 pub(super) struct NativeCompletionPort {
+    pub(super) closed: AtomicBool,
     pub(super) queue: Mutex<std::collections::VecDeque<NativeCompletion>>,
     pub(super) ready: Condvar,
     worker_sender: Mutex<Option<std::os::unix::net::UnixStream>>,
@@ -434,6 +439,7 @@ pub(super) struct NativeCompletion {
 impl NativeCompletionPort {
     pub(super) fn new() -> Self {
         Self {
+            closed: AtomicBool::new(false),
             queue: Mutex::new(std::collections::VecDeque::new()),
             ready: Condvar::new(),
             worker_sender: Mutex::new(None),
@@ -485,6 +491,9 @@ impl NativeCompletionPort {
     }
 
     pub(super) fn post(&self, completion: NativeCompletion) -> bool {
+        if self.closed.load(Ordering::Acquire) {
+            return false;
+        }
         if let Ok(mut sender) = self.worker_sender.lock() {
             if let Some(sender) = sender.as_mut() {
                 use std::io::Write;
@@ -494,6 +503,9 @@ impl NativeCompletionPort {
         let Ok(mut queue) = self.queue.lock() else {
             return false;
         };
+        if self.closed.load(Ordering::Acquire) {
+            return false;
+        }
         queue.push_back(completion);
         self.ready.notify_one();
         true

@@ -674,7 +674,7 @@ pub(super) fn native_set_overlapped_status(overlapped: u64, status: u64, bytes: 
         (*(overlapped as *const AtomicU64)).store(status, Ordering::Release);
     }
 }
-fn native_file_error(status: u64) -> u32 {
+pub(super) fn native_file_error(status: u64) -> u32 {
     if status == 0xc000_0054 {
         return 33;
     }
@@ -700,9 +700,21 @@ fn native_finish_pending_file_io(
         Ok(bytes) => (bytes, 0),
         Err(status) => (0, status),
     };
+    if let Ok(mut pending) = process.pending_requests.lock() {
+        let key = (request.handle, overlapped);
+        if pending
+            .get(&key)
+            .is_some_and(|current| Arc::ptr_eq(current, &request))
+        {
+            pending.remove(&key);
+        }
+    }
     if let Ok(_guard) = process.io_wait.lock() {
         native_set_overlapped_status(overlapped, status, bytes);
         process.io_ready.notify_all();
+    }
+    if let Some(completion) = &request.completion {
+        completion.complete(overlapped, bytes, status);
     }
     if let Some(event) = event {
         native_signal_event(&event);
@@ -721,15 +733,6 @@ fn native_finish_pending_file_io(
     if let Ok(_guard) = process.io_wait.lock() {
         process.pending_file_io.fetch_sub(1, Ordering::AcqRel);
         process.io_ready.notify_all();
-    }
-    if let Ok(mut pending) = process.pending_requests.lock() {
-        let key = (request.handle, overlapped);
-        if pending
-            .get(&key)
-            .is_some_and(|current| Arc::ptr_eq(current, &request))
-        {
-            pending.remove(&key);
-        }
     }
 }
 pub(super) fn native_cancel_pending_file_locks(
@@ -814,6 +817,41 @@ pub(super) fn native_enqueue_file_io(
     offset: usize,
     operation: NativeFileIoOperation,
 ) -> Result<(), u32> {
+    native_enqueue_file_io_inner(
+        queue, process, handle, file, overlapped, offset, operation, None,
+    )
+}
+pub(super) fn native_submit_file_io_callback(
+    process: &Arc<NativeProcessContext>,
+    handle: u64,
+    file: NativeFile,
+    overlapped: u64,
+    offset: usize,
+    operation: NativeFileIoOperation,
+    completion: NativeIoCompletion,
+) -> Result<(), u32> {
+    let queue = native_file_io_queue(process)?;
+    native_enqueue_file_io_inner(
+        &queue,
+        process,
+        handle,
+        file,
+        overlapped,
+        offset,
+        operation,
+        Some(completion),
+    )
+}
+fn native_enqueue_file_io_inner(
+    queue: &NativeFileIoQueue,
+    process: &Arc<NativeProcessContext>,
+    handle: u64,
+    file: NativeFile,
+    overlapped: u64,
+    offset: usize,
+    operation: NativeFileIoOperation,
+    completion: Option<NativeIoCompletion>,
+) -> Result<(), u32> {
     let mut state = queue.state.lock().map_err(|_| 6u32)?;
     if native_file_io_queue_full(&state) {
         return Err(8);
@@ -822,8 +860,13 @@ pub(super) fn native_enqueue_file_io(
     if pending.contains_key(&(handle, overlapped)) {
         return Err(87);
     }
-    let event = native_prepare_overlapped_event(overlapped)?;
+    let event = if completion.is_some() {
+        None
+    } else {
+        native_prepare_overlapped_event(overlapped)?
+    };
     let request = Arc::new(NativePendingIo {
+        completion,
         is_lock: matches!(&operation, NativeFileIoOperation::Lock { .. }),
         handle,
         overlapped,
@@ -919,7 +962,9 @@ fn native_file_io_worker(queue: Arc<NativeFileIoQueue>) {
                         Err(0xc000_0054)
                     }
                     Ok(fs) => match fs.fs.file_len(&job.file.path) {
-                        Ok(file_len) if job.offset as u64 >= file_len => Err(STATUS_END_OF_FILE),
+                        Ok(file_len) if length != 0 && job.offset as u64 >= file_len => {
+                            Err(STATUS_END_OF_FILE)
+                        }
                         Ok(_) => {
                             let mut copied = 0usize;
                             let mut failure = None;
@@ -965,26 +1010,35 @@ fn native_file_io_worker(queue: Arc<NativeFileIoQueue>) {
                     Err(_) => Err(STATUS_UNSUCCESSFUL),
                 },
                 NativeFileIoOperation::Write { data } => match job.process.fs.lock() {
-                    Ok(_) if job.request.cancelled.load(Ordering::Acquire) => {
-                        Err(STATUS_CANCELLED)
+                    Ok(_) if job.request.cancelled.load(Ordering::Acquire) => Err(STATUS_CANCELLED),
+                    Ok(_) if data.is_empty() => Ok(0),
+                    Ok(mut fs) => {
+                        let offset = if job.offset == usize::MAX {
+                            fs.fs.file_len(&job.file.path).ok()
+                        } else {
+                            Some(job.offset as u64)
+                        };
+                        match offset {
+                            Some(offset)
+                                if !native_file_lock_allows(
+                                    &fs,
+                                    job.request.handle,
+                                    &job.file.path,
+                                    offset,
+                                    data.len() as u64,
+                                    true,
+                                ) =>
+                            {
+                                Err(0xc000_0054)
+                            }
+                            Some(offset) => fs
+                                .fs
+                                .write_at(&job.file.path, offset, &data)
+                                .map(|_| data.len() as u32)
+                                .map_err(|_| STATUS_UNSUCCESSFUL),
+                            None => Err(STATUS_UNSUCCESSFUL),
+                        }
                     }
-                    Ok(fs)
-                        if !native_file_lock_allows(
-                            &fs,
-                            job.request.handle,
-                            &job.file.path,
-                            job.offset as u64,
-                            data.len() as u64,
-                            true,
-                        ) =>
-                    {
-                        Err(0xc000_0054)
-                    }
-                    Ok(mut fs) => fs
-                        .fs
-                        .write_at(&job.file.path, job.offset as u64, &data)
-                        .map(|_| data.len() as u32)
-                        .map_err(|_| STATUS_UNSUCCESSFUL),
                     Err(_) => Err(STATUS_UNSUCCESSFUL),
                 },
                 NativeFileIoOperation::Lock { .. } => unreachable!(),
@@ -1159,7 +1213,7 @@ pub(super) extern "win64" fn native_get_queued_completion_status_ex(
     count: u32,
     removed: *mut u32,
     timeout: u32,
-    _alertable: i32,
+    alertable: i32,
 ) -> i32 {
     if native_diagnostic_enabled() {
         eprintln!("native GetQueuedCompletionStatusEx timeout={timeout} count={count}");
@@ -1178,30 +1232,52 @@ pub(super) extern "win64" fn native_get_queued_completion_status_ex(
         native_set_last_error(6);
         return 0;
     };
+    let deadline = wait_deadline(timeout);
     let Ok(mut queue) = port.queue.lock() else {
         return 0;
     };
-    if timeout == u32::MAX {
-        while queue.is_empty() {
-            queue = match port.ready.wait(queue) {
+    while queue.is_empty() {
+        unsafe {
+            removed.write(0);
+        }
+        if port.closed.load(Ordering::Acquire) {
+            native_set_last_error(735);
+            return 0;
+        }
+        if alertable != 0 {
+            drop(queue);
+            if dispatch_apcs() {
+                native_set_last_error(WAIT_IO_COMPLETION);
+                return 0;
+            }
+            if wait_expired(deadline) {
+                native_set_last_error(258);
+                return 0;
+            }
+            apc_pause();
+            queue = match port.queue.lock() {
                 Ok(queue) => queue,
                 Err(_) => return 0,
             };
+        } else {
+            if wait_expired(deadline) {
+                native_set_last_error(258);
+                return 0;
+            }
+            queue = match deadline {
+                Some(deadline) => match port.ready.wait_timeout(
+                    queue,
+                    deadline.saturating_duration_since(std::time::Instant::now()),
+                ) {
+                    Ok((queue, _)) => queue,
+                    Err(_) => return 0,
+                },
+                None => match port.ready.wait(queue) {
+                    Ok(queue) => queue,
+                    Err(_) => return 0,
+                },
+            };
         }
-    } else if queue.is_empty() {
-        let Ok((new_queue, _)) = port.ready.wait_timeout_while(
-            queue,
-            std::time::Duration::from_millis(timeout as u64),
-            |queue| queue.is_empty(),
-        ) else {
-            return 0;
-        };
-        queue = new_queue;
-    }
-    if queue.is_empty() {
-        unsafe { removed.write(0) };
-        native_set_last_error(258); // WAIT_TIMEOUT
-        return 0;
     }
     let mut n = 0;
     while n < count {
