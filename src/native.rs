@@ -17,6 +17,8 @@ use crate::pe::PeImage;
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod worker;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod diagnostics;
 
 const COMMAND_LINE_BYTES: usize = 0x10000;
 
@@ -58,12 +60,30 @@ fn quote_arg(arg: &str) -> String {
 /// Execute the private request used by the exec-based native worker process.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub fn execute_worker_request(path: &std::path::Path) -> Result<u32, String> {
-    worker::execute_request(path)
+    let result = worker::execute_request(path);
+    if let Err(error) = &result {
+        let program = std::fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|request| {
+                request
+                    .get("program")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            });
+        let context = program
+            .map(|program| format!("{program}: "))
+            .unwrap_or_default();
+        diagnostics::report(format!("winrun: {context}native worker failed: {error}\n").as_bytes());
+    }
+    result
 }
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 pub fn execute_worker_request(_path: &std::path::Path) -> Result<u32, String> {
-    Err("exec-based native workers are supported only on Linux x86-64".to_string())
+    let message = "exec-based native workers are supported only on Linux x86-64";
+    eprintln!("winrun: native worker failed: {message}");
+    Err(message.to_string())
 }
 
 /// Configure the result channel for the private Linux worker process.

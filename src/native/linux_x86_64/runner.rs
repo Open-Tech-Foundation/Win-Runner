@@ -172,17 +172,36 @@ fn run_exec_worker(
     // put it back however the worker ends.
     let terminal = TerminalSettings::save();
     let worker_start = std::time::Instant::now();
-    let mut child = match Command::new(executable)
+    let diagnostics = match super::super::diagnostics::DiagnosticChannel::new() {
+        Ok(channel) => channel,
+        Err(error) => {
+            return Err(failed(
+                format!("cannot create native diagnostics channel: {error}"),
+                fs,
+            ));
+        }
+    };
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    let error_fd = diagnostics.writer.as_raw_fd();
+    let mut command = Command::new(executable);
+    command
         .arg("__native-worker")
         .arg(&request_path)
         .env_remove("WINRUN_NATIVE_WORKER")
+        .env(super::super::diagnostics::CHANNEL_ENV, error_fd.to_string())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+    // The closure runs after fork and only performs an async-signal-safe
+    // fcntl, retaining the diagnostics writer in this worker and its children.
+    unsafe {
+        command.pre_exec(move || super::super::diagnostics::inherit_writer(error_fd));
+    }
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => return Err(failed(format!("cannot start native worker: {error}"), fs)),
     };
+    drop(diagnostics.writer);
     let worker_start_ms = worker_start.elapsed().as_secs_f64() * 1000.0;
     let guest_started = std::time::Instant::now();
     let stdout = child.stdout.take().expect("piped worker stdout");
@@ -212,6 +231,7 @@ fn run_exec_worker(
     let readers = vec![
         forward_output(false, stdout, sender.clone()),
         forward_output(true, stderr, sender.clone()),
+        forward_output(true, diagnostics.reader, sender.clone()),
     ];
     drop(sender);
     let mut stdout_bytes = Vec::new();

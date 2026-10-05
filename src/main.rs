@@ -90,10 +90,7 @@ fn main() {
     if args.len() == 3 && args[1] == "__native-worker" {
         match winrun::native::execute_worker_request(Path::new(&args[2])) {
             Ok(code) => std::process::exit(code as i32),
-            Err(error) => {
-                eprintln!("winrun: native worker failed: {error}");
-                std::process::exit(127);
-            }
+            Err(_) => std::process::exit(127),
         }
     }
     if let Ok(executable) = std::env::current_exe() {

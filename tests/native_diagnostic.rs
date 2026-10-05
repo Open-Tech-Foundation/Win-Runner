@@ -233,3 +233,76 @@ fn image_headers_are_read_only_and_nonexecutable_sections_cannot_run() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+fn run_redirected_missing_import(strict: bool) {
+    use std::io::Write;
+    let path = std::env::temp_dir().join(format!(
+        "winrun-hidden-shim-{}-{strict}.exe",
+        std::process::id()
+    ));
+    std::fs::write(&path, winrun::pe::builder::unknown_import()).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_winrun"));
+    if strict {
+        command.env("WINRUN_NATIVE_STRICT_IMPORTS", "1");
+    }
+    let mut child = command
+        .arg("shell")
+        .env_remove("WINRUN_NATIVE_DIAGNOSTIC")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let script = format!("New-Item C:\\probe -ItemType Directory\n@seed \"{}\" C:\\probe\\missing.exe\ncmd /c cmd /c C:\\probe\\missing.exe >NUL 2>&1\nexit\n", path.display());
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    std::fs::remove_file(path).unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stdout.contains("unsupported native import"), "{stdout}");
+    assert!(stderr.contains("C:\\probe\\missing.exe"), "{stderr}");
+    assert_eq!(
+        stderr.matches("KERNEL32.dll!NoSuchApiForTest").count(),
+        1,
+        "{stderr}"
+    );
+}
+
+#[test]
+fn missing_shim_errors_survive_nested_cmd_output_redirection() {
+    run_redirected_missing_import(false);
+}
+#[test]
+fn strict_import_errors_survive_nested_cmd_output_redirection() {
+    run_redirected_missing_import(true);
+}
+#[test]
+fn worker_setup_errors_fall_back_to_stderr_without_a_valid_channel() {
+    for channel in [None, Some("not-a-descriptor"), Some("-1"), Some("999999")] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_winrun"));
+        command
+            .args(["__native-worker", "/no-such-winrun-worker-request.json"])
+            .env_remove("WINRUN_NATIVE_ERROR_FD");
+        if let Some(channel) = channel {
+            command.env("WINRUN_NATIVE_ERROR_FD", channel);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(127));
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            stderr.matches("native worker failed:").count(),
+            1,
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("cannot read native worker request"),
+            "{stderr}"
+        );
+    }
+}

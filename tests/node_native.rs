@@ -860,3 +860,58 @@ exit
         assert!(out.contains(expected), "missing {expected}: {out}\n{err}");
     }
 }
+
+#[test]
+#[ignore = "requires WINRUN_NODE_EXE; run explicitly with --ignored"]
+fn hidden_nested_node_children_still_report_missing_native_shims() {
+    let node = PathBuf::from(std::env::var_os("WINRUN_NODE_EXE").expect("set WINRUN_NODE_EXE"))
+        .canonicalize()
+        .unwrap();
+    let missing = std::env::temp_dir().join(format!(
+        "winrun-node-hidden-shim-{}.exe",
+        std::process::id()
+    ));
+    let script_path =
+        std::env::temp_dir().join(format!("winrun-node-hidden-shim-{}.js", std::process::id()));
+    std::fs::write(&missing, winrun::pe::builder::unknown_import()).unwrap();
+    std::fs::write(&script_path, r#"
+const cp = require('node:child_process');
+const child = "const r=require('node:child_process').spawnSync('C:\\\\probe\\\\missing.exe',[],{stdio:'ignore'});process.exit(r.status);";
+const result = cp.spawnSync(process.execPath, ['-e', child], {stdio:'ignore'});
+if (result.error || result.status !== 126) throw Error(JSON.stringify(result));
+console.log('hidden child exit: 126');
+"#).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_winrun"))
+        .arg("shell")
+        .env_remove("WINRUN_NATIVE_DIAGNOSTIC")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let script = format!("New-Item C:\\probe -ItemType Directory\n@seed \"{}\" C:\\probe\\missing.exe\n@seed \"{}\" C:\\probe\\node.exe\n@seed \"{}\" C:\\probe\\probe.js\nC:\\probe\\node.exe C:\\probe\\probe.js\nexit\n", missing.display(), node.display(), script_path.display());
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    std::fs::remove_file(missing).unwrap();
+    std::fs::remove_file(script_path).unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("hidden child exit: 126"),
+        "{stdout}\n{stderr}"
+    );
+    assert!(!stdout.contains("unsupported native import"), "{stdout}");
+    assert!(stderr.contains("C:\\probe\\missing.exe"), "{stderr}");
+    assert_eq!(
+        stderr
+            .matches("unsupported native import called: KERNEL32.dll!NoSuchApiForTest")
+            .count(),
+        1,
+        "{stderr}"
+    );
+}

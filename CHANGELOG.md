@@ -38,6 +38,12 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Route fatal native missing-import, worker-startup and child-crash diagnostics
+  through a launcher-owned channel, independent of guest stdout/stderr.
+  Show the failing executable and DLL/API even through nested child processes,
+  redirected output, or `stdio: "ignore"`, without duplicate error messages.
+  Add native PE and real Windows Node regression coverage.
+
 - Persist UTF-16 thread descriptions and return independent `LocalFree`-owned
   copies. Keep opened and duplicated thread handles usable after closing
   the creation handle, including waits, APC delivery and suspended-thread resume.

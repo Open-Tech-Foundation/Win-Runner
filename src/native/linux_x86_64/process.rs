@@ -2058,9 +2058,12 @@ fn worker_exit_code(status: std::process::ExitStatus, program: &str) -> u32 {
     };
     let code = crash_exit_code(signal);
     if code != 1 {
-        eprintln!(
-            "winrun: {program} crashed ({}); exit code {code:#010X}",
-            signal_name(signal)
+        super::super::diagnostics::report(
+            format!(
+                "winrun: {program} crashed ({}); exit code {code:#010X}\n",
+                signal_name(signal)
+            )
+            .as_bytes(),
         );
     }
     code

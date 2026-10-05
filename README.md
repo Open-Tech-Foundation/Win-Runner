@@ -190,7 +190,7 @@ winrun --mount-ro=Z:/path/to/folder shell
 
 ## Compatibility
 
-Win-Runner implements Windows APIs needed by supported programs incrementally; unsupported imports are reported by name when called.
+Win-Runner implements Windows APIs needed by supported programs incrementally; unsupported imports are reported with the executable, DLL, and API name when called. Missing-import, worker-startup, and child-crash errors reach the launcher even when child processes redirect stderr or discard it with `stdio: "ignore"`.
 `winrun inspect app.exe` reports static imports, and `WINRUN_NATIVE_STRICT_IMPORTS=1` rejects missing imports before execution.
 
 ## Development

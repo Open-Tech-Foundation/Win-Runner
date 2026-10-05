@@ -1643,14 +1643,12 @@ pub(super) struct MissingImportStubs {
 }
 
 extern "win64" fn native_missing_import(message: *const u8, len: u64) -> ! {
-    let mut offset = 0;
-    while offset < len as usize {
-        let written = unsafe { write(2, message.add(offset).cast(), len as usize - offset) };
-        if written <= 0 {
-            break;
-        }
-        offset += written as usize;
-    }
+    let bytes = unsafe { std::slice::from_raw_parts(message, len as usize) };
+    let program = process_ctx()
+        .map(|process| process.module_path.clone())
+        .unwrap_or_default();
+    let diagnostic = format!("winrun: {program}: {}", String::from_utf8_lossy(bytes));
+    super::super::diagnostics::report(diagnostic.as_bytes());
     if std::env::var_os("WINRUN_NATIVE_WORKER").as_deref() == Some(std::ffi::OsStr::new("1")) {
         let fd = NATIVE_WORKER_RESULT_FD.load(Ordering::Acquire);
         if fd >= 0 {
