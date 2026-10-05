@@ -29,6 +29,7 @@ with `guests/build-oracle.sh` (rustc and rust-lld only). A probe:
 | `path_names` | path spellings from `GetLongPathNameW`, `GetFullPathNameW`, and final paths |
 | `links` | `CreateSymbolicLinkW`, what a handle names with and without `FILE_FLAG_OPEN_REPARSE_POINT`, `FSCTL_GET_REPARSE_POINT` data |
 | `pool_console` | `QueueUserWorkItem`, `MapVirtualKeyW`, console input functions on a non-console handle |
+| `console_runtime` | independent input/output code pages, invalid-page errors, shared child-process changes without handle inheritance, restoration, current thread stack bounds on main and created threads |
 | `thread_queries` | pseudo/opened/duplicated thread identity, query/set/synchronize rights, UTF-16 description copies, suspended and terminated threads, retained handles, exit codes and CPU timestamps |
 | `apc_io` | per-thread APC queues, FIFO and duplicated thread handles, alertable single/multiple waits, wait-all state preservation, extended file completion callbacks, EOF, pipe cancellation, result timeouts and alertable completion-port waits |
 | `dll_search` | directory cookies and removal, Set/Get DLL directory buffers, search flags and defaults, loaded-name reuse, distinct absolute paths, recursive dependencies, loaded module filenames and truncation |
@@ -39,6 +40,12 @@ with `guests/build-oracle.sh` (rustc and rust-lld only). A probe:
 threads in other guest processes or arbitrary Linux host processes is outside
 this batch. Thread descriptions preserve UTF-16 and returned copies are freed
 with `LocalFree`; CPU times use Linux per-thread accounting.
+
+`console_runtime` tests code pages 1252 and 65001, the encodings currently
+supported by Win-Runner. Other encodings return an explicit invalid-parameter
+error. Initial Windows console code pages are saved and restored rather than
+assuming a machine-specific default. The child shares its parent's console;
+detached and separately allocated consoles are outside this probe.
 
 `dll_search` embeds four small real DLLs, built from the `dll_*_support.rs`
 fixtures. The runners place its executable in an application subdirectory,

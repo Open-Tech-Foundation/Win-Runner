@@ -96,6 +96,9 @@ use crt::*;
 #[path = "linux_x86_64/console.rs"]
 mod console;
 use console::*;
+#[path = "linux_x86_64/console_code_pages.rs"]
+mod console_code_pages;
+use console_code_pages::*;
 #[path = "linux_x86_64/overlapped.rs"]
 mod overlapped;
 use overlapped::*;

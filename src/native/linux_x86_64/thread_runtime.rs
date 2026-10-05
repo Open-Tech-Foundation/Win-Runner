@@ -174,6 +174,33 @@ pub(super) extern "win64" fn native_set_thread_stack_guarantee(size: *mut u32) -
     (!size.is_null()) as i32
 }
 
+pub(super) extern "win64" fn native_get_current_thread_stack_limits(
+    low: *mut usize,
+    high: *mut usize,
+) {
+    let base = THREAD_TEB_BASE.get();
+    let (limit, top) = if base != 0 {
+        unsafe {
+            (
+                ((base + 0x10) as *const usize).read_unaligned(),
+                ((base + 0x08) as *const usize).read_unaligned(),
+            )
+        }
+    } else {
+        // Also support host-side calls without an installed Windows TEB.
+        let mut teb = [0u8; TEB_SIZE];
+        set_teb_stack_bounds(&mut teb);
+        (
+            usize::from_le_bytes(teb[0x10..0x18].try_into().unwrap()),
+            usize::from_le_bytes(teb[0x08..0x10].try_into().unwrap()),
+        )
+    };
+    unsafe {
+        low.write(limit);
+        high.write(top);
+    }
+}
+
 /// `TlsAlloc`: the lowest free index, 0-1087 as on Windows. Its value is
 /// empty on every thread (slots are cleared when freed).
 pub(super) extern "win64" fn native_tls_alloc() -> u32 {
@@ -760,5 +787,20 @@ pub(super) extern "win64" fn native_rtl_get_current_peb() -> u64 {
         unsafe { ((teb + 0x60) as *const u64).read_unaligned() }
     } else {
         0
+    }
+}
+
+#[cfg(test)]
+mod stack_limit_tests {
+    use super::*;
+
+    #[test]
+    fn current_host_stack_is_inside_reported_limits() {
+        let mut low = 0;
+        let mut high = 0;
+        native_get_current_thread_stack_limits(&mut low, &mut high);
+        let marker = &low as *const usize as usize;
+        assert!(low != 0 && low <= marker && marker < high);
+        assert!(baseline_trampoline("GetCurrentThreadStackLimits").is_some());
     }
 }

@@ -214,6 +214,7 @@ pub(super) struct NativeProcessContext {
     pub(super) crt_fd_next: AtomicI32,
     pub(super) fs: Arc<Mutex<NativeFs>>,
     pub(super) named_pipes: Mutex<NativeNamedPipeTable>,
+    pub(super) console_code_pages: NativeConsoleCodePages,
     pub(super) console_output_modes: [AtomicU32; 2],
     pub(super) error_mode: AtomicU32,
     pub(super) wer_flags: AtomicU32,

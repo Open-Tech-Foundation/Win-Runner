@@ -189,6 +189,7 @@ fn run_exec_worker(
         .arg("__native-worker")
         .arg(&request_path)
         .env_remove("WINRUN_NATIVE_WORKER")
+        .env_remove("WINRUN_NATIVE_CONSOLE_FD")
         .env(super::super::diagnostics::CHANNEL_ENV, error_fd.to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -487,6 +488,7 @@ fn run_rust_baseline_argv_with_fs_impl(
         let tls = Arc::new(Mutex::new(setup_tls(&mapping, img)?));
         let tls_ms = tls_started.elapsed().as_secs_f64() * 1000.0;
         let context_started = std::time::Instant::now();
+        let console_code_pages = NativeConsoleCodePages::from_worker_environment()?;
         let mut instance_fs = recovery_fs
             .take()
             .expect("filesystem is available before launch");
@@ -541,6 +543,7 @@ fn run_rust_baseline_argv_with_fs_impl(
             crt_fd_next: AtomicI32::new(3),
             fs,
             named_pipes: Mutex::new(NativeNamedPipeTable::new()),
+            console_code_pages,
             console_output_modes: [AtomicU32::new(1), AtomicU32::new(1)],
             error_mode: AtomicU32::new(0),
             wer_flags: AtomicU32::new(0),

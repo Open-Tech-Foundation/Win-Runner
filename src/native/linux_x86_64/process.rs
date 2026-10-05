@@ -1966,6 +1966,7 @@ fn create_exec_worker_child(
         .stdin(stdio.next().ok_or(8u32)?)
         .stdout(stdio.next().ok_or(8u32)?)
         .stderr(stdio.next().ok_or(8u32)?);
+    parent.console_code_pages.configure_child(&mut command);
     let mut worker = match command.spawn() {
         Ok(worker) => worker,
         Err(_) => {

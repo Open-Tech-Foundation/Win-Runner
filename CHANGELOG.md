@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add native console input/output code-page getters and setters, with
+  independent shared state across child workers and explicit rejection of
+  unsupported encodings. Add `GetCurrentThreadStackLimits` using native TEB
+  stack bounds, and a Windows oracle covering console changes, invalid pages,
+  child-process sharing and stack queries on main and created threads.
+
 - Add native `OpenThread`, `GetThreadId`, `GetProcessIdOfThread`,
   `GetExitCodeThread`, `GetThreadTimes`, and `GetThreadDescription`, with
   shared native guest thread objects, per-handle access checks, retained

@@ -29,9 +29,6 @@ pub(super) extern "win64" fn native_get_console_mode(handle: u64, mode: *mut u32
     unsafe { mode.write(value) };
     1
 }
-pub(super) extern "win64" fn native_get_console_output_cp() -> u32 {
-    native_get_acp()
-}
 pub(super) extern "win64" fn native_get_console_cursor_info(handle: u64, output: *mut u8) -> i32 {
     if console_fd(handle).is_none() || output.is_null() {
         return 0;

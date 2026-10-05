@@ -1487,7 +1487,13 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "HeapFree" => Some(native_heap_free as *const () as usize as u64),
         "ProcessPrng" => Some(native_process_prng as *const () as usize as u64),
         "GetConsoleMode" => Some(native_get_console_mode as *const () as usize as u64),
+        "GetConsoleCP" => Some(native_get_console_cp as *const () as usize as u64),
+        "SetConsoleCP" => Some(native_set_console_cp as *const () as usize as u64),
+        "SetConsoleOutputCP" => Some(native_set_console_output_cp as *const () as usize as u64),
         "GetConsoleOutputCP" => Some(native_get_console_output_cp as *const () as usize as u64),
+        "GetCurrentThreadStackLimits" => {
+            Some(native_get_current_thread_stack_limits as *const () as usize as u64)
+        }
         "GetConsoleCursorInfo" => Some(native_get_console_cursor_info as *const () as usize as u64),
         "SetConsoleCursorInfo" => Some(native_set_console_cursor_info as *const () as usize as u64),
         "SetConsoleCursorPosition" => {

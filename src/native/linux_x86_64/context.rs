@@ -66,6 +66,7 @@ pub(super) fn new_test_process() -> Arc<NativeProcessContext> {
             next: 0x100,
         })),
         named_pipes: Mutex::new(NativeNamedPipeTable::new()),
+        console_code_pages: NativeConsoleCodePages::new().expect("create test console"),
         console_output_modes: [AtomicU32::new(1), AtomicU32::new(1)],
         error_mode: AtomicU32::new(0),
         wer_flags: AtomicU32::new(0),

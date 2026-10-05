@@ -13,8 +13,8 @@ mkdir -p "$OUT"
 for exe in "$ROOT"/tests/artifacts/exe/oracle_*.exe; do
     name="$(basename "$exe" .exe)"
     name="${name#oracle_}"
-    if [[ "$name" == process_runtime ]]; then
-        commands=$(printf 'New-Item C:\\oracle-run -ItemType Directory\ncd C:\\oracle-run\n@seed "%s" C:\\oracle-run\\process_runtime.exe\nC:\\oracle-run\\process_runtime.exe\nexit\n' "$exe")
+    if [[ "$name" == process_runtime || "$name" == console_runtime ]]; then
+        commands=$(printf 'New-Item C:\\oracle-run -ItemType Directory\ncd C:\\oracle-run\n@seed "%s" C:\\oracle-run\\%s.exe\nC:\\oracle-run\\%s.exe\nexit\n' "$exe" "$name" "$name")
     elif [[ "$name" == dll_search ]]; then
         commands=$(printf 'New-Item C:\\oracle-run\\app -ItemType Directory\ncd C:\\oracle-run\n@seed "%s" C:\\oracle-run\\app\\oracle_dll_search.exe\nC:\\oracle-run\\app\\oracle_dll_search.exe\nexit\n' "$exe")
     else

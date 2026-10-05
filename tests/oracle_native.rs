@@ -31,11 +31,11 @@ fn transcript(probe: &Path) -> String {
         .stderr(Stdio::piped())
         .spawn()
         .expect("start the winrun shell");
-    let executable = if probe.file_stem().and_then(|name| name.to_str())
-        == Some("oracle_process_runtime")
-    {
+    let stem = probe.file_stem().and_then(|name| name.to_str()).unwrap();
+    let executable = if matches!(stem, "oracle_process_runtime" | "oracle_console_runtime") {
+        let name = stem.trim_start_matches("oracle_");
         format!(
-            "@seed \"{}\" C:\\oracle-run\\process_runtime.exe\nC:\\oracle-run\\process_runtime.exe",
+            "@seed \"{}\" C:\\oracle-run\\{name}.exe\nC:\\oracle-run\\{name}.exe",
             probe.display()
         )
     } else if probe.file_stem().and_then(|name| name.to_str()) == Some("oracle_dll_search") {
@@ -88,6 +88,7 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
                 | "dll_search"
                 | "apc_io"
                 | "thread_queries"
+                | "console_runtime"
         ) {
             assert!(
                 !actual.contains("wrong") && !actual.contains("unavailable"),
@@ -119,6 +120,17 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
         // Require important behavior cases even before complete transcripts
         // are checked in. Windows CI compares every new probe with Windows.
         let required: &[&str] = match name.as_str() {
+            "console_runtime" => &[
+                "pages.independent: ok",
+                "pages.invalid_input: fail err=87",
+                "pages.invalid_output: fail err=87",
+                "pages.invalid_preserves: ok",
+                "pages.child: ok",
+                "pages.child_updates: ok",
+                "pages.restored: ok",
+                "stack.main: ok",
+                "stack.thread: ok",
+            ],
             "crt_runtime" => &[
                 "invalid.global_dispatch: ok",
                 "invalid.local_dispatch: ok",
