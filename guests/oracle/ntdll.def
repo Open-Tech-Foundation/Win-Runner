@@ -15,3 +15,10 @@ RtlQueryPerformanceFrequency
 NtQueryInformationFile
 NtWaitForAlertByThreadId
 NtAlertThreadByThreadId
+RtlAllocateHeap
+RtlReAllocateHeap
+RtlFreeHeap
+RtlSizeHeap
+RtlGetActiveActivationContext
+NtCreateThreadEx
+NtResumeThread

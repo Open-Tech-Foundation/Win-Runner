@@ -131,6 +131,8 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
                 "console.flush_input: ok", "console.flush_output: ok",
                 "sync_pipe.created: ok", "sync_pipe.read_access: ok", "sync_pipe.write_access: ok",
                 "sync_pipe.write: ok", "sync_pipe.read: ok", "sync_pipe.eof: ok",
+                "nt_thread.create: ok", "nt_thread.outputs: ok", "nt_thread.suspended: ok", "nt_thread.resume: ok", "nt_thread.completed: ok", "nt_thread.invalid: ok",
+                "activation.absent: ok", "heap.peb: ok", "heap.allocate: ok", "heap.reallocate: ok", "heap.free: ok", "heap.last_error: ok",
                 "nt_memory.allocate: ok", "nt_memory.protect: ok", "nt_memory.release: ok", "nt_time.precise: ok", "nt_time.performance: ok",
                 "device.attributes_roundtrip: ok",
                 "cert.memory_empty: ok", "cert.memory_close: ok", "cert.root_open: ok",

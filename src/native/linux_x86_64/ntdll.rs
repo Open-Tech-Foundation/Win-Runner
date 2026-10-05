@@ -1230,3 +1230,27 @@ pub(super) extern "win64" fn native_nt_cancel_io_file_ex(handle: u64, io_status:
     }
     status
 }
+
+/// The loader currently creates no side-by-side activation contexts, so a query
+/// of the current thread has no active context to retain. Context creation and
+/// activation imports remain unsupported rather than accepting fake handles.
+pub(super) extern "win64" fn native_rtl_get_active_activation_context(out: *mut u64) -> u32 {
+    if out.is_null() {
+        return 0xc000000d;
+    }
+    unsafe { out.write_unaligned(0) };
+    0
+}
+#[cfg(test)]
+mod inactive_activation_context_tests {
+    use super::*;
+    #[test]
+    fn reports_no_active_context_and_preserves_last_error() {
+        let mut context = u64::MAX;
+        native_set_last_error(0x4567);
+        assert_eq!(native_rtl_get_active_activation_context(&mut context), 0);
+        assert_eq!(context, 0);
+        assert_eq!(native_rtl_get_active_activation_context(std::ptr::null_mut()), 0xc000000d);
+        assert_eq!(native_get_last_error(), 0x4567);
+    }
+}

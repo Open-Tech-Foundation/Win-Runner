@@ -95,6 +95,9 @@ impl NativeTls {
         super::thread_runtime::put64(&mut out.teb[..], 0x58, out.slots.as_ptr() as u64);
         super::thread_runtime::put64(&mut out.teb[..], 0x60, teb + 0x800);
         super::thread_runtime::put64(&mut out.teb[..], 0x800 + 0x10, image_base);
+        // Native libraries may read PEB.ProcessHeap directly instead of calling
+        // GetProcessHeap. Use the same handle accepted by both heap API families.
+        put64(&mut out.teb[..], 0x800 + 0x30, PROCESS_HEAP_HANDLE);
         super::thread_runtime::put64(&mut out.teb[..], 0x800 + 0x20, out._ldr.as_ptr() as u64);
         super::thread_runtime::put64(
             &mut out.teb[..],
@@ -633,4 +636,19 @@ pub(super) struct NativeTimerState {
     pub(super) deadline: Option<std::time::Instant>,
     pub(super) period: u32,
     pub(super) signaled: bool,
+}
+
+#[cfg(test)]
+mod peb_heap_tests {
+    use super::*;
+    #[test]
+    fn primary_and_cloned_tebs_publish_the_process_heap() {
+        let main = NativeTls::new(0x140000000);
+        let child = main.clone_for_thread();
+        for tls in [&main, &child] {
+            let heap = u64::from_le_bytes(tls.teb[0x830..0x838].try_into().unwrap());
+            assert_eq!(heap, native_get_process_heap());
+            assert_ne!(heap, 0);
+        }
+    }
 }

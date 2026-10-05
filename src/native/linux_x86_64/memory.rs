@@ -1379,3 +1379,53 @@ mod shared_mapping_tests {
         assert_eq!(native_close_handle(file), 1);
     }
 }
+
+// The NT heap family uses the same process heap but leaves Win32 LastError alone.
+pub(super) extern "win64" fn native_rtl_allocate_heap(heap: u64, flags: u32, size: usize) -> u64 {
+    let saved = native_get_last_error();
+    let result = native_heap_alloc(heap, flags, size);
+    native_set_last_error(saved);
+    result
+}
+pub(super) extern "win64" fn native_rtl_reallocate_heap(heap: u64, flags: u32, ptr: u64, size: usize) -> u64 {
+    let saved = native_get_last_error();
+    let result = native_heap_realloc(heap, flags, ptr, size);
+    native_set_last_error(saved);
+    result
+}
+pub(super) extern "win64" fn native_rtl_free_heap(heap: u64, flags: u32, ptr: u64) -> u8 {
+    let saved = native_get_last_error();
+    let result = native_heap_free(heap, flags, ptr) as u8;
+    native_set_last_error(saved);
+    result
+}
+pub(super) extern "win64" fn native_rtl_size_heap(heap: u64, flags: u32, ptr: u64) -> usize {
+    let saved = native_get_last_error();
+    let result = native_heap_size(heap, flags, ptr);
+    native_set_last_error(saved);
+    result
+}
+#[cfg(test)]
+mod nt_heap_tests {
+    use super::*;
+    #[test]
+    fn nt_and_win32_heap_families_share_allocations_and_preserve_last_error() {
+        let previous = THREAD_NATIVE_PROCESS.with(|slot| slot.replace(Some(context::new_test_process())));
+        native_set_last_error(0x1234);
+        let heap = native_get_process_heap();
+        let ptr = native_rtl_allocate_heap(heap, 8, 8);
+        assert_ne!(ptr, 0);
+        assert_eq!(unsafe { std::slice::from_raw_parts(ptr as *const u8, 8) }, &[0; 8]);
+        assert_eq!(native_heap_size(heap, 0, ptr), 8);
+        unsafe { (ptr as *mut u8).write(42) };
+        let ptr = native_rtl_reallocate_heap(heap, 8, ptr, 16);
+        assert_ne!(ptr, 0);
+        assert_eq!(unsafe { (ptr as *const u8).read() }, 42);
+        assert_eq!(native_rtl_size_heap(heap, 0, ptr), 16);
+        assert_eq!(native_rtl_free_heap(heap, 0, ptr), 1);
+        assert_eq!(native_rtl_allocate_heap(0, 0, 8), 0);
+        assert_eq!(native_rtl_free_heap(heap, 0, ptr), 0);
+        assert_eq!(native_get_last_error(), 0x1234);
+        THREAD_NATIVE_PROCESS.with(|slot| slot.replace(previous));
+    }
+}

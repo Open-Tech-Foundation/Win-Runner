@@ -130,7 +130,10 @@ mod memory;
 use memory::*;
 #[path = "linux_x86_64/nt_memory.rs"]
 mod nt_memory;
+#[path = "linux_x86_64/nt_threads.rs"]
+mod nt_threads;
 use nt_memory::*;
+use nt_threads::*;
 #[path = "linux_x86_64/system.rs"]
 mod system;
 use system::*;

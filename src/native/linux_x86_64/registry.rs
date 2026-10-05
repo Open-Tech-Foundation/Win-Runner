@@ -539,11 +539,18 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                 | "RtlVirtualUnwind"
                 | "RtlGetVersion"
                 | "RtlNtStatusToDosError"
+                | "RtlGetActiveActivationContext"
+                | "RtlAllocateHeap"
+                | "RtlReAllocateHeap"
+                | "RtlFreeHeap"
+                | "RtlSizeHeap"
                 | "NtWaitForAlertByThreadId"
                 | "NtAlertThreadByThreadId"
                 | "RtlQueryPerformanceCounter"
                 | "RtlQueryPerformanceFrequency"
                 | "RtlGetSystemTimePrecise"
+                | "NtCreateThreadEx"
+                | "NtResumeThread"
                 | "NtAllocateVirtualMemory"
                 | "NtFreeVirtualMemory"
                 | "NtProtectVirtualMemory"
@@ -1064,6 +1071,8 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "NtWaitForAlertByThreadId" => Some(native_nt_wait_for_alert_by_thread_id as *const () as usize as u64),
         "NtAlertThreadByThreadId" => Some(native_nt_alert_thread_by_thread_id as *const () as usize as u64),
         "RtlGetSystemTimePrecise" => Some(native_rtl_get_system_time_precise as *const () as usize as u64),
+        "NtCreateThreadEx" => Some(native_nt_create_thread_ex as *const () as usize as u64),
+        "NtResumeThread" => Some(native_nt_resume_thread as *const () as usize as u64),
         "NtAllocateVirtualMemory" => Some(native_nt_allocate_virtual_memory as *const () as usize as u64),
         "NtFreeVirtualMemory" => Some(native_nt_free_virtual_memory as *const () as usize as u64),
         "NtProtectVirtualMemory" => Some(native_nt_protect_virtual_memory as *const () as usize as u64),
@@ -1539,9 +1548,14 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "GetStringTypeW" => Some(native_get_string_type_w as *const () as usize as u64),
         "LCMapStringW" => Some(native_lc_map_string_w as *const () as usize as u64),
         "WideCharToMultiByte" => Some(native_wide_char_to_multi_byte as *const () as usize as u64),
+        "RtlGetActiveActivationContext" => Some(native_rtl_get_active_activation_context as *const () as usize as u64),
+        "RtlAllocateHeap" => Some(native_rtl_allocate_heap as *const () as usize as u64),
         "HeapAlloc" => Some(native_heap_alloc as *const () as usize as u64),
+        "RtlReAllocateHeap" => Some(native_rtl_reallocate_heap as *const () as usize as u64),
         "HeapReAlloc" => Some(native_heap_realloc as *const () as usize as u64),
+        "RtlSizeHeap" => Some(native_rtl_size_heap as *const () as usize as u64),
         "HeapSize" => Some(native_heap_size as *const () as usize as u64),
+        "RtlFreeHeap" => Some(native_rtl_free_heap as *const () as usize as u64),
         "HeapFree" => Some(native_heap_free as *const () as usize as u64),
         "ProcessPrng" => Some(native_process_prng as *const () as usize as u64),
         "GetConsoleMode" => Some(native_get_console_mode as *const () as usize as u64),

@@ -44,6 +44,15 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Populate PEB process-heap metadata and expose NT heap allocation, reallocation,
+  sizing and freeing through the existing shared process heap, preserving Win32
+  LastError. Allow querying an absent thread activation context; side-by-side
+  context creation and activation remain unsupported. Add native and Windows
+  oracle coverage for direct PEB access,
+  allocation ownership, zero initialization and data preservation. Implement
+  current-process `NtCreateThreadEx` and `NtResumeThread` through native thread
+  objects, with suspended startup, access rights and client-ID/TEB attributes.
+
 - Publish native child filesystem changes while workers are running, without
   replaying applied changes at exit. Map NT device-volume paths back to guest
   drives so extracted native libraries can reopen temporary files. Return
@@ -54,8 +63,8 @@ All notable changes to this project will be documented in this file.
   lifetime management. Add current-process NT virtual-memory entry points and
   NTDLL precise/performance clocks over the existing native backends. Support
   NT thread alerts, pending-alert coalescing and timeouts, plus console input
-  flushing that preserves console modes, with
-  Windows oracle and real Bun stdin regression coverage.
+  flushing that preserves console modes, with Windows oracle and real Bun
+  stdin regression coverage.
 
 - Return the main PE module for `GetModuleHandleA(NULL)` so embedded
   applications can find their own executable sections. Bind existing NT file

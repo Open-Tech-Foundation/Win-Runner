@@ -62,7 +62,15 @@ and final `wait4` accounting. Commit charge sums accountable VMAs in `smaps`;
 peak commit is the maximum sampled by queries, not a lifetime kernel counter.
 Extended memory counters beyond `PROCESS_MEMORY_COUNTERS_EX` fail explicitly.
 
-The startup probe also checks child namespace visibility before exit and
+The startup probe checks direct PEB process-heap identity and interoperable NT/Win32
+heap allocations, including zero initialization, reallocation and LastError.
+An executable without an activation context checks the absent-context query;
+side-by-side manifest activation is outside this implementation. NT thread creation
+checks suspended execution, client-ID/TEB outputs, resume and completion. It
+supports current-process creation and these two output attributes; additional
+creation flags, nonzero ZeroBits and custom security descriptors fail explicitly.
+Host stacks reserve the larger requested stack size with the native 4 MiB minimum.
+It also checks child namespace visibility before exit and
 ensures final journals do not undo parent deletions. Child-to-parent namespace
 publication currently polls every 20 ms; changes from a parent into an already
 running child are not broadcast. Shared existing file contents use the same

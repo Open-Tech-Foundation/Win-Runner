@@ -6,6 +6,13 @@ include!("common.rs");
 include!("fs_support.rs");
 extern "system" {
     fn NtClose(handle: usize) -> u32;
+    fn NtCreateThreadEx(out: *mut usize, desired: u32, object: usize, process: usize, start: usize, parameter: usize, flags: u32, zero_bits: usize, stack: usize, maximum: usize, attributes: *const usize) -> u32;
+    fn NtResumeThread(handle: usize, previous: *mut u32) -> u32;
+    fn RtlGetActiveActivationContext(out: *mut usize) -> u32;
+    fn RtlAllocateHeap(heap: usize, flags: u32, size: usize) -> usize;
+    fn RtlReAllocateHeap(heap: usize, flags: u32, ptr: usize, size: usize) -> usize;
+    fn RtlFreeHeap(heap: usize, flags: u32, ptr: usize) -> u8;
+    fn RtlSizeHeap(heap: usize, flags: u32, ptr: usize) -> usize;
     fn NtWaitForAlertByThreadId(address: usize, timeout: *const i64) -> u32;
     fn NtAlertThreadByThreadId(id: usize) -> u32;
     fn NtQueryInformationFile(
@@ -60,6 +67,62 @@ extern "system" {
 fn boolean(name: &str, value: bool) {
     case(name);
     out_str(if value { "ok\n" } else { "wrong\n" });
+}
+extern "system" fn nt_thread_entry(parameter: usize) -> u32 {
+    unsafe { (parameter as *mut u32).write(42) }
+    42
+}
+fn nt_threads() {
+    type Id = unsafe extern "system" fn(usize) -> u32;
+    type Wait = unsafe extern "system" fn(usize, u32) -> u32;
+    let id = api!("nt_thread.id_api", "GetThreadId", Id);
+    let wait = api!("nt_thread.wait_api", "WaitForSingleObject", Wait);
+    unsafe {
+        let mut client = [0usize;2];
+        let mut teb = 0usize;
+        let mut size = 0usize;
+        let attributes = [72usize, 0x10003, 16, client.as_mut_ptr() as usize, 0, 0x10004, 8, &mut teb as *mut _ as usize, &mut size as *mut _ as usize];
+        let mut handle = 0usize;
+        let mut output = 0u32;
+        let empty_name = [0usize; 2];
+        let object = [48usize, 0, empty_name.as_ptr() as usize, 0x40, 0, 0];
+        let status = NtCreateThreadEx(&mut handle, 0x1fffff, object.as_ptr() as usize, usize::MAX, nt_thread_entry as *const () as usize, &mut output as *mut _ as usize, 1, 0, 0, 0, attributes.as_ptr());
+        boolean("nt_thread.create", status == 0 && handle != 0);
+        if handle == 0 { return }
+        boolean("nt_thread.outputs", client[0] != 0 && client[1] == id(handle) as usize && teb != 0 && size == 8);
+        boolean("nt_thread.suspended", wait(handle, 0) == 258 && output == 0);
+        let mut count = 0;
+        boolean("nt_thread.resume", NtResumeThread(handle, &mut count) == 0 && count == 1);
+        boolean("nt_thread.completed", wait(handle, 5000) == 0 && output == 42);
+        NtClose(handle);
+        count = 0x1234;
+        boolean("nt_thread.invalid", NtResumeThread(0, &mut count) == 0xc0000008 && count == 0x1234);
+    }
+}
+fn nt_heap() {
+    type Heap = unsafe extern "system" fn() -> usize;
+    type Size = unsafe extern "system" fn(usize, u32, usize) -> usize;
+    let get = api!("heap.get", "GetProcessHeap", Heap);
+    let size = api!("heap.size", "HeapSize", Size);
+    let set_error = api!("heap.error", "SetLastError", SetLastErrorFn);
+    unsafe {
+        let mut activation = usize::MAX;
+        boolean("activation.absent", RtlGetActiveActivationContext(&mut activation) == 0 && activation == 0);
+        let peb: usize;
+        core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, readonly));
+        let heap = get();
+        boolean("heap.peb", heap != 0 && *((peb + 0x30) as *const usize) == heap);
+        set_error(0x1234);
+        let ptr = RtlAllocateHeap(heap, 8, 8);
+        boolean("heap.allocate", ptr != 0 && size(heap, 0, ptr) == 8 && core::slice::from_raw_parts(ptr as *const u8, 8) == &[0;8]);
+        if ptr != 0 {
+            *(ptr as *mut u8) = 42;
+            let grown = RtlReAllocateHeap(heap, 8, ptr, 16);
+            boolean("heap.reallocate", grown != 0 && *(grown as *const u8) == 42 && RtlSizeHeap(heap, 0, grown) == 16);
+            boolean("heap.free", RtlFreeHeap(heap, 0, if grown == 0 {ptr} else {grown}) != 0);
+        }
+        boolean("heap.last_error", last_error() == 0x1234);
+    }
 }
 fn modules() {
     type ModuleA = unsafe extern "system" fn(*const u8) -> usize;
@@ -925,6 +988,8 @@ pub extern "system" fn probe_entry() -> ! {
     suspended_child_mode();
     out_str("probe native_startup\n");
     modules();
+    nt_heap();
+    nt_threads();
     files();
     socket_options();
     waits();
