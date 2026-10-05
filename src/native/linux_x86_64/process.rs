@@ -433,10 +433,13 @@ pub(super) extern "win64" fn native_create_thread(
             native_set_last_error(6);
             return 0;
         };
-        let tls = template
+        let mut tls = template
             .as_ref()
             .map(NativeTls::clone_for_thread)
             .unwrap_or_else(|| NativeTls::new(process.image_base));
+        put64(&mut tls.teb[..], 0x40, process.process_id as u64);
+        put64(&mut tls.teb[..], 0x48, handle);
+        put64(&mut tls.teb[..], 0x800 + 0x20, &process.parameters as *const NativeProcessParameters as u64);
         let tls = Arc::new(Mutex::new(tls));
         let Ok(mut blocks) = process.tls_blocks.lock() else {
             native_set_last_error(6);
@@ -505,6 +508,7 @@ pub(super) extern "win64" fn native_create_thread(
         };
         thread_runtime::notify_guest_thread_modules(&thread_process, false);
         thread_runtime::run_thread_fls_callbacks(&thread_process);
+        release_thread_desktop(&thread_process, handle as u32);
         thread_apc.thread.finish(exit_code);
         exit_code
     });
@@ -2262,7 +2266,7 @@ pub(super) extern "win64" fn native_create_process_w(
     native_resolve_launch_application(&mut launch, &fs.fs, &search_environment);
     native_batch_launch_through_cmd(&mut launch);
     let parent_std_handles =
-        std::array::from_fn(|index| parent.std_handles[index].load(Ordering::Acquire));
+        std::array::from_fn(|index| parent.parameters.std_handles[index].load(Ordering::Acquire));
     let child_std_handles = native_startup_std_handles(startup_info, parent_std_handles);
     // Callers such as libuv pass DuplicateHandle aliases of their standard
     // handles; the child inherits what the aliases refer to.

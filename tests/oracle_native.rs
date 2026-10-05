@@ -32,7 +32,7 @@ fn transcript(probe: &Path) -> String {
         .spawn()
         .expect("start the winrun shell");
     let stem = probe.file_stem().and_then(|name| name.to_str()).unwrap();
-    let executable = if matches!(stem, "oracle_process_runtime" | "oracle_console_runtime" | "oracle_native_startup") {
+    let executable = if matches!(stem, "oracle_process_runtime" | "oracle_console_runtime" | "oracle_native_startup" | "oracle_desktop_clipboard") {
         let name = stem.trim_start_matches("oracle_");
         format!(
             "@seed \"{}\" C:\\oracle-run\\{name}.exe\nC:\\oracle-run\\{name}.exe",
@@ -121,6 +121,7 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
         // Require important behavior cases even before complete transcripts
         // are checked in. Windows CI compares every new probe with Windows.
         let required: &[&str] = match name.as_str() {
+            "desktop_clipboard" => &["format.register: ok", "global.movable: ok", "global.zeroed: ok", "global.nested_lock: ok", "global.final_unlock: ok", "global.not_locked: ok", "global.free: ok", "global.fixed: ok", "window.create: ok", "window.post: ok", "window.peek: ok", "window.remove: ok", "clipboard.not_open: ok", "clipboard.open: ok", "clipboard.set: ok", "clipboard.roundtrip: ok", "clipboard.close: ok", "clipboard.child: ok", "clipboard.clear: ok", "window.destroy: ok", "window.invalid: ok"],
             "native_startup" => &[
                 "socket.ordinal_text: ok", "socket.ordinal_select: ok", "socket.ipv4_text: ok",
                 "socket.modern_ioctl: ok", "socket.modern_addr: ok", "socket.modern_text: ok",
@@ -129,10 +130,11 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
                 "socket.exclusive: ok", "socket.exclusive_reuse: ok", "socket.exclusive_bind: ok", "socket.exclusive_competitor: ok",
                 "alert.timeout: ok", "alert.pending: ok", "alert.other_thread: ok",
                 "console.flush_input: ok", "console.flush_output: ok",
+                "pipe.peek: ok", "pipe.peek_query: ok", "pipe.peek_eof: ok",
                 "sync_pipe.created: ok", "sync_pipe.read_access: ok", "sync_pipe.write_access: ok",
                 "sync_pipe.write: ok", "sync_pipe.read: ok", "sync_pipe.eof: ok",
-                "nt_thread.create: ok", "nt_thread.outputs: ok", "nt_thread.suspended: ok", "nt_thread.resume: ok", "nt_thread.completed: ok", "nt_thread.invalid: ok",
-                "activation.absent: ok", "heap.peb: ok", "heap.allocate: ok", "heap.reallocate: ok", "heap.free: ok", "heap.last_error: ok",
+                "nt_thread.create: ok", "nt_thread.outputs: ok", "nt_thread.teb_identity: ok", "nt_thread.suspended: ok", "nt_thread.resume: ok", "nt_thread.completed: ok", "nt_thread.invalid: ok",
+                "nt_wait.nonalertable: ok", "nt_wait.apc: ok", "nt_wait.thread: ok", "nt_wait.poll: ok", "nt_wait.relative: ok", "nt_wait.absolute: ok", "nt_wait.invalid: ok", "nt_wait.last_error: ok", "nt_error.missing_parent: ok", "nt_error.invalid_name: ok", "peb.standard_handles: ok", "peb.set_standard_handle: ok", "nt_thread.parameters_shared: ok", "activation.absent: ok", "heap.peb: ok", "heap.allocate: ok", "heap.reallocate: ok", "heap.free: ok", "heap.last_error: ok",
                 "nt_memory.allocate: ok", "nt_memory.protect: ok", "nt_memory.release: ok", "nt_time.precise: ok", "nt_time.performance: ok",
                 "device.attributes_roundtrip: ok",
                 "cert.memory_empty: ok", "cert.memory_close: ok", "cert.root_open: ok",

@@ -88,3 +88,16 @@ console.log('native Bun startup verified');
     assert!(stderr.is_empty(), "unexpected native diagnostics: {stderr}");
     assert!(stdout.contains("native Bun startup verified"), "{stdout}");
 }
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires WINRUN_BUN_EXE and python3; run explicitly with --ignored"]
+fn windows_bun_preserves_console_identity_and_classifies_redirected_children_as_pipes() {
+    let binary = std::env::var("WINRUN_BUN_EXE").expect("set WINRUN_BUN_EXE");
+    let output = std::process::Command::new("python3")
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/artifacts/bun/console_driver.py"))
+        .arg(env!("CARGO_BIN_EXE_winrun"))
+        .arg(binary)
+        .output().unwrap();
+    assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+}

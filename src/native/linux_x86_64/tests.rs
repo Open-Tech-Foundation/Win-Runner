@@ -6163,6 +6163,8 @@ mod protection_tests {
         assert_eq!(u32::from_le_bytes(info[12..16].try_into().unwrap()), 19045);
         info[..4].copy_from_slice(&275u32.to_le_bytes());
         assert_eq!(native_rtl_get_version(info.as_mut_ptr()), 0xC000_000D);
+        assert_eq!(native_rtl_nt_status_to_dos_error(0xC000_0033), 123);
+        assert_eq!(native_rtl_nt_status_to_dos_error(0xC000_003A), 3);
         assert_eq!(native_rtl_nt_status_to_dos_error(0xC000_0022), 5);
         assert_eq!(native_rtl_nt_status_to_dos_error(0xC000_0120), 995);
         assert_eq!(native_rtl_nt_status_to_dos_error(0xC000_014B), 109);
@@ -9095,9 +9097,8 @@ mod editor_runtime_tests {
 
     #[test]
     fn optional_desktop_and_provider_services_fail_explicitly() {
+        let _scope = IsolatedProcess::new();
         assert_eq!(native_is_clipboard_format_available(13), 0);
-        assert_eq!(native_open_clipboard(0), 0);
-        assert_eq!(native_get_last_error(), 50);
         assert_eq!(native_close_clipboard(), 0);
         assert_eq!(native_get_last_error(), 1418);
         assert_eq!(native_empty_clipboard(), 0);

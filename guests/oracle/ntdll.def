@@ -22,3 +22,5 @@ RtlSizeHeap
 RtlGetActiveActivationContext
 NtCreateThreadEx
 NtResumeThread
+RtlNtStatusToDosError
+NtWaitForSingleObject

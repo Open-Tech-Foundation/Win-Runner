@@ -10,7 +10,7 @@ pub(super) extern "win64" fn native_get_std_handle(which: u32) -> u64 {
         _ => return u64::MAX,
     };
     let handle = process_ctx()
-        .map(|process| process.std_handles[index].load(Ordering::Acquire))
+        .map(|process| process.parameters.std_handles[index].load(Ordering::Acquire))
         .unwrap_or(u64::MAX);
     if native_diagnostic_enabled() {
         eprintln!("native GetStdHandle which={which:#x} handle={handle:#x}");
@@ -22,7 +22,7 @@ pub(super) extern "win64" fn native_crt_get_osfhandle(fd: i32) -> u64 {
         return u64::MAX;
     };
     let handle = if (0..3).contains(&fd) {
-        process.std_handles[fd as usize].load(Ordering::Acquire)
+        process.parameters.std_handles[fd as usize].load(Ordering::Acquire)
     } else {
         process
             .crt_fds
@@ -148,7 +148,7 @@ pub(super) extern "win64" fn native_set_std_handle(which: u32, handle: u64) -> i
     let Some(process) = process_ctx() else {
         return 0;
     };
-    process.std_handles[index].store(handle, Ordering::Release);
+    process.parameters.std_handles[index].store(handle, Ordering::Release);
     1
 }
 
@@ -349,6 +349,12 @@ pub(super) fn host_standard_fd(handle: u64) -> Option<i32> {
     }
 }
 
+pub(super) fn native_host_console_mask() -> u32 {
+    (0..3).fold(0, |mask, fd| mask | (((unsafe { libc::isatty(fd) } != 0) as u32) << fd))
+}
+pub(super) fn native_standard_is_console(fd: i32) -> bool {
+    (0..3).contains(&fd) && (crate::control::is_control_session() || process_ctx().map_or_else(|| unsafe {libc::isatty(fd)} != 0, |process| process.std_console_mask & (1 << fd) != 0))
+}
 pub(super) extern "win64" fn native_get_file_type(handle: u64) -> u32 {
     let handle = process_ctx()
         .and_then(|process| {
@@ -364,7 +370,7 @@ pub(super) extern "win64" fn native_get_file_type(handle: u64) -> u32 {
         return 0x0002; // FILE_TYPE_CHAR for the controlled virtual console.
     }
     let kind = match host_standard_fd(handle) {
-        Some(fd) if unsafe { isatty(fd) } != 0 => 0x0002,
+        Some(fd) if native_standard_is_console(fd) => 0x0002,
         Some(_) => 0x0003, // anonymous launcher pipes
         None => {
             if process_ctx().is_some_and(|process| {

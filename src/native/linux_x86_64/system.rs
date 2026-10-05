@@ -87,6 +87,8 @@ pub(super) extern "win64" fn native_rtl_nt_status_to_dos_error(status: u32) -> u
         0xC000_000D => 87,  // STATUS_INVALID_PARAMETER
         0xC000_0017 => 8,   // STATUS_NO_MEMORY
         0xC000_0022 => 5,   // STATUS_ACCESS_DENIED
+        0xC000_0033 => 123, // STATUS_OBJECT_NAME_INVALID
+        0xC000_003A => 3,   // STATUS_OBJECT_PATH_NOT_FOUND
         0xC000_0034 => 2,   // STATUS_OBJECT_NAME_NOT_FOUND
         0xC000_0101 => 145, // STATUS_DIRECTORY_NOT_EMPTY
         0xC000_0120 => 995, // STATUS_CANCELLED

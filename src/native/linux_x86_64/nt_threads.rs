@@ -286,6 +286,11 @@ mod tests {
         assert_ne!(handle, 0);
         assert_ne!(teb, 0);
         assert_eq!(length, 8);
+        assert_eq!(unsafe { ((teb + 0x40) as *const u64).read() }, client[0]);
+        assert_eq!(unsafe { ((teb + 0x48) as *const u64).read() }, client[1]);
+        let peb = unsafe { ((teb + 0x60) as *const u64).read() };
+        let process = process_ctx().unwrap();
+        assert_eq!(unsafe { ((peb + 0x20) as *const u64).read() }, &process.parameters as *const NativeProcessParameters as u64);
         assert_eq!(client[1], native_get_thread_id(handle) as u64);
         assert_eq!(output, 0);
         assert_eq!(native_wait_for_single_object(handle, 0), 258);

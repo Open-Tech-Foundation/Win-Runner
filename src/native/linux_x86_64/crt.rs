@@ -2942,7 +2942,7 @@ pub(super) extern "win64" fn native_crt_fread(
             let Some(process) = process_ctx() else {
                 return 0;
             };
-            (process.std_handles[0].load(Ordering::Acquire), true, None)
+            (process.parameters.std_handles[0].load(Ordering::Acquire), true, None)
         } else if let Some(file) = native_crt_file(stream) {
             (
                 unsafe { (*file).handle },
@@ -3248,7 +3248,7 @@ pub(super) extern "win64" fn native_crt_fwrite(
             return 0;
         };
         (
-            process.std_handles[index].load(Ordering::Acquire),
+            process.parameters.std_handles[index].load(Ordering::Acquire),
             false,
             None,
         )
@@ -3597,7 +3597,7 @@ pub(super) extern "win64" fn native_crt_fileno(stream: *mut u8) -> i32 {
 fn crt_fd_handle(fd: i32) -> Option<u64> {
     let process = process_ctx()?;
     if (0..3).contains(&fd) {
-        return Some(process.std_handles[fd as usize].load(Ordering::Acquire));
+        return Some(process.parameters.std_handles[fd as usize].load(Ordering::Acquire));
     }
     let handle = process.crt_fds.lock().ok()?.get(&fd).copied();
     handle

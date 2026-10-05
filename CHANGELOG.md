@@ -44,6 +44,25 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Add session-wide clipboard formats and HGLOBAL payload sharing across native
+  workers, with clipboard locks, ownership transfer and explicit unsupported
+  delayed rendering. Add global-memory allocation, sizing, lock counts and
+  freeing, plus nonvisual STATIC window identity and application message queues.
+  Release windows and clipboard locks when guest threads exit. Populate TEB
+  client IDs before suspended threads are returned and on primary-thread setup.
+  Implement non-consuming byte-pipe peeks, including redirected Linux stdin.
+  Preserve original standard-stream console identity across output-forwarding
+  workers, retaining pipe classification for redirected child handles. Publish
+  standard handles through shared PEB process parameters for native libraries
+  that read them directly, including SetStdHandle updates across guest threads.
+  Translate missing-parent and invalid-name NT errors instead of returning
+  unknown errors to filesystem callers. Add NT single-object waits with relative
+  and absolute deadlines, alertable APC delivery and preserved Win32 last error.
+  Keep background-worker shim diagnostics visible without making foreground
+  command completion wait for a surviving child to close the error channel.
+  Add native and Windows oracle coverage for memory, clipboard ownership,
+  messages, cross-process clipboard data, TEB identity and pipe peeking.
+
 - Populate PEB process-heap metadata and expose NT heap allocation, reallocation,
   sizing and freeing through the existing shared process heap, preserving Win32
   LastError. Allow querying an absent thread activation context; side-by-side

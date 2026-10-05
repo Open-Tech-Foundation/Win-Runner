@@ -119,14 +119,14 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_create_file_w(
         Some(crate::winfs::DosDevicePath::Null) => Some(NativeDevice::Null),
         Some(crate::winfs::DosDevicePath::Console) => {
             process_ctx().map(|process| NativeDevice::Console {
-                input: process.std_handles[0].load(Ordering::Acquire),
-                output: process.std_handles[1].load(Ordering::Acquire),
+                input: process.parameters.std_handles[0].load(Ordering::Acquire),
+                output: process.parameters.std_handles[1].load(Ordering::Acquire),
             })
         }
         Some(crate::winfs::DosDevicePath::ConsoleIn) => process_ctx()
-            .map(|process| NativeDevice::ConsoleIn(process.std_handles[0].load(Ordering::Acquire))),
+            .map(|process| NativeDevice::ConsoleIn(process.parameters.std_handles[0].load(Ordering::Acquire))),
         Some(crate::winfs::DosDevicePath::ConsoleOut) => process_ctx().map(|process| {
-            NativeDevice::ConsoleOut(process.std_handles[1].load(Ordering::Acquire))
+            NativeDevice::ConsoleOut(process.parameters.std_handles[1].load(Ordering::Acquire))
         }),
         Some(crate::winfs::DosDevicePath::Reserved) => {
             native_set_last_error(123); // ERROR_INVALID_NAME

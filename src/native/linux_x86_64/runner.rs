@@ -190,6 +190,7 @@ fn run_exec_worker(
         .arg(&request_path)
         .env_remove("WINRUN_NATIVE_WORKER")
         .env_remove("WINRUN_NATIVE_CONSOLE_FD")
+        .env("WINRUN_NATIVE_CONSOLE_MASK", native_host_console_mask().to_string())
         .env(super::super::diagnostics::CHANNEL_ENV, error_fd.to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -232,11 +233,21 @@ fn run_exec_worker(
     let readers = vec![
         forward_output(false, stdout, sender.clone()),
         forward_output(true, stderr, sender.clone()),
-        forward_output(true, diagnostics.reader, sender.clone()),
     ];
+    let (foreground_diagnostics, diagnostic_reader) =
+        super::super::diagnostics::forward(diagnostics.reader, sender.clone(), write_host_stderr);
     drop(sender);
     let mut stdout_bytes = Vec::new();
-    for (is_stderr, bytes) in receiver {
+    loop {
+        let message = receiver.recv_timeout(std::time::Duration::from_millis(25));
+        if child.try_wait().ok().flatten().is_some() {
+            foreground_diagnostics.store(false, Ordering::Release);
+        }
+        let (is_stderr, bytes) = match message {
+            Ok(message) => message,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         if !is_stderr {
             stdout_bytes.extend_from_slice(&bytes);
         }
@@ -249,6 +260,10 @@ fn run_exec_worker(
     for reader in readers {
         let _ = reader.join();
     }
+    foreground_diagnostics.store(false, Ordering::Release);
+    if diagnostic_reader.is_finished() {
+        let _ = diagnostic_reader.join();
+    } // Otherwise its reader keeps background shim errors visible on host stderr.
     let status = child.wait();
     drop(terminal);
     let status = match status {
@@ -538,7 +553,8 @@ fn run_rust_baseline_argv_with_fs_impl(
             crt_exit_functions: Mutex::new(Vec::new()),
             crt_new_mode: AtomicI32::new(0),
             crt_invalid_parameter_handler: AtomicU64::new(0),
-            std_handles: std_handles.map(AtomicU64::new),
+            std_console_mask: std::env::var("WINRUN_NATIVE_CONSOLE_MASK").ok().and_then(|mask| mask.parse().ok()).unwrap_or_else(native_host_console_mask),
+            parameters: NativeProcessParameters::new(std_handles),
             crt_fds: Mutex::new(HashMap::new()),
             crt_fd_next: AtomicI32::new(3),
             fs,
@@ -549,6 +565,7 @@ fn run_rust_baseline_argv_with_fs_impl(
             wer_flags: AtomicU32::new(0),
             priority_boost_disabled: AtomicBool::new(false),
             pointer_cookie: random_pointer_cookie(),
+            desktop: Mutex::new(NativeDesktop::default()),
             heap_allocations: Mutex::new(HashMap::new()),
             virtual_allocations: Mutex::new(HashMap::new()),
             image_page_protections: Mutex::new(

@@ -73,6 +73,36 @@ pub(super) const TEB_TLS_EXPANSION_SLOTS: usize = 0x1780;
 /// `TLS_MINIMUM_AVAILABLE` + `TLS_EXPANSION_SLOTS`: Windows' `TlsAlloc` indices.
 pub(super) const TLS_INDEXES: usize = 64 + 1024;
 
+/// The x64 RTL_USER_PROCESS_PARAMETERS prefix read directly by native libraries.
+/// Standard handles share storage with GetStdHandle/SetStdHandle across threads.
+#[repr(C)]
+pub(super) struct NativeProcessParameters {
+    allocation_size: u32,
+    size: u32,
+    flags: u32,
+    debug_flags: u32,
+    console_handle: u64,
+    console_flags: u32,
+    padding: u32,
+    pub(super) std_handles: [AtomicU64; 3],
+    reserved: [u8; 0x448 - 0x38],
+}
+impl NativeProcessParameters {
+    pub(super) fn new(handles: [u64; 3]) -> Self {
+        Self {
+            allocation_size: std::mem::size_of::<Self>() as u32,
+            size: std::mem::size_of::<Self>() as u32,
+            flags: 1, // RTL_USER_PROC_PARAMS_NORMALIZED: pointers are absolute.
+            debug_flags: 0,
+            console_handle: 0,
+            console_flags: 0,
+            padding: 0,
+            std_handles: handles.map(AtomicU64::new),
+            reserved: [0; 0x448 - 0x38],
+        }
+    }
+}
+
 pub(super) struct NativeTls {
     pub(super) teb: Box<[u8; TEB_SIZE]>,
     pub(super) slots: Box<[u64; 64]>,
@@ -98,7 +128,7 @@ impl NativeTls {
         // Native libraries may read PEB.ProcessHeap directly instead of calling
         // GetProcessHeap. Use the same handle accepted by both heap API families.
         put64(&mut out.teb[..], 0x800 + 0x30, PROCESS_HEAP_HANDLE);
-        super::thread_runtime::put64(&mut out.teb[..], 0x800 + 0x20, out._ldr.as_ptr() as u64);
+        super::thread_runtime::put64(&mut out.teb[..], 0x800 + 0x18, out._ldr.as_ptr() as u64);
         super::thread_runtime::put64(
             &mut out.teb[..],
             TEB_TLS_EXPANSION_SLOTS,
@@ -143,7 +173,7 @@ impl NativeTls {
         for (index, data) in out.static_tls_data.iter().enumerate() {
             out.slots[index] = data.as_ref().map(|data| data.as_ptr() as u64).unwrap_or(0);
         }
-        put64(&mut out.teb[..], 0x800 + 0x20, out._ldr.as_ptr() as u64);
+        put64(&mut out.teb[..], 0x800 + 0x18, out._ldr.as_ptr() as u64);
         // A new thread starts with every TlsAlloc value empty.
         out.teb[TEB_TLS_SLOTS..TEB_TLS_SLOTS + 64 * 8].fill(0);
         put64(
@@ -212,7 +242,8 @@ pub(super) struct NativeProcessContext {
     pub(super) crt_exit_functions: Mutex<Vec<u64>>,
     pub(super) crt_new_mode: AtomicI32,
     pub(super) crt_invalid_parameter_handler: AtomicU64,
-    pub(super) std_handles: [AtomicU64; 3],
+    pub(super) std_console_mask: u32,
+    pub(super) parameters: NativeProcessParameters,
     pub(super) crt_fds: Mutex<HashMap<i32, u64>>,
     pub(super) crt_fd_next: AtomicI32,
     pub(super) fs: Arc<Mutex<NativeFs>>,
@@ -223,6 +254,7 @@ pub(super) struct NativeProcessContext {
     pub(super) wer_flags: AtomicU32,
     pub(super) priority_boost_disabled: AtomicBool,
     pub(super) pointer_cookie: u64,
+    pub(super) desktop: Mutex<NativeDesktop>,
     pub(super) heap_allocations: Mutex<HashMap<u64, usize>>,
     pub(super) virtual_allocations: Mutex<HashMap<u64, NativeVirtualAllocation>>,
     pub(super) image_page_protections: Mutex<HashMap<u64, Vec<u32>>>,
@@ -649,6 +681,35 @@ mod peb_heap_tests {
             let heap = u64::from_le_bytes(tls.teb[0x830..0x838].try_into().unwrap());
             assert_eq!(heap, native_get_process_heap());
             assert_ne!(heap, 0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod process_parameters_tests {
+    use super::*;
+    #[test]
+    fn standard_handles_have_the_x64_process_parameter_layout() {
+        assert_eq!(std::mem::offset_of!(NativeProcessParameters, std_handles), 0x20);
+        assert_eq!(std::mem::size_of::<NativeProcessParameters>(), 0x448);
+        let parameters = NativeProcessParameters::new([7, 8, 9]);
+        let pointer = &parameters as *const _ as *const u8;
+        for (index, expected) in [7u64, 8, 9].into_iter().enumerate() {
+            assert_eq!(unsafe { pointer.add(0x20 + index * 8).cast::<u64>().read() }, expected);
+        }
+        parameters.std_handles[1].store(42, Ordering::Release);
+        assert_eq!(unsafe { pointer.add(0x28).cast::<u64>().read() }, 42);
+    }
+    #[test]
+    fn cloned_tebs_keep_shared_parameters_separate_from_loader_data() {
+        let mut primary = NativeTls::new(0x140000000);
+        let parameters = NativeProcessParameters::new([7, 8, 9]);
+        let address = &parameters as *const _ as u64;
+        put64(&mut primary.teb[..], 0x820, address);
+        let child = primary.clone_for_thread();
+        for tls in [&primary, &child] {
+            assert_eq!(u64::from_le_bytes(tls.teb[0x820..0x828].try_into().unwrap()), address);
+            assert_eq!(u64::from_le_bytes(tls.teb[0x818..0x820].try_into().unwrap()), tls._ldr.as_ptr() as u64);
         }
     }
 }

@@ -516,6 +516,7 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
         "USER32.DLL" => matches!(
             func,
             "GetSystemMetrics" | "MessageBeep" | "LoadStringW" | "MapVirtualKeyW"
+                | "RegisterClipboardFormatW" | "CreateWindowExW" | "DestroyWindow" | "IsWindow" | "PostMessageW" | "PeekMessageW" | "DispatchMessageW" | "TranslateMessage" | "OpenClipboard" | "CloseClipboard" | "EmptyClipboard" | "GetClipboardData" | "SetClipboardData" | "IsClipboardFormatAvailable"
         ),
         "IPHLPAPI.DLL" => func == "GetAdaptersAddresses",
         "NTDLL.DLL" => matches!(
@@ -544,6 +545,7 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                 | "RtlReAllocateHeap"
                 | "RtlFreeHeap"
                 | "RtlSizeHeap"
+                | "NtWaitForSingleObject"
                 | "NtWaitForAlertByThreadId"
                 | "NtAlertThreadByThreadId"
                 | "RtlQueryPerformanceCounter"
@@ -1068,6 +1070,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "RtlLookupFunctionEntry" => {
             Some(native_rtl_lookup_function_entry as *const () as usize as u64)
         }
+        "NtWaitForSingleObject" => Some(native_nt_wait_for_single_object as *const () as usize as u64),
         "NtWaitForAlertByThreadId" => Some(native_nt_wait_for_alert_by_thread_id as *const () as usize as u64),
         "NtAlertThreadByThreadId" => Some(native_nt_alert_thread_by_thread_id as *const () as usize as u64),
         "RtlGetSystemTimePrecise" => Some(native_rtl_get_system_time_precise as *const () as usize as u64),
@@ -1217,6 +1220,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "CopyFileA" => Some(native_copy_file_a as *const () as usize as u64),
         "CopyFile2" => Some(native_copy_file2 as *const () as usize as u64),
         "CopyFileExW" => Some(native_copy_file_ex_w as *const () as usize as u64),
+        "PeekNamedPipe" => Some(native_peek_named_pipe as *const () as usize as u64),
         "GetNamedPipeHandleStateW" => {
             Some(native_get_named_pipe_handle_state_w as *const () as usize as u64)
         }
@@ -1323,6 +1327,19 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "IsClipboardFormatAvailable" => {
             Some(native_is_clipboard_format_available as *const () as usize as u64)
         }
+        "GlobalAlloc" => Some(native_global_alloc as *const () as usize as u64),
+        "GlobalFree" => Some(native_global_free as *const () as usize as u64),
+        "GlobalLock" => Some(native_global_lock as *const () as usize as u64),
+        "GlobalUnlock" => Some(native_global_unlock as *const () as usize as u64),
+        "GlobalSize" => Some(native_global_size as *const () as usize as u64),
+        "RegisterClipboardFormatW" => Some(native_register_clipboard_format_w as *const () as usize as u64),
+        "CreateWindowExW" => Some(native_create_window_ex_w as *const () as usize as u64),
+        "DestroyWindow" => Some(native_destroy_window as *const () as usize as u64),
+        "IsWindow" => Some(native_is_window as *const () as usize as u64),
+        "PostMessageW" => Some(native_post_message_w as *const () as usize as u64),
+        "PeekMessageW" => Some(native_peek_message_w as *const () as usize as u64),
+        "DispatchMessageW" => Some(native_dispatch_message_w as *const () as usize as u64),
+        "TranslateMessage" => Some(native_translate_message as *const () as usize as u64),
         "OpenClipboard" => Some(native_open_clipboard as *const () as usize as u64),
         "CloseClipboard" => Some(native_close_clipboard as *const () as usize as u64),
         "EmptyClipboard" => Some(native_empty_clipboard as *const () as usize as u64),

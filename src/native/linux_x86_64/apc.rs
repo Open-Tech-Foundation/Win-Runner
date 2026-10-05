@@ -81,6 +81,7 @@ pub(super) struct NativeThreadApcGuard {
 }
 impl Drop for NativeThreadApcGuard {
     fn drop(&mut self) {
+        release_thread_desktop(&self.process, self.queue.thread.id.load(Ordering::Acquire));
         self.queue.thread.finish(1);
         self.queue.close();
         if let Ok(mut queues) = self.process.apc_queues.lock() {

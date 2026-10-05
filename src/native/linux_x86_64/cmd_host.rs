@@ -51,7 +51,7 @@ fn wide_z(text: &str) -> Vec<u16> {
 
 fn std_handle(index: usize) -> u64 {
     process_ctx()
-        .map(|process| process.std_handles[index].load(Ordering::Acquire))
+        .map(|process| process.parameters.std_handles[index].load(Ordering::Acquire))
         .unwrap_or(STD_HANDLE_BASE + index as u64)
 }
 

@@ -29,6 +29,7 @@ with `guests/build-oracle.sh` (rustc and rust-lld only). A probe:
 | `path_names` | path spellings from `GetLongPathNameW`, `GetFullPathNameW`, and final paths |
 | `links` | `CreateSymbolicLinkW`, what a handle names with and without `FILE_FLAG_OPEN_REPARSE_POINT`, `FSCTL_GET_REPARSE_POINT` data |
 | `pool_console` | `QueueUserWorkItem`, `MapVirtualKeyW`, console input functions on a non-console handle |
+| `desktop_clipboard` | global-memory handles and locks, hidden STATIC windows, message queues, clipboard payload ownership and cross-process sharing |
 | `native_startup` | main-module ANSI/Unicode identity, Winsock dynamic ordinal lookup, static NT directory/attribute queries and handle closing, native address waits and NTSTATUS timeouts |
 | `console_runtime` | independent input/output code pages, invalid-page errors, shared child-process changes without handle inheritance, restoration, current thread stack bounds on main and created threads |
 | `thread_queries` | pseudo/opened/duplicated thread identity, query/set/synchronize rights, UTF-16 description copies, suspended and terminated threads, retained handles, exit codes and CPU timestamps |
@@ -85,6 +86,19 @@ alert checks cover pending alerts, coalescing, timeouts and delivery to a newly
 created thread. Console input flushing checks queued input removal and rejection
 of an output handle.
 
+
+`desktop_clipboard` uses a clipboard shared by workers in one WinFS session,
+backed by host files and process-safe locks. It does not access the Linux desktop
+clipboard or persist clipboard contents into snapshots. Only immediate HGLOBAL
+formats and nonvisual built-in STATIC windows are supported; GUI rendering,
+custom window procedures, clipboard format synthesis and delayed rendering
+remain unsupported. The probe clears the clipboard in its test environment and
+checks a child reads the same registered format and payload. `native_startup`
+also checks TEB client IDs, shared PEB standard handles and updates, NT object
+waits and error translations, and that byte-pipe peeks leave data available for
+reads. Optional real Windows Bun PTY tests verify console identity across output
+forwarding and pipe classification for captured child output.
+The pipe backend still rejects message-type pipes; peeks apply to byte pipes.
 
 `console_runtime` tests code pages 1252 and 65001, the encodings currently
 supported by Win-Runner. Other encodings return an explicit invalid-parameter
@@ -151,3 +165,14 @@ present, `cargo test --test oracle_native` requires Win-Runner's transcript to
 match it exactly, so the comparison also runs locally without Windows. To
 record or refresh one, copy it from the workflow's `oracle-windows` artifact
 and commit it. Record the Windows version it came from in the commit message.
+
+Optional OpenCode integration checks use an unchanged official Windows binary:
+
+```sh
+WINRUN_OPENCODE_EXE=/path/to/opencode.exe cargo test --test opencode_native -- --ignored
+```
+
+These checks require Python 3 and network access. Each creates a fresh shell,
+seeds the executable, verifies a rendered frame and typed prompt text, and exits
+with Ctrl+C without an unsupported-import diagnostic. Both managed and standalone
+server startup are covered. They do not submit a model request.

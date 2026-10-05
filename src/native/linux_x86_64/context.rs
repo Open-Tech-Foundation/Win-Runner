@@ -46,11 +46,8 @@ pub(super) fn new_test_process() -> Arc<NativeProcessContext> {
         crt_exit_functions: Mutex::new(Vec::new()),
         crt_new_mode: AtomicI32::new(0),
         crt_invalid_parameter_handler: AtomicU64::new(0),
-        std_handles: [
-            AtomicU64::new(STD_HANDLE_BASE),
-            AtomicU64::new(STD_HANDLE_BASE + 1),
-            AtomicU64::new(STD_HANDLE_BASE + 2),
-        ],
+        std_console_mask: 0,
+        parameters: NativeProcessParameters::new([STD_HANDLE_BASE, STD_HANDLE_BASE + 1, STD_HANDLE_BASE + 2]),
         crt_fds: Mutex::new(HashMap::new()),
         crt_fd_next: AtomicI32::new(3),
         fs: Arc::new(Mutex::new(NativeFs {
@@ -72,6 +69,7 @@ pub(super) fn new_test_process() -> Arc<NativeProcessContext> {
         wer_flags: AtomicU32::new(0),
         priority_boost_disabled: AtomicBool::new(false),
         pointer_cookie: random_pointer_cookie(),
+        desktop: Mutex::new(NativeDesktop::default()),
         heap_allocations: Mutex::new(HashMap::new()),
         virtual_allocations: Mutex::new(HashMap::new()),
         image_page_protections: Mutex::new(HashMap::new()),

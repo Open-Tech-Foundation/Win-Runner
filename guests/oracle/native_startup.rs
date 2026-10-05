@@ -6,9 +6,11 @@ include!("common.rs");
 include!("fs_support.rs");
 extern "system" {
     fn NtClose(handle: usize) -> u32;
+    fn NtWaitForSingleObject(handle: usize, alertable: u8, timeout: *const i64) -> u32;
     fn NtCreateThreadEx(out: *mut usize, desired: u32, object: usize, process: usize, start: usize, parameter: usize, flags: u32, zero_bits: usize, stack: usize, maximum: usize, attributes: *const usize) -> u32;
     fn NtResumeThread(handle: usize, previous: *mut u32) -> u32;
     fn RtlGetActiveActivationContext(out: *mut usize) -> u32;
+    fn RtlNtStatusToDosError(status: u32) -> u32;
     fn RtlAllocateHeap(heap: usize, flags: u32, size: usize) -> usize;
     fn RtlReAllocateHeap(heap: usize, flags: u32, ptr: usize, size: usize) -> usize;
     fn RtlFreeHeap(heap: usize, flags: u32, ptr: usize) -> u8;
@@ -90,14 +92,23 @@ fn nt_threads() {
         boolean("nt_thread.create", status == 0 && handle != 0);
         if handle == 0 { return }
         boolean("nt_thread.outputs", client[0] != 0 && client[1] == id(handle) as usize && teb != 0 && size == 8);
+        boolean("nt_thread.teb_identity", teb != 0 && *((teb + 0x40) as *const usize) == client[0] && *((teb + 0x48) as *const usize) == client[1]);
+        let primary_peb: usize;
+        core::arch::asm!("mov {}, gs:[0x60]", out(reg) primary_peb, options(nostack, readonly));
+        let thread_peb = *((teb + 0x60) as *const usize);
+        boolean("nt_thread.parameters_shared", *((primary_peb + 0x20) as *const usize) != 0 && *((primary_peb + 0x20) as *const usize) == *((thread_peb + 0x20) as *const usize));
         boolean("nt_thread.suspended", wait(handle, 0) == 258 && output == 0);
         let mut count = 0;
         boolean("nt_thread.resume", NtResumeThread(handle, &mut count) == 0 && count == 1);
         boolean("nt_thread.completed", wait(handle, 5000) == 0 && output == 42);
+        boolean("nt_wait.thread", NtWaitForSingleObject(handle, 0, core::ptr::null()) == 0);
         NtClose(handle);
         count = 0x1234;
         boolean("nt_thread.invalid", NtResumeThread(0, &mut count) == 0xc0000008 && count == 0x1234);
     }
+}
+extern "system" fn nt_wait_apc(parameter: usize) {
+    unsafe { (parameter as *mut u32).write(1) }
 }
 fn nt_heap() {
     type Heap = unsafe extern "system" fn() -> usize;
@@ -106,10 +117,41 @@ fn nt_heap() {
     let size = api!("heap.size", "HeapSize", Size);
     let set_error = api!("heap.error", "SetLastError", SetLastErrorFn);
     unsafe {
+        boolean("nt_error.missing_parent", RtlNtStatusToDosError(0xc000003a) == 3);
+        boolean("nt_error.invalid_name", RtlNtStatusToDosError(0xc0000033) == 123);
+        type Event = unsafe extern "system" fn(usize, i32, i32, *const u16) -> usize;
+        let create_event = api!("nt_wait.event_api", "CreateEventW", Event);
+        let event = create_event(0, 0, 0, core::ptr::null());
+        let poll = 0i64;
+        let relative = -10_000i64;
+        let expired = 1i64;
+        set_error(0x5678);
+        boolean("nt_wait.poll", NtWaitForSingleObject(event, 0, &poll) == 0x102);
+        boolean("nt_wait.relative", NtWaitForSingleObject(event, 0, &relative) == 0x102);
+        boolean("nt_wait.absolute", NtWaitForSingleObject(event, 0, &expired) == 0x102);
+        boolean("nt_wait.invalid", NtWaitForSingleObject(0, 0, &poll) == 0xc0000008);
+        boolean("nt_wait.last_error", last_error() == 0x5678);
+        type Queue = unsafe extern "system" fn(usize, usize, usize) -> u32;
+        let queue = api!("nt_wait.queue_api", "QueueUserAPC", Queue);
+        let current = api!("nt_wait.current_api", "GetCurrentThread", Heap);
+        let mut calls = 0u32;
+        let queued = queue(nt_wait_apc as *const () as usize, current(), &mut calls as *mut _ as usize);
+        boolean("nt_wait.nonalertable", queued != 0 && NtWaitForSingleObject(event, 0, &poll) == 0x102 && calls == 0);
+        boolean("nt_wait.apc", NtWaitForSingleObject(event, 1, &poll) == 0xc0 && calls == 1);
+        close(event);
         let mut activation = usize::MAX;
         boolean("activation.absent", RtlGetActiveActivationContext(&mut activation) == 0 && activation == 0);
         let peb: usize;
         core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, readonly));
+        type SetStd = unsafe extern "system" fn(u32, usize) -> i32;
+        let set_std = api!("peb.set_std_api", "SetStdHandle", SetStd);
+        let parameters = *((peb + 0x20) as *const usize);
+        let handles = core::slice::from_raw_parts((parameters + 0x20) as *const usize, 3);
+        boolean("peb.standard_handles", (0..3).all(|index| handles[index] == GetStdHandle((-10i32 - index as i32) as u32)));
+        let original = GetStdHandle((-12i32) as u32);
+        let replacement = GetStdHandle((-11i32) as u32);
+        boolean("peb.set_standard_handle", set_std((-12i32) as u32, replacement) != 0 && *((parameters + 0x30) as *const usize) == replacement);
+        set_std((-12i32) as u32, original);
         let heap = get();
         boolean("heap.peb", heap != 0 && *((peb + 0x30) as *const usize) == heap);
         set_error(0x1234);
@@ -844,6 +886,8 @@ fn alerts_and_console_flush() {
 }
 
 fn sync_pipes() {
+    type Peek = unsafe extern "system" fn(usize,*mut u8,u32,*mut u32,*mut u32,*mut u32)->i32;
+    let peek = api!("pipe.peek_api", "PeekNamedPipe", Peek);
     type Pipe = unsafe extern "system" fn(*mut usize, *mut usize, usize, u32) -> i32;
     type Read = unsafe extern "system" fn(usize, *mut u8, u32, *mut u32, *mut u64) -> i32;
     let pipe = api!("sync_pipe.api", "CreatePipe", Pipe);
@@ -882,6 +926,12 @@ fn sync_pipes() {
             ) != 0
                 && transferred == 4,
         );
+        let mut peeked = [0u8; 1];
+        let mut peek_count = 99;
+        let mut available = 99;
+        let mut left = 99;
+        boolean("pipe.peek", peek(reader,peeked.as_mut_ptr(),1,&mut peek_count,&mut available,&mut left)!=0 && peeked[0]==b's' && peek_count==1 && available==4 && left==0);
+        boolean("pipe.peek_query", peek(reader,core::ptr::null_mut(),0,&mut peek_count,&mut available,&mut left)!=0 && peek_count==0 && available==4 && left==0);
         let mut buffer = [0u8; 4];
         boolean(
             "sync_pipe.read",
@@ -908,6 +958,7 @@ fn sync_pipes() {
             ) == 0
                 && last_error() == 109,
         );
+        boolean("pipe.peek_eof", peek(reader,core::ptr::null_mut(),0,&mut peek_count,&mut available,&mut left)==0 && last_error()==109);
         NtClose(reader);
     }
 }

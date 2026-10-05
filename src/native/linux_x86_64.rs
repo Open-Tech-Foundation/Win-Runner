@@ -128,6 +128,9 @@ use ntdll::*;
 #[path = "linux_x86_64/memory.rs"]
 mod memory;
 use memory::*;
+#[path = "linux_x86_64/desktop.rs"]
+mod desktop;
+use desktop::*;
 #[path = "linux_x86_64/nt_memory.rs"]
 mod nt_memory;
 #[path = "linux_x86_64/nt_threads.rs"]

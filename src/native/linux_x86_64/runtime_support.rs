@@ -883,29 +883,3 @@ mod tests {
         );
     }
 }
-
-// A terminal-only guest has no desktop clipboard. Export the APIs so clients
-// can detect its unavailability and use their internal clipboard instead.
-pub(super) extern "win64" fn native_is_clipboard_format_available(_format: u32) -> i32 {
-    0
-}
-pub(super) extern "win64" fn native_open_clipboard(_window: u64) -> i32 {
-    native_set_last_error(50);
-    0
-}
-pub(super) extern "win64" fn native_close_clipboard() -> i32 {
-    native_set_last_error(1418);
-    0 // ERROR_CLIPBOARD_NOT_OPEN
-}
-pub(super) extern "win64" fn native_empty_clipboard() -> i32 {
-    native_set_last_error(1418);
-    0
-}
-pub(super) extern "win64" fn native_get_clipboard_data(_format: u32) -> u64 {
-    native_set_last_error(1418);
-    0
-}
-pub(super) extern "win64" fn native_set_clipboard_data(_format: u32, _memory: u64) -> u64 {
-    native_set_last_error(1418);
-    0
-}

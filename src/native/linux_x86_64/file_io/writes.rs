@@ -748,3 +748,285 @@ mod named_pipe_tests {
         );
     }
 }
+
+/// Observe byte-pipe input without consuming it, including redirected host stdin.
+pub(in crate::native::linux_x86_64) extern "win64" fn native_peek_named_pipe(
+    handle: u64,
+    buffer: *mut u8,
+    length: u32,
+    read: *mut u32,
+    available: *mut u32,
+    left: *mut u32,
+) -> i32 {
+    let original = handle;
+    let pipe = process_ctx().and_then(|process| {
+        process
+            .named_pipes
+            .lock()
+            .ok()
+            .and_then(|pipes| pipes.handles.get(&original).cloned())
+    });
+    let fd = if let Some(pipe) = &pipe {
+        let readable = if pipe.endpoint.server && !pipe.endpoint.name.is_empty() {
+            pipe.access & 1 != 0
+        } else {
+            pipe.access & (0x80000000 | 0x10000000 | 1) != 0
+        };
+        if !readable {
+            native_set_last_error(5);
+            return 0;
+        }
+        if pipe.pending_client.is_some() {
+            native_set_last_error(233);
+            return 0;
+        }
+        pipe.endpoint.fd
+    } else if let Some(fd) = host_standard_fd(original) {
+        fd
+    } else {
+        native_set_last_error(6);
+        return 0;
+    };
+    peek_byte_pipe_fd(fd, buffer, length, read, available, left)
+}
+fn peek_byte_pipe_fd(
+    fd: i32,
+    buffer: *mut u8,
+    length: u32,
+    read: *mut u32,
+    available: *mut u32,
+    left: *mut u32,
+) -> i32 {
+    if unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_ACCMODE == libc::O_WRONLY {
+        native_set_last_error(5);
+        return 0;
+    }
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd, metadata.as_mut_ptr()) } != 0 {
+        native_set_last_error(6);
+        return 0;
+    }
+    let kind = unsafe { metadata.assume_init().st_mode } & libc::S_IFMT;
+    if kind != libc::S_IFIFO && kind != libc::S_IFSOCK {
+        native_set_last_error(6);
+        return 0;
+    }
+    let mut count = 0i32;
+    if unsafe { libc::ioctl(fd, libc::FIONREAD, &mut count) } != 0 {
+        native_set_last_error(6);
+        return 0;
+    }
+    let mut descriptor = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    unsafe {
+        libc::poll(&mut descriptor, 1, 0);
+    }
+    if count == 0 && descriptor.revents & libc::POLLHUP != 0 {
+        native_set_last_error(109);
+        return 0;
+    }
+    let copy = if buffer.is_null() {
+        0
+    } else {
+        length.min(count.max(0) as u32)
+    };
+    let copied = if copy == 0 {
+        0
+    } else if kind == libc::S_IFSOCK {
+        let result = unsafe {
+            libc::recv(
+                fd,
+                buffer.cast(),
+                copy as usize,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        if result < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
+                0
+            } else {
+                native_set_last_error(109);
+                return 0;
+            }
+        } else {
+            result as u32
+        }
+    } else {
+        // tee duplicates Linux pipe bytes into a temporary pipe without advancing
+        // the source read position. Descriptors never cross a guest child exec.
+        let mut temporary = [-1; 2];
+        if unsafe { libc::pipe2(temporary.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+            native_set_last_error(8);
+            return 0;
+        }
+        let result = unsafe { libc::tee(fd, temporary[1], copy as usize, libc::SPLICE_F_NONBLOCK) };
+        let copied = if result > 0 {
+            unsafe { libc::read(temporary[0], buffer.cast(), result as usize) }
+        } else {
+            result
+        };
+        let error = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(temporary[0]);
+            libc::close(temporary[1]);
+        }
+        if copied < 0 {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                0
+            } else {
+                native_set_last_error(109);
+                return 0;
+            }
+        } else {
+            copied as u32
+        }
+    };
+    unsafe {
+        if !read.is_null() {
+            read.write_unaligned(copied)
+        }
+        if !available.is_null() {
+            available.write_unaligned(count.max(0) as u32)
+        }
+        if !left.is_null() {
+            left.write_unaligned(0)
+        } // Byte pipes have no message remainder.
+    }
+    1
+}
+
+#[cfg(test)]
+mod peek_tests {
+    use super::*;
+    #[test]
+    fn anonymous_pipe_peeks_preserve_data_and_validate_access_and_eof() {
+        let _process = crate::native::linux_x86_64::context::TestProcessGuard::new();
+        let (mut reader, mut writer) = (0, 0);
+        assert_eq!(
+            native_create_pipe(&mut reader, &mut writer, std::ptr::null(), 0),
+            1
+        );
+        let (mut copied, mut available, mut left) = (99, 99, 99);
+        let mut buffer = [0xcc; 3];
+        assert_eq!(
+            native_peek_named_pipe(
+                reader,
+                buffer.as_mut_ptr(),
+                3,
+                &mut copied,
+                &mut available,
+                &mut left
+            ),
+            1
+        );
+        assert_eq!((copied, available, left), (0, 0, 0));
+        assert_eq!(buffer, [0xcc; 3]);
+        let mut written = 0;
+        assert_eq!(
+            native_write_file(writer, b"hello".as_ptr(), 5, &mut written, 0),
+            1
+        );
+        assert_eq!(
+            native_peek_named_pipe(
+                reader,
+                buffer.as_mut_ptr(),
+                3,
+                &mut copied,
+                &mut available,
+                &mut left
+            ),
+            1
+        );
+        assert_eq!(&buffer, b"hel");
+        assert_eq!((copied, available, left), (3, 5, 0));
+        assert_eq!(
+            native_peek_named_pipe(
+                writer,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut()
+            ),
+            0
+        );
+        assert_eq!(native_get_last_error(), 5);
+        let mut duplicate = 0;
+        assert_eq!(
+            native_duplicate_handle(u64::MAX, reader, u64::MAX, &mut duplicate, 0, 0, 2),
+            1
+        );
+        native_close_handle(reader);
+        let mut data = [0u8; 5];
+        assert_eq!(
+            native_read_file(duplicate, data.as_mut_ptr(), 5, &mut copied, 0),
+            1
+        );
+        assert_eq!(&data, b"hello");
+        native_close_handle(writer);
+        assert_eq!(
+            native_peek_named_pipe(
+                duplicate,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut()
+            ),
+            0
+        );
+        assert_eq!(native_get_last_error(), 109);
+        native_close_handle(duplicate);
+    }
+    #[test]
+    fn redirected_linux_pipe_can_be_peeked_without_consuming_input() {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        assert_eq!(
+            unsafe { libc::write(fds[1], b"hello".as_ptr().cast(), 5) },
+            5
+        );
+        let mut bytes = [0; 3];
+        let (mut copied, mut available, mut left) = (0, 0, 99);
+        assert_eq!(
+            peek_byte_pipe_fd(
+                fds[0],
+                bytes.as_mut_ptr(),
+                3,
+                &mut copied,
+                &mut available,
+                &mut left
+            ),
+            1
+        );
+        assert_eq!(&bytes, b"hel");
+        assert_eq!((copied, available, left), (3, 5, 0));
+        let mut original = [0; 5];
+        assert_eq!(
+            unsafe { libc::read(fds[0], original.as_mut_ptr().cast(), 5) },
+            5
+        );
+        assert_eq!(&original, b"hello");
+        unsafe {
+            libc::close(fds[1]);
+        }
+        assert_eq!(
+            peek_byte_pipe_fd(
+                fds[0],
+                std::ptr::null_mut(),
+                0,
+                &mut copied,
+                &mut available,
+                &mut left
+            ),
+            0
+        );
+        assert_eq!(native_get_last_error(), 109);
+        unsafe {
+            libc::close(fds[0]);
+        }
+    }
+}

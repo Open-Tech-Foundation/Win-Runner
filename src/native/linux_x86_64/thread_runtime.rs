@@ -41,6 +41,11 @@ pub(super) fn set_teb_stack_bounds(teb: &mut [u8; TEB_SIZE]) {
     }
 }
 pub(super) fn install_thread_teb(teb: &mut [u8; TEB_SIZE]) -> bool {
+    put64(teb, 0x40, native_get_current_process_id() as u64);
+    put64(teb, 0x48, native_get_current_thread_id() as u64);
+    if let Some(process) = process_ctx() {
+        put64(teb, 0x800 + 0x20, &process.parameters as *const NativeProcessParameters as u64);
+    }
     set_teb_stack_bounds(teb);
     let base = teb.as_ptr() as u64;
     if !unsafe { set_gs(base) } {

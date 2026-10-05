@@ -1,7 +1,6 @@
 //! Host-owned diagnostics channel, independent of guest stdout and stderr.
 //! Workers inherit its writer, so redirection in any descendant cannot hide
 //! a fatal compatibility error from the launcher.
-#[cfg(test)]
 use std::os::fd::AsRawFd;
 use std::os::fd::{FromRawFd, OwnedFd};
 
@@ -25,6 +24,82 @@ impl DiagnosticChannel {
         Ok(Self { reader, writer })
     }
 }
+/// Foreground diagnostics participate in the launcher's output stream. Once the
+/// foreground worker exits, keep reading errors from surviving child workers
+/// through a host sink without retaining the launcher's completion channel.
+pub(super) fn forward(
+    mut reader: std::fs::File,
+    sender: std::sync::mpsc::Sender<(bool, Vec<u8>)>,
+    background: impl Fn(&[u8]) + Send + 'static,
+) -> (
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    std::thread::JoinHandle<()>,
+) {
+    use std::io::Read;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    let foreground = Arc::new(AtomicBool::new(true));
+    let active = Arc::clone(&foreground);
+    let worker = std::thread::spawn(move || {
+        let mut sender = Some(sender);
+        let mut buffer = [0u8; 4096];
+        loop {
+            // Drain diagnostics already queued before switching sinks; fatal
+            // errors written just before process exit still reach its caller.
+            let is_foreground = active.load(Ordering::Acquire);
+            let mut descriptor = libc::pollfd {
+                fd: reader.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ready = unsafe {
+                libc::poll(
+                    &mut descriptor,
+                    1,
+                    if sender.is_none() {
+                        -1 // Background diagnostics sleep until bytes or EOF arrive.
+                    } else if is_foreground {
+                        25
+                    } else {
+                        0
+                    },
+                )
+            };
+            if ready < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+            if ready == 0 {
+                if !is_foreground {
+                    sender.take();
+                }
+                continue;
+            }
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(length) => {
+                    let bytes = &buffer[..length];
+                    if let Some(ref output) = sender {
+                        if output.send((true, bytes.to_vec())).is_err() {
+                            sender.take();
+                            background(bytes);
+                        }
+                    } else {
+                        background(bytes);
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    });
+    (foreground, worker)
+}
+
 pub(super) fn inherit_writer(fd: i32) -> std::io::Result<()> {
     if unsafe { libc::fcntl(fd, libc::F_SETFD, 0) } != 0 {
         return Err(std::io::Error::last_os_error());
@@ -82,6 +157,44 @@ mod tests {
         let mut text = String::new();
         channel.reader.read_to_string(&mut text).unwrap();
         assert_eq!(text, "missing shim\n");
+    }
+    #[test]
+    fn surviving_child_writer_does_not_block_foreground_and_still_reports_errors() {
+        use std::sync::{atomic::Ordering, mpsc, Arc, Mutex};
+        use std::time::Duration;
+        let channel = DiagnosticChannel::new().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let (background_sender, background_receiver) = mpsc::channel();
+        let sink = Arc::new(Mutex::new(background_sender));
+        let (foreground, worker) = forward(channel.reader, sender, move |bytes| {
+            sink.lock().unwrap().send(bytes.to_vec()).unwrap();
+        });
+        assert!(write_message(
+            channel.writer.as_raw_fd(),
+            b"foreground error\n"
+        ));
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
+            (true, b"foreground error\n".to_vec())
+        );
+        foreground.store(false, Ordering::Release);
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_secs(2)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
+        // The surviving child retains its writer after foreground completion.
+        assert!(write_message(
+            channel.writer.as_raw_fd(),
+            b"background error\n"
+        ));
+        assert_eq!(
+            background_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap(),
+            b"background error\n"
+        );
+        drop(channel.writer);
+        worker.join().unwrap();
     }
     #[test]
     fn a_closed_channel_reports_failure_for_stderr_fallback() {

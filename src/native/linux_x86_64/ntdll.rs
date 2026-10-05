@@ -15,6 +15,7 @@ mod startup_tests {
         assert_eq!(native_get_last_error(), 42);
         for name in [
             "NtClose",
+            "NtWaitForSingleObject",
             "NtQueryDirectoryFile",
             "NtQueryInformationFile",
             "NtQueryVolumeInformationFile",
@@ -241,6 +242,40 @@ pub(super) extern "win64" fn native_nt_close(handle: u64) -> u32 {
         }
     };
     native_set_last_error(previous_error);
+    status
+}
+
+/// Native object waits use NT 100-nanosecond timeouts and preserve Win32 last error.
+pub(super) extern "win64" fn native_nt_wait_for_single_object(
+    handle: u64,
+    alertable: u8,
+    timeout: *const i64,
+) -> u32 {
+    if handle == 0 {
+        return 0xc0000008; // NULL is never a waitable NT handle.
+    }
+    let milliseconds = if timeout.is_null() {
+        u32::MAX
+    } else {
+        let ticks = unsafe { timeout.read_unaligned() };
+        let remaining = if ticks < 0 {
+            ticks.unsigned_abs()
+        } else {
+            (ticks as u64).saturating_sub(process_filetime_now())
+        };
+        remaining.div_ceil(10_000).min(u32::MAX as u64 - 1) as u32
+    };
+    let previous = native_get_last_error();
+    let result = native_wait_for_single_object_ex(handle, milliseconds, alertable as i32);
+    let status = match result {
+        0 | 0x80 | 0xc0 | 0x102 => result,
+        _ => match native_get_last_error() {
+            5 => 0xc0000022, // STATUS_ACCESS_DENIED
+            87 => 0xc000000d,
+            _ => 0xc0000008,
+        },
+    };
+    native_set_last_error(previous);
     status
 }
 
@@ -1252,5 +1287,39 @@ mod inactive_activation_context_tests {
         assert_eq!(context, 0);
         assert_eq!(native_rtl_get_active_activation_context(std::ptr::null_mut()), 0xc000000d);
         assert_eq!(native_get_last_error(), 0x4567);
+    }
+}
+
+#[cfg(test)]
+mod nt_object_wait_tests {
+    use super::*;
+    extern "win64" fn record_apc(value: u64) {
+        unsafe { (*(value as *const AtomicU32)).fetch_add(1, Ordering::SeqCst); }
+    }
+    #[test]
+    fn object_waits_translate_deadlines_errors_and_alertable_apcs() {
+        let _guard = TestProcessGuard::new();
+        let event = native_create_event_w(0, 0, 0, ptr::null());
+        let poll = 0;
+        let relative = -10_000;
+        let absolute = 1;
+        native_set_last_error(0x1234);
+        for timeout in [&poll, &relative, &absolute] {
+            assert_eq!(native_nt_wait_for_single_object(event, 0, timeout), 0x102);
+            assert_eq!(native_get_last_error(), 0x1234);
+        }
+        assert_eq!(native_nt_wait_for_single_object(0, 0, &poll), 0xc0000008);
+        assert_eq!(native_get_last_error(), 0x1234);
+        let count = AtomicU32::new(0);
+        assert_eq!(native_queue_user_apc(record_apc as *const () as u64, native_get_current_thread(), &count as *const _ as u64), 1);
+        assert_eq!(native_nt_wait_for_single_object(event, 0, &poll), 0x102);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert_eq!(native_nt_wait_for_single_object(event, 1, ptr::null()), 0xc0);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(native_get_last_error(), 0x1234);
+        assert_eq!(native_set_event(event), 1);
+        assert_eq!(native_nt_wait_for_single_object(event, 0, ptr::null()), 0);
+        assert_eq!(native_nt_wait_for_single_object(event, 0, &poll), 0x102);
+        native_close_handle(event);
     }
 }
