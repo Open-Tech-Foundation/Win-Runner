@@ -211,6 +211,14 @@ pub(crate) fn execute_request(path: &Path) -> Result<u32, String> {
     } else {
         std::env::remove_var("WINRUN_NATIVE_PIPE_FDS");
     }
+    if request.get("initially_suspended").and_then(serde_json::Value::as_bool) == Some(true) {
+        // Stop before loading guest code or invoking TLS/DllMain. The parent
+        // observes WUNTRACED before returning CreateProcessW; ResumeThread on
+        // the primary thread then releases this worker with SIGCONT.
+        if unsafe { libc::raise(libc::SIGSTOP) } != 0 {
+            return Err("cannot suspend native worker before guest startup".to_string());
+        }
+    }
     let text = |key: &str| -> Result<String, String> {
         request
             .get(key)

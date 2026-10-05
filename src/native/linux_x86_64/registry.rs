@@ -8,6 +8,12 @@ use super::*;
 pub(super) fn ordinal_export_name(dll: &str, func: &str) -> Option<&'static str> {
     let module = dll.to_ascii_uppercase();
     match (module.trim_end_matches(".DLL"), func) {
+        ("WSOCK32", "#10") => Some("inet_addr"),
+        ("WSOCK32", "#11") => Some("inet_ntoa"),
+        ("WSOCK32", "#12") => Some("ioctlsocket"),
+        ("WS2_32", "#10") => Some("ioctlsocket"),
+        ("WS2_32", "#11") => Some("inet_addr"),
+        ("WS2_32", "#12") => Some("inet_ntoa"),
         ("OLEAUT32", "#200") => Some("GetErrorInfo"),
         ("OLEAUT32", "#201") => Some("SetErrorInfo"),
         _ => None,
@@ -374,6 +380,7 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                 | "EnumerateSecurityPackagesA"
                 | "EnumerateSecurityPackagesW"
         ),
+        "PSAPI.DLL" => func == "GetProcessMemoryInfo",
         "WINMM.DLL" => func == "timeGetTime",
         "USERENV.DLL" => func == "GetUserProfileDirectoryW",
         "BCRYPTPRIMITIVES.DLL" => func == "ProcessPrng",
@@ -427,7 +434,7 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                 | "OpenProcessToken"
                 | "GetUserNameW"
         ),
-        "WS2_32.DLL" => matches!(
+        "WS2_32.DLL" | "WSOCK32.DLL" => matches!(
             func,
             "select"
                 | "__WSAFDIsSet"
@@ -448,6 +455,9 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                 | "#6"
                 | "#21"
                 | "#7"
+                | "#12"
+                | "#18"
+                | "#151"
                 | "#11"
                 | "#10"
                 | "#8"
@@ -479,6 +489,7 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                 | "getsockopt"
                 | "setsockopt"
                 | "ioctlsocket"
+                | "inet_ntoa"
                 | "inet_addr"
                 | "send"
                 | "recv"
@@ -487,6 +498,7 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                 | "shutdown"
                 | "socket"
                 | "gethostname"
+                | "GetHostNameW"
                 | "htonl"
                 | "htons"
                 | "ntohl"
@@ -527,6 +539,16 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                 | "RtlGetVersion"
                 | "RtlNtStatusToDosError"
                 | "NtReadFile"
+                | "NtQueryDirectoryFile"
+                | "NtQueryInformationFile"
+                | "NtQueryInformationProcess"
+                | "NtQueryVolumeInformationFile"
+                | "NtSetInformationFile"
+                | "NtClose"
+                | "NtQueryAttributesFile"
+                | "RtlWaitOnAddress"
+                | "RtlWakeAddressAll"
+                | "RtlWakeAddressSingle"
                 | "NtWriteFile"
         ),
         "KERNEL32.DLL" | "KERNELBASE.DLL" => {
@@ -553,8 +575,8 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
 pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
     match name {
         "WSACreateEvent" => Some(native_wsa_create_event as *const () as usize as u64),
-        "select" => Some(native_select as *const () as usize as u64),
-        "__WSAFDIsSet" => Some(native_wsa_fd_is_set as *const () as usize as u64),
+        "#18" | "select" => Some(native_select as *const () as usize as u64),
+        "#151" | "__WSAFDIsSet" => Some(native_wsa_fd_is_set as *const () as usize as u64),
         "inet_pton" => Some(native_inet_pton as *const () as usize as u64),
         "WSAEventSelect" => Some(native_wsa_event_select as *const () as usize as u64),
         "WSAEnumNetworkEvents" => Some(native_wsa_enum_network_events as *const () as usize as u64),
@@ -1031,6 +1053,16 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
             Some(native_rtl_lookup_function_entry as *const () as usize as u64)
         }
         "NtCreateFile" => Some(native_nt_create_file as *const () as usize as u64),
+        "NtQueryDirectoryFile" => Some(native_nt_query_directory_file as *const () as usize as u64),
+        "NtQueryInformationFile" => Some(native_nt_query_information_file as *const () as usize as u64),
+        "NtQueryInformationProcess" => Some(native_nt_query_information_process as *const () as usize as u64),
+        "NtQueryVolumeInformationFile" => Some(native_nt_query_volume_information_file as *const () as usize as u64),
+        "NtSetInformationFile" => Some(native_nt_set_information_file as *const () as usize as u64),
+        "NtClose" => Some(native_nt_close as *const () as usize as u64),
+        "NtQueryAttributesFile" => Some(native_nt_query_attributes_file as *const () as usize as u64),
+        "RtlWaitOnAddress" => Some(native_rtl_wait_on_address as *const () as usize as u64),
+        "RtlWakeAddressAll" => Some(native_wake_by_address_all as *const () as usize as u64),
+        "RtlWakeAddressSingle" => Some(native_wake_by_address_single as *const () as usize as u64),
         "NtOpenFile" => Some(native_nt_open_file as *const () as usize as u64),
         "NtCancelIoFileEx" => Some(native_nt_cancel_io_file_ex as *const () as usize as u64),
         "NtDeviceIoControlFile" => {
@@ -1053,6 +1085,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "#8" | "#14" | "htonl" | "ntohl" => Some(native_network_u32 as *const () as usize as u64),
         "#9" | "#15" | "htons" | "ntohs" => Some(native_network_u16 as *const () as usize as u64),
         "#10" | "ioctlsocket" => Some(native_ioctlsocket as *const () as usize as u64),
+        "#12" | "inet_ntoa" => Some(native_wsa_inet_ntoa as *const () as usize as u64),
         "#11" | "inet_addr" => Some(native_wsa_inet_addr as *const () as usize as u64),
         "#4" | "connect" => Some(native_connect_socket as *const () as usize as u64),
         "#2" | "bind" => Some(native_bind_socket as *const () as usize as u64),
@@ -1063,6 +1096,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "#6" | "getsockname" => Some(native_getsockname as *const () as usize as u64),
         "#21" | "setsockopt" => Some(native_setsockopt as *const () as usize as u64),
         "#57" | "gethostname" => Some(native_wsa_get_host_name as *const () as usize as u64),
+        "GetHostNameW" => Some(native_wsa_get_host_name_w as *const () as usize as u64),
         "GetAddrInfoW" => Some(native_get_addr_info_w as *const () as usize as u64),
         "FreeAddrInfoW" => Some(native_free_addr_info_w as *const () as usize as u64),
         "#115" | "WSAStartup" => Some(native_wsa_startup as *const () as usize as u64),
@@ -1131,6 +1165,8 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "WaitNamedPipeA" => Some(native_wait_named_pipe_a as *const () as usize as u64),
         "CreatePipe" => Some(native_create_pipe as *const () as usize as u64),
         "GetProcessTimes" => Some(native_get_process_times as *const () as usize as u64),
+        "K32GetProcessMemoryInfo" | "GetProcessMemoryInfo" => Some(native_get_process_memory_info as *const () as usize as u64),
+        "GetProcessIoCounters" => Some(native_get_process_io_counters as *const () as usize as u64),
         "InitializeProcThreadAttributeList" => {
             Some(native_initialize_proc_thread_attribute_list as *const () as usize as u64)
         }

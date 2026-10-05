@@ -534,6 +534,19 @@ pub(super) extern "win64" fn native_create_thread(
     }
     result
 }
+fn resume_worker_primary_thread(child: &NativeChildProcess) -> u32 {
+    if !child.initially_suspended.swap(false, Ordering::AcqRel) {
+        return 0;
+    }
+    let pid = child.host_pid.load(Ordering::Acquire);
+    if pid <= 0 || unsafe { libc::kill(pid, libc::SIGCONT) } != 0 {
+        child.initially_suspended.store(true, Ordering::Release);
+        native_set_last_error(6);
+        return u32::MAX;
+    }
+    1
+}
+
 /// `QueueUserWorkItem(function, context, flags)`: run `function(context)`
 /// on a worker guest thread. libuv queues its console line reader this way
 /// (`WT_EXECUTELONGFUNCTION`), so every item gets its own guest thread with
@@ -555,6 +568,15 @@ pub(super) extern "win64" fn native_queue_user_work_item(
     1
 }
 pub(super) extern "win64" fn native_resume_thread(handle: u64) -> u32 {
+    if let Some(process) = process_ctx() {
+        let original = process.duplicate_handles.lock().ok()
+            .and_then(|handles| handles.get(&handle).copied()).unwrap_or(handle);
+        let child = process.children.lock().ok()
+            .and_then(|table| table.primary_threads.get(&original).cloned());
+        if let Some(child) = child {
+            return resume_worker_primary_thread(&child);
+        }
+    }
     let thread = match require_thread_handle(handle, 0x2) {
         Ok(thread) => thread,
         Err(error) => {
@@ -1079,6 +1101,9 @@ fn restore_worker_socket_handles(
             return Err("worker socket descriptor was not inherited".to_string());
         }
         sockets.insert(handle);
+        if item.get("exclusive").and_then(serde_json::Value::as_bool) == Some(true) {
+            process.socket_exclusive.lock().map_err(|_| "worker socket options are poisoned")?.insert(handle);
+        }
         let completion = item
             .get("completion")
             .filter(|value| !value.is_null())
@@ -1422,6 +1447,33 @@ fn apply_worker_native_fs(
 }
 
 #[cfg(test)]
+mod suspended_worker_tests {
+    use super::*;
+    #[test]
+    fn resume_primary_thread_releases_stopped_worker_and_rejects_process_handle() {
+        let _guard = TestProcessGuard::new();
+        let process = process_ctx().unwrap();
+        let (handle, thread, child) = process.children.lock().unwrap().allocate(process.process_id);
+        let mut worker = std::process::Command::new("sh")
+            .args(["-c", "kill -STOP $$; exit 23"]).spawn().unwrap();
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(worker.id() as i32, &mut status, libc::WUNTRACED) }, worker.id() as i32);
+        assert!(libc::WIFSTOPPED(status));
+        child.host_pid.store(worker.id() as i32, Ordering::Release);
+        child.initially_suspended.store(true, Ordering::Release);
+        assert_eq!(native_resume_thread(handle), u32::MAX);
+        assert_eq!(native_get_last_error(), 6);
+        assert!(child.initially_suspended.load(Ordering::Acquire));
+        assert_eq!(native_resume_thread(thread), 1);
+        assert_eq!(native_resume_thread(thread), 0);
+        assert_eq!(worker.wait().unwrap().code(), Some(23));
+        assert_eq!(native_close_handle(thread), 1);
+        assert_eq!(native_resume_thread(thread), u32::MAX);
+        native_close_handle(handle);
+    }
+}
+
+#[cfg(test)]
 mod worker_native_fs_tests {
     use super::*;
 
@@ -1735,6 +1787,7 @@ fn create_exec_worker_child(
     inherit_handles: bool,
     handle_list: Option<&[u64]>,
     environment: &[(String, String)],
+    initially_suspended: bool,
     process_information: u64,
 ) -> Result<(), u32> {
     use std::os::unix::fs::PermissionsExt;
@@ -1835,6 +1888,7 @@ fn create_exec_worker_child(
         .lock()
         .map_err(|_| 6u32)?
         .clone();
+    let exclusive_sockets = parent.socket_exclusive.lock().map_err(|_| 6u32)?.clone();
     let inherited_socket_metadata = inherited_socket_handles
         .iter()
         .map(|handle| {
@@ -1848,6 +1902,7 @@ fn create_exec_worker_child(
                 "handle": handle,
                 "completion": completion,
                 "completion_modes": socket_modes.get(handle).copied().unwrap_or(0),
+                "exclusive": exclusive_sockets.contains(handle),
             })
         })
         .collect::<Vec<_>>();
@@ -1932,6 +1987,7 @@ fn create_exec_worker_child(
     child_fs.fs.clear_changes();
     let request = serde_json::json!({
         "image_path": image_path,
+        "initially_suspended": initially_suspended,
         "snapshot_path": snapshot_path,
         "state_path": state_path,
         "result_path": result_path,
@@ -1973,6 +2029,7 @@ fn create_exec_worker_child(
             return Err(8);
         }
     };
+    child.times.prepare_worker_io(worker.id());
     if let Some(listener) = pipe_listener {
         let (stream, _) = match listener.accept() {
             Ok(connection) => connection,
@@ -1986,6 +2043,24 @@ fn create_exec_worker_child(
             let _ = worker.kill();
             let _ = worker.wait();
             return Err(8);
+        }
+    }
+    if initially_suspended {
+        let mut status = 0;
+        loop {
+            let result = unsafe { libc::waitpid(worker.id() as i32, &mut status, libc::WUNTRACED) };
+            if result > 0 {
+                if !libc::WIFSTOPPED(status) {
+                    return Err(8);
+                }
+                child.initially_suspended.store(true, Ordering::Release);
+                break;
+            }
+            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                let _ = worker.kill();
+                let _ = worker.wait();
+                return Err(8);
+            }
         }
     }
     // Close this process's copies immediately; only the worker should retain
@@ -2206,6 +2281,10 @@ pub(super) extern "win64" fn native_create_process_w(
             .unwrap_or(handle)
     });
     if crate::shell::is_powershell_shell_link(&fs.fs, &launch.application) {
+        if creation_flags & 4 != 0 {
+            native_set_last_error(50);
+            return 0;
+        }
         let powershell_fs = fs.fs.clone();
         drop(fs);
         return native_create_powershell_shell_child(
@@ -2264,6 +2343,7 @@ pub(super) extern "win64" fn native_create_process_w(
         inherit_handles != 0,
         handle_list.as_deref(),
         &environment,
+        creation_flags & 4 != 0,
         process_information,
     ) {
         Ok(()) => {

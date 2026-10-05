@@ -32,7 +32,7 @@ fn transcript(probe: &Path) -> String {
         .spawn()
         .expect("start the winrun shell");
     let stem = probe.file_stem().and_then(|name| name.to_str()).unwrap();
-    let executable = if matches!(stem, "oracle_process_runtime" | "oracle_console_runtime") {
+    let executable = if matches!(stem, "oracle_process_runtime" | "oracle_console_runtime" | "oracle_native_startup") {
         let name = stem.trim_start_matches("oracle_");
         format!(
             "@seed \"{}\" C:\\oracle-run\\{name}.exe\nC:\\oracle-run\\{name}.exe",
@@ -89,6 +89,7 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
                 | "apc_io"
                 | "thread_queries"
                 | "console_runtime"
+                | "native_startup"
         ) {
             assert!(
                 !actual.contains("wrong") && !actual.contains("unavailable"),
@@ -120,6 +121,21 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
         // Require important behavior cases even before complete transcripts
         // are checked in. Windows CI compares every new probe with Windows.
         let required: &[&str] = match name.as_str() {
+            "native_startup" => &[
+                "socket.ordinal_text: ok", "socket.ordinal_select: ok", "socket.ipv4_text: ok",
+                "socket.modern_ioctl: ok", "socket.modern_addr: ok", "socket.modern_text: ok",
+                "socket.ordinal_addr: ok", "socket.ordinal_ioctl: ok", "socket.ordinal_fdset: ok",
+                "socket.accept: ok", "socket.recv_push_peek: ok", "socket.recv_push_waitall: ok",
+                "socket.exclusive: ok", "socket.exclusive_reuse: ok", "socket.exclusive_bind: ok", "socket.exclusive_competitor: ok",
+                "suspend.created: ok", "suspend.before_resume: ok", "suspend.invalid_handle: ok",
+                "suspend.resume: ok", "suspend.second_resume: ok", "suspend.exit: ok", "suspend.final_io: ok",
+                "file.duplicate_type: ok", "file.duplicate_closed: ok",
+                "process.io: ok", "process.io_invalid: ok", "process.memory: ok",
+                "process.memory_invalid: ok", "process.memory_small: ok", "process.memory_basic: ok",
+                "module.main: ok", "socket.ordinal: ok", "socket.hostname: ok", "close.success: ok",
+                "close.invalid: ok", "attributes.file: ok", "directory.entries: ok",
+                "wait.different: ok", "wait.timeout: ok", "wait.invalid: ok",
+            ],
             "console_runtime" => &[
                 "pages.independent: ok",
                 "pages.invalid_input: fail err=87",

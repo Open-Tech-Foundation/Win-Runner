@@ -91,6 +91,25 @@ pub(super) extern "win64" fn native_wsa_get_host_name(name: *mut u8, length: i32
     0
 }
 
+pub(super) extern "win64" fn native_wsa_get_host_name_w(name: *mut u16, length: i32) -> i32 {
+    if name.is_null() || length <= 0 {
+        native_wsa_set_last_error(10014);
+        return -1;
+    }
+    let mut bytes = [0u8; 256];
+    if native_wsa_get_host_name(bytes.as_mut_ptr(), bytes.len() as i32) != 0 {
+        return -1;
+    }
+    let end = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
+    let units: Vec<u16> = String::from_utf8_lossy(&bytes[..end]).encode_utf16().chain(Some(0)).collect();
+    if units.len() > length as usize {
+        native_wsa_set_last_error(10014);
+        return -1;
+    }
+    unsafe { ptr::copy_nonoverlapping(units.as_ptr(), name, units.len()) };
+    0
+}
+
 pub(super) extern "win64" fn native_connect_socket(
     socket: u64,
     address: *const u8,
@@ -589,6 +608,44 @@ pub(super) extern "win64" fn native_setsockopt(
         native_wsa_set_last_error(10014);
         return -1;
     }
+    if level == 0xffff && matches!(option, -5 | 4) {
+        if length < 4 {
+            native_wsa_set_last_error(10014);
+            return -1;
+        }
+        let enabled = unsafe { value.cast::<i32>().read_unaligned() } != 0;
+        let Some(process) = process_ctx() else {
+            native_wsa_set_last_error(10038);
+            return -1;
+        };
+        let mut exclusive = process.socket_exclusive.lock().unwrap();
+        if option == 4 && enabled && exclusive.contains(&socket) {
+            native_wsa_set_last_error(10022);
+            return -1;
+        }
+        if option == -5 {
+            let mut address = [0u8; 128];
+            let mut address_length = 128u32;
+            if unsafe { getsockname(socket as i32, address.as_mut_ptr().cast(), &mut address_length) } != 0 {
+                set_wsa_error_from_errno();
+                return -1;
+            }
+            let mut reuse = 0i32;
+            let mut size = 4u32;
+            if unsafe { getsockopt(socket as i32, libc::SOL_SOCKET, libc::SO_REUSEADDR, (&mut reuse as *mut i32).cast(), &mut size) } != 0 {
+                set_wsa_error_from_errno();
+                return -1;
+            }
+            if address[2..4] != [0, 0] || (enabled && reuse != 0) {
+                native_wsa_set_last_error(10022);
+                return -1;
+            }
+            // Linux's default non-reuse binding excludes competing binders.
+            // Track the Windows option to reject conflicting reuse requests.
+            if enabled { exclusive.insert(socket); } else { exclusive.remove(&socket); }
+            return 0;
+        }
+    }
     let (host_level, host_option) = match (level, option) {
         (0xffff, 0x0004) => (1, 2), // SO_REUSEADDR
         (0xffff, 0x0008) => (1, 9), // SO_KEEPALIVE
@@ -1022,6 +1079,20 @@ pub(super) extern "win64" fn native_ioctlsocket(
     }
 }
 
+pub(super) extern "win64" fn native_wsa_inet_ntoa(address: u32) -> *const u8 {
+    std::thread_local! {
+        static IPV4_TEXT: std::cell::RefCell<[u8; 16]> = const { std::cell::RefCell::new([0; 16]) };
+    }
+    let octets = address.to_ne_bytes();
+    let text = format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3]);
+    IPV4_TEXT.with(|buffer| {
+        let mut buffer = buffer.borrow_mut();
+        buffer.fill(0);
+        buffer[..text.len()].copy_from_slice(text.as_bytes());
+        buffer.as_ptr()
+    })
+}
+
 pub(super) extern "win64" fn native_wsa_inet_addr(address: *const u8) -> u32 {
     if address.is_null() {
         return u32::MAX;
@@ -1276,6 +1347,7 @@ pub(super) extern "win64" fn native_close_socket(handle: u64) -> i32 {
     // completion port the socket is still associated with.
     cancel_pending_accepts(handle);
     if let Some(process) = process_ctx() {
+        process.socket_exclusive.lock().unwrap().remove(&handle);
         if let Ok(mut sockets) = process.socket_handles.lock() {
             sockets.remove(&handle);
         }
@@ -1317,6 +1389,24 @@ pub(super) extern "win64" fn native_getsockopt(
         native_wsa_set_last_error(10014); // WSAEFAULT
         return -1;
     }
+    if level == 0xffff && option == -5 {
+        if unsafe { length.read_unaligned() } < 4 {
+            native_wsa_set_last_error(10014);
+            return -1;
+        }
+        let mut kind = 0i32;
+        let mut size = 4u32;
+        if unsafe { getsockopt(handle as i32, libc::SOL_SOCKET, libc::SO_TYPE, (&mut kind as *mut i32).cast(), &mut size) } != 0 {
+            set_wsa_error_from_errno();
+            return -1;
+        }
+        let enabled = process_ctx().is_some_and(|process| process.socket_exclusive.lock().unwrap().contains(&handle));
+        unsafe {
+            value.cast::<i32>().write_unaligned(enabled as i32);
+            length.write_unaligned(4);
+        }
+        return 0;
+    }
     if level == 0xffff && option == 0x2005 {
         // SO_PROTOCOL_INFOW
         const WSAPROTOCOL_INFO_W_SIZE: u32 = 628;
@@ -1332,6 +1422,7 @@ pub(super) extern "win64" fn native_getsockopt(
         return 0;
     }
     let (host_level, host_option) = match (level, option) {
+        (0xffff, 0x0004) => (1, 2), // SO_REUSEADDR
         (0xffff, 0x1008) => (1, 3),  // SOL_SOCKET, SO_TYPE
         (0xffff, 0x1007) => (1, 4),  // SO_ERROR
         (0xffff, 0x1002) => (1, 8),  // SO_RCVBUF
@@ -1442,12 +1533,17 @@ pub(super) extern "win64" fn native_accept_socket(socket: u64, address: *mut u8,
         return u64::MAX;
     }
     let mut host_length = if length.is_null() { 0 } else { unsafe { length.read_unaligned() }.max(0) as u32 };
+    let listener_flags = unsafe { libc::fcntl(socket as i32, libc::F_GETFL) };
+    if listener_flags < 0 {
+        set_wsa_error_from_errno();
+        return u64::MAX;
+    }
     let fd = unsafe {
         libc::accept4(
             socket as i32,
             if address.is_null() { ptr::null_mut() } else { address.cast() },
             if length.is_null() { ptr::null_mut() } else { &mut host_length },
-            libc::SOCK_CLOEXEC,
+            libc::SOCK_CLOEXEC | if listener_flags & libc::O_NONBLOCK != 0 { libc::SOCK_NONBLOCK } else { 0 },
         )
     };
     if fd < 0 {
@@ -1483,6 +1579,29 @@ pub(super) extern "win64" fn native_recvfrom_socket(
         native_wsa_set_last_error(10014);
         return -1;
     }
+    // Winsock MSG_PUSH_IMMEDIATE (0x20) is a receive hint, whereas Linux
+    // interprets 0x20 as MSG_TRUNC and can discard TCP data without copying it.
+    // MSG_WAITALL also has a different numeric value on the two platforms.
+    if flags & !(0x1 | 0x2 | 0x8 | 0x20) != 0 {
+        native_wsa_set_last_error(10022);
+        return -1;
+    }
+    if flags & 0x8 != 0 {
+        let mut kind = 0i32;
+        let mut size = 4u32;
+        let options = unsafe { libc::fcntl(socket as i32, libc::F_GETFL) };
+        if options < 0 || unsafe { getsockopt(socket as i32, libc::SOL_SOCKET, libc::SO_TYPE, (&mut kind as *mut i32).cast(), &mut size) } != 0 {
+            set_wsa_error_from_errno();
+            return -1;
+        }
+        if flags & 0x3 != 0 || options & libc::O_NONBLOCK != 0 || kind != libc::SOCK_STREAM {
+            native_wsa_set_last_error(10045);
+            return -1;
+        }
+    }
+    let flags = (flags & 0x1) * libc::MSG_OOB
+        | ((flags & 0x2 != 0) as i32) * libc::MSG_PEEK
+        | ((flags & 0x8 != 0) as i32) * libc::MSG_WAITALL;
     let mut host_length = if from_length.is_null() { 0 } else { unsafe { from_length.read_unaligned() }.max(0) as u32 };
     let received = unsafe {
         libc::recvfrom(
@@ -1609,6 +1728,47 @@ mod named_socket_tests {
     use super::*;
 
     #[test]
+    fn winsock_receive_hints_preserve_data_and_accepted_sockets_inherit_nonblocking() {
+        let _guard = TestProcessGuard::new();
+        let listener = native_socket(2, 1, 6);
+        let mut address = [2u8, 0, 0, 0, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut length = 16;
+        assert_eq!(native_bind_socket(listener, address.as_ptr(), 16), 0);
+        assert_eq!(native_getsockname(listener, address.as_mut_ptr(), &mut length), 0);
+        assert_eq!(native_listen_socket(listener, 2), 0);
+        let client = native_socket(2, 1, 6);
+        assert_eq!(native_connect_socket(client, address.as_ptr(), 16), 0);
+        let server = native_accept_socket(listener, ptr::null_mut(), ptr::null_mut());
+        assert_ne!(server, u64::MAX);
+        assert_eq!(native_send_socket(client, b"ping".as_ptr(), 4, 0), 4);
+        let mut buffer = [0u8; 4];
+        assert_eq!(native_recv_socket(server, buffer.as_mut_ptr(), 4, 0x22), 4);
+        assert_eq!(&buffer, b"ping");
+        buffer.fill(0);
+        assert_eq!(native_recv_socket(server, buffer.as_mut_ptr(), 4, 0x28), 4);
+        assert_eq!(&buffer, b"ping");
+        assert_eq!(native_recv_socket(server, buffer.as_mut_ptr(), 4, 0x10), -1);
+        assert_eq!(native_wsa_get_last_error(), 10022);
+        assert_eq!(&buffer, b"ping");
+        native_close_socket(server);
+        native_close_socket(client);
+        let mut enabled = 1;
+        assert_eq!(native_ioctlsocket(listener, 0x8004_667e_u32 as i32, &mut enabled), 0);
+        let client = native_socket(2, 1, 6);
+        assert_eq!(native_connect_socket(client, address.as_ptr(), 16), 0);
+        let server = native_accept_socket(listener, ptr::null_mut(), ptr::null_mut());
+        assert_ne!(server, u64::MAX);
+        assert_ne!(unsafe { libc::fcntl(server as i32, libc::F_GETFL) } & libc::O_NONBLOCK, 0);
+        assert_eq!(native_recv_socket(server, buffer.as_mut_ptr(), 4, 8), -1);
+        assert_eq!(native_wsa_get_last_error(), 10045);
+        assert_eq!(native_recv_socket(server, buffer.as_mut_ptr(), 4, 0), -1);
+        assert_eq!(native_wsa_get_last_error(), 10035);
+        native_close_socket(server);
+        native_close_socket(client);
+        native_close_socket(listener);
+    }
+
+    #[test]
     fn named_winsock_calls_accept_receive_and_datagrams() {
         let listener = native_wsa_socket_w(2, 1, 6, ptr::null(), 0, 0x81);
         assert_ne!(listener, u64::MAX);
@@ -1690,6 +1850,49 @@ mod named_socket_tests {
         assert_eq!(native_get_last_error(), 10038, "GetLastError sees WSAENOTSOCK");
         native_set_last_error(5);
         assert_eq!(native_wsa_get_last_error(), 5);
+    }
+
+    #[test]
+    fn exclusive_socket_options_prevent_reuse_and_keep_the_port_exclusive() {
+        let _guard = TestProcessGuard::new();
+        let first = native_socket(2, 1, 6);
+        let second = native_socket(2, 1, 6);
+        let enabled = 1i32;
+        let value = (&enabled as *const i32).cast();
+        assert_eq!(native_setsockopt(first, 0xffff, -5, value, 4), 0);
+        assert_eq!(native_setsockopt(first, 0xffff, 4, value, 4), -1);
+        assert_eq!(native_wsa_get_last_error(), 10022);
+        let mut option = 0i32;
+        let mut length = 4;
+        assert_eq!(native_getsockopt(first, 0xffff, -5, (&mut option as *mut i32).cast(), &mut length), 0);
+        assert_eq!((option, length), (1, 4));
+        let mut address = [2u8, 0, 0, 0, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(native_bind_socket(first, address.as_ptr(), 16), 0);
+        let mut size = 16;
+        assert_eq!(native_getsockname(first, address.as_mut_ptr(), &mut size), 0);
+        assert_eq!(native_setsockopt(first, 0xffff, -5, value, 4), -1);
+        assert_eq!(native_setsockopt(second, 0xffff, 4, value, 4), 0);
+        assert_eq!(native_bind_socket(second, address.as_ptr(), 16), -1);
+        native_close_socket(second);
+        native_close_socket(first);
+        assert!(!process_ctx().unwrap().socket_exclusive.lock().unwrap().contains(&first));
+    }
+
+    #[test]
+    fn inet_ntoa_preserves_network_order_and_per_thread_storage() {
+        native_set_last_error(42);
+        let first = native_wsa_inet_ntoa(u32::from_ne_bytes([127, 0, 0, 1]));
+        assert_eq!(unsafe { ascii_z(first) }, Some("127.0.0.1"));
+        let pointer = first as usize;
+        std::thread::spawn(move || {
+            let text = native_wsa_inet_ntoa(u32::MAX);
+            assert_ne!(text as usize, pointer);
+            assert_eq!(unsafe { ascii_z(text) }, Some("255.255.255.255"));
+        }).join().unwrap();
+        assert_eq!(unsafe { ascii_z(first) }, Some("127.0.0.1"));
+        assert_eq!(native_wsa_inet_ntoa(0), first);
+        assert_eq!(unsafe { ascii_z(first) }, Some("0.0.0.0"));
+        assert_eq!(native_get_last_error(), 42);
     }
 
     #[test]

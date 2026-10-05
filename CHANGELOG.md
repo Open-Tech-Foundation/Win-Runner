@@ -44,6 +44,24 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Return the main PE module for `GetModuleHandleA(NULL)` so embedded
+  applications can find their own executable sections. Bind existing NT file
+  queries for static imports; add `NtClose`, `NtQueryAttributesFile`,
+  `RtlWaitOnAddress`/wake exports and `GetHostNameW`, plus Winsock ordinal
+  lookup and `WSOCK32.dll` loading. Report unhandled software exceptions and
+  fatal delay-load failures through the launcher diagnostic channel. Add
+  native startup oracle and regression coverage. Resolve duplicated file
+  handles in `GetFileType` so redirected child output works. Add Linux-backed
+  `GetProcessIoCounters` and `K32GetProcessMemoryInfo`/PSAPI queries, retaining
+  final child I/O, faults and peak resident memory after reaping. Honor
+  `CREATE_SUSPENDED` for native workers and resume child primary threads,
+  allowing detached libuv launches to complete without `EBADF`. Support
+  exclusive socket binds and Winsock `inet_ntoa`/`select` ordinal exports
+  used by native server runtimes. Distinguish the differing `WSOCK32.dll`
+  and `WS2_32.dll` ordinal tables in static and dynamic import resolution,
+  translate receive flags instead of leaking Linux `MSG_TRUNC` semantics,
+  and inherit nonblocking mode on accepted sockets.
+
 - Record shell commands before execution in terminal, controlled and piped
   sessions, so failed commands and commands that save a snapshot are retained
   in guest history. Ignore blank input and consecutive duplicate commands.

@@ -19,6 +19,8 @@ pub(super) const SOCKET_HANDLE_TAG: u64 = 0x534f_434b_0000_0000;
 pub(super) const CRYPTO_PROVIDER_HANDLE: u64 = 0x4352_5950_544f_0001;
 // A child-local stand-in for API-set modules dynamically requested by the UCRT.
 pub(super) const API_SET_MODULE: u64 = 0x5749_4e43_4c49_0001;
+pub(super) const WS2_MODULE: u64 = 0x5749_4e43_4c49_0002;
+pub(super) const WSOCK_MODULE: u64 = 0x5749_4e43_4c49_0003;
 pub(super) static EMPTY_ENVIRONMENT_BLOCK: [u16; 2] = [0, 0];
 
 // Preferred-base PE mappings collide by design. Serialize native runs until

@@ -95,6 +95,7 @@ pub(super) fn new_test_process() -> Arc<NativeProcessContext> {
         wait_registrations: Mutex::new(HashMap::new()),
         completion_ports: Mutex::new(HashMap::new()),
         socket_handles: Mutex::new(std::collections::HashSet::new()),
+        socket_exclusive: Mutex::new(std::collections::HashSet::new()),
         socket_events: Mutex::new(HashMap::new()),
         socket_errors: Mutex::new(HashMap::new()),
         socket_completion_ports: Mutex::new(HashMap::new()),

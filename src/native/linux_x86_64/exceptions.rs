@@ -717,7 +717,60 @@ extern "win64" fn winrun_raise_exception_with_context(
         }
     }
     if !dispatch_exception(&mut record, context) {
+        let program = process_ctx().map(|p| p.module_path.clone()).unwrap_or_default();
+        super::super::diagnostics::report(
+            format!("winrun: {program}: {}\n", unhandled_exception_message(&record)).as_bytes(),
+        );
         native_exit_process(code)
+    }
+}
+
+fn unhandled_exception_message(record: &NativeExceptionRecord) -> String {
+    if matches!(record.code, 0xc06d007e | 0xc06d007f) && record.parameter_count == 1
+        && record.information[0] != 0 {
+        // The MSVC delay-load helper supplies its documented DelayLoadInfo
+        // through ExceptionInformation[0] when a DLL or export cannot load.
+        let info = record.information[0] as *const u8;
+        unsafe {
+            if info.cast::<u32>().read_unaligned() >= 64 {
+                let dll = info.add(24).cast::<*const u8>().read_unaligned();
+                if let Some(dll) = ascii_z(dll) {
+                    let by_name = info.add(32).cast::<u32>().read_unaligned() != 0;
+                    let export = if by_name {
+                        ascii_z(info.add(40).cast::<*const u8>().read_unaligned())
+                            .unwrap_or("<unknown>").to_owned()
+                    } else {
+                        format!("#{}", info.add(40).cast::<u32>().read_unaligned())
+                    };
+                    return format!("unhandled delay-load failure: {dll}!{export} (exception {:#010x})", record.code);
+                }
+            }
+        }
+    }
+    format!("unhandled Windows exception {:#010x}", record.code)
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    #[test]
+    fn fatal_delay_load_diagnostics_identify_named_and_ordinal_exports() {
+        let mut info = [0usize; 8];
+        info[0] = 64;
+        info[3] = b"WS2_32.dll\0".as_ptr() as usize;
+        info[4] = 1;
+        info[5] = b"MissingExport\0".as_ptr() as usize;
+        let mut record: NativeExceptionRecord = unsafe { std::mem::zeroed() };
+        record.code = 0xc06d007f;
+        record.parameter_count = 1;
+        record.information[0] = info.as_ptr() as u64;
+        assert!(unhandled_exception_message(&record).contains("WS2_32.dll!MissingExport"));
+        info[4] = 0;
+        info[5] = 55;
+        record.information[0] = info.as_ptr() as u64;
+        assert!(unhandled_exception_message(&record).contains("WS2_32.dll!#55"));
+        record.parameter_count = 0;
+        assert_eq!(unhandled_exception_message(&record), "unhandled Windows exception 0xc06d007f");
     }
 }
 

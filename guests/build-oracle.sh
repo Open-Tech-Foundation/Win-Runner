@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Build the Windows-oracle probes (guests/oracle/*.rs) into PE32+ .exe files
 # with rustc + rust-lld only. Output: tests/artifacts/exe/oracle_<name>.exe.
-# The probes import only guests/oracle/kernel32.def statically; every other
-# API is found with GetProcAddress at run time. See tests/oracle/README.md.
+# Most probes import only kernel32.def statically; native_startup also uses
+# ntdll.def to exercise NT import binding. Other APIs use GetProcAddress. See tests/oracle/README.md.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -24,6 +24,8 @@ mkdir -p "$OUT" "$ART"
     "/DEF:$ROOT/guests/oracle/kernel32.def" \
     "/OUT:$OUT/oracle_kernel32.lib" \
     /MACHINE:x64
+
+"$LLD" -flavor link "/DEF:$ROOT/guests/oracle/ntdll.def" "/OUT:$OUT/oracle_ntdll.lib" /MACHINE:x64
 
 # Small real DLLs embedded by the DLL-search probe. Two copies export distinct
 # values; a parent/middle chain exercises recursive dependency lookup.
@@ -73,7 +75,7 @@ for probe in "$ROOT"/guests/oracle/*.rs; do
         "/OUT:$ART/oracle_$name.exe" \
         /ENTRY:probe_entry \
         /NODEFAULTLIB /SUBSYSTEM:CONSOLE /DYNAMICBASE \
-        "$obj" "$OUT/oracle_kernel32.lib" \
+        "$obj" "$OUT/oracle_kernel32.lib" "$OUT/oracle_ntdll.lib" \
         "$RLIB"/libcore-*.rlib "$RLIB"/libcompiler_builtins-*.rlib
     echo "built $ART/oracle_$name.exe"
 done

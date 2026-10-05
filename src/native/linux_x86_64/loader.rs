@@ -882,6 +882,8 @@ fn native_module_name_supported(name: &str) -> bool {
                 | "winmm.dll"
                 | "ws2_32"
                 | "ws2_32.dll"
+                | "wsock32"
+                | "wsock32.dll"
         )
 }
 
@@ -1053,6 +1055,9 @@ pub(super) extern "win64" fn native_get_module_handle_ex_a(
 }
 
 pub(super) extern "win64" fn native_get_module_handle_a(name: *const u8) -> u64 {
+    if name.is_null() {
+        return native_get_module_handle_w(ptr::null());
+    }
     match unsafe { ascii_z(name) } {
         Some(value) => module_handle_by_name(value).unwrap_or(0),
         _ => {
@@ -1060,6 +1065,17 @@ pub(super) extern "win64" fn native_get_module_handle_a(name: *const u8) -> u64 
             0
         }
     }
+}
+
+fn synthetic_system_module(name: &str) -> u64 {
+    match module_basename(name).to_ascii_lowercase().trim_end_matches(".dll") {
+        "ws2_32" => WS2_MODULE,
+        "wsock32" => WSOCK_MODULE,
+        _ => API_SET_MODULE,
+    }
+}
+fn is_synthetic_module(module: u64) -> bool {
+    matches!(module, API_SET_MODULE | WS2_MODULE | WSOCK_MODULE)
 }
 
 fn module_handle_by_name(name: &str) -> Option<u64> {
@@ -1071,7 +1087,7 @@ fn module_handle_by_name(name: &str) -> Option<u64> {
         &name_with_extension
     };
     if native_module_name_supported(name) {
-        return Some(API_SET_MODULE);
+        return Some(synthetic_system_module(name));
     }
     let process = process_ctx()?;
     if process.module_path.eq_ignore_ascii_case(name)
@@ -1186,7 +1202,7 @@ fn load_guest_module(name: &str) -> Option<u64> {
     let result = load_guest_module_inner(name, &mut std::collections::HashSet::new(), 0);
     GUEST_DLL_LOAD_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
     let module = result?;
-    if module != API_SET_MODULE {
+    if !is_synthetic_module(module) {
         let process = process_ctx()?;
         if outermost && !initialize_pending_modules(&process) {
             collect_unreferenced_modules(&process);
@@ -1406,7 +1422,7 @@ fn load_guest_module_inner(
         return None;
     }
     if native_system_module_name(name) {
-        return Some(API_SET_MODULE);
+        return Some(synthetic_system_module(name));
     }
     if let Some(handle) = module_handle_by_name(name) {
         return Some(handle);
@@ -1530,7 +1546,7 @@ fn load_guest_module_inner(
                 continue;
             }
             let dependency = load_guest_module_inner(&import.dll, loading, depth + 1)?;
-            if dependency == API_SET_MODULE {
+            if is_synthetic_module(dependency) {
                 return None;
             }
             if !dependencies.contains(&dependency) {
@@ -1601,9 +1617,21 @@ pub(super) extern "win64" fn native_get_proc_address(module: u64, name: *const u
         native_set_last_error(127);
         return 0;
     };
-    if module != API_SET_MODULE {
+    if !is_synthetic_module(module) {
         return resolve_module_export(module, &selector, 0).unwrap_or_else(|| {
             native_set_last_error(127); // ERROR_PROC_NOT_FOUND
+            0
+        });
+    }
+    if selector.starts_with('#') {
+        let dll = match module {
+            WS2_MODULE => "WS2_32.dll",
+            WSOCK_MODULE => "WSOCK32.dll",
+            _ => { native_set_last_error(127); return 0; }
+        };
+        let function = super::registry::ordinal_export_name(dll, &selector).unwrap_or(&selector);
+        return baseline_trampoline(function).unwrap_or_else(|| {
+            native_set_last_error(127);
             0
         });
     }
@@ -1678,7 +1706,7 @@ fn resolve_module_export(module: u64, selector: &str, depth: usize) -> Option<u6
     if let Some(forwarder) = export.forwarder {
         let (dll, function) = forwarder.rsplit_once('.')?;
         let forwarded_module = module_handle_by_name(dll).or_else(|| load_guest_module(dll))?;
-        if forwarded_module == API_SET_MODULE {
+        if is_synthetic_module(forwarded_module) {
             let function = std::ffi::CString::new(function).ok()?;
             let address = native_get_proc_address(forwarded_module, function.as_ptr().cast());
             return (address != 0).then_some(address);
@@ -1692,7 +1720,7 @@ fn resolve_module_export(module: u64, selector: &str, depth: usize) -> Option<u6
 // translation exists, return a real NT failure code to callers instead
 // of pretending that the operation succeeded.
 pub(super) extern "win64" fn native_free_library(module: u64) -> i32 {
-    if module == API_SET_MODULE {
+    if is_synthetic_module(module) {
         return 1;
     }
     let Some(process) = process_ctx() else {

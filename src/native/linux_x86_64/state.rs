@@ -245,6 +245,7 @@ pub(super) struct NativeProcessContext {
     pub(super) wait_registrations: Mutex<HashMap<u64, Arc<NativeWaitRegistration>>>,
     pub(super) completion_ports: Mutex<HashMap<u64, Arc<NativeCompletionPort>>>,
     pub(super) socket_handles: Mutex<std::collections::HashSet<u64>>,
+    pub(super) socket_exclusive: Mutex<std::collections::HashSet<u64>>,
     pub(super) socket_events: Mutex<HashMap<u64, NativeSocketEvent>>,
     pub(super) socket_errors: Mutex<HashMap<u64, i32>>,
     pub(super) socket_completion_ports: Mutex<HashMap<u64, (Arc<NativeCompletionPort>, u64)>>,
@@ -556,6 +557,7 @@ pub(super) struct NativeChildProcess {
     pub(super) parent_process_id: u32,
     pub(super) host_pid: AtomicI32,
     pub(super) termination_code: Mutex<Option<u32>>,
+    pub(super) initially_suspended: AtomicBool,
     pub(super) state: Mutex<Option<u32>>,
     pub(super) exited: Condvar,
 }
@@ -610,6 +612,7 @@ impl NativeProcessTable {
             parent_process_id,
             host_pid: AtomicI32::new(0),
             termination_code: Mutex::new(None),
+            initially_suspended: AtomicBool::new(false),
             state: Mutex::new(None),
             exited: Condvar::new(),
         });

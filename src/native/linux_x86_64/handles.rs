@@ -350,6 +350,12 @@ pub(super) fn host_standard_fd(handle: u64) -> Option<i32> {
 }
 
 pub(super) extern "win64" fn native_get_file_type(handle: u64) -> u32 {
+    let handle = process_ctx()
+        .and_then(|process| {
+            process.duplicate_handles.lock().ok()
+                .and_then(|handles| handles.get(&handle).copied())
+        })
+        .unwrap_or(handle);
     if native_device(handle).is_some() {
         native_set_last_error(0);
         return 0x0002; // FILE_TYPE_CHAR

@@ -13,7 +13,7 @@ Windows.
 with `guests/build-oracle.sh` (rustc and rust-lld only). A probe:
 
 - is `no_std` with no C runtime, so nothing but the Win32 API is exercised;
-- imports only `GetStdHandle`, `WriteFile`, `ExitProcess`, `GetModuleHandleW`,
+- normally imports only `GetStdHandle`, `WriteFile`, `ExitProcess`, `GetModuleHandleW`,
   and `GetProcAddress`, and looks up every API it tests at run time, so a
   missing API prints `<case>: unavailable` instead of stopping the probe;
 - prints one line per observation, `<case>: <result>`, with the error code
@@ -29,6 +29,7 @@ with `guests/build-oracle.sh` (rustc and rust-lld only). A probe:
 | `path_names` | path spellings from `GetLongPathNameW`, `GetFullPathNameW`, and final paths |
 | `links` | `CreateSymbolicLinkW`, what a handle names with and without `FILE_FLAG_OPEN_REPARSE_POINT`, `FSCTL_GET_REPARSE_POINT` data |
 | `pool_console` | `QueueUserWorkItem`, `MapVirtualKeyW`, console input functions on a non-console handle |
+| `native_startup` | main-module ANSI/Unicode identity, Winsock dynamic ordinal lookup, static NT directory/attribute queries and handle closing, native address waits and NTSTATUS timeouts |
 | `console_runtime` | independent input/output code pages, invalid-page errors, shared child-process changes without handle inheritance, restoration, current thread stack bounds on main and created threads |
 | `thread_queries` | pseudo/opened/duplicated thread identity, query/set/synchronize rights, UTF-16 description copies, suspended and terminated threads, retained handles, exit codes and CPU timestamps |
 | `apc_io` | per-thread APC queues, FIFO and duplicated thread handles, alertable single/multiple waits, wait-all state preservation, extended file completion callbacks, EOF, pipe cancellation, result timeouts and alertable completion-port waits |
@@ -43,6 +44,23 @@ with `LocalFree`; CPU times use Linux per-thread accounting.
 Access-denial checks use a `THREAD_TERMINATE`-only handle, which grants
 neither query nor synchronization rights. They do not rely on Windows
 accepting an empty `OpenThread` access mask.
+
+`native_startup` additionally imports the tested NT APIs statically through
+`ntdll.def`, so it exercises PE import binding as well as API behavior. Its
+directory checks cover `FileDirectoryInformation`; unsupported NT directory
+information classes remain outside this probe. It also checks duplicated file
+handle classification and process I/O/basic/extended memory queries, including
+invalid handles and undersized buffers. A self-spawned child verifies
+`CREATE_SUSPENDED`, primary-thread resume counts, wrong-handle rejection,
+exit status and retained final I/O counters. Winsock cases cover ordinal
+exports for both `WSOCK32.dll` and `WS2_32.dll`, IPv4 formatting, exclusive binds against a competing socket, and
+loopback receive flags (`MSG_PEEK`, `MSG_WAITALL`, `MSG_PUSH_IMMEDIATE`).
+Linux I/O counters use syscall counts
+and cached read/write bytes; Windows "other" counters and kernel pool quotas
+have no Linux equivalent and are zero. Resident memory and faults use `/proc`
+and final `wait4` accounting. Commit charge sums accountable VMAs in `smaps`;
+peak commit is the maximum sampled by queries, not a lifetime kernel counter.
+Extended memory counters beyond `PROCESS_MEMORY_COUNTERS_EX` fail explicitly.
 
 `console_runtime` tests code pages 1252 and 65001, the encodings currently
 supported by Win-Runner. Other encodings return an explicit invalid-parameter

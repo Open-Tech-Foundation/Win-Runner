@@ -1221,6 +1221,26 @@ fn test_art_exe_exit_code() {
 }
 
 #[test]
+fn native_unhandled_software_exceptions_are_reported_to_the_user() {
+    let mut asm = pe::builder::Asm::new();
+    asm.sub_rsp(0x28);
+    asm.mov_ecx_imm(0xe1230042);
+    asm.mov_edx_imm(0);
+    asm.emit(&[0x45, 0x31, 0xc0, 0x45, 0x31, 0xc9]); // zero r8/r9
+    asm.call_import(0);
+    asm.ret();
+    let bytes = pe::builder::build(asm, &[("KERNEL32.dll", "RaiseException")]);
+    let executable = tmp_path("unhandled-exception.exe");
+    std::fs::write(&executable, bytes).unwrap();
+    let (code, stdout, stderr) = run_cli(&executable);
+    std::fs::remove_file(&executable).unwrap();
+    assert_ne!(code, 0);
+    assert!(stdout.is_empty());
+    assert!(stderr.contains("unhandled Windows exception 0xe1230042"), "stderr: {stderr}");
+    assert!(stderr.contains("unhandled-exception.exe"), "stderr: {stderr}");
+}
+
+#[test]
 fn test_art_exe_fs_file_selftest() {
     let (code, stdout, stderr) = run_cli(&artifact("exe/fs_file.exe"));
     assert_eq!(code, 0, "stderr: {stderr}");

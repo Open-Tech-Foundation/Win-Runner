@@ -1,0 +1,8 @@
+LIBRARY ntdll
+EXPORTS
+NtClose
+NtQueryDirectoryFile
+NtQueryAttributesFile
+RtlWaitOnAddress
+RtlWakeAddressAll
+RtlWakeAddressSingle

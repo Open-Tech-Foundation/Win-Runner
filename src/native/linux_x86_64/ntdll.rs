@@ -2,6 +2,229 @@
 
 use super::*;
 
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+    #[test]
+    fn module_identity_and_static_nt_bindings_match_dynamic_exports() {
+        let _guard = TestProcessGuard::new();
+        native_set_last_error(42);
+        let module = native_get_module_handle_a(ptr::null());
+        assert_ne!(module, 0);
+        assert_eq!(module, native_get_module_handle_w(ptr::null()));
+        assert_eq!(native_get_last_error(), 42);
+        for name in [
+            "NtClose",
+            "NtQueryDirectoryFile",
+            "NtQueryInformationFile",
+            "NtQueryVolumeInformationFile",
+            "NtSetInformationFile",
+            "NtQueryAttributesFile",
+            "RtlWaitOnAddress",
+            "RtlWakeAddressAll",
+            "RtlWakeAddressSingle",
+        ] {
+            assert!(
+                super::super::registry::supports_import("ntdll.dll", name),
+                "{name}"
+            );
+            let c_name = format!("{name}\0");
+            assert_eq!(
+                native_get_proc_address(API_SET_MODULE, c_name.as_ptr()),
+                baseline_trampoline(name).unwrap(),
+                "{name}"
+            );
+        }
+        let socket = native_load_library_a(b"WSOCK32.dll\0".as_ptr());
+        assert_ne!(socket, 0);
+        assert_eq!(
+            native_get_proc_address(socket, 111usize as *const u8),
+            native_get_proc_address(socket, b"WSAGetLastError\0".as_ptr())
+        );
+        for (ordinal, name) in [(10, "inet_addr"), (11, "inet_ntoa"), (12, "ioctlsocket"), (18, "select"), (151, "__WSAFDIsSet")] {
+            let name = format!("{name}\0");
+            assert_eq!(native_get_proc_address(socket, ordinal as *const u8), native_get_proc_address(socket, name.as_ptr()));
+        }
+        let modern = native_load_library_a(b"WS2_32.dll\0".as_ptr());
+        assert_ne!(modern, socket);
+        for (ordinal, name) in [(10, "ioctlsocket"), (11, "inet_addr"), (12, "inet_ntoa")] {
+            let c_name = format!("{name}\0");
+            let expected = baseline_trampoline(name).unwrap();
+            assert_eq!(native_get_proc_address(modern, ordinal as *const u8), expected);
+            for dll in ["WSOCK32.dll", "WS2_32.dll"] {
+                let selector = format!("#{ordinal}");
+                let name = super::super::registry::ordinal_export_name(dll, &selector).unwrap();
+                assert!(super::super::registry::supports_import(dll, &selector));
+                assert!(baseline_trampoline(name).is_some());
+            }
+        }
+        assert_eq!(native_free_library(socket), 1);
+        assert_eq!(native_free_library(modern), 1);
+        assert_eq!(native_get_proc_address(socket, 65535usize as *const u8), 0);
+        assert_eq!(native_get_last_error(), 127);
+    }
+    #[test]
+    fn duplicated_file_handles_keep_their_file_type() {
+        let _guard = TestProcessGuard::new();
+        let path = r"C:\duplicate-file-type.txt";
+        fs_ctx().unwrap().lock().unwrap().fs.write_file(path, b"abc".to_vec()).unwrap();
+        let name: Vec<_> = path.encode_utf16().chain([0]).collect();
+        let file = native_create_file_w(name.as_ptr(), 0x8000_0000, 7, 0, 3, 0, 0);
+        assert_ne!(file, u64::MAX);
+        let process = process_ctx().unwrap().process_handle;
+        let mut duplicate = 0;
+        assert_eq!(native_duplicate_handle(process, file, process, &mut duplicate, 0, 0, 2), 1);
+        assert_eq!(native_get_file_type(file), 1);
+        assert_eq!(native_get_file_type(duplicate), 1);
+        assert_eq!(native_close_handle(duplicate), 1);
+        assert_eq!(native_get_file_type(duplicate), 0);
+        assert_eq!(native_get_last_error(), 6);
+        assert_eq!(native_get_file_type(file), 1);
+        assert_eq!(native_close_handle(file), 1);
+    }
+    #[test]
+    fn nt_close_preserves_last_error_and_protected_handles() {
+        let _guard = TestProcessGuard::new();
+        let handle = native_open_thread(0x800, 0, native_get_current_thread_id());
+        assert_ne!(handle, 0);
+        native_set_last_error(42);
+        assert_eq!(native_set_handle_information(handle, 2, 2), 1);
+        assert_eq!(native_nt_close(handle), 0xc0000235);
+        assert_eq!(native_get_last_error(), 42);
+        assert_eq!(native_set_handle_information(handle, 2, 0), 1);
+        assert_eq!(native_nt_close(handle), 0);
+        assert_eq!(native_get_last_error(), 42);
+        assert_eq!(native_nt_close(handle), 0xc0000008);
+        assert_eq!(native_get_last_error(), 42);
+    }
+    #[test]
+    fn rtl_wait_translates_nt_timeouts_and_preserves_last_error() {
+        let address = 1u32;
+        let different = 2u32;
+        let poll = 0i64;
+        let relative = -10_000i64;
+        native_set_last_error(42);
+        let a = (&address as *const u32).cast();
+        assert_eq!(
+            native_rtl_wait_on_address(a, (&different as *const u32).cast(), 4, ptr::null()),
+            0
+        );
+        assert_eq!(native_rtl_wait_on_address(a, a, 4, &poll), 0x102);
+        assert_eq!(native_rtl_wait_on_address(a, a, 4, &relative), 0x102);
+        assert_eq!(native_rtl_wait_on_address(a, a, 3, &poll), 0xc000000d);
+        assert_eq!(native_get_last_error(), 42);
+    }
+    #[test]
+    fn nt_attributes_return_metadata_and_leave_error_outputs_untouched() {
+        let _guard = TestProcessGuard::new();
+        let path = r"C:\native-startup-unit.txt";
+        fs_ctx()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .fs
+            .write_file(path, b"abc".to_vec())
+            .unwrap();
+        let units: Vec<u16> = path.encode_utf16().collect();
+        let bytes = units.len() * 2;
+        let unicode = [bytes | (bytes << 16), units.as_ptr() as usize];
+        let mut attributes = [48usize, 0, unicode.as_ptr() as usize, 0x40, 0, 0];
+        let mut basic = [0u64; 5];
+        native_set_last_error(42);
+        assert_eq!(
+            native_nt_query_attributes_file(attributes.as_ptr().cast(), basic.as_mut_ptr().cast()),
+            0
+        );
+        assert_eq!(
+            basic[0],
+            fs_ctx()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .fs
+                .file_metadata(path)
+                .creation_time
+        );
+        assert_eq!(basic[4] as u32 & 0x10, 0);
+        assert_eq!(native_get_last_error(), 42);
+        attributes[1] = 0xdead;
+        basic.fill(42);
+        assert_eq!(
+            native_nt_query_attributes_file(attributes.as_ptr().cast(), basic.as_mut_ptr().cast()),
+            0xc0000008
+        );
+        assert_eq!(basic, [42; 5]);
+        assert_eq!(
+            native_nt_query_attributes_file(ptr::null(), ptr::null_mut()),
+            0xc000000d
+        );
+    }
+    #[test]
+    fn wide_hostname_matches_narrow_and_rejects_small_buffers() {
+        let mut narrow = [0u8; 256];
+        let mut wide = [0u16; 256];
+        assert_eq!(native_wsa_get_host_name(narrow.as_mut_ptr(), 256), 0);
+        assert_eq!(native_wsa_get_host_name_w(wide.as_mut_ptr(), 256), 0);
+        let n = narrow.iter().position(|value| *value == 0).unwrap();
+        let w = wide.iter().position(|value| *value == 0).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&narrow[..n]),
+            String::from_utf16_lossy(&wide[..w])
+        );
+        let mut small = [42u16];
+        assert_eq!(native_wsa_get_host_name_w(small.as_mut_ptr(), 1), -1);
+        assert_eq!(native_wsa_get_last_error(), 10014);
+        assert_eq!(small, [42]);
+        assert_eq!(native_wsa_get_host_name_w(ptr::null_mut(), 256), -1);
+    }
+}
+
+pub(super) extern "win64" fn native_nt_close(handle: u64) -> u32 {
+    let previous_error = native_get_last_error();
+    let status = if native_close_handle(handle) != 0 {
+        0 // STATUS_SUCCESS
+    } else {
+        match native_get_last_error() {
+            5 => 0xC000_0235, // STATUS_HANDLE_NOT_CLOSABLE
+            _ => 0xC000_0008, // STATUS_INVALID_HANDLE
+        }
+    };
+    native_set_last_error(previous_error);
+    status
+}
+
+pub(super) extern "win64" fn native_rtl_wait_on_address(
+    address: *const u8,
+    compare: *const u8,
+    size: usize,
+    timeout: *const i64,
+) -> u32 {
+    if !matches!(size, 1 | 2 | 4 | 8) {
+        return 0xC000_000D;
+    }
+    let milliseconds = if timeout.is_null() {
+        u32::MAX
+    } else {
+        let ticks = unsafe { timeout.read_unaligned() };
+        let remaining = if ticks < 0 {
+            ticks.unsigned_abs()
+        } else {
+            (ticks as u64).saturating_sub(process_filetime_now())
+        };
+        remaining.div_ceil(10_000).min(u32::MAX as u64 - 1) as u32
+    };
+    let previous_error = native_get_last_error();
+    let status = if native_wait_on_address(address, compare, size, milliseconds) != 0 {
+        0
+    } else if native_get_last_error() == 1460 {
+        0x102 // STATUS_TIMEOUT
+    } else {
+        0xC000_000D // STATUS_INVALID_PARAMETER
+    };
+    native_set_last_error(previous_error);
+    status
+}
+
 pub(super) extern "win64" fn native_nt_device_io_control_file(
     file: u64,
     _event: u64,
@@ -773,6 +996,41 @@ fn object_attributes_path(attributes: *const u8) -> Result<String, u32> {
     } else {
         format!("{}\\{relative}", directory.trim_end_matches('\\'))
     })
+}
+
+pub(super) extern "win64" fn native_nt_query_attributes_file(
+    attributes: *const u8,
+    information: *mut u8,
+) -> u32 {
+    if information.is_null() {
+        return 0xC000_000D;
+    }
+    let path = match object_attributes_path(attributes) {
+        Ok(path) => path,
+        Err(status) => return status,
+    };
+    let path: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+    let previous_error = native_get_last_error();
+    let mut metadata = [0u8; 36];
+    let status = if native_get_file_attributes_ex_w(path.as_ptr(), 0, metadata.as_mut_ptr().cast()) != 0 {
+        unsafe {
+            ptr::write_bytes(information, 0, 40);
+            ptr::copy_nonoverlapping(metadata.as_ptr().add(4), information, 24);
+            ptr::copy_nonoverlapping(metadata.as_ptr().add(20), information.add(24), 8);
+            ptr::copy_nonoverlapping(metadata.as_ptr(), information.add(32), 4);
+        }
+        0
+    } else {
+        match native_get_last_error() {
+            2 => 0xC000_0034,
+            3 => 0xC000_003A,
+            5 => 0xC000_0022,
+            123 => 0xC000_0033,
+            _ => 0xC000_000D,
+        }
+    };
+    native_set_last_error(previous_error);
+    status
 }
 
 /// `NtCreateFile` over `CreateFileW`: NT dispositions and options mapped to

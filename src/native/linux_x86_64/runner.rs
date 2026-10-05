@@ -577,6 +577,7 @@ fn run_rust_baseline_argv_with_fs_impl(
             wait_registrations: Mutex::new(HashMap::new()),
             completion_ports: Mutex::new(HashMap::new()),
             socket_handles: Mutex::new(std::collections::HashSet::new()),
+            socket_exclusive: Mutex::new(std::collections::HashSet::new()),
             socket_events: Mutex::new(HashMap::new()),
             socket_errors: Mutex::new(HashMap::new()),
             socket_completion_ports: Mutex::new(HashMap::new()),
