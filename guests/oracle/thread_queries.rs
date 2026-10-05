@@ -121,8 +121,11 @@ fn probe() {
         if !other.is_null() {
             free(other as usize);
         }
-        let denied = open(0, 0, my_id);
-        boolean("rights.zero_open", denied != 0);
+        // Request a documented non-query right. OpenThread with an empty
+        // access mask need not produce a usable handle on Windows, so it
+        // cannot establish the precondition for the access-denial checks.
+        let denied = open(0x1, 0, my_id); // THREAD_TERMINATE
+        boolean("rights.restricted_open", denied != 0);
         boolean("rights.id", query_id(denied) == 0 && last_error() == 5);
         boolean("rights.owner", owner(denied) == 0 && last_error() == 5);
         let mut result = 123;

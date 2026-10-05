@@ -44,6 +44,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Fix the thread-rights oracle to open a documented terminate-only handle
+  before checking denied queries and waits, instead of assuming Windows
+  accepts an empty `OpenThread` access mask. Add a regression for the
+  restricted handle and preserve failed-query output buffers.
+
 - Route fatal native missing-import, worker-startup and child-crash diagnostics
   through a launcher-owned channel, independent of guest stdout/stderr.
   Show the failing executable and DLL/API even through nested child processes,

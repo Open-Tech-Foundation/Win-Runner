@@ -526,6 +526,40 @@ mod tests {
         assert_eq!(native_get_last_error(), 6);
     }
     #[test]
+    fn opened_terminate_only_handle_denies_query_and_wait_access() {
+        let _guard = TestProcessGuard::new();
+        let handle = native_open_thread(1, 0, native_get_current_thread_id());
+        assert_ne!(handle, 0);
+        assert_eq!(lookup_thread_handle(handle).unwrap().access, 1);
+        assert_eq!(native_get_thread_id(handle), 0);
+        assert_eq!(native_get_last_error(), 5);
+        assert_eq!(native_get_process_id_of_thread(handle), 0);
+        assert_eq!(native_get_last_error(), 5);
+        let mut code = 42;
+        assert_eq!(native_get_exit_code_thread(handle, &mut code), 0);
+        assert_eq!(native_get_last_error(), 5);
+        assert_eq!(code, 42);
+        let mut values = [42; 4];
+        assert_eq!(
+            native_get_thread_times(
+                handle,
+                &mut values[0],
+                &mut values[1],
+                &mut values[2],
+                &mut values[3]
+            ),
+            0
+        );
+        assert_eq!(native_get_last_error(), 5);
+        assert_eq!(values, [42; 4]);
+        assert_eq!(native_wait_for_single_object(handle, 0), u32::MAX);
+        assert_eq!(native_get_last_error(), 5);
+        let mut name = ptr::null_mut();
+        assert!(native_get_thread_description(handle, &mut name) < 0);
+        assert!(native_set_thread_description(handle, [65, 0].as_ptr()) < 0);
+        assert_eq!(native_close_handle(handle), 1);
+    }
+    #[test]
     fn opened_thread_handle_flags_and_duplicate_flags_are_independent() {
         let _guard = TestProcessGuard::new();
         let handle = native_open_thread(QUERY, 1, native_get_current_thread_id());

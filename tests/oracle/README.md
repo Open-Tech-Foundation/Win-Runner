@@ -40,6 +40,9 @@ with `guests/build-oracle.sh` (rustc and rust-lld only). A probe:
 threads in other guest processes or arbitrary Linux host processes is outside
 this batch. Thread descriptions preserve UTF-16 and returned copies are freed
 with `LocalFree`; CPU times use Linux per-thread accounting.
+Access-denial checks use a `THREAD_TERMINATE`-only handle, which grants
+neither query nor synchronization rights. They do not rely on Windows
+accepting an empty `OpenThread` access mask.
 
 `console_runtime` tests code pages 1252 and 65001, the encodings currently
 supported by Win-Runner. Other encodings return an explicit invalid-parameter

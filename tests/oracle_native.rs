@@ -156,6 +156,7 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
                 "async.cancel_result: ok",
             ],
             "thread_queries" => &[
+                "rights.restricted_open: ok",
                 "identity.pseudo: ok",
                 "identity.open: ok",
                 "rights.id: ok",
