@@ -429,6 +429,18 @@ impl Shell {
             .write_file(SHELL_HISTORY_PATH, contents.into_bytes())
     }
 
+    fn record_shell_command(&mut self, line: &str) -> Result<(), String> {
+        if line.trim().is_empty() {
+            return Ok(());
+        }
+        let mut entries = self.shell_history();
+        if entries.last().is_some_and(|entry| entry == line) {
+            return Ok(());
+        }
+        entries.push(line.to_owned());
+        self.persist_shell_history(&entries)
+    }
+
     fn environment_value(&self, name: &str) -> Option<&str> {
         ps1::environment_get(&self.sess.environment, name)
     }
@@ -1442,8 +1454,7 @@ fn run_session_controlled(
             }
         };
         editor.set_helper(Some(ShellHelper::default()));
-        let mut history = shell.shell_history();
-        for entry in &history {
+        for entry in &shell.shell_history() {
             let _ = editor.add_history_entry(entry.as_str());
         }
         loop {
@@ -1453,15 +1464,7 @@ fn run_session_controlled(
             let prompt = format!("PS {}> ", shell.cwd());
             match editor.readline(&prompt) {
                 Ok(line) => {
-                    if editor.add_history_entry(line.as_str()).unwrap_or(false) {
-                        history.push(line.clone());
-                        if history.len() > MAX_SHELL_HISTORY_ENTRIES {
-                            history.remove(0);
-                        }
-                        if let Err(error) = shell.persist_shell_history(&history) {
-                            eprintln!("winrun: cannot save shell history to {SHELL_HISTORY_PATH}: {error}");
-                        }
-                    }
+                    let _ = editor.add_history_entry(line.as_str());
                     if let Some(code) = execute_input_line(&mut shell, &line, output_sink.clone()) {
                         return (code, shell.fs);
                     }
@@ -1552,6 +1555,15 @@ fn execute_input_line(
             }
         })
     });
+    // All shell input paths reach this boundary, including controlled and
+    // piped sessions. Persist before parsing or starting a guest process.
+    if let Err(error) = shell.record_shell_command(line) {
+        sink(
+            backend::OutputChannel::Stderr,
+            format!("winrun: cannot save shell history to {SHELL_HISTORY_PATH}: {error}\n")
+                .as_bytes(),
+        );
+    }
     match shell.exec_line_streaming(line, &mut out, sink.clone()) {
         Ok(ShellFlow::Continue) => {
             sink(backend::OutputChannel::Stdout, &out);
@@ -1720,6 +1732,61 @@ mod tests {
         let restored = crate::snapshot::load_file(snapshot.to_str().unwrap()).unwrap();
         std::fs::remove_file(snapshot).unwrap();
         assert_eq!(Shell::with_fs(restored).shell_history(), entries);
+    }
+
+    #[test]
+    fn input_history_is_saved_before_execution_and_retains_failures() {
+        let mut shell = Shell::new();
+        let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = output.clone();
+        let sink: backend::OutputSink = Arc::new(move |_, chunk| {
+            captured.lock().unwrap().extend_from_slice(chunk);
+        });
+        execute_input_line(&mut shell, "missing-history-command", Some(sink.clone()));
+        assert_eq!(shell.shell_history(), ["missing-history-command"]);
+        assert!(String::from_utf8_lossy(&output.lock().unwrap()).contains("nothing to run"));
+        output.lock().unwrap().clear();
+        let query = format!("Get-Content {SHELL_HISTORY_PATH}");
+        execute_input_line(&mut shell, &query, Some(sink.clone()));
+        let contents = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(contents.lines().any(|line| line == query));
+        execute_control_line(&mut shell, b"missing-control-command", Some(sink), None);
+        assert_eq!(shell.shell_history().last().unwrap(), "missing-control-command");
+    }
+
+    #[test]
+    fn history_save_errors_are_reported_without_blocking_execution() {
+        let mut shell = Shell::new();
+        shell.fs.mkdir(SHELL_HISTORY_PATH).unwrap();
+        let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = output.clone();
+        let sink: backend::OutputSink = Arc::new(move |_, chunk| {
+            captured.lock().unwrap().extend_from_slice(chunk);
+        });
+        assert_eq!(
+            execute_input_line(&mut shell, "echo still-running", Some(sink)),
+            None
+        );
+        let contents = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(contents.contains("cannot save shell history"));
+        assert!(contents.contains("still-running"));
+    }
+
+    #[test]
+    fn command_history_skips_blank_and_adjacent_duplicates_and_bounds_entries() {
+        let mut shell = Shell::new();
+        let entries: Vec<_> = (0..MAX_SHELL_HISTORY_ENTRIES)
+            .map(|index| format!("echo {index}"))
+            .collect();
+        shell.persist_shell_history(&entries).unwrap();
+        shell.record_shell_command("  ").unwrap();
+        shell.record_shell_command(entries.last().unwrap()).unwrap();
+        assert_eq!(shell.shell_history(), entries);
+        shell.record_shell_command("echo next").unwrap();
+        let history = shell.shell_history();
+        assert_eq!(history.len(), MAX_SHELL_HISTORY_ENTRIES);
+        assert_eq!(history[0], entries[1]);
+        assert_eq!(history.last().unwrap(), "echo next");
     }
 
     #[test]

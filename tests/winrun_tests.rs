@@ -1658,6 +1658,30 @@ fn run_shell_env(input: &str, envs: &[(&str, &str)]) -> (i32, String, String) {
 }
 
 #[test]
+fn piped_shell_history_records_failed_commands_before_saving_snapshot() {
+    let snapshot = tmp_path("failed-command-history.winfs");
+    let save = format!("snapshot save {}", snapshot.display());
+    let (code, _, stderr) = run_shell_env(
+        &format!("missing-history-command\nmissing-history-command\n   \n{save}\nexit\n"),
+        &[],
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stderr.contains("nothing to run: missing-history-command"));
+    let saved = winrun::snapshot::load_file(snapshot.to_str().unwrap()).unwrap();
+    let history = String::from_utf8(
+        saved.read_file(
+            r"C:\Users\runner\AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt"
+        ).unwrap(),
+    ).unwrap();
+    // The save command itself must already be present in the saved image.
+    assert_eq!(
+        history.lines().collect::<Vec<_>>(),
+        ["missing-history-command", save.as_str()]
+    );
+    std::fs::remove_file(snapshot).unwrap();
+}
+
+#[test]
 fn shell_starts_in_the_user_profile_with_a_standard_windows_environment() {
     let (code, stdout, stderr) = run_shell_env(
         "Get-Location
@@ -2012,6 +2036,15 @@ fn interactive_shell_completes_commands_and_inserts_text_at_the_cursor() {
         String::from_utf8_lossy(&output)
     );
     let before_exit = output.len();
+    master.write_all(b"missing-history-command\r").unwrap();
+    assert!(
+        read_until(&mut master, &mut output, &|bytes| bytes[before_exit..]
+            .windows(b"nothing to run: missing-history-command".len())
+            .any(|window| window == b"nothing to run: missing-history-command")),
+        "failed command did not report its error: {}",
+        String::from_utf8_lossy(&output)
+    );
+    let before_exit = output.len();
     master.write_all(b"exit 3\x1b[D1\r").unwrap();
     let exited = read_until(&mut master, &mut output, &|bytes| {
         bytes[before_exit..]
@@ -2042,6 +2075,10 @@ fn interactive_shell_completes_commands_and_inserts_text_at_the_cursor() {
     );
     assert!(
         saved_history.contains("exit 13"),
+        "history: {saved_history}"
+    );
+    assert!(
+        saved_history.contains("missing-history-command"),
         "history: {saved_history}"
     );
     std::fs::remove_file(snapshot_path).ok();

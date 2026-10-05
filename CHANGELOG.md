@@ -44,6 +44,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Record shell commands before execution in terminal, controlled and piped
+  sessions, so failed commands and commands that save a snapshot are retained
+  in guest history. Ignore blank input and consecutive duplicate commands.
+
 - Fix the thread-rights oracle to open a documented terminate-only handle
   before checking denied queries and waits, instead of assuming Windows
   accepts an empty `OpenThread` access mask. Add a regression for the
