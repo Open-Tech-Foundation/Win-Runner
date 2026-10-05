@@ -11,6 +11,7 @@ struct NativeApcState {
 }
 #[derive(Default)]
 pub(super) struct NativeApcQueue {
+    pub(super) thread: NativeThreadInfo,
     state: Mutex<NativeApcState>,
     ready: Condvar,
 }
@@ -19,7 +20,7 @@ impl NativeApcQueue {
         let Ok(mut state) = self.state.lock() else {
             return false;
         };
-        if state.closed {
+        if state.closed || self.thread.status.lock().map_or(true, |status| status.exit_code.is_some()) {
             return false;
         }
         state.callbacks.push_back((function, arguments));
@@ -38,6 +39,7 @@ impl NativeApcQueue {
 pub(super) struct NativeApcHandle {
     pub(super) queue: Arc<NativeApcQueue>,
     pub(super) access: u32,
+    pub(super) flags: u32,
 }
 pub(super) struct NativeThreadApcGuard {
     pub(super) queue: Arc<NativeApcQueue>,
@@ -45,6 +47,7 @@ pub(super) struct NativeThreadApcGuard {
 }
 impl Drop for NativeThreadApcGuard {
     fn drop(&mut self) {
+        self.queue.thread.finish(1);
         self.queue.close();
         if let Ok(mut queues) = self.process.apc_queues.lock() {
             queues.remove(&std::thread::current().id());
@@ -75,12 +78,30 @@ impl NativeIoCompletion {
 pub(super) fn current_apc_queue() -> Option<Arc<NativeApcQueue>> {
     let process = process_ctx()?;
     let mut queues = process.apc_queues.lock().ok()?;
-    Some(
-        queues
-            .entry(std::thread::current().id())
-            .or_default()
-            .clone(),
-    )
+    let queue = queues
+        .entry(std::thread::current().id())
+        .or_insert_with(|| {
+            let queue = Arc::new(NativeApcQueue::default());
+            queue
+                .thread
+                .id
+                .store(native_get_current_thread_id(), Ordering::Release);
+            if THREAD_NATIVE_HANDLE.get() == 0 {
+                queue
+                    .thread
+                    .creation
+                    .store(process.times.creation, Ordering::Release);
+            }
+            queue
+                .thread
+                .host_tid
+                .store(unsafe { libc::gettid() }, Ordering::Release);
+            queue
+        })
+        .clone();
+    drop(queues);
+    register_thread_object(&process, &queue);
+    Some(queue)
 }
 pub(super) fn dispatch_apcs() -> bool {
     let Some(queue) = current_apc_queue() else {
@@ -124,45 +145,16 @@ pub(super) fn wait_expired(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|deadline| Instant::now() >= deadline)
 }
 pub(super) extern "win64" fn native_queue_user_apc(function: u64, thread: u64, data: u64) -> u32 {
-    let Some(process) = process_ctx() else {
-        native_set_last_error(6);
-        return 0;
-    };
     if function == 0 {
         native_set_last_error(87);
         return 0;
     }
-    let queue = if thread == u64::MAX - 1 {
-        current_apc_queue()
-    } else {
-        let handle = process
-            .apc_handles
-            .lock()
-            .ok()
-            .and_then(|handles| handles.get(&thread).cloned());
-        if let Some(handle) = handle {
-            if handle.access & (0x10 | 0x1000_0000 | 0x4000_0000) == 0 {
-                native_set_last_error(5);
-                return 0;
-            }
-            Some(handle.queue)
-        } else {
-            let thread = process
-                .duplicate_handles
-                .lock()
-                .ok()
-                .and_then(|handles| handles.get(&thread).copied())
-                .unwrap_or(thread);
-            process
-                .threads
-                .lock()
-                .ok()
-                .and_then(|threads| threads.get(&thread).map(|thread| thread.apc.clone()))
+    let queue = match require_thread_handle(thread, 0x10) {
+        Ok(handle) => handle.queue,
+        Err(error) => {
+            native_set_last_error(error);
+            return 0;
         }
-    };
-    let Some(queue) = queue else {
-        native_set_last_error(6);
-        return 0;
     };
     if queue.post(function, [data, 0, 0]) {
         1

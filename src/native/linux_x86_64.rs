@@ -26,6 +26,9 @@ use loader::*;
 #[path = "linux_x86_64/apc.rs"]
 mod apc;
 use apc::*;
+#[path = "linux_x86_64/thread_queries.rs"]
+mod thread_queries;
+use thread_queries::*;
 #[path = "linux_x86_64/process.rs"]
 mod process;
 use process::*;

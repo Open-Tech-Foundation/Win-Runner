@@ -385,52 +385,24 @@ pub(super) extern "win64" fn native_wait_for_single_object(handle: u64, millisec
         *count -= 1;
         return 0; // WAIT_OBJECT_0
     }
-    if process.as_ref().is_some_and(|process| {
-        process
-            .threads
-            .lock()
-            .ok()
-            .is_some_and(|threads| threads.contains_key(&handle))
-    }) {
-        let deadline = if milliseconds == u32::MAX {
-            None
-        } else {
-            std::time::Instant::now()
-                .checked_add(std::time::Duration::from_millis(milliseconds as u64))
-        };
+    if let Some(thread) = lookup_thread_handle(handle) {
+        if thread.access & 0x100000 == 0 {
+            native_set_last_error(5);
+            return u32::MAX;
+        }
+        let deadline = wait_deadline(milliseconds);
         loop {
-            let join = {
-                let Some(process) = process.as_ref() else {
-                    return 0xffff_ffff;
-                };
-                let Ok(mut threads) = process.threads.lock() else {
-                    return 0xffff_ffff;
-                };
-                let Some(thread) = threads.get_mut(&handle) else {
-                    return 0xffff_ffff;
-                };
-                if thread.exit_code.is_some() {
-                    return 0;
-                }
-                if thread.join.as_ref().is_some_and(|join| join.is_finished()) {
-                    thread.join.take()
-                } else {
-                    None
-                }
-            };
-            if let Some(join) = join {
-                let code = join.join().unwrap_or(1);
-                if let Some(process) = process.as_ref() {
-                    if let Ok(mut threads) = process.threads.lock() {
-                        if let Some(thread) = threads.get_mut(&handle) {
-                            thread.exit_code = Some(code);
-                        }
-                    }
-                }
+            if thread
+                .queue
+                .thread
+                .status
+                .lock()
+                .is_ok_and(|status| status.exit_code.is_some())
+            {
                 return 0;
             }
-            if milliseconds == 0 || deadline.is_some_and(|at| std::time::Instant::now() >= at) {
-                return 258; // WAIT_TIMEOUT; handle remains valid
+            if wait_expired(deadline) {
+                return 258;
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }

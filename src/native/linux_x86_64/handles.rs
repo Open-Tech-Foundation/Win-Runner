@@ -162,6 +162,12 @@ pub(super) extern "win64" fn native_set_handle_information(
         return 0;
     }
     if let Some(process) = process_ctx() {
+        if let Ok(mut handles) = process.apc_handles.lock() {
+            if let Some(thread) = handles.get_mut(&handle) {
+                thread.flags = (thread.flags & !mask) | (flags & mask);
+                return 1;
+            }
+        }
         if let Ok(mut pipes) = process.named_pipes.lock() {
             if let Some(pipe) = pipes.handles.get_mut(&handle) {
                 if mask & flags & 2 != 0 {
@@ -284,34 +290,11 @@ fn native_duplicate_handle_impl(
             return 1;
         }
     }
-    let apc = process
-        .apc_handles
-        .lock()
-        .ok()
-        .and_then(|handles| handles.get(&source_handle).cloned())
-        .or_else(|| {
-            if source_handle == u64::MAX - 1 {
-                current_apc_queue().map(|queue| NativeApcHandle {
-                    queue,
-                    access: 0x1fffff,
-                })
-            } else {
-                process.threads.lock().ok().and_then(|threads| {
-                    threads.get(&original).map(|thread| NativeApcHandle {
-                        queue: thread.apc.clone(),
-                        access: 0x1fffff,
-                    })
-                })
-            }
-        });
+    let apc = lookup_thread_handle(source_handle);
     let valid = apc.is_some()
         || matches!(original, u64::MAX | 0xffff_ffff_ffff_fffe)
         || host_standard_fd(original).is_some()
         || native_device(original).is_some()
-        || process
-            .threads
-            .lock()
-            .is_ok_and(|values| values.contains_key(&original))
         || process
             .completion_ports
             .lock()
@@ -333,8 +316,9 @@ fn native_duplicate_handle_impl(
         Err(_) => return 0,
     }
     if let Some(mut apc) = apc {
+        apc.flags = u32::from(inherit != 0);
         if options & 2 == 0 {
-            apc.access = desired_access;
+            apc.access = thread_access_mask(desired_access);
         }
         let Ok(mut handles) = process.apc_handles.lock() else {
             return 0;
@@ -411,10 +395,28 @@ pub(super) extern "win64" fn native_close_handle(h: u64) -> i32 {
         return 0;
     }
     let process = process_ctx();
-    if let Some(process) = &process {
-        if let Ok(mut handles) = process.apc_handles.lock() {
-            handles.remove(&h);
+    if process.as_ref().is_some_and(|process| {
+        process
+            .apc_handles
+            .lock()
+            .is_ok_and(|handles| handles.get(&h).is_some_and(|thread| thread.flags & 2 != 0))
+    }) {
+        native_set_last_error(5);
+        return 0;
+    }
+    let thread_handle = process.as_ref().is_some_and(|process| {
+        process
+            .apc_handles
+            .lock()
+            .is_ok_and(|mut handles| handles.remove(&h).is_some())
+    });
+    if thread_handle {
+        if let Some(process) = &process {
+            if let Ok(mut duplicates) = process.duplicate_handles.lock() {
+                duplicates.remove(&h);
+            }
         }
+        return 1;
     }
     if let Some(job) = process.as_ref().and_then(|process| {
         process
@@ -504,19 +506,6 @@ pub(super) extern "win64" fn native_close_handle(h: u64) -> i32 {
             .lock()
             .is_ok_and(|mut values| values.remove(&h).is_some())
     }) {
-        return 1;
-    }
-    if process
-        .as_ref()
-        .and_then(|process| {
-            process
-                .threads
-                .lock()
-                .ok()
-                .map(|mut threads| threads.remove(&h).is_some())
-        })
-        .unwrap_or(false)
-    {
         return 1;
     }
     if process

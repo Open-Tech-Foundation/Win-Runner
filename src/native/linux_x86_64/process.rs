@@ -452,12 +452,18 @@ pub(super) extern "win64" fn native_create_thread(
     let builder = std::thread::Builder::new().stack_size(stack_size.max(4 * 1024 * 1024));
     let thread_process = Arc::clone(&process);
     let thread_tls = Arc::clone(&tls_block);
-    let suspension = Arc::new((Mutex::new((flags & 4 != 0) as u32), Condvar::new()));
-    let thread_suspension = Arc::clone(&suspension);
     let apc = Arc::new(NativeApcQueue::default());
+    *apc.thread.suspension.0.lock().unwrap() = (flags & 4 != 0) as u32;
+    let thread_suspension = apc.thread.suspension.clone();
+    apc.thread.id.store(handle as u32, Ordering::Release);
+    register_thread_object(&process, &apc);
     let thread_apc = apc.clone();
     let spawned = builder.spawn(move || {
         THREAD_NATIVE_HANDLE.set(handle);
+        thread_apc
+            .thread
+            .host_tid
+            .store(unsafe { libc::gettid() }, Ordering::Release);
         if let Ok(mut queues) = thread_process.apc_queues.lock() {
             queues.insert(std::thread::current().id(), thread_apc.clone());
         }
@@ -499,33 +505,30 @@ pub(super) extern "win64" fn native_create_thread(
         };
         thread_runtime::notify_guest_thread_modules(&thread_process, false);
         thread_runtime::run_thread_fls_callbacks(&thread_process);
+        thread_apc.thread.finish(exit_code);
         exit_code
     });
     let Ok(join) = spawned else {
         native_set_last_error(8);
         return 0;
     };
+    if let Ok(mut handles) = process.apc_handles.lock() {
+        handles.insert(
+            handle,
+            NativeApcHandle {
+                queue: apc.clone(),
+                access: THREAD_ALL_ACCESS,
+                flags: 0,
+            },
+        );
+    }
     if !thread_id.is_null() {
         unsafe { thread_id.write(handle as u32) }
     }
-    let result = match process.threads.lock() {
-        Ok(mut threads) => {
-            threads.insert(
-                handle,
-                NativeThread {
-                    apc,
-                    join: Some(join),
-                    exit_code: None,
-                    suspension,
-                },
-            );
-            handle
-        }
-        Err(_) => {
-            native_set_last_error(6);
-            0
-        }
-    };
+    // The shared thread object publishes termination; joining host threads is
+    // unnecessary and closing a Windows handle must never wait for completion.
+    drop(join);
+    let result = handle;
     if native_diagnostic_enabled() {
         eprintln!("native CreateThread start={start:#x} handle={result:#x}");
     }
@@ -552,16 +555,14 @@ pub(super) extern "win64" fn native_queue_user_work_item(
     1
 }
 pub(super) extern "win64" fn native_resume_thread(handle: u64) -> u32 {
-    let Some(suspension) = process_ctx().and_then(|process| {
-        process.threads.lock().ok().and_then(|threads| {
-            threads
-                .get(&handle)
-                .map(|thread| Arc::clone(&thread.suspension))
-        })
-    }) else {
-        native_set_last_error(6);
-        return u32::MAX;
+    let thread = match require_thread_handle(handle, 0x2) {
+        Ok(thread) => thread,
+        Err(error) => {
+            native_set_last_error(error);
+            return u32::MAX;
+        }
     };
+    let suspension = thread.queue.thread.suspension.clone();
     let (count, ready) = &*suspension;
     let Ok(mut count) = count.lock() else {
         return u32::MAX;
@@ -2523,17 +2524,12 @@ pub(super) extern "win64" fn native_free_library_and_exit_thread(_module: u64, _
         eprintln!("native FreeLibraryAndExitThread");
     }
     if let Some(queue) = current_apc_queue() {
+        queue.thread.finish(_code);
         queue.close();
     }
-    let handle = THREAD_NATIVE_HANDLE.get();
     if let Some(process) = process_ctx() {
         if let Ok(mut queues) = process.apc_queues.lock() {
             queues.remove(&std::thread::current().id());
-        }
-        if let Ok(mut threads) = process.threads.lock() {
-            if let Some(thread) = threads.get_mut(&handle) {
-                thread.exit_code = Some(_code);
-            }
         }
     }
     // SYS_exit terminates only this Linux thread. pthread_exit would

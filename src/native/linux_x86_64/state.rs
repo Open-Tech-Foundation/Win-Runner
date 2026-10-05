@@ -231,8 +231,8 @@ pub(super) struct NativeProcessContext {
     /// threads. A DLL load updates these blocks before running its callbacks.
     pub(super) tls_blocks: Mutex<HashMap<u64, std::sync::Weak<Mutex<NativeTls>>>>,
     pub(super) dynamic_tls: Mutex<DynamicTlsSlots>,
-    pub(super) threads: Mutex<HashMap<u64, NativeThread>>,
     pub(super) thread_next: AtomicU64,
+    pub(super) thread_objects: Mutex<HashMap<u32, Weak<NativeApcQueue>>>,
     pub(super) apc_handles: Mutex<HashMap<u64, NativeApcHandle>>,
     pub(super) apc_queues: Mutex<HashMap<std::thread::ThreadId, Arc<NativeApcQueue>>>,
     pub(super) semaphores: Mutex<HashMap<u64, Arc<NativeSemaphore>>>,
@@ -292,13 +292,6 @@ pub(super) struct NativeLoadedModule {
     pub(super) mapping: Option<super::loader::Mapping>,
     /// Set before calling attach callbacks to prevent recursive duplicate attach.
     pub(super) initialized: bool,
-}
-
-pub(super) struct NativeThread {
-    pub(super) apc: Arc<NativeApcQueue>,
-    pub(super) join: Option<std::thread::JoinHandle<u32>>,
-    pub(super) exit_code: Option<u32>,
-    pub(super) suspension: Arc<(Mutex<u32>, Condvar)>,
 }
 
 pub(super) struct NativeSemaphore {

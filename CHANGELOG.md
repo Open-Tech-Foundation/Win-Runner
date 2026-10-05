@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add native `OpenThread`, `GetThreadId`, `GetProcessIdOfThread`,
+  `GetExitCodeThread`, `GetThreadTimes`, and `GetThreadDescription`, with
+  shared native guest thread objects, per-handle access checks, retained
+  termination state and Linux thread CPU accounting. Add a Windows oracle
+  for thread identity, descriptions, access rights and lifetime queries.
+
 - Add native `QueueUserAPC`, `ReadFileEx`, and `WriteFileEx`, with per-thread
   callback queues, issuing-thread completion delivery for regular files and
   named pipes, cancellation, EOF, and ignored overlapped event handles.
@@ -31,6 +37,10 @@ All notable changes to this project will be documented in this file.
   and PATH immediately, preserving shell variables, functions, and files.
 
 ### Fixed
+
+- Persist UTF-16 thread descriptions and return independent `LocalFree`-owned
+  copies. Keep opened and duplicated thread handles usable after closing
+  the creation handle, including waits, APC delivery and suspended-thread resume.
 
 - Honor alertable waits in `SleepEx`, single/multiple-object waits,
   `SignalObjectAndWait`, `GetOverlappedResultEx`, and completion-port waits.

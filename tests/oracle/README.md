@@ -29,10 +29,16 @@ with `guests/build-oracle.sh` (rustc and rust-lld only). A probe:
 | `path_names` | path spellings from `GetLongPathNameW`, `GetFullPathNameW`, and final paths |
 | `links` | `CreateSymbolicLinkW`, what a handle names with and without `FILE_FLAG_OPEN_REPARSE_POINT`, `FSCTL_GET_REPARSE_POINT` data |
 | `pool_console` | `QueueUserWorkItem`, `MapVirtualKeyW`, console input functions on a non-console handle |
+| `thread_queries` | pseudo/opened/duplicated thread identity, query/set/synchronize rights, UTF-16 description copies, suspended and terminated threads, retained handles, exit codes and CPU timestamps |
 | `apc_io` | per-thread APC queues, FIFO and duplicated thread handles, alertable single/multiple waits, wait-all state preservation, extended file completion callbacks, EOF, pipe cancellation, result timeouts and alertable completion-port waits |
 | `dll_search` | directory cookies and removal, Set/Get DLL directory buffers, search flags and defaults, loaded-name reuse, distinct absolute paths, recursive dependencies, loaded module filenames and truncation |
 | `file_locks` | shared/exclusive byte ranges, contention, read/write exclusion, exact unlock, close cleanup, 64-bit offsets, async grants and cancellation |
 | `process_runtime` | anonymous pipe access, duplication and EOF, startup handle-list filtering and child output/timestamps, volume metadata, error mode and WER flags, system-directory buffer sizing, priority boost, continuation dispatch, timer deadlines/reset/cancel/errors, shared clocks and PEB, read/write console devices and VT modes |
+
+`thread_queries` exercises threads in the active guest process. Opening
+threads in other guest processes or arbitrary Linux host processes is outside
+this batch. Thread descriptions preserve UTF-16 and returned copies are freed
+with `LocalFree`; CPU times use Linux per-thread accounting.
 
 `dll_search` embeds four small real DLLs, built from the `dll_*_support.rs`
 fixtures. The runners place its executable in an application subdirectory,

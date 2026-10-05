@@ -87,6 +87,7 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
                 | "file_locks"
                 | "dll_search"
                 | "apc_io"
+                | "thread_queries"
         ) {
             assert!(
                 !actual.contains("wrong") && !actual.contains("unavailable"),
@@ -141,6 +142,22 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
                 "lock.large_range: ok",
                 "async.granted: ok",
                 "async.cancel_result: ok",
+            ],
+            "thread_queries" => &[
+                "identity.pseudo: ok",
+                "identity.open: ok",
+                "rights.id: ok",
+                "rights.code: ok",
+                "rights.times: ok",
+                "rights.wait: ok",
+                "name.roundtrip: ok",
+                "thread.close_original: ok",
+                "thread.resume_opened: ok",
+                "thread.completed: ok",
+                "thread.final_times: ok",
+                "thread.times_stable: ok",
+                "thread.reopen_terminated: ok",
+                "thread.exit_259: ok",
             ],
             "apc_io" => &[
                 "apc.fifo: ok",

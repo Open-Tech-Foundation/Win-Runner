@@ -552,11 +552,6 @@ pub(super) extern "win64" fn native_ro_initialize(_init_type: u32) -> i32 {
     0 // S_OK
 }
 
-/// `SetThreadDescription(thread, name)`: thread names are informational.
-pub(super) extern "win64" fn native_set_thread_description(_thread: u64, _name: *const u16) -> i32 {
-    0 // S_OK
-}
-
 pub(super) extern "win64" fn native_co_task_mem_alloc(size: usize) -> *mut c_void {
     native_crt_malloc(size)
 }
@@ -865,7 +860,7 @@ mod tests {
         assert_eq!(native_disable_thread_library_calls(0x1_8000_0000), 1);
         assert_eq!(native_disable_thread_library_calls(0), 0);
         assert_eq!(native_is_thread_a_fiber(), 0);
-        assert_eq!(native_set_thread_description(0, ptr::null()), 0);
+        assert!(native_set_thread_description(0, ptr::null()) < 0);
     }
 
     #[test]
