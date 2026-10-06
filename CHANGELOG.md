@@ -90,6 +90,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Native processes publish `ImagePathName` and `CommandLine` in the PEB's
+  process parameters, which Zig-built programs read directly: `bun
+  completions` (run by Bun's installer) no longer panics finding its own
+  directory, and creates `bunx.exe`. `RtlCaptureStackBackTrace` reports zero
+  frames instead of stopping the process. The `native_startup` Windows oracle
+  checks both PEB strings.
+
 - ZIP extraction reads entry sizes from the central directory, so archives
   written with data descriptors (such as Bun's releases) extract instead of
   failing.

@@ -1162,6 +1162,33 @@ pub(super) extern "win64" fn native_rtl_delete_growable_function_table(handle: u
     native_rtl_delete_function_table(handle as *mut NativeRuntimeFunction);
 }
 
+/// `RtlCaptureStackBackTrace`: reports no captured frames (a valid result
+/// callers such as crash reporters handle) and a zero hash.
+pub(super) extern "win64" fn native_rtl_capture_stack_back_trace(
+    _frames_to_skip: u32,
+    _frames_to_capture: u32,
+    _back_trace: *mut u64,
+    back_trace_hash: *mut u32,
+) -> u16 {
+    if !back_trace_hash.is_null() {
+        unsafe { back_trace_hash.write_unaligned(0) };
+    }
+    0
+}
+
+#[cfg(test)]
+mod stack_back_trace_tests {
+    use super::*;
+    #[test]
+    fn back_traces_report_no_frames_and_a_zero_hash() {
+        let mut frames = [7u64; 4];
+        let mut hash = 9u32;
+        assert_eq!(native_rtl_capture_stack_back_trace(0, 4, frames.as_mut_ptr(), &mut hash), 0);
+        assert_eq!((frames, hash), ([7; 4], 0));
+        assert_eq!(native_rtl_capture_stack_back_trace(1, 4, frames.as_mut_ptr(), std::ptr::null_mut()), 0);
+    }
+}
+
 /// Apply the common x64 UNWIND_INFO operations to a Windows CONTEXT.
 pub(super) extern "win64" fn native_rtl_virtual_unwind(
     handler_type: u32,

@@ -531,6 +531,13 @@ fn run_rust_baseline_argv_with_fs_impl(
             .ok()
             .and_then(|value| serde_json::from_str::<[u64; 3]>(&value).ok())
             .unwrap_or([STD_HANDLE_BASE, STD_HANDLE_BASE + 1, STD_HANDLE_BASE + 2]);
+        let mut parameters = NativeProcessParameters::new(std_handles);
+        // The image path lives as long as this (single) guest process.
+        let image_path_w: &'static [u16] =
+            Box::leak(prog.encode_utf16().chain([0]).collect::<Vec<u16>>().into_boxed_slice());
+        // `command_line_w`'s buffer keeps its address when the vector moves
+        // into the process context below.
+        parameters.set_image_and_command_line(image_path_w, &command_line_w);
         let process = Arc::new(NativeProcessContext {
             times: NativeProcessTimes::new(),
             image_base: img.image_base,
@@ -554,7 +561,7 @@ fn run_rust_baseline_argv_with_fs_impl(
             crt_new_mode: AtomicI32::new(0),
             crt_invalid_parameter_handler: AtomicU64::new(0),
             std_console_mask: std::env::var("WINRUN_NATIVE_CONSOLE_MASK").ok().and_then(|mask| mask.parse().ok()).unwrap_or_else(native_host_console_mask),
-            parameters: NativeProcessParameters::new(std_handles),
+            parameters,
             crt_fds: Mutex::new(HashMap::new()),
             crt_fd_next: AtomicI32::new(3),
             fs,

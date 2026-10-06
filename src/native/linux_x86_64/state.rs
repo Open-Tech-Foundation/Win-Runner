@@ -101,6 +101,21 @@ impl NativeProcessParameters {
             reserved: [0; 0x448 - 0x38],
         }
     }
+
+    /// Point `ImagePathName` (0x60) and `CommandLine` (0x70) at NUL-ended
+    /// UTF-16 buffers that live as long as the process. Runtimes such as
+    /// Zig's read the image path from here instead of calling
+    /// `GetModuleFileNameW`.
+    pub(super) fn set_image_and_command_line(&mut self, image_path: &[u16], command_line: &[u16]) {
+        for (offset, text) in [(0x60usize, image_path), (0x70, command_line)] {
+            let units = text.iter().position(|&unit| unit == 0).unwrap_or(text.len());
+            let length = (units * 2).min(0xfffc) as u16;
+            let at = offset - 0x38;
+            self.reserved[at..at + 2].copy_from_slice(&length.to_le_bytes());
+            self.reserved[at + 2..at + 4].copy_from_slice(&(length + 2).to_le_bytes());
+            self.reserved[at + 8..at + 16].copy_from_slice(&(text.as_ptr() as u64).to_le_bytes());
+        }
+    }
 }
 
 pub(super) struct NativeTls {
@@ -700,6 +715,22 @@ mod process_parameters_tests {
         parameters.std_handles[1].store(42, Ordering::Release);
         assert_eq!(unsafe { pointer.add(0x28).cast::<u64>().read() }, 42);
     }
+    #[test]
+    fn image_path_and_command_line_are_unicode_strings() {
+        let image: Vec<u16> = r"C:\bun\bun.exe".encode_utf16().chain([0]).collect();
+        let line: Vec<u16> = "bun completions".encode_utf16().chain([0]).collect();
+        let mut parameters = NativeProcessParameters::new([7, 8, 9]);
+        parameters.set_image_and_command_line(&image, &line);
+        let pointer = &parameters as *const _ as *const u8;
+        for (offset, text) in [(0x60, &image), (0x70, &line)] {
+            let read16 = |o: usize| unsafe { pointer.add(o).cast::<u16>().read_unaligned() };
+            assert_eq!(read16(offset) as usize, (text.len() - 1) * 2);
+            assert_eq!(read16(offset + 2) as usize, text.len() * 2);
+            let buffer = unsafe { pointer.add(offset + 8).cast::<u64>().read_unaligned() };
+            assert_eq!(buffer, text.as_ptr() as u64);
+        }
+    }
+
     #[test]
     fn cloned_tebs_keep_shared_parameters_separate_from_loader_data() {
         let mut primary = NativeTls::new(0x140000000);

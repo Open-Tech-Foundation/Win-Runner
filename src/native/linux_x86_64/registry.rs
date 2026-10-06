@@ -538,6 +538,7 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                 | "RtlUnwind"
                 | "RtlUnwindEx"
                 | "RtlVirtualUnwind"
+                | "RtlCaptureStackBackTrace"
                 | "RtlGetVersion"
                 | "RtlNtStatusToDosError"
                 | "RtlGetActiveActivationContext"
@@ -1096,6 +1097,9 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
             Some(native_nt_device_io_control_file as *const () as usize as u64)
         }
         "RtlVirtualUnwind" => Some(native_rtl_virtual_unwind as *const () as usize as u64),
+        "RtlCaptureStackBackTrace" => {
+            Some(native_rtl_capture_stack_back_trace as *const () as usize as u64)
+        }
         "RtlAddGrowableFunctionTable" => {
             Some(native_rtl_add_growable_function_table as *const () as usize as u64)
         }

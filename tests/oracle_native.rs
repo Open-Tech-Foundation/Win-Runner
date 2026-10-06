@@ -134,7 +134,7 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
                 "sync_pipe.created: ok", "sync_pipe.read_access: ok", "sync_pipe.write_access: ok",
                 "sync_pipe.write: ok", "sync_pipe.read: ok", "sync_pipe.eof: ok",
                 "nt_thread.create: ok", "nt_thread.outputs: ok", "nt_thread.teb_identity: ok", "nt_thread.suspended: ok", "nt_thread.resume: ok", "nt_thread.completed: ok", "nt_thread.invalid: ok",
-                "nt_wait.nonalertable: ok", "nt_wait.apc: ok", "nt_wait.thread: ok", "nt_wait.poll: ok", "nt_wait.relative: ok", "nt_wait.absolute: ok", "nt_wait.invalid: ok", "nt_wait.last_error: ok", "nt_error.missing_parent: ok", "nt_error.invalid_name: ok", "peb.standard_handles: ok", "peb.set_standard_handle: ok", "nt_thread.parameters_shared: ok", "activation.absent: ok", "heap.peb: ok", "heap.allocate: ok", "heap.reallocate: ok", "heap.free: ok", "heap.last_error: ok",
+                "nt_wait.nonalertable: ok", "nt_wait.apc: ok", "nt_wait.thread: ok", "nt_wait.poll: ok", "nt_wait.relative: ok", "nt_wait.absolute: ok", "nt_wait.invalid: ok", "nt_wait.last_error: ok", "nt_error.missing_parent: ok", "nt_error.invalid_name: ok", "peb.standard_handles: ok", "peb.image_path: ok", "peb.command_line: ok", "peb.set_standard_handle: ok", "nt_thread.parameters_shared: ok", "activation.absent: ok", "heap.peb: ok", "heap.allocate: ok", "heap.reallocate: ok", "heap.free: ok", "heap.last_error: ok",
                 "nt_memory.allocate: ok", "nt_memory.protect: ok", "nt_memory.release: ok", "nt_time.precise: ok", "nt_time.performance: ok",
                 "device.attributes_roundtrip: ok",
                 "cert.memory_empty: ok", "cert.memory_close: ok", "cert.root_open: ok",

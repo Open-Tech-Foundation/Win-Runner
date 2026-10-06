@@ -148,6 +148,26 @@ fn nt_heap() {
         let parameters = *((peb + 0x20) as *const usize);
         let handles = core::slice::from_raw_parts((parameters + 0x20) as *const usize, 3);
         boolean("peb.standard_handles", (0..3).all(|index| handles[index] == GetStdHandle((-10i32 - index as i32) as u32)));
+        // ImagePathName (0x60) and CommandLine (0x70) are UNICODE_STRINGs
+        // that runtimes read directly instead of calling the APIs.
+        let unicode = |offset: usize| -> &[u16] {
+            let length = *((parameters + offset) as *const u16) as usize / 2;
+            let buffer = *((parameters + offset + 8) as *const usize);
+            if buffer == 0 { &[] } else { core::slice::from_raw_parts(buffer as *const u16, length) }
+        };
+        type ModuleName = unsafe extern "system" fn(usize, *mut u16, u32) -> u32;
+        let module_name = api!("peb.module_api", "GetModuleFileNameW", ModuleName);
+        let mut image = [0u16; 1024];
+        let image_length = module_name(0, image.as_mut_ptr(), 1024) as usize;
+        boolean("peb.image_path", image_length > 0 && unicode(0x60) == &image[..image_length]);
+        type CommandLine = unsafe extern "system" fn() -> *const u16;
+        let command_line = api!("peb.command_api", "GetCommandLineW", CommandLine);
+        let line = command_line();
+        let mut line_length = 0;
+        while *line.add(line_length) != 0 {
+            line_length += 1;
+        }
+        boolean("peb.command_line", unicode(0x70) == core::slice::from_raw_parts(line, line_length));
         let original = GetStdHandle((-12i32) as u32);
         let replacement = GetStdHandle((-11i32) as u32);
         boolean("peb.set_standard_handle", set_std((-12i32) as u32, replacement) != 0 && *((parameters + 0x30) as *const usize) == replacement);
