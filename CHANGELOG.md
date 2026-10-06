@@ -12,7 +12,8 @@ All notable changes to this project will be documented in this file.
   a pipeline. Bun's
   official installer (`powershell -c "irm bun.sh/install.ps1|iex"`) now
   installs Bun through the native `wpkg` curl, creates `bunx.exe`, adds it to
-  the user `PATH`, and registers the uninstaller, as on Windows.
+  the user `PATH`, and registers the uninstaller, as on Windows. Tests cover
+  the generic PowerShell and Win32 behavior, not Bun itself.
 
 - PowerShell scripts run programs natively: `& "C:\app.exe" args`, bare names
   resolved on the guest `PATH` with `PATHEXT`, `.ps1` files inline, output
