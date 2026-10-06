@@ -290,6 +290,13 @@ fn native_duplicate_handle_impl(
             return 1;
         }
     }
+    if let Some(duplicate) = duplicate_mutex(original) {
+        if options & 1 != 0 {
+            close_mutex(source_handle);
+        }
+        unsafe { target_handle.write(duplicate) };
+        return 1;
+    }
     let apc = lookup_thread_handle(source_handle);
     let valid = apc.is_some()
         || matches!(original, u64::MAX | 0xffff_ffff_ffff_fffe)
@@ -489,6 +496,9 @@ pub(super) extern "win64" fn native_close_handle(h: u64) -> i32 {
         .as_ref()
         .is_some_and(|p| p.timers.lock().is_ok_and(|mut t| t.remove(&h).is_some()))
     {
+        return 1;
+    }
+    if close_mutex(h) {
         return 1;
     }
     if process.as_ref().is_some_and(|process| {

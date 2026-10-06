@@ -122,6 +122,16 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
         // are checked in. Windows CI compares every new probe with Windows.
         let required: &[&str] = match name.as_str() {
             "desktop_clipboard" => &["format.register: ok", "global.movable: ok", "global.zeroed: ok", "global.nested_lock: ok", "global.final_unlock: ok", "global.not_locked: ok", "global.free: ok", "global.fixed: ok", "window.create: ok", "window.post: ok", "window.peek: ok", "window.remove: ok", "clipboard.not_open: ok", "clipboard.open: ok", "clipboard.set: ok", "clipboard.roundtrip: ok", "clipboard.close: ok", "clipboard.child: ok", "clipboard.clear: ok", "window.destroy: ok", "window.invalid: ok"],
+            "sync_crypto" => &[
+                "mutex.create_owned: ok", "mutex.recursive_wait: 0", "mutex.other_wait: 258",
+                "mutex.other_release: 0 err=288", "mutex.release_free: 0 err=288", "mutex.handoff_wait: 0",
+                "mutex.named_second_error: 183", "mutex.named_not_owner: 0 err=288", "mutex.open_missing: 0 err=2",
+                "filetime.compare: -1 0 1 ", "filetime.roundtrip: ok", "filetime.invalid_handle: 0 err=6",
+                "bcrypt.system_preferred: ok", "bcrypt.no_algorithm: 0xc0000008",
+                "cert.intended: 1 0x84 0x80", "cert.intended_none: 0 zeroed err=0", "cert.system_store: ok",
+                "crt.strtoll_overflow: -9223372036854775808 used=20", "crt.byteswap: 0x78563412 0x3412",
+                "crt.isxdigit: ok", "crt.difftime: ok",
+            ],
             "native_startup" => &[
                 "socket.ordinal_text: ok", "socket.ordinal_select: ok", "socket.ipv4_text: ok",
                 "socket.modern_ioctl: ok", "socket.modern_addr: ok", "socket.modern_text: ok",

@@ -385,6 +385,9 @@ pub(super) extern "win64" fn native_wait_for_single_object(handle: u64, millisec
         *count -= 1;
         return 0; // WAIT_OBJECT_0
     }
+    if let Some(mutex) = lookup_mutex(handle) {
+        return wait_mutex(&mutex, milliseconds);
+    }
     if let Some(thread) = lookup_thread_handle(handle) {
         if thread.access & 0x100000 == 0 {
             native_set_last_error(5);
@@ -1374,12 +1377,14 @@ enum WaitAllObject {
     Event(Arc<NativeEvent>),
     Semaphore(Arc<NativeSemaphore>),
     Timer(Arc<NativeWaitableTimer>),
+    Mutex(Arc<NativeMutex>),
     Other(u64),
 }
 enum WaitAllState<'a> {
     Event(std::sync::MutexGuard<'a, bool>, bool),
     Semaphore(std::sync::MutexGuard<'a, i32>),
     Timer(std::sync::MutexGuard<'a, NativeTimerState>, bool),
+    Mutex(HeldMutex<'a>),
     Other,
 }
 fn poll_wait_all(handles: &[u64]) -> u32 {
@@ -1421,6 +1426,9 @@ fn poll_wait_all(handles: &[u64]) -> u32 {
             {
                 return WaitAllObject::Timer(timer);
             }
+            if let Some(mutex) = lookup_mutex(handle) {
+                return WaitAllObject::Mutex(mutex);
+            }
             WaitAllObject::Other(handle)
         })
         .collect();
@@ -1428,7 +1436,8 @@ fn poll_wait_all(handles: &[u64]) -> u32 {
         WaitAllObject::Event(event) => (0, Arc::as_ptr(event) as usize),
         WaitAllObject::Semaphore(semaphore) => (1, Arc::as_ptr(semaphore) as usize),
         WaitAllObject::Timer(timer) => (2, Arc::as_ptr(timer) as usize),
-        WaitAllObject::Other(handle) => (3, *handle as usize),
+        WaitAllObject::Mutex(mutex) => (3, Arc::as_ptr(mutex) as usize),
+        WaitAllObject::Other(handle) => (4, *handle as usize),
     };
     objects.sort_unstable_by_key(identity);
     if objects
@@ -1464,6 +1473,13 @@ fn poll_wait_all(handles: &[u64]) -> u32 {
                 }
                 Err(_) => return WAIT_FAILED,
             },
+            WaitAllObject::Mutex(mutex) => match HeldMutex::lock(mutex) {
+                Some(state) => {
+                    ready &= state.ready();
+                    WaitAllState::Mutex(state)
+                }
+                None => return WAIT_FAILED,
+            },
             WaitAllObject::Other(handle) => match native_wait_for_single_object(*handle, 0) {
                 0 => WaitAllState::Other,
                 WAIT_TIMEOUT => {
@@ -1483,6 +1499,7 @@ fn poll_wait_all(handles: &[u64]) -> u32 {
             WaitAllState::Event(state, manual) => **state = *manual,
             WaitAllState::Semaphore(state) => **state -= 1,
             WaitAllState::Timer(state, manual) => state.signaled = *manual,
+            WaitAllState::Mutex(state) => state.acquire(),
             WaitAllState::Other => {}
         }
     }

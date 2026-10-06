@@ -26,6 +26,49 @@ fn fill_random_bytes(out: *mut u8, len: usize) -> bool {
     }
     true
 }
+/// `BCryptGenRandom` with the system-preferred generator, the form callers
+/// use without opening an algorithm provider.
+pub(super) extern "win64" fn native_bcrypt_gen_random(
+    algorithm: u64,
+    buffer: *mut u8,
+    length: u32,
+    flags: u32,
+) -> u32 {
+    const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+    const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+    const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
+    const USE_SYSTEM_PREFERRED_RNG: u32 = 2;
+    if flags & !(USE_SYSTEM_PREFERRED_RNG | 1) != 0 || (buffer.is_null() && length != 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if algorithm != 0 || flags & USE_SYSTEM_PREFERRED_RNG == 0 {
+        return STATUS_INVALID_HANDLE;
+    }
+    if fill_random_bytes(buffer, length as usize) {
+        0
+    } else {
+        STATUS_UNSUCCESSFUL
+    }
+}
+
+#[cfg(test)]
+mod bcrypt_tests {
+    use super::*;
+    #[test]
+    fn system_preferred_random_fills_and_rejects_bad_requests() {
+        let mut first = [0u8; 64];
+        let mut second = [0u8; 64];
+        assert_eq!(native_bcrypt_gen_random(0, first.as_mut_ptr(), 64, 2), 0);
+        assert_eq!(native_bcrypt_gen_random(0, second.as_mut_ptr(), 64, 2), 0);
+        assert_ne!(first, second);
+        assert_eq!(native_bcrypt_gen_random(0, std::ptr::null_mut(), 0, 2), 0);
+        assert_eq!(native_bcrypt_gen_random(0, first.as_mut_ptr(), 8, 0), 0xC000_0008);
+        assert_eq!(native_bcrypt_gen_random(0x10, first.as_mut_ptr(), 8, 2), 0xC000_0008);
+        assert_eq!(native_bcrypt_gen_random(0, std::ptr::null_mut(), 8, 2), 0xC000_000D);
+        assert_eq!(native_bcrypt_gen_random(0, first.as_mut_ptr(), 8, 0x10), 0xC000_000D);
+    }
+}
+
 pub(super) extern "win64" fn native_crypt_acquire_context_w(
     provider_out: *mut u64,
     _container: *const u16,

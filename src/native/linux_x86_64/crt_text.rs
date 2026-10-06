@@ -133,6 +133,54 @@ pub(super) extern "win64" fn native_crt_strtoull(
     unsigned_result(value, negative, overflow, u64::MAX)
 }
 
+/// `strtoll` / `_strtoi64`: a signed 64-bit `strtol`, saturating at the
+/// range ends with `ERANGE`.
+pub(super) extern "win64" fn native_crt_strtoll(
+    input: *const u8,
+    end: *mut *mut u8,
+    base: i32,
+) -> i64 {
+    if input.is_null() || !valid_base(base) {
+        set_errno(EINVAL);
+        return 0;
+    }
+    const MAGNITUDE: u64 = 1 << 63;
+    let (consumed, value, negative, overflow) = parse_unsigned(
+        |i| u32::from(unsafe { input.add(i).read() }),
+        base as u32,
+        MAGNITUDE,
+    );
+    if !end.is_null() {
+        unsafe { end.write_unaligned(input.add(consumed) as *mut u8) };
+    }
+    match (negative, overflow || (!negative && value == MAGNITUDE)) {
+        (false, true) => {
+            set_errno(ERANGE);
+            i64::MAX
+        }
+        (true, true) => {
+            set_errno(ERANGE);
+            i64::MIN
+        }
+        (true, false) => (value as i64).wrapping_neg(),
+        (false, false) => value as i64,
+    }
+}
+
+pub(super) extern "win64" fn native_crt_byteswap_ushort(value: u16) -> u16 {
+    value.swap_bytes()
+}
+pub(super) extern "win64" fn native_crt_byteswap_ulong(value: u32) -> u32 {
+    value.swap_bytes()
+}
+pub(super) extern "win64" fn native_crt_byteswap_uint64(value: u64) -> u64 {
+    value.swap_bytes()
+}
+/// `_difftime64`: seconds from `start` to `end`.
+pub(super) extern "win64" fn native_crt_difftime64(end: i64, start: i64) -> f64 {
+    end as f64 - start as f64
+}
+
 pub(super) extern "win64" fn native_crt_wcstoul(
     input: *const u16,
     end: *mut *mut u16,
@@ -527,6 +575,9 @@ pub(super) extern "win64" fn native_crt_isalpha(value: i32) -> i32 {
 pub(super) extern "win64" fn native_crt_isdigit(value: i32) -> i32 {
     i32::from(u8::try_from(value).is_ok_and(|byte| byte.is_ascii_digit()))
 }
+pub(super) extern "win64" fn native_crt_isxdigit(value: i32) -> i32 {
+    i32::from(u8::try_from(value).is_ok_and(|byte| byte.is_ascii_hexdigit()))
+}
 pub(super) extern "win64" fn native_crt_isspace(value: i32) -> i32 {
     i32::from(matches!(value, 0x20 | 0x09..=0x0d))
 }
@@ -714,5 +765,42 @@ mod tests {
         assert_eq!(native_crt_ltow_s(255, buffer.as_mut_ptr(), 12, 16), 0);
         assert_eq!(String::from_utf16_lossy(&buffer[..2]), "ff");
         assert_eq!(native_crt_ltow_s(12345, buffer.as_mut_ptr(), 3, 10), ERANGE);
+    }
+}
+
+#[cfg(test)]
+mod integer_utility_tests {
+    use super::*;
+
+    fn strtoll(text: &str, base: i32) -> (i64, usize, i32) {
+        let bytes: Vec<u8> = text.bytes().chain([0]).collect();
+        let mut end = std::ptr::null_mut();
+        THREAD_CRT_ERRNO.with(|errno| errno.set(0));
+        let value = native_crt_strtoll(bytes.as_ptr(), &mut end, base);
+        let used = if end.is_null() { 0 } else { end as usize - bytes.as_ptr() as usize };
+        (value, used, THREAD_CRT_ERRNO.with(|errno| errno.get()))
+    }
+
+    #[test]
+    fn strtoll_parses_signs_bases_and_saturates() {
+        assert_eq!(strtoll("  -42x", 10), (-42, 5, 0));
+        assert_eq!(strtoll("0x7fffffffffffffff", 0), (i64::MAX, 18, 0));
+        assert_eq!(strtoll("9223372036854775808", 10), (i64::MAX, 19, ERANGE));
+        assert_eq!(strtoll("-9223372036854775808", 10), (i64::MIN, 20, 0));
+        assert_eq!(strtoll("-9223372036854775809", 10), (i64::MIN, 20, ERANGE));
+        assert_eq!(strtoll("zz", 10), (0, 0, 0));
+        assert_eq!(strtoll("1", 1).2, EINVAL);
+    }
+
+    #[test]
+    fn byte_swaps_hex_digits_and_time_differences() {
+        assert_eq!(native_crt_byteswap_ushort(0x1234), 0x3412);
+        assert_eq!(native_crt_byteswap_ulong(0x1234_5678), 0x7856_3412);
+        assert_eq!(native_crt_byteswap_uint64(0x0102_0304_0506_0708), 0x0807_0605_0403_0201);
+        assert_eq!(
+            (native_crt_isxdigit(b'F' as i32), native_crt_isxdigit(b'g' as i32), native_crt_isxdigit(300)),
+            (1, 0, 0)
+        );
+        assert_eq!(native_crt_difftime64(10, 25), -15.0);
     }
 }

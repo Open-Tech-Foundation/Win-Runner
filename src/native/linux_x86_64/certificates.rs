@@ -454,6 +454,103 @@ fn release(stores: &mut Stores, pointer: u64) -> bool {
     }
     true
 }
+/// `CertGetIntendedKeyUsage`: the key-usage bits (extension 2.5.29.15) of a
+/// `CERT_INFO`, zero-padded to the caller's size. Without the extension it
+/// returns FALSE, zeroes the buffer, and leaves the last error 0.
+pub(super) extern "win64" fn native_cert_get_intended_key_usage(
+    _encoding: u32,
+    info: *const u64,
+    usage: *mut u8,
+    size: u32,
+) -> i32 {
+    if info.is_null() || (usage.is_null() && size != 0) {
+        native_set_last_error(87);
+        return 0;
+    }
+    if size != 0 {
+        unsafe { std::ptr::write_bytes(usage, 0, size as usize) };
+    }
+    // CERT_INFO.cExtension and .rgExtension are its last two words; each
+    // CERT_EXTENSION is { pszObjId, fCritical, Value { cbData, pbData } }.
+    let (count, extensions) = unsafe {
+        (
+            info.add(24).read_unaligned() as u32 as usize,
+            info.add(25).read_unaligned() as *const u64,
+        )
+    };
+    native_set_last_error(0);
+    if extensions.is_null() {
+        return 0;
+    }
+    for index in 0..count {
+        let extension = unsafe { extensions.add(index * 4) };
+        let id = unsafe { extension.read_unaligned() } as *const u8;
+        if unsafe { ascii_z(id) } != Some("2.5.29.15") {
+            continue;
+        }
+        let (length, data) = unsafe {
+            (
+                extension.add(2).read_unaligned() as u32 as usize,
+                extension.add(3).read_unaligned() as *const u8,
+            )
+        };
+        if data.is_null() {
+            return 0;
+        }
+        let mut value = unsafe { std::slice::from_raw_parts(data, length) };
+        let Ok(bits) = der(&mut value, Some(3)) else {
+            native_set_last_error(ASN1_ERROR);
+            return 0;
+        };
+        // A BIT STRING body is its unused-bit count, then the bits.
+        let bytes = bits.body.get(1..).unwrap_or(&[]);
+        let copied = bytes.len().min(size as usize);
+        unsafe { usage.copy_from_nonoverlapping(bytes.as_ptr(), copied) };
+        return 1;
+    }
+    0
+}
+
+#[cfg(test)]
+mod intended_key_usage_tests {
+    use super::*;
+
+    #[test]
+    fn key_usage_bits_come_from_the_extension_or_report_none() {
+        let key_usage_id = b"2.5.29.15\0";
+        let other_id = b"2.5.29.19\0";
+        // BIT STRING, 1 unused bit: digitalSignature | keyCertSign, 2nd byte.
+        let value = [0x03u8, 0x03, 0x01, 0x84, 0x80];
+        let extensions: [[u64; 4]; 2] = [
+            [other_id.as_ptr() as u64, 0, 0, 0],
+            [key_usage_id.as_ptr() as u64, 1, value.len() as u64, value.as_ptr() as u64],
+        ];
+        let mut info = [0u64; 26];
+        info[24] = 2;
+        info[25] = extensions.as_ptr() as u64;
+        let mut usage = [0xffu8; 4];
+        assert_eq!(native_cert_get_intended_key_usage(1, info.as_ptr(), usage.as_mut_ptr(), 4), 1);
+        assert_eq!(usage, [0x84, 0x80, 0, 0]);
+        let mut one = [0xffu8; 1];
+        assert_eq!(native_cert_get_intended_key_usage(1, info.as_ptr(), one.as_mut_ptr(), 1), 1);
+        assert_eq!(one, [0x84]);
+        info[24] = 1;
+        assert_eq!(native_cert_get_intended_key_usage(1, info.as_ptr(), usage.as_mut_ptr(), 4), 0);
+        assert_eq!((usage, native_get_last_error()), ([0; 4], 0));
+        assert_eq!(native_cert_get_intended_key_usage(1, std::ptr::null(), usage.as_mut_ptr(), 4), 0);
+        assert_eq!(native_get_last_error(), 87);
+    }
+}
+
+/// `CertOpenSystemStoreA`: the current user's system store by name.
+pub(super) extern "win64" fn native_cert_open_system_store_a(_provider: u64, name: *const u8) -> u64 {
+    native_cert_open_store(9, 0, 0, 0x10000, name)
+}
+/// `CertOpenSystemStoreW`.
+pub(super) extern "win64" fn native_cert_open_system_store_w(_provider: u64, name: *const u16) -> u64 {
+    native_cert_open_store(10, 0, 0, 0x10000, name.cast())
+}
+
 pub(super) extern "win64" fn native_cert_enum_certificates(store: u64, previous: u64) -> u64 {
     let mut stores = STORES.lock().unwrap();
     let index = if previous == 0 {

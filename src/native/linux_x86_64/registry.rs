@@ -254,6 +254,13 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                     | "modff"
                     | "strtoul"
                     | "strtoull"
+                    | "strtoll"
+                    | "_strtoi64"
+                    | "isxdigit"
+                    | "_byteswap_ushort"
+                    | "_byteswap_ulong"
+                    | "_byteswap_uint64"
+                    | "_difftime64"
                     | "wcstoul"
                     | "_wcstoui64"
                     | "wcstoull"
@@ -380,11 +387,12 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                 | "EnumerateSecurityPackagesA"
                 | "EnumerateSecurityPackagesW"
         ),
-        "CRYPT32.DLL" => matches!(func, "CertOpenStore" | "CertGetEnhancedKeyUsage" | "CertEnumCertificatesInStore" | "CertCloseStore" | "CertFreeCertificateContext" | "CertDuplicateCertificateContext"),
+        "CRYPT32.DLL" => matches!(func, "CertOpenStore" | "CertOpenSystemStoreA" | "CertOpenSystemStoreW" | "CertGetIntendedKeyUsage" | "CertGetEnhancedKeyUsage" | "CertEnumCertificatesInStore" | "CertCloseStore" | "CertFreeCertificateContext" | "CertDuplicateCertificateContext"),
         "PSAPI.DLL" => func == "GetProcessMemoryInfo",
         "WINMM.DLL" => func == "timeGetTime",
         "USERENV.DLL" => func == "GetUserProfileDirectoryW",
         "BCRYPTPRIMITIVES.DLL" => func == "ProcessPrng",
+        "BCRYPT.DLL" => func == "BCryptGenRandom",
         "OLE32.DLL" => matches!(
             func,
             "CoInitialize"
@@ -694,6 +702,12 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "_initterm" => Some(native_crt_initterm as *const () as usize as u64),
         "strtoul" => Some(native_crt_strtoul as *const () as usize as u64),
         "strtoull" => Some(native_crt_strtoull as *const () as usize as u64),
+        "strtoll" | "_strtoi64" => Some(native_crt_strtoll as *const () as usize as u64),
+        "isxdigit" => Some(native_crt_isxdigit as *const () as usize as u64),
+        "_byteswap_ushort" => Some(native_crt_byteswap_ushort as *const () as usize as u64),
+        "_byteswap_ulong" => Some(native_crt_byteswap_ulong as *const () as usize as u64),
+        "_byteswap_uint64" => Some(native_crt_byteswap_uint64 as *const () as usize as u64),
+        "_difftime64" => Some(native_crt_difftime64 as *const () as usize as u64),
         "wcstoul" => Some(native_crt_wcstoul as *const () as usize as u64),
         "_wcstoui64" => Some(native_crt_wcstoui64 as *const () as usize as u64),
         "wcstoull" => Some(native_crt_wcstoui64 as *const () as usize as u64),
@@ -1254,6 +1268,9 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "UnmapViewOfFile" => Some(native_unmap_view_of_file as *const () as usize as u64),
         "CertGetEnhancedKeyUsage" => Some(native_cert_get_enhanced_key_usage as *const () as usize as u64),
         "CertOpenStore" => Some(native_cert_open_store as *const () as usize as u64),
+        "CertGetIntendedKeyUsage" => Some(native_cert_get_intended_key_usage as *const () as usize as u64),
+        "CertOpenSystemStoreA" => Some(native_cert_open_system_store_a as *const () as usize as u64),
+        "CertOpenSystemStoreW" => Some(native_cert_open_system_store_w as *const () as usize as u64),
         "CertEnumCertificatesInStore" => Some(native_cert_enum_certificates as *const () as usize as u64),
         "CertCloseStore" => Some(native_cert_close_store as *const () as usize as u64),
         "CertFreeCertificateContext" => Some(native_cert_free_context as *const () as usize as u64),
@@ -1579,6 +1596,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "RtlFreeHeap" => Some(native_rtl_free_heap as *const () as usize as u64),
         "HeapFree" => Some(native_heap_free as *const () as usize as u64),
         "ProcessPrng" => Some(native_process_prng as *const () as usize as u64),
+        "BCryptGenRandom" => Some(native_bcrypt_gen_random as *const () as usize as u64),
         "GetConsoleMode" => Some(native_get_console_mode as *const () as usize as u64),
         "GetConsoleCP" => Some(native_get_console_cp as *const () as usize as u64),
         "SetConsoleCP" => Some(native_set_console_cp as *const () as usize as u64),
@@ -1625,6 +1643,10 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "SetCurrentDirectoryA" => Some(native_set_current_directory_a as *const () as usize as u64),
         "GetComputerNameExW" => Some(native_get_computer_name_ex_w as *const () as usize as u64),
         "SetFileTime" => Some(native_set_file_time as *const () as usize as u64),
+        "GetFileTime" => Some(native_get_file_time as *const () as usize as u64),
+        "CompareFileTime" => Some(native_compare_file_time as *const () as usize as u64),
+        "GetFileAttributesA" => Some(native_get_file_attributes_a as *const () as usize as u64),
+        "MoveFileExA" => Some(native_move_file_ex_a as *const () as usize as u64),
         "SetFilePointerEx" => Some(native_set_file_pointer_ex as *const () as usize as u64),
         "SetFilePointer" => Some(native_set_file_pointer as *const () as usize as u64),
         "WriteFile" => Some(native_write_file as *const () as usize as u64),
@@ -1687,6 +1709,13 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "WaitForSingleObject" => Some(native_wait_for_single_object as *const () as usize as u64),
         "CreateEventW" => Some(native_create_event_w as *const () as usize as u64),
         "CreateEventA" => Some(native_create_event_a as *const () as usize as u64),
+        "CreateMutexW" => Some(native_create_mutex_w as *const () as usize as u64),
+        "CreateMutexA" => Some(native_create_mutex_a as *const () as usize as u64),
+        "CreateMutexExW" => Some(native_create_mutex_ex_w as *const () as usize as u64),
+        "CreateMutexExA" => Some(native_create_mutex_ex_a as *const () as usize as u64),
+        "OpenMutexW" => Some(native_open_mutex_w as *const () as usize as u64),
+        "OpenMutexA" => Some(native_open_mutex_a as *const () as usize as u64),
+        "ReleaseMutex" => Some(native_release_mutex as *const () as usize as u64),
         "CreateEventExW" => Some(native_create_event_ex_w as *const () as usize as u64),
         "CreateEventExA" => Some(native_create_event_ex_a as *const () as usize as u64),
         "SetEvent" => Some(native_set_event as *const () as usize as u64),

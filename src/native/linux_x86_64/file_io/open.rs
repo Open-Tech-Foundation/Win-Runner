@@ -372,6 +372,42 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_create_file_a(
     )
 }
 
+pub(in crate::native::linux_x86_64) extern "win64" fn native_get_file_attributes_a(path: *const u8) -> u32 {
+    let Some(wide_path) = native_ansi_path(path) else {
+        native_set_last_error(87);
+        return u32::MAX;
+    };
+    native_get_file_attributes_w(wide_path.as_ptr())
+}
+
+pub(in crate::native::linux_x86_64) extern "win64" fn native_move_file_ex_a(
+    from: *const u8,
+    to: *const u8,
+    flags: u32,
+) -> i32 {
+    let Some(from) = native_ansi_path(from) else {
+        native_set_last_error(87);
+        return 0;
+    };
+    // A null destination (delete on reboot) passes through as null.
+    let to = if to.is_null() {
+        None
+    } else {
+        match native_ansi_path(to) {
+            Some(to) => Some(to),
+            None => {
+                native_set_last_error(87);
+                return 0;
+            }
+        }
+    };
+    native_move_file_ex_w(
+        from.as_ptr(),
+        to.as_ref().map_or(std::ptr::null(), |to| to.as_ptr()),
+        flags,
+    )
+}
+
 pub(in crate::native::linux_x86_64) extern "win64" fn native_create_named_pipe_w(
     path: *const u16,
     open_mode: u32,

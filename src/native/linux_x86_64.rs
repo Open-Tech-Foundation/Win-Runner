@@ -92,6 +92,9 @@ use handles::*;
 #[path = "linux_x86_64/sync.rs"]
 mod sync;
 use sync::*;
+#[path = "linux_x86_64/mutexes.rs"]
+mod mutexes;
+use mutexes::*;
 #[path = "linux_x86_64/crt.rs"]
 mod crt;
 use crt::*;

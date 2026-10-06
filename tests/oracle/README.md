@@ -37,6 +37,7 @@ with `guests/build-oracle.sh` (rustc and rust-lld only). A probe:
 | `dll_search` | directory cookies and removal, Set/Get DLL directory buffers, search flags and defaults, loaded-name reuse, distinct absolute paths, recursive dependencies, loaded module filenames and truncation |
 | `file_locks` | shared/exclusive byte ranges, contention, read/write exclusion, exact unlock, close cleanup, 64-bit offsets, async grants and cancellation |
 | `process_runtime` | anonymous pipe access, duplication and EOF, startup handle-list filtering and child output/timestamps, volume metadata, error mode and WER flags, system-directory buffer sizing, priority boost, continuation dispatch, timer deadlines/reset/cancel/errors, shared clocks and PEB, read/write console devices and VT modes |
+| `sync_crypto` | mutex ownership, recursion, names and non-owner release; `CompareFileTime`/`GetFileTime`; `BCryptGenRandom`; `CertGetIntendedKeyUsage` and `CertOpenSystemStoreA`; CRT `strtoll`, `_byteswap_*`, `isxdigit`, `_difftime64` |
 | `powershell_essentials.ps1` | everyday item, content and text-pipeline cmdlets (a script, run by real PowerShell and the guest shell) |
 | `powershell_scripting.ps1` | `param` blocks, named/switch/positional binding, `return`, the `HKLM:`/`HKCU:` registry provider and `RegistryKey` methods |
 

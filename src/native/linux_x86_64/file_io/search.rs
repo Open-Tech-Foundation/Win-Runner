@@ -241,6 +241,58 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_find_close(handle: 
         .unwrap_or(false) as i32
 }
 
+/// `CompareFileTime`: -1, 0 or 1 as the first time is earlier, equal or
+/// later.
+pub(in crate::native::linux_x86_64) extern "win64" fn native_compare_file_time(
+    first: *const u64,
+    second: *const u64,
+) -> i32 {
+    if first.is_null() || second.is_null() {
+        return 0;
+    }
+    let (a, b) = unsafe { (first.read_unaligned(), second.read_unaligned()) };
+    match a.cmp(&b) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
+/// `GetFileTime`: the creation, access and write times recorded for an
+/// open file (each output optional).
+pub(in crate::native::linux_x86_64) extern "win64" fn native_get_file_time(
+    handle: u64,
+    creation: *mut u64,
+    access: *mut u64,
+    write: *mut u64,
+) -> i32 {
+    let Some(context) = fs_ctx() else {
+        native_set_last_error(6);
+        return 0;
+    };
+    let Ok(context) = context.lock() else {
+        native_set_last_error(6);
+        return 0;
+    };
+    let Some(path) = context.handles.get(&handle).map(|file| file.path.clone()) else {
+        native_set_last_error(6);
+        return 0;
+    };
+    let metadata = context.fs.file_metadata(&path);
+    unsafe {
+        for (out, value) in [
+            (creation, metadata.creation_time),
+            (access, metadata.access_time),
+            (write, metadata.write_time),
+        ] {
+            if !out.is_null() {
+                out.write_unaligned(value);
+            }
+        }
+    }
+    1
+}
+
 pub(in crate::native::linux_x86_64) extern "win64" fn native_set_file_time(
     handle: u64,
     creation: *const u64,

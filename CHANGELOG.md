@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Native Win32 mutexes (`CreateMutexA/W`, `CreateMutexExA/W`,
+  `OpenMutexA/W`, `ReleaseMutex`) with owner recursion, names, waits
+  (including wait-all) and handle duplication, plus `BCryptGenRandom`,
+  `CertOpenSystemStoreA/W`, `CertGetIntendedKeyUsage`, `CompareFileTime`,
+  `GetFileTime`, `GetFileAttributesA`, `MoveFileExA`, and the CRT's
+  `strtoll`/`_strtoi64`, `_byteswap_*`, `isxdigit` and `_difftime64`. The
+  official Windows curl (`wpkg install curl`) now downloads over HTTPS
+  natively. A new `sync_crypto` Windows oracle checks these APIs.
+
 - PowerShell values: `X -split P` and `X -join S` in assignments, and quoted
   patterns containing `.` in conditions (`$v -like "*-canary.*"`), `$_` bound
   to the error inside `catch`, and `$v = 'a|b'` kept as one string instead of
