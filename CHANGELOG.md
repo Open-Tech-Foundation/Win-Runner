@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- PowerShell scripts and functions accept `param(...)` blocks with typed,
+  `[switch]` and defaulted parameters bound by name (`-Name value`,
+  `-Name:value`, unique prefixes) or position, and `return` outputs its value
+  and leaves the function or script. Installer scripts such as Bun's start
+  with these.
+
 - Add native console input/output code-page getters and setters, with
   independent shared state across child workers and explicit rejection of
   unsupported encodings. Add `GetCurrentThreadStackLimits` using native TEB

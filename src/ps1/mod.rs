@@ -19,8 +19,10 @@
 //! `switch` matches literal patterns (plus `default`) as a statement or
 //! an assignment value; bare quoted/`$` strings output their value.
 //! `foreach` iterates arrays/literals/scalars with `break`/`continue`;
-//! `function` defines named params with child-scope calls (output
-//! capturable by assignment). `@{}` maps string keys to values with
+//! `function` defines params (`F($a)` or a `param(...)` block with typed,
+//! `[switch]` and defaulted entries, bound by name or position) with
+//! child-scope calls (output capturable by assignment); `return` outputs
+//! its value and unwinds; a script's own `param(...)` takes its defaults. `@{}` maps string keys to values with
 //! `.ContainsKey()` and `[key]`/`[index]` reads (arrays/strings index
 //! too). String methods cover case, trim, replace, split (arrays,
 //! indexable), and starts/ends/contains. Static .NET calls cover
@@ -105,11 +107,23 @@ pub fn environment_set(environment: &mut Vec<(String, String)>, name: &str, valu
     }
 }
 
-/// A defined function: parameter names (lowercased, no `$`) and body text.
+/// A defined function: its parameters and body text.
 #[derive(Clone)]
 pub struct FuncDef {
-    pub params: Vec<String>,
+    pub params: Vec<Param>,
     pub body: String,
+}
+
+/// One declared parameter: `[Type]$name = default` from a `function
+/// F(...)` list or a `param(...)` block. The default stays source text and
+/// evaluates at bind time, after earlier parameters are bound.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Param {
+    /// Lowercased, without `$`.
+    pub name: String,
+    pub default: Option<String>,
+    /// `[switch]`: present means `True`, absent `False`, takes no value.
+    pub switch: bool,
 }
 
 /// Statement flow: straight-line runs return `Next`; `break`/`continue`
@@ -120,6 +134,8 @@ enum Flow {
     Next,
     Break,
     Continue,
+    /// `return`: unwinds to the enclosing function or script.
+    Return,
 }
 
 /// A variable value: plain string, array (possibly nested, e.g. parsed
@@ -170,7 +186,7 @@ impl<'a> Interpreter<'a> {
     fn run(mut self, script: &str) -> Result<i32, String> {
         // Stray top-level break/continue is ignored, like the real shell.
         match self.run_code(script)? {
-            Flow::Next | Flow::Break | Flow::Continue => Ok(0),
+            Flow::Next | Flow::Break | Flow::Continue | Flow::Return => Ok(0),
         }
     }
 
@@ -203,14 +219,14 @@ impl<'a> Interpreter<'a> {
                 i = next;
                 match flow {
                     Flow::Next => {}
-                    Flow::Break | Flow::Continue => return Ok(flow),
+                    Flow::Break | Flow::Continue | Flow::Return => return Ok(flow),
                 }
             } else if starts_kw(t, "try") {
                 let (next, flow) = self.run_try_chain(&chunks, i)?;
                 i = next;
                 match flow {
                     Flow::Next => {}
-                    Flow::Break | Flow::Continue => return Ok(flow),
+                    Flow::Break | Flow::Continue | Flow::Return => return Ok(flow),
                 }
             } else if let Some((name, op, first)) = split_assign_if_head(&chunks[i]) {
                 // `$v = if ...` / `$v += if ...`: gather the chain,
@@ -674,6 +690,12 @@ impl<'a> Interpreter<'a> {
             }
             if kw == "function" {
                 return self.cmd_function_def(stmt);
+            }
+            if kw == "return" {
+                return self.cmd_return(&toks[1..]);
+            }
+            if starts_kw(stmt, "param") {
+                return self.cmd_param_block(stmt);
             }
             if kw == "foreach-object" || kw == "%" {
                 return self.cmd_foreach_object(stmt, pipe_in);
@@ -1501,6 +1523,7 @@ impl<'a> Interpreter<'a> {
                 Flow::Next => {}
                 Flow::Break => break,
                 Flow::Continue => continue,
+                Flow::Return => return Ok(Flow::Return),
             }
         }
         Ok(Flow::Next)
@@ -1551,49 +1574,126 @@ impl<'a> Interpreter<'a> {
         if rest.starts_with('(') {
             let (inner, rest2) = take_wrapped(&rest, '(', ')')?;
             rest = rest2.trim_start().to_string();
-            for p in split_top_commas(&inner) {
-                let p = p.trim().strip_prefix('$').unwrap_or(p.trim());
-                if p.is_empty() || !is_var_name(p) {
-                    return Err(format!("invalid function parameter: {p}"));
-                }
-                params.push(p.to_lowercase());
-            }
+            params = parse_param_list(&inner)?;
         }
         if !rest.starts_with('{') {
             return Err("function needs {body}".to_string());
         }
-        let (body, rest2) = take_wrapped(&rest, '{', '}')?;
+        let (mut body, rest2) = take_wrapped(&rest, '{', '}')?;
         if !rest2.trim().is_empty() {
             return Err("unexpected text after function".to_string());
+        }
+        // A leading `param(...)` block declares the parameters instead.
+        if starts_kw(&body, "param") {
+            let after = body.trim_start()["param".len()..].trim_start();
+            if after.starts_with('(') {
+                if !params.is_empty() {
+                    return Err("a function cannot declare parameters twice".to_string());
+                }
+                let (inner, rest3) = take_wrapped(after, '(', ')')?;
+                params = parse_param_list(&inner)?;
+                body = rest3;
+            }
         }
         self.funcs
             .insert(name.to_lowercase(), FuncDef { params, body });
         Ok(Flow::Next)
     }
 
-    /// Call a defined function: bind positionals (missing → `""`, extra is
-    /// an error), run the body in a child scope (writes are local).
+    /// Call a defined function: bind `-Name value` / `-Name:value` / switch
+    /// arguments by (unique prefix of) name and the rest positionally in
+    /// declaration order (extra is an error), then run the body in a child
+    /// scope (writes are local). Unbound parameters take their default,
+    /// else `False` for switches and `""` otherwise. `return` ends the call.
     fn call_function(
         &mut self,
         name: &str,
-        params: &[String],
+        params: &[Param],
         body: &str,
         args: &[String],
     ) -> Result<Flow, String> {
-        if args.len() > params.len() {
-            return Err(format!("too many arguments to {name}"));
-        }
+        let bound = bind_arguments(name, params, args)?;
         let saved = self.vars.clone();
-        for (i, p) in params.iter().enumerate() {
-            self.vars.insert(
-                p.clone(),
-                Value::Str(args.get(i).cloned().unwrap_or_default()),
-            );
-        }
-        let body = body.to_string();
-        let r = self.run_code(&body);
+        let r = self.bind_params(params, bound).and_then(|()| {
+            let body = body.to_string();
+            self.run_code(&body)
+        });
         *self.vars = saved;
-        r
+        match r? {
+            Flow::Return => Ok(Flow::Next),
+            f => Ok(f),
+        }
+    }
+
+    /// Assign parameters in declaration order: a bound argument, else the
+    /// evaluated default, else `False` (switch) or `""`.
+    fn bind_params(
+        &mut self,
+        params: &[Param],
+        mut bound: HashMap<String, String>,
+    ) -> Result<(), String> {
+        for p in params {
+            let v = match bound.remove(&p.name) {
+                Some(v) => Value::Str(v),
+                None => match &p.default {
+                    Some(text) => {
+                        let toks = tokenize(text)?;
+                        match self.eval_value(&toks)? {
+                            (v, Flow::Next) => v,
+                            _ => return Err("loop control cannot appear here".to_string()),
+                        }
+                    }
+                    None if p.switch => Value::Str("False".to_string()),
+                    None => Value::Str(String::new()),
+                },
+            };
+            self.vars.insert(p.name.clone(), v);
+        }
+        Ok(())
+    }
+
+    /// A script's `param(...)` block: scripts here take no arguments, so
+    /// every parameter takes its default.
+    fn cmd_param_block(&mut self, stmt: &str) -> Result<Flow, String> {
+        let after = stmt.trim_start()["param".len()..].trim_start();
+        if !after.starts_with('(') {
+            return Err("param needs (...)".to_string());
+        }
+        let (inner, rest) = take_wrapped(after, '(', ')')?;
+        if !rest.trim().is_empty() {
+            return Err("unexpected text after param(...)".to_string());
+        }
+        let params = parse_param_list(&inner)?;
+        self.bind_params(&params, HashMap::new())?;
+        Ok(Flow::Next)
+    }
+
+    /// `return [value]`: output the value, then unwind to the caller.
+    fn cmd_return(&mut self, vals: &[Token]) -> Result<Flow, String> {
+        if !vals.is_empty() {
+            match self.eval_value(vals)? {
+                (v, Flow::Next) => self.emit_value(&v),
+                (_, f) => return Ok(f),
+            }
+        }
+        Ok(Flow::Return)
+    }
+
+    /// Output a value the way a bare expression does: array elements one
+    /// per line, maps as JSON, strings raw.
+    fn emit_value(&mut self, v: &Value) {
+        match v {
+            Value::Arr(items) => {
+                for item in items {
+                    match item {
+                        Value::Str(s) => self.emit(s),
+                        _ => self.emit(&render_json(item)),
+                    }
+                }
+            }
+            Value::Map(_) => self.emit(&render_json(v)),
+            Value::Str(s) => self.emit(s),
+        }
     }
 
     /// The switch value: single expanded token in `(...)` (parens required).
@@ -1821,6 +1921,12 @@ impl<'a> Interpreter<'a> {
     fn lookup_scalar(&self, name: &str) -> String {
         if name.eq_ignore_ascii_case("null") {
             return String::new();
+        }
+        if name.eq_ignore_ascii_case("true") {
+            return "True".to_string();
+        }
+        if name.eq_ignore_ascii_case("false") {
+            return "False".to_string();
         }
         // PowerShell's $HOME is the Windows profile directory.
         if name.eq_ignore_ascii_case("home") {
@@ -4427,6 +4533,120 @@ fn split_top_commas(s: &str) -> Vec<String> {
     parts
 }
 
+/// Parse a parameter list (`function F(...)` or `param(...)`): each entry
+/// is `[attribute]... $name [= default]`. Attributes are accepted; only
+/// `[switch]` changes binding.
+fn parse_param_list(inner: &str) -> Result<Vec<Param>, String> {
+    let mut params = Vec::new();
+    if inner.trim().is_empty() {
+        return Ok(params);
+    }
+    for entry in split_top_commas(inner) {
+        let mut rest = entry.trim().to_string();
+        let mut switch = false;
+        while rest.starts_with('[') {
+            let (attribute, after) = take_wrapped(&rest, '[', ']')?;
+            let attribute = attribute.trim();
+            if attribute.eq_ignore_ascii_case("switch")
+                || attribute.eq_ignore_ascii_case("System.Management.Automation.SwitchParameter")
+            {
+                switch = true;
+            }
+            rest = after.trim_start().to_string();
+        }
+        let Some(after) = rest.strip_prefix('$') else {
+            return Err(format!("invalid function parameter: {}", entry.trim()));
+        };
+        let name_end = after
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(after.len());
+        let name = &after[..name_end];
+        if !is_var_name(name) {
+            return Err(format!("invalid function parameter: {}", entry.trim()));
+        }
+        let tail = after[name_end..].trim();
+        let default = if tail.is_empty() {
+            None
+        } else if let Some(value) = tail.strip_prefix('=') {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(format!("missing default for parameter ${name}"));
+            }
+            Some(value.to_string())
+        } else {
+            return Err(format!("invalid function parameter: {}", entry.trim()));
+        };
+        params.push(Param {
+            name: name.to_lowercase(),
+            default,
+            switch,
+        });
+    }
+    Ok(params)
+}
+
+/// Bind call arguments to parameters: `-Name value`, `-Name:value`, and
+/// bare `-Switch` by exact or unique-prefix name; everything else fills
+/// the remaining non-switch parameters in order.
+fn bind_arguments(
+    function: &str,
+    params: &[Param],
+    args: &[String],
+) -> Result<HashMap<String, String>, String> {
+    let mut bound = HashMap::new();
+    let mut positional = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        let named = arg
+            .strip_prefix('-')
+            .filter(|n| n.starts_with(|c: char| c.is_ascii_alphabetic()));
+        let Some(spec) = named else {
+            positional.push(arg.clone());
+            i += 1;
+            continue;
+        };
+        let (pname, inline) = match spec.split_once(':') {
+            Some((n, v)) => (n.to_lowercase(), Some(v.to_string())),
+            None => (spec.to_lowercase(), None),
+        };
+        let param = params.iter().find(|p| p.name == pname).or_else(|| {
+            let mut hits = params.iter().filter(|p| p.name.starts_with(&pname));
+            match (hits.next(), hits.next()) {
+                (Some(p), None) => Some(p),
+                _ => None,
+            }
+        });
+        let Some(param) = param else {
+            return Err(format!("{function}: unknown parameter -{pname}"));
+        };
+        let value = match inline {
+            Some(v) => v,
+            None if param.switch => "True".to_string(),
+            None => {
+                i += 1;
+                args.get(i)
+                    .cloned()
+                    .ok_or_else(|| format!("{function}: missing value for -{}", param.name))?
+            }
+        };
+        bound.insert(param.name.clone(), value);
+        i += 1;
+    }
+    let free: Vec<&Param> = params
+        .iter()
+        .filter(|p| !p.switch && !bound.contains_key(&p.name))
+        .collect();
+    let mut free = free.into_iter();
+    for value in positional {
+        let Some(p) = free.next() else {
+            return Err(format!("too many arguments to {function}"));
+        };
+        bound.insert(p.name.clone(), value);
+    }
+    Ok(bound)
+}
+
 /// Detect `$name = if ...` / `$name += if ...` on raw chunk text.
 /// Returns (name, op, text starting at `if`).
 /// First unquoted `op` token (`-and` / `-or`); whole `(...)` groups
@@ -6228,6 +6448,50 @@ $x
             .1
             .unwrap_err()
             .contains("function name"));
+    }
+
+    #[test]
+    fn param_blocks_bind_named_switch_and_default_arguments() {
+        let script = "function F {\n  param([String]$Name = \"def\", [Switch]$Loud, [bool]$Flag = $False)\n  echo \"$Name-$Loud-$Flag\"\n}\nF\nF -Name x -Loud\nF -Fl $True y\nF -Loud:$false -N z";
+        let (out, r) = run_session(script);
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(out, b"def-False-False\nx-True-False\ny-False-True\nz-False-False\n");
+        // Defaults see earlier parameters; positional args skip switches.
+        let (out, r) = run_session("function G($a, $b = \"$a!\") { echo $b }\nG hi");
+        assert!(r.is_ok());
+        assert_eq!(out, b"hi!\n");
+        assert!(run_session("function F { param($a) }\nF -Nope 1")
+            .1
+            .unwrap_err()
+            .contains("unknown parameter -nope"));
+        assert!(run_session("function F { param($a) }\nF -a")
+            .1
+            .unwrap_err()
+            .contains("missing value for -a"));
+        assert!(run_session("function F { param($ab, $ac) }\nF -a 1")
+            .1
+            .unwrap_err()
+            .contains("unknown parameter -a"));
+        assert!(run_session("function F($x) { param($y) }")
+            .1
+            .unwrap_err()
+            .contains("twice"));
+        // A script-level block assigns defaults.
+        let (out, r) = run_session("param(\n  [String]$Version = \"latest\",\n  [Switch]$Quiet = $false\n)\necho \"$Version $Quiet\"");
+        assert!(r.is_ok());
+        assert_eq!(out, b"latest False\n");
+        assert!(run_session("param([int]oops)").1.unwrap_err().contains("invalid function parameter"));
+    }
+
+    #[test]
+    fn return_outputs_its_value_and_unwinds_the_function() {
+        let (out, r) = run_session("function F($x) {\n  if ($x -eq 1) { return 1 }\n  foreach ($i in @(5, 6)) { return \"loop-$i\" }\n  echo unreachable\n}\nF 1\nF 2\n$v = F 2\necho \"v=$v\"");
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(out, b"1\nloop-5\nv=loop-5\n");
+        // A top-level return ends the script.
+        let (out, r) = run_session("echo a\nreturn\necho b");
+        assert_eq!(r, Ok(0));
+        assert_eq!(out, b"a\n");
     }
 
     #[test]
