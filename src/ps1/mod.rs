@@ -161,7 +161,7 @@ pub fn run_ps1(fs: &mut WinFs, script: &str, out: &mut Vec<u8>) -> Result<i32, S
     run_ps1_session(&mut Session::default(), fs, script, out)
 }
 
-/// Run a script whose program calls (`& app.exe`, `curl.exe ...`) go to
+/// Run a script whose program calls (`& app.exe`, `git ...`) go to
 /// `host`.
 pub fn run_ps1_with_host(
     sess: &mut Session,

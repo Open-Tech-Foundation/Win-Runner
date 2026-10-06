@@ -1,7 +1,6 @@
 pub mod backend;
 pub mod cmd;
 pub mod control;
-pub mod curl_command;
 pub mod deflate;
 pub mod inspect;
 pub mod install;

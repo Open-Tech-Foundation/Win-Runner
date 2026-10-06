@@ -95,7 +95,7 @@ Write-Output "program.exit: $LASTEXITCODE"
 $captured = "$(cmd.exe /c echo hi 2>&1)"
 Write-Output "program.output: [$captured] $LASTEXITCODE"
 & "$env:SystemRoot\System32\cmd.exe" /c "exit 0"
-Write-Output "program.path: $LASTEXITCODE $(Test-Path "$env:SystemRoot\System32\curl.exe")"
+Write-Output "program.path: $LASTEXITCODE"
 # Redirected native standard error is data, not a script error.
 $ErrorActionPreference = 'Continue'
 $merged = "$(cmd.exe /c "1>&2 echo oops" 2>&1)"

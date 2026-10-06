@@ -282,11 +282,14 @@ fn named_archive(name: &str, data: &[u8]) -> Vec<u8> {
 }
 
 #[test]
+#[ignore = "requires WINRUN_CURL_EXE (official Windows curl); run explicitly with --ignored"]
 fn bun_official_installer_installs_registers_and_updates_the_user_path() {
-    if Command::new("curl").arg("--version").output().is_err() {
-        eprintln!("skipping: host curl is not installed");
-        return;
-    }
+    // The installer downloads with `curl.exe`, which Windows ships in
+    // System32; the official Windows build runs natively here.
+    let curl = std::fs::canonicalize(
+        std::env::var_os("WINRUN_CURL_EXE").expect("configure WINRUN_CURL_EXE"),
+    )
+    .unwrap();
     // A stand-in bun.exe: it prints its command line and exits 0.
     let stub = std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -312,11 +315,13 @@ fn bun_official_installer_installs_registers_and_updates_the_user_path() {
         (200, script.into_bytes(), String::new()),
     )]));
     let (out, err) = shell(&format!(
-        "powershell -c \"irm {}/install.ps1|iex\"\n\
+        "@seed \"{}\" C:\\Windows\\System32\\curl.exe\n\
+         powershell -c \"irm {}/install.ps1|iex\"\n\
          reg query HKCU\\Environment /v Path\n\
          reg query HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Bun /v InstallLocation\n\
          bun --version\n\
          exit\n",
+        curl.display(),
         source.url
     ));
     assert!(out.contains("was installed successfully!"), "{out}\n{err}");

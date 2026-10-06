@@ -138,11 +138,8 @@ Scripts can declare `param(...)` blocks and functions, `return`, use
 and capture program output with `$(...)`. `Add-Type` accepts
 `[DllImport]` declarations for the Win32 calls installers make
 (`IsProcessorFeaturePresent`, `SendMessageTimeout`). Official one-liners
-such as `powershell -c "irm bun.sh/install.ps1|iex"` run unchanged.
-`C:\Windows\System32\curl.exe` downloads over HTTP(S) through the host's
-curl, with the options of plain downloads (`-fsSL`, `-#`, `-o`, `-O`, `-H`,
-`-A`, timeouts and retries); options that would reach host files are
-refused.
+such as `powershell -c "irm bun.sh/install.ps1|iex"` run unchanged once
+the programs they call are installed (Bun's needs `wpkg install curl`).
 Pipelines carry text rather than full PowerShell objects. Advanced
 providers, administration cmdlets, and unimplemented parameters remain
 unsupported; this shell is not a complete PowerShell distribution.

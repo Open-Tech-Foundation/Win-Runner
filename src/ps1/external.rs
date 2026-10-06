@@ -1,5 +1,5 @@
 //! Running programs from scripts: `& "C:\app.exe" args`, bare names found
-//! on the guest `PATH` (`curl.exe ...`), `$LASTEXITCODE`, and the `2>&1`
+//! on the guest `PATH` (`git --version`), `$LASTEXITCODE`, and the `2>&1`
 //! family of stream redirections. The interpreter resolves the program
 //! against the guest disk; a [`ProcessHost`] supplied by the caller runs it.
 use super::*;

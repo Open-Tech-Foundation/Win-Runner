@@ -11,20 +11,16 @@ All notable changes to this project will be documented in this file.
   to the error inside `catch`, and `$v = 'a|b'` kept as one string instead of
   a pipeline. Bun's
   official installer (`powershell -c "irm bun.sh/install.ps1|iex"`) now
-  installs Bun, creates `bunx.exe`, adds it to the user `PATH`, and registers
-  the uninstaller, as on Windows.
+  installs Bun through the native `wpkg` curl, creates `bunx.exe`, adds it to
+  the user `PATH`, and registers the uninstaller, as on Windows.
 
-- PowerShell scripts run programs: `& "C:\app.exe" args`, bare names
+- PowerShell scripts run programs natively: `& "C:\app.exe" args`, bare names
   resolved on the guest `PATH` with `PATHEXT`, `.ps1` files inline, output
   captured by `$(...)` and assignments, `$LASTEXITCODE` (exit codes as signed
   32-bit numbers), and standard error merged into output by `2>&1` or
   dropped by `2>$null`. `Write-Warning` and
   `Write-Error` write to standard error (`Write-Error` stops under
   `$ErrorActionPreference = 'Stop'`).
-- The disk has `C:\Windows\System32\curl.exe`, as Windows ships, running
-  plain HTTP(S) downloads through the host's curl into the guest disk
-  (`-fsSL`, `-#`, `-o`, `-O`, `--create-dirs`, headers, user agent, timeouts,
-  retries); `file://` URLs and options that reach host files are refused.
 
 - PowerShell `Add-Type -MemberDefinition` declares `[DllImport]` functions
   answered by built-in implementations (`IsProcessorFeaturePresent` from the

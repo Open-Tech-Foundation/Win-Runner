@@ -339,13 +339,6 @@ impl ps1::ProcessHost for ShellProcessHost {
         args: &[String],
         errors: ps1::ErrorStream,
     ) -> Result<ps1::ProcessOutput, String> {
-        if crate::curl_command::is_curl_shell_link(fs, image) {
-            let run = crate::curl_command::run(fs, args);
-            return Ok(ps1::ProcessOutput {
-                code: run.code,
-                stdout: run.stdout,
-            });
-        }
         let image_path = fs.resolve_links(image).unwrap_or_else(|| image.to_string());
         let data = fs
             .read_file(&image_path)
@@ -434,7 +427,6 @@ impl Shell {
     /// subsequent `snapshot save` commands without a path.
     pub fn with_snapshot_path(mut fs: WinFs, snapshot_path: Option<std::path::PathBuf>) -> Self {
         seed_powershell_shell_link(&mut fs);
-        crate::curl_command::seed_curl_exe(&mut fs);
         crate::cmd::seed_cmd_exe(&mut fs);
         // npm's standard Windows cache and global-prefix folders; npm
         // expects the cache's temp and log directories to exist.
@@ -982,9 +974,7 @@ impl Shell {
             self.do_powershell(&argv[1..], out)?;
             return Ok(ShellFlow::Continue);
         }
-        if self.fs.is_file(target) && crate::curl_command::is_curl_shell_link(&self.fs, target) {
-            return Ok(self.run_curl(&argv[1..], out));
-        }
+
         if std::path::Path::new(target).is_file() {
             let ext = std::path::Path::new(target)
                 .extension()
@@ -1053,9 +1043,7 @@ impl Shell {
                             self.do_powershell(&argv[1..], out)?;
                             return Ok(ShellFlow::Continue);
                         }
-                        if crate::curl_command::is_curl_shell_link(&self.fs, &candidate) {
-                            return Ok(self.run_curl(&argv[1..], out));
-                        }
+
                         if is_batch_file(&candidate) {
                             return self.run_batch(&candidate, &argv[1..], out, sink);
                         }
@@ -1271,14 +1259,6 @@ impl Shell {
         out.extend_from_slice(&output);
         self.last_code = 0;
         Ok(())
-    }
-
-    /// `curl.exe` from the prompt.
-    fn run_curl(&mut self, args: &[String], out: &mut Vec<u8>) -> ShellFlow {
-        let run = crate::curl_command::run(&mut self.fs, args);
-        out.extend_from_slice(&run.stdout);
-        self.last_code = run.code;
-        ShellFlow::Continue
     }
 
     /// Run PowerShell text in this session; programs it calls run on the

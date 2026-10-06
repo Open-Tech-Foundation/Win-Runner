@@ -107,7 +107,7 @@ fn powershell_scripting_oracle_script_matches_windows_results() {
          cast: 255 42\n\
          program.exit: 7\n\
          program.output: [hi] 0\n\
-         program.path: 0 True\n\
+         program.path: 0\n\
          program.merged: [oops]\n\
          catch: boom\n\
          split: 4 a|b||c\n\
