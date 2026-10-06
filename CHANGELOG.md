@@ -44,6 +44,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Match Windows in the `native_startup` oracle: reject `recv` with
+  `MSG_WAITALL | MSG_PUSH_IMMEDIATE` (`WSAEOPNOTSUPP`) without consuming data,
+  report a byte pipe's `PeekNamedPipe` message remainder as zero minus the
+  peeked bytes, test console input flushing through `CONIN$` rather than a
+  possibly redirected standard input, and accept a
+  `CertGetEnhancedKeyUsage` read that uses fewer bytes than the size query.
+
 - Add session-wide clipboard formats and HGLOBAL payload sharing across native
   workers, with clipboard locks, ownership transfer and explicit unsupported
   delayed rendering. Add global-memory allocation, sizing, lock counts and

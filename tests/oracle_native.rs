@@ -126,7 +126,7 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
                 "socket.ordinal_text: ok", "socket.ordinal_select: ok", "socket.ipv4_text: ok",
                 "socket.modern_ioctl: ok", "socket.modern_addr: ok", "socket.modern_text: ok",
                 "socket.ordinal_addr: ok", "socket.ordinal_ioctl: ok", "socket.ordinal_fdset: ok",
-                "socket.accept: ok", "socket.recv_push_peek: ok", "socket.recv_push_waitall: ok",
+                "socket.accept: ok", "socket.recv_push_peek: ok", "socket.recv_push_waitall: failed err=10045", "socket.recv_waitall: ok",
                 "socket.exclusive: ok", "socket.exclusive_reuse: ok", "socket.exclusive_bind: ok", "socket.exclusive_competitor: ok",
                 "alert.timeout: ok", "alert.pending: ok", "alert.other_thread: ok",
                 "console.flush_input: ok", "console.flush_output: ok",

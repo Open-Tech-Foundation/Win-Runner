@@ -891,9 +891,11 @@ fn peek_byte_pipe_fd(
         if !available.is_null() {
             available.write_unaligned(count.max(0) as u32)
         }
+        // Windows reports MessageLength - bytes peeked, and a byte pipe's
+        // MessageLength is 0, so a non-empty peek wraps below zero.
         if !left.is_null() {
-            left.write_unaligned(0)
-        } // Byte pipes have no message remainder.
+            left.write_unaligned(0u32.wrapping_sub(copied))
+        }
     }
     1
 }
@@ -941,7 +943,7 @@ mod peek_tests {
             1
         );
         assert_eq!(&buffer, b"hel");
-        assert_eq!((copied, available, left), (3, 5, 0));
+        assert_eq!((copied, available, left), (3, 5, u32::MAX - 2));
         assert_eq!(
             native_peek_named_pipe(
                 writer,
@@ -1003,7 +1005,7 @@ mod peek_tests {
             1
         );
         assert_eq!(&bytes, b"hel");
-        assert_eq!((copied, available, left), (3, 5, 0));
+        assert_eq!((copied, available, left), (3, 5, u32::MAX - 2));
         let mut original = [0; 5];
         assert_eq!(
             unsafe { libc::read(fds[0], original.as_mut_ptr().cast(), 5) },

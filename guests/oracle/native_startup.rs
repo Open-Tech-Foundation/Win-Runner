@@ -385,11 +385,23 @@ fn socket_options() {
                 && &buffer == b"ping",
         );
         buffer.fill(0);
+        // Windows rejects MSG_WAITALL combined with MSG_PUSH_IMMEDIATE and
+        // leaves the queued bytes for the next receive.
+        case("socket.recv_push_waitall");
+        clear_error();
+        let received = if accepted != usize::MAX { recv(accepted, buffer.as_mut_ptr(), 4, 0x28) } else { -2 };
+        if received == 4 && &buffer == b"ping" {
+            out_str("ok\n");
+        } else {
+            out_str("failed");
+            out_error();
+            out_byte(b'\n');
+        }
+        buffer.fill(0);
         boolean(
-            "socket.recv_push_waitall",
+            "socket.recv_waitall",
             accepted != usize::MAX
-                && recv(accepted, buffer.as_mut_ptr(), 4, 0x28) == 4
-                && &buffer == b"ping",
+                && (received == 4 || recv(accepted, buffer.as_mut_ptr(), 4, 0x8) == 4 && &buffer == b"ping"),
         );
         close(accepted);
         close(client);
@@ -793,10 +805,17 @@ fn certificates() {
                 && small == size
                 && buffer[0] == 0x5555555555555555,
         );
+        // The size query may overestimate; a read reports the bytes it used.
         let mut capacity = 4096;
+        let base = buffer.as_ptr() as usize;
         boolean(
             "cert.usage_read",
-            usage(first, 0, buffer.as_mut_ptr().cast(), &mut capacity) != 0 && capacity == size,
+            usage(first, 0, buffer.as_mut_ptr().cast(), &mut capacity) != 0
+                && capacity >= 16
+                && capacity <= size
+                && (buffer[0] as u32 == 0
+                    || buffer[1] as usize >= base + 16
+                        && buffer[1] as usize + (buffer[0] as u32 as usize) * 8 <= base + capacity as usize),
         );
         boolean("cert.duplicate", duplicate(first) == first);
         let mut current = first;
@@ -867,7 +886,10 @@ fn alerts_and_console_flush() {
         record[4] = 1;
         record[8] = 1;
         record[14] = 65;
-        let input = GetStdHandle(0xfffffff6);
+        // Standard input may be redirected; the console input buffer is CONIN$.
+        let create = api!("console.conin_api", "CreateFileW", CreateFileWFn);
+        let mut name = [0u16; 8];
+        let input = create(wide("CONIN$", &mut name).as_ptr(), 0xc0000000, 3, 0, 3, 0, 0);
         let mut written = 0;
         let mut remaining = u32::MAX;
         boolean(
@@ -878,6 +900,9 @@ fn alerts_and_console_flush() {
                 && count(input, &mut remaining) != 0
                 && remaining == 0,
         );
+        if input != usize::MAX {
+            NtClose(input);
+        }
         boolean(
             "console.flush_output",
             flush_input(GetStdHandle(0xfffffff5)) == 0 && last_error() == 6,
@@ -930,7 +955,7 @@ fn sync_pipes() {
         let mut peek_count = 99;
         let mut available = 99;
         let mut left = 99;
-        boolean("pipe.peek", peek(reader,peeked.as_mut_ptr(),1,&mut peek_count,&mut available,&mut left)!=0 && peeked[0]==b's' && peek_count==1 && available==4 && left==0);
+        boolean("pipe.peek", peek(reader,peeked.as_mut_ptr(),1,&mut peek_count,&mut available,&mut left)!=0 && peeked[0]==b's' && peek_count==1 && available==4 && left==u32::MAX);
         boolean("pipe.peek_query", peek(reader,core::ptr::null_mut(),0,&mut peek_count,&mut available,&mut left)!=0 && peek_count==0 && available==4 && left==0);
         let mut buffer = [0u8; 4];
         boolean(

@@ -1594,7 +1594,9 @@ pub(super) extern "win64" fn native_recvfrom_socket(
             set_wsa_error_from_errno();
             return -1;
         }
-        if flags & 0x3 != 0 || options & libc::O_NONBLOCK != 0 || kind != libc::SOCK_STREAM {
+        // MSG_PUSH_IMMEDIATE asks for early completion, which contradicts
+        // MSG_WAITALL; Windows rejects the pair like MSG_OOB and MSG_PEEK.
+        if flags & 0x23 != 0 || options & libc::O_NONBLOCK != 0 || kind != libc::SOCK_STREAM {
             native_wsa_set_last_error(10045);
             return -1;
         }
@@ -1745,7 +1747,10 @@ mod named_socket_tests {
         assert_eq!(native_recv_socket(server, buffer.as_mut_ptr(), 4, 0x22), 4);
         assert_eq!(&buffer, b"ping");
         buffer.fill(0);
-        assert_eq!(native_recv_socket(server, buffer.as_mut_ptr(), 4, 0x28), 4);
+        assert_eq!(native_recv_socket(server, buffer.as_mut_ptr(), 4, 0x28), -1);
+        assert_eq!(native_wsa_get_last_error(), 10045);
+        assert_eq!(&buffer, &[0; 4], "rejected waits leave data queued");
+        assert_eq!(native_recv_socket(server, buffer.as_mut_ptr(), 4, 0x8), 4);
         assert_eq!(&buffer, b"ping");
         assert_eq!(native_recv_socket(server, buffer.as_mut_ptr(), 4, 0x10), -1);
         assert_eq!(native_wsa_get_last_error(), 10022);
