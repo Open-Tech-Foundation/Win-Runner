@@ -45,6 +45,7 @@
 //! that the EXE shims use.
 
 mod essentials;
+mod dotnet;
 mod registry;
 
 use crate::winfs::WinFs;
@@ -60,6 +61,8 @@ const MAX_IEX_DEPTH: usize = 32;
 pub struct Session {
     pub vars: HashMap<String, Value>,
     pub funcs: HashMap<String, FuncDef>,
+    /// Types declared by `Add-Type`, by lowercased full name.
+    pub types: HashMap<String, dotnet::AddedType>,
     /// `Push-Location`/`Pop-Location` stack (guest-absolute directories).
     pub dir_stack: Vec<String>,
     /// The guest process environment behind `$env:`, `$HOME`, and
@@ -78,6 +81,7 @@ impl Session {
         Session {
             vars: HashMap::new(),
             funcs: HashMap::new(),
+            types: HashMap::new(),
             dir_stack: Vec::new(),
             environment,
         }
@@ -167,6 +171,7 @@ pub fn run_ps1_session(
         depth: 0,
         vars: &mut sess.vars,
         funcs: &mut sess.funcs,
+        types: &mut sess.types,
         dir_stack: &mut sess.dir_stack,
         environment: &mut sess.environment,
     };
@@ -179,6 +184,7 @@ struct Interpreter<'a> {
     depth: usize,
     vars: &'a mut HashMap<String, Value>,
     funcs: &'a mut HashMap<String, FuncDef>,
+    types: &'a mut HashMap<String, dotnet::AddedType>,
     dir_stack: &'a mut Vec<String>,
     environment: &'a mut Vec<(String, String)>,
 }
@@ -194,7 +200,8 @@ impl<'a> Interpreter<'a> {
     fn run_code(&mut self, script: &str) -> Result<Flow, String> {
         // Split into statements on newlines and top-level ';'. A line
         // ending in `=`, `|`, `,`, or backtick continues on the next line.
-        let script = strip_block_comments(script)?;
+        let script = fold_here_strings(&protect_escaped_quotes(script))?;
+        let script = strip_block_comments(&script)?;
         let mut code = String::new();
         for line in script.lines() {
             let stripped = strip_comment(line);
@@ -469,12 +476,12 @@ impl<'a> Interpreter<'a> {
         }
         // `-not X` / `!X` negate one operand, which may be a whole `(...)`
         // condition (`-not ($a -eq 1 -or $b)`).
-        if !toks[0].quoted {
+        if toks[0].chars.first().is_some_and(|&(_, ex)| ex) {
             let head = toks[0].text();
             if toks.len() == 2 && (head.eq_ignore_ascii_case("-not") || head == "!") {
                 return Ok(!self.eval_cond_tokens(&toks[1..])?);
             }
-            if toks.len() == 1 && head.len() > 1 && head.starts_with('!') {
+            if toks.len() == 1 && head.len() > 1 && toks[0].chars[0] == ('!', true) {
                 let inner = Token {
                     chars: toks[0].chars[1..].to_vec(),
                     quoted: false,
@@ -513,6 +520,9 @@ impl<'a> Interpreter<'a> {
                         let v = self.expand_token(&toks[0])?;
                         return Ok(is_truthy(&v));
                     }
+                    // `(expr).Member` / `(expr)::Method()`: the value's truth.
+                    let v = self.expand_token(&toks[0])?;
+                    return Ok(is_truthy(&v));
                 }
                 return Err("parenthesized conditions are not supported".to_string());
             }
@@ -560,8 +570,10 @@ impl<'a> Interpreter<'a> {
                     .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == ':');
             let static_member =
                 split_static_member(&t).is_some_and(|(_, _, rest)| rest.is_empty());
+            let type_name = dotnet::type_literal(&t).is_some();
             if !property_path
                 && !static_member
+                && !type_name
                 && t.contains(['.', '(', ')', '{', '}', '[', ']', '@'])
             {
                 return Err(format!("not supported in conditions: {t}"));
@@ -590,6 +602,13 @@ impl<'a> Interpreter<'a> {
             }
             if op == "-notmatch" {
                 return Ok(!regex_match(&args[2], &args[0])?);
+            }
+            if op == "-as" {
+                let typ = dotnet::type_literal(&toks[2].text())
+                    .ok_or("-as needs a [Type]")?
+                    .to_string();
+                let v = self.as_value(&typ, Value::Str(args[0].clone()));
+                return Ok(is_truthy(&value_string(&v)));
             }
             if op == "-like" || op == "-notlike" {
                 let hit = essentials::wildcard(&args[2], &args[0]);
@@ -875,8 +894,22 @@ impl<'a> Interpreter<'a> {
         }
         // A comparison/logic expression statement outputs True/False,
         // unless it is a command whose arguments look like operators.
-        let negation = toks.len() == 1 && !toks[0].quoted && toks[0].text().len() > 1
-            && toks[0].text().starts_with('!');
+        // `[T] x` / `[T]x` / `x -as [T]` statements output the value.
+        if (toks.len() == 3 && toks[1].text().eq_ignore_ascii_case("-as"))
+            || toks[0].chars.first() == Some(&('[', true))
+        {
+            if let Some(v) = self.eval_conversion(&toks)? {
+                // A failed `-as` is `$null`, which outputs nothing.
+                let null = toks.len() == 3 && v == Value::Str(String::new());
+                if !null {
+                    self.emit_value(&v);
+                }
+                return Ok(Flow::Next);
+            }
+        }
+        let negation = toks.len() == 1
+            && toks[0].chars.len() > 1
+            && toks[0].chars[0] == ('!', true);
         if negation || is_boolean_expression(&toks) {
             let head = toks[0].text().to_lowercase();
             if toks[0].quoted
@@ -983,6 +1016,7 @@ impl<'a> Interpreter<'a> {
             "test-path" => self.cmd_test_path(rest),
             "get-item" => self.cmd_get_item(rest),
             "get-itemproperty" | "gp" => self.cmd_get_item_property(rest),
+            "add-type" => self.cmd_add_type(rest),
             "new-itemproperty" => self.cmd_set_item_property(rest, true),
             "set-itemproperty" | "sp" => self.cmd_set_item_property(rest, false),
             "remove-itemproperty" | "rp" => self.cmd_remove_item_property(rest),
@@ -1399,8 +1433,14 @@ impl<'a> Interpreter<'a> {
         {
             return Ok((Value::Str(self.eval_replace(vals)?), Flow::Next));
         }
-        // Comparison and logic expressions evaluate to True/False.
-        if is_boolean_expression(vals) {
+        if let Some(v) = self.eval_conversion(vals)? {
+            return Ok((v, Flow::Next));
+        }
+        // Comparison and logic expressions (`!x` too) evaluate to True/False.
+        let negation = vals.len() == 1
+            && vals[0].chars.len() > 1
+            && vals[0].chars[0] == ('!', true);
+        if negation || is_boolean_expression(vals) {
             return Ok((Value::Str(bool_string(self.eval_cond_tokens(vals)?)), Flow::Next));
         }
         if vals.len() != 1 {
@@ -1829,6 +1869,12 @@ impl<'a> Interpreter<'a> {
     /// subexpression (`Copy-Item (Join-Path $a $b) ...`); partial or
     /// mid-token parens stay literal.
     fn expand_token(&mut self, tok: &Token) -> Result<String, String> {
+        // `[char]27`: a cast attached to its operand.
+        if tok.chars.first() == Some(&('[', true)) {
+            if let Some(v) = self.eval_conversion(std::slice::from_ref(tok))? {
+                return Ok(value_string(&v));
+            }
+        }
         {
             let text = tok.text();
             let t = text.trim();
@@ -2011,6 +2057,7 @@ impl<'a> Interpreter<'a> {
             depth: self.depth,
             vars: &mut *self.vars,
             funcs: &mut *self.funcs,
+            types: &mut *self.types,
             dir_stack: &mut *self.dir_stack,
             environment: &mut *self.environment,
         }
@@ -2123,12 +2170,17 @@ impl<'a> Interpreter<'a> {
         }
     }
 
-    /// Comma-separated single-value method arguments, expanded.
+    /// Comma-separated method arguments, expanded: single values or
+    /// conversions (`[ref] $x`, `[IntPtr] 0xffff`).
     fn expand_arg_list(&mut self, inner: &str) -> Result<Vec<String>, String> {
         let mut argvals = Vec::new();
         if !inner.trim().is_empty() {
             for a in split_top_commas(inner) {
                 let atoks = tokenize(a.trim())?;
+                if let Some(v) = self.eval_conversion(&atoks)? {
+                    argvals.push(value_string(&v));
+                    continue;
+                }
                 if atoks.len() != 1 {
                     return Err("method arguments must be single values".to_string());
                 }
@@ -2291,15 +2343,9 @@ impl<'a> Interpreter<'a> {
         method: &str,
         inner: &str,
     ) -> Result<Option<String>, String> {
-        let mut argvals = Vec::new();
-        if !inner.trim().is_empty() {
-            for a in split_top_commas(inner) {
-                let atoks = tokenize(a.trim())?;
-                if atoks.len() != 1 {
-                    return Err("static arguments must be single values".to_string());
-                }
-                argvals.push(self.expand_token(&atoks[0])?);
-            }
+        let argvals = self.expand_arg_list(inner)?;
+        if let Some(r) = self.call_added_type(typ, method, &argvals) {
+            return r.map(Some);
         }
         let t = typ.to_lowercase();
         let m = method.to_lowercase();
@@ -3471,6 +3517,18 @@ impl<'a> Interpreter<'a> {
     fn apply_member_rest(&mut self, mut cur: Value, rest: &str) -> Result<Value, String> {
         let mut r = rest.trim().to_string();
         while !r.is_empty() {
+            // `(type expression)::Method(args)`: a static call on the type
+            // the value names (`(Add-Type ... -PassThru)::F(1)`).
+            if let Some(after) = r.strip_prefix("::") {
+                let typ = value_string(&cur);
+                let src = format!("[{}]::{after}", typ.trim().trim_matches(['[', ']']));
+                let Some((typ, method, inner, rest2)) = split_static_call(&src)? else {
+                    return Err(format!("cannot evaluate expression tail: {rest}"));
+                };
+                cur = Value::Str(self.eval_static(&typ, &method, &inner)?.unwrap_or_default());
+                r = rest2.trim().to_string();
+                continue;
+            }
             if let Some(after) = r.strip_prefix('.') {
                 let mut len = 0usize;
                 for c in after.chars() {
@@ -3516,6 +3574,162 @@ impl<'a> Interpreter<'a> {
             }
         }
         Ok(cur)
+    }
+}
+
+/// Stand-ins for backtick-escaped quotes, so every quote-aware scanner
+/// sees ordinary characters; the tokenizer turns them back into quotes.
+const ESCAPED_DQ: char = '\u{E000}';
+const ESCAPED_SQ: char = '\u{E001}';
+
+/// Replace `` `" `` and `` `' `` (outside single-quoted strings, where a
+/// backtick is literal) with their stand-ins. Other escapes stay for the
+/// tokenizer. Idempotent, as bodies run through here again.
+fn protect_escaped_quotes(script: &str) -> String {
+    let mut out = String::with_capacity(script.len());
+    let mut chars = script.chars().peekable();
+    let mut sq = false;
+    while let Some(c) = chars.next() {
+        match c {
+            // Comments are copied untouched (an apostrophe in prose must
+            // not open a string).
+            '#' if !sq => {
+                out.push(c);
+                while let Some(&d) = chars.peek() {
+                    if d == '\n' {
+                        break;
+                    }
+                    out.push(d);
+                    chars.next();
+                }
+            }
+            '<' if !sq && chars.peek() == Some(&'#') => {
+                out.push(c);
+                let mut prev = '\0';
+                for d in chars.by_ref() {
+                    out.push(d);
+                    if prev == '#' && d == '>' {
+                        break;
+                    }
+                    prev = d;
+                }
+            }
+            '\'' => {
+                sq = !sq;
+                out.push(c);
+            }
+            '`' if !sq => match chars.peek() {
+                Some('"') => {
+                    chars.next();
+                    out.push(ESCAPED_DQ);
+                }
+                Some('\'') => {
+                    chars.next();
+                    out.push(ESCAPED_SQ);
+                }
+                Some(&next) => {
+                    // Keep `` `` `` (and any escape) as one unit.
+                    chars.next();
+                    out.push('`');
+                    out.push(next);
+                }
+                None => out.push('`'),
+            },
+            '"' if !sq => {
+                // Track double-quoted spans only to keep `'` inside them
+                // from toggling the single-quote state.
+                out.push(c);
+                while let Some(d) = chars.next() {
+                    match d {
+                        '`' => {
+                            match chars.next() {
+                                Some('"') => out.push(ESCAPED_DQ),
+                                Some('\'') => out.push(ESCAPED_SQ),
+                                Some(e) => {
+                                    out.push('`');
+                                    out.push(e);
+                                }
+                                None => out.push('`'),
+                            }
+                        }
+                        '"' if chars.peek() == Some(&'"') => {
+                            // `""` inside a double-quoted string is a quote.
+                            chars.next();
+                            out.push(ESCAPED_DQ);
+                        }
+                        '"' => {
+                            out.push(d);
+                            break;
+                        }
+                        _ => out.push(d),
+                    }
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Fold here-strings (`@"` / `@'` ending a line, closed by `"@` / `'@`
+/// starting a line) into one-line double-quoted strings: newlines become
+/// `` `n ``, and a verbatim `@'...'@` escapes its `$`, backticks and quotes.
+fn fold_here_strings(script: &str) -> Result<String, String> {
+    let mut out = String::with_capacity(script.len());
+    let mut rest = script;
+    loop {
+        let open = ["@\"", "@'"]
+            .iter()
+            .filter_map(|m| {
+                rest.match_indices(m)
+                    .find(|(i, _)| {
+                        let after = &rest[i + 2..];
+                        after.trim_start_matches([' ', '\t']).starts_with(['\n', '\r'])
+                    })
+                    .map(|(i, _)| (i, *m))
+            })
+            .min_by_key(|(i, _)| *i);
+        let Some((start, marker)) = open else {
+            out.push_str(rest);
+            return Ok(out);
+        };
+        let verbatim = marker == "@'";
+        let close = if verbatim { "'@" } else { "\"@" };
+        let body_start = start + 2 + rest[start + 2..].find('\n').unwrap() + 1;
+        let mut end = None;
+        let mut line_start = body_start;
+        while line_start <= rest.len() {
+            if rest[line_start..].starts_with(close) {
+                end = Some(line_start);
+                break;
+            }
+            match rest[line_start..].find('\n') {
+                Some(n) => line_start += n + 1,
+                None => break,
+            }
+        }
+        let end = end.ok_or_else(|| format!("missing here-string terminator {close}"))?;
+        let body = rest[body_start..end]
+            .strip_suffix('\n')
+            .unwrap_or(&rest[body_start..end]);
+        let body = body.strip_suffix('\r').unwrap_or(body);
+        out.push_str(&rest[..start]);
+        out.push('"');
+        for c in body.chars() {
+            match c {
+                '\n' => out.push_str("`n"),
+                '\r' => {}
+                '"' => out.push(ESCAPED_DQ),
+                '\'' if verbatim => out.push(ESCAPED_SQ),
+                '$' | '`' if verbatim => {
+                    out.push('`');
+                    out.push(c);
+                }
+                _ => out.push(c),
+            }
+        }
+        out.push('"');
+        rest = &rest[end + 2..];
     }
 }
 
@@ -5154,6 +5368,13 @@ fn is_condition_shape(inner: &str) -> Result<bool, String> {
             "-notin",
             "-contains",
             "-notcontains",
+            "-as",
+            "-lt",
+            "-le",
+            "-gt",
+            "-ge",
+            "-like",
+            "-notlike",
         ]
         .contains(&toks[1].text().to_lowercase().as_str())
     {
@@ -5441,6 +5662,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "wget",
     "expand-archive",
     "get-filehash",
+    "add-type",
     "mkdir",
     "md",
     "get-itemproperty",
@@ -5782,6 +6004,41 @@ fn tokenize(s: &str) -> Result<Vec<Token>, String> {
             cur.extend(chars[start..idx].iter().map(|&d| (d, true)));
             continue;
         }
+        // Escaped quotes and backtick escapes are literal text; inside
+        // `(...)` code they stay encoded for that code's own tokenizing.
+        if (c == ESCAPED_DQ || c == ESCAPED_SQ) && !sq {
+            in_tok = true;
+            if pdepth > 0 {
+                cur.push((c, true));
+            } else {
+                cur.push((if c == ESCAPED_DQ { '"' } else { '\'' }, false));
+            }
+            continue;
+        }
+        if c == '`' && !sq && idx < chars.len() {
+            let next = chars[idx];
+            idx += 1;
+            in_tok = true;
+            if pdepth > 0 {
+                cur.push(('`', true));
+                cur.push((next, true));
+            } else {
+                let decoded = match next {
+                    'n' => '\n',
+                    't' => '\t',
+                    'r' => '\r',
+                    '0' => '\0',
+                    'a' => '\u{7}',
+                    'b' => '\u{8}',
+                    'e' => '\u{1b}',
+                    'f' => '\u{c}',
+                    'v' => '\u{b}',
+                    other => other,
+                };
+                cur.push((decoded, false));
+            }
+            continue;
+        }
         match c {
             '\'' if !dq => {
                 sq = !sq;
@@ -6076,6 +6333,7 @@ $x
             let mut out = Vec::new();
             let mut vars = HashMap::new();
             let mut funcs = HashMap::new();
+            let mut types = HashMap::new();
             let mut stack = Vec::new();
             let mut environment = Vec::new();
             let mut interp = Interpreter {
@@ -6084,6 +6342,7 @@ $x
                 depth,
                 vars: &mut vars,
                 funcs: &mut funcs,
+                types: &mut types,
                 dir_stack: &mut stack,
                 environment: &mut environment,
             };
@@ -7124,6 +7383,45 @@ $x
         assert!(r.is_ok());
         assert_eq!(out, b"latest False\n");
         assert!(run_session("param([int]oops)").1.unwrap_err().contains("invalid function parameter"));
+    }
+
+    #[test]
+    fn escapes_here_strings_and_comparisons() {
+        assert_eq!(
+            protect_escaped_quotes("echo \"a `\"b`\" it's\" 'x`\"y' # don't `\"\nz `'"),
+            format!("echo \"a {ESCAPED_DQ}b{ESCAPED_DQ} it's\" 'x`\"y' # don't `\"\nz {ESCAPED_SQ}")
+        );
+        assert_eq!(
+            fold_here_strings("$a = @\"\none \"two\"\n$x\n\"@\n$b = @'\n$y `n\n'@\n").unwrap(),
+            format!("$a = \"one {ESCAPED_DQ}two{ESCAPED_DQ}`n$x\"\n$b = \"`$y ``n\"\n")
+        );
+        assert!(fold_here_strings("$a = @\"\nnever closed\n").unwrap_err().contains("terminator"));
+        let (out, r) = run_session("$t = \"tab`there`n`$no\"\necho $t\necho \"x`\"y\"\necho \"[\"\"]\"");
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(out, b"tab\there\n$no\nx\"y\n[\"]\n");
+        use std::cmp::Ordering::*;
+        assert_eq!(compare_values("9", "10"), Less);
+        assert_eq!(compare_values("b", "A"), Greater);
+        assert_eq!(compare_values("0x10", "16"), Equal);
+        assert!(equal_values("-1073741515", "-1073741515"));
+        assert!(!equal_values("1.0", "1"));
+        assert!(equal_values("ABC", "abc"));
+        let args: Vec<String> = ["x", "-EA", "Ignore", "-ErrorAction:Stop"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(split_silent_error_action(&args), (vec!["x".to_string(), "-ErrorAction:Stop".to_string()], true));
+    }
+
+    #[test]
+    fn conversions_and_added_types() {
+        let (out, r) = run_session("[int]'42'\n[char]65\n'7' -as [int]\n'x' -as [int]\n[bool]'0'\n$t = Add-Type -MemberDefinition '[DllImport(\"user32.dll\")] public static extern IntPtr SendMessageTimeout(IntPtr h);' -Name N -Namespace W -PassThru\necho $t\n[W.N]::SendMessageTimeout([IntPtr] 0xffff)");
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(out, b"42\nA\n7\nFalse\nW.N\n1\n");
+        assert!(run_session("[int]'x'").1.unwrap_err().contains("Cannot convert"));
+        assert!(run_session("[byte]300").1.unwrap_err().contains("Cannot convert"));
+        assert!(run_session("[Some.Thing]5").1.unwrap_err().contains("not supported"));
+        assert!(run_session("Add-Type -TypeDefinition 'public class A {}'").1.unwrap_err().contains("not supported"));
+        let declared = "Add-Type -MemberDefinition '[DllImport(\"kernel32.dll\")] public static extern int Beep(int f, int d);' -Name K -Namespace W\n";
+        assert!(run_session(&format!("{declared}[W.K]::Beep(1, 2)")).1.unwrap_err().contains("kernel32.dll!Beep is not supported"));
+        assert!(run_session(&format!("{declared}[W.K]::Other()")).1.unwrap_err().contains("not defined"));
     }
 
     #[test]

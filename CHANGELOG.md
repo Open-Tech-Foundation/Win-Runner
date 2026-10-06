@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- PowerShell `Add-Type -MemberDefinition` declares `[DllImport]` functions
+  answered by built-in implementations (`IsProcessorFeaturePresent` from the
+  host CPU, `SendMessageTimeout` broadcasts), callable as
+  `[Ns.Name]::F()` or `(Add-Type ... -PassThru)::F()`. Scripts also get
+  `[Type]` casts (`[int]`, `[char]27`, `[IntPtr] 0xffff`, `[ref] $x`),
+  `-as [Type]`, here-strings (`@"..."@`, `@'...'@`), backtick escapes
+  (`` `n ``, `` `" ``, `` `$ ``) and `""` inside double-quoted strings.
+
 - PowerShell expressions: `-lt`/`-le`/`-gt`/`-ge` (numeric when both sides
   are numbers), `-like`/`-notlike`, integer-aware `-eq`, `-not (...)` and
   `!x` over compound conditions, and comparisons as values and statements.

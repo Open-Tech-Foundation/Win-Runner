@@ -71,4 +71,23 @@ Remove-Item missing.txt -ErrorAction SilentlyContinue
 Write-Output 'erroraction: continued'
 $global:Pref = 'g'
 Write-Output "scope: $Pref $global:Pref"
+$noSse2 = !( `
+    Add-Type -MemberDefinition '[DllImport("kernel32.dll")] public static extern bool IsProcessorFeaturePresent(int ProcessorFeature);' `
+        -Name 'OracleKernel32' -Namespace 'WinRunOracle' -PassThru `
+)::IsProcessorFeaturePresent(10)
+Write-Output "addtype.sse2: $noSse2 $([WinRunOracle.OracleKernel32]::IsProcessorFeaturePresent(10))"
+Write-Output "addtype.as: $(-not ('WinRunOracle.Missing' -as [Type])) $([bool]('WinRunOracle.OracleKernel32' -as [Type]))"
+$here = @"
+quote "one" and `$literal
+second $noSse2
+"@
+Write-Output "here: $here"
+$verbatim = @'
+keep $this `n
+'@
+Write-Output "verbatim: $verbatim"
+Write-Output "escapes: `"q`" [`$x] it`'s"
+Write-Output ("char: " + [char]65)
+$p = [IntPtr] 0xff
+Write-Output "cast: $p $([int]'42')"
 Write-Output 'END'

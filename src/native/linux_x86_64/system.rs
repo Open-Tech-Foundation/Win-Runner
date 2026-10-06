@@ -51,20 +51,7 @@ pub(super) extern "win64" fn native_get_user_name_w(name: *mut u16, size: *mut u
 }
 
 pub(super) extern "win64" fn native_is_processor_feature_present(feature: u32) -> i32 {
-    let present = match feature {
-        2 | 3 | 6 | 8 | 9 | 10 | 12 => true,
-        13 => std::is_x86_feature_detected!("sse3"),
-        17 => std::is_x86_feature_detected!("xsave"),
-        36 => std::is_x86_feature_detected!("ssse3"),
-        37 => std::is_x86_feature_detected!("sse4.1"),
-        38 => std::is_x86_feature_detected!("sse4.2"),
-        39 => std::is_x86_feature_detected!("avx"),
-        40 => std::is_x86_feature_detected!("avx2"),
-        41 => std::is_x86_feature_detected!("avx512f"),
-        60 => std::is_x86_feature_detected!("bmi2"),
-        _ => false,
-    };
-    present as i32
+    system_profile::processor_feature_present(feature) as i32
 }
 pub(super) extern "win64" fn native_rtl_get_version(info: *mut u8) -> u32 {
     if info.is_null() || unsafe { (info as *const u32).read_unaligned() } < 276 {

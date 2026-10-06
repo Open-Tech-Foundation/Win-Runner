@@ -15,6 +15,31 @@ pub const PROCESSOR_COUNT: u32 = 1;
 /// (Windows 10 22H2).
 pub const OS_BUILD_NUMBER: u32 = 19045;
 pub const OS_BUILD: &str = "19045";
+/// `IsProcessorFeaturePresent`: the `PF_*` features of the host CPU the
+/// guest runs on (baseline x86-64 features are always present).
+pub fn processor_feature_present(feature: u32) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        match feature {
+            2 | 3 | 6 | 8 | 9 | 10 | 12 => true,
+            13 => std::is_x86_feature_detected!("sse3"),
+            17 => std::is_x86_feature_detected!("xsave"),
+            36 => std::is_x86_feature_detected!("ssse3"),
+            37 => std::is_x86_feature_detected!("sse4.1"),
+            38 => std::is_x86_feature_detected!("sse4.2"),
+            39 => std::is_x86_feature_detected!("avx"),
+            40 => std::is_x86_feature_detected!("avx2"),
+            41 => std::is_x86_feature_detected!("avx512f"),
+            60 => std::is_x86_feature_detected!("bmi2"),
+            _ => false,
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        matches!(feature, 2 | 3 | 6 | 8 | 9 | 10 | 12)
+    }
+}
+
 /// The local account's security identifier, as `ProfileList` and
 /// `HKEY_USERS` name it.
 pub const USER_SID: &str = "S-1-5-21-1000000000-1000000000-1000000000-1001";

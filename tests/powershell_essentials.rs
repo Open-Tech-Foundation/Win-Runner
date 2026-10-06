@@ -97,6 +97,14 @@ fn powershell_scripting_oracle_script_matches_windows_results() {
          mkdir: deep True\n\
          erroraction: continued\n\
          scope: g g\n\
+         addtype.sse2: False True\n\
+         addtype.as: True True\n\
+         here: quote \"one\" and $literal\n\
+         second False\n\
+         verbatim: keep $this `n\n\
+         escapes: \"q\" [$x] it's\n\
+         char: A\n\
+         cast: 255 42\n\
          END\n"
     );
 }
