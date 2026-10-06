@@ -138,7 +138,7 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
                 "nt_memory.allocate: ok", "nt_memory.protect: ok", "nt_memory.release: ok", "nt_time.precise: ok", "nt_time.performance: ok",
                 "device.attributes_roundtrip: ok",
                 "cert.memory_empty: ok", "cert.memory_close: ok", "cert.root_open: ok",
-                "cert.usage_size: ok", "cert.usage_small: ok", "cert.usage_read: ok",
+                "cert.usage_size: ok", "cert.usage_small: ok", "cert.usage_read: 1", "cert.usage_read_size: =query",
                 "cert.root_context: ok", "cert.duplicate: ok", "cert.enum_end: ok",
                 "cert.pending_close: ok", "cert.copy_survives_close: ok", "cert.free: ok",
                 "live.before_exit: ok", "live.parent_remove: ok", "live.no_final_replay: ok",

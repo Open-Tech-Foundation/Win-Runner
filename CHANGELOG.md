@@ -96,6 +96,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- The `native_startup` oracle reports `CertGetEnhancedKeyUsage` reads as
+  separate observations (result, size relative to the size query, layout)
+  so real Windows' behavior shows in the comparison instead of `wrong`.
+
 - Native processes publish `ImagePathName` and `CommandLine` in the PEB's
   process parameters, which Zig-built programs read directly: `bun
   completions` (run by Bun's installer) no longer panics finding its own

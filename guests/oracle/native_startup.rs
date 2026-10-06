@@ -825,18 +825,40 @@ fn certificates() {
                 && small == size
                 && buffer[0] == 0x5555555555555555,
         );
-        // The size query may overestimate; a read reports the bytes it used.
-        let mut capacity = 4096;
+        // Each observation prints separately (sizes as relations to the
+        // size query, never machine-specific numbers).
+        let mut capacity = 4096u32;
         let base = buffer.as_ptr() as usize;
-        boolean(
-            "cert.usage_read",
-            usage(first, 0, buffer.as_mut_ptr().cast(), &mut capacity) != 0
-                && capacity >= 16
-                && capacity <= size
-                && (buffer[0] as u32 == 0
-                    || buffer[1] as usize >= base + 16
-                        && buffer[1] as usize + (buffer[0] as u32 as usize) * 8 <= base + capacity as usize),
-        );
+        clear_error();
+        let read = usage(first, 0, buffer.as_mut_ptr().cast(), &mut capacity);
+        case("cert.usage_read");
+        out_dec(read as u64);
+        if read == 0 {
+            out_error();
+        }
+        out_byte(b'\n');
+        case("cert.usage_read_size");
+        out_str(if capacity == size {
+            "=query"
+        } else if capacity == 4096 {
+            "=buffer"
+        } else if capacity < size {
+            "<query"
+        } else {
+            ">query"
+        });
+        out_byte(b'\n');
+        let count = buffer[0] as u32 as usize;
+        let array = buffer[1] as usize;
+        case("cert.usage_read_layout");
+        out_str(if count == 0 {
+            "empty"
+        } else if array >= base + 16 && array + count * 8 <= base + 4096 {
+            "inside"
+        } else {
+            "outside"
+        });
+        out_byte(b'\n');
         boolean("cert.duplicate", duplicate(first) == first);
         let mut current = first;
         let mut complete = false;
