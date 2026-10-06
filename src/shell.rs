@@ -337,6 +337,7 @@ impl ps1::ProcessHost for ShellProcessHost {
         environment: &[(String, String)],
         image: &str,
         args: &[String],
+        errors: ps1::ErrorStream,
     ) -> Result<ps1::ProcessOutput, String> {
         if crate::curl_command::is_curl_shell_link(fs, image) {
             let run = crate::curl_command::run(fs, args);
@@ -353,14 +354,45 @@ impl ps1::ProcessHost for ShellProcessHost {
             pe::load_lenient(&data).map_err(|e| format!("failed to load {image_path}: {e}"))?;
         let backend = self.backend.as_ref().map_err(Clone::clone)?;
         let taken = std::mem::replace(fs, WinFs::ephemeral_runner());
-        match backend.execute_with_environment(&img, taken, &image_path, args, environment) {
+        // Streaming keeps standard error apart, so `2>&1` can interleave
+        // it into the captured output and `2>$null` can drop it.
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink: backend::OutputSink = {
+            let captured = Arc::clone(&captured);
+            Arc::new(move |channel, bytes: &[u8]| {
+                let keep = match (channel, errors) {
+                    (backend::OutputChannel::Stdout, _) => true,
+                    (_, ps1::ErrorStream::Merge) => true,
+                    (_, ps1::ErrorStream::Discard) => false,
+                    (_, ps1::ErrorStream::Console) => {
+                        let _ = std::io::stderr().write_all(bytes);
+                        false
+                    }
+                };
+                if keep {
+                    if let Ok(mut out) = captured.lock() {
+                        out.extend_from_slice(bytes);
+                    }
+                }
+            })
+        };
+        let result = backend.execute_streaming_with_environment(
+            &img,
+            taken,
+            &image_path,
+            args,
+            environment,
+            sink,
+        );
+        match result {
             Ok(result) => {
                 *fs = result.fs;
+                let stdout = std::mem::take(&mut *captured.lock().unwrap());
                 Ok(ps1::ProcessOutput {
                     // Windows exit codes are DWORDs; PowerShell reads them
                     // as Int32 (`0xC0000135` is -1073741515).
                     code: result.code as i32,
-                    stdout: result.stdout,
+                    stdout,
                 })
             }
             Err(failure) => {

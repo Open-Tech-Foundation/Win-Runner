@@ -49,7 +49,7 @@ mod dotnet;
 mod external;
 mod registry;
 
-pub use external::{ProcessHost, ProcessOutput};
+pub use external::{ErrorStream, ProcessHost, ProcessOutput};
 
 use crate::winfs::WinFs;
 use std::collections::HashMap;
@@ -395,7 +395,12 @@ impl<'a> Interpreter<'a> {
             Err(e) => {
                 let cf = if let Some(cb) = catches.first() {
                     let cb = cb.clone();
-                    match self.run_code(&cb) {
+                    // `$_` is the error inside the handler (its message, as
+                    // an ErrorRecord reads in a string).
+                    let saved = self.vars.insert("_".to_string(), Value::Str(e.clone()));
+                    let handled = self.run_code(&cb);
+                    Self::restore_under(self.vars, saved);
+                    match handled {
                         Err(e2) => {
                             run_finally(self)?;
                             return Err(e2);
@@ -580,7 +585,9 @@ impl<'a> Interpreter<'a> {
         };
         for (idx, tok) in toks.iter().enumerate() {
             let t = tok.text();
-            if tok.verbatim() || is_count_probe(&t) {
+            // Quoted strings are values whatever they contain.
+            let quoted_string = tok.quoted && !t.starts_with(['(', '[', '@', '$']);
+            if tok.verbatim() || is_count_probe(&t) || quoted_string {
                 continue;
             }
             if match_operands.is_some_and(|(a, b)| idx == a || idx == b) {
@@ -1386,11 +1393,14 @@ impl<'a> Interpreter<'a> {
         // `a | b` in value position (`$line = Get-Content $f | Where ...
         // | Select -First 1`): run the whole pipeline as a statement,
         // capturing the last stage's output lines.
-        if split_pipeline(&joined)?.len() > 1 {
+        // (Quotes restored, so `'a|b'` stays one string.)
+        let source: Vec<String> = vals.iter().map(token_source).collect();
+        let source = source.join(" ");
+        if split_pipeline(&source)?.len() > 1 {
             let mut buf = Vec::new();
             let flow = {
                 let mut sub = self.sub(&mut buf);
-                sub.run_pipeline(&joined)
+                sub.run_pipeline(&source)
             };
             match flow? {
                 Flow::Next => {}
@@ -1476,6 +1486,30 @@ impl<'a> Interpreter<'a> {
                 let lines: Vec<String> = text.lines().map(str::to_string).collect();
                 return Ok((lines_value(lines), Flow::Next));
             }
+        }
+        // `X -join S`: X's elements joined by S.
+        if vals.len() == 3 && !vals[1].quoted && vals[1].text().eq_ignore_ascii_case("-join") {
+            return Ok((Value::Str(self.eval_join(vals)?), Flow::Next));
+        }
+        // `X -split P`: each element of X split on regex P.
+        if vals.len() == 3 && !vals[1].quoted && vals[1].text().eq_ignore_ascii_case("-split") {
+            let (lhs, flow) = match self.var_value(&vals[0].text()).filter(|_| !vals[0].quoted) {
+                Some(v) => (v.clone(), Flow::Next),
+                None => self.eval_value(&vals[..1])?,
+            };
+            if !matches!(flow, Flow::Next) {
+                return Ok((Value::Str(String::new()), flow));
+            }
+            let pattern = self.expand_token(&vals[2])?;
+            let items = match lhs {
+                Value::Arr(items) => items.iter().map(value_string).collect(),
+                other => vec![value_string(&other)],
+            };
+            let mut parts = Vec::new();
+            for item in items {
+                parts.extend(regex_split(&pattern, &item)?.into_iter().map(Value::Str));
+            }
+            return Ok((Value::Arr(parts), Flow::Next));
         }
         // `A + B` string concatenation (after callable heads so e.g.
         // `Join-Path a + b` keeps builtin argument handling).
@@ -7495,6 +7529,20 @@ $x
         assert!(equal_values("ABC", "abc"));
         let args: Vec<String> = ["x", "-EA", "Ignore", "-ErrorAction:Stop"].iter().map(|s| s.to_string()).collect();
         assert_eq!(split_silent_error_action(&args), (vec!["x".to_string(), "-ErrorAction:Stop".to_string()], true));
+    }
+
+    #[test]
+    fn catch_binds_the_error_to_underscore() {
+        let (out, r) = run_session("$_ = 'outer'\ntry { throw 'boom' } catch { echo \"got $_\" }\necho $_");
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(out, b"got boom\nouter\n");
+    }
+
+    #[test]
+    fn split_and_join_values() {
+        let (out, r) = run_session("$p = (echo 'a;b;') -split ';'\necho $p.Count\n$p += 'c'\n$env:X = $p -join '|'\necho $env:X\n$q = $p -split '\\|'\necho $q.Count");
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(out, b"3\na|b||c\n4\n");
     }
 
     #[test]

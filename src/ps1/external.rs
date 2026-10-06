@@ -11,6 +11,17 @@ pub struct ProcessOutput {
     pub stdout: Vec<u8>,
 }
 
+/// Where a program's standard error goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorStream {
+    /// The console, as for an uncaptured call.
+    Console,
+    /// Into the output, in order (`2>&1`).
+    Merge,
+    /// Nowhere (`2>$null`).
+    Discard,
+}
+
 /// Runs a guest program for a script. The shell provides one; without a
 /// host (one-shot `run_ps1`), scripts cannot start programs.
 pub trait ProcessHost {
@@ -20,6 +31,7 @@ pub trait ProcessHost {
         environment: &[(String, String)],
         image: &str,
         args: &[String],
+        errors: ErrorStream,
     ) -> Result<ProcessOutput, String>;
 }
 
@@ -32,15 +44,16 @@ fn has_program_extension(name: &str) -> bool {
     PROGRAM_EXTENSIONS.iter().any(|e| lower.ends_with(e)) || lower.ends_with(".ps1")
 }
 
-/// Is this argument a stream redirection the program call drops? Error
-/// output already reaches the console, so merging (`2>&1`) or discarding
-/// (`2>$null`, `2>nul`) it changes nothing captured here.
-fn is_error_redirection(arg: &str) -> bool {
-    let lower = arg.to_ascii_lowercase();
-    matches!(
-        lower.as_str(),
-        "2>&1" | "*>&1" | "2>" | "2>nul" | "2>$null" | "3>&1" | "4>&1" | "5>&1" | "6>&1"
-    )
+/// The error-stream redirection an argument spells, if any: merging
+/// (`2>&1`, `*>&1`) or discarding (`2>$null`, which expands to `2>`, and
+/// `2>nul`). Other streams' merges (`3>&1`...) carry nothing here.
+fn error_redirection(arg: &str) -> Option<Option<ErrorStream>> {
+    match arg.to_ascii_lowercase().as_str() {
+        "2>&1" | "*>&1" => Some(Some(ErrorStream::Merge)),
+        "2>" | "2>nul" | "2>$null" | "*>" | "*>$null" => Some(Some(ErrorStream::Discard)),
+        "3>&1" | "4>&1" | "5>&1" | "6>&1" => Some(None),
+        _ => None,
+    }
 }
 
 impl Interpreter<'_> {
@@ -79,11 +92,16 @@ impl Interpreter<'_> {
     /// script's output, the exit code to `$LASTEXITCODE`. Scripts run
     /// in this session; PowerShell links run their script inline.
     pub(super) fn run_program(&mut self, path: &str, args: &[String]) -> Result<Flow, String> {
-        let args: Vec<String> = args
-            .iter()
-            .filter(|a| !is_error_redirection(a))
-            .cloned()
-            .collect();
+        let mut errors = ErrorStream::Console;
+        let mut kept = Vec::with_capacity(args.len());
+        for arg in args {
+            match error_redirection(arg) {
+                Some(Some(stream)) => errors = stream,
+                Some(None) => {}
+                None => kept.push(arg.clone()),
+            }
+        }
+        let args = kept;
         let lower = path.to_ascii_lowercase();
         if lower.ends_with(".ps1") {
             let data = self
@@ -108,7 +126,7 @@ impl Interpreter<'_> {
         let Some(host) = self.host.as_deref_mut() else {
             return Err(format!("programs cannot run from this script: {path}"));
         };
-        let output = host.run(self.fs, self.environment, path, &args)?;
+        let output = host.run(self.fs, self.environment, path, &args, errors)?;
         self.out.extend_from_slice(&output.stdout);
         if !output.stdout.is_empty() && !output.stdout.ends_with(b"\n") {
             self.out.push(b'\n');
@@ -148,11 +166,17 @@ mod tests {
             _environment: &[(String, String)],
             image: &str,
             args: &[String],
+            errors: ErrorStream,
         ) -> Result<ProcessOutput, String> {
             self.0.push((image.to_string(), args.to_vec()));
+            let stream = match errors {
+                ErrorStream::Console => "",
+                ErrorStream::Merge => " +err",
+                ErrorStream::Discard => " -err",
+            };
             Ok(ProcessOutput {
                 code: if args.first().is_some_and(|a| a == "fail") { 3 } else { 0 },
-                stdout: format!("ran {}", args.join(",")).into_bytes(),
+                stdout: format!("ran {}{stream}", args.join(",")).into_bytes(),
             })
         }
     }
@@ -176,10 +200,10 @@ mod tests {
     #[test]
     fn programs_resolve_on_path_and_by_call_operator() {
         let (r, out, calls) = run_with_host(
-            "app a 'b c'\n& \"C:\\tools\\other.exe\" fail 2>&1\necho \"code=$LASTEXITCODE\"\n$v = \"$(app.exe x)\"\necho \"v=$v\"",
+            "app a 'b c'\n& \"C:\\tools\\other.exe\" fail 2>&1\necho \"code=$LASTEXITCODE\"\n$v = \"$(app.exe x 2>$null)\"\necho \"v=$v\"",
         );
         assert_eq!(r, Ok(0));
-        assert_eq!(out, "ran a,b c\nran fail\ncode=3\nv=ran x\n");
+        assert_eq!(out, "ran a,b c\nran fail +err\ncode=3\nv=ran x -err\n");
         assert_eq!(
             calls,
             vec![

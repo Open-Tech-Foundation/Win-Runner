@@ -243,3 +243,93 @@ fn webrequest_follows_redirects_preserves_bytes_and_reports_http_errors() {
     );
     assert!(!err.contains("nothing to run: irm"), "{err}");
 }
+
+/// A stored archive holding `name` and its directory, with a central
+/// directory like release archives have.
+fn named_archive(name: &str, data: &[u8]) -> Vec<u8> {
+    let mut zip = Vec::new();
+    let mut central = Vec::new();
+    let directory = format!("{}/", name.rsplit_once('/').unwrap().0);
+    for (entry, body) in [(directory.as_str(), &[][..]), (name, data)] {
+        let offset = zip.len() as u32;
+        let header = |zip: &mut Vec<u8>, signature: &[u8], central: bool| {
+            zip.extend_from_slice(signature);
+            if central {
+                zip.extend_from_slice(&20u16.to_le_bytes());
+            }
+            zip.extend_from_slice(&[20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            zip.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            zip.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            zip.extend_from_slice(&(entry.len() as u16).to_le_bytes());
+            zip.extend_from_slice(&0u16.to_le_bytes());
+        };
+        header(&mut zip, b"PK\x03\x04", false);
+        zip.extend_from_slice(entry.as_bytes());
+        zip.extend_from_slice(body);
+        header(&mut central, b"PK\x01\x02", true);
+        // Comment length, disk, internal and external attributes.
+        central.extend_from_slice(&[0; 10]);
+        central.extend_from_slice(&offset.to_le_bytes());
+        central.extend_from_slice(entry.as_bytes());
+    }
+    let start = zip.len() as u32;
+    zip.extend_from_slice(&central);
+    zip.extend_from_slice(b"PK\x05\x06\0\0\0\0\x02\0\x02\0");
+    zip.extend_from_slice(&(central.len() as u32).to_le_bytes());
+    zip.extend_from_slice(&start.to_le_bytes());
+    zip.extend_from_slice(&0u16.to_le_bytes());
+    zip
+}
+
+#[test]
+fn bun_official_installer_installs_registers_and_updates_the_user_path() {
+    if Command::new("curl").arg("--version").output().is_err() {
+        eprintln!("skipping: host curl is not installed");
+        return;
+    }
+    // A stand-in bun.exe: it prints its command line and exits 0.
+    let stub = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/artifacts/exe/rust_argv.exe"
+    ))
+    .unwrap();
+    let mut routes = HashMap::new();
+    for target in ["bun-windows-x64", "bun-windows-x64-baseline"] {
+        routes.insert(
+            format!("/latest/download/{target}.zip"),
+            (200, named_archive(&format!("{target}/bun.exe"), &stub), String::new()),
+        );
+    }
+    let release = Server::new(routes);
+    let script = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/bun-install.ps1"
+    ))
+    .unwrap()
+    .replace("https://github.com/oven-sh/bun/releases", &release.url);
+    let source = Server::new(HashMap::from([(
+        "/install.ps1".into(),
+        (200, script.into_bytes(), String::new()),
+    )]));
+    let (out, err) = shell(&format!(
+        "powershell -c \"irm {}/install.ps1|iex\"\n\
+         reg query HKCU\\Environment /v Path\n\
+         reg query HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Bun /v InstallLocation\n\
+         bun --version\n\
+         exit\n",
+        source.url
+    ));
+    assert!(out.contains("was installed successfully!"), "{out}\n{err}");
+    assert!(
+        out.contains(r"The binary is located at C:\Users\runner\.bun\bin\bun.exe"),
+        "{out}"
+    );
+    assert!(
+        out.contains("To get started, restart your terminal/editor, then type \"bun\""),
+        "{out}"
+    );
+    assert!(out.contains(r";C:\Users\runner\.bun\bin"), "{out}");
+    assert!(out.contains(r"InstallLocation    REG_SZ    C:\Users\runner\.bun"), "{out}");
+    assert!(out.trim_end().ends_with("--version"), "{out}");
+    assert!(!err.contains("script error"), "{err}");
+}

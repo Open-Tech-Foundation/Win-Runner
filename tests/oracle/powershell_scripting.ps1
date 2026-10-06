@@ -96,5 +96,15 @@ $captured = "$(cmd.exe /c echo hi 2>&1)"
 Write-Output "program.output: [$captured] $LASTEXITCODE"
 & "$env:SystemRoot\System32\cmd.exe" /c "exit 0"
 Write-Output "program.path: $LASTEXITCODE $(Test-Path "$env:SystemRoot\System32\curl.exe")"
+# Redirected native standard error is data, not a script error.
+$ErrorActionPreference = 'Continue'
+$merged = "$(cmd.exe /c "1>&2 echo oops" 2>&1)"
+Write-Output "program.merged: [$merged]"
+cmd.exe /c "1>&2 echo gone" 2>$null
+$ErrorActionPreference = 'Stop'
+try { throw 'boom' } catch { Write-Output "catch: $_" }
+$parts = 'a;b;' -split ';'
+$parts += 'c'
+Write-Output "split: $($parts.Count) $($parts -join '|')"
 Write-Warning 'not in output'
 Write-Output 'END'

@@ -108,6 +108,9 @@ fn powershell_scripting_oracle_script_matches_windows_results() {
          program.exit: 7\n\
          program.output: [hi] 0\n\
          program.path: 0 True\n\
+         program.merged: [oops]\n\
+         catch: boom\n\
+         split: 4 a|b||c\n\
          END\n"
     );
 }
