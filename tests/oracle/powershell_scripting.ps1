@@ -56,4 +56,19 @@ Remove-ItemProperty -Path $key -Name Number
 Write-Output "reg.removed: [$((Get-ItemProperty $key).Number)]"
 Remove-Item $key -Recurse
 Write-Output "reg.cleaned: $(Test-Path $key)"
+$v = [System.Environment]::OSVersion.Version
+Write-Output "os: $($v.Major -ge 10) $([Environment]::OSVersion.Platform)"
+$isArm = 'AMD64' -eq 'ARM64'
+Write-Output "expr.bool: $isArm $(-not ($isArm -or 'x' -like 'X*')) $(!$isArm)"
+Write-Output "expr.numeric: $(9 -lt 10) $(0x10 -eq 16) $('Bun' -notlike '*-canary.*')"
+Write-Output "nested: $(if ('a' -eq "a") { "yes" } else { 'no' })"
+Write-Output `
+    'continued: ok'
+$null = mkdir -Force made\deep
+$made = mkdir -Force made\deep
+Write-Output "mkdir: $(Split-Path $made -Leaf) $(Test-Path made\deep)"
+Remove-Item missing.txt -ErrorAction SilentlyContinue
+Write-Output 'erroraction: continued'
+$global:Pref = 'g'
+Write-Output "scope: $Pref $global:Pref"
 Write-Output 'END'

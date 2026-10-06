@@ -6,6 +6,16 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- PowerShell expressions: `-lt`/`-le`/`-gt`/`-ge` (numeric when both sides
+  are numbers), `-like`/`-notlike`, integer-aware `-eq`, `-not (...)` and
+  `!x` over compound conditions, and comparisons as values and statements.
+  `[Environment]::OSVersion` (and other `[Environment]` properties) report
+  the guest's Windows build, property paths work in conditions, `$null = x`
+  discards, `$global:`/`$script:` names resolve, `-ErrorAction
+  SilentlyContinue|Ignore` swallows a command's error, `mkdir` and `New-Item`
+  yield the created path in value position, backtick line continuations
+  join cleanly, and `"...$(...)..."` keeps the quotes inside its code.
+
 - PowerShell gains the registry provider: `Get-Item`, `New-Item`,
   `Remove-Item` and `Test-Path` on `HKLM:`/`HKCU:` paths, `Get-`/`New-`/
   `Set-`/`Remove-ItemProperty`, and `RegistryKey` objects with `OpenSubKey`,

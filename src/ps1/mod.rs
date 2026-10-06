@@ -200,7 +200,8 @@ impl<'a> Interpreter<'a> {
             let stripped = strip_comment(line);
             let t = stripped.trim_end();
             if t.ends_with('=') || t.ends_with('|') || t.ends_with(',') || t.ends_with('`') {
-                code.push_str(t);
+                // A trailing backtick escapes the newline; it is not text.
+                code.push_str(t.strip_suffix('`').unwrap_or(t));
                 code.push(' ');
                 continue;
             }
@@ -466,6 +467,22 @@ impl<'a> Interpreter<'a> {
             }
             return self.eval_cond_tokens(&toks[i + 1..]);
         }
+        // `-not X` / `!X` negate one operand, which may be a whole `(...)`
+        // condition (`-not ($a -eq 1 -or $b)`).
+        if !toks[0].quoted {
+            let head = toks[0].text();
+            if toks.len() == 2 && (head.eq_ignore_ascii_case("-not") || head == "!") {
+                return Ok(!self.eval_cond_tokens(&toks[1..])?);
+            }
+            if toks.len() == 1 && head.len() > 1 && head.starts_with('!') {
+                let inner = Token {
+                    chars: toks[0].chars[1..].to_vec(),
+                    quoted: false,
+                    commas: Vec::new(),
+                };
+                return Ok(!self.eval_cond_tokens(&[inner])?);
+            }
+        }
         // A command as the condition (`if (Test-Path $p)`): its output's
         // truthiness decides.
         if !toks[0].quoted {
@@ -535,7 +552,18 @@ impl<'a> Interpreter<'a> {
             if t.trim_start().starts_with('(') && take_wrapped(t.trim_start(), '(', ')').is_ok() {
                 continue;
             }
-            if t.contains(['.', '(', ')', '{', '}', '[', ']', '@']) {
+            // Property paths (`$v.Major`) and static members (`[T]::X`)
+            // read values; calls and blocks still need a value model.
+            let property_path = t.starts_with('$')
+                && t[1..]
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == ':');
+            let static_member =
+                split_static_member(&t).is_some_and(|(_, _, rest)| rest.is_empty());
+            if !property_path
+                && !static_member
+                && t.contains(['.', '(', ')', '{', '}', '[', ']', '@'])
+            {
                 return Err(format!("not supported in conditions: {t}"));
             }
         }
@@ -552,16 +580,29 @@ impl<'a> Interpreter<'a> {
         if args.len() == 3 {
             let op = args[1].to_lowercase();
             if op == "-eq" {
-                return Ok(args[0].to_lowercase() == args[2].to_lowercase());
+                return Ok(equal_values(&args[0], &args[2]));
             }
             if op == "-ne" {
-                return Ok(args[0].to_lowercase() != args[2].to_lowercase());
+                return Ok(!equal_values(&args[0], &args[2]));
             }
             if op == "-match" {
                 return regex_match(&args[2], &args[0]);
             }
             if op == "-notmatch" {
                 return Ok(!regex_match(&args[2], &args[0])?);
+            }
+            if op == "-like" || op == "-notlike" {
+                let hit = essentials::wildcard(&args[2], &args[0]);
+                return Ok(hit == (op == "-like"));
+            }
+            if let Some(order) = ["-lt", "-le", "-gt", "-ge"].iter().position(|o| *o == op) {
+                let ordering = compare_values(&args[0], &args[2]);
+                return Ok(match order {
+                    0 => ordering.is_lt(),
+                    1 => ordering.is_le(),
+                    2 => ordering.is_gt(),
+                    _ => ordering.is_ge(),
+                });
             }
             return Err(format!("{} is not supported in conditions", args[1]));
         }
@@ -731,9 +772,10 @@ impl<'a> Interpreter<'a> {
         }
         // `[Type]::Member` as a whole statement outputs the member.
         if let Some((typ, member, rest)) = split_static_member(stmt.trim_start()) {
-            if rest.trim().is_empty() {
+            if rest.trim().is_empty() || rest.starts_with('.') {
                 let v = self.eval_static_member(&typ, &member)?;
-                self.emit(&v);
+                let v = self.apply_member_rest(v, &rest)?;
+                self.emit_value(&v);
                 return Ok(Flow::Next);
             }
         }
@@ -831,6 +873,21 @@ impl<'a> Interpreter<'a> {
                 return Ok(Flow::Next);
             }
         }
+        // A comparison/logic expression statement outputs True/False,
+        // unless it is a command whose arguments look like operators.
+        let negation = toks.len() == 1 && !toks[0].quoted && toks[0].text().len() > 1
+            && toks[0].text().starts_with('!');
+        if negation || is_boolean_expression(&toks) {
+            let head = toks[0].text().to_lowercase();
+            if toks[0].quoted
+                || head.starts_with(['$', '(', '[', '-', '!'])
+                || parse_number(&head).is_some()
+            {
+                let b = self.eval_cond_tokens(&toks)?;
+                self.emit(&bool_string(b));
+                return Ok(Flow::Next);
+            }
+        }
         if toks.len() >= 3 && !toks[1].verbatim() && toks[1].text().eq_ignore_ascii_case("-replace")
         {
             let value = self.eval_replace(&toks)?;
@@ -855,14 +912,22 @@ impl<'a> Interpreter<'a> {
         if cmd == "iex" || cmd == "invoke-expression" {
             return self.cmd_iex(rest, pipe_in);
         }
-        if let Some((params, body)) = self
+        // `-ErrorAction SilentlyContinue|Ignore` swallows the command's
+        // error; output it produced before failing stays.
+        let (rest, silent) = split_silent_error_action(rest);
+        let r = if let Some((params, body)) = self
             .funcs
             .get(&cmd)
             .map(|f| (f.params.clone(), f.body.clone()))
         {
-            return self.call_function(&cmd, &params, &body, rest);
+            self.call_function(&cmd, &params, &body, &rest)
+        } else {
+            self.exec_builtin(&cmd, &rest, pipe_in)
+        };
+        match r {
+            Err(_) if silent => Ok(Flow::Next),
+            r => r,
         }
-        self.exec_builtin(&cmd, rest, pipe_in)
     }
 
     /// Plain builtins shared by statement position and value capture
@@ -903,6 +968,11 @@ impl<'a> Interpreter<'a> {
                 Ok(())
             }
             "new-item" => self.cmd_new_item(rest),
+            "mkdir" | "md" => {
+                let mut args = vec!["-ItemType".to_string(), "Directory".to_string()];
+                args.extend_from_slice(rest);
+                self.cmd_new_item(&args)
+            }
             "set-content" => self.cmd_set_content(rest, pipe_in),
             "add-content" => self.cmd_add_content(rest, pipe_in),
             "get-content" => self.cmd_get_content(rest),
@@ -1170,6 +1240,10 @@ impl<'a> Interpreter<'a> {
             environment_set(self.environment, &variable[4..], &value);
             return Ok(());
         }
+        // `$null = expr` evaluates and discards, as in PowerShell.
+        if name.eq_ignore_ascii_case("$null") {
+            return Ok(());
+        }
         let key = check_assign_target(name)?;
         match op {
             AssignOp::Set => {
@@ -1325,11 +1399,23 @@ impl<'a> Interpreter<'a> {
         {
             return Ok((Value::Str(self.eval_replace(vals)?), Flow::Next));
         }
+        // Comparison and logic expressions evaluate to True/False.
+        if is_boolean_expression(vals) {
+            return Ok((Value::Str(bool_string(self.eval_cond_tokens(vals)?)), Flow::Next));
+        }
         if vals.len() != 1 {
             return Err("unexpected tokens after assignment value".to_string());
         }
         if let Some(v) = self.object_member_expr(&vals[0])? {
             return Ok((v, Flow::Next));
+        }
+        if !vals[0].quoted {
+            if let Some((typ, member, rest)) = split_static_member(&vals[0].text()) {
+                if rest.is_empty() || rest.starts_with('.') {
+                    let v = self.eval_static_member(&typ, &member)?;
+                    return Ok((self.apply_member_rest(v, &rest)?, Flow::Next));
+                }
+            }
         }
         Ok((Value::Str(self.expand_token(&vals[0])?), Flow::Next))
     }
@@ -1788,8 +1874,19 @@ impl<'a> Interpreter<'a> {
                 }
                 if let Some((typ, member, rest2)) = split_static_member(&tail) {
                     let v = self.eval_static_member(&typ, &member)?;
-                    out.push_str(&v);
-                    i += tail.chars().count() - rest2.chars().count();
+                    // A `.Member` chain continues on the value.
+                    let chain: String = rest2
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
+                        .collect();
+                    let v = if chain.starts_with('.') && chain.len() > 1 {
+                        self.apply_member_rest(v, &chain)?
+                    } else {
+                        v
+                    };
+                    out.push_str(&value_string(&v));
+                    i += tail.chars().count() - rest2.chars().count()
+                        + if chain.len() > 1 { chain.chars().count() } else { 0 };
                     continue;
                 }
             }
@@ -1944,6 +2041,7 @@ impl<'a> Interpreter<'a> {
     /// A name's value for member navigation: plain vars, `$env:`, `$HOME`.
     /// (`$null`/`$_`-unset yield empty; unknown drives stay literal upstream.)
     fn lookup_value(&self, name: &str) -> Option<Value> {
+        let name = strip_scope(name);
         if name.eq_ignore_ascii_case("null") {
             return Some(Value::Str(String::new()));
         }
@@ -1957,6 +2055,7 @@ impl<'a> Interpreter<'a> {
     }
 
     fn lookup_scalar(&self, name: &str) -> String {
+        let name = strip_scope(name);
         if name.eq_ignore_ascii_case("null") {
             return String::new();
         }
@@ -2261,16 +2360,31 @@ impl<'a> Interpreter<'a> {
     }
 
     /// `[Type]::Member` static properties and enum values.
-    fn eval_static_member(&mut self, typ: &str, member: &str) -> Result<String, String> {
+    fn eval_static_member(&mut self, typ: &str, member: &str) -> Result<Value, String> {
         if let Some(v) = registry::enum_member(typ, member) {
-            return Ok(v);
+            return Ok(Value::Str(v));
         }
         let t = typ.to_lowercase();
         let t = t.strip_prefix("system.").unwrap_or(&t);
-        if matches!(t, "intptr" | "uintptr") && member.eq_ignore_ascii_case("zero") {
-            return Ok("0".to_string());
+        let m = member.to_lowercase();
+        match (t, m.as_str()) {
+            ("intptr" | "uintptr", "zero") => Ok(Value::Str("0".to_string())),
+            ("environment", "osversion") => Ok(os_version()),
+            ("environment", "newline") => Ok(Value::Str("\r\n".to_string())),
+            ("environment", "is64bitoperatingsystem" | "is64bitprocess") => {
+                Ok(Value::Str("True".to_string()))
+            }
+            ("environment", "processorcount") => Ok(Value::Str(
+                crate::system_profile::PROCESSOR_COUNT.to_string(),
+            )),
+            ("environment", "machinename") => Ok(Value::Str(
+                crate::system_profile::COMPUTER_NAME.to_string(),
+            )),
+            ("environment", "username") => {
+                Ok(Value::Str(crate::system_profile::USER_NAME.to_string()))
+            }
+            _ => Err(format!("[{typ}]::{member} is not supported")),
         }
-        Err(format!("[{typ}]::{member} is not supported"))
     }
 
     /// `$v[key]`: map lookup (case-insensitive, missing → empty), array
@@ -3052,6 +3166,8 @@ impl<'a> Interpreter<'a> {
                     | "invoke-webrequest"
                     | "get-item"
                     | "new-item"
+                    | "mkdir"
+                    | "md"
                     | "get-itemproperty"
                     | "gp"
             )
@@ -3073,11 +3189,31 @@ impl<'a> Interpreter<'a> {
             }
             "new-item" => {
                 let path = item_path_arg(argvals)?;
-                registry::provider_path(&path)?;
-                Some(self.registry_new_item_args(argvals))
+                if registry::provider_path(&path).is_some() {
+                    return Some(self.registry_new_item_args(argvals));
+                }
+                Some(self.new_item_value(argvals))
+            }
+            "mkdir" | "md" => {
+                let mut args = vec!["-ItemType".to_string(), "Directory".to_string()];
+                args.extend_from_slice(argvals);
+                Some(self.new_item_value(&args))
             }
             _ => Some(self.get_item_property_args(argvals)),
         }
+    }
+
+    /// `New-Item` in value position: create the item, yield its full path
+    /// (what a `FileInfo`/`DirectoryInfo` reads as in a string).
+    fn new_item_value(&mut self, args: &[String]) -> Result<Value, String> {
+        self.cmd_new_item(args)?;
+        let path = item_path_arg(args).unwrap_or_default();
+        let full = self
+            .fs
+            .normalize(&path)
+            .map(|p| p.display())
+            .map_err(|e| format!("New-Item: {e}"))?;
+        Ok(Value::Str(full))
     }
 
     fn registry_new_item_args(&mut self, args: &[String]) -> Result<Value, String> {
@@ -3358,12 +3494,11 @@ impl<'a> Interpreter<'a> {
                     // A missing member of an object reads as `$null`,
                     // as in PowerShell without strict mode.
                     let object = matches!(cur, Value::Map(_));
-                    let s = match Self::navigate_value(cur, name) {
-                        Some(s) => s,
-                        None if object => String::new(),
+                    cur = match member_value(cur, name) {
+                        Some(v) => v,
+                        None if object => Value::Str(String::new()),
                         None => return Err(format!("member {name} not found")),
                     };
-                    cur = Value::Str(s);
                     r = tail.trim().to_string();
                 }
             } else if r.starts_with('[') {
@@ -4722,13 +4857,60 @@ fn split_static_member(s: &str) -> Option<(String, String, String)> {
     Some((typ.to_string(), rest[..mend].to_string(), rest[mend..].to_string()))
 }
 
+/// Hidden map entry holding an object's `ToString()` text.
+const OBJECT_STRING: &str = "\0string";
+
+/// `[Environment]::OSVersion` for the guest's Windows build.
+fn os_version() -> Value {
+    let build = crate::system_profile::OS_BUILD_NUMBER;
+    let mut version = HashMap::new();
+    for (name, v) in [("Major", 10), ("Minor", 0), ("Build", build), ("Revision", 0)] {
+        version.insert(name.to_string(), Value::Str(v.to_string()));
+    }
+    version.insert(
+        OBJECT_STRING.to_string(),
+        Value::Str(format!("10.0.{build}.0")),
+    );
+    let mut os = HashMap::new();
+    os.insert("Platform".to_string(), Value::Str("Win32NT".to_string()));
+    os.insert("Version".to_string(), Value::Map(version));
+    let text = format!("Microsoft Windows NT 10.0.{build}.0");
+    os.insert("VersionString".to_string(), Value::Str(text.clone()));
+    os.insert(OBJECT_STRING.to_string(), Value::Str(text));
+    Value::Map(os)
+}
+
+/// One `.Member` step on a value: map entries (case-insensitive), array
+/// `Count`/`Length`/index, string `Length`.
+fn member_value(cur: Value, name: &str) -> Option<Value> {
+    match cur {
+        Value::Map(m) => m
+            .into_iter()
+            .find(|(k, _)| !registry::is_hidden_member(k) && k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v),
+        Value::Arr(a) => {
+            if name.eq_ignore_ascii_case("count") || name.eq_ignore_ascii_case("length") {
+                return Some(Value::Str(a.len().to_string()));
+            }
+            let idx: i64 = name.trim().parse().ok()?;
+            let idx = if idx < 0 { a.len() as i64 + idx } else { idx };
+            a.into_iter().nth(idx as usize)
+        }
+        Value::Str(s) => (name.eq_ignore_ascii_case("length"))
+            .then(|| Value::Str(s.chars().count().to_string())),
+    }
+}
+
 /// A value in string context: strings as-is, arrays space-joined
 /// (recursively), empty maps stringify empty.
 fn value_string(v: &Value) -> String {
     match v {
         Value::Str(s) => s.clone(),
         Value::Arr(a) => a.iter().map(value_string).collect::<Vec<_>>().join(" "),
-        Value::Map(_) => String::new(),
+        Value::Map(m) => match m.get(OBJECT_STRING) {
+            Some(Value::Str(s)) => s.clone(),
+            _ => String::new(),
+        },
     }
 }
 
@@ -5022,6 +5204,44 @@ fn split_assign_if_head(chunk: &str) -> Option<(String, AssignOp, String)> {
     Some((name, op, after))
 }
 
+/// Remove `-ErrorAction SilentlyContinue|Ignore` (or `-EA`, or the
+/// `-ErrorAction:value` form) from arguments; the flag says it was there.
+/// Other actions stay for the command (errors terminate regardless).
+fn split_silent_error_action(args: &[String]) -> (Vec<String>, bool) {
+    let mut kept = Vec::with_capacity(args.len());
+    let mut silent = false;
+    let mut i = 0;
+    while i < args.len() {
+        let lower = args[i].to_lowercase();
+        let (flag, inline) = match lower.split_once(':') {
+            Some((f, v)) => (f.to_string(), Some(v.to_string())),
+            None => (lower.clone(), None),
+        };
+        if flag == "-erroraction" || flag == "-ea" {
+            let value = inline.or_else(|| args.get(i + 1).map(|v| v.to_lowercase()));
+            if matches!(value.as_deref(), Some("silentlycontinue" | "ignore")) {
+                silent = true;
+                i += if lower.contains(':') { 1 } else { 2 };
+                continue;
+            }
+        }
+        kept.push(args[i].clone());
+        i += 1;
+    }
+    (kept, silent)
+}
+
+/// Drop a `global:`/`script:`/`local:`/`private:` scope qualifier: this
+/// interpreter has one variable scope per function call.
+fn strip_scope(name: &str) -> &str {
+    for scope in ["global:", "script:", "local:", "private:"] {
+        if name.len() > scope.len() && name[..scope.len()].eq_ignore_ascii_case(scope) {
+            return &name[scope.len()..];
+        }
+    }
+    name
+}
+
 /// `env:NAME`, the environment drive's variable syntax.
 fn is_env_name(name: &str) -> bool {
     name.len() > 4 && name[..4].eq_ignore_ascii_case("env:")
@@ -5032,6 +5252,7 @@ fn check_assign_target(name: &str) -> Result<String, String> {
     let bare = name
         .strip_prefix('$')
         .ok_or_else(|| "invalid variable name".to_string())?;
+    let bare = strip_scope(bare);
     if bare.eq_ignore_ascii_case("null") {
         return Err("cannot assign to $null".to_string());
     }
@@ -5220,6 +5441,8 @@ pub const COMMAND_NAMES: &[&str] = &[
     "wget",
     "expand-archive",
     "get-filehash",
+    "mkdir",
+    "md",
     "get-itemproperty",
     "gp",
     "new-itemproperty",
@@ -5387,6 +5610,60 @@ fn take_balanced(cs: &[(char, bool)]) -> Result<(String, usize), String> {
     Err("unbalanced $(...)".to_string())
 }
 
+/// Operators that make a token run a boolean expression.
+const BOOLEAN_OPERATORS: &[&str] = &[
+    "-eq", "-ne", "-lt", "-le", "-gt", "-ge", "-like", "-notlike", "-match", "-notmatch", "-in",
+    "-notin", "-contains", "-notcontains", "-and", "-or", "-not",
+];
+
+/// `a -eq b`, `-not $x`, `$a -and $b`, ...: a value-position expression
+/// with a top-level comparison or logic operator.
+fn is_boolean_expression(toks: &[Token]) -> bool {
+    toks.len() >= 2
+        && toks.iter().any(|t| {
+            !t.quoted && BOOLEAN_OPERATORS.contains(&t.text().to_lowercase().as_str())
+        })
+}
+
+/// PowerShell comparison of two operands: numerically when both read as
+/// numbers (`10 -eq 10.0`, `9 -lt 10`), else case-insensitively as text.
+fn compare_values(left: &str, right: &str) -> std::cmp::Ordering {
+    match (parse_number(left), parse_number(right)) {
+        (Some(a), Some(b)) => a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal),
+        _ => left.to_lowercase().cmp(&right.to_lowercase()),
+    }
+}
+
+/// `-eq`: integers by value (`0x10 -eq 16`), anything else as
+/// case-insensitive text (`"1.0" -ne "1"`, as for PowerShell strings).
+fn equal_values(left: &str, right: &str) -> bool {
+    let integer = |t: &str| parse_number(t).filter(|_| !t.contains('.'));
+    match (integer(left), integer(right)) {
+        (Some(a), Some(b)) => a == b,
+        _ => left.to_lowercase() == right.to_lowercase(),
+    }
+}
+
+/// A decimal or `0x` hexadecimal number, as PowerShell literals spell them.
+fn parse_number(text: &str) -> Option<f64> {
+    let t = text.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let (negative, digits) = match t.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, t),
+    };
+    let value = if let Some(hex) = digits.strip_prefix("0x").or_else(|| digits.strip_prefix("0X")) {
+        i64::from_str_radix(hex, 16).ok()? as f64
+    } else if digits.chars().all(|c| c.is_ascii_digit() || c == '.') && digits.chars().any(|c| c.is_ascii_digit()) {
+        digits.parse::<f64>().ok()?
+    } else {
+        return None;
+    };
+    Some(if negative { -value } else { value })
+}
+
 /// A token back as source text: single-quoted spans requoted so they stay
 /// verbatim, and expandable text quoted when it holds whitespace.
 fn token_source(tok: &Token) -> String {
@@ -5476,7 +5753,35 @@ fn tokenize(s: &str) -> Result<Vec<Token>, String> {
     let mut quoted = false;
     let mut pdepth = 0usize;
     let mut commas = Vec::new();
-    for c in s.chars() {
+    let chars: Vec<char> = s.chars().collect();
+    let mut idx = 0;
+    while idx < chars.len() {
+        let c = chars[idx];
+        idx += 1;
+        // `$( ... )` inside a double-quoted string is code: copy it whole,
+        // quotes included, for the subexpression evaluator.
+        if dq && pdepth == 0 && c == '$' && chars.get(idx) == Some(&'(') {
+            let start = idx - 1;
+            let (mut depth, mut isq, mut idq) = (0usize, false, false);
+            while idx < chars.len() {
+                let d = chars[idx];
+                idx += 1;
+                match d {
+                    '\'' if !idq => isq = !isq,
+                    '"' if !isq => idq = !idq,
+                    '(' if !isq && !idq => depth += 1,
+                    ')' if !isq && !idq => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            cur.extend(chars[start..idx].iter().map(|&d| (d, true)));
+            continue;
+        }
         match c {
             '\'' if !dq => {
                 sq = !sq;
@@ -6053,12 +6358,16 @@ $x
     }
 
     #[test]
-    fn erroraction_is_universal_noop() {
-        // Real scripts sprinkle -ErrorAction everywhere; with only
-        // terminating errors there is nothing to suppress.
+    fn erroraction_silences_or_keeps_errors() {
+        // Stop/Continue keep errors terminating; SilentlyContinue and
+        // Ignore swallow a failing command's error.
         let (out, r) = run_session("New-Item C:\\ea.txt -Value x -ErrorAction SilentlyContinue\nGet-Content C:\\ea.txt -ErrorAction Stop");
         assert!(r.is_ok());
         assert_eq!(out, b"x\n");
+        let (out, r) = run_session("Remove-Item C:\\missing -ErrorAction SilentlyContinue\nGet-Content C:\\missing -EA:Ignore\necho after");
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(out, b"after\n");
+        assert!(run_session("Remove-Item C:\\missing -ErrorAction Stop").1.is_err());
         assert!(run_session("echo hi -ErrorAction")
             .1
             .unwrap_err()
@@ -6338,7 +6647,10 @@ $x
         assert!(run_session("$x = a b").1.is_err());
         assert!(run_session("$x == 1").1.unwrap_err().contains("comparison"));
         assert!(run_session("$HOME = b").1.unwrap_err().contains("$HOME"));
-        assert!(run_session("$null = b").1.unwrap_err().contains("$null"));
+        // `$null = x` discards; scoped names share the one scope.
+        let (out, r) = run_session("$null = b\n$global:G = 1\necho \"[$null][$G][$script:G]\"");
+        assert!(r.is_ok());
+        assert_eq!(out, b"[][1][1]\n");
     }
 
     #[test]

@@ -89,6 +89,14 @@ fn powershell_scripting_oracle_script_matches_windows_results() {
          reg.missing: null\n\
          reg.removed: []\n\
          reg.cleaned: False\n\
+         os: True Win32NT\n\
+         expr.bool: False False True\n\
+         expr.numeric: True True True\n\
+         nested: yes\n\
+         continued: ok\n\
+         mkdir: deep True\n\
+         erroraction: continued\n\
+         scope: g g\n\
          END\n"
     );
 }
