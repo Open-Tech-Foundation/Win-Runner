@@ -193,6 +193,80 @@ pub struct ZipEntry {
 /// List a ZIP archive's entries (stored or deflated).
 /// Scans local headers; central directory not required.
 pub fn zip_entries(zip: &[u8]) -> Result<Vec<ZipEntry>, String> {
+    // The central directory has every entry's sizes, including entries
+    // written with trailing data descriptors (streamed archives, such as
+    // Bun's releases), which local headers leave as zero.
+    if let Some(entries) = central_directory_entries(zip)? {
+        return Ok(entries);
+    }
+    local_header_entries(zip)
+}
+
+/// Entries from the end-of-central-directory record, or `None` when the
+/// archive has none (local headers are scanned instead).
+fn central_directory_entries(zip: &[u8]) -> Result<Option<Vec<ZipEntry>>, String> {
+    const EOCD: &[u8] = b"PK\x05\x06";
+    if zip.len() < 22 {
+        return Ok(None);
+    }
+    let earliest = zip.len().saturating_sub(22 + 0xffff);
+    let Some(eocd) = (earliest..=zip.len() - 22)
+        .rev()
+        .find(|&o| &zip[o..o + 4] == EOCD)
+    else {
+        return Ok(None);
+    };
+    let u16le = |o: usize| u16::from_le_bytes([zip[o], zip[o + 1]]) as usize;
+    let u32le =
+        |o: usize| u32::from_le_bytes([zip[o], zip[o + 1], zip[o + 2], zip[o + 3]]) as usize;
+    let count = u16le(eocd + 10);
+    let mut off = u32le(eocd + 16);
+    if count == 0xffff || off == 0xffff_ffff {
+        return Err("zip64 archives are not supported".to_string());
+    }
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        if off + 46 > zip.len() || &zip[off..off + 4] != b"PK\x01\x02" {
+            return Err("invalid zip central directory".to_string());
+        }
+        let method = u16le(off + 10) as u16;
+        let csize = u32le(off + 20);
+        let nlen = u16le(off + 28);
+        let elen = u16le(off + 30);
+        let clen = u16le(off + 32);
+        let local = u32le(off + 42);
+        if csize == 0xffff_ffff || local == 0xffff_ffff {
+            return Err("zip64 archives are not supported".to_string());
+        }
+        let name_end = off + 46 + nlen;
+        if name_end > zip.len() {
+            return Err("truncated zip central directory".to_string());
+        }
+        let name = std::str::from_utf8(&zip[off + 46..name_end])
+            .map_err(|_| "invalid zip entry name".to_string())?;
+        if local + 30 > zip.len() || &zip[local..local + 4] != b"PK\x03\x04" {
+            return Err(format!("invalid zip local header (entry '{name}')"));
+        }
+        let data_off = local + 30 + u16le(local + 26) + u16le(local + 28);
+        if data_off
+            .checked_add(csize)
+            .is_none_or(|end| end > zip.len())
+        {
+            return Err(format!("truncated zip data (entry '{name}')"));
+        }
+        out.push(ZipEntry {
+            name: name.to_string(),
+            is_dir: name.ends_with('/'),
+            method,
+            data_off,
+            csize,
+        });
+        off = name_end + elen + clen;
+    }
+    Ok(Some(out))
+}
+
+fn local_header_entries(zip: &[u8]) -> Result<Vec<ZipEntry>, String> {
     let mut out = Vec::new();
     let mut off = 0usize;
     let u16le = |o: usize| u16::from_le_bytes([zip[o], zip[o + 1]]);
@@ -491,5 +565,70 @@ mod tests {
         z[8] = 99;
         let err = extract_entry(&z, "a.defl").unwrap_err();
         assert!(err.contains("unsupported zip method 99"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod zip_directory_tests {
+    use super::*;
+
+    /// A stored one-entry archive written the streaming way: zero sizes in
+    /// the local header, a data descriptor after the data, and the real
+    /// sizes only in the central directory.
+    fn streamed_zip(name: &str, data: &[u8]) -> Vec<u8> {
+        let mut zip = Vec::new();
+        zip.extend_from_slice(b"PK\x03\x04");
+        zip.extend_from_slice(&20u16.to_le_bytes());
+        zip.extend_from_slice(&0x08u16.to_le_bytes());
+        zip.extend_from_slice(&0u16.to_le_bytes()); // stored
+        zip.extend_from_slice(&[0; 4]); // time, date
+        zip.extend_from_slice(&[0; 12]); // crc, sizes deferred
+        zip.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        zip.extend_from_slice(name.as_bytes());
+        zip.extend_from_slice(data);
+        zip.extend_from_slice(b"PK\x07\x08");
+        zip.extend_from_slice(&[0; 4]);
+        zip.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        zip.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        let central = zip.len();
+        zip.extend_from_slice(b"PK\x01\x02");
+        zip.extend_from_slice(&20u16.to_le_bytes());
+        zip.extend_from_slice(&20u16.to_le_bytes());
+        zip.extend_from_slice(&0x08u16.to_le_bytes());
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        zip.extend_from_slice(&[0; 8]); // time, date, crc
+        zip.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        zip.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        zip.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        zip.extend_from_slice(&[0; 12]); // extra, comment, disk, attributes
+        zip.extend_from_slice(&0u32.to_le_bytes()); // local header offset
+        zip.extend_from_slice(name.as_bytes());
+        let size = zip.len() - central;
+        zip.extend_from_slice(b"PK\x05\x06");
+        zip.extend_from_slice(&[0; 4]);
+        zip.extend_from_slice(&1u16.to_le_bytes());
+        zip.extend_from_slice(&1u16.to_le_bytes());
+        zip.extend_from_slice(&(size as u32).to_le_bytes());
+        zip.extend_from_slice(&(central as u32).to_le_bytes());
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        zip
+    }
+
+    #[test]
+    fn streamed_entries_read_their_sizes_from_the_central_directory() {
+        let zip = streamed_zip("dir/app.exe", b"MZ-payload");
+        let entries = zip_entries(&zip).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "dir/app.exe");
+        assert_eq!(extract_bytes(&zip, &entries[0]).unwrap(), b"MZ-payload");
+        // Without the directory the local headers cannot size the entry.
+        let central = zip.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+        assert!(zip_entries(&zip[..central]).err().unwrap().contains("data descriptors"));
+        // A directory pointing past the data is rejected.
+        let mut broken = zip.clone();
+        let eocd = broken.len() - 22;
+        broken[eocd + 16..eocd + 20].copy_from_slice(&9999u32.to_le_bytes());
+        assert!(zip_entries(&broken).is_err());
     }
 }

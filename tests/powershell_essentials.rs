@@ -64,7 +64,7 @@ fn powershell_scripting_oracle_script_matches_windows_results() {
     let (out, err) = shell(&format!(
         "@seed \"{probe}\" C:\\probe.ps1\npowershell -File C:\\probe.ps1\nexit\n"
     ));
-    assert!(err.is_empty(), "{err}");
+    assert_eq!(err, "WARNING: not in output\n");
     assert_eq!(
         out,
         "param.defaults: latest False\n\
@@ -105,6 +105,9 @@ fn powershell_scripting_oracle_script_matches_windows_results() {
          escapes: \"q\" [$x] it's\n\
          char: A\n\
          cast: 255 42\n\
+         program.exit: 7\n\
+         program.output: [hi] 0\n\
+         program.path: 0 True\n\
          END\n"
     );
 }

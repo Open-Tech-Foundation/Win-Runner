@@ -90,4 +90,11 @@ Write-Output "escapes: `"q`" [`$x] it`'s"
 Write-Output ("char: " + [char]65)
 $p = [IntPtr] 0xff
 Write-Output "cast: $p $([int]'42')"
+& cmd.exe /c exit 7
+Write-Output "program.exit: $LASTEXITCODE"
+$captured = "$(cmd.exe /c echo hi 2>&1)"
+Write-Output "program.output: [$captured] $LASTEXITCODE"
+& "$env:SystemRoot\System32\cmd.exe" /c "exit 0"
+Write-Output "program.path: $LASTEXITCODE $(Test-Path "$env:SystemRoot\System32\curl.exe")"
+Write-Warning 'not in output'
 Write-Output 'END'

@@ -324,6 +324,53 @@ pub enum ShellFlow {
 }
 
 /// One shell session: the filesystem and variables every line shares.
+/// Starts the programs PowerShell scripts call, on the shell's backend,
+/// with the session disk handed over for the run and back afterwards.
+struct ShellProcessHost {
+    backend: Result<&'static dyn backend::ExecutionBackend, String>,
+}
+
+impl ps1::ProcessHost for ShellProcessHost {
+    fn run(
+        &mut self,
+        fs: &mut WinFs,
+        environment: &[(String, String)],
+        image: &str,
+        args: &[String],
+    ) -> Result<ps1::ProcessOutput, String> {
+        if crate::curl_command::is_curl_shell_link(fs, image) {
+            let run = crate::curl_command::run(fs, args);
+            return Ok(ps1::ProcessOutput {
+                code: run.code,
+                stdout: run.stdout,
+            });
+        }
+        let image_path = fs.resolve_links(image).unwrap_or_else(|| image.to_string());
+        let data = fs
+            .read_file(&image_path)
+            .map_err(|e| format!("cannot read guest executable {image_path}: {e}"))?;
+        let img =
+            pe::load_lenient(&data).map_err(|e| format!("failed to load {image_path}: {e}"))?;
+        let backend = self.backend.as_ref().map_err(Clone::clone)?;
+        let taken = std::mem::replace(fs, WinFs::ephemeral_runner());
+        match backend.execute_with_environment(&img, taken, &image_path, args, environment) {
+            Ok(result) => {
+                *fs = result.fs;
+                Ok(ps1::ProcessOutput {
+                    // Windows exit codes are DWORDs; PowerShell reads them
+                    // as Int32 (`0xC0000135` is -1073741515).
+                    code: result.code as i32,
+                    stdout: result.stdout,
+                })
+            }
+            Err(failure) => {
+                *fs = failure.fs;
+                Err(format!("{} execution failed: {}", backend.id(), failure.message))
+            }
+        }
+    }
+}
+
 pub struct Shell {
     fs: WinFs,
     sess: ps1::Session,
@@ -355,6 +402,7 @@ impl Shell {
     /// subsequent `snapshot save` commands without a path.
     pub fn with_snapshot_path(mut fs: WinFs, snapshot_path: Option<std::path::PathBuf>) -> Self {
         seed_powershell_shell_link(&mut fs);
+        crate::curl_command::seed_curl_exe(&mut fs);
         crate::cmd::seed_cmd_exe(&mut fs);
         // npm's standard Windows cache and global-prefix folders; npm
         // expects the cache's temp and log directories to exist.
@@ -710,7 +758,7 @@ impl Shell {
                     .skip(1)
                     .any(|arg| arg.starts_with('-') || arg == "|"))
         {
-            self.last_code = ps1::run_ps1_session(&mut self.sess, &mut self.fs, line, out)
+            self.last_code = self.run_ps1(line, out)
                 .map_err(|error| format!("script error: {error}"))?;
             return Ok(ShellFlow::Continue);
         }
@@ -902,6 +950,9 @@ impl Shell {
             self.do_powershell(&argv[1..], out)?;
             return Ok(ShellFlow::Continue);
         }
+        if self.fs.is_file(target) && crate::curl_command::is_curl_shell_link(&self.fs, target) {
+            return Ok(self.run_curl(&argv[1..], out));
+        }
         if std::path::Path::new(target).is_file() {
             let ext = std::path::Path::new(target)
                 .extension()
@@ -915,7 +966,7 @@ impl Shell {
                     let script = std::fs::read_to_string(target)
                         .map_err(|e| format!("cannot read {target}: {e}"))?;
                     report_timing(target, "host_file_read", file_read_started);
-                    let code = ps1::run_ps1_session(&mut self.sess, &mut self.fs, &script, out)
+                    let code = self.run_ps1(&script, out)
                         .map_err(|e| format!("script error: {e}"))?;
                     self.last_code = code;
                     return Ok(ShellFlow::Continue);
@@ -940,7 +991,7 @@ impl Shell {
                 .map_err(|error| format!("cannot read {target}: {error}"))?;
             let script = String::from_utf8(data)
                 .map_err(|error| format!("cannot read {target}: {error}"))?;
-            self.last_code = ps1::run_ps1_session(&mut self.sess, &mut self.fs, &script, out)
+            self.last_code = self.run_ps1(&script, out)
                 .map_err(|error| format!("script error: {error}"))?;
             return Ok(ShellFlow::Continue);
         }
@@ -970,6 +1021,9 @@ impl Shell {
                             self.do_powershell(&argv[1..], out)?;
                             return Ok(ShellFlow::Continue);
                         }
+                        if crate::curl_command::is_curl_shell_link(&self.fs, &candidate) {
+                            return Ok(self.run_curl(&argv[1..], out));
+                        }
                         if is_batch_file(&candidate) {
                             return self.run_batch(&candidate, &argv[1..], out, sink);
                         }
@@ -991,7 +1045,7 @@ impl Shell {
         }
         // Otherwise a PS1 statement; an unknown first word that is not
         // installed reads as the familiar install hint.
-        match ps1::run_ps1_session(&mut self.sess, &mut self.fs, line, out) {
+        match self.run_ps1(line, out) {
             Ok(code) => {
                 self.last_code = code;
                 Ok(ShellFlow::Continue)
@@ -1187,11 +1241,28 @@ impl Shell {
         Ok(())
     }
 
+    /// `curl.exe` from the prompt.
+    fn run_curl(&mut self, args: &[String], out: &mut Vec<u8>) -> ShellFlow {
+        let run = crate::curl_command::run(&mut self.fs, args);
+        out.extend_from_slice(&run.stdout);
+        self.last_code = run.code;
+        ShellFlow::Continue
+    }
+
+    /// Run PowerShell text in this session; programs it calls run on the
+    /// session's backend.
+    fn run_ps1(&mut self, script: &str, out: &mut Vec<u8>) -> Result<i32, String> {
+        let mut host = ShellProcessHost {
+            backend: self.backend.clone(),
+        };
+        ps1::run_ps1_with_host(&mut self.sess, &mut self.fs, script, out, &mut host)
+    }
+
     /// Minimal `powershell -c <script>` passthrough so Windows install
     /// one-liners (`powershell -c "irm ...|iex"`) run as PS1 in-session.
     fn do_powershell(&mut self, argv: &[String], out: &mut Vec<u8>) -> Result<(), String> {
         let script = powershell_script(&self.fs, argv)?;
-        let code = ps1::run_ps1_session(&mut self.sess, &mut self.fs, &script, out)
+        let code = self.run_ps1(&script, out)
             .map_err(|e| format!("script error: {e}"))?;
         self.last_code = code;
         Ok(())

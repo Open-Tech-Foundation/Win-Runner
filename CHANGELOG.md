@@ -6,6 +6,17 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- PowerShell scripts run programs: `& "C:\app.exe" args`, bare names
+  resolved on the guest `PATH` with `PATHEXT`, `.ps1` files inline, output
+  captured by `$(...)` and assignments, `$LASTEXITCODE` (exit codes as signed
+  32-bit numbers), and `2>&1`-style redirections. `Write-Warning` and
+  `Write-Error` write to standard error (`Write-Error` stops under
+  `$ErrorActionPreference = 'Stop'`).
+- The disk has `C:\Windows\System32\curl.exe`, as Windows ships, running
+  plain HTTP(S) downloads through the host's curl into the guest disk
+  (`-fsSL`, `-#`, `-o`, `-O`, `--create-dirs`, headers, user agent, timeouts,
+  retries); `file://` URLs and options that reach host files are refused.
+
 - PowerShell `Add-Type -MemberDefinition` declares `[DllImport]` functions
   answered by built-in implementations (`IsProcessorFeaturePresent` from the
   host CPU, `SendMessageTimeout` broadcasts), callable as
@@ -78,6 +89,10 @@ All notable changes to this project will be documented in this file.
   and PATH immediately, preserving shell variables, functions, and files.
 
 ### Fixed
+
+- ZIP extraction reads entry sizes from the central directory, so archives
+  written with data descriptors (such as Bun's releases) extract instead of
+  failing.
 
 - Match Windows in the `native_startup` oracle: reject `recv` with
   `MSG_WAITALL | MSG_PUSH_IMMEDIATE` (`WSAEOPNOTSUPP`) without consuming data,

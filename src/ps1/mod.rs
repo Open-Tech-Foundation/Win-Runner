@@ -46,7 +46,10 @@
 
 mod essentials;
 mod dotnet;
+mod external;
 mod registry;
+
+pub use external::{ProcessHost, ProcessOutput};
 
 use crate::winfs::WinFs;
 use std::collections::HashMap;
@@ -158,6 +161,29 @@ pub fn run_ps1(fs: &mut WinFs, script: &str, out: &mut Vec<u8>) -> Result<i32, S
     run_ps1_session(&mut Session::default(), fs, script, out)
 }
 
+/// Run a script whose program calls (`& app.exe`, `curl.exe ...`) go to
+/// `host`.
+pub fn run_ps1_with_host(
+    sess: &mut Session,
+    fs: &mut WinFs,
+    script: &str,
+    out: &mut Vec<u8>,
+    host: &mut (dyn ProcessHost + 'static),
+) -> Result<i32, String> {
+    Interpreter {
+        fs,
+        out,
+        depth: 0,
+        vars: &mut sess.vars,
+        funcs: &mut sess.funcs,
+        types: &mut sess.types,
+        dir_stack: &mut sess.dir_stack,
+        environment: &mut sess.environment,
+        host: Some(host),
+    }
+    .run(script)
+}
+
 /// Run a script with a caller-held [`Session`] (variables persist).
 pub fn run_ps1_session(
     sess: &mut Session,
@@ -174,6 +200,7 @@ pub fn run_ps1_session(
         types: &mut sess.types,
         dir_stack: &mut sess.dir_stack,
         environment: &mut sess.environment,
+        host: None,
     };
     interp.run(script)
 }
@@ -187,6 +214,8 @@ struct Interpreter<'a> {
     types: &'a mut HashMap<String, dotnet::AddedType>,
     dir_stack: &'a mut Vec<String>,
     environment: &'a mut Vec<(String, String)>,
+    /// Starts programs the script calls; `None` refuses them.
+    host: Option<&'a mut (dyn ProcessHost + 'static)>,
 }
 
 impl<'a> Interpreter<'a> {
@@ -932,8 +961,21 @@ impl<'a> Interpreter<'a> {
         for tok in &toks {
             args.push(self.expand_token(tok)?);
         }
-        let cmd = args[0].to_lowercase();
-        let rest = &args[1..];
+        // `& target args`: the call operator runs a command, function, or
+        // program named by a (possibly quoted or computed) value.
+        let call = args[0] == "&" && args.len() > 1;
+        let (name, rest) = if call {
+            (args[1].clone(), &args[2..])
+        } else {
+            (args[0].clone(), &args[1..])
+        };
+        let cmd = name.to_lowercase();
+        // Neither a function nor a built-in: a program on the guest disk.
+        if !self.funcs.contains_key(&cmd) && (call || !is_builtin_command(&cmd)) {
+            if let Some(path) = self.resolve_program(&name) {
+                return self.run_program(&path, rest);
+            }
+        }
         // Loop signals and code execution (flow-aware) precede the
         // plain builtins below.
         if cmd == "break" {
@@ -1036,6 +1078,24 @@ impl<'a> Interpreter<'a> {
             "write-host" | "write-output" | "echo" => {
                 let (_, positional) = parse_params(rest, &[])?;
                 self.emit(&positional.join(" "));
+                Ok(())
+            }
+            // Warnings and non-terminating errors go to the console's error
+            // stream, never to captured output.
+            "write-warning" => {
+                let (named, positional) = parse_params(rest, &["message"])?;
+                let msg = named.get("message").cloned().unwrap_or_else(|| positional.join(" "));
+                eprintln!("WARNING: {msg}");
+                Ok(())
+            }
+            "write-error" => {
+                let (named, positional) = parse_params(rest, &["message", "category"])?;
+                let msg = named.get("message").cloned().unwrap_or_else(|| positional.join(" "));
+                // `$ErrorActionPreference = 'Stop'` makes it terminating.
+                if self.lookup_scalar("ErrorActionPreference").eq_ignore_ascii_case("stop") {
+                    return Err(msg);
+                }
+                eprintln!("Write-Error: {msg}");
                 Ok(())
             }
             "throw" => {
@@ -1339,6 +1399,29 @@ impl<'a> Interpreter<'a> {
             let text = String::from_utf8_lossy(&buf);
             let lines: Vec<String> = text.lines().map(str::to_string).collect();
             return Ok((lines_value(lines), Flow::Next));
+        }
+        // `$t = app.exe ...` / `$t = & $path ...`: a program's output lines.
+        if !vals.is_empty() && !vals[0].quoted {
+            let head = vals[0].text();
+            let lower = head.to_lowercase();
+            let program = head == "&"
+                || (!self.funcs.contains_key(&lower)
+                    && !is_builtin_command(&lower)
+                    && !head.starts_with(['$', '(', '@', '[', '-', '!'])
+                    && parse_number(&head).is_none()
+                    && self.resolve_program(&head).is_some());
+            if program {
+                let code: Vec<String> = vals.iter().map(token_source).collect();
+                let mut buf = Vec::new();
+                let flow = {
+                    let mut sub = self.sub(&mut buf);
+                    sub.exec_statement(&code.join(" "), None)
+                };
+                let flow = flow?;
+                let text = String::from_utf8_lossy(&buf);
+                let lines: Vec<String> = text.lines().map(str::to_string).collect();
+                return Ok((lines_value(lines), flow));
+            }
         }
         // `$t = Command [$args...]`: defined function or builtin, run
         // capturing output (0 lines → `""`, 1 → string, N → array).
@@ -2060,6 +2143,7 @@ impl<'a> Interpreter<'a> {
             types: &mut *self.types,
             dir_stack: &mut *self.dir_stack,
             environment: &mut *self.environment,
+            host: self.host.as_deref_mut(),
         }
     }
 
@@ -5663,6 +5747,8 @@ pub const COMMAND_NAMES: &[&str] = &[
     "expand-archive",
     "get-filehash",
     "add-type",
+    "write-warning",
+    "write-error",
     "mkdir",
     "md",
     "get-itemproperty",
@@ -6345,6 +6431,7 @@ $x
                 types: &mut types,
                 dir_stack: &mut stack,
                 environment: &mut environment,
+                host: None,
             };
             interp.cmd_iex(&["echo hi".to_string()], None).map(|_| ())
         }
