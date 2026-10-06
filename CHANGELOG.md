@@ -6,6 +6,17 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- PowerShell gains the registry provider: `Get-Item`, `New-Item`,
+  `Remove-Item` and `Test-Path` on `HKLM:`/`HKCU:` paths, `Get-`/`New-`/
+  `Set-`/`Remove-ItemProperty`, and `RegistryKey` objects with `OpenSubKey`,
+  `CreateSubKey`, `GetValue` (with `DoNotExpandEnvironmentNames`),
+  `GetValueKind`, `SetValue`, `DeleteValue` and name listings, backed by the
+  guest hives. Commands work as `if` conditions, `(expr).Member` is a
+  statement, `[Type]::Member` reads registry enums and `[IntPtr]::Zero`, and
+  a missing object member reads as `$null`. A new `powershell_scripting.ps1`
+  Windows oracle checks these against real PowerShell, and both oracle
+  runners now run every `tests/oracle/*.ps1`.
+
 - PowerShell scripts and functions accept `param(...)` blocks with typed,
   `[switch]` and defaulted parameters bound by name (`-Name value`,
   `-Name:value`, unique prefixes) or position, and `return` outputs its value

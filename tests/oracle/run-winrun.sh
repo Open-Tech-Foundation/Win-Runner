@@ -24,6 +24,10 @@ for exe in "$ROOT"/tests/artifacts/exe/oracle_*.exe; do
         "$WINRUN" shell 2>"$OUT/$name.stderr" | tr -d '\r' >"$OUT/$name.txt" || true
     echo "ran $name: $(wc -l <"$OUT/$name.txt") lines"
 done
-printf 'New-Item C:\\oracle-run -ItemType Directory\ncd C:\\oracle-run\n@seed "%s" C:\\oracle-run\\powershell_essentials.ps1\npowershell -File C:\\oracle-run\\powershell_essentials.ps1\nexit\n' "$ROOT/tests/oracle/powershell_essentials.ps1" |
-    "$WINRUN" shell 2>"$OUT/powershell_essentials.stderr" | tr -d '\r' >"$OUT/powershell_essentials.txt"
-echo "ran powershell_essentials: $(wc -l <"$OUT/powershell_essentials.txt") lines"
+for script in "$ROOT"/tests/oracle/*.ps1; do
+    name="$(basename "$script" .ps1)"
+    [[ "$name" == run-* ]] && continue
+    printf 'New-Item C:\\oracle-run -ItemType Directory\ncd C:\\oracle-run\n@seed "%s" C:\\oracle-run\\%s.ps1\npowershell -File C:\\oracle-run\\%s.ps1\nexit\n' "$script" "$name" "$name" |
+        "$WINRUN" shell 2>"$OUT/$name.stderr" | tr -d '\r' >"$OUT/$name.txt" || true
+    echo "ran $name: $(wc -l <"$OUT/$name.txt") lines"
+done

@@ -45,15 +45,19 @@ Get-ChildItem (Join-Path $root 'tests\artifacts\exe') -Filter 'oracle_*.exe' | F
         Remove-Item -Recurse -Force $run -ErrorAction SilentlyContinue
     }
 }
-# PowerShell compatibility uses the same script instead of a Win32 PE probe.
-$run = Join-Path $root ("oracle-run-" + [guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory -Path $run | Out-Null
-Push-Location $run
-try {
-    $probe = Join-Path $root 'tests\oracle\powershell_essentials.ps1'
-    $text = (& $probe | Out-String -Width 4096) -replace "`r`n", "`n"
-    [System.IO.File]::WriteAllText((Join-Path $OutputDir 'powershell_essentials.txt'), $text)
-} finally {
-    Pop-Location
-    Remove-Item -Recurse -Force $run -ErrorAction SilentlyContinue
+# PowerShell compatibility uses the same scripts instead of Win32 PE probes.
+Get-ChildItem (Join-Path $root 'tests\oracle') -Filter '*.ps1' |
+    Where-Object { $_.Name -notlike 'run-*' } | ForEach-Object {
+    $name = $_.BaseName
+    $run = Join-Path $root ("oracle-run-" + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $run | Out-Null
+    Push-Location $run
+    try {
+        $text = (& $_.FullName | Out-String -Width 4096) -replace "`r`n", "`n"
+        [System.IO.File]::WriteAllText((Join-Path $OutputDir "$name.txt"), $text)
+        Write-Host "ran ${name}"
+    } finally {
+        Pop-Location
+        Remove-Item -Recurse -Force $run -ErrorAction SilentlyContinue
+    }
 }

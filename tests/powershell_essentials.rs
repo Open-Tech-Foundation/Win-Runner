@@ -54,3 +54,41 @@ fn powershell_oracle_script_finishes_with_expected_native_results() {
     assert!(err.is_empty(), "{err}");
     assert_eq!(out, "rename.old\nFalse\nrename.new\nTrue\nhello\nhello\ncollision: rejected\nkeep\nTrue\nFalse\nnested\nlisting\ntaken.mjs\nwith space.mjs\nnested.txt\n.txt\nTrue\npipeline\nappend\nTrue\nEND\n");
 }
+
+#[test]
+fn powershell_scripting_oracle_script_matches_windows_results() {
+    let probe = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/oracle/powershell_scripting.ps1"
+    );
+    let (out, err) = shell(&format!(
+        "@seed \"{probe}\" C:\\probe.ps1\npowershell -File C:\\probe.ps1\nexit\n"
+    ));
+    assert!(err.is_empty(), "{err}");
+    assert_eq!(
+        out,
+        "param.defaults: latest False\n\
+         param.bound: def-False-False\n\
+         param.bound: x-True-False\n\
+         param.bound: y-False-True\n\
+         param.bound: z-False-False\n\
+         return.early: one\n\
+         return.value: loop-5\n\
+         reg.arch: AMD64\n\
+         reg.created: HKEY_CURRENT_USER\\Software\\WinRunOracle\n\
+         reg.plain: C:\\plain\n\
+         reg.expanded: C:\\Windows\\x\n\
+         reg.number: 7\n\
+         reg.changed: C:\\changed\n\
+         reg.root: HKEY_CURRENT_USER\n\
+         reg.open: HKEY_CURRENT_USER\\Software\\WinRunOracle\n\
+         reg.raw: %SystemRoot%\\x\n\
+         reg.kind: ExpandString DWord\n\
+         reg.set: ExpandString a;b\n\
+         reg.deleted: gone\n\
+         reg.missing: null\n\
+         reg.removed: []\n\
+         reg.cleaned: False\n\
+         END\n"
+    );
+}

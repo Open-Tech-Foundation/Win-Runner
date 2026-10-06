@@ -45,6 +45,7 @@
 //! that the EXE shims use.
 
 mod essentials;
+mod registry;
 
 use crate::winfs::WinFs;
 use std::collections::HashMap;
@@ -465,6 +466,16 @@ impl<'a> Interpreter<'a> {
             }
             return self.eval_cond_tokens(&toks[i + 1..]);
         }
+        // A command as the condition (`if (Test-Path $p)`): its output's
+        // truthiness decides.
+        if !toks[0].quoted {
+            let head = toks[0].text().to_lowercase();
+            if is_builtin_command(&head) || self.funcs.contains_key(&head) {
+                let code: Vec<String> = toks.iter().map(token_source).collect();
+                let out = self.eval_sub(&code.join(" "))?;
+                return Ok(is_truthy(&out));
+            }
+        }
         if toks.len() == 1 {
             let t = toks[0].text();
             if t.eq_ignore_ascii_case("$true") {
@@ -718,9 +729,27 @@ impl<'a> Interpreter<'a> {
             }
             return Ok(Flow::Next);
         }
+        // `[Type]::Member` as a whole statement outputs the member.
+        if let Some((typ, member, rest)) = split_static_member(stmt.trim_start()) {
+            if rest.trim().is_empty() {
+                let v = self.eval_static_member(&typ, &member)?;
+                self.emit(&v);
+                return Ok(Flow::Next);
+            }
+        }
         // `(...)` grouping: evaluate capturing output here.
         if stmt.trim_start().starts_with('(') {
             let (inner, rest) = take_wrapped(stmt.trim_start(), '(', ')')?;
+            if rest.trim_start().starts_with(['.', '[']) {
+                // `(expr).Member` / `(expr)[i]`: output the member value.
+                let (v, flow) = self.eval_paren_inner(&inner)?;
+                if !matches!(flow, Flow::Next) {
+                    return Ok(flow);
+                }
+                let v = self.apply_member_rest(v, rest.trim())?;
+                self.emit_value(&v);
+                return Ok(Flow::Next);
+            }
             if !rest.trim().is_empty() {
                 return Err("unexpected text after (...)".to_string());
             }
@@ -776,6 +805,10 @@ impl<'a> Interpreter<'a> {
                         Value::Str(_) => {}
                     }
                 }
+            }
+            if let Some(v) = self.object_member_expr(&toks[0])? {
+                self.emit_value(&v);
+                return Ok(Flow::Next);
             }
             let v = self.expand_token(&toks[0])?;
             self.emit(&v);
@@ -879,6 +912,10 @@ impl<'a> Interpreter<'a> {
             "move-item" | "move" | "mv" | "mi" => self.cmd_move_item(rest),
             "test-path" => self.cmd_test_path(rest),
             "get-item" => self.cmd_get_item(rest),
+            "get-itemproperty" | "gp" => self.cmd_get_item_property(rest),
+            "new-itemproperty" => self.cmd_set_item_property(rest, true),
+            "set-itemproperty" | "sp" => self.cmd_set_item_property(rest, false),
+            "remove-itemproperty" | "rp" => self.cmd_remove_item_property(rest),
             "get-location" | "pwd" | "gl" => {
                 let path = self.fs.cwd();
                 self.emit(&path);
@@ -1222,22 +1259,14 @@ impl<'a> Interpreter<'a> {
                 return Ok((lines_value(lines), Flow::Next));
             }
             if is_builtin_command(&fname) {
+                let mut argvals = Vec::with_capacity(vals.len().saturating_sub(1));
+                for tok in vals.iter().skip(1) {
+                    argvals.push(self.expand_token(tok)?);
+                }
                 // Preserve command response objects for member access in
                 // value position rather than capturing their display text.
-                if matches!(
-                    fname.as_str(),
-                    "get-filehash" | "invoke-webrequest" | "iwr" | "wget"
-                ) {
-                    let mut argvals = Vec::with_capacity(vals.len().saturating_sub(1));
-                    for tok in vals.iter().skip(1) {
-                        argvals.push(self.expand_token(tok)?);
-                    }
-                    let v = if fname == "get-filehash" {
-                        self.get_filehash_value(&argvals)?
-                    } else {
-                        self.webrequest_value(&argvals)?
-                    };
-                    return Ok((v, Flow::Next));
+                if let Some(v) = self.object_command(&fname, &argvals) {
+                    return Ok((v?, Flow::Next));
                 }
                 let mut argvals = Vec::with_capacity(vals.len().saturating_sub(1));
                 for tok in vals.iter().skip(1) {
@@ -1298,6 +1327,9 @@ impl<'a> Interpreter<'a> {
         }
         if vals.len() != 1 {
             return Err("unexpected tokens after assignment value".to_string());
+        }
+        if let Some(v) = self.object_member_expr(&vals[0])? {
+            return Ok((v, Flow::Next));
         }
         Ok((Value::Str(self.expand_token(&vals[0])?), Flow::Next))
     }
@@ -1754,6 +1786,12 @@ impl<'a> Interpreter<'a> {
                     }
                     None => {}
                 }
+                if let Some((typ, member, rest2)) = split_static_member(&tail) {
+                    let v = self.eval_static_member(&typ, &member)?;
+                    out.push_str(&v);
+                    i += tail.chars().count() - rest2.chars().count();
+                    continue;
+                }
             }
             if c != '$' || !ex {
                 out.push(c);
@@ -2004,7 +2042,7 @@ impl<'a> Interpreter<'a> {
     /// `$recv.Method(args)`: `ContainsKey` on maps; case/trim/replace/
     /// split/starts/ends/contains on strings. Anything else fails clearly.
     /// Booleans render PowerShell-capitalized (`True`/`False`).
-    fn eval_method(&self, recv: &str, method: &str, args: &[String]) -> Result<Value, String> {
+    fn eval_method(&mut self, recv: &str, method: &str, args: &[String]) -> Result<Value, String> {
         let receiver = match self.vars.get(&recv.to_lowercase()) {
             Some(v) => v.clone(),
             None => return Err("cannot call method on null".to_string()),
@@ -2015,11 +2053,15 @@ impl<'a> Interpreter<'a> {
     /// Method call on an already-resolved value (member chains on
     /// parenthesized expressions share this with `$var.Method()`).
     fn eval_method_value(
-        &self,
+        &mut self,
         receiver: Value,
         method: &str,
         args: &[String],
     ) -> Result<Value, String> {
+        if let Some((hive, sub)) = registry::as_key(&receiver) {
+            let args: Vec<Value> = args.iter().cloned().map(Value::Str).collect();
+            return self.registry_key_method(hive, &sub, method, &args);
+        }
         let m = method.to_lowercase();
         match receiver {
             Value::Map(map) => {
@@ -2190,6 +2232,47 @@ impl<'a> Interpreter<'a> {
         Err(format!("type [{typ}] is not supported"))
     }
 
+    /// `$obj.Member...` / `$obj.Method(...)...` on an object variable (a
+    /// registry key), keeping object results such as `OpenSubKey`'s.
+    /// `None` when the token is not such an expression.
+    fn object_member_expr(&mut self, tok: &Token) -> Result<Option<Value>, String> {
+        // Quotes inside the argument list are fine; a quoted head is not.
+        if tok.chars.first() != Some(&('$', true)) {
+            return Ok(None);
+        }
+        let text = tok.text();
+        let Some(after) = text.strip_prefix('$') else {
+            return Ok(None);
+        };
+        let end = after
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(after.len());
+        let rest = &after[end..];
+        if end == 0 || !(rest.starts_with('.') || rest.starts_with('[')) {
+            return Ok(None);
+        }
+        match self.vars.get(&after[..end].to_lowercase()) {
+            Some(v) if registry::as_key(v).is_some() => {
+                let v = v.clone();
+                self.apply_member_rest(v, rest).map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// `[Type]::Member` static properties and enum values.
+    fn eval_static_member(&mut self, typ: &str, member: &str) -> Result<String, String> {
+        if let Some(v) = registry::enum_member(typ, member) {
+            return Ok(v);
+        }
+        let t = typ.to_lowercase();
+        let t = t.strip_prefix("system.").unwrap_or(&t);
+        if matches!(t, "intptr" | "uintptr") && member.eq_ignore_ascii_case("zero") {
+            return Ok("0".to_string());
+        }
+        Err(format!("[{typ}]::{member} is not supported"))
+    }
+
     /// `$v[key]`: map lookup (case-insensitive, missing → empty), array
     /// or string index (negative counts from the end, out-of-range →
     /// empty), unset (`$null`) → empty.
@@ -2239,6 +2322,17 @@ impl<'a> Interpreter<'a> {
             }
         });
         let force = named.contains_key("force");
+        if registry::provider_path(&path).is_some() {
+            let mut path = path;
+            if let Some(name) = named.get("name") {
+                path = format!(r"{}\{name}", path.trim_end_matches('\\'));
+            }
+            let key = self.registry_new_item(&path, force)?;
+            self.emit(&value_string(&Value::Str(
+                registry::key_name(&key).unwrap_or_default(),
+            )));
+            return Ok(());
+        }
         if item_type.eq_ignore_ascii_case("directory") {
             if force {
                 self.fs.mkdir(&path).map_err(|e| format!("New-Item: {e}"))?;
@@ -2508,6 +2602,9 @@ impl<'a> Interpreter<'a> {
             .or_else(|| pos.first().cloned())
             .ok_or_else(|| "Remove-Item: missing -Path".to_string())?;
         let recurse = named.contains_key("recurse");
+        if registry::provider_path(&path).is_some() {
+            return self.registry_remove_item(&path, recurse);
+        }
         // `-Force` does not imply recursive deletion; only `-Recurse` does.
         self.fs
             .remove(&path, recurse)
@@ -2622,6 +2719,11 @@ impl<'a> Interpreter<'a> {
             .cloned()
             .or_else(|| pos.first().cloned())
             .ok_or_else(|| "Test-Path: missing -Path".to_string())?;
+        if registry::provider_path(&path).is_some() {
+            let exists = self.registry_exists(&path)?;
+            self.emit(&bool_string(exists));
+            return Ok(());
+        }
         let exists = match named.get("pathtype").map(|v| v.to_lowercase()).as_deref() {
             None | Some("any") => self.fs.test_path(&path),
             Some("leaf") => self.fs.is_file(&path),
@@ -2642,6 +2744,11 @@ impl<'a> Interpreter<'a> {
             .cloned()
             .or_else(|| pos.first().cloned())
             .ok_or_else(|| "Get-Item: missing -Path".to_string())?;
+        if registry::provider_path(&path).is_some() {
+            let key = self.registry_get_item(&path)?;
+            self.emit(&registry::key_name(&key).unwrap_or_default());
+            return Ok(());
+        }
         let display = self
             .fs
             .normalize(&path)
@@ -2935,6 +3042,147 @@ impl<'a> Interpreter<'a> {
         Ok(Value::Map(map))
     }
 
+    /// Commands whose value-position result is an object (member access
+    /// works on it) rather than captured display text.
+    fn is_object_command(&self, cmd: &str) -> bool {
+        !self.funcs.contains_key(cmd)
+            && matches!(
+                essentials::canonical_command(cmd),
+                "get-filehash"
+                    | "invoke-webrequest"
+                    | "get-item"
+                    | "new-item"
+                    | "get-itemproperty"
+                    | "gp"
+            )
+    }
+
+    /// The object a command yields in value position, or `None` when this
+    /// invocation produces plain output (e.g. `Get-Item` on a file).
+    fn object_command(&mut self, cmd: &str, argvals: &[String]) -> Option<Result<Value, String>> {
+        if !self.is_object_command(cmd) {
+            return None;
+        }
+        match essentials::canonical_command(cmd) {
+            "get-filehash" => Some(self.get_filehash_value(argvals)),
+            "invoke-webrequest" => Some(self.webrequest_value(argvals)),
+            "get-item" => {
+                let path = item_path_arg(argvals)?;
+                registry::provider_path(&path)?;
+                Some(self.registry_get_item(&path))
+            }
+            "new-item" => {
+                let path = item_path_arg(argvals)?;
+                registry::provider_path(&path)?;
+                Some(self.registry_new_item_args(argvals))
+            }
+            _ => Some(self.get_item_property_args(argvals)),
+        }
+    }
+
+    fn registry_new_item_args(&mut self, args: &[String]) -> Result<Value, String> {
+        let (named, pos) = parse_params(args, &["path", "force", "name"])?;
+        let mut path = named
+            .get("path")
+            .cloned()
+            .or_else(|| pos.first().cloned())
+            .ok_or_else(|| "New-Item: missing -Path".to_string())?;
+        if let Some(name) = named.get("name") {
+            path = format!(r"{}\{name}", path.trim_end_matches('\\'));
+        }
+        self.registry_new_item(&path, named.contains_key("force"))
+    }
+
+    fn get_item_property_args(&mut self, args: &[String]) -> Result<Value, String> {
+        let (named, pos) = parse_params(args, &["path", "literalpath", "name"])?;
+        let path = named
+            .get("literalpath")
+            .or_else(|| named.get("path"))
+            .cloned()
+            .or_else(|| pos.first().cloned())
+            .ok_or_else(|| "Get-ItemProperty: missing -Path".to_string())?;
+        if registry::provider_path(&path).is_none() {
+            return Err(format!(
+                "Get-ItemProperty: only registry paths are supported: {path}"
+            ));
+        }
+        let name = named.get("name").cloned().or_else(|| pos.get(1).cloned());
+        self.registry_item_property(&path, name.as_deref())
+    }
+
+    /// `Get-ItemProperty`: one `Name : value` line per registry value.
+    fn cmd_get_item_property(&mut self, args: &[String]) -> Result<(), String> {
+        let Value::Map(map) = self.get_item_property_args(args)? else {
+            unreachable!("registry properties are a map");
+        };
+        let mut names: Vec<&String> = map.keys().collect();
+        names.sort_by_key(|n| n.to_lowercase());
+        for name in names {
+            let line = format!("{name} : {}", value_string(&map[name]));
+            self.emit(&line);
+        }
+        Ok(())
+    }
+
+    /// `New-ItemProperty` / `Set-ItemProperty` on a registry key.
+    fn cmd_set_item_property(&mut self, args: &[String], create: bool) -> Result<(), String> {
+        let what = if create { "New-ItemProperty" } else { "Set-ItemProperty" };
+        let (named, pos) = parse_params(
+            args,
+            &["path", "literalpath", "name", "value", "propertytype", "type", "force"],
+        )?;
+        let path = named
+            .get("literalpath")
+            .or_else(|| named.get("path"))
+            .cloned()
+            .or_else(|| pos.first().cloned())
+            .ok_or_else(|| format!("{what}: missing -Path"))?;
+        let name = named
+            .get("name")
+            .cloned()
+            .or_else(|| pos.get(1).cloned())
+            .ok_or_else(|| format!("{what}: missing -Name"))?;
+        let value = named
+            .get("value")
+            .cloned()
+            .or_else(|| pos.get(2).cloned())
+            .unwrap_or_default();
+        if registry::provider_path(&path).is_none() {
+            return Err(format!("{what}: only registry paths are supported: {path}"));
+        }
+        let kind = named.get("propertytype").or_else(|| named.get("type"));
+        self.registry_set_property(
+            &path,
+            &name,
+            &Value::Str(value),
+            kind.map(String::as_str),
+            create,
+            named.contains_key("force"),
+        )
+    }
+
+    /// `Remove-ItemProperty <key> -Name n`.
+    fn cmd_remove_item_property(&mut self, args: &[String]) -> Result<(), String> {
+        let (named, pos) = parse_params(args, &["path", "literalpath", "name", "force"])?;
+        let path = named
+            .get("literalpath")
+            .or_else(|| named.get("path"))
+            .cloned()
+            .or_else(|| pos.first().cloned())
+            .ok_or_else(|| "Remove-ItemProperty: missing -Path".to_string())?;
+        let name = named
+            .get("name")
+            .cloned()
+            .or_else(|| pos.get(1).cloned())
+            .ok_or_else(|| "Remove-ItemProperty: missing -Name".to_string())?;
+        if registry::provider_path(&path).is_none() {
+            return Err(format!(
+                "Remove-ItemProperty: only registry paths are supported: {path}"
+            ));
+        }
+        self.registry_remove_property(&path, &name)
+    }
+
     /// `Get-FileHash` from already-expanded argument values (shared by
     /// value position and parenthesized member chains).
     fn get_filehash_value(&self, argvals: &[String]) -> Result<Value, String> {
@@ -3055,23 +3303,17 @@ impl<'a> Interpreter<'a> {
                 Flow::Next,
             ));
         }
-        if !toks.is_empty()
-            && !toks[0].verbatim()
-            && matches!(
-                toks[0].text().to_lowercase().as_str(),
-                "get-filehash" | "invoke-webrequest" | "iwr" | "wget"
-            )
-        {
-            let mut argvals = Vec::with_capacity(toks.len().saturating_sub(1));
-            for tok in toks.iter().skip(1) {
-                argvals.push(self.expand_token(tok)?);
+        if !toks.is_empty() && !toks[0].verbatim() {
+            let cmd = toks[0].text().to_lowercase();
+            if self.is_object_command(&cmd) {
+                let mut argvals = Vec::with_capacity(toks.len().saturating_sub(1));
+                for tok in toks.iter().skip(1) {
+                    argvals.push(self.expand_token(tok)?);
+                }
+                if let Some(v) = self.object_command(&cmd, &argvals) {
+                    return Ok((v?, Flow::Next));
+                }
             }
-            let v = if toks[0].text().eq_ignore_ascii_case("get-filehash") {
-                self.get_filehash_value(&argvals)?
-            } else {
-                self.webrequest_value(&argvals)?
-            };
-            return Ok((v, Flow::Next));
         }
         let mut buf = Vec::new();
         let flow = {
@@ -3113,8 +3355,14 @@ impl<'a> Interpreter<'a> {
                     cur = self.eval_method_value(cur, name, &argvals)?;
                     r = rest2.trim().to_string();
                 } else {
-                    let s = Self::navigate_value(cur, name)
-                        .ok_or_else(|| format!("member {name} not found"))?;
+                    // A missing member of an object reads as `$null`,
+                    // as in PowerShell without strict mode.
+                    let object = matches!(cur, Value::Map(_));
+                    let s = match Self::navigate_value(cur, name) {
+                        Some(s) => s,
+                        None if object => String::new(),
+                        None => return Err(format!("member {name} not found")),
+                    };
                     cur = Value::Str(s);
                     r = tail.trim().to_string();
                 }
@@ -4264,7 +4512,10 @@ fn render_json(v: &Value) -> String {
             format!("[{}]", parts.join(","))
         }
         Value::Map(map) => {
-            let mut keys: Vec<&String> = map.keys().collect();
+            let mut keys: Vec<&String> = map
+                .keys()
+                .filter(|k| !registry::is_hidden_member(k))
+                .collect();
             keys.sort();
             let parts: Vec<String> = keys
                 .iter()
@@ -4447,6 +4698,30 @@ fn split_static_call(s: &str) -> Result<Option<(String, String, String, String)>
     Ok(Some((typ, method, inner, rest2)))
 }
 
+/// Parse `[Type]::Member` (no call parentheses): returns (type, member,
+/// rest). `None` for any other shape, including static method calls.
+fn split_static_member(s: &str) -> Option<(String, String, String)> {
+    let t = s.trim_start();
+    let inner = t.strip_prefix('[')?;
+    let end = inner.find(']')?;
+    let typ = &inner[..end];
+    if typ.is_empty()
+        || !typ
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+    {
+        return None;
+    }
+    let rest = inner[end + 1..].strip_prefix("::")?;
+    let mend = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    if mend == 0 || rest[mend..].trim_start().starts_with('(') {
+        return None;
+    }
+    Some((typ.to_string(), rest[..mend].to_string(), rest[mend..].to_string()))
+}
+
 /// A value in string context: strings as-is, arrays space-joined
 /// (recursively), empty maps stringify empty.
 fn value_string(v: &Value) -> String {
@@ -4531,6 +4806,26 @@ fn split_top_commas(s: &str) -> Vec<String> {
     }
     parts.push(cur);
     parts
+}
+
+/// The `-Path`/`-LiteralPath`/first positional argument of an item command.
+fn item_path_arg(args: &[String]) -> Option<String> {
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a.eq_ignore_ascii_case("-path") || a.eq_ignore_ascii_case("-literalpath") {
+            return args.get(i + 1).cloned();
+        }
+        if a.starts_with('-') && a.len() > 1 {
+            // Every other item parameter here either takes a value or is a
+            // switch; skip a following value only for value parameters.
+            let switch = ["-force", "-recurse"].iter().any(|s| a.eq_ignore_ascii_case(s));
+            i += if switch { 1 } else { 2 };
+            continue;
+        }
+        return Some(a.clone());
+    }
+    None
 }
 
 /// Parse a parameter list (`function F(...)` or `param(...)`): each entry
@@ -4925,6 +5220,13 @@ pub const COMMAND_NAMES: &[&str] = &[
     "wget",
     "expand-archive",
     "get-filehash",
+    "get-itemproperty",
+    "gp",
+    "new-itemproperty",
+    "set-itemproperty",
+    "sp",
+    "remove-itemproperty",
+    "rp",
     "iex",
     "invoke-expression",
     "break",
@@ -5083,6 +5385,35 @@ fn take_balanced(cs: &[(char, bool)]) -> Result<(String, usize), String> {
         i += 1;
     }
     Err("unbalanced $(...)".to_string())
+}
+
+/// A token back as source text: single-quoted spans requoted so they stay
+/// verbatim, and expandable text quoted when it holds whitespace.
+fn token_source(tok: &Token) -> String {
+    if !tok.quoted {
+        return tok.text();
+    }
+    let mut out = String::new();
+    let mut verbatim = None;
+    for &(c, ex) in &tok.chars {
+        if verbatim != Some(!ex) {
+            if let Some(v) = verbatim {
+                out.push(if v { '\'' } else { '"' });
+            }
+            out.push(if ex { '"' } else { '\'' });
+            verbatim = Some(!ex);
+        }
+        if !ex && c == '\'' {
+            out.push('\'');
+        }
+        out.push(c);
+    }
+    match verbatim {
+        Some(true) => out.push('\''),
+        Some(false) => out.push('"'),
+        None => out.push_str("''"),
+    }
+    out
 }
 
 /// True for plain variable names (case-insensitive, ASCII).
