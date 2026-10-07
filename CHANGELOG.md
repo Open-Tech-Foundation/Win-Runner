@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- MSVC exception handling from VCRUNTIME140: `_CxxThrowException`,
+  `__CxxFrameHandler3` (try/catch by type, value, reference and `...`,
+  rethrow, throws from catch blocks, destructor and cleanup funclets) and
+  `__C_specific_handler` (`__except` filters, `__finally`). Rust programs
+  built for `x86_64-pc-windows-msvc` now unwind panics: `catch_unwind`,
+  `#[should_panic]`, failing `assert!`s and `expect`s in test harnesses, and
+  thread panics behave as on Windows instead of stopping the process. New
+  `cxx_eh` and `rust_unwind` Windows oracles check both.
+
 - Native Win32 mutexes (`CreateMutexA/W`, `CreateMutexExA/W`,
   `OpenMutexA/W`, `ReleaseMutex`) with owner recursion, names, waits
   (including wait-all) and handle duplication, plus `BCryptGenRandom`,

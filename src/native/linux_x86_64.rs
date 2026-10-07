@@ -152,6 +152,9 @@ pub(super) use runner::*;
 #[path = "linux_x86_64/exceptions.rs"]
 mod exceptions;
 use exceptions::*;
+#[path = "linux_x86_64/cxx_eh.rs"]
+mod cxx_eh;
+use cxx_eh::*;
 #[path = "linux_x86_64/crypto.rs"]
 mod crypto;
 use crypto::*;

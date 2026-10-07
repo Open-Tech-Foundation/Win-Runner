@@ -161,6 +161,27 @@ std::arch::global_asm!(
     "add rsp, 0x518",
     "ret",
     ".size winrun_native_raise_exception, .-winrun_native_raise_exception",
+    // _CxxThrowException(object, throw_info): capture the thrower's context
+    // like RaiseException, then raise the C++ exception from Rust.
+    ".global winrun_native_cxx_throw_exception",
+    ".type winrun_native_cxx_throw_exception,@function",
+    "winrun_native_cxx_throw_exception:",
+    "mov [rsp + 8], rcx",
+    "mov [rsp + 16], rdx",
+    "sub rsp, 0x518",
+    "lea rcx, [rsp + 0x40]",
+    "call winrun_native_rtl_capture_context",
+    "lea rax, [rsp + 0x520]",
+    "mov [rsp + 0x40 + 152], rax",
+    "mov rax, [rsp + 0x518]",
+    "mov [rsp + 0x40 + 248], rax",
+    "mov rcx, [rsp + 0x520]",
+    "mov rdx, [rsp + 0x528]",
+    "lea r8, [rsp + 0x40]",
+    "call winrun_cxx_throw_with_context",
+    "add rsp, 0x518",
+    "ret",
+    ".size winrun_native_cxx_throw_exception, .-winrun_native_cxx_throw_exception",
     ".global winrun_native_rtl_unwind_ex",
     ".type winrun_native_rtl_unwind_ex,@function",
     "winrun_native_rtl_unwind_ex:",
@@ -246,6 +267,7 @@ std::arch::global_asm!(
 unsafe extern "win64" {
     pub(super) fn winrun_native_rtl_capture_context(context: *mut u8);
     pub(super) fn winrun_native_raise_exception(code: u32, flags: u32, count: u32, arguments: *const u64);
+    pub(super) fn winrun_native_cxx_throw_exception(object: u64, throw_info: u64);
     pub(super) fn winrun_native_rtl_unwind_ex(
         target_frame: u64,
         target_ip: u64,

@@ -3531,10 +3531,10 @@ mod protection_tests {
             assert!(super::supports_import("MSVCRT.dll", export), "{export}");
             assert!(super::baseline_trampoline(export).is_some(), "{export}");
         }
-        assert!(!super::supports_import(
-            "VCRUNTIME140.dll",
-            "__CxxFrameHandler3"
-        ));
+        for export in ["_CxxThrowException", "__CxxFrameHandler3", "__C_specific_handler"] {
+            assert!(super::supports_import("VCRUNTIME140.dll", export), "{export}");
+        }
+        assert!(super::supports_import("ntdll.dll", "__C_specific_handler"));
         assert!(super::supports_import("MSVCRT.dll", "__lconv_init"));
         assert!(super::supports_import("MSVCRT.dll", "strncmp"));
         assert!(super::supports_import("MSVCRT.dll", "setlocale"));

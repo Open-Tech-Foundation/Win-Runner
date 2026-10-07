@@ -376,6 +376,9 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                     | "__uncaught_exceptions"
                     | "__current_exception"
                     | "__current_exception_context"
+                    | "_CxxThrowException"
+                    | "__CxxFrameHandler3"
+                    | "__C_specific_handler"
             )
         }
         "SECUR32.DLL" | "SSPICLI.DLL" => matches!(
@@ -530,6 +533,7 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
         "NTDLL.DLL" => matches!(
             func,
             "RtlAddFunctionTable"
+                | "__C_specific_handler"
                 | "RtlCaptureContext"
                 | "RtlDeleteFunctionTable"
                 | "RtlDispatchException"
@@ -1124,6 +1128,9 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "RaiseException" => Some(winrun_native_raise_exception as *const () as usize as u64),
         "RtlUnwindEx" => Some(winrun_native_rtl_unwind_ex as *const () as usize as u64),
         "RtlUnwind" => Some(winrun_native_rtl_unwind as *const () as usize as u64),
+        "_CxxThrowException" => Some(winrun_native_cxx_throw_exception as *const () as usize as u64),
+        "__CxxFrameHandler3" => Some(native_cxx_frame_handler3 as *const () as usize as u64),
+        "__C_specific_handler" => Some(native_c_specific_handler as *const () as usize as u64),
         "RtlRestoreContext" => Some(native_rtl_restore_context as *const () as usize as u64),
         "RtlRaiseException" => Some(native_rtl_raise_exception as *const () as usize as u64),
         // Winsock's stable ordinal exports for byte-order conversion.

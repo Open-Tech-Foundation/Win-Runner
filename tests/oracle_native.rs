@@ -122,6 +122,17 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
         // are checked in. Windows CI compares every new probe with Windows.
         let required: &[&str] = match name.as_str() {
             "desktop_clipboard" => &["format.register: ok", "global.movable: ok", "global.zeroed: ok", "global.nested_lock: ok", "global.final_unlock: ok", "global.not_locked: ok", "global.free: ok", "global.fixed: ok", "window.create: ok", "window.post: ok", "window.peek: ok", "window.remove: ok", "clipboard.not_open: ok", "clipboard.open: ok", "clipboard.set: ok", "clipboard.roundtrip: ok", "clipboard.close: ok", "clipboard.child: ok", "clipboard.clear: ok", "window.destroy: ok", "window.invalid: ok"],
+            "cxx_eh" => &[
+                "catch.std_exception: runtime", "catch.by_value_slices: base", "catch.by_reference: derived",
+                "catch.order: int 42", "catch.all: ok", "rethrow: outer 42", "level.caught: runtime",
+                "from_catch: second alive=1", "nested_catch: 2", "nested_rethrow: 1",
+                "seh.divide: caught filter_calls=1", "seh.finally: abnormal=1", "seh.custom: caught",
+                "seh.access_violation: caught", "after_seh: catch ok", "after_run: alive=0",
+            ],
+            "rust_unwind" => &[
+                "catch_unwind: true", "drops: 5", "nested: true", "resume_unwind: Some(42)",
+                "no_panic: Some(7)", "drop: thread", "thread_join: true",
+            ],
             "sync_crypto" => &[
                 "mutex.create_owned: ok", "mutex.recursive_wait: 0", "mutex.other_wait: 258",
                 "mutex.other_release: 0 err=288", "mutex.release_free: 0 err=288", "mutex.handoff_wait: 0",

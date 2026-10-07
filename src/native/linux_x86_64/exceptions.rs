@@ -78,17 +78,17 @@ pub(super) struct NativeExceptionPointers {
 }
 
 #[repr(C)]
-struct NativeDispatcherContext {
-    control_pc: u64,
-    image_base: u64,
-    function_entry: *const NativeRuntimeFunction,
-    establisher_frame: u64,
-    target_ip: u64,
-    context_record: *mut NativeExceptionContext,
-    language_handler: u64,
-    handler_data: *mut c_void,
-    history_table: *mut c_void,
-    scope_index: u32,
+pub(super) struct NativeDispatcherContext {
+    pub(super) control_pc: u64,
+    pub(super) image_base: u64,
+    pub(super) function_entry: *const NativeRuntimeFunction,
+    pub(super) establisher_frame: u64,
+    pub(super) target_ip: u64,
+    pub(super) context_record: *mut NativeExceptionContext,
+    pub(super) language_handler: u64,
+    pub(super) handler_data: *mut c_void,
+    pub(super) history_table: *mut c_void,
+    pub(super) scope_index: u32,
 }
 
 impl NativeExceptionContext {
@@ -744,7 +744,7 @@ fn is_guest_image_address(address: u64) -> bool {
 /// `RaiseException` continued from its assembly entry, with the caller's
 /// captured context: the handler search starts at the raising function.
 #[no_mangle]
-extern "win64" fn winrun_raise_exception_with_context(
+pub(super) extern "win64" fn winrun_raise_exception_with_context(
     code: u32,
     flags: u32,
     argument_count: u32,
