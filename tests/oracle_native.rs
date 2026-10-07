@@ -142,6 +142,11 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
                 "info.allocation_zero: ret=1 size=0", "info.end_of_file_shrink: ret=1 size=4",
                 "info.end_of_file_grow: ret=1 size=12",
             ],
+            "nt_pipes" => &[
+                "nt_pipe.write: status=0x0 bytes=7", "nt_pipe.read: status=0x0 bytes=7 data=ok",
+                "unnamed_pipe.open_root: status=0x0", "unnamed_pipe.create: status=0x0",
+                "unnamed_pipe.open_peer: status=0x0", "unnamed_pipe.transfer: ok",
+            ],
             "sync_crypto" => &[
                 "mutex.create_owned: ok", "mutex.recursive_wait: 0", "mutex.other_wait: 258",
                 "mutex.other_release: 0 err=288", "mutex.release_free: 0 err=288", "mutex.handoff_wait: 0",

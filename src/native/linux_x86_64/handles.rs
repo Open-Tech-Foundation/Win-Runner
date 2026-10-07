@@ -474,6 +474,10 @@ pub(super) extern "win64" fn native_close_handle(h: u64) -> i32 {
             pipes.handles.remove(&h).is_some()
         })
     }) {
+        forget_unopened_peer(h);
+        return 1;
+    }
+    if h == PIPE_FS_HANDLE {
         return 1;
     }
     if process.as_ref().is_some_and(|process| {

@@ -81,6 +81,29 @@ mod startup_tests {
     }
 
     #[test]
+    fn nt_read_and_write_transfer_through_synchronous_pipes() {
+        let _guard = TestProcessGuard::new();
+        let (mut read, mut write) = (0, 0);
+        assert_eq!(native_create_pipe(&mut read, &mut write, ptr::null(), 0), 1);
+        let process = process_ctx().unwrap().process_handle;
+        let mut writer = 0;
+        assert_eq!(native_duplicate_handle(process, write, process, &mut writer, 0, 0, 2), 1);
+        let mut status = [u64::MAX; 2];
+        let null = ptr::null();
+        assert_eq!(native_nt_write_file(writer, 0, 0, 0, status.as_mut_ptr().cast(), b"nt-pipe".as_ptr(), 7, null, ptr::null()), 0);
+        assert_eq!((status[0] as u32, status[1]), (0, 7));
+        let mut buffer = [0u8; 16];
+        assert_eq!(native_nt_read_file(read, 0, 0, 0, status.as_mut_ptr().cast(), buffer.as_mut_ptr(), 16, null, ptr::null()), 0);
+        assert_eq!((status[0] as u32, status[1]), (0, 7));
+        assert_eq!(&buffer[..7], b"nt-pipe");
+        native_close_handle(writer);
+        native_close_handle(write);
+        let status_code = native_nt_read_file(read, 0, 0, 0, status.as_mut_ptr().cast(), buffer.as_mut_ptr(), 16, null, ptr::null());
+        assert_eq!(status_code, 0xC000_014B, "STATUS_PIPE_BROKEN after the writers close");
+        assert_eq!(pipe_error_status(5), 0xC000_0022);
+    }
+
+    #[test]
     fn nt_pipe_access_queries_map_generic_client_rights_and_duplicates() {
         let _guard = TestProcessGuard::new();
         let mut read = 0;
@@ -336,6 +359,34 @@ pub(super) extern "win64" fn native_nt_device_io_control_file(
     STATUS_NOT_IMPLEMENTED
 }
 
+/// A pipe handle (or a duplicate of one) opened for synchronous I/O, which
+/// NtReadFile/NtWriteFile without an event or APC transfer through like
+/// ReadFile/WriteFile.
+fn synchronous_pipe_handle(handle: u64) -> Option<u64> {
+    let process = process_ctx()?;
+    let original = process
+        .duplicate_handles
+        .lock()
+        .ok()
+        .and_then(|aliases| aliases.get(&handle).copied())
+        .unwrap_or(handle);
+    let pipes = process.named_pipes.lock().ok()?;
+    let pipe = pipes.handles.get(&original)?;
+    (!pipe.overlapped).then_some(original)
+}
+
+/// The NTSTATUS of a failed pipe transfer, from its Win32 error.
+fn pipe_error_status(error: u32) -> u32 {
+    match error {
+        109 => 0xC000_014B, // ERROR_BROKEN_PIPE: STATUS_PIPE_BROKEN
+        232 => 0xC000_00B1, // ERROR_NO_DATA: STATUS_PIPE_CLOSING
+        233 => 0xC000_00B0, // ERROR_PIPE_NOT_CONNECTED: STATUS_PIPE_DISCONNECTED
+        5 => 0xC000_0022,   // ERROR_ACCESS_DENIED
+        6 => 0xC000_0008,   // ERROR_INVALID_HANDLE
+        _ => 0xC000_0001,   // STATUS_UNSUCCESSFUL
+    }
+}
+
 pub(super) extern "win64" fn native_nt_read_file(
     file: u64,
     event: u64,
@@ -382,6 +433,14 @@ pub(super) extern "win64" fn native_nt_read_file(
             Some(value as u64)
         }
     };
+    if let Some(pipe) = synchronous_pipe_handle(file) {
+        let mut count = 0u32;
+        return if native_read_file(pipe, buffer, length, &mut count, 0) != 0 {
+            finish(STATUS_SUCCESS, count as usize)
+        } else {
+            finish(pipe_error_status(native_get_last_error()), 0)
+        };
+    }
     if let Some(fd) = host_standard_fd(file) {
         if requested_offset.is_some() {
             return finish(STATUS_INVALID_PARAMETER, 0);
@@ -487,6 +546,14 @@ pub(super) extern "win64" fn native_nt_write_file(
             Some(value as u64)
         }
     };
+    if let Some(pipe) = synchronous_pipe_handle(file) {
+        let mut count = 0u32;
+        return if native_write_file(pipe, buffer, length, &mut count, 0) != 0 {
+            finish(STATUS_SUCCESS, count as usize)
+        } else {
+            finish(pipe_error_status(native_get_last_error()), 0)
+        };
+    }
     if let Some(fd) = host_standard_fd(file) {
         if requested_offset.is_some() {
             return finish(STATUS_INVALID_PARAMETER, 0);
@@ -1155,6 +1222,9 @@ pub(super) extern "win64" fn native_nt_create_file(
     const FILE_OPEN_REPARSE_POINT: u32 = 0x20_0000;
     if handle.is_null() || io_status.is_null() {
         return 0xC000_000D;
+    }
+    if let Some(status) = open_pipe_object(handle, access, attributes, io_status, options) {
+        return status;
     }
     let path = match object_attributes_path(attributes) {
         Ok(path) => path,

@@ -114,6 +114,14 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Child processes started by current Rust programs (`Command::output`,
+  `spawn` with piped streams) get working pipes: `\Device\NamedPipe\` opens,
+  `NtCreateNamedPipeFile` creates unnamed pipes with the peer opened
+  relative to the pipe, and `NtWriteFile`/`NtReadFile` transfer through
+  synchronous pipe handles (and their duplicates) instead of failing, which
+  had made such programs drop their output silently. A new `nt_pipes`
+  Windows oracle covers the sequence.
+
 - `winrun app.exe` starts the program as a Windows process starts: on a
   stock runner disk (profile folders, System32) with the user's logon
   environment (`TEMP`, `USERPROFILE`, `SystemRoot`, `PATH`, ...), the same as

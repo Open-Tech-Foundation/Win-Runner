@@ -541,6 +541,7 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                 | "RtlRaiseException"
                 | "NtCreateFile"
                 | "NtOpenFile"
+                | "NtCreateNamedPipeFile"
                 | "NtCancelIoFileEx"
                 | "NtDeviceIoControlFile"
                 | "RtlRestoreContext"
@@ -1110,6 +1111,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "RtlWakeAddressAll" => Some(native_wake_by_address_all as *const () as usize as u64),
         "RtlWakeAddressSingle" => Some(native_wake_by_address_single as *const () as usize as u64),
         "NtOpenFile" => Some(native_nt_open_file as *const () as usize as u64),
+        "NtCreateNamedPipeFile" => Some(native_nt_create_named_pipe_file as *const () as usize as u64),
         "NtCancelIoFileEx" => Some(native_nt_cancel_io_file_ex as *const () as usize as u64),
         "NtDeviceIoControlFile" => {
             Some(native_nt_device_io_control_file as *const () as usize as u64)
