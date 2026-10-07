@@ -114,6 +114,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- `GetConsoleMode` and `SetConsoleMode` fail with `ERROR_INVALID_HANDLE` on a
+  standard handle whose stream is redirected (a pipe, file or `NUL`), as on
+  Windows. Programs detecting a terminal (Rust's `is_terminal`, the C
+  runtime's `_isatty`) no longer prompt interactively or emit terminal
+  control codes when their input or output is redirected. The
+  `native_startup` oracle checks redirected stdout and stderr.
+
 - Oracle probes provide `strlen` and `wcslen`, which newer LLVM emits for
   NUL-terminated length loops, so they link with current Rust toolchains.
 

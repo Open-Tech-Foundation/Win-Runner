@@ -13,8 +13,18 @@ pub(super) fn console_fd(handle: u64) -> Option<i32> {
     })
 }
 
+/// A standard handle whose stream is redirected (a pipe, file or NUL on
+/// the host side) is not a console: console-mode queries fail on it with
+/// ERROR_INVALID_HANDLE, which is how programs tell a terminal from a
+/// redirection (Rust's `is_terminal`, the C runtime's `_isatty`).
+fn redirected_standard_handle(handle: u64) -> bool {
+    native_device(handle).is_none()
+        && host_standard_fd(handle).is_some_and(|fd| !native_standard_is_console(fd))
+}
+
 pub(super) extern "win64" fn native_get_console_mode(handle: u64, mode: *mut u32) -> i32 {
-    if console_fd(handle).is_none() || mode.is_null() {
+    if console_fd(handle).is_none() || mode.is_null() || redirected_standard_handle(handle) {
+        native_set_last_error(6);
         return 0;
     }
     // Console devices share modes with the corresponding standard stream.
@@ -108,6 +118,10 @@ pub(super) extern "win64" fn native_get_console_screen_buffer_info(
     1
 }
 pub(super) extern "win64" fn native_set_console_mode(handle: u64, mode: u32) -> i32 {
+    if redirected_standard_handle(handle) {
+        native_set_last_error(6);
+        return 0;
+    }
     match console_fd(handle) {
         Some(0) => {
             set_console_input_mode(mode);

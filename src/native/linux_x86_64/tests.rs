@@ -6566,13 +6566,30 @@ mod protection_tests {
 
     #[test]
     fn reports_a_basic_console_mode_for_standard_output() {
-        let previous = super::THREAD_NATIVE_PROCESS
-            .with(|slot| slot.replace(Some(super::context::new_test_process())));
+        let mut process = super::context::new_test_process();
+        std::sync::Arc::get_mut(&mut process).unwrap().std_console_mask = 0b111;
+        let previous = super::THREAD_NATIVE_PROCESS.with(|slot| slot.replace(Some(process)));
         let mut mode = 0;
         assert_eq!(native_get_console_mode(1, &mut mode), 1);
         assert_eq!(mode, 1);
         assert_eq!(native_get_console_mode(99, &mut mode), 0);
         assert_eq!(native_get_console_mode(1, std::ptr::null_mut()), 0);
+        super::THREAD_NATIVE_PROCESS.with(|slot| slot.replace(previous));
+    }
+
+    #[test]
+    fn redirected_standard_handles_are_not_consoles() {
+        // stdout redirected (a pipe or file on the host), stdin a terminal.
+        let mut process = super::context::new_test_process();
+        std::sync::Arc::get_mut(&mut process).unwrap().std_console_mask = 0b001;
+        let previous = super::THREAD_NATIVE_PROCESS.with(|slot| slot.replace(Some(process)));
+        let mut mode = 0;
+        native_set_last_error(0);
+        assert_eq!(native_get_console_mode(1, &mut mode), 0);
+        assert_eq!(native_get_last_error(), 6);
+        assert_eq!(native_set_console_mode(2, 5), 0);
+        assert_eq!(native_get_last_error(), 6);
+        assert_eq!(native_get_console_mode(0, &mut mode), 1);
         super::THREAD_NATIVE_PROCESS.with(|slot| slot.replace(previous));
     }
 
@@ -7274,8 +7291,12 @@ mod protection_tests {
 
     #[test]
     fn accepts_console_mode_changes_for_standard_handles() {
+        let mut process = super::context::new_test_process();
+        std::sync::Arc::get_mut(&mut process).unwrap().std_console_mask = 0b111;
+        let previous = super::THREAD_NATIVE_PROCESS.with(|slot| slot.replace(Some(process)));
         assert_eq!(native_set_console_mode(1, 5), 1);
         assert_eq!(native_set_console_mode(99, 5), 0);
+        super::THREAD_NATIVE_PROCESS.with(|slot| slot.replace(previous));
     }
 
     #[test]

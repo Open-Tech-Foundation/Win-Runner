@@ -150,7 +150,7 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
                 "socket.accept: ok", "socket.recv_push_peek: ok", "socket.recv_push_waitall: failed err=10045", "socket.recv_waitall: ok",
                 "socket.exclusive: ok", "socket.exclusive_reuse: ok", "socket.exclusive_bind: ok", "socket.exclusive_competitor: ok",
                 "alert.timeout: ok", "alert.pending: ok", "alert.other_thread: ok",
-                "console.flush_input: ok", "console.flush_output: ok",
+                "console.flush_input: ok", "console.stdout_redirected: 0 err=6", "console.stderr_redirected: 0 err=6", "console.flush_output: ok",
                 "pipe.peek: ok", "pipe.peek_query: ok", "pipe.peek_eof: ok",
                 "sync_pipe.created: ok", "sync_pipe.read_access: ok", "sync_pipe.write_access: ok",
                 "sync_pipe.write: ok", "sync_pipe.read: ok", "sync_pipe.eof: ok",

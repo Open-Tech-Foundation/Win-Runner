@@ -945,6 +945,18 @@ fn alerts_and_console_flush() {
         if input != usize::MAX {
             NtClose(input);
         }
+        // Both oracle runners redirect stdout and stderr to pipes, which
+        // are not consoles: console-mode queries fail on them.
+        type ConsoleMode = unsafe extern "system" fn(usize, *mut u32) -> i32;
+        let console_mode = api!("console.mode_api", "GetConsoleMode", ConsoleMode);
+        for (name, which) in [("console.stdout_redirected", 0xfffffff5u32), ("console.stderr_redirected", 0xfffffff4)] {
+            let mut mode = 0;
+            clear_error();
+            case(name);
+            out_dec(console_mode(GetStdHandle(which), &mut mode) as u64);
+            out_error();
+            out_byte(b'\n');
+        }
         boolean(
             "console.flush_output",
             flush_input(GetStdHandle(0xfffffff5)) == 0 && last_error() == 6,
