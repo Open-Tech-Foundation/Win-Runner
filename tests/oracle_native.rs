@@ -162,7 +162,7 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
                 "socket.modern_ioctl: ok", "socket.modern_addr: ok", "socket.modern_text: ok",
                 "socket.ordinal_addr: ok", "socket.ordinal_ioctl: ok", "socket.ordinal_fdset: ok",
                 "socket.accept: ok", "socket.recv_push_peek: ok", "socket.recv_push_waitall: failed err=10045", "socket.recv_waitall: ok",
-                "socket.exclusive: ok", "socket.exclusive_reuse: ok", "socket.exclusive_bind: ok", "socket.exclusive_competitor: ok",
+                "socket.exclusive: ok", "socket.exclusive_reuse: ok", "socket.exclusive_bind: ok", "socket.exclusive_competitor: ok", "socket.ip_multicast_if: ok",
                 "alert.timeout: ok", "alert.pending: ok", "alert.other_thread: ok",
                 "console.flush_input: ok", "console.stdout_redirected: 0 err=6", "console.stderr_redirected: 0 err=6", "console.flush_output: ok",
                 "pipe.peek: ok", "pipe.peek_query: ok", "pipe.peek_eof: ok",

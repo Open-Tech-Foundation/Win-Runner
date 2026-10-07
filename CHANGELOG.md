@@ -114,6 +114,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- `setsockopt`/`getsockopt` accept `SO_BROADCAST` and the IPv4/IPv6 TTL and
+  multicast options (`IP_TTL`, `IP_TOS`, `IP_MULTICAST_IF/TTL/LOOP`,
+  `IP_ADD/DROP_MEMBERSHIP` and their IPv6 counterparts), translating
+  Winsock's numbers to Linux's instead of failing with `WSAENOPROTOOPT`;
+  `getsockopt` also reads `SO_KEEPALIVE` and `TCP_NODELAY`. The
+  `native_startup` oracle sets and reads them on a UDP socket.
+
 - Child processes started by current Rust programs (`Command::output`,
   `spawn` with piped streams) get working pipes: `\Device\NamedPipe\` opens,
   `NtCreateNamedPipeFile` creates unnamed pipes with the peer opened

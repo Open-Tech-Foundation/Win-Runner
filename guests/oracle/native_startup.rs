@@ -362,6 +362,37 @@ fn socket_options() {
             "socket.exclusive_competitor",
             set(second, 0xffff, 4, &enabled, 4) == 0 && bind(second, address.as_ptr(), 16) == -1,
         );
+        // IP-level and broadcast options on a UDP socket: each set must
+        // succeed; the value read back prints for comparison.
+        let udp = socket(2, 2, 17);
+        for (name, level, option, value) in [
+            ("socket.ip_ttl", 0, 4, 7),
+            ("socket.ip_multicast_ttl", 0, 10, 3),
+            ("socket.ip_multicast_loop", 0, 11, 0),
+            ("socket.broadcast", 0xffff, 0x20, 1),
+        ] {
+            let set_ok = set(udp, level, option, &value, 4) == 0;
+            let mut read_back = -1;
+            let mut size = 4;
+            let got = get(udp, level, option, &mut read_back, &mut size);
+            case(name);
+            out_str(if set_ok { "set " } else { "failed " });
+            if got == 0 {
+                out_str("get=");
+                out_dec(read_back as u64);
+                out_str(" size=");
+                out_dec(size as u64);
+            } else {
+                out_str("get=failed");
+            }
+            out_byte(b'\n');
+        }
+        let interface = [127u8, 0, 0, 1];
+        boolean(
+            "socket.ip_multicast_if",
+            set(udp, 0, 9, interface.as_ptr().cast(), 4) == 0,
+        );
+        close(udp);
         let listen = wsa_api!(
             module,
             "listen",

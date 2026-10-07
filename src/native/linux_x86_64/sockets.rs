@@ -646,17 +646,9 @@ pub(super) extern "win64" fn native_setsockopt(
             return 0;
         }
     }
-    let (host_level, host_option) = match (level, option) {
-        (0xffff, 0x0004) => (1, 2), // SO_REUSEADDR
-        (0xffff, 0x0008) => (1, 9), // SO_KEEPALIVE
-        (0xffff, 0x1001) => (1, 7), // SO_SNDBUF
-        (0xffff, 0x1002) => (1, 8), // SO_RCVBUF
-        (6, 1) => (6, 1),           // TCP_NODELAY
-        (41, 27) => (41, 26),       // IPV6_V6ONLY
-        _ => {
-            native_wsa_set_last_error(10042);
-            return -1;
-        }
+    let Some((host_level, host_option)) = host_socket_option(level, option) else {
+        native_wsa_set_last_error(10042);
+        return -1;
     };
     let result = unsafe {
         setsockopt(
@@ -675,6 +667,38 @@ pub(super) extern "win64" fn native_setsockopt(
         ));
         -1
     }
+}
+
+/// A Winsock (level, option) as the Linux one with the same meaning and
+/// value layout (Winsock numbers from winsock2.h/ws2ipdef.h). `ip_mreq`,
+/// `ipv6_mreq` and the DWORD/IN_ADDR values match Linux's.
+fn host_socket_option(level: i32, option: i32) -> Option<(i32, i32)> {
+    Some(match (level, option) {
+        (0xffff, 0x0002) => (1, 30), // SO_ACCEPTCONN
+        (0xffff, 0x0004) => (1, 2),  // SO_REUSEADDR
+        (0xffff, 0x0008) => (1, 9),  // SO_KEEPALIVE
+        (0xffff, 0x0020) => (1, 6),  // SO_BROADCAST
+        (0xffff, 0x1001) => (1, 7),  // SO_SNDBUF
+        (0xffff, 0x1002) => (1, 8),  // SO_RCVBUF
+        (0xffff, 0x1007) => (1, 4),  // SO_ERROR
+        (0xffff, 0x1008) => (1, 3),  // SO_TYPE
+        (6, 1) => (6, 1),            // TCP_NODELAY
+        (0, 3) => (0, 1),            // IP_TOS
+        (0, 4) => (0, 2),            // IP_TTL
+        (0, 9) => (0, 32),           // IP_MULTICAST_IF
+        (0, 10) => (0, 33),          // IP_MULTICAST_TTL
+        (0, 11) => (0, 34),          // IP_MULTICAST_LOOP
+        (0, 12) => (0, 35),          // IP_ADD_MEMBERSHIP
+        (0, 13) => (0, 36),          // IP_DROP_MEMBERSHIP
+        (41, 4) => (41, 16),         // IPV6_UNICAST_HOPS
+        (41, 9) => (41, 17),         // IPV6_MULTICAST_IF
+        (41, 10) => (41, 18),        // IPV6_MULTICAST_HOPS
+        (41, 11) => (41, 19),        // IPV6_MULTICAST_LOOP
+        (41, 12) => (41, 20),        // IPV6_ADD_MEMBERSHIP (IPV6_JOIN_GROUP)
+        (41, 13) => (41, 21),        // IPV6_DROP_MEMBERSHIP (IPV6_LEAVE_GROUP)
+        (41, 27) => (41, 26),        // IPV6_V6ONLY
+        _ => return None,
+    })
 }
 
 pub(super) fn errno_to_wsa(errno: i32) -> i32 {
@@ -1421,18 +1445,9 @@ pub(super) extern "win64" fn native_getsockopt(
         }
         return 0;
     }
-    let (host_level, host_option) = match (level, option) {
-        (0xffff, 0x0004) => (1, 2), // SO_REUSEADDR
-        (0xffff, 0x1008) => (1, 3),  // SOL_SOCKET, SO_TYPE
-        (0xffff, 0x1007) => (1, 4),  // SO_ERROR
-        (0xffff, 0x1002) => (1, 8),  // SO_RCVBUF
-        (0xffff, 0x1001) => (1, 7),  // SO_SNDBUF
-        (0xffff, 0x0002) => (1, 30), // SO_ACCEPTCONN
-        (41, 27) => (41, 26),        // IPV6_V6ONLY
-        _ => {
-            native_wsa_set_last_error(10042); // WSAENOPROTOOPT
-            return -1;
-        }
+    let Some((host_level, host_option)) = host_socket_option(level, option) else {
+        native_wsa_set_last_error(10042); // WSAENOPROTOOPT
+        return -1;
     };
     if level == 0xffff && option == 0x1007 {
         if value.is_null() || length.is_null() || unsafe { length.read_unaligned() } < 4 {
@@ -1728,6 +1743,30 @@ pub(super) extern "win64" fn native_getaddrinfo(
 #[cfg(test)]
 mod named_socket_tests {
     use super::*;
+
+    #[test]
+    fn ip_level_and_broadcast_options_round_trip_with_winsock_numbers() {
+        let socket = native_socket(2, 2, 17); // AF_INET, SOCK_DGRAM, UDP
+        assert_ne!(socket, u64::MAX);
+        let get = |level: i32, option: i32| {
+            let mut value = 0i32;
+            let mut length = 4u32;
+            assert_eq!(native_getsockopt(socket, level, option, (&mut value as *mut i32).cast(), &mut length), 0, "get {level}/{option}");
+            value
+        };
+        let set = |level: i32, option: i32, value: i32| {
+            native_setsockopt(socket, level, option, (&value as *const i32).cast(), 4)
+        };
+        for (level, option, value) in [(0, 4, 7), (0, 10, 3), (0, 11, 0), (0xffff, 0x20, 1)] {
+            assert_eq!(set(level, option, value), 0, "set {level}/{option}");
+            assert_eq!(get(level, option), value, "read back {level}/{option}");
+        }
+        let loopback = [127u8, 0, 0, 1];
+        assert_eq!(native_setsockopt(socket, 0, 9, loopback.as_ptr(), 4), 0, "IP_MULTICAST_IF");
+        assert_eq!(set(0, 99, 1), -1);
+        assert_eq!(native_wsa_get_last_error(), 10042);
+        native_close_socket(socket);
+    }
 
     #[test]
     fn winsock_receive_hints_preserve_data_and_accepted_sockets_inherit_nonblocking() {
