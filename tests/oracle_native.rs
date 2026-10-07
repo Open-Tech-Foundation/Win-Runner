@@ -128,6 +128,9 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
                 "from_catch: second alive=1", "nested_catch: 2", "nested_rethrow: 1",
                 "seh.divide: caught filter_calls=1", "seh.finally: abnormal=1", "seh.custom: caught",
                 "seh.access_violation: caught", "after_seh: catch ok", "after_run: alive=0",
+                "rtti.downcast: 1", "rtti.crosscast: 1 3", "rtti.to_void: 1", "rtti.failed_pointer: 1",
+                "rtti.failed_reference: bad_cast", "rtti.virtual_base: 7", "rtti.virtual_down: 8",
+                "rtti.typeid: 1", "rtti.typeid_null: bad_typeid",
             ],
             "rust_unwind" => &[
                 "catch_unwind: true", "drops: 5", "nested: true", "resume_unwind: Some(42)",

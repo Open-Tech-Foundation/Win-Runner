@@ -377,6 +377,9 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                     | "__current_exception"
                     | "__current_exception_context"
                     | "_CxxThrowException"
+                    | "__RTDynamicCast"
+                    | "__RTCastToVoid"
+                    | "__RTtypeid"
                     | "__CxxFrameHandler3"
                     | "__C_specific_handler"
             )
@@ -1132,6 +1135,9 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "RtlUnwindEx" => Some(winrun_native_rtl_unwind_ex as *const () as usize as u64),
         "RtlUnwind" => Some(winrun_native_rtl_unwind as *const () as usize as u64),
         "_CxxThrowException" => Some(winrun_native_cxx_throw_exception as *const () as usize as u64),
+        "__RTDynamicCast" => Some(winrun_native_rt_dynamic_cast as *const () as usize as u64),
+        "__RTCastToVoid" => Some(native_rt_cast_to_void as *const () as usize as u64),
+        "__RTtypeid" => Some(winrun_native_rt_typeid as *const () as usize as u64),
         "__CxxFrameHandler3" => Some(native_cxx_frame_handler3 as *const () as usize as u64),
         "__C_specific_handler" => Some(native_c_specific_handler as *const () as usize as u64),
         "RtlRestoreContext" => Some(native_rtl_restore_context as *const () as usize as u64),

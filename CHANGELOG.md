@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- C++ RTTI from VCRUNTIME140: `__RTDynamicCast` (`dynamic_cast` down and
+  across single, multiple and virtual inheritance, throwing `std::bad_cast`
+  for a failed reference cast), `__RTCastToVoid` and `__RTtypeid` (throwing
+  `std::bad_typeid` for a null object). The `cxx_eh` oracle covers them.
+
 - `GetProcessId` for the current process and child process handles. The
   `native_startup` oracle compares it with `CreateProcessW`'s process id.
 
