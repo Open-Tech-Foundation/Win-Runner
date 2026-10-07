@@ -61,6 +61,23 @@ pub unsafe extern "C" fn memset(dst: *mut u8, value: i32, n: usize) -> *mut u8 {
     }
     dst
 }
+// Newer LLVM also turns NUL-terminated length loops into these calls.
+#[no_mangle]
+pub unsafe extern "C" fn strlen(s: *const u8) -> usize {
+    let mut n = 0;
+    while core::ptr::read_volatile(s.add(n)) != 0 {
+        n += 1;
+    }
+    n
+}
+#[no_mangle]
+pub unsafe extern "C" fn wcslen(s: *const u16) -> usize {
+    let mut n = 0;
+    while core::ptr::read_volatile(s.add(n)) != 0 {
+        n += 1;
+    }
+    n
+}
 #[no_mangle]
 pub unsafe extern "C" fn memcmp(a: *const u8, b: *const u8, n: usize) -> i32 {
     let mut i = 0;

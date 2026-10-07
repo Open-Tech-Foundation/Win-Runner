@@ -114,6 +114,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Oracle probes provide `strlen` and `wcslen`, which newer LLVM emits for
+  NUL-terminated length loops, so they link with current Rust toolchains.
+
 - Hardware faults (access violations, divide by zero) dispatch on the
   faulting thread's stack below the faulting frame, as on Windows, instead of
   on the call gate's stack, which overwrote the guest frames a handler search
