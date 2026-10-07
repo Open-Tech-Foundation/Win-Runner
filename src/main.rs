@@ -1,7 +1,6 @@
 use std::io::Write;
 use std::path::Path;
-use std::sync::Arc;
-use winrun::{backend, inspect, instance, pe, snapshot, winfs::WinFs};
+use winrun::{inspect, instance, snapshot, winfs::WinFs};
 
 fn exit(code: i32) -> ! {
     std::process::exit(code)
@@ -406,7 +405,13 @@ fn run_target(target: &str, guest_args: &[String]) {
             .unwrap_or("")
             .to_lowercase();
         match ext.as_str() {
-            "exe" => run_exe_file(target, target, guest_args),
+            // As a Windows process starts: on a stock runner disk (profile
+            // folders, System32) with the user's logon environment.
+            "exe" => {
+                let (code, _) =
+                    winrun::shell::run_headless_program(WinFs::ephemeral_runner(), target, guest_args);
+                exit(code);
+            }
             "ps1" => {
                 if !guest_args.is_empty() {
                     eprintln!("winrun: script args not supported yet");
@@ -423,76 +428,6 @@ fn run_target(target: &str, guest_args: &[String]) {
     }
     eprintln!("winrun: nothing to run: {target} (no such host file; install packages inside `winrun shell`)");
     exit(1);
-}
-
-fn run_exe_file(path: &str, prog: &str, guest_args: &[String]) {
-    // NOTE: this reads the *Linux host* file as the PE container only.
-    // The Windows guest filesystem stays purely in memory (WinFs).
-    let read_started = std::time::Instant::now();
-    let data = match std::fs::read(path) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("winrun: cannot read {path}: {e}");
-            exit(1);
-        }
-    };
-    if std::env::var_os("WINRUN_TIMINGS").is_some() {
-        eprintln!(
-            "winrun timing: {prog}: host_read={:.3}ms",
-            read_started.elapsed().as_secs_f64() * 1000.0
-        );
-    }
-    let pe_load_started = std::time::Instant::now();
-    let img = match pe::load_lenient(&data) {
-        Ok(img) => img,
-        Err(e) => {
-            eprintln!("winrun: failed to load {path}: {e}");
-            exit(1);
-        }
-    };
-    if std::env::var_os("WINRUN_TIMINGS").is_some() {
-        eprintln!(
-            "winrun timing: {prog}: pe_load={:.3}ms",
-            pe_load_started.elapsed().as_secs_f64() * 1000.0
-        );
-    }
-    run_with_runner(&img, path, prog, guest_args);
-}
-
-/// Execute a loaded image through the configured platform backend.
-fn run_with_runner(img: &pe::PeImage, path: &str, prog: &str, guest_args: &[String]) {
-    let backend = match backend::configured() {
-        Ok(value) => value,
-        Err(e) => {
-            eprintln!("winrun: failed to select execution backend for {path}: {e}");
-            exit(1);
-        }
-    };
-    let sink: backend::OutputSink = Arc::new(|channel, chunk| match channel {
-        backend::OutputChannel::Stdout => {
-            let mut stdout = std::io::stdout().lock();
-            let _ = stdout.write_all(chunk);
-            let _ = stdout.flush();
-        }
-        backend::OutputChannel::Stderr => {
-            let mut stderr = std::io::stderr().lock();
-            let _ = stderr.write_all(chunk);
-            let _ = stderr.flush();
-        }
-    });
-    match backend.execute_streaming(img, WinFs::new(), prog, guest_args, sink) {
-        Ok(result) => {
-            exit(result.code as i32);
-        }
-        Err(e) => {
-            eprintln!(
-                "winrun: {} execution failed for {path}: {}",
-                backend.id(),
-                e.message
-            );
-            exit(1);
-        }
-    }
 }
 
 fn run_ps1_file(path: &str) {

@@ -114,6 +114,12 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- `winrun app.exe` starts the program as a Windows process starts: on a
+  stock runner disk (profile folders, System32) with the user's logon
+  environment (`TEMP`, `USERPROFILE`, `SystemRoot`, `PATH`, ...), the same as
+  inside `winrun shell`, instead of an empty environment that sent
+  `GetTempPath` to `C:\Windows`.
+
 - `CreateFileW` sets the last error to 0 when `CREATE_ALWAYS` or
   `OPEN_ALWAYS` creates a new file, instead of leaving a stale
   `ERROR_ALREADY_EXISTS` that made Rust's `File::create` treat new files as

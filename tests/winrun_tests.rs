@@ -1443,7 +1443,7 @@ fn native_timing_reports_load_execution_and_state_stages() {
     assert_eq!(code, 0, "stderr: {stderr}");
     assert_eq!(stdout, "Hello from Windows");
     for stage in [
-        "host_read=",
+        "host_file_read=",
         "pe_load=",
         "worker_start=",
         "guest_until_output_eof=",
