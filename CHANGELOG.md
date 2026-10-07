@@ -114,6 +114,14 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- `CreateFileW` sets the last error to 0 when `CREATE_ALWAYS` or
+  `OPEN_ALWAYS` creates a new file, instead of leaving a stale
+  `ERROR_ALREADY_EXISTS` that made Rust's `File::create` treat new files as
+  existing. `SetFileInformationByHandle` supports `FileEndOfFileInfo` and
+  truncation through a zero `FileAllocationInfo`, so `std::fs::write`
+  overwrites existing files. A new `file_info` Windows oracle records the
+  other dispositions and allocation sizes for comparison.
+
 - `GetConsoleMode` and `SetConsoleMode` fail with `ERROR_INVALID_HANDLE` on a
   standard handle whose stream is redirected (a pipe, file or `NUL`), as on
   Windows. Programs detecting a terminal (Rust's `is_terminal`, the C

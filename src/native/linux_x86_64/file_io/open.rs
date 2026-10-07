@@ -208,8 +208,11 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_create_file_w(
         }
         return u64::MAX;
     }
-    if exists && matches!(creation, 2 | 4) {
-        native_set_last_error(183); // ERROR_ALREADY_EXISTS
+    if matches!(creation, 2 | 4) {
+        // CREATE_ALWAYS / OPEN_ALWAYS: ERROR_ALREADY_EXISTS for an existing
+        // file; a newly created one sets the last error to zero (documented
+        // for CreateFileW), so a stale code never reads as "it existed".
+        native_set_last_error(if exists { 183 } else { 0 });
     }
     let h = ctx.next;
     ctx.next += 1;

@@ -449,6 +449,33 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_set_file_informatio
             }
             1
         }
+        // FileAllocationInfo with AllocationSize 0 truncates the file, which
+        // runtimes rely on to empty an existing file opened with OPEN_ALWAYS
+        // (Rust's File::create). Other sizes are not implemented yet.
+        5 if size >= 8 && unsafe { information.cast::<i64>().read_unaligned() } == 0 => {
+            match ctx.fs.set_len(&path, 0) {
+                Ok(()) => 1,
+                Err(_) => {
+                    native_set_last_error(5);
+                    0
+                }
+            }
+        }
+        // FileEndOfFileInfo: the new end of file.
+        6 if size >= 8 => {
+            let length = unsafe { information.cast::<i64>().read_unaligned() };
+            if length < 0 {
+                native_set_last_error(87);
+                return 0;
+            }
+            match ctx.fs.set_len(&path, length as u64) {
+                Ok(()) => 1,
+                Err(_) => {
+                    native_set_last_error(5);
+                    0
+                }
+            }
+        }
         4 | 21 if size >= 1 && delete_requested(class, information) && directory_not_empty(&ctx, handle) => {
             native_set_last_error(145); // ERROR_DIR_NOT_EMPTY
             0

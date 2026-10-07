@@ -133,6 +133,15 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
                 "catch_unwind: true", "drops: 5", "nested: true", "resume_unwind: Some(42)",
                 "no_panic: Some(7)", "drop: thread", "thread_join: true",
             ],
+            // Documented results only; the probe's other lines record
+            // Windows behavior winrun is checked against in CI.
+            "file_info" => &[
+                "create.create_always.new: opened err=0", "create.create_always.existing: opened err=183",
+                "create.open_always.new: opened err=0", "create.open_always.existing: opened err=183",
+                "create.create_new.existing: failed err=80", "create.open_existing.missing: failed err=2",
+                "info.allocation_zero: ret=1 size=0", "info.end_of_file_shrink: ret=1 size=4",
+                "info.end_of_file_grow: ret=1 size=12",
+            ],
             "sync_crypto" => &[
                 "mutex.create_owned: ok", "mutex.recursive_wait: 0", "mutex.other_wait: 258",
                 "mutex.other_release: 0 err=288", "mutex.release_free: 0 err=288", "mutex.handoff_wait: 0",

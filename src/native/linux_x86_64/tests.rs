@@ -1208,6 +1208,46 @@ mod protection_tests {
     }
 
     #[test]
+    fn create_disposition_errors_and_handle_truncation() {
+        {
+            let context = super::fs_ctx().unwrap();
+            context.lock().unwrap().fs.mkdir(r"C:\create_truncate_cases").unwrap();
+        }
+        let path = wide_z(r"C:\create_truncate_cases\f.txt");
+        let length = || {
+            super::fs_ctx().unwrap().lock().unwrap().fs.file_len(r"C:\create_truncate_cases\f.txt").unwrap()
+        };
+        // A stale last error never survives creating a new file.
+        for disposition in [2u32, 4] {
+            super::native_set_last_error(183);
+            let handle = super::native_create_file_w(path.as_ptr(), 0x4000_0000, 0, 0, disposition, 0x80, 0);
+            assert_ne!(handle, u64::MAX);
+            assert_eq!(super::native_get_last_error(), 0, "disposition {disposition} created");
+            assert_eq!(super::native_close_handle(handle), 1);
+            super::native_set_last_error(0);
+            let again = super::native_create_file_w(path.as_ptr(), 0x4000_0000, 0, 0, disposition, 0x80, 0);
+            assert_eq!(super::native_get_last_error(), 183, "disposition {disposition} existing");
+            assert_eq!(super::native_close_handle(again), 1);
+            super::fs_ctx().unwrap().lock().unwrap().fs.remove(r"C:\create_truncate_cases\f.txt", false).unwrap();
+        }
+        super::fs_ctx().unwrap().lock().unwrap().fs.write_file(r"C:\create_truncate_cases\f.txt", b"0123456789".to_vec()).unwrap();
+        let handle = super::native_create_file_w(path.as_ptr(), 0x4000_0000, 0, 0, 4, 0x80, 0);
+        // FileEndOfFileInfo shrinks and grows; FileAllocationInfo 0 empties.
+        let eof = 4i64.to_le_bytes();
+        assert_eq!(super::native_set_file_information_by_handle(handle, 6, eof.as_ptr(), 8), 1);
+        assert_eq!(length(), 4);
+        let eof = 12i64.to_le_bytes();
+        assert_eq!(super::native_set_file_information_by_handle(handle, 6, eof.as_ptr(), 8), 1);
+        assert_eq!(length(), 12);
+        let negative = (-1i64).to_le_bytes();
+        assert_eq!(super::native_set_file_information_by_handle(handle, 6, negative.as_ptr(), 8), 0);
+        let zero = 0i64.to_le_bytes();
+        assert_eq!(super::native_set_file_information_by_handle(handle, 5, zero.as_ptr(), 8), 1);
+        assert_eq!(length(), 0);
+        assert_eq!(super::native_close_handle(handle), 1);
+    }
+
+    #[test]
     fn find_first_file_reports_directories_sizes_and_names() {
         let context = super::fs_ctx().unwrap();
         {
