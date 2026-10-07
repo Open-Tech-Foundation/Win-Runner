@@ -6393,6 +6393,21 @@ mod protection_tests {
     }
 
     #[test]
+    fn process_ids_come_from_current_and_child_process_handles() {
+        let process = process_ctx().unwrap();
+        assert_eq!(super::native_get_process_id(native_get_current_process()), process.process_id);
+        let (handle, thread_handle, child) = process.children.lock().unwrap().allocate(process.process_id);
+        assert_eq!(super::native_get_process_id(handle), child.process_id());
+        native_set_last_error(0);
+        assert_eq!(super::native_get_process_id(thread_handle), 0, "a thread handle is not a process");
+        assert_eq!(native_get_last_error(), 6);
+        assert_eq!(super::native_get_process_id(0x1234), 0);
+        assert_eq!(native_terminate_process(handle, 0), 1);
+        assert_eq!(native_close_handle(handle), 1);
+        assert_eq!(native_close_handle(thread_handle), 1);
+    }
+
+    #[test]
     fn owns_child_process_handles_until_explicit_close() {
         let process = process_ctx().unwrap();
         let (handle, thread_handle, child) = process

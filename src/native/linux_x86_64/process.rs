@@ -729,6 +729,36 @@ pub(super) fn child_process(
         .cloned()
 }
 
+/// `GetProcessId`: the id of the current process (pseudo handle) or of a
+/// child process handle; 0 with ERROR_INVALID_HANDLE otherwise.
+pub(super) extern "win64" fn native_get_process_id(handle: u64) -> u32 {
+    let Some(process) = process_ctx() else {
+        native_set_last_error(6);
+        return 0;
+    };
+    let handle = process
+        .duplicate_handles
+        .lock()
+        .ok()
+        .and_then(|aliases| aliases.get(&handle).copied())
+        .unwrap_or(handle);
+    if handle == u64::MAX || handle == process.process_handle {
+        return process.process_id;
+    }
+    let child = process
+        .children
+        .lock()
+        .ok()
+        .and_then(|table| table.children.get(&handle).cloned());
+    match child {
+        Some(child) => child.process_id.load(Ordering::Acquire),
+        None => {
+            native_set_last_error(6);
+            0
+        }
+    }
+}
+
 pub(super) extern "win64" fn native_get_exit_code_process(handle: u64, code: *mut u32) -> i32 {
     if code.is_null() {
         native_set_last_error(87); // ERROR_INVALID_PARAMETER

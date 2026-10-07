@@ -6,6 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- `GetProcessId` for the current process and child process handles. The
+  `native_startup` oracle compares it with `CreateProcessW`'s process id.
+
 - MSVC exception handling from VCRUNTIME140: `_CxxThrowException`,
   `__CxxFrameHandler3` (try/catch by type, value, reference and `...`,
   rethrow, throws from catch blocks, destructor and cleanup funclets) and

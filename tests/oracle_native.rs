@@ -177,7 +177,7 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
                 "cert.root_context: ok", "cert.duplicate: ok", "cert.enum_end: ok",
                 "cert.pending_close: ok", "cert.copy_survives_close: ok", "cert.free: ok",
                 "live.before_exit: ok", "live.parent_remove: ok", "live.no_final_replay: ok",
-                "suspend.created: ok", "suspend.before_resume: ok", "suspend.invalid_handle: ok",
+                "suspend.created: ok", "suspend.process_id: ok", "suspend.before_resume: ok", "suspend.invalid_handle: ok",
                 "suspend.resume: ok", "suspend.second_resume: ok", "suspend.exit: ok", "suspend.final_io: ok",
                 "file.duplicate_type: ok", "file.duplicate_closed: ok",
                 "process.io: ok", "process.io_invalid: ok", "process.memory: ok",

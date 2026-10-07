@@ -685,7 +685,15 @@ fn suspended_process() {
     if created == 0 {
         return;
     }
+    type ProcessId = unsafe extern "system" fn(usize) -> u32;
+    let process_id = api!("suspend.process_id_api", "GetProcessId", ProcessId);
     unsafe {
+        boolean("suspend.process_id", process_id(information[0]) == information[2] as u32);
+        clear_error();
+        case("suspend.process_id_of_thread_handle");
+        out_dec(process_id(information[1]) as u64);
+        out_error();
+        out_byte(b'\n');
         boolean("suspend.before_resume", wait(information[0], 20) == 258);
         boolean("suspend.invalid_handle", resume(information[0]) == u32::MAX);
         boolean("suspend.resume", resume(information[1]) == 1);

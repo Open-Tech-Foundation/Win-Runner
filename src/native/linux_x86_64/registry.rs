@@ -856,6 +856,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "OpenThread" => Some(native_open_thread as *const () as usize as u64),
         "GetThreadId" => Some(native_get_thread_id as *const () as usize as u64),
         "GetProcessIdOfThread" => Some(native_get_process_id_of_thread as *const () as usize as u64),
+        "GetProcessId" => Some(native_get_process_id as *const () as usize as u64),
         "GetExitCodeThread" => Some(native_get_exit_code_thread as *const () as usize as u64),
         "GetThreadTimes" => Some(native_get_thread_times as *const () as usize as u64),
         "GetThreadDescription" => Some(native_get_thread_description as *const () as usize as u64),
