@@ -105,6 +105,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Hardware faults (access violations, divide by zero) dispatch on the
+  faulting thread's stack below the faulting frame, as on Windows, instead of
+  on the call gate's stack, which overwrote the guest frames a handler search
+  walks: `__try`/`__except` around a faulting call now finds its handler.
+
 - The `native_startup` oracle reports `CertGetEnhancedKeyUsage` reads as
   separate observations (result, size relative to the size query, layout)
   so real Windows' behavior shows in the comparison instead of `wrong`.

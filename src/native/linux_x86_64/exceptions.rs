@@ -16,6 +16,9 @@ struct NativeFaultSlot {
     signal_code: AtomicI32,
     fault_address: AtomicU64,
     page_fault_error: AtomicU64,
+    /// An unhandled fault's exception code, set by the on-stack dispatch
+    /// before it returns to the call gate (bit 32 marks it present).
+    unhandled: AtomicU64,
 }
 
 impl NativeFaultSlot {
@@ -29,6 +32,7 @@ impl NativeFaultSlot {
             signal_code: AtomicI32::new(0),
             fault_address: AtomicU64::new(0),
             page_fault_error: AtomicU64::new(0),
+            unhandled: AtomicU64::new(0),
         }
     }
 
@@ -315,6 +319,48 @@ extern "C" fn native_guest_fault_signal_handler(
         unsafe { (*source).uc_mcontext.gregs[libc::REG_ERR as usize] as u64 },
         Ordering::Relaxed,
     );
+    // Dispatch on the faulting thread's stack below the faulting frame (and
+    // its red zone), as Windows does, so a frame walk reads intact guest
+    // frames: return from the signal into the dispatch trampoline. A fault
+    // at the stack's edge (an overflow) has no room there; it dispatches on
+    // the call gate's stack instead.
+    let gregs = unsafe { &mut (*source).uc_mcontext.gregs };
+    let fault_stack = gregs[libc::REG_RSP as usize] as u64;
+    let fault_address = unsafe { (*signal_info).si_addr() } as u64;
+    let near_stack = fault_address < fault_stack.wrapping_add(4096)
+        && fault_address > fault_stack.wrapping_sub(256 * 1024);
+    if near_stack || fault_stack < 64 * 1024 {
+        unsafe { siglongjmp(slot.jump_buffer(), 1) }
+    }
+    // Past the 128-byte red zone with room for a call frame; the return
+    // address slot is 0 so walks stop at the trampoline.
+    let stack = ((fault_stack - 128 - 512) & !15) - 8;
+    unsafe { (stack as *mut u64).write(0) };
+    gregs[libc::REG_RSP as usize] = stack as i64;
+    gregs[libc::REG_RIP as usize] = native_guest_fault_trampoline as *const () as usize as i64;
+    gregs[libc::REG_RDI as usize] = slot as *const NativeFaultSlot as i64;
+}
+
+/// Runs where the faulting guest code was interrupted (see the signal
+/// handler): dispatch the fault, then resume the handled context, or report
+/// an unhandled one to the call gate.
+extern "C" fn native_guest_fault_trampoline(slot: *const NativeFaultSlot) -> ! {
+    let slot = unsafe { &*slot };
+    // A fault while dispatching reuses the slot: work on a copy.
+    let mut fxstate = NativeFaultFxState([0; 512]);
+    let mut context: libc::ucontext_t = unsafe { std::ptr::read(slot.context_mut()) };
+    unsafe {
+        fxstate.0.copy_from_slice(&(*slot.fxstate.get()).0);
+        if !context.uc_mcontext.fpregs.is_null() {
+            context.uc_mcontext.fpregs = fxstate.0.as_mut_ptr().cast();
+        }
+    }
+    let result = dispatch_fault(slot, &mut context);
+    if result == 1 {
+        unsafe { libc::setcontext(&context) };
+    }
+    slot.unhandled
+        .store(u64::from(result as u32) | 1 << 32, Ordering::Release);
     unsafe { siglongjmp(slot.jump_buffer(), 1) }
 }
 
@@ -337,11 +383,22 @@ extern "C" fn dispatch_linux_guest_fault(slot_pointer: *const std::ffi::c_void) 
         return 0xc000_0005u32 as i32; // STATUS_ACCESS_VIOLATION
     }
     let slot = unsafe { &*slot_pointer.cast::<NativeFaultSlot>() };
+    let unhandled = slot.unhandled.swap(0, Ordering::AcqRel);
+    if unhandled != 0 {
+        // Already dispatched on the guest stack, and unhandled.
+        return unhandled as u32 as i32;
+    }
+    dispatch_fault(slot, unsafe { slot.context_mut() })
+}
+
+/// Turn a recorded Linux fault into a Windows exception and dispatch it;
+/// 1 when a handler continued execution (with `linux_context` updated),
+/// otherwise the exception code.
+fn dispatch_fault(slot: &NativeFaultSlot, linux_context: &mut libc::ucontext_t) -> i32 {
     let signal = slot.signal.load(Ordering::Relaxed);
     let signal_code = slot.signal_code.load(Ordering::Relaxed);
     let fault_address = slot.fault_address.load(Ordering::Relaxed);
     let page_fault_error = slot.page_fault_error.load(Ordering::Relaxed);
-    let linux_context = unsafe { slot.context_mut() };
     let mut windows_context = context_from_linux_ucontext(linux_context);
     let instruction_pointer = context_register(&windows_context, 16).unwrap_or(0);
     let Some(mut record) = exception_record_from_linux_signal(
