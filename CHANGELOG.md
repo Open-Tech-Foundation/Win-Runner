@@ -114,6 +114,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- `CertOpenStore` accepts `CERT_STORE_DEFER_CLOSE_UNTIL_LAST_FREE_FLAG`,
+  which TLS clients pass for their in-memory stores.
+
 - `setsockopt`/`getsockopt` accept `SO_BROADCAST` and the IPv4/IPv6 TTL and
   multicast options (`IP_TTL`, `IP_TOS`, `IP_MULTICAST_IF/TTL/LOOP`,
   `IP_ADD/DROP_MEMBERSHIP` and their IPv6 counterparts), translating

@@ -406,7 +406,11 @@ pub(super) extern "win64" fn native_cert_open_store(
     if crypt != 0 {
         return fail(INVALID_ARGUMENT);
     }
-    if flags & !(0x0003_0000 | 0xc001) != 0 {
+    // CERT_STORE_NO_CRYPT_RELEASE (0x1), DEFER_CLOSE_UNTIL_LAST_FREE (0x4:
+    // contexts here keep their certificate alive anyway), OPEN_EXISTING
+    // (0x4000), READONLY (0x8000), and the current-user/local-machine
+    // locations.
+    if flags & !(0x0003_0000 | 0xc005) != 0 {
         return fail(50);
     }
     let mut stores = STORES.lock().unwrap();
@@ -718,6 +722,21 @@ mod tests {
         assert_eq!(native_cert_enum_certificates(store, 0), 0);
         assert_eq!(native_get_last_error(), INVALID_ARGUMENT);
         assert_eq!(native_cert_open_store(123, 0, 0, 0, std::ptr::null()), 0);
+        assert_eq!(native_get_last_error(), 50);
+    }
+}
+
+#[cfg(test)]
+mod store_flag_tests {
+    use super::*;
+
+    #[test]
+    fn memory_stores_accept_deferred_close_and_reject_unknown_flags() {
+        let store = native_cert_open_store(2, 0, 0, 0x4, std::ptr::null());
+        assert_ne!(store, 0, "CERT_STORE_DEFER_CLOSE_UNTIL_LAST_FREE_FLAG");
+        assert_eq!(native_cert_enum_certificates(store, 0), 0);
+        assert_eq!(native_cert_close_store(store, 0), 1);
+        assert_eq!(native_cert_open_store(2, 0, 0, 0x40, std::ptr::null()), 0);
         assert_eq!(native_get_last_error(), 50);
     }
 }
