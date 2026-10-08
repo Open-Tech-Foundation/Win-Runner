@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- An HTTP/1.1 client (`http_client`) for the guest's built-in network tools:
+  plain and TLS (rustls) connections verified against the guest's own ROOT
+  store, redirects, chunked and length-delimited bodies, gzip/deflate
+  decoding, timeouts, and curl-compatible error codes and messages.
+
 - C++ RTTI from VCRUNTIME140: `__RTDynamicCast` (`dynamic_cast` down and
   across single, multiple and virtual inheritance, throwing `std::bad_cast`
   for a failed reference cast), `__RTCastToVoid` and `__RTtypeid` (throwing

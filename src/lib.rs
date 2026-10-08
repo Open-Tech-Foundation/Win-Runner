@@ -2,6 +2,7 @@ pub mod backend;
 pub mod cmd;
 pub mod control;
 pub mod deflate;
+pub mod http_client;
 pub mod inspect;
 pub mod install;
 pub mod instance;
