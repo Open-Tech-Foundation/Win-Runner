@@ -158,7 +158,7 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
                 "mutex.named_second_error: 183", "mutex.named_not_owner: 0 err=288", "mutex.open_missing: 0 err=2",
                 "filetime.compare: -1 0 1 ", "filetime.roundtrip: ok", "filetime.invalid_handle: 0 err=6",
                 "bcrypt.system_preferred: ok", "bcrypt.no_algorithm: 0xc0000008",
-                "cert.intended: 1 0x84 0x80", "cert.intended_none: 0 zeroed err=0", "cert.system_store: ok",
+                "cert.intended: 1 0x84 0x80", "cert.intended_none: 0 zeroed err=0", "cert.system_store: ok", "cert.system_store_ca: ok", "cert.system_store_my: ok",
                 "crt.strtoll_overflow: -9223372036854775808 used=20", "crt.byteswap: 0x78563412 0x3412",
                 "crt.isxdigit: ok", "crt.difftime: ok",
             ],

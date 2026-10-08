@@ -3,3 +3,9 @@ Win-Runner
 Copyright 2026 Open Tech Foundation <https://opentechf.org> and its contributors
 
 This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+resources/cacert.pem is the CA certificate bundle published by the curl
+project (https://curl.se/docs/caextract.html), extracted from Mozilla's root
+store. Its certificate data is available under the Mozilla Public License,
+version 2.0 (https://mozilla.org/MPL/2.0/). Win-Runner seeds new guest disks'
+ROOT certificate store from it.

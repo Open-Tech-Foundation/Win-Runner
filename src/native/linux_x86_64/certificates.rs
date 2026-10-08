@@ -1,7 +1,6 @@
 //! CryptoAPI certificate enumeration using the host's configured trust bundle.
 //! This supplies data, not certificate-chain verification or private keys.
 use super::*;
-use base64::Engine;
 const NOT_FOUND: u32 = 0x8009_2004;
 const ASN1_ERROR: u32 = 0x8009_310b;
 const INVALID_ARGUMENT: u32 = 0x8007_0057;
@@ -274,24 +273,40 @@ fn certificate(encoded: Vec<u8>, store: u64) -> Result<Arc<Certificate>, u32> {
         _extensions: extensions,
     }))
 }
-fn bundle(pem: &str, store: u64) -> Result<Vec<Arc<Certificate>>, u32> {
+/// The system stores every Windows installation has.
+const SYSTEM_STORES: &[&str] = &[
+    "ROOT", "CA", "MY", "TRUST", "Disallowed", "AuthRoot", "TrustedPeople", "TrustedPublisher",
+];
+
+/// A system store's certificates from the guest registry: the machine's
+/// `SOFTWARE\Microsoft\SystemCertificates\<name>\Certificates` then the
+/// user's, each certificate a serialized `Blob` (an absent store is empty).
+fn system_store(name: &str, store: u64) -> Result<Vec<Arc<Certificate>>, u32> {
+    let context = fs_ctx().ok_or(6u32)?;
+    let ctx = context.lock().map_err(|_| 6u32)?;
+    let registry = crate::winreg::Registry::load(&ctx.fs).map_err(|_| 1015u32)?; // ERROR_REGISTRY_CORRUPT
     let mut certificates = Vec::new();
-    for part in pem.split("-----BEGIN CERTIFICATE-----").skip(1) {
-        let body = part
-            .split_once("-----END CERTIFICATE-----")
-            .ok_or(ASN1_ERROR)?
-            .0;
-        let text: String = body.chars().filter(|c| !c.is_ascii_whitespace()).collect();
-        let encoded = base64::engine::general_purpose::STANDARD
-            .decode(text)
-            .map_err(|_| ASN1_ERROR)?;
-        certificates.push(certificate(encoded, store)?);
-    }
-    if certificates.is_empty() {
-        return Err(NOT_FOUND);
+    for (hive, root) in [
+        (crate::winreg::Hive::LocalMachine, "SOFTWARE"),
+        (crate::winreg::Hive::CurrentUser, "Software"),
+    ] {
+        let path = format!(r"{root}\Microsoft\SystemCertificates\{name}\Certificates");
+        let Some(key) = registry.key(hive, &path) else {
+            continue;
+        };
+        for thumbprint in key.subkey_names() {
+            let encoded = key
+                .subkey(thumbprint)
+                .and_then(|entry| entry.value("Blob"))
+                .and_then(|blob| crate::trust_roots::certificate_from_blob(&blob.data));
+            if let Some(encoded) = encoded {
+                certificates.push(certificate(encoded.to_vec(), store)?);
+            }
+        }
     }
     Ok(certificates)
 }
+
 fn decode_usage(bytes: &[u8]) -> Result<Vec<Vec<u8>>, u32> {
     let mut input = bytes;
     let mut sequence = der(&mut input, Some(48))?.body;
@@ -431,18 +446,10 @@ pub(super) extern "win64" fn native_cert_open_store(
             } else {
                 wide(parameter.cast())
             };
-            if !name.is_some_and(|name| name.eq_ignore_ascii_case("ROOT")) {
+            let Some(name) = name.filter(|name| SYSTEM_STORES.iter().any(|known| known.eq_ignore_ascii_case(name))) else {
                 return fail(50);
-            }
-            let pem = [
-                "/etc/ssl/certs/ca-certificates.crt",
-                "/etc/pki/tls/certs/ca-bundle.crt",
-                "/etc/ssl/ca-bundle.pem",
-            ]
-            .into_iter()
-            .find_map(|path| std::fs::read_to_string(path).ok());
-            let Some(pem) = pem else { return fail(2) };
-            match bundle(&pem, handle) {
+            };
+            match system_store(&name, handle) {
                 Ok(certificates) => certificates,
                 Err(error) => return fail(error),
             }
@@ -661,7 +668,6 @@ mod tests {
             vec![b"1.3.6.1.5.5.7.3.1\0".to_vec()]
         );
         assert!(decode_usage(&[0x30, 1, 6]).is_err());
-        assert!(bundle("-----BEGIN CERTIFICATE-----!-----END CERTIFICATE-----", 0).is_err());
     }
     #[test]
     fn system_root_contexts_decode_and_remain_valid_after_store_close() {

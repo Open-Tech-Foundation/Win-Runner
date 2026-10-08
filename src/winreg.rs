@@ -432,6 +432,11 @@ impl Registry {
 
     /// The registry of a stock installation for [`system_profile`](profile).
     pub fn defaults() -> Self {
+        static DEFAULTS: std::sync::LazyLock<Registry> = std::sync::LazyLock::new(Registry::build_defaults);
+        DEFAULTS.clone()
+    }
+
+    fn build_defaults() -> Self {
         let mut registry = Registry {
             machine: Key::default(),
             user: Key::default(),
@@ -609,6 +614,21 @@ impl Registry {
             ],
         );
         registry.create_key(user, "Software");
+        // Trusted roots, as Windows keeps them in the machine's ROOT store.
+        for der in crate::trust_roots::bundled_roots() {
+            let path = format!(
+                r"{}\{}",
+                crate::trust_roots::MACHINE_ROOT_STORE,
+                crate::trust_roots::thumbprint(der)
+            );
+            registry.create_key(machine, &path).0.set_value(
+                "Blob",
+                RegValue {
+                    kind: REG_BINARY,
+                    data: crate::trust_roots::serialized_blob(der),
+                },
+            );
+        }
         registry
     }
 }

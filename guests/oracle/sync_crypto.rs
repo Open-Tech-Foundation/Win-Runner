@@ -279,11 +279,17 @@ fn certificates() {
         unavailable("cert.system_store_api");
         return;
     }
-    let store = unsafe { core::mem::transmute::<usize, OpenSystem>(open_api)(0, b"ROOT\0".as_ptr()) };
-    boolean(
-        "cert.system_store",
-        store != 0 && unsafe { core::mem::transmute::<usize, CloseStore>(close_api)(store, 0) } != 0,
-    );
+    for (name, store_name) in [
+        ("cert.system_store", &b"ROOT\0"[..]),
+        ("cert.system_store_ca", &b"CA\0"[..]),
+        ("cert.system_store_my", &b"MY\0"[..]),
+    ] {
+        let store = unsafe { core::mem::transmute::<usize, OpenSystem>(open_api)(0, store_name.as_ptr()) };
+        boolean(
+            name,
+            store != 0 && unsafe { core::mem::transmute::<usize, CloseStore>(close_api)(store, 0) } != 0,
+        );
+    }
 }
 
 fn crt_helpers() {

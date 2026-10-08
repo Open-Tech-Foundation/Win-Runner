@@ -14,6 +14,7 @@ pub mod reg_command;
 pub mod shell;
 pub mod snapshot;
 pub mod system_profile;
+pub mod trust_roots;
 pub mod winfs;
 pub mod winreg;
 pub mod wpkg;

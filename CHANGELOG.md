@@ -120,6 +120,16 @@ All notable changes to this project will be documented in this file.
 - Add the shell `reload` command to refresh saved guest environment variables
   and PATH immediately, preserving shell variables, functions, and files.
 
+### Changed
+
+- The guest's trusted root certificates live in its own registry, as on
+  Windows (`HKLM\SOFTWARE\Microsoft\SystemCertificates\ROOT\Certificates`,
+  one key per thumbprint with a serialized `Blob`), seeded on new disks from
+  the Mozilla CA bundle pinned in `resources/cacert.pem`. `CertOpenStore` and
+  `CertOpenSystemStore` read the standard system stores (`ROOT`, `CA`, `MY`,
+  `TRUST`, `Disallowed`, `AuthRoot`, `TrustedPeople`, `TrustedPublisher`)
+  from the guest's machine and user hives instead of the host's CA files.
+
 ### Fixed
 
 - Match the Windows oracle results: `CreateFileW` clears the last error on
