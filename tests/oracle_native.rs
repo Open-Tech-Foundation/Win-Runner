@@ -136,9 +136,11 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
                 "catch_unwind: true", "drops: 5", "nested: true", "resume_unwind: Some(42)",
                 "no_panic: Some(7)", "drop: thread", "thread_join: true",
             ],
-            // Documented results only; the probe's other lines record
-            // Windows behavior winrun is checked against in CI.
+            // Results recorded from Windows by the oracle CI.
             "file_info" => &[
+                "create.create_new.new: opened err=0", "create.open_existing.existing: opened err=0",
+                "create.truncate_existing.existing: opened err=0",
+                "info.allocation_smaller: ret=1 size=8", "info.allocation_larger: ret=1 size=10",
                 "create.create_always.new: opened err=0", "create.create_always.existing: opened err=183",
                 "create.open_always.new: opened err=0", "create.open_always.existing: opened err=183",
                 "create.create_new.existing: failed err=80", "create.open_existing.missing: failed err=2",
@@ -176,7 +178,7 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
                 "nt_memory.allocate: ok", "nt_memory.protect: ok", "nt_memory.release: ok", "nt_time.precise: ok", "nt_time.performance: ok",
                 "device.attributes_roundtrip: ok",
                 "cert.memory_empty: ok", "cert.memory_close: ok", "cert.root_open: ok",
-                "cert.usage_size: ok", "cert.usage_small: ok", "cert.usage_read: 1", "cert.usage_read_size: =query",
+                "cert.usage_size: ok", "cert.usage_small: ok", "cert.usage_read: 1", "cert.usage_read_size: =buffer", "cert.usage_read_layout: consistent",
                 "cert.root_context: ok", "cert.duplicate: ok", "cert.enum_end: ok",
                 "cert.pending_close: ok", "cert.copy_survives_close: ok", "cert.free: ok",
                 "live.before_exit: ok", "live.parent_remove: ok", "live.no_final_replay: ok",

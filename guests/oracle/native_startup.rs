@@ -889,11 +889,11 @@ fn certificates() {
         out_byte(b'\n');
         let count = buffer[0] as u32 as usize;
         let array = buffer[1] as usize;
+        // Which usages the first root has depends on the store's
+        // contents; the layout must be self-contained either way.
         case("cert.usage_read_layout");
-        out_str(if count == 0 {
-            "empty"
-        } else if array >= base + 16 && array + count * 8 <= base + 4096 {
-            "inside"
+        out_str(if count == 0 || (array >= base + 16 && array + count * 8 <= base + 4096) {
+            "consistent"
         } else {
             "outside"
         });

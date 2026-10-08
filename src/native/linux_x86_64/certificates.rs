@@ -354,7 +354,11 @@ pub(super) extern "win64" fn native_cert_get_enhanced_key_usage(
     let identifiers = usage.unwrap_or_default();
     let needed = 16 + identifiers.len() * 8 + identifiers.iter().map(Vec::len).sum::<usize>();
     let capacity = unsafe { size.read_unaligned() } as usize;
-    unsafe { size.write_unaligned(needed as u32) };
+    // Windows reports the size for a query or a too-small buffer, and
+    // leaves the caller's size as it was after a successful read.
+    if output.is_null() || capacity < needed {
+        unsafe { size.write_unaligned(needed as u32) };
+    }
     if !output.is_null() {
         if capacity < needed {
             fail(234);

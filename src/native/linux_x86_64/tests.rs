@@ -1241,10 +1241,26 @@ mod protection_tests {
         assert_eq!(length(), 12);
         let negative = (-1i64).to_le_bytes();
         assert_eq!(super::native_set_file_information_by_handle(handle, 6, negative.as_ptr(), 8), 0);
+        // FileAllocationInfo: larger leaves the size, smaller truncates to
+        // the allocation rounded up to 8 bytes, 0 empties.
+        let larger = 4096i64.to_le_bytes();
+        assert_eq!(super::native_set_file_information_by_handle(handle, 5, larger.as_ptr(), 8), 1);
+        assert_eq!(length(), 12);
+        let smaller = 4i64.to_le_bytes();
+        assert_eq!(super::native_set_file_information_by_handle(handle, 5, smaller.as_ptr(), 8), 1);
+        assert_eq!(length(), 8);
         let zero = 0i64.to_le_bytes();
         assert_eq!(super::native_set_file_information_by_handle(handle, 5, zero.as_ptr(), 8), 1);
         assert_eq!(length(), 0);
         assert_eq!(super::native_close_handle(handle), 1);
+        // Every successful open clears a stale last error.
+        for disposition in [3u32, 5] {
+            super::native_set_last_error(1234);
+            let handle = super::native_create_file_w(path.as_ptr(), 0x4000_0000, 0, 0, disposition, 0x80, 0);
+            assert_ne!(handle, u64::MAX);
+            assert_eq!(super::native_get_last_error(), 0, "disposition {disposition}");
+            assert_eq!(super::native_close_handle(handle), 1);
+        }
     }
 
     #[test]

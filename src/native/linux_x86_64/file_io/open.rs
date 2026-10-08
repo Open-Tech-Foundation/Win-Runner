@@ -208,12 +208,10 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_create_file_w(
         }
         return u64::MAX;
     }
-    if matches!(creation, 2 | 4) {
-        // CREATE_ALWAYS / OPEN_ALWAYS: ERROR_ALREADY_EXISTS for an existing
-        // file; a newly created one sets the last error to zero (documented
-        // for CreateFileW), so a stale code never reads as "it existed".
-        native_set_last_error(if exists { 183 } else { 0 });
-    }
+    // Success clears the last error for every disposition, except
+    // ERROR_ALREADY_EXISTS when CREATE_ALWAYS / OPEN_ALWAYS found the file
+    // (as the file_info Windows oracle records).
+    native_set_last_error(if exists && matches!(creation, 2 | 4) { 183 } else { 0 });
     let h = ctx.next;
     ctx.next += 1;
     // A handle names the file a link leads to, unless the caller opened the

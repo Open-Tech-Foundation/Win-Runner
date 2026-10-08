@@ -122,6 +122,14 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Match the Windows oracle results: `CreateFileW` clears the last error on
+  every successful open (keeping `ERROR_ALREADY_EXISTS` for existing files
+  under `CREATE_ALWAYS`/`OPEN_ALWAYS`); `FileAllocationInfo` below the end of
+  file truncates to the allocation rounded up to 8 bytes and a larger one
+  keeps the size; `CertGetEnhancedKeyUsage` leaves the caller's size alone
+  after a successful read. The certificate layout check no longer depends
+  on which root certificate the store lists first.
+
 - `CertOpenStore` accepts `CERT_STORE_DEFER_CLOSE_UNTIL_LAST_FREE_FLAG`,
   which TLS clients pass for their in-memory stores.
 

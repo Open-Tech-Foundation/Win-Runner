@@ -449,11 +449,22 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_set_file_informatio
             }
             1
         }
-        // FileAllocationInfo with AllocationSize 0 truncates the file, which
-        // runtimes rely on to empty an existing file opened with OPEN_ALWAYS
-        // (Rust's File::create). Other sizes are not implemented yet.
-        5 if size >= 8 && unsafe { information.cast::<i64>().read_unaligned() } == 0 => {
-            match ctx.fs.set_len(&path, 0) {
+        // FileAllocationInfo: an allocation below the end of file truncates
+        // the file to the allocation rounded up to 8 bytes (4 of 10 bytes
+        // leaves 8, as the file_info Windows oracle records); a larger one
+        // leaves the size alone. Rust's File::create empties files this way.
+        5 if size >= 8 => {
+            let allocation = unsafe { information.cast::<i64>().read_unaligned() };
+            if allocation < 0 {
+                native_set_last_error(87);
+                return 0;
+            }
+            let rounded = (allocation as u64).div_ceil(8) * 8;
+            let length = ctx.fs.file_len(&path).unwrap_or(0);
+            if rounded >= length {
+                return 1;
+            }
+            match ctx.fs.set_len(&path, rounded) {
                 Ok(()) => 1,
                 Err(_) => {
                     native_set_last_error(5);
