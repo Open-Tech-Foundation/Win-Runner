@@ -182,6 +182,10 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
                 "cert.root_context: ok", "cert.duplicate: ok", "cert.enum_end: ok",
                 "cert.pending_close: ok", "cert.copy_survives_close: ok", "cert.free: ok",
                 "live.before_exit: ok", "live.parent_remove: ok", "live.no_final_replay: ok",
+                // Recorded from Windows by the oracle CI.
+                "rtl.nt_version: 10.0 high=0xf", "perf.info: cb=104 page=4096 consistent",
+                "perf.info_small: ret=0 err=24", "known_folder.local_app_data: hr=0x0 path=profile\\AppData\\Local",
+                "known_folder.unknown: hr=0x80070002 path=null", "resource.missing_manifest: ret=0 err=1812",
                 "handle_info.inherited: flags=1",
                 "handle_info.cleared: flags=0", "suspend.created: ok", "suspend.process_id: ok", "suspend.before_resume: ok", "suspend.invalid_handle: ok",
                 "suspend.resume: ok", "suspend.second_resume: ok", "suspend.exit: ok", "suspend.final_io: ok",

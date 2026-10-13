@@ -316,7 +316,8 @@ pub(super) extern "win64" fn native_sh_get_folder_path_w(
 }
 
 /// `SHGetKnownFolderPath`: the folder's path in memory from CoTaskMemAlloc;
-/// `*path` is NULL on failure, and an unknown folder is E_INVALIDARG.
+/// `*path` is NULL on failure, and an unknown folder is
+/// HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND), as the Windows oracle records.
 pub(super) extern "win64" fn native_sh_get_known_folder_path(
     id: *const u8,
     _flags: u32,
@@ -342,7 +343,7 @@ pub(super) extern "win64" fn native_sh_get_known_folder_path(
         guid[10..].iter().map(|byte| format!("{byte:02X}")).collect::<String>()
     );
     let Some(folder) = system_profile::known_folder_path(&text) else {
-        return E_INVALIDARG;
+        return 0x8007_0002u32 as i32;
     };
     let encoded: Vec<u16> = folder.encode_utf16().chain(std::iter::once(0)).collect();
     let memory = native_co_task_mem_alloc(encoded.len() * 2).cast::<u16>();

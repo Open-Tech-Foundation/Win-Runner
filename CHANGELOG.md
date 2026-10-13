@@ -165,6 +165,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- `SHGetKnownFolderPath` returns `HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)`
+  for an unknown folder, as the Windows oracle records.
+
 - `Invoke-RestMethod` accepts `-OutFile` (writing the body byte for byte)
   and `-UseBasicParsing`, which installers use as their download fallback.
 
