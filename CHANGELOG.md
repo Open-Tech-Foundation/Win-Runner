@@ -154,6 +154,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- `New-Item -ItemType Directory` creates missing parent directories, as
+  PowerShell does; only an existing item still needs `-Force`.
+
 - The interactive shell runs any pipeline through PowerShell
   (`app.exe | Select-Object -First 1` no longer passes `| Select-Object ...`
   to the program), sets `$LASTEXITCODE` for programs and batch files it runs

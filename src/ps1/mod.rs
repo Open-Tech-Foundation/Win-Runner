@@ -2632,13 +2632,12 @@ impl<'a> Interpreter<'a> {
             return Ok(());
         }
         if item_type.eq_ignore_ascii_case("directory") {
-            if force {
-                self.fs.mkdir(&path).map_err(|e| format!("New-Item: {e}"))?;
-            } else {
-                self.fs
-                    .mkdir_one(&path)
-                    .map_err(|e| format!("New-Item: {e}"))?;
+            // Missing parents are created either way; only an existing
+            // item needs -Force.
+            if !force && self.fs.exists(&path) {
+                return Err(format!("New-Item: already exists: {path}"));
             }
+            self.fs.mkdir(&path).map_err(|e| format!("New-Item: {e}"))?;
         } else {
             // file
             if self.fs.is_dir(&path) {
@@ -6980,6 +6979,14 @@ $x
             out,
             b"C:\\Users\\runner C:\\Users\\runner\\AppData\\Local\n"
         );
+    }
+
+    #[test]
+    fn new_item_directories_create_missing_parents() {
+        let (code, out, result) = run("New-Item C:\\a\\b\\c -ItemType Directory\nTest-Path C:\\a\\b\\c -PathType Container");
+        assert_eq!((code, String::from_utf8_lossy(&out).trim_end()), (0, "True"), "{result:?}");
+        let (_, _, result) = run("New-Item C:\\d -ItemType Directory\nNew-Item C:\\d -ItemType Directory");
+        assert!(result.unwrap_err().contains("already exists"));
     }
 
     #[test]
