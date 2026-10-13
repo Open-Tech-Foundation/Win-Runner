@@ -285,26 +285,10 @@ fn system_store(name: &str, store: u64) -> Result<Vec<Arc<Certificate>>, u32> {
     let context = fs_ctx().ok_or(6u32)?;
     let ctx = context.lock().map_err(|_| 6u32)?;
     let registry = crate::winreg::Registry::load(&ctx.fs).map_err(|_| 1015u32)?; // ERROR_REGISTRY_CORRUPT
-    let mut certificates = Vec::new();
-    for (hive, root) in [
-        (crate::winreg::Hive::LocalMachine, "SOFTWARE"),
-        (crate::winreg::Hive::CurrentUser, "Software"),
-    ] {
-        let path = format!(r"{root}\Microsoft\SystemCertificates\{name}\Certificates");
-        let Some(key) = registry.key(hive, &path) else {
-            continue;
-        };
-        for thumbprint in key.subkey_names() {
-            let encoded = key
-                .subkey(thumbprint)
-                .and_then(|entry| entry.value("Blob"))
-                .and_then(|blob| crate::trust_roots::certificate_from_blob(&blob.data));
-            if let Some(encoded) = encoded {
-                certificates.push(certificate(encoded.to_vec(), store)?);
-            }
-        }
-    }
-    Ok(certificates)
+    crate::trust_roots::store_certificates(&registry, name)
+        .into_iter()
+        .map(|encoded| certificate(encoded, store))
+        .collect()
 }
 
 fn decode_usage(bytes: &[u8]) -> Result<Vec<Vec<u8>>, u32> {

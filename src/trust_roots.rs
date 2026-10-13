@@ -77,6 +77,32 @@ pub fn certificate_from_blob(blob: &[u8]) -> Option<&[u8]> {
     None
 }
 
+/// A system store's encoded certificates in the guest registry: the
+/// machine's `SOFTWARE\Microsoft\SystemCertificates\<name>\Certificates`
+/// then the user's, each a serialized `Blob` (an absent store is empty).
+pub fn store_certificates(registry: &crate::winreg::Registry, name: &str) -> Vec<Vec<u8>> {
+    let mut certificates = Vec::new();
+    for (hive, root) in [
+        (crate::winreg::Hive::LocalMachine, "SOFTWARE"),
+        (crate::winreg::Hive::CurrentUser, "Software"),
+    ] {
+        let path = format!(r"{root}\Microsoft\SystemCertificates\{name}\Certificates");
+        let Some(key) = registry.key(hive, &path) else {
+            continue;
+        };
+        for thumbprint in key.subkey_names() {
+            let encoded = key
+                .subkey(thumbprint)
+                .and_then(|entry| entry.value("Blob"))
+                .and_then(|blob| certificate_from_blob(&blob.data));
+            if let Some(encoded) = encoded {
+                certificates.push(encoded.to_vec());
+            }
+        }
+    }
+    certificates
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,5 +128,12 @@ mod tests {
         assert_eq!(certificate_from_blob(&blob), Some(&der[..]));
         assert_eq!(certificate_from_blob(&blob[..20]), None, "truncated");
         assert!(pem_certificates("-----BEGIN CERTIFICATE-----\nAAA").is_err());
+    }
+
+    #[test]
+    fn the_default_registry_holds_the_bundled_roots() {
+        let registry = crate::winreg::Registry::defaults();
+        assert_eq!(store_certificates(&registry, "ROOT").len(), bundled_roots().len());
+        assert!(store_certificates(&registry, "CA").is_empty());
     }
 }

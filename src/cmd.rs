@@ -190,6 +190,12 @@ pub fn cmd_exe_path() -> String {
 /// `WinrunCmdMain` native export and exits with its result, so cmd.exe runs
 /// as a real child process with its own command line and handles.
 pub fn cmd_exe_image() -> Vec<u8> {
+    stub_image("WinrunCmdMain")
+}
+
+/// A minimal PE whose entry point calls the private native export `main`
+/// and exits with its result: how the seeded System32 tools run.
+pub fn stub_image(main: &str) -> Vec<u8> {
     use crate::pe::builder::{build, Asm};
     let mut asm = Asm::new();
     asm.sub_rsp(0x28);
@@ -201,7 +207,7 @@ pub fn cmd_exe_image() -> Vec<u8> {
     build(
         asm,
         &[
-            ("KERNEL32.dll", "WinrunCmdMain"),
+            ("KERNEL32.dll", main),
             ("KERNEL32.dll", "ExitProcess"),
         ],
     )

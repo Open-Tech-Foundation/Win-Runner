@@ -474,9 +474,6 @@ fn request_head(request: &Request, method: &str, url: &Url, body: Option<&[u8]>)
         }
     }
     if let Some(body) = body {
-        if !headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("Content-Type")) {
-            headers.push(("Content-Type".into(), "application/x-www-form-urlencoded".into()));
-        }
         headers.push(("Content-Length".into(), body.len().to_string()));
     }
     headers.push(("Connection".into(), "close".into()));

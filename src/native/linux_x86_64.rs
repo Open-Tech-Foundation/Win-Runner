@@ -80,6 +80,9 @@ use crt_text::*;
 #[path = "linux_x86_64/cmd_host.rs"]
 mod cmd_host;
 use cmd_host::*;
+#[path = "linux_x86_64/curl_host.rs"]
+mod curl_host;
+use curl_host::*;
 #[path = "linux_x86_64/sockets.rs"]
 mod sockets;
 use sockets::*;

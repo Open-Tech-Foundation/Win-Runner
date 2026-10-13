@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- `curl.exe` in System32, as Windows 10+ ships it: curl's command line
+  (`-o`/`-O`/`--output-dir`, `-L`, `-f`/`--fail-with-body`, `-s`/`-S`,
+  `-I`/`-i`/`-D`, `-X`, `-H`, `-d`/`--data-*`/`--json`/`-G`, `-T`, `-u`,
+  `-A`, `-k`, `--compressed`, `-w`, `-m`, `--retry`, `-v`) and exit codes,
+  running natively in the guest over the built-in HTTP client and trusting
+  the guest's ROOT certificate store.
+
 - An HTTP/1.1 client (`http_client`) for the guest's built-in network tools:
   plain and TLS (rustls) connections verified against the guest's own ROOT
   store, redirects, chunked and length-delimited bodies, gzip/deflate
