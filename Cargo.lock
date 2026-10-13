@@ -712,6 +712,7 @@ dependencies = [
  "flate2",
  "libc",
  "rustls",
+ "rustls-webpki",
  "rustyline",
  "serde",
  "serde_json",

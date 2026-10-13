@@ -427,7 +427,10 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                 | "EnumerateSecurityPackagesA"
                 | "EnumerateSecurityPackagesW"
         ),
-        "CRYPT32.DLL" => matches!(func, "CertOpenStore" | "CertOpenSystemStoreA" | "CertOpenSystemStoreW" | "CertGetIntendedKeyUsage" | "CertGetEnhancedKeyUsage" | "CertEnumCertificatesInStore" | "CertCloseStore" | "CertFreeCertificateContext" | "CertDuplicateCertificateContext" | "CertAddEncodedCertificateToStore"),
+        "CRYPT32.DLL" => matches!(func, "CertOpenStore" | "CertOpenSystemStoreA" | "CertOpenSystemStoreW" | "CertGetIntendedKeyUsage" | "CertGetEnhancedKeyUsage" | "CertEnumCertificatesInStore" | "CertCloseStore" | "CertFreeCertificateContext" | "CertDuplicateCertificateContext" | "CertAddEncodedCertificateToStore"
+            | "CertGetCertificateChain" | "CertFreeCertificateChain" | "CertDuplicateCertificateChain"
+            | "CertVerifyCertificateChainPolicy" | "CertCreateCertificateChainEngine"
+            | "CertFreeCertificateChainEngine" | "CertSetCertificateContextProperty"),
         "PSAPI.DLL" => matches!(func, "GetProcessMemoryInfo" | "GetPerformanceInfo"),
         "WINMM.DLL" => func == "timeGetTime",
         "USERENV.DLL" => func == "GetUserProfileDirectoryW",
@@ -1365,6 +1368,23 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "CertOpenSystemStoreW" => Some(native_cert_open_system_store_w as *const () as usize as u64),
         "CertEnumCertificatesInStore" => Some(native_cert_enum_certificates as *const () as usize as u64),
         "CertCloseStore" => Some(native_cert_close_store as *const () as usize as u64),
+        "CertGetCertificateChain" => Some(native_cert_get_certificate_chain as *const () as usize as u64),
+        "CertFreeCertificateChain" => Some(native_cert_free_certificate_chain as *const () as usize as u64),
+        "CertDuplicateCertificateChain" => {
+            Some(native_cert_duplicate_certificate_chain as *const () as usize as u64)
+        }
+        "CertVerifyCertificateChainPolicy" => {
+            Some(native_cert_verify_certificate_chain_policy as *const () as usize as u64)
+        }
+        "CertCreateCertificateChainEngine" => {
+            Some(native_cert_create_certificate_chain_engine as *const () as usize as u64)
+        }
+        "CertFreeCertificateChainEngine" => {
+            Some(native_cert_free_certificate_chain_engine as *const () as usize as u64)
+        }
+        "CertSetCertificateContextProperty" => {
+            Some(native_cert_set_certificate_context_property as *const () as usize as u64)
+        }
         "CertAddEncodedCertificateToStore" => {
             Some(native_cert_add_encoded_certificate_to_store as *const () as usize as u64)
         }

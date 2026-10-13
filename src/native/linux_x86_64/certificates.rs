@@ -647,6 +647,38 @@ pub(super) extern "win64" fn native_cert_add_encoded_certificate_to_store(
     1
 }
 
+/// The encoded certificate of a context this process holds.
+pub(super) fn context_der(pointer: u64) -> Option<Vec<u8>> {
+    let stores = STORES.lock().unwrap();
+    let lease = stores.contexts.get(&pointer)?;
+    let context = &lease.certificate.context;
+    Some(unsafe { std::slice::from_raw_parts(context.encoded as *const u8, context.size as usize) }.to_vec())
+}
+
+/// The encoded certificates of an open store.
+pub(super) fn store_der(store: u64) -> Option<Vec<Vec<u8>>> {
+    let stores = STORES.lock().unwrap();
+    let certificates = stores.stores.get(&store)?;
+    Some(
+        certificates
+            .iter()
+            .map(|certificate| {
+                let context = &certificate.context;
+                unsafe { std::slice::from_raw_parts(context.encoded as *const u8, context.size as usize) }.to_vec()
+            })
+            .collect(),
+    )
+}
+
+/// The guest's machine and user ROOT stores, encoded.
+pub(super) fn guest_root_der() -> Vec<Vec<u8>> {
+    let Some(context) = fs_ctx() else { return Vec::new() };
+    let Ok(ctx) = context.lock() else { return Vec::new() };
+    crate::winreg::Registry::load(&ctx.fs)
+        .map(|registry| crate::trust_roots::store_certificates(&registry, "ROOT"))
+        .unwrap_or_default()
+}
+
 pub(super) extern "win64" fn native_cert_duplicate_context(pointer: u64) -> u64 {
     if pointer == 0 {
         return 0;

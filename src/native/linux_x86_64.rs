@@ -98,6 +98,9 @@ use crt_io::*;
 #[path = "linux_x86_64/socket_pending.rs"]
 mod socket_pending;
 use socket_pending::*;
+#[path = "linux_x86_64/cert_chain.rs"]
+mod cert_chain;
+use cert_chain::*;
 #[path = "linux_x86_64/sockets.rs"]
 mod sockets;
 use sockets::*;

@@ -6,6 +6,16 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Certificate chains: `CertGetCertificateChain` (built and verified with
+  rustls-webpki against the guest's ROOT store or a chain engine's roots,
+  with the additional store as intermediates, returned as a
+  `CERT_CHAIN_CONTEXT` with `CERT_TRUST_*` status), `CertVerifyCertificateChainPolicy`
+  (base and SSL, with the server-name check and the documented ignore
+  flags), `CertCreateCertificateChainEngine`, `CertFreeCertificateChain(Engine)`,
+  `CertDuplicateCertificateChain`, and `CertSetCertificateContextProperty`.
+  Revocation is not checked. The native_startup oracle probe records a
+  trusted and an untrusted chain.
+
 - `--memory=<size>` (or `WINRUN_MEMORY`) sets the physical memory the guest
   reports (`GlobalMemoryStatusEx`, `GetPerformanceInfo`), e.g. `8G` or
   `4096M`; the default stays 512 MiB.
