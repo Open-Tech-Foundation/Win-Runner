@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Release packaging for GitHub: `release.toml` and the generated
+  `.github/workflows/release.yml` build `target/release/winrun` on `main`,
+  publish a checksummed archive with build provenance attestation, and use
+  the curated changelog notes.
+
 - `CertAddEncodedCertificateToStore` with the `CERT_STORE_ADD_*`
   dispositions, for memory and system stores (additions stay with the open
   store; a certificate matches another with identical encoded bytes).
@@ -194,6 +199,11 @@ All notable changes to this project will be documented in this file.
   `CertOpenSystemStore` read the standard system stores (`ROOT`, `CA`, `MY`,
   `TRUST`, `Disallowed`, `AuthRoot`, `TrustedPeople`, `TrustedPublisher`)
   from the guest's machine and user hives instead of the host's CA files.
+
+### Changed
+
+- Regenerated the embedded `registry.zip` from `registry/` so the catalog
+  documentation inside the binary matches the package source tree.
 
 ### Fixed
 

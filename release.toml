@@ -1,0 +1,26 @@
+adapters = ["generic"]
+tag_format = "v{version}"
+provider = "github"
+default_branch = "main"
+changelog_strategy = "curated"
+changelog_scope = "root"
+github_release_notes = "curated-changelog"
+
+[hooks]
+
+[publish.ignore_paths]
+win-runner = ["**/*.md"]
+
+[[package]]
+name = "win-runner"
+adapter = "generic"
+mode = "build-only"
+matrix = false
+command = "cargo build --release"
+artifacts = "target/release/winrun"
+bin_name = "winrun"
+manifest = "Cargo.toml"
+version_field = "version"
+archive = "auto"
+attest = true
+checksums = true

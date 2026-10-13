@@ -1,0 +1,90 @@
+# Generated from release.toml by `release` · sha256:4c2ec9ccc6c03f87d3a4be6769e4a2b9d766996120a46bbcc914779467eb4cdf
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write  # create tags and GitHub Releases
+  id-token: write
+  attestations: write  # sign build provenance for release assets
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  check-release:
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+      release_win_runner: ${{ steps.check.outputs.release_win_runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install release
+        shell: bash
+        env:
+          OTF_RELEASE_VERSION: v0.41.0
+        run: curl -fsSL https://raw.githubusercontent.com/Open-Tech-Foundation/release/v0.41.0/install.sh | bash
+      - name: Expose release command
+        shell: bash
+        run: |
+          if ! command -v release >/dev/null 2>&1; then
+            mkdir -p "$RUNNER_TEMP/release-cli"
+            cp "$(command -v otf-release)" "$RUNNER_TEMP/release-cli/release"
+            echo "$RUNNER_TEMP/release-cli" >> "$GITHUB_PATH"
+          fi
+      - id: check
+        run: |
+          echo "should_release=$(release check --exclude-package win-runner)" >> "$GITHUB_OUTPUT"
+          echo "release_win_runner=$(release check --package win-runner)" >> "$GITHUB_OUTPUT"
+
+  build-win-runner:
+    needs: [check-release]
+    if: needs.check-release.outputs.release_win_runner == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build win-runner
+        run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: win-runner
+          path: target/release/winrun
+
+  github-release-win-runner:
+    needs: [check-release, build-win-runner]
+    if: needs.check-release.outputs.release_win_runner == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          path: .artifacts
+      - name: Install release
+        shell: bash
+        env:
+          OTF_RELEASE_VERSION: v0.41.0
+        run: curl -fsSL https://raw.githubusercontent.com/Open-Tech-Foundation/release/v0.41.0/install.sh | bash
+      - name: Expose release command
+        shell: bash
+        run: |
+          if ! command -v release >/dev/null 2>&1; then
+            mkdir -p "$RUNNER_TEMP/release-cli"
+            cp "$(command -v otf-release)" "$RUNNER_TEMP/release-cli/release"
+            echo "$RUNNER_TEMP/release-cli" >> "$GITHUB_PATH"
+          fi
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: release github-release --package win-runner --artifacts-dir .artifacts
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: .artifacts/.flat-win-runner/*
+
