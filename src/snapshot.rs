@@ -1097,7 +1097,13 @@ mod tests {
             parent.file_id(r"C:\work\hard.txt").unwrap(),
             parent.file_id(r"C:\work\source.txt").unwrap()
         );
-        assert_eq!(parent.file_metadata(r"C:\work\hard.txt").write_time, 33);
+        // The write through the hard link moved the file's last-write time,
+        // which both names share, and kept its creation time.
+        let written = child.file_metadata(r"C:\work\source.txt");
+        assert_eq!((written.creation_time, written.attributes), (11, 0x21));
+        assert!(written.write_time > 33);
+        assert_eq!(parent.file_metadata(r"C:\work\hard.txt"), written);
+        assert_eq!(parent.file_metadata(r"C:\work\source.txt"), written);
     }
 
     #[test]

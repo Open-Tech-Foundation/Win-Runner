@@ -197,6 +197,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Guest files keep their times as Windows does: creating one sets its
+  creation, last-access and last-write times, and writing it moves the
+  last-write and last-access times (for every hard link to it); the times
+  reach other guest processes through the filesystem journal. Files on
+  mounted host drives report (and `SetFileTime` sets) the host file's times
+  instead of zero.
+
 - `SO_RCVTIMEO`/`SO_SNDTIMEO` are supported (a DWORD of milliseconds, as
   Winsock takes them), and a blocking socket whose timeout runs out fails
   with `WSAETIMEDOUT` rather than `WSAEWOULDBLOCK`; the overlapped_sockets

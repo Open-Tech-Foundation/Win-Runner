@@ -241,6 +241,9 @@ pub(crate) struct WinFileMetadata {
     pub write_time: u64,
 }
 
+/// 1970-01-01 as a FILETIME (100 ns intervals since 1601).
+const UNIX_EPOCH_AS_FILETIME: u64 = 116_444_736_000_000_000;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SnapshotMetadata {
     pub path: String,
@@ -423,6 +426,8 @@ pub struct WinFs {
     symlinks: HashMap<String, String>,
     changes: Vec<FsChange>,
     record_changes: bool,
+    /// Applying another process's journal, whose entries carry file times.
+    replaying: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -690,6 +695,7 @@ impl WinFs {
             symlinks: HashMap::new(),
             changes: Vec::new(),
             record_changes: true,
+            replaying: false,
         }
     }
 
@@ -1004,6 +1010,7 @@ impl WinFs {
 
     pub(crate) fn apply_changes(&mut self, changes: &[FsChange]) -> Result<(), String> {
         let mut disks = HashMap::<PathBuf, Arc<DiskStore>>::new();
+        let replaying = std::mem::replace(&mut self.replaying, true);
         let result = (|| {
             for change in changes {
                 match change {
@@ -1037,6 +1044,7 @@ impl WinFs {
             }
             Ok(())
         })();
+        self.replaying = replaying;
         result
     }
 
@@ -1114,7 +1122,60 @@ impl WinFs {
         let file_id = self.next_file_id;
         self.next_file_id = self.next_file_id.wrapping_add(1).max(1);
         self.file_ids.insert(p.key(), file_id);
+        self.stamp_times(p, true);
         Ok(())
+    }
+
+    /// A guest file's times as Windows keeps them: creating it sets all
+    /// three, writing it the last-write and last-access times.
+    fn stamp_times(&mut self, p: &WinPath, created: bool) {
+        if self.replaying || self.is_host_drive(p.drive) {
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| (since.as_nanos() / 100) as u64 + UNIX_EPOCH_AS_FILETIME);
+        let key = p.key();
+        let mut metadata = if created {
+            WinFileMetadata::default()
+        } else {
+            self.file_metadata.get(&key).copied().unwrap_or_default()
+        };
+        if created || metadata.creation_time == 0 {
+            metadata.creation_time = now;
+        }
+        metadata.write_time = now;
+        metadata.access_time = now;
+        // Hard links name one file, with one set of times.
+        let linked: Vec<String> = match self.file_ids.get(&key).copied() {
+            Some(id) => self
+                .file_ids
+                .iter()
+                .filter_map(|(path, candidate)| (*candidate == id).then(|| path.clone()))
+                .collect(),
+            None => vec![key.clone()],
+        };
+        for key in linked {
+            self.file_metadata.insert(key, metadata);
+        }
+        self.file_metadata.insert(key, metadata);
+    }
+
+    /// Journal a C-drive file's current times after what it holds, so other
+    /// processes see them, also for a write made in place in a shared blob.
+    /// Consecutive entries for one file keep a single one.
+    fn journal_times(&mut self, p: &WinPath) {
+        if !self.record_changes || p.drive != 'C' {
+            return;
+        }
+        let Some(metadata) = self.file_metadata.get(&p.key()).copied() else {
+            return;
+        };
+        let path = p.display();
+        match self.changes.last_mut() {
+            Some(FsChange::SetMetadata { path: last, metadata: pending }) if *last == path => *pending = metadata,
+            _ => self.changes.push(FsChange::SetMetadata { path, metadata }),
+        }
     }
 
     /// Replace an existing file's contents for every hard link to it.
@@ -1144,6 +1205,7 @@ impl WinFs {
             path: p.display(),
             data,
         });
+        self.journal_times(p);
         Ok(())
     }
 
@@ -1293,10 +1355,33 @@ impl WinFs {
     }
 
     pub(crate) fn file_metadata(&self, path: &str) -> WinFileMetadata {
-        self.normalize(path)
-            .ok()
-            .and_then(|p| self.file_metadata.get(&p.key()).copied())
-            .unwrap_or_default()
+        let Ok(p) = self.normalize(path) else {
+            return WinFileMetadata::default();
+        };
+        let stored = self.file_metadata.get(&p.key()).copied().unwrap_or_default();
+        if !self.is_host_drive(p.drive) {
+            return stored;
+        }
+        // A mounted file's times are the host file's; attributes stay the
+        // guest's, as the host has no place for them.
+        let Some(host) = self.host_path(&p, false).ok().and_then(|host| std::fs::metadata(host).ok()) else {
+            return stored;
+        };
+        let filetime = |time: std::io::Result<std::time::SystemTime>| {
+            time.ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |since| (since.as_nanos() / 100) as u64 + UNIX_EPOCH_AS_FILETIME)
+        };
+        let write_time = filetime(host.modified());
+        WinFileMetadata {
+            attributes: stored.attributes,
+            creation_time: match filetime(host.created()) {
+                0 => write_time,
+                created => created,
+            },
+            access_time: filetime(host.accessed()),
+            write_time,
+        }
     }
 
     pub(crate) fn set_file_metadata(
@@ -1307,6 +1392,28 @@ impl WinFs {
         let p = self.normalize(path)?;
         if !self.exists(&p.display()) {
             return Err(format!("path not found: {}", p.display()));
+        }
+        if self.is_host_drive(p.drive) {
+            // Times go to the host file; attributes are kept as the guest's.
+            let host = self.host_path(&p, false)?;
+            let time = |filetime: u64| {
+                (filetime > UNIX_EPOCH_AS_FILETIME).then(|| {
+                    UNIX_EPOCH + std::time::Duration::from_nanos((filetime - UNIX_EPOCH_AS_FILETIME) * 100)
+                })
+            };
+            let mut times = std::fs::FileTimes::new();
+            if let Some(modified) = time(metadata.write_time) {
+                times = times.set_modified(modified);
+            }
+            if let Some(accessed) = time(metadata.access_time) {
+                times = times.set_accessed(accessed);
+            }
+            let file = std::fs::File::options()
+                .write(!host.is_dir())
+                .read(host.is_dir())
+                .open(&host)
+                .map_err(|e| format!("cannot open mounted path {}: {e}", p.display()))?;
+            file.set_times(times).map_err(|e| format!("cannot set times on {}: {e}", p.display()))?;
         }
         let key = p.key();
         let keys = if !self.symlinks.contains_key(&key) {
@@ -2018,10 +2125,16 @@ impl WinFs {
             Some(Node::File {
                 data: FileData::Blob(blob),
                 ..
-            }) => blob.replace(&data),
+            }) => {
+                blob.replace(&data)?;
+                self.stamp_times(&p, false);
+                self.journal_times(&p);
+                Ok(())
+            }
             Some(Node::File { .. }) => {
                 let stored = self.store_file(data)?;
                 self.set_data(&p, stored)?;
+                self.stamp_times(&p, false);
                 self.record_data(&p)
             }
             Some(Node::Dir { .. }) => Err(format!("path is a directory: {}", p.display())),
@@ -2103,11 +2216,15 @@ impl WinFs {
         };
         if let FileData::Blob(_) = data {
             let mut data = data;
-            return change(&mut data);
+            change(&mut data)?;
+            self.stamp_times(p, false);
+            self.journal_times(p);
+            return Ok(());
         }
         let mut copy = self.copy_up(&data)?;
         change(&mut copy)?;
         self.set_data(p, copy)?;
+        self.stamp_times(p, false);
         self.record_data(p)
     }
 
@@ -2772,6 +2889,10 @@ mod tests {
         fs.append_file(source, b"-second").unwrap();
         assert_eq!(fs.read_file(source).unwrap(), b"first-second");
         assert_eq!(fs.file_len(source).unwrap(), 12);
+        // Writing moves the last-write and last-access times only.
+        let source_metadata = fs.file_metadata(source);
+        assert_eq!((source_metadata.attributes, source_metadata.creation_time), (0x21, 11));
+        assert!(source_metadata.write_time > 33 && source_metadata.access_time > 22);
 
         fs.copy_path(source, copy, true).unwrap();
         assert_eq!(fs.read_file(copy).unwrap(), b"first-second");
