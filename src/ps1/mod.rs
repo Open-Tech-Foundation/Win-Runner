@@ -1140,14 +1140,24 @@ impl<'a> Interpreter<'a> {
         Ok(Flow::Next)
     }
 
-    /// Invoke-RestMethod: HTTPS GET via host curl, response text to output.
+    /// Invoke-RestMethod: an HTTP(S) GET whose body goes to the output, or
+    /// with `-OutFile` byte for byte to a file (and nothing to the output).
     fn cmd_irm(&mut self, args: &[String]) -> Result<(), String> {
-        let (named, positional) = parse_params(args, &["uri"])?;
+        let (named, positional) = parse_params(args, &["uri", "outfile", "usebasicparsing"])?;
         let url = named
             .get("uri")
             .cloned()
             .or_else(|| positional.first().cloned())
             .ok_or_else(|| "usage: irm <url>".to_string())?;
+        if let Some(dest) = named.get("outfile").cloned().or_else(|| positional.get(1).cloned()) {
+            let body = crate::install::fetch_url(&url, 600).map_err(|e| format!("irm: {e}"))?;
+            if let Some(parent) = parent_of(&dest) {
+                if !parent.is_empty() && !self.fs.exists(&parent) {
+                    self.ensure_dir(&parent)?;
+                }
+            }
+            return self.fs.write_file(&dest, body).map_err(|e| format!("irm: {e}"));
+        }
         let text = crate::install::fetch_url(&url, 120).map_err(|e| format!("irm: {e}"))?;
         // Like the real cmdlet, JSON bodies arrive parsed: arrays flow
         // one element per line (JSON Lines), anything else one line.

@@ -154,6 +154,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- `Invoke-RestMethod` accepts `-OutFile` (writing the body byte for byte)
+  and `-UseBasicParsing`, which installers use as their download fallback.
+
 - Disks created before the guest ROOT certificate store get the bundled
   roots when a shell starts, so `curl.exe` verifies HTTPS servers there too
   (it failed with curl error 60); a store that exists is left as it is.

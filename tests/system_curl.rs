@@ -95,3 +95,15 @@ fn curl_exit_codes_reach_shells_and_pipelines() {
     assert!(err.contains("curl: (22) The requested URL returned error: 404"), "{err}");
     assert!(err.contains("curl: option --definitely-unknown: is unknown"), "{err}");
 }
+
+#[test]
+fn invoke_rest_method_saves_bodies_with_outfile() {
+    let base = format!("http://127.0.0.1:{}", server());
+    let (out, err) = shell(&format!(
+        "Invoke-RestMethod {base}/hello -OutFile C:\\saved.txt\n\
+         Get-Content C:\\saved.txt\n\
+         exit\n"
+    ));
+    assert!(err.is_empty(), "{err}");
+    assert_eq!(out, "hello from the server\nsecond line\n");
+}
