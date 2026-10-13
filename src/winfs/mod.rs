@@ -2512,12 +2512,12 @@ impl WinFs {
     /// Copy file bytes (helper for CopyFileW semantics).
     pub fn copy_file(&mut self, src: &str, dst: &str, fail_if_exists: bool) -> Result<(), String> {
         let s = self.normalize(src)?;
-        match self.get_node(&s) {
-            Some(Node::File { .. }) => {}
-            Some(Node::Dir { .. }) => {
-                return Err(format!("source is a directory: {}", s.display()))
-            }
-            None => return Err(format!("source not found: {}", s.display())),
+        // is_file/is_dir see mounted host drives too.
+        if self.is_dir(src) {
+            return Err(format!("source is a directory: {}", s.display()));
+        }
+        if !self.is_file(src) {
+            return Err(format!("source not found: {}", s.display()));
         }
         self.copy_path(src, dst, fail_if_exists)
     }
@@ -3313,6 +3313,26 @@ mod tests {
                 (r"C:\b.txt".to_string(), b"b".to_vec()),
             ]
         );
+    }
+
+    #[test]
+    fn mounted_host_drive_files_copy_like_guest_files() {
+        let root = std::env::temp_dir().join(format!(
+            "winrun-mount-copy-{}-{}",
+            std::process::id(),
+            NEXT_DISK_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("src.txt"), b"hello").unwrap();
+        let mut fs = WinFs::ephemeral_runner();
+        fs.mount_host_dir('z', &root, false).unwrap();
+        fs.copy_file(r"Z:\src.txt", r"Z:/dst.txt", true).unwrap();
+        assert_eq!(std::fs::read(root.join("dst.txt")).unwrap(), b"hello");
+        assert!(fs.copy_file(r"Z:\src.txt", r"Z:\dst.txt", true).is_err(), "fail if exists");
+        fs.copy_file(r"Z:\src.txt", r"C:\copied.txt", false).unwrap();
+        assert_eq!(fs.read_file(r"C:\copied.txt").unwrap(), b"hello");
+        assert!(fs.copy_file(r"Z:\missing.txt", r"Z:\x.txt", false).is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

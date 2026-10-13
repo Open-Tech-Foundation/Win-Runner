@@ -197,6 +197,15 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Directory enumeration through `GetFileInformationByHandleEx` resumes after
+  the last name returned, as NTFS does, so deleting entries between batches
+  no longer skips the rest (Rust's `remove_dir_all` failed with
+  `ERROR_DIR_NOT_EMPTY` on folders of more than one batch).
+- Files on mounted host drives copy (`CopyFile`/`CopyFileEx` reported access
+  denied), `CopyFileExW` reports progress (Rust's `fs::copy` returned 0
+  bytes), and a mounted drive's root canonicalizes to `\\?\Z:\` rather than
+  `\\?\Z:`.
+
 - `NtReadFile`/`NtWriteFile` without an event or APC on an overlapped pipe
   handle complete before returning instead of failing with
   `STATUS_INVALID_HANDLE`, so `std::fs::File` reads of a child's pipe (as

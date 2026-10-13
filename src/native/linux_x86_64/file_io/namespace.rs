@@ -223,19 +223,42 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_copy_file_a(
     native_copy_file_w(source.as_ptr(), destination.as_ptr(), fail)
 }
 
+/// `CopyFileExW`: the copy, reported to the progress routine as a stream
+/// switch and then one finished chunk of the whole file (Rust's `fs::copy`
+/// returns the byte count the routine saw). PROGRESS_CANCEL (1) or
+/// PROGRESS_STOP (2) from it fails the copy with ERROR_REQUEST_ABORTED.
 pub(in crate::native::linux_x86_64) extern "win64" fn native_copy_file_ex_w(
     source: *const u16,
     destination: *const u16,
-    _progress: u64,
-    _data: u64,
+    progress: u64,
+    data: u64,
     _cancel: *mut i32,
     flags: u32,
 ) -> i32 {
+    type Progress = unsafe extern "win64" fn(i64, i64, i64, i64, u32, u32, u64, u64, u64) -> u32;
     if flags & !0x3 != 0 {
         native_set_last_error(87);
         return 0;
     }
-    native_copy_file_w(source, destination, (flags & 1 != 0) as i32)
+    if native_copy_file_w(source, destination, (flags & 1 != 0) as i32) == 0 {
+        return 0;
+    }
+    if progress != 0 {
+        let size = wide(source)
+            .and_then(|path| {
+                fs_ctx().and_then(|context| context.lock().ok().and_then(|ctx| ctx.fs.file_len(&path).ok()))
+            })
+            .unwrap_or(0) as i64;
+        let routine = unsafe { std::mem::transmute::<u64, Progress>(progress) };
+        // CALLBACK_STREAM_SWITCH, then CALLBACK_CHUNK_FINISHED, stream 1.
+        for (transferred, reason) in [(0, 1u32), (size, 0u32)] {
+            if matches!(unsafe { routine(size, transferred, size, transferred, 1, reason, 0, 0, data) }, 1 | 2) {
+                native_set_last_error(1235);
+                return 0;
+            }
+        }
+    }
+    1
 }
 
 pub(in crate::native::linux_x86_64) extern "win64" fn native_copy_file2(

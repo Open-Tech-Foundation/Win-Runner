@@ -937,8 +937,11 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_get_file_attributes
 }
 pub(in crate::native::linux_x86_64) fn native_extended_path(path: &str) -> String {
     let path = path.trim_end_matches('.').trim_end_matches('\\');
-    if path.eq_ignore_ascii_case("C:") || path.is_empty() {
+    if path.is_empty() {
         "\\\\?\\C:\\".to_string()
+    } else if path.len() == 2 && path.as_bytes()[1] == b':' {
+        // A drive's root keeps its separator (`\\?\Z:\`).
+        format!("\\\\?\\{path}\\")
     } else {
         format!("\\\\?\\{}", path)
     }
@@ -1138,8 +1141,26 @@ impl DirectoryInfoLayout {
     }
 }
 
-/// Fill `output` with as many directory records as fit, continuing from the
-/// handle's enumeration position (NTFS order: `.`, `..`, then entries).
+/// Where a directory handle's enumeration stopped: after `.`, `..`, or a
+/// named entry. Resuming by name (as NTFS does) keeps entries deleted or
+/// added in between from shifting the rest, which index positions would.
+#[derive(Clone)]
+pub(in crate::native::linux_x86_64) enum DirectoryCursor {
+    Dot,
+    DotDot,
+    After(String),
+}
+
+pub(in crate::native::linux_x86_64) static DIRECTORY_CURSORS: LazyLock<Mutex<HashMap<u64, DirectoryCursor>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The case-insensitive order directory listings are sorted in.
+fn listing_key(name: &str) -> String {
+    name.chars().map(|character| character.to_uppercase().next().unwrap_or(character)).collect()
+}
+
+/// Fill `output` with as many directory records as fit, continuing after
+/// the handle's cursor (NTFS order: `.`, `..`, then entries by name).
 /// `ERROR_NO_MORE_FILES` once the listing is exhausted.
 fn native_directory_information(handle: u64, layout: DirectoryInfoLayout, output: *mut u8, size: u32) -> i32 {
     let Some(context) = fs_ctx() else {
@@ -1155,7 +1176,11 @@ fn native_directory_information(handle: u64, layout: DirectoryInfoLayout, output
         return 0;
     };
     let path = file.path.clone();
-    let start = if layout.restart { 0 } else { file.offset };
+    let cursor = if layout.restart {
+        None
+    } else {
+        DIRECTORY_CURSORS.lock().ok().and_then(|cursors| cursors.get(&handle).cloned())
+    };
     if !ctx.fs.is_dir(&path) {
         native_set_last_error(267); // ERROR_DIRECTORY
         return 0;
@@ -1175,6 +1200,15 @@ fn native_directory_information(handle: u64, layout: DirectoryInfoLayout, output
         let full = format!("{base}\\{name}");
         (name, full)
     }));
+    let start = match &cursor {
+        None => 0,
+        Some(DirectoryCursor::Dot) => 1,
+        Some(DirectoryCursor::DotDot) => 2,
+        Some(DirectoryCursor::After(last)) => {
+            let last = listing_key(last);
+            2 + entries[2..].iter().take_while(|(name, _)| listing_key(name) <= last).count()
+        }
+    };
     if start >= entries.len() {
         native_set_last_error(18); // ERROR_NO_MORE_FILES
         return 0;
@@ -1235,8 +1269,14 @@ fn native_directory_information(handle: u64, layout: DirectoryInfoLayout, output
         written += (used + 7) & !7;
         index += 1;
     }
-    if let Some(file) = ctx.handles.get_mut(&handle) {
-        file.offset = index;
+    let next = match index {
+        0 => None,
+        1 => Some(DirectoryCursor::Dot),
+        2 => Some(DirectoryCursor::DotDot),
+        _ => Some(DirectoryCursor::After(entries[index - 1].0.clone())),
+    };
+    if let (Ok(mut cursors), Some(next)) = (DIRECTORY_CURSORS.lock(), next) {
+        cursors.insert(handle, next);
     }
     1
 }

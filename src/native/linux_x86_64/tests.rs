@@ -414,6 +414,59 @@ mod protection_tests {
     }
 
     #[test]
+    fn directory_enumeration_resumes_by_name_while_entries_are_deleted() {
+        // As Rust's remove_dir_all does: read a batch, delete it, read on.
+        let directory = r"C:\enumerate-while-deleting";
+        let context = super::fs_ctx().unwrap();
+        let handle = {
+            let mut fs = context.lock().unwrap();
+            fs.fs.mkdir(directory).unwrap();
+            for index in 0..30 {
+                fs.fs.write_file(&format!(r"{directory}\entry-{index:02}.txt"), vec![1]).unwrap();
+            }
+            let handle = fs.next;
+            fs.next += 1;
+            fs.handles.insert(
+                handle,
+                super::NativeFile { path: directory.into(), offset: 0, overlapped: false, completion: None },
+            );
+            handle
+        };
+        let mut seen = Vec::new();
+        let mut class = 11; // FileIdBothDirectoryRestartInfo first
+        let mut buffer = vec![0u8; 512];
+        loop {
+            if super::native_get_file_information_by_handle_ex(handle, class, buffer.as_mut_ptr(), 512) == 0 {
+                assert_eq!(super::native_get_last_error(), 18, "ERROR_NO_MORE_FILES");
+                break;
+            }
+            class = 10;
+            let mut offset = 0usize;
+            loop {
+                let next = u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap()) as usize;
+                let length = u32::from_le_bytes(buffer[offset + 60..offset + 64].try_into().unwrap()) as usize;
+                let units: Vec<u16> = buffer[offset + 104..offset + 104 + length]
+                    .chunks_exact(2)
+                    .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                    .collect();
+                let name = String::from_utf16(&units).unwrap();
+                if name != "." && name != ".." {
+                    context.lock().unwrap().fs.delete_file(&format!(r"{directory}\{name}")).unwrap();
+                    seen.push(name);
+                }
+                if next == 0 {
+                    break;
+                }
+                offset += next;
+            }
+        }
+        assert_eq!(seen.len(), 30, "{seen:?}");
+        assert!(context.lock().unwrap().fs.list_dir(directory).unwrap().is_empty());
+        assert_eq!(super::native_close_handle(handle), 1);
+        context.lock().unwrap().fs.rmdir(directory).unwrap();
+    }
+
+    #[test]
     fn get_file_information_by_handle_ex_reports_basic_metadata() {
         let path = r"C:\handle_ex_unit.txt";
         let context = super::fs_ctx().unwrap();

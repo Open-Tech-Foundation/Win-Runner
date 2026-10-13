@@ -629,7 +629,12 @@ pub(super) extern "win64" fn native_close_handle(h: u64) -> i32 {
                         };
                     }
                 }
-                device_closed || c.handles.remove(&h).is_some() || c.finds.remove(&h).is_some()
+                device_closed || {
+                    if let Ok(mut cursors) = DIRECTORY_CURSORS.lock() {
+                        cursors.remove(&h);
+                    }
+                    c.handles.remove(&h).is_some()
+                } || c.finds.remove(&h).is_some()
             })
         })
         .unwrap_or(false);
