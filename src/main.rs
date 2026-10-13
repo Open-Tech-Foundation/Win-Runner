@@ -293,20 +293,32 @@ fn main() {
     run_target(&args[1], &args[2..]);
 }
 
+/// The instance's shell line running `args` exactly: an argument with
+/// spaces, quotes or PowerShell's special characters is quoted as
+/// PowerShell reads it — single quotes for a literal, or double quotes with
+/// backtick escapes when it contains a single quote.
 fn shell_command(args: &[String]) -> Result<String, String> {
-    args.iter()
+    Ok(args
+        .iter()
         .map(|arg| {
-            if arg.contains('"') {
-                return Err("instance exec arguments may not contain double quotes yet".to_string());
-            }
-            if arg.is_empty() || arg.chars().any(char::is_whitespace) {
-                Ok(format!("\"{arg}\""))
+            let special = |c: char| c.is_whitespace() || "\"'`$;|&(){}@#<>,".contains(c);
+            if !arg.is_empty() && !arg.chars().any(special) {
+                arg.clone()
+            } else if !arg.contains('\'') {
+                format!("'{arg}'")
             } else {
-                Ok(arg.clone())
+                let escaped: String = arg
+                    .chars()
+                    .flat_map(|c| match c {
+                        '"' | '`' | '$' => vec!['`', c],
+                        c => vec![c],
+                    })
+                    .collect();
+                format!("\"{escaped}\"")
             }
         })
-        .collect::<Result<Vec<_>, _>>()
-        .map(|parts| parts.join(" "))
+        .collect::<Vec<_>>()
+        .join(" "))
 }
 
 fn load_snapshot(path: &str) -> WinFs {
@@ -359,6 +371,18 @@ mod tests {
 
     fn argv(words: &[&str]) -> Vec<String> {
         words.iter().map(|word| (*word).to_string()).collect()
+    }
+
+    #[test]
+    fn instance_commands_quote_arguments_for_powershell() {
+        let args: Vec<String> = ["tool.exe", "plain", "two words", r#"say "hi""#, "it's $HOME", ""]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            super::shell_command(&args).unwrap(),
+            r#"tool.exe plain 'two words' 'say "hi"' "it's `$HOME" ''"#
+        );
     }
 
     #[test]
@@ -437,13 +461,8 @@ fn run_target(target: &str, guest_args: &[String]) {
         match ext.as_str() {
             // As a Windows process starts: on a stock runner disk (profile
             // folders, System32) with the user's logon environment.
-            "exe" => {
-                let (code, _) =
-                    winrun::shell::run_headless_program(WinFs::ephemeral_runner(), target, guest_args);
-                exit(code);
-            }
-            "ps1" => {
-                // Arguments bind to the script's param() block or $args.
+            // A script's arguments bind to its param() block or $args.
+            "exe" | "ps1" => {
                 let (code, _) =
                     winrun::shell::run_headless_program(WinFs::ephemeral_runner(), target, guest_args);
                 exit(code);
@@ -453,7 +472,6 @@ fn run_target(target: &str, guest_args: &[String]) {
                 exit(2);
             }
         }
-        return;
     }
     eprintln!("winrun: nothing to run: {target} (no such host file; install packages inside `winrun shell`)");
     exit(1);

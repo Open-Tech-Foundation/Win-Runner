@@ -188,12 +188,10 @@ fn build(end: &[u8], intermediates: &[Vec<u8>], roots: &[Vec<u8>], time: UnixTim
                 E::UnknownIssuer | E::CaUsedAsEndEntity if self_issued(end) => CERT_TRUST_IS_UNTRUSTED_ROOT,
                 E::UnknownIssuer => CERT_TRUST_IS_PARTIAL_CHAIN,
                 E::InvalidSignatureForPublicKey
-                | E::UnsupportedSignatureAlgorithm
                 | E::UnsupportedSignatureAlgorithmContext(_)
-                | E::UnsupportedSignatureAlgorithmForPublicKey
                 | E::UnsupportedSignatureAlgorithmForPublicKeyContext(_)
                 | E::SignatureAlgorithmMismatch => CERT_TRUST_IS_NOT_SIGNATURE_VALID,
-                E::RequiredEkuNotFound | E::RequiredEkuNotFoundContext(_) | E::EmptyEkuExtension | E::CaUsedAsEndEntity => {
+                E::RequiredEkuNotFoundContext(_) | E::EmptyEkuExtension | E::CaUsedAsEndEntity => {
                     CERT_TRUST_IS_NOT_VALID_FOR_USAGE
                 }
                 E::NameConstraintViolation => CERT_TRUST_INVALID_NAME_CONSTRAINTS,

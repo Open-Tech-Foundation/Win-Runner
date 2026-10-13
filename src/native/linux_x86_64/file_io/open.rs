@@ -1171,7 +1171,7 @@ fn native_directory_information(handle: u64, layout: DirectoryInfoLayout, output
         native_set_last_error(6);
         return 0;
     };
-    let Ok(mut ctx) = context.lock() else {
+    let Ok(ctx) = context.lock() else {
         native_set_last_error(6);
         return 0;
     };

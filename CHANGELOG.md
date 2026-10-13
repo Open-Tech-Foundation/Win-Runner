@@ -249,6 +249,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- `winrun instance exec` passes arguments with double quotes, single quotes
+  and PowerShell's special characters exactly, quoted as PowerShell reads
+  them (it rejected double quotes before).
+
 - A program run from a host path (`winrun /path/app.exe`) runs from its
   folder mounted as a drive (the last free letter, Z: down), so it sees a
   Windows module path and finds the DLLs beside it; it ran under the Linux
