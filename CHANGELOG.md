@@ -6,6 +6,18 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- A PowerShell expression engine for statements and assignments:
+  arithmetic (`1+1`, `7/2`, `%`, `kb`/`mb` suffixes, hex), string and array
+  repetition and concatenation, arrays (`1,2,3`, `@(...)`, ranges
+  `1..5`, negative indexes), hashtable literals with entries, comparison
+  operators (with `c`/`i` forms and array filtering), `-like`, `-match`,
+  `-replace`, `-split`, `-join`, `-contains`/`-in`, `-is`/`-as`, logical
+  and bitwise operators, `-f` formatting (`N`, `D`, `F`, `X`, `P`), casts
+  with .NET's range checks and rounding, `[math]::` and `[string]::`
+  members, and common string, array and hashtable properties and methods.
+  Statements it does not cover keep their previous handling. `$s += "x"`
+  now concatenates strings and `[bool]'0'` is True, as in PowerShell.
+
 - `winrun --help` (`-h`) prints the usage and `winrun --version` (`-V`) the
   version, both exiting 0.
 

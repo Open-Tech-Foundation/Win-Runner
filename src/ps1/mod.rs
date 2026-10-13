@@ -48,6 +48,7 @@ mod essentials;
 mod dotnet;
 mod external;
 mod registry;
+mod expr;
 
 pub use external::{ErrorStream, ProcessHost, ProcessOutput};
 
@@ -900,6 +901,16 @@ impl<'a> Interpreter<'a> {
                 return self.cmd_select_object(stmt, pipe_in);
             }
         }
+        // An expression statement (`1+1`, `1,2,3`, `@{a=1}`, `$s -split
+        // ';'`) outputs its value; `$null` outputs nothing.
+        if pipe_in.is_none() && starts_like_expression(stmt) {
+            if let Some(value) = self.eval_expression(stmt.trim())? {
+                if value != expr::V::Null {
+                    self.emit_value(&value.into_value());
+                }
+                return Ok(Flow::Next);
+            }
+        }
         // `[Type]::Method(...)` as a whole statement: evaluate, emit
         // non-void results.
         if let Some((typ, method, inner, rest)) = split_static_call(stmt.trim_start())? {
@@ -955,6 +966,19 @@ impl<'a> Interpreter<'a> {
         // `$m[$k] = v` assigns into a map.
         if let Some(ix) = split_index_assign(stmt) {
             return self.cmd_assign_index(ix.0, ix.1, ix.2, ix.3);
+        }
+        // `$x = <expression>` / `$x += <expression>` (`+=` as `$x + (...)`).
+        if let Some((name, op, rhs)) = split_assign_rhs(stmt) {
+            if starts_like_expression(&rhs) && !is_pipeline(&rhs) {
+                let source = match op {
+                    AssignOp::Set => rhs.clone(),
+                    AssignOp::Append => format!("{name} + ({rhs})"),
+                };
+                if let Some(value) = self.eval_expression(source.trim())? {
+                    self.store_assign(&name, AssignOp::Set, value.into_value())?;
+                    return Ok(Flow::Next);
+                }
+            }
         }
         if !toks[0].verbatim() {
             if let Some(asg) = split_assignment(&toks)? {
@@ -4054,6 +4078,17 @@ fn split_chunks(code: &str) -> Vec<String> {
 
 /// True when `s` starts with keyword `kw` on a word boundary
 /// (case-insensitive; `elsewhere` is not `else`).
+/// Whether a statement or value starts the way an expression does: a
+/// number, a quote, `$`, `(`, `@`, `[`, `!`, or a negative number.
+fn starts_like_expression(text: &str) -> bool {
+    let mut chars = text.trim_start().chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_digit() || matches!(c, '\'' | '"' | '$' | '(' | '@' | '[' | '!') => true,
+        Some('-') | Some('.') => chars.next().is_some_and(|c| c.is_ascii_digit()),
+        _ => false,
+    }
+}
+
 fn starts_kw(s: &str, kw: &str) -> bool {
     let t = s.trim_start();
     match t.get(..kw.len()) {
@@ -7481,10 +7516,10 @@ $x
         let (out, r) = run_session("$u = @{}\necho \"x$u['nope']y\"");
         assert!(r.is_ok());
         assert_eq!(out, b"xy\n");
-        assert!(run_session("$u = @{a=1}")
-            .1
-            .unwrap_err()
-            .contains("entries"));
+        // Hashtable literals with entries.
+        let (out, r) = run_session("$u = @{a=1}\necho $u.a");
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(out, b"1\n");
         assert!(run_session("echo $u.Length('x')")
             .1
             .unwrap_err()
@@ -7673,7 +7708,8 @@ $x
     fn conversions_and_added_types() {
         let (out, r) = run_session("[int]'42'\n[char]65\n'7' -as [int]\n'x' -as [int]\n[bool]'0'\n$t = Add-Type -MemberDefinition '[DllImport(\"user32.dll\")] public static extern IntPtr SendMessageTimeout(IntPtr h);' -Name N -Namespace W -PassThru\necho $t\n[W.N]::SendMessageTimeout([IntPtr] 0xffff)");
         assert!(r.is_ok(), "{r:?}");
-        assert_eq!(out, b"42\nA\n7\nFalse\nW.N\n1\n");
+        // [bool] of any non-empty string is True, as in PowerShell.
+        assert_eq!(out, b"42\nA\n7\nTrue\nW.N\n1\n");
         assert!(run_session("[int]'x'").1.unwrap_err().contains("Cannot convert"));
         assert!(run_session("[byte]300").1.unwrap_err().contains("Cannot convert"));
         assert!(run_session("[Some.Thing]5").1.unwrap_err().contains("not supported"));
@@ -7816,10 +7852,10 @@ $x
         let (out, r) = run_session("$u += \"b\"\necho $u");
         assert!(r.is_ok());
         assert_eq!(out, b"b\n");
-        // scalar + scalar becomes an array.
+        // string + string concatenates, as in PowerShell.
         let (out, r) = run_session("$s = \"a\"\n$s += \"b\"\necho $s");
         assert!(r.is_ok());
-        assert_eq!(out, b"a b\n");
+        assert_eq!(out, b"ab\n");
         // empty array stays an array (Count works).
         let (out, r) = run_session("$e = @()\n$e += \"x\"\nif ($e.Count -eq 1) { echo y }");
         assert!(r.is_ok());
