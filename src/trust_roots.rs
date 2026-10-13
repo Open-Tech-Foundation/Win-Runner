@@ -77,6 +77,31 @@ pub fn certificate_from_blob(blob: &[u8]) -> Option<&[u8]> {
     None
 }
 
+/// Put the bundled roots in the machine's ROOT store, as Windows keeps them.
+pub fn add_bundled_roots(registry: &mut crate::winreg::Registry) {
+    for der in bundled_roots() {
+        let path = format!(r"{MACHINE_ROOT_STORE}\{}", thumbprint(der));
+        registry.create_key(crate::winreg::Hive::LocalMachine, &path).0.set_value(
+            "Blob",
+            crate::winreg::RegValue {
+                kind: crate::winreg::REG_BINARY,
+                data: serialized_blob(der),
+            },
+        );
+    }
+}
+
+/// Give a disk whose machine hive predates the ROOT store the bundled roots.
+/// A store that exists is left as it is, removals included.
+pub fn seed_root_store(fs: &mut crate::winfs::WinFs) -> Result<(), String> {
+    let mut registry = crate::winreg::Registry::load(fs)?;
+    if registry.key(crate::winreg::Hive::LocalMachine, MACHINE_ROOT_STORE).is_some() {
+        return Ok(());
+    }
+    add_bundled_roots(&mut registry);
+    registry.save(fs, crate::winreg::Hive::LocalMachine)
+}
+
 /// A system store's encoded certificates in the guest registry: the
 /// machine's `SOFTWARE\Microsoft\SystemCertificates\<name>\Certificates`
 /// then the user's, each a serialized `Blob` (an absent store is empty).
@@ -128,6 +153,26 @@ mod tests {
         assert_eq!(certificate_from_blob(&blob), Some(&der[..]));
         assert_eq!(certificate_from_blob(&blob[..20]), None, "truncated");
         assert!(pem_certificates("-----BEGIN CERTIFICATE-----\nAAA").is_err());
+    }
+
+    #[test]
+    fn disks_without_a_root_store_get_one_and_others_keep_theirs() {
+        use crate::winreg::{Hive, Registry};
+        let mut fs = crate::winfs::WinFs::new();
+        // A machine hive saved before the ROOT store existed.
+        let mut registry = Registry::defaults();
+        registry.delete_key(Hive::LocalMachine, r"SOFTWARE\Microsoft\SystemCertificates", true).unwrap();
+        registry.save(&mut fs, Hive::LocalMachine).unwrap();
+        assert!(store_certificates(&Registry::load(&fs).unwrap(), "ROOT").is_empty());
+        seed_root_store(&mut fs).unwrap();
+        let mut registry = Registry::load(&fs).unwrap();
+        assert_eq!(store_certificates(&registry, "ROOT").len(), bundled_roots().len());
+        // A root the user removed stays removed.
+        let first = format!(r"{MACHINE_ROOT_STORE}\{}", thumbprint(&bundled_roots()[0]));
+        registry.delete_key(Hive::LocalMachine, &first, true).unwrap();
+        registry.save(&mut fs, Hive::LocalMachine).unwrap();
+        seed_root_store(&mut fs).unwrap();
+        assert_eq!(store_certificates(&Registry::load(&fs).unwrap(), "ROOT").len(), bundled_roots().len() - 1);
     }
 
     #[test]

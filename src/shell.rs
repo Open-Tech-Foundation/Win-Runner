@@ -430,6 +430,9 @@ impl Shell {
         crate::cmd::seed_cmd_exe(&mut fs);
         crate::curl_tool::seed_curl_exe(&mut fs);
         crate::tar_tool::seed_tar_exe(&mut fs);
+        if let Err(error) = crate::trust_roots::seed_root_store(&mut fs) {
+            eprintln!("winrun: cannot add trusted root certificates: {error}");
+        }
         // npm's standard Windows cache and global-prefix folders; npm
         // expects the cache's temp and log directories to exist.
         for directory in [

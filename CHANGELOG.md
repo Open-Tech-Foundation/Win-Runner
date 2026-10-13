@@ -154,6 +154,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Disks created before the guest ROOT certificate store get the bundled
+  roots when a shell starts, so `curl.exe` verifies HTTPS servers there too
+  (it failed with curl error 60); a store that exists is left as it is.
+
 - The npm global-launcher test passes its folder to `node -e` as an argument
   instead of a JavaScript template literal, whose backticks PowerShell treats
   as escapes inside double quotes.
