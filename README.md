@@ -61,26 +61,38 @@ you download packages with `wpkg` or call out to HTTP from the guest.
 
 ## Installation
 
-### Install script (recommended)
+### Install (copy and paste)
 
-On Linux x86-64, install a published release with the bundled script. It
-downloads the tarball and `checksums.txt`, verifies the SHA-256, and installs
-`winrun` into a directory on your `PATH`.
+Linux x86-64 only. Needs `curl` and `sha256sum`.
 
 ```bash
-# Latest script default (pin with --version / WINRUN_VERSION)
-curl -fsSL "https://raw.githubusercontent.com/Open-Tech-Foundation/Win-Runner/main/scripts/install.sh" | bash
+curl -fsSL https://raw.githubusercontent.com/Open-Tech-Foundation/Win-Runner/main/scripts/install.sh | bash
+```
 
-# Or from a clone of this repository:
+Installs `winrun` onto your `PATH` (no service; no admin step unless the prefix needs it).
+
+### Install options
+
+```bash
+# From a clone of this repository
 ./scripts/install.sh
+```
+
+```bash
+# Pin a version and choose where it goes
 ./scripts/install.sh --version v0.1.0 --prefix "$HOME/.local/bin"
+```
+
+```bash
+# See what it would do without downloading
 ./scripts/install.sh --dry-run
 ```
 
-Default prefix is `/usr/local/bin` when that directory is writable, otherwise
-`$HOME/.local/bin`. Override with `--prefix` or `WINRUN_PREFIX`. Requires
-`curl` and `sha256sum`. There is no post-install service; the install is just
-the `winrun` binary.
+| Flag / env | Meaning |
+|---|---|
+| `--version TAG` / `WINRUN_VERSION` | Release tag (default `v0.1.0`) |
+| `--prefix DIR` / `WINRUN_PREFIX` | Install directory (default `/usr/local/bin` if writable, else `~/.local/bin`) |
+| `--dry-run` | Print the plan only |
 
 ### Download a release manually
 
@@ -89,14 +101,17 @@ page. Each release ships a Linux x86-64 `winrun` binary in a tarball plus a
 `checksums.txt` file.
 
 ```bash
-# Example for v0.1.0 — pick the latest version from the releases page
 VERSION=v0.1.0
 curl -fsSLO "https://github.com/Open-Tech-Foundation/Win-Runner/releases/download/${VERSION}/winrun-win-runner.tar.gz"
 curl -fsSLO "https://github.com/Open-Tech-Foundation/Win-Runner/releases/download/${VERSION}/checksums.txt"
 sha256sum -c checksums.txt
 tar -xzf winrun-win-runner.tar.gz
-sudo install -m 755 winrun /usr/local/bin/winrun   # or: mv winrun ~/.local/bin/
-winrun inspect /path/to/app.exe                    # smoke check
+sudo install -m 755 winrun /usr/local/bin/winrun
+```
+
+```bash
+# or install into your home directory without sudo
+install -m 755 winrun "$HOME/.local/bin/winrun"
 ```
 
 The archive contains only the `winrun` binary (stripped). License text lives
@@ -112,8 +127,11 @@ git clone https://github.com/Open-Tech-Foundation/Win-Runner.git
 cd Win-Runner
 cargo build --release
 sudo install -m 755 target/release/winrun /usr/local/bin/winrun
-# or without install:
-# export PATH="$PWD/target/release:$PATH"
+```
+
+```bash
+# without installing system-wide
+export PATH="$PWD/target/release:$PATH"
 ```
 
 Offline builds work with a warm Cargo cache: `cargo build --release --offline`.
@@ -121,13 +139,18 @@ Offline builds work with a warm Cargo cache: `cargo build --release --offline`.
 ### Verify the install
 
 ```bash
-winrun                    # prints usage and exits 2 (there is no --help flag)
+which winrun
+winrun
 winrun inspect path/to/app.exe
 winrun shell
 ```
 
-If `winrun` is not found, put the directory that contains the binary on your
-`PATH`. There is no installer daemon and no post-install service.
+`winrun` with no arguments prints usage and exits 2 (there is no `--help` flag).
+If `winrun` is not found, add the install directory to `PATH`, for example:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
 
 ## How to use
 
