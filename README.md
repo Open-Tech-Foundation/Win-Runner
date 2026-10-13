@@ -163,6 +163,7 @@ export PATH="$HOME/.local/bin:$PATH"
 | Persistent C: between runs | `winrun --snapshot=tools.winfs --save shell` |
 | Mount a host folder as guest `Z:` | `winrun --mount=Z:/path/to/folder shell` |
 | Read-only mount | `winrun --mount-ro=Z:/path/to/folder shell` |
+| Guest memory (default 512M) | `winrun --memory=8G shell` (or `WINRUN_MEMORY=8G`) |
 | Headless / agent control | `winrun --headless --control=127.0.0.1:0 shell` |
 | Scripted batch jobs | `winrun runner` (commands on stdin) |
 | Long-lived named instance | `winrun instance boot <name>` then `instance exec` / `status` / `destroy` |

@@ -11,6 +11,49 @@ pub const USER_NAME: &str = "runner";
 pub const COMPUTER_NAME: &str = "WINRUNNER";
 /// `GetSystemInfo` and `NUMBER_OF_PROCESSORS` report the same count.
 pub const PROCESSOR_COUNT: u32 = 1;
+
+/// The physical memory the guest reports when nothing configures it.
+pub const DEFAULT_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
+/// The least memory `--memory` accepts.
+pub const MINIMUM_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
+
+/// A memory size: bytes, or a number with a `K`, `M`, `G` or `T` suffix
+/// (binary units, an optional trailing `B`, any case).
+pub fn parse_memory_size(text: &str) -> Result<u64, String> {
+    let trimmed = text.trim();
+    let upper = trimmed.to_ascii_uppercase();
+    let upper = upper.strip_suffix('B').unwrap_or(&upper);
+    let (number, shift) = match upper.chars().last() {
+        Some('K') => (&upper[..upper.len() - 1], 10),
+        Some('M') => (&upper[..upper.len() - 1], 20),
+        Some('G') => (&upper[..upper.len() - 1], 30),
+        Some('T') => (&upper[..upper.len() - 1], 40),
+        _ => (upper, 0),
+    };
+    let value: u64 = number
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid memory size {trimmed:?} (use e.g. 4096M or 8G)"))?;
+    let bytes = value
+        .checked_mul(1u64 << shift)
+        .ok_or_else(|| format!("memory size {trimmed:?} is too large"))?;
+    if bytes < MINIMUM_MEMORY_BYTES {
+        return Err(format!("memory size {trimmed:?} is below the 64M minimum"));
+    }
+    Ok(bytes)
+}
+
+/// The guest's physical memory: `WINRUN_MEMORY` (set by `--memory`), else
+/// 512 MiB.
+pub fn memory_bytes() -> u64 {
+    static MEMORY: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+        std::env::var("WINRUN_MEMORY")
+            .ok()
+            .and_then(|value| parse_memory_size(&value).ok())
+            .unwrap_or(DEFAULT_MEMORY_BYTES)
+    });
+    *MEMORY
+}
 /// The build `GetVersionEx`, `RtlGetVersion`, and the registry report
 /// (Windows 10 22H2).
 pub const OS_BUILD_NUMBER: u32 = 19045;
@@ -187,6 +230,17 @@ pub fn temp_path(environment: &[(String, String)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_sizes_parse_with_binary_suffixes() {
+        assert_eq!(parse_memory_size("8G"), Ok(8 << 30));
+        assert_eq!(parse_memory_size("4096m"), Ok(4096 << 20));
+        assert_eq!(parse_memory_size("2gb"), Ok(2 << 30));
+        assert_eq!(parse_memory_size("134217728"), Ok(128 << 20));
+        assert!(parse_memory_size("1M").is_err(), "below the minimum");
+        assert!(parse_memory_size("lots").is_err());
+        assert!(parse_memory_size("99999999999T").is_err(), "overflow");
+    }
 
     fn value<'a>(environment: &'a [(String, String)], key: &str) -> &'a str {
         environment

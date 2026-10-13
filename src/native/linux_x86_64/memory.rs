@@ -129,8 +129,6 @@ pub(super) struct NativeMemoryBasicInformation {
 /// to 0x7FFF_FFFE_FFFF.
 const X64_USER_ADDRESS_SPACE: u64 = 0x7fff_fffe_0000;
 
-/// The physical memory the guest reports, rather than the host's.
-const GUEST_MEMORY_BUDGET: u64 = 512 * 1024 * 1024;
 
 /// `GetPerformanceInfo`: PERFORMANCE_INFORMATION (104 bytes on x64) with
 /// the same budget GlobalMemoryStatusEx reports, counted in 4 KiB pages.
@@ -139,7 +137,7 @@ pub(super) extern "win64" fn native_get_performance_info(information: *mut u8, s
         native_set_last_error(24); // ERROR_BAD_LENGTH
         return 0;
     }
-    let pages = GUEST_MEMORY_BUDGET / 4096;
+    let pages = crate::system_profile::memory_bytes() / 4096;
     let fields: [u64; 10] = [
         pages / 2, // CommitTotal
         pages,     // CommitLimit
@@ -184,7 +182,8 @@ pub(super) extern "win64" fn native_global_memory_status_ex(
     // WinFS process model rather than exposing an arbitrary host memory
     // size. The virtual address space is the x64 user range Windows reports
     // (128 TiB): runtimes such as CoreCLR size their GC reservation from it.
-    let budget = GUEST_MEMORY_BUDGET;
+    // The configured guest memory (`--memory`), not the host's.
+    let budget = crate::system_profile::memory_bytes();
     let available = budget / 2;
     let value = NativeMemoryStatus {
         length: 64,

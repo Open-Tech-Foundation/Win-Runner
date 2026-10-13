@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- `--memory=<size>` (or `WINRUN_MEMORY`) sets the physical memory the guest
+  reports (`GlobalMemoryStatusEx`, `GetPerformanceInfo`), e.g. `8G` or
+  `4096M`; the default stays 512 MiB.
+
 - `scripts/install.sh` to install a published Linux x86-64 release: download
   the tarball and checksums, verify the SHA-256, and install `winrun` into
   `/usr/local/bin` or `~/.local/bin` (override with `--prefix` /

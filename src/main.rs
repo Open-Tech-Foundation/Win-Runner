@@ -23,6 +23,7 @@ fn usage() -> ! {
     eprintln!("  winrun --snapshot=os.disk <app.exe> [args...]  run headless with streamed stdio");
     eprintln!("  winrun --mount=Z:/host/folder shell  mount a writable host folder");
     eprintln!("  winrun --mount-ro=Z:/host/folder shell  mount a read-only host folder");
+    eprintln!("  winrun --memory=8G shell|app.exe  physical memory the guest reports (default 512M)");
     eprintln!("  winrun snapshot build <dir> <os.winfs>  build image from <dir>/C");
     eprintln!("  winrun instance boot <name> [--snapshot=os.snap]");
     eprintln!("  winrun instance status|destroy <name>");
@@ -40,6 +41,7 @@ struct RuntimeOptions {
     read_only_mount_specs: Vec<String>,
     control_bind: Option<String>,
     headless: bool,
+    memory: Option<String>,
 }
 
 /// Consume Win-Runner options only before the command target. Everything from the
@@ -75,6 +77,8 @@ fn parse_runtime_options(argv: &[String]) -> (RuntimeOptions, Vec<String>) {
                 .get_or_insert_with(|| value.to_string());
         } else if arg == "--headless" {
             options.headless = true;
+        } else if let Some(value) = arg.strip_prefix("--memory=") {
+            options.memory = Some(value.to_string());
         } else {
             args.extend(argv[index..].iter().cloned());
             break;
@@ -104,6 +108,16 @@ fn main() {
         return;
     }
     let (options, args) = parse_runtime_options(&args);
+    if let Some(memory) = options.memory.as_deref() {
+        // Workers and guest children inherit it through the environment.
+        match winrun::system_profile::parse_memory_size(memory) {
+            Ok(bytes) => std::env::set_var("WINRUN_MEMORY", bytes.to_string()),
+            Err(error) => {
+                eprintln!("winrun: --memory: {error}");
+                exit(2);
+            }
+        }
+    }
     let snapshot_path = options.snapshot_path.as_deref();
     let save_snapshot_path = options.save_snapshot_path.as_deref().or_else(|| {
         if options.save_on_exit {
@@ -337,6 +351,14 @@ mod tests {
 
     fn argv(words: &[&str]) -> Vec<String> {
         words.iter().map(|word| (*word).to_string()).collect()
+    }
+
+    #[test]
+    fn memory_option_is_a_runtime_option() {
+        let input: Vec<String> = ["winrun", "--memory=8G", "shell"].iter().map(|s| s.to_string()).collect();
+        let (options, args) = parse_runtime_options(&input);
+        assert_eq!(options.memory.as_deref(), Some("8G"));
+        assert_eq!(args, vec!["winrun".to_string(), "shell".to_string()]);
     }
 
     #[test]
