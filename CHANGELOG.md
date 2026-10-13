@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- `WSADuplicateSocketW` for the calling process with `WSASocketW` from its
+  protocol info (Rust's `TcpStream::try_clone`); closing one handle of a
+  duplicated socket leaves the connection to the others. Sharing a socket
+  with another process is not supported yet (WSAEINVAL).
+
 - What CPython 3.14 (`wpkg install python`) needs to run, asyncio included:
   - CRT: `_wopen`/`_open`, `_lseek`, `_dup`/`_dup2`, `_commit`, `_chsize_s`,
     `_umask`, `_chmod`/`_wchmod`, the `_stat64i32` family, `_wputenv_s`,

@@ -224,6 +224,8 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
                 "wsa_recv.no_data: ret=4294967295 wsa=997", "wsa_recv.state: pending",
                 "wsa_recv.completion: ok bytes=3 data=ok", "wsa_recv.nonblocking: ret=4294967295 wsa=997",
                 "cancel.first: 1", "cancel.completion: ret=0 same err=995", "cancel.again: ret=0 err=1168",
+                "duplicate.info: ret=0 family=2 type=1 protocol=6", "duplicate.socket: created",
+                "duplicate.transfer: ok",
             ],
             "socket_events" => &[
                 "select.empty: ok",

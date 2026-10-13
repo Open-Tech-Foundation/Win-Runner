@@ -179,11 +179,68 @@ fn probe() {
     out_dec(unsafe { cancel(accepted, &mut nonblocking_overlapped) } as u64);
     out_error();
     out_byte(b'\n');
+    duplicate(module, client, accepted, &buffer);
     unsafe {
         close(client);
         close(accepted);
         close(listener);
     }
+}
+
+/// WSADuplicateSocketW for this process and WSASocketW from its protocol
+/// info, as Rust's `TcpStream::try_clone` does: the copy sends on the same
+/// connection.
+fn duplicate(module: usize, client: usize, accepted: usize, buffer: &[usize; 2]) {
+    type Duplicate = unsafe extern "system" fn(usize, u32, *mut u8) -> i32;
+    type WsaSocket = unsafe extern "system" fn(i32, i32, i32, *const u8, u32, u32) -> usize;
+    type Send = unsafe extern "system" fn(usize, *const u8, i32, i32) -> i32;
+    type Recv = unsafe extern "system" fn(usize, *mut u8, i32, i32) -> i32;
+    type Close = unsafe extern "system" fn(usize) -> i32;
+    type ProcessId = unsafe extern "system" fn() -> u32;
+    let duplicate = socket_api!(module, "WSADuplicateSocketW", Duplicate);
+    let wsa_socket = socket_api!(module, "WSASocketW", WsaSocket);
+    let send = socket_api!(module, "send", Send);
+    let recv = socket_api!(module, "recv", Recv);
+    let close = socket_api!(module, "closesocket", Close);
+    let process_id = api!("duplicate.pid_api", "GetCurrentProcessId", ProcessId);
+    type SleepFn = unsafe extern "system" fn(u32);
+    let sleep = api!("duplicate.sleep_api", "Sleep", SleepFn);
+    let _ = buffer;
+    let mut info = [0u8; 628];
+    let ret = unsafe { duplicate(client, process_id(), info.as_mut_ptr()) };
+    let field = |offset: usize| i32::from_le_bytes([info[offset], info[offset + 1], info[offset + 2], info[offset + 3]]);
+    case("duplicate.info");
+    out_str("ret=");
+    out_dec(ret as u32 as u64);
+    out_str(" family=");
+    out_dec(field(76) as u64);
+    out_str(" type=");
+    out_dec(field(88) as u64);
+    out_str(" protocol=");
+    out_dec(field(92) as u64);
+    out_byte(b'\n');
+    let copy = unsafe { wsa_socket(-1, -1, -1, info.as_ptr(), 0, 0x81) };
+    case("duplicate.socket");
+    if copy == usize::MAX {
+        out_str("failed\n");
+        return;
+    }
+    out_str("created\n");
+    unsafe { close(client) };
+    let sent = unsafe { send(copy, b"dup".as_ptr(), 3, 0) };
+    let mut got = [0u8; 8];
+    // The accepted side is non-blocking now; wait for the bytes to land.
+    let mut received = -1;
+    for _ in 0..200 {
+        received = unsafe { recv(accepted, got.as_mut_ptr(), 8, 0) };
+        if received > 0 {
+            break;
+        }
+        unsafe { sleep(10) };
+    }
+    case("duplicate.transfer");
+    out_str(if sent == 3 && received == 3 && &got[..3] == b"dup" { "ok\n" } else { "wrong\n" });
+    unsafe { close(copy) };
 }
 
 #[no_mangle]

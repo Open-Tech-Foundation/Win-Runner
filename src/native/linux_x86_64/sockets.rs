@@ -1525,8 +1525,10 @@ pub(super) extern "win64" fn native_close_socket(handle: u64) -> i32 {
             modes.remove(&handle);
         }
     }
-    unsafe {
-        shutdown(handle as i32, 2);
+    if release_socket_share(handle as i32) {
+        unsafe {
+            shutdown(handle as i32, 2);
+        }
     }
     if unsafe { close(handle as i32) } == 0 {
         0
@@ -1817,6 +1819,115 @@ pub(super) extern "win64" fn native_sendto_socket(
 /// `WSASocketW(family, type, protocol, info, group, flags)`: the protocol
 /// info and group are not supported; overlapped and non-inheritable
 /// sockets need nothing extra.
+/// Open handles per socket (by inode) for sockets that were duplicated:
+/// closing one of them leaves the connection to the others, as on Windows.
+static SOCKET_SHARES: Mutex<Vec<(u64, usize)>> = Mutex::new(Vec::new());
+
+fn socket_inode(fd: i32) -> Option<u64> {
+    let mut status: libc::stat = unsafe { std::mem::zeroed() };
+    (unsafe { libc::fstat(fd, &mut status) } == 0).then_some(status.st_ino)
+}
+
+/// Whether closing `fd` is the last close of its socket; the count drops.
+fn release_socket_share(fd: i32) -> bool {
+    let Some(inode) = socket_inode(fd) else { return true };
+    let mut shares = SOCKET_SHARES.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(index) = shares.iter().position(|(key, _)| *key == inode) else {
+        return true;
+    };
+    shares[index].1 -= 1;
+    if shares[index].1 == 0 {
+        shares.swap_remove(index);
+        return true;
+    }
+    false
+}
+
+/// Descriptors `WSADuplicateSocketW` made, each waiting for one
+/// `WSASocketW` to claim it through the protocol info's provider field.
+static SOCKET_DUPLICATES: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+
+/// `WSAPROTOCOL_INFOW` offsets (628 bytes in all).
+const INFO_VERSION: usize = 72;
+const INFO_FAMILY: usize = 76;
+const INFO_MAX_ADDRESS: usize = 80;
+const INFO_MIN_ADDRESS: usize = 84;
+const INFO_TYPE: usize = 88;
+const INFO_PROTOCOL: usize = 92;
+const INFO_MESSAGE_SIZE: usize = 108;
+const INFO_PROVIDER_RESERVED: usize = 112;
+const INFO_NAME: usize = 116;
+
+/// `WSADuplicateSocketW` for this process (Rust's `TcpStream::try_clone`
+/// and similar): a new descriptor for the same socket travels in the
+/// protocol info for `WSASocketW`. Sharing a socket with another process
+/// is not supported (WSAEINVAL).
+pub(super) extern "win64" fn native_wsa_duplicate_socket_w(socket: u64, process_id: u32, info: *mut u8) -> i32 {
+    if socket & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG {
+        native_wsa_set_last_error(10038); // WSAENOTSOCK
+        return -1;
+    }
+    if info.is_null() {
+        native_wsa_set_last_error(10014); // WSAEFAULT
+        return -1;
+    }
+    if process_id != native_get_current_process_id() {
+        native_wsa_set_last_error(10022);
+        return -1;
+    }
+    let fd = socket as u32 as i32;
+    let option = |level: i32, name: i32| {
+        let mut value = 0i32;
+        let mut length = 4u32;
+        (unsafe { libc::getsockopt(fd, level, name, (&mut value as *mut i32).cast(), &mut length) } == 0).then_some(value)
+    };
+    let (Some(kind), Some(protocol), Some(domain)) = (
+        option(libc::SOL_SOCKET, libc::SO_TYPE),
+        option(libc::SOL_SOCKET, libc::SO_PROTOCOL),
+        option(libc::SOL_SOCKET, libc::SO_DOMAIN),
+    ) else {
+        native_wsa_set_last_error(10038);
+        return -1;
+    };
+    let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if copy < 0 {
+        native_wsa_set_last_error(10024); // WSAEMFILE
+        return -1;
+    }
+    SOCKET_DUPLICATES.lock().unwrap_or_else(|e| e.into_inner()).push(copy);
+    if let Some(inode) = socket_inode(fd) {
+        let mut shares = SOCKET_SHARES.lock().unwrap_or_else(|e| e.into_inner());
+        match shares.iter_mut().find(|(key, _)| *key == inode) {
+            Some((_, count)) => *count += 1,
+            None => shares.push((inode, 2)),
+        }
+    }
+    let (family, address_size) = if domain == libc::AF_INET6 { (23, 28) } else { (2, 16) };
+    let name = match (kind, family) {
+        (libc::SOCK_STREAM, 2) => "MSAFD Tcpip [TCP/IP]",
+        (libc::SOCK_STREAM, _) => "MSAFD Tcpip [TCP/IPv6]",
+        (libc::SOCK_DGRAM, 2) => "MSAFD Tcpip [UDP/IP]",
+        (libc::SOCK_DGRAM, _) => "MSAFD Tcpip [UDP/IPv6]",
+        _ => "MSAFD Tcpip [RAW/IP]",
+    };
+    unsafe {
+        std::ptr::write_bytes(info, 0, 628);
+        let put = |offset: usize, value: i32| info.add(offset).cast::<i32>().write_unaligned(value);
+        put(INFO_VERSION, 2);
+        put(INFO_FAMILY, family);
+        put(INFO_MAX_ADDRESS, address_size);
+        put(INFO_MIN_ADDRESS, address_size);
+        put(INFO_TYPE, kind);
+        put(INFO_PROTOCOL, protocol);
+        put(INFO_MESSAGE_SIZE, if kind == libc::SOCK_DGRAM { 65507 } else { 0 });
+        put(INFO_PROVIDER_RESERVED, copy);
+        for (index, unit) in name.encode_utf16().enumerate() {
+            info.add(INFO_NAME + index * 2).cast::<u16>().write_unaligned(unit);
+        }
+    }
+    0
+}
+
 pub(super) extern "win64" fn native_wsa_socket_w(
     family: i32,
     kind: i32,
@@ -1825,11 +1936,34 @@ pub(super) extern "win64" fn native_wsa_socket_w(
     group: u32,
     _flags: u32,
 ) -> u64 {
-    if !info.is_null() || group != 0 {
+    if group != 0 {
         native_wsa_set_last_error(10045); // WSAEOPNOTSUPP
         return u64::MAX;
     }
-    native_socket(family, kind, protocol)
+    if info.is_null() {
+        return native_socket(family, kind, protocol);
+    }
+    // A socket WSADuplicateSocketW described: claim its descriptor once.
+    let read = |offset: usize| unsafe { info.add(offset).cast::<i32>().read_unaligned() };
+    let copy = read(INFO_PROVIDER_RESERVED);
+    let claimed = {
+        let mut duplicates = SOCKET_DUPLICATES.lock().unwrap_or_else(|e| e.into_inner());
+        duplicates.iter().position(|fd| *fd == copy).map(|index| duplicates.swap_remove(index))
+    };
+    let matches = |requested: i32, described: i32| requested == -1 || requested == described;
+    let Some(fd) = claimed.filter(|_| {
+        matches(family, read(INFO_FAMILY)) && matches(kind, read(INFO_TYPE)) && matches(protocol, read(INFO_PROTOCOL))
+    }) else {
+        native_wsa_set_last_error(10022);
+        return u64::MAX;
+    };
+    let handle = SOCKET_HANDLE_TAG | fd as u64;
+    if let Some(process) = process_ctx() {
+        if let Ok(mut sockets) = process.socket_handles.lock() {
+            sockets.insert(handle);
+        }
+    }
+    handle
 }
 
 /// `getaddrinfo`: `GetAddrInfoW` with narrow names; canonical names in the

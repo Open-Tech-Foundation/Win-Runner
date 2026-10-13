@@ -490,6 +490,7 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                 | "inet_pton"
                 | "inet_ntop"
                 | "WSAStringToAddressW"
+                | "WSADuplicateSocketW"
                 | "WSACreateEvent"
                 | "WSACloseEvent"
                 | "WSAResetEvent"
@@ -652,6 +653,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "inet_pton" => Some(native_inet_pton as *const () as usize as u64),
         "inet_ntop" => Some(native_inet_ntop as *const () as usize as u64),
         "WSAStringToAddressW" => Some(native_wsa_string_to_address_w as *const () as usize as u64),
+        "WSADuplicateSocketW" => Some(native_wsa_duplicate_socket_w as *const () as usize as u64),
         "WSAEventSelect" => Some(native_wsa_event_select as *const () as usize as u64),
         "WSAEnumNetworkEvents" => Some(native_wsa_enum_network_events as *const () as usize as u64),
         "WSACloseEvent" => Some(native_wsa_close_event as *const () as usize as u64),
