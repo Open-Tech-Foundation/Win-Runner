@@ -226,6 +226,10 @@ pub(super) extern "win64" fn native_send_socket(
     let result = unsafe { send(socket as i32, buffer.cast(), length as usize, flags) };
     if result < 0 {
         let error = std::io::Error::last_os_error().raw_os_error().unwrap_or(9);
+        if error == libc::EAGAIN && timed_out(socket) {
+            native_wsa_set_last_error(10060); // WSAETIMEDOUT
+            return -1;
+        }
         if error == libc::EAGAIN {
             socket_event_rearm(socket, 2);
         }
@@ -633,6 +637,34 @@ pub(super) extern "win64" fn native_setsockopt(
     if value.is_null() || length < 0 || length > 1024 {
         native_wsa_set_last_error(10014);
         return -1;
+    }
+    // SO_SNDTIMEO / SO_RCVTIMEO: a DWORD of milliseconds (0: none) on
+    // Windows, a timeval on Linux.
+    if level == 0xffff && matches!(option, 0x1005 | 0x1006) {
+        if length < 4 {
+            native_wsa_set_last_error(10014);
+            return -1;
+        }
+        let milliseconds = unsafe { value.cast::<u32>().read_unaligned() };
+        let timeval = libc::timeval {
+            tv_sec: (milliseconds / 1000) as libc::time_t,
+            tv_usec: ((milliseconds % 1000) * 1000) as libc::suseconds_t,
+        };
+        let host = if option == 0x1005 { libc::SO_SNDTIMEO } else { libc::SO_RCVTIMEO };
+        let set = unsafe {
+            libc::setsockopt(
+                socket as u32 as i32,
+                libc::SOL_SOCKET,
+                host,
+                (&timeval as *const libc::timeval).cast(),
+                std::mem::size_of::<libc::timeval>() as u32,
+            )
+        };
+        if set != 0 {
+            native_wsa_set_last_error(errno_to_wsa(std::io::Error::last_os_error().raw_os_error().unwrap_or(22)));
+            return -1;
+        }
+        return 0;
     }
     if level == 0xffff && matches!(option, -5 | 4) {
         if length < 4 {
@@ -1552,6 +1584,25 @@ pub(super) extern "win64" fn native_getsockopt(
         native_wsa_set_last_error(10014); // WSAEFAULT
         return -1;
     }
+    if level == 0xffff && matches!(option, 0x1005 | 0x1006) {
+        if unsafe { length.read_unaligned() } < 4 {
+            native_wsa_set_last_error(10014);
+            return -1;
+        }
+        let mut timeval = libc::timeval { tv_sec: 0, tv_usec: 0 };
+        let mut size = std::mem::size_of::<libc::timeval>() as u32;
+        let host = if option == 0x1005 { libc::SO_SNDTIMEO } else { libc::SO_RCVTIMEO };
+        if unsafe { getsockopt(handle as i32, libc::SOL_SOCKET, host, (&mut timeval as *mut libc::timeval).cast(), &mut size) } != 0 {
+            native_wsa_set_last_error(errno_to_wsa(std::io::Error::last_os_error().raw_os_error().unwrap_or(22)));
+            return -1;
+        }
+        let milliseconds = (timeval.tv_sec as u64 * 1000 + timeval.tv_usec as u64 / 1000).min(u32::MAX as u64) as u32;
+        unsafe {
+            value.cast::<u32>().write_unaligned(milliseconds);
+            length.write_unaligned(4);
+        }
+        return 0;
+    }
     if level == 0xffff && option == -5 {
         if unsafe { length.read_unaligned() } < 4 {
             native_wsa_set_last_error(10014);
@@ -1712,6 +1763,14 @@ pub(super) extern "win64" fn native_accept_socket(socket: u64, address: *mut u8,
 }
 
 /// `recv(socket, buffer, length, flags)`: bytes received, 0 at end of stream.
+/// Whether the failure just seen (errno EAGAIN) was a blocking socket's
+/// SO_RCVTIMEO/SO_SNDTIMEO running out, which Windows reports as
+/// WSAETIMEDOUT; a non-blocking socket's EAGAIN stays WSAEWOULDBLOCK.
+fn timed_out(socket: u64) -> bool {
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN)
+        && unsafe { libc::fcntl(socket as u32 as i32, libc::F_GETFL) } & libc::O_NONBLOCK == 0
+}
+
 pub(super) extern "win64" fn native_recv_socket(socket: u64, buffer: *mut u8, length: i32, flags: i32) -> i32 {
     native_recvfrom_socket(socket, buffer, length, flags, ptr::null_mut(), ptr::null_mut())
 }
@@ -1770,7 +1829,11 @@ pub(super) extern "win64" fn native_recvfrom_socket(
         )
     };
     if received < 0 {
-        set_wsa_error_from_errno();
+        if timed_out(socket) {
+            native_wsa_set_last_error(10060); // WSAETIMEDOUT
+        } else {
+            set_wsa_error_from_errno();
+        }
         return -1;
     }
     if !from_length.is_null() && !from.is_null() {

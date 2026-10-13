@@ -197,6 +197,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- `SO_RCVTIMEO`/`SO_SNDTIMEO` are supported (a DWORD of milliseconds, as
+  Winsock takes them), and a blocking socket whose timeout runs out fails
+  with `WSAETIMEDOUT` rather than `WSAEWOULDBLOCK`; the overlapped_sockets
+  oracle probe records both.
+
 - On mounted host drives, a name removed within the directory's timestamp
   granularity no longer lingers in the lookup index (creating the file again
   failed with `ERROR_FILE_NOT_FOUND`).

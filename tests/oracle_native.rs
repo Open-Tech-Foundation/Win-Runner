@@ -226,6 +226,7 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
                 "cancel.first: 1", "cancel.completion: ret=0 same err=995", "cancel.again: ret=0 err=1168",
                 "duplicate.info: ret=0 family=2 type=1 protocol=6", "duplicate.socket: created",
                 "duplicate.transfer: ok",
+                "timeout.option: set=0 get=0 value=100", "timeout.recv: ret=4294967295 wsa=10060",
             ],
             "socket_events" => &[
                 "select.empty: ok",

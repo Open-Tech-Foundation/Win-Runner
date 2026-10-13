@@ -240,6 +240,34 @@ fn duplicate(module: usize, client: usize, accepted: usize, buffer: &[usize; 2])
     }
     case("duplicate.transfer");
     out_str(if sent == 3 && received == 3 && &got[..3] == b"dup" { "ok\n" } else { "wrong\n" });
+
+    // A receive timeout on a blocking socket with nothing to read.
+    type SetOption = unsafe extern "system" fn(usize, i32, i32, *const u8, i32) -> i32;
+    type GetOption = unsafe extern "system" fn(usize, i32, i32, *mut u8, *mut i32) -> i32;
+    type LastError = unsafe extern "system" fn() -> i32;
+    let set_option = socket_api!(module, "setsockopt", SetOption);
+    let get_option = socket_api!(module, "getsockopt", GetOption);
+    let wsa_error = socket_api!(module, "WSAGetLastError", LastError);
+    let timeout = 100u32;
+    let set = unsafe { set_option(copy, 0xffff, 0x1006, (&timeout as *const u32).cast(), 4) };
+    let mut read_back = 0u32;
+    let mut length = 4i32;
+    let got_option = unsafe { get_option(copy, 0xffff, 0x1006, (&mut read_back as *mut u32).cast(), &mut length) };
+    case("timeout.option");
+    out_str("set=");
+    out_dec(set as u32 as u64);
+    out_str(" get=");
+    out_dec(got_option as u32 as u64);
+    out_str(" value=");
+    out_dec(read_back as u64);
+    out_byte(b'\n');
+    let received = unsafe { recv(copy, got.as_mut_ptr(), 8, 0) };
+    case("timeout.recv");
+    out_str("ret=");
+    out_dec(received as u32 as u64);
+    out_str(" wsa=");
+    out_dec(unsafe { wsa_error() } as u64);
+    out_byte(b'\n');
     unsafe { close(copy) };
 }
 
