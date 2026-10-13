@@ -134,6 +134,10 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- `wpkg`, `Invoke-RestMethod` and `Invoke-WebRequest` download with the
+  built-in HTTP client and the bundled Mozilla roots instead of running the
+  host's `curl`.
+
 - The guest's trusted root certificates live in its own registry, as on
   Windows (`HKLM\SOFTWARE\Microsoft\SystemCertificates\ROOT\Certificates`,
   one key per thumbprint with a serialized `Blob`), seeded on new disks from

@@ -1,8 +1,7 @@
 //! Shared HTTPS, ZIP, and checksum helpers for guest package data and snapshots.
 
-use std::{io::Read, process::Stdio};
-
-/// Download bytes over HTTPS via `curl`. Clear error when curl is missing.
+/// Download bytes over HTTP(S) with the built-in client, trusting the
+/// bundled Mozilla roots (the guest's default ROOT store), never the host's.
 pub fn fetch_url(url: &str, max_time_secs: u64) -> Result<Vec<u8>, String> {
     Ok(fetch_response(url, max_time_secs)?.body)
 }
@@ -15,46 +14,7 @@ pub struct HttpResponse {
 }
 
 pub fn fetch_response(url: &str, max_time_secs: u64) -> Result<HttpResponse, String> {
-    let out = std::process::Command::new("curl")
-        .args([
-            "-sSL",
-            "--fail",
-            "--max-time",
-            &max_time_secs.to_string(),
-            "-A",
-            "winrun/0.1.0",
-            "--write-out",
-            "\n%{http_code}\n%{url_effective}",
-            "--url",
-            url,
-        ])
-        .output()
-        .map_err(|_| "cannot run curl: install it to use remote sources".to_string())?;
-    if !out.status.success() {
-        let tail = String::from_utf8_lossy(&out.stderr);
-        return Err(format!(
-            "download failed: {url} ({}){}",
-            out.status,
-            if tail.trim().is_empty() {
-                String::new()
-            } else {
-                format!(": {}", tail.trim())
-            }
-        ));
-    }
-    let mut parts = out.stdout.rsplitn(3, |byte| *byte == b'\n');
-    let effective = parts.next().ok_or("missing response URI")?;
-    let status = parts.next().ok_or("missing HTTP status")?;
-    let body = parts.next().ok_or("missing response body")?;
-    let body_len = body.len();
-    let url = String::from_utf8(effective.to_vec()).map_err(|_| "invalid response URI")?;
-    let status = std::str::from_utf8(status)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .ok_or("invalid HTTP status")?;
-    let mut body = out.stdout;
-    body.truncate(body_len);
-    Ok(HttpResponse { body, url, status })
+    fetch(url, max_time_secs, &mut |_| {})
 }
 
 /// How much of a download has arrived.
@@ -65,119 +25,69 @@ pub struct DownloadProgress {
     pub total: Option<u64>,
 }
 
-/// Download bytes over HTTPS, reporting the bytes received as they stream
-/// in (at most every 100 ms, and once at the end).
+/// Download bytes, reporting the bytes received as they stream in (at most
+/// every 100 ms, and once at the end).
 pub fn fetch_url_with_progress(
     url: &str,
     max_time_secs: u64,
     mut progress: impl FnMut(DownloadProgress),
 ) -> Result<Vec<u8>, String> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT_DOWNLOAD: AtomicU64 = AtomicU64::new(1);
-    // curl writes each response's headers here before its body, so the
-    // final response's length is known once body bytes arrive.
-    let headers = std::env::temp_dir().join(format!(
-        "winrun-download-{}-{}.tmp",
-        std::process::id(),
-        NEXT_DOWNLOAD.fetch_add(1, Ordering::Relaxed)
-    ));
-    struct RemoveOnDrop<'a>(&'a std::path::Path);
-    impl Drop for RemoveOnDrop<'_> {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(self.0);
-        }
-    }
-    let _headers_guard = RemoveOnDrop(&headers);
-    let mut child = std::process::Command::new("curl")
-        .args([
-            "--silent",
-            "--show-error",
-            "--fail",
-            "--location",
-            "--max-time",
-            &max_time_secs.to_string(),
-            "-A",
-            "winrun/0.1.0",
-            "--dump-header",
-        ])
-        .arg(&headers)
-        .arg(url)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|_| "cannot run curl: install it to use remote sources".to_string())?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "curl did not provide an error stream".to_string())?;
-    let stderr_reader = std::thread::spawn(move || {
-        let mut message = Vec::new();
-        let _ = stderr.read_to_end(&mut message);
-        message
-    });
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "curl did not provide a download stream".to_string())?;
-    let mut bytes = Vec::new();
-    let mut chunk = vec![0u8; 64 * 1024];
-    let mut total = None;
-    let mut reported = std::time::Instant::now();
-    loop {
-        let read = match stdout.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(read) => read,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(format!("cannot read curl download: {error}")),
-        };
-        bytes.extend_from_slice(&chunk[..read]);
-        if total.is_none() {
-            total = std::fs::read_to_string(&headers)
-                .ok()
-                .and_then(|text| final_content_length(&text));
-        }
-        if reported.elapsed() >= std::time::Duration::from_millis(100) {
-            reported = std::time::Instant::now();
-            progress(DownloadProgress {
-                received: bytes.len() as u64,
-                total,
-            });
-        }
-    }
-    let status = child
-        .wait()
-        .map_err(|error| format!("cannot wait for curl: {error}"))?;
-    let stderr_message = stderr_reader.join().unwrap_or_default();
-    if !status.success() {
-        let tail = String::from_utf8_lossy(&stderr_message);
-        return Err(format!(
-            "download failed: {url} ({status}){}",
-            if tail.trim().is_empty() {
-                String::new()
-            } else {
-                format!(": {}", tail.trim())
-            }
-        ));
-    }
+    let body = fetch(url, max_time_secs, &mut progress)?.body;
     progress(DownloadProgress {
-        received: bytes.len() as u64,
-        total: Some(bytes.len() as u64),
+        received: body.len() as u64,
+        total: Some(body.len() as u64),
     });
-    Ok(bytes)
+    Ok(body)
 }
 
-/// The `Content-Length` of the last response in a `curl --dump-header`
-/// file, which lists every redirect's headers before the final ones.
-fn final_content_length(headers: &str) -> Option<u64> {
-    let last = headers
-        .split("\r\n\r\n")
-        .filter(|block| block.trim_start().starts_with("HTTP/"))
-        .last()?;
-    last.lines().find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        name.trim()
-            .eq_ignore_ascii_case("content-length")
-            .then(|| value.trim().parse().ok())?
+/// Follow redirects and collect the final body; an HTTP error status fails.
+fn fetch(
+    url: &str,
+    max_time_secs: u64,
+    progress: &mut dyn FnMut(DownloadProgress),
+) -> Result<HttpResponse, String> {
+    use crate::http_client::{HttpError, ResponseHead, Sink};
+    struct Collect<'a> {
+        body: Vec<u8>,
+        progress: &'a mut dyn FnMut(DownloadProgress),
+        reported: std::time::Instant,
+    }
+    impl Sink for Collect<'_> {
+        fn head(&mut self, _head: &ResponseHead, _last: bool) -> Result<(), HttpError> {
+            Ok(())
+        }
+        fn data(&mut self, data: &[u8]) -> Result<(), HttpError> {
+            self.body.extend_from_slice(data);
+            Ok(())
+        }
+        fn progress(&mut self, received: u64, total: Option<u64>) {
+            if self.reported.elapsed() >= std::time::Duration::from_millis(100) {
+                self.reported = std::time::Instant::now();
+                (self.progress)(DownloadProgress { received, total });
+            }
+        }
+    }
+    let failed = |detail: String| format!("download failed: {url}: {detail}");
+    let mut request = crate::http_client::Request::get(
+        crate::http_client::Url::parse(url).map_err(|e| failed(e.message()))?,
+    );
+    request.follow_redirects = true;
+    request.timeout = Some(std::time::Duration::from_secs(max_time_secs));
+    request.user_agent = "winrun/0.1.0".to_string();
+    let mut sink = Collect {
+        body: Vec::new(),
+        progress,
+        reported: std::time::Instant::now(),
+    };
+    let head = crate::http_client::fetch(&request, crate::trust_roots::bundled_roots(), &mut sink)
+        .map_err(|e| failed(e.message()))?;
+    if head.status >= 400 {
+        return Err(failed(format!("HTTP {} {}", head.status, head.reason)));
+    }
+    Ok(HttpResponse {
+        body: sink.body,
+        url: head.url.as_string(),
+        status: head.status,
     })
 }
 
@@ -578,16 +488,35 @@ mod tests {
     }
 
     #[test]
-    fn reads_the_final_responses_length_after_redirects() {
-        let headers = "HTTP/1.1 302 Found\r\nLocation: /x\r\nContent-Length: 5\r\n\r\n\
-            HTTP/2 200\r\ncontent-type: application/zip\r\ncontent-length: 33554432\r\n\r\n";
-        assert_eq!(final_content_length(headers), Some(33_554_432));
-        // Not yet received, or no length (chunked).
-        assert_eq!(final_content_length(""), None);
-        assert_eq!(
-            final_content_length("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"),
-            None
-        );
+    fn downloads_follow_redirects_and_fail_on_error_statuses() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(3) {
+                let mut stream = stream.unwrap();
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
+                    head.push(byte[0]);
+                }
+                let reply: &[u8] = if head.starts_with(b"GET /old ") {
+                    b"HTTP/1.1 301 Moved\r\nLocation: /new\r\nContent-Length: 0\r\n\r\n"
+                } else if head.starts_with(b"GET /new ") {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody"
+                } else {
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
+                };
+                let _ = stream.write_all(reply);
+            }
+        });
+        let base = format!("http://127.0.0.1:{port}");
+        let mut reports = Vec::new();
+        let body = fetch_url_with_progress(&format!("{base}/old"), 10, |p| reports.push(p)).unwrap();
+        assert_eq!(body, b"body");
+        assert_eq!(reports.last(), Some(&DownloadProgress { received: 4, total: Some(4) }));
+        let error = fetch_url(&format!("{base}/gone"), 10).unwrap_err();
+        assert!(error.contains("HTTP 404"), "{error}");
     }
 
     #[test]
