@@ -19,6 +19,9 @@ use crate::pe::PeImage;
 mod worker;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod diagnostics;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "native/process_table.rs"]
+pub mod process_table;
 
 const COMMAND_LINE_BYTES: usize = 0x10000;
 

@@ -430,6 +430,7 @@ impl Shell {
         crate::cmd::seed_cmd_exe(&mut fs);
         crate::curl_tool::seed_curl_exe(&mut fs);
         crate::tar_tool::seed_tar_exe(&mut fs);
+        crate::taskkill_tool::seed_taskkill_exe(&mut fs);
         if let Err(error) = crate::trust_roots::seed_root_store(&mut fs) {
             eprintln!("winrun: cannot add trusted root certificates: {error}");
         }

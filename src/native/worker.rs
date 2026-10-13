@@ -331,14 +331,16 @@ pub(crate) fn execute_request(path: &Path) -> Result<u32, String> {
         state_file.into_raw_fd().to_string(),
     );
     let program = text("program")?;
-    let (code, _, _) = crate::native::run_rust_baseline_argv_with_fs_environment_recoverable(
+    crate::native::process_table::register(process_id as u32, parent_process_id as u32, &program);
+    let result = crate::native::run_rust_baseline_argv_with_fs_environment_recoverable(
         &image,
         fs,
         &program,
         &args,
         &environment,
-    )
-    .map_err(|failure| failure.message)?;
+    );
+    crate::native::process_table::unregister(process_id as u32);
+    let (code, _, _) = result.map_err(|failure| failure.message)?;
     if result_fd >= 0 {
         let bytes = code.to_le_bytes();
         unsafe { libc::write(result_fd, bytes.as_ptr().cast(), bytes.len()) };

@@ -1387,8 +1387,128 @@ fn certificate_chains() {
     }
 }
 
+/// `--sleep-child`: a process that never ends on its own.
+fn sleep_child_mode() {
+    type Command = unsafe extern "system" fn() -> *const u16;
+    type Sleep = unsafe extern "system" fn(u32);
+    let command = api!("sleep_child.command", "GetCommandLineW", Command);
+    let sleep = api!("sleep_child.sleep", "Sleep", Sleep);
+    let marker = b"--sleep-child";
+    unsafe {
+        let pointer = command();
+        let mut length = 0;
+        while length < 4096 && *pointer.add(length) != 0 {
+            length += 1;
+        }
+        let units = core::slice::from_raw_parts(pointer, length);
+        if units.windows(marker.len()).any(|part| part.iter().zip(marker).all(|(a, b)| *a == *b as u16)) {
+            loop {
+                sleep(1000);
+            }
+        }
+    }
+}
+
+/// `taskkill /PID <pid> /F /T` on a copy of this probe that sleeps
+/// forever, with taskkill's (machine-specific) messages sent to NUL.
+fn taskkill_tree() {
+    type Module = unsafe extern "system" fn(usize, *mut u16, u32) -> u32;
+    type Process = unsafe extern "system" fn(
+        *const u16, *mut u16, usize, usize, i32, u32, usize, usize, *mut u8, *mut usize,
+    ) -> i32;
+    type Wait = unsafe extern "system" fn(usize, u32) -> u32;
+    type ExitCode = unsafe extern "system" fn(usize, *mut u32) -> i32;
+    type Close = unsafe extern "system" fn(usize) -> i32;
+    let module = api!("taskkill.module_api", "GetModuleFileNameW", Module);
+    let create = api!("taskkill.create_api", "CreateProcessW", Process);
+    let wait = api!("taskkill.wait_api", "WaitForSingleObject", Wait);
+    let exit = api!("taskkill.exit_api", "GetExitCodeProcess", ExitCode);
+    let close = api!("taskkill.close_api", "CloseHandle", Close);
+    let open = api!("taskkill.open_api", "CreateFileW", CreateFileWFn);
+    let mut path = [0u16; 512];
+    let length = unsafe { module(0, path.as_mut_ptr(), 512) } as usize;
+    let mut command = [0u16; 600];
+    command[0] = 34;
+    command[1..length + 1].copy_from_slice(&path[..length]);
+    for (i, byte) in br#"" --sleep-child"#.iter().enumerate() {
+        command[length + 1 + i] = *byte as u16;
+    }
+    let mut startup = [0u64; 13];
+    startup[0] = 104;
+    let mut sleeper = [0usize; 3];
+    if unsafe { create(path.as_ptr(), command.as_mut_ptr(), 0, 0, 0, 0, 0, 0, startup.as_mut_ptr().cast(), sleeper.as_mut_ptr()) } == 0 {
+        unavailable("taskkill.sleeper");
+        return;
+    }
+    // An inheritable NUL handle for taskkill's output.
+    let security: [u64; 3] = [24, 0, 1];
+    let mut nul_name = [0u16; 8];
+    let nul = unsafe { open(wide("NUL", &mut nul_name).as_ptr(), 0x4000_0000, 3, security.as_ptr() as usize, 3, 0x80, 0) };
+    let run_taskkill = |pid: u32| -> u32 {
+        let mut line = [0u16; 128];
+        let mut at = 0;
+        for byte in b"taskkill /F /T /PID " {
+            line[at] = *byte as u16;
+            at += 1;
+        }
+        let mut digits = [0u8; 10];
+        let mut count = 0;
+        let mut value = pid;
+        loop {
+            digits[count] = b'0' + (value % 10) as u8;
+            count += 1;
+            value /= 10;
+            if value == 0 {
+                break;
+            }
+        }
+        for index in (0..count).rev() {
+            line[at] = digits[index] as u16;
+            at += 1;
+        }
+        let mut startup = [0u64; 13];
+        startup[0] = 104;
+        // STARTF_USESTDHANDLES; standard input, output and error.
+        startup[7] = 0x100 << 32;
+        startup[10] = nul as u64;
+        startup[11] = nul as u64;
+        startup[12] = nul as u64;
+        let mut information = [0usize; 3];
+        if unsafe { create(0 as *const u16, line.as_mut_ptr(), 0, 0, 1, 0, 0, 0, startup.as_mut_ptr().cast(), information.as_mut_ptr()) } == 0 {
+            return u32::MAX;
+        }
+        let mut code = u32::MAX;
+        unsafe {
+            wait(information[0], 30_000);
+            exit(information[0], &mut code);
+            close(information[0]);
+            close(information[1]);
+        }
+        code
+    };
+    case("taskkill.tree");
+    out_str("exit=");
+    out_dec(run_taskkill(sleeper[2] as u32) as u64);
+    let mut code = 0u32;
+    let ended = unsafe { wait(sleeper[0], 10_000) } == 0;
+    unsafe { exit(sleeper[0], &mut code) };
+    out_str(if ended { " child=ended code=" } else { " child=running code=" });
+    out_dec(code as u64);
+    out_byte(b'\n');
+    case("taskkill.again");
+    out_str("exit=");
+    out_dec(run_taskkill(sleeper[2] as u32) as u64);
+    out_byte(b'\n');
+    unsafe {
+        close(sleeper[0]);
+        close(sleeper[1]);
+        close(nul);
+    }
+}
+
 #[no_mangle]
 pub extern "system" fn probe_entry() -> ! {
+    sleep_child_mode();
     suspended_child_mode();
     out_str("probe native_startup\n");
     modules();
@@ -1405,6 +1525,7 @@ pub extern "system" fn probe_entry() -> ! {
     certificate_chains();
     system_info();
     suspended_process();
+    taskkill_tree();
     out_str("END\n");
     flush();
     unsafe { ExitProcess(0) }

@@ -101,6 +101,9 @@ use socket_pending::*;
 #[path = "linux_x86_64/cert_chain.rs"]
 mod cert_chain;
 use cert_chain::*;
+#[path = "linux_x86_64/taskkill_host.rs"]
+mod taskkill_host;
+use taskkill_host::*;
 #[path = "linux_x86_64/sockets.rs"]
 mod sockets;
 use sockets::*;

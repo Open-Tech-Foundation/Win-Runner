@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- `taskkill.exe` in System32, as Windows ships it: `/PID` and `/IM` (with
+  `*` wildcards), `/F`, and `/T` (descendants first), with Windows' messages
+  and exit codes (128 when nothing matches). It finds guest processes in a
+  per-session process table: each worker registers its PID (its host PID),
+  parent and image, with its kernel start time so a reused PID is never
+  signalled. Programs that end a child with `taskkill /F /T` (esdev's test
+  timeout) no longer wait forever. The native_startup oracle probe ends a
+  copy of itself this way.
+
 - Certificate chains: `CertGetCertificateChain` (built and verified with
   rustls-webpki against the guest's ROOT store or a chain engine's roots,
   with the additional store as intermediates, returned as a

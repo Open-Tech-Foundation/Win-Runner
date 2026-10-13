@@ -17,6 +17,7 @@ pub mod shell;
 pub mod snapshot;
 pub mod system_profile;
 pub mod tar_tool;
+pub mod taskkill_tool;
 pub mod trust_roots;
 pub mod winfs;
 pub mod winreg;

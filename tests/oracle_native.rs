@@ -186,7 +186,7 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
                 "rtl.nt_version: 10.0 high=0xf", "perf.info: cb=104 page=4096 consistent",
                 "perf.info_small: ret=0 err=24", "known_folder.local_app_data: hr=0x0 path=profile\\AppData\\Local",
                 "known_folder.unknown: hr=0x80070002 path=null", "resource.missing_manifest: ret=0 err=1812",
-                "handle_info.inherited: flags=1",
+                "handle_info.inherited: flags=1", "taskkill.tree: exit=0 child=ended code=1", "taskkill.again: exit=128",
                 "handle_info.cleared: flags=0", "suspend.created: ok", "suspend.process_id: ok", "suspend.before_resume: ok", "suspend.invalid_handle: ok",
                 "suspend.resume: ok", "suspend.second_resume: ok", "suspend.exit: ok", "suspend.final_io: ok",
                 "file.duplicate_type: ok", "file.duplicate_closed: ok",

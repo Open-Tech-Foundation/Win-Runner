@@ -2,7 +2,14 @@ use std::io::Write;
 use std::path::Path;
 use winrun::{inspect, instance, snapshot, winfs::WinFs};
 
+/// This session's guest process table (`taskkill`), when it made one.
+static PROCESS_TABLE: std::sync::OnceLock<Option<winrun::native::process_table::SessionTable>> =
+    std::sync::OnceLock::new();
+
 fn exit(code: i32) -> ! {
+    if let Some(Some(table)) = PROCESS_TABLE.get() {
+        table.remove();
+    }
     std::process::exit(code)
 }
 
@@ -108,6 +115,7 @@ fn main() {
         return;
     }
     let (options, args) = parse_runtime_options(&args);
+    PROCESS_TABLE.get_or_init(winrun::native::process_table::begin_session);
     if let Some(memory) = options.memory.as_deref() {
         // Workers and guest children inherit it through the environment.
         match winrun::system_profile::parse_memory_size(memory) {
