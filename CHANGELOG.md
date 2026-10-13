@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `scripts/install.sh` to install a published Linux x86-64 release: download
+  the tarball and checksums, verify the SHA-256, and install `winrun` into
+  `/usr/local/bin` or `~/.local/bin` (override with `--prefix` /
+  `WINRUN_PREFIX`, pin with `--version` / `WINRUN_VERSION`).
+
+- README installation docs: requirements, installing from a GitHub Release
+  (download, checksum, install), building from source, how to use the main
+  CLI surfaces, and a short list of what is not supported yet.
+
 ## [0.1.0] - 2026-10-13
 
 ### Added

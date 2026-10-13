@@ -46,20 +46,156 @@ programs**, driven by people, CI pipelines, and coding agents.
 Win-Runner does not aim to replace Wine. It targets command-line programs, not GUI
 apps, games, or drivers. For those, use Wine or a real Windows machine.
 
-## Quick start
+## Requirements
+
+| | |
+|---|---|
+| **OS** | Linux |
+| **CPU** | x86-64 (guest PE code runs natively on the host CPU) |
+| **Privileges** | None beyond normal user access to the paths you mount |
+| **Not required** | Wine, Windows, a VM, or a separate package manager |
+
+Win-Runner is a single native binary. It does not need a prefix install, a
+system-wide service, or host Windows tools. Network access is only needed when
+you download packages with `wpkg` or call out to HTTP from the guest.
+
+## Installation
+
+### Install script (recommended)
+
+On Linux x86-64, install a published release with the bundled script. It
+downloads the tarball and `checksums.txt`, verifies the SHA-256, and installs
+`winrun` into a directory on your `PATH`.
 
 ```bash
-cargo build --release
-./target/release/winrun shell
+# Latest script default (pin with --version / WINRUN_VERSION)
+curl -fsSL "https://raw.githubusercontent.com/Open-Tech-Foundation/Win-Runner/main/scripts/install.sh" | bash
+
+# Or from a clone of this repository:
+./scripts/install.sh
+./scripts/install.sh --version v0.1.0 --prefix "$HOME/.local/bin"
+./scripts/install.sh --dry-run
 ```
 
-Run a Windows program or script directly, or inspect a PE file's imported APIs:
+Default prefix is `/usr/local/bin` when that directory is writable, otherwise
+`$HOME/.local/bin`. Override with `--prefix` or `WINRUN_PREFIX`. Requires
+`curl` and `sha256sum`. There is no post-install service; the install is just
+the `winrun` binary.
+
+### Download a release manually
+
+Prebuilt binaries are on the [GitHub Releases](https://github.com/Open-Tech-Foundation/Win-Runner/releases)
+page. Each release ships a Linux x86-64 `winrun` binary in a tarball plus a
+`checksums.txt` file.
 
 ```bash
-winrun app.exe [args...]
-winrun script.ps1
+# Example for v0.1.0 — pick the latest version from the releases page
+VERSION=v0.1.0
+curl -fsSLO "https://github.com/Open-Tech-Foundation/Win-Runner/releases/download/${VERSION}/winrun-win-runner.tar.gz"
+curl -fsSLO "https://github.com/Open-Tech-Foundation/Win-Runner/releases/download/${VERSION}/checksums.txt"
+sha256sum -c checksums.txt
+tar -xzf winrun-win-runner.tar.gz
+sudo install -m 755 winrun /usr/local/bin/winrun   # or: mv winrun ~/.local/bin/
+winrun inspect /path/to/app.exe                    # smoke check
+```
+
+The archive contains only the `winrun` binary (stripped). License text lives
+in the repository (`LICENSE`, `NOTICE`); release assets are checksummed, and
+the release workflow attaches build provenance when published from CI.
+
+### Build from source
+
+Requires a stable Rust toolchain with Cargo (edition 2021).
+
+```bash
+git clone https://github.com/Open-Tech-Foundation/Win-Runner.git
+cd Win-Runner
+cargo build --release
+sudo install -m 755 target/release/winrun /usr/local/bin/winrun
+# or without install:
+# export PATH="$PWD/target/release:$PATH"
+```
+
+Offline builds work with a warm Cargo cache: `cargo build --release --offline`.
+
+### Verify the install
+
+```bash
+winrun                    # prints usage and exits 2 (there is no --help flag)
+winrun inspect path/to/app.exe
+winrun shell
+```
+
+If `winrun` is not found, put the directory that contains the binary on your
+`PATH`. There is no installer daemon and no post-install service.
+
+## How to use
+
+| Goal | Command |
+|---|---|
+| Interactive shell | `winrun shell` |
+| Run a Windows EXE from a host path | `winrun path/to/app.exe [args…]` |
+| Run a PowerShell-style script | `winrun path/to/script.ps1` (script args not supported yet) |
+| Inspect PE imports before running | `winrun inspect path/to/app.exe` |
+| Persistent C: between runs | `winrun --snapshot=tools.winfs --save shell` |
+| Mount a host folder as guest `Z:` | `winrun --mount=Z:/path/to/folder shell` |
+| Read-only mount | `winrun --mount-ro=Z:/path/to/folder shell` |
+| Headless / agent control | `winrun --headless --control=127.0.0.1:0 shell` |
+| Scripted batch jobs | `winrun runner` (commands on stdin) |
+| Long-lived named instance | `winrun instance boot <name>` then `instance exec` / `status` / `destroy` |
+
+Runtime flags (`--snapshot`, `--mount`, `--headless`, …) must appear **before**
+the program target. Everything after the target is passed to the guest program,
+even if it looks like a Win-Runner option.
+
+Minimal examples:
+
+```bash
+# Clean ephemeral session
+winrun shell
+
+# Keep tools you installed with wpkg
+winrun --snapshot=tools.winfs --save shell
+
+# One-shot guest program with streamed stdio
+winrun --snapshot=tools.winfs "C:\Program Files\nodejs\current\node.exe" -e "console.log(1)"
+
+# Inspect without running
 winrun inspect app.exe
 ```
+
+Inside the shell, install packages and run Windows tools by name:
+
+```powershell
+wpkg install nodejs
+wpkg install python
+node -v
+python --version
+Get-Command
+exit
+```
+
+See [Guest state](#guest-state) for the disposable C: layout, registry, and
+snapshots; [Shell and packages](#shell-and-packages) for the PowerShell subset
+and `wpkg`; and [Headless control](#headless-control) / [Mount host folders](#mount-host-folders)
+for automation.
+
+### Not installed / not supported yet
+
+Call these out so first-time setup does not look like a broken install:
+
+- **No `--help` / `--version` flags.** Run `winrun` with no arguments for usage.
+- **`.ps1` arguments** are not accepted on the command line yet (`winrun s.ps1 arg` fails).
+- **Only host `.exe` and `.ps1` targets.** Other extensions must be installed
+  inside the shell (for example via `wpkg`) or run as guest `PATH` commands.
+- **Linux x86-64 only** in published releases today (no Windows/macOS/arm64
+  host builds; guest packages may still include arm64 manifests for future hosts).
+- **Not a security sandbox.** Do not point it at untrusted binaries without an
+  OS-level sandbox.
+- **PowerShell subset, not full Windows PowerShell.** Missing common cmdlets
+  (for example `Get-Date`, `Get-Process`) fail loudly rather than half-working;
+  `Get-Command` / `Get-Help` list what the shell implements.
+- **Desktop clipboard and GUI** are out of scope; Micro uses an internal clipboard.
 
 ## Guest state
 
