@@ -835,7 +835,7 @@ global-cli JavaScript FTW!
 npm install -g C:\fixtures\v2.tgz --offline --no-update-notifier --no-audit --no-fund --ignore-scripts
 global-cli upgraded
 cmd /c global-cli child
-node -e "const fs=require('fs');const p=String.raw`{root}\node_modules`;if(fs.readdirSync(p).some(n=>n.startsWith('.winrun-global-cli-')))throw Error('retired package remains');console.log('cleanup verified')"
+node -e "const fs=require('fs');const p=process.argv[1];if(fs.readdirSync(p).some(n=>n.startsWith('.winrun-global-cli-')))throw Error('retired package remains');console.log('cleanup verified')" "{root}\node_modules"
 exit
 "#
     );

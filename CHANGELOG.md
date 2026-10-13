@@ -154,6 +154,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- The npm global-launcher test passes its folder to `node -e` as an argument
+  instead of a JavaScript template literal, whose backticks PowerShell treats
+  as escapes inside double quotes.
+
 - `New-Item -ItemType Directory` creates missing parent directories, as
   PowerShell does; only an existing item still needs `-Force`.
 
