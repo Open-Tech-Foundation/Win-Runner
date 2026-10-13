@@ -66,6 +66,22 @@ pub(super) extern "win64" fn native_rtl_get_version(info: *mut u8) -> u32 {
     }
     0
 }
+/// `RtlGetNtVersionNumbers`: the version RtlGetVersion reports, with the
+/// build number's top nibble set as on release builds of Windows.
+pub(super) extern "win64" fn native_rtl_get_nt_version_numbers(major: *mut u32, minor: *mut u32, build: *mut u32) {
+    unsafe {
+        if !major.is_null() {
+            major.write_unaligned(10);
+        }
+        if !minor.is_null() {
+            minor.write_unaligned(0);
+        }
+        if !build.is_null() {
+            build.write_unaligned(0xF000_0000 | system_profile::OS_BUILD_NUMBER);
+        }
+    }
+}
+
 pub(super) extern "win64" fn native_rtl_nt_status_to_dos_error(status: u32) -> u32 {
     match status {
         0 => 0,

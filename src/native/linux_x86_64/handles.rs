@@ -152,6 +152,42 @@ pub(super) extern "win64" fn native_set_std_handle(which: u32, handle: u64) -> i
     1
 }
 
+/// HANDLE_FLAG_INHERIT (1) and HANDLE_FLAG_PROTECT_FROM_CLOSE (2) as
+/// SetHandleInformation left them; handles without tracked flags report 0.
+pub(super) extern "win64" fn native_get_handle_information(handle: u64, flags: *mut u32) -> i32 {
+    if flags.is_null() {
+        native_set_last_error(998); // ERROR_NOACCESS
+        return 0;
+    }
+    let known = (|| {
+        if let Some(process) = process_ctx() {
+            if let Some(thread) = process.apc_handles.lock().ok()?.get(&handle) {
+                return Some(thread.flags & 3);
+            }
+            if let Some(pipe) = process.named_pipes.lock().ok()?.handles.get(&handle) {
+                return Some(u32::from(pipe.inheritable));
+            }
+        }
+        if handle & 0xffff_ffff_0000_0000 == SOCKET_HANDLE_TAG {
+            let descriptor_flags = unsafe { fcntl(handle as i32, 1) }; // F_GETFD
+            return (descriptor_flags >= 0).then_some(u32::from(descriptor_flags & 1 == 0));
+        }
+        let open = host_standard_fd(handle).is_some()
+            || fs_ctx().is_some_and(|context| context.lock().is_ok_and(|fs| fs.handles.contains_key(&handle)));
+        open.then_some(0)
+    })();
+    match known {
+        Some(value) => {
+            unsafe { flags.write_unaligned(value) };
+            1
+        }
+        None => {
+            native_set_last_error(6);
+            0
+        }
+    }
+}
+
 pub(super) extern "win64" fn native_set_handle_information(
     handle: u64,
     mask: u32,

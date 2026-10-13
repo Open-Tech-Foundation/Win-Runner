@@ -129,6 +129,46 @@ pub(super) struct NativeMemoryBasicInformation {
 /// to 0x7FFF_FFFE_FFFF.
 const X64_USER_ADDRESS_SPACE: u64 = 0x7fff_fffe_0000;
 
+/// The physical memory the guest reports, rather than the host's.
+const GUEST_MEMORY_BUDGET: u64 = 512 * 1024 * 1024;
+
+/// `GetPerformanceInfo`: PERFORMANCE_INFORMATION (104 bytes on x64) with
+/// the same budget GlobalMemoryStatusEx reports, counted in 4 KiB pages.
+pub(super) extern "win64" fn native_get_performance_info(information: *mut u8, size: u32) -> i32 {
+    if information.is_null() || size < 104 {
+        native_set_last_error(24); // ERROR_BAD_LENGTH
+        return 0;
+    }
+    let pages = GUEST_MEMORY_BUDGET / 4096;
+    let fields: [u64; 10] = [
+        pages / 2, // CommitTotal
+        pages,     // CommitLimit
+        pages / 2, // CommitPeak
+        pages,     // PhysicalTotal
+        pages / 2, // PhysicalAvailable
+        0,         // SystemCache
+        0,         // KernelTotal
+        0,         // KernelPaged
+        0,         // KernelNonpaged
+        4096,      // PageSize (bytes)
+    ];
+    let threads = process_ctx()
+        .and_then(|process| process.apc_handles.lock().ok().map(|threads| threads.len() as u32))
+        .unwrap_or(0)
+        .max(1);
+    unsafe {
+        std::ptr::write_bytes(information, 0, 104);
+        information.cast::<u32>().write_unaligned(104);
+        for (index, value) in fields.iter().enumerate() {
+            information.add(8 + index * 8).cast::<u64>().write_unaligned(*value);
+        }
+        information.add(88).cast::<u32>().write_unaligned(0); // HandleCount
+        information.add(92).cast::<u32>().write_unaligned(1); // ProcessCount
+        information.add(96).cast::<u32>().write_unaligned(threads); // ThreadCount
+    }
+    1
+}
+
 pub(super) extern "win64" fn native_global_memory_status_ex(
     status: *mut NativeMemoryStatus,
 ) -> i32 {
@@ -144,7 +184,7 @@ pub(super) extern "win64" fn native_global_memory_status_ex(
     // WinFS process model rather than exposing an arbitrary host memory
     // size. The virtual address space is the x64 user range Windows reports
     // (128 TiB): runtimes such as CoreCLR size their GC reservation from it.
-    let budget = 512 * 1024 * 1024u64;
+    let budget = GUEST_MEMORY_BUDGET;
     let available = budget / 2;
     let value = NativeMemoryStatus {
         length: 64,

@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- `GetHandleInformation`; PE resources (`FindResourceA/W`,
+  `FindResourceExA/W`, `LoadResource`, `LockResource`, `SizeofResource`,
+  `FreeResource`) read from the mapped image's resource directory;
+  `SHGetKnownFolderPath` for the standard known folders;
+  `GetPerformanceInfo`/`K32GetPerformanceInfo`; and
+  `RtlGetNtVersionNumbers`. The native_startup oracle probe records each on
+  Windows.
+
 - `tar.exe` in System32, as Windows 10+ ships it (bsdtar's command line):
   `-c`/`-x`/`-t` (also the bundled `tar xzf` form), `-f` (with `-` for
   standard streams), `-C`, `-z`/`-j`/`-a`/`--format zip`, `-v`, `-k`, `-O`,

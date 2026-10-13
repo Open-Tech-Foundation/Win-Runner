@@ -315,6 +315,47 @@ pub(super) extern "win64" fn native_sh_get_folder_path_w(
     0 // S_OK
 }
 
+/// `SHGetKnownFolderPath`: the folder's path in memory from CoTaskMemAlloc;
+/// `*path` is NULL on failure, and an unknown folder is E_INVALIDARG.
+pub(super) extern "win64" fn native_sh_get_known_folder_path(
+    id: *const u8,
+    _flags: u32,
+    _token: u64,
+    path: *mut *mut u16,
+) -> i32 {
+    const E_INVALIDARG: i32 = 0x8007_0057u32 as i32;
+    if path.is_null() {
+        return E_INVALIDARG;
+    }
+    unsafe { path.write(ptr::null_mut()) };
+    if id.is_null() {
+        return E_INVALIDARG;
+    }
+    let guid = unsafe { std::slice::from_raw_parts(id, 16) };
+    let text = format!(
+        "{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{}",
+        u32::from_le_bytes(guid[0..4].try_into().unwrap()),
+        u16::from_le_bytes(guid[4..6].try_into().unwrap()),
+        u16::from_le_bytes(guid[6..8].try_into().unwrap()),
+        guid[8],
+        guid[9],
+        guid[10..].iter().map(|byte| format!("{byte:02X}")).collect::<String>()
+    );
+    let Some(folder) = system_profile::known_folder_path(&text) else {
+        return E_INVALIDARG;
+    };
+    let encoded: Vec<u16> = folder.encode_utf16().chain(std::iter::once(0)).collect();
+    let memory = native_co_task_mem_alloc(encoded.len() * 2).cast::<u16>();
+    if memory.is_null() {
+        return 0x8007_000Eu32 as i32; // E_OUTOFMEMORY
+    }
+    unsafe {
+        memory.copy_from_nonoverlapping(encoded.as_ptr(), encoded.len());
+        path.write(memory);
+    }
+    0
+}
+
 pub(super) extern "win64" fn native_get_user_profile_directory_w(
     _token: u64,
     output: *mut u16,

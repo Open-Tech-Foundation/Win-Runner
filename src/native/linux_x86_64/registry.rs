@@ -394,7 +394,7 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                 | "EnumerateSecurityPackagesW"
         ),
         "CRYPT32.DLL" => matches!(func, "CertOpenStore" | "CertOpenSystemStoreA" | "CertOpenSystemStoreW" | "CertGetIntendedKeyUsage" | "CertGetEnhancedKeyUsage" | "CertEnumCertificatesInStore" | "CertCloseStore" | "CertFreeCertificateContext" | "CertDuplicateCertificateContext"),
-        "PSAPI.DLL" => func == "GetProcessMemoryInfo",
+        "PSAPI.DLL" => matches!(func, "GetProcessMemoryInfo" | "GetPerformanceInfo"),
         "WINMM.DLL" => func == "timeGetTime",
         "USERENV.DLL" => func == "GetUserProfileDirectoryW",
         "BCRYPTPRIMITIVES.DLL" => func == "ProcessPrng",
@@ -409,7 +409,7 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                 | "CoCreateGuid"
                 | "CoGetContextToken"
         ),
-        "SHELL32.DLL" => func == "SHGetFolderPathW",
+        "SHELL32.DLL" => matches!(func, "SHGetFolderPathW" | "SHGetKnownFolderPath"),
         "OLEAUT32.DLL" => matches!(func, "GetErrorInfo" | "SetErrorInfo"),
         "ADVAPI32.DLL" => matches!(
             func,
@@ -556,6 +556,7 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                 | "RtlVirtualUnwind"
                 | "RtlCaptureStackBackTrace"
                 | "RtlGetVersion"
+                | "RtlGetNtVersionNumbers"
                 | "RtlNtStatusToDosError"
                 | "RtlGetActiveActivationContext"
                 | "RtlAllocateHeap"
@@ -1418,6 +1419,15 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
             Some(native_adjust_token_privileges as *const () as usize as u64)
         }
         "SHGetFolderPathW" => Some(native_sh_get_folder_path_w as *const () as usize as u64),
+        "SHGetKnownFolderPath" => Some(native_sh_get_known_folder_path as *const () as usize as u64),
+        "FindResourceA" => Some(native_find_resource_a as *const () as usize as u64),
+        "FindResourceW" => Some(native_find_resource_w as *const () as usize as u64),
+        "FindResourceExA" => Some(native_find_resource_ex_a as *const () as usize as u64),
+        "FindResourceExW" => Some(native_find_resource_ex_w as *const () as usize as u64),
+        "LoadResource" => Some(native_load_resource as *const () as usize as u64),
+        "LockResource" => Some(native_lock_resource as *const () as usize as u64),
+        "SizeofResource" => Some(native_sizeof_resource as *const () as usize as u64),
+        "FreeResource" => Some(native_free_resource as *const () as usize as u64),
         "GetProcessHeap" => Some(native_get_process_heap as *const () as usize as u64),
         "GetCurrentThreadId" => Some(native_get_current_thread_id as *const () as usize as u64),
         "GetCurrentProcessId" => Some(native_get_current_process_id as *const () as usize as u64),
@@ -1472,6 +1482,9 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         }
         "timeGetTime" => Some(native_time_get_time as *const () as usize as u64),
         "GlobalMemoryStatusEx" => Some(native_global_memory_status_ex as *const () as usize as u64),
+        "GetPerformanceInfo" | "K32GetPerformanceInfo" => {
+            Some(native_get_performance_info as *const () as usize as u64)
+        }
         "InitializeCriticalSectionEx" => {
             Some(native_initialize_critical_section_ex as *const () as usize as u64)
         }
@@ -1527,6 +1540,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
             Some(native_is_processor_feature_present as *const () as usize as u64)
         }
         "RtlGetVersion" => Some(native_rtl_get_version as *const () as usize as u64),
+        "RtlGetNtVersionNumbers" => Some(native_rtl_get_nt_version_numbers as *const () as usize as u64),
         "NtReadFile" => Some(native_nt_read_file as *const () as usize as u64),
         "NtWriteFile" => Some(native_nt_write_file as *const () as usize as u64),
         "RtlNtStatusToDosError" => {
@@ -1573,6 +1587,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "GetStdHandle" => Some(native_get_std_handle as *const () as usize as u64),
         "SetStdHandle" => Some(native_set_std_handle as *const () as usize as u64),
         "SetHandleInformation" => Some(native_set_handle_information as *const () as usize as u64),
+        "GetHandleInformation" => Some(native_get_handle_information as *const () as usize as u64),
         "DuplicateHandle" => Some(native_duplicate_handle as *const () as usize as u64),
         "GetFileType" => Some(native_get_file_type as *const () as usize as u64),
         "GetModuleFileNameW" => Some(native_get_module_file_name_w as *const () as usize as u64),

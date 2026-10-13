@@ -1152,6 +1152,126 @@ fn waits() {
         RtlWakeAddressSingle(&address);
     }
 }
+/// Version numbers, performance counters, known folders, resources, and
+/// handle flags: values that do not depend on the machine.
+fn system_info() {
+    type Load = unsafe extern "system" fn(*const u8) -> usize;
+    type Versions = unsafe extern "system" fn(*mut u32, *mut u32, *mut u32);
+    type Performance = unsafe extern "system" fn(*mut u8, u32) -> i32;
+    type KnownFolder = unsafe extern "system" fn(*const u8, u32, usize, *mut *mut u16) -> i32;
+    type TaskFree = unsafe extern "system" fn(*mut u16);
+    type FindResource = unsafe extern "system" fn(usize, usize, usize) -> usize;
+    type CreatePipe = unsafe extern "system" fn(*mut usize, *mut usize, *const u64, u32) -> i32;
+    type HandleInfo = unsafe extern "system" fn(usize, *mut u32) -> i32;
+    type SetHandleInfo = unsafe extern "system" fn(usize, u32, u32) -> i32;
+    type Close = unsafe extern "system" fn(usize) -> i32;
+    let load = api!("system.load", "LoadLibraryA", Load);
+    let proc = |module: &[u8], name: &[u8]| unsafe { GetProcAddress(load(module.as_ptr()), name.as_ptr()) };
+
+    let versions = proc(b"ntdll.dll\0", b"RtlGetNtVersionNumbers\0");
+    if versions == 0 {
+        unavailable("rtl.nt_version");
+    } else {
+        let (mut major, mut minor, mut build) = (0u32, 0u32, 0u32);
+        unsafe { core::mem::transmute::<usize, Versions>(versions)(&mut major, &mut minor, &mut build) };
+        case("rtl.nt_version");
+        out_dec(major as u64);
+        out_byte(b'.');
+        out_dec(minor as u64);
+        out_str(" high=");
+        out_hex((build >> 28) as u64);
+        out_byte(b'\n');
+    }
+
+    let performance = api!("perf.info_api", "K32GetPerformanceInfo", Performance);
+    let mut info = [0u64; 13];
+    let ok = unsafe { performance(info.as_mut_ptr().cast(), 104) } != 0;
+    case("perf.info");
+    if ok {
+        out_str("cb=");
+        out_dec(info[0] as u32 as u64);
+        out_str(" page=");
+        out_dec(info[10]);
+        out_str(if info[4] >= info[5] && info[2] >= info[1].min(1) { " consistent\n" } else { " inconsistent\n" });
+    } else {
+        out_str("failed");
+        out_error();
+        out_byte(b'\n');
+    }
+    case("perf.info_small");
+    out_str("ret=");
+    out_dec(unsafe { performance(info.as_mut_ptr().cast(), 8) } as u64);
+    out_error();
+    out_byte(b'\n');
+
+    let known = proc(b"shell32.dll\0", b"SHGetKnownFolderPath\0");
+    let free = proc(b"ole32.dll\0", b"CoTaskMemFree\0");
+    if known == 0 || free == 0 {
+        unavailable("known_folder.local_app_data");
+    } else {
+        let known = unsafe { core::mem::transmute::<usize, KnownFolder>(known) };
+        let free = unsafe { core::mem::transmute::<usize, TaskFree>(free) };
+        // FOLDERID_LocalAppData {F1B32785-6FBA-4FCF-9D55-7B8E7F157091}.
+        let local: [u8; 16] = [0x85, 0x27, 0xb3, 0xf1, 0xba, 0x6f, 0xcf, 0x4f, 0x9d, 0x55, 0x7b, 0x8e, 0x7f, 0x15, 0x70, 0x91];
+        let mut path: *mut u16 = core::ptr::null_mut();
+        let hr = unsafe { known(local.as_ptr(), 0, 0, &mut path) };
+        case("known_folder.local_app_data");
+        out_str("hr=");
+        out_hex(hr as u32 as u64);
+        if !path.is_null() {
+            let length = unsafe { wcslen(path) };
+            let text = unsafe { core::slice::from_raw_parts(path, length) };
+            let suffix: [u16; 14] = [b'\\' as u16, b'A' as u16, b'p' as u16, b'p' as u16, b'D' as u16, b'a' as u16, b't' as u16, b'a' as u16, b'\\' as u16, b'L' as u16, b'o' as u16, b'c' as u16, b'a' as u16, b'l' as u16];
+            out_str(if text.ends_with(&suffix) { " path=profile\\AppData\\Local" } else { " path=other" });
+            unsafe { free(path) };
+        }
+        out_byte(b'\n');
+        let unknown = [0x11u8; 16];
+        let mut path: *mut u16 = 1 as *mut u16;
+        let hr = unsafe { known(unknown.as_ptr(), 0, 0, &mut path) };
+        case("known_folder.unknown");
+        out_str("hr=");
+        out_hex(hr as u32 as u64);
+        out_str(if path.is_null() { " path=null\n" } else { " path=set\n" });
+    }
+
+    let find = api!("resource.find_api", "FindResourceW", FindResource);
+    case("resource.missing_manifest");
+    // The probe links no resources: MAKEINTRESOURCE(1) of RT_MANIFEST (24).
+    out_str("ret=");
+    out_dec(unsafe { find(0, 1, 24) } as u64);
+    out_error();
+    out_byte(b'\n');
+
+    let create_pipe = api!("handle_info.pipe_api", "CreatePipe", CreatePipe);
+    let get = api!("handle_info.get_api", "GetHandleInformation", HandleInfo);
+    let set = api!("handle_info.set_api", "SetHandleInformation", SetHandleInfo);
+    let close = api!("handle_info.close_api", "CloseHandle", Close);
+    // SECURITY_ATTRIBUTES { nLength = 24, bInheritHandle = TRUE }.
+    let security: [u64; 3] = [24, 0, 1];
+    let (mut reader, mut writer) = (0usize, 0usize);
+    if unsafe { create_pipe(&mut reader, &mut writer, security.as_ptr(), 0) } == 0 {
+        unavailable("handle_info.inherited");
+        return;
+    }
+    let mut flags = 0xffu32;
+    let ok = unsafe { get(reader, &mut flags) } != 0;
+    case("handle_info.inherited");
+    out_str(if ok { "flags=" } else { "failed" });
+    out_dec(flags as u64);
+    out_byte(b'\n');
+    unsafe { set(reader, 1, 0) };
+    let ok = unsafe { get(reader, &mut flags) } != 0;
+    case("handle_info.cleared");
+    out_str(if ok { "flags=" } else { "failed" });
+    out_dec(flags as u64);
+    out_byte(b'\n');
+    unsafe {
+        close(reader);
+        close(writer);
+    }
+}
+
 #[no_mangle]
 pub extern "system" fn probe_entry() -> ! {
     suspended_child_mode();
@@ -1167,6 +1287,7 @@ pub extern "system" fn probe_entry() -> ! {
     alerts_and_console_flush();
     resources();
     certificates();
+    system_info();
     suspended_process();
     out_str("END\n");
     flush();
