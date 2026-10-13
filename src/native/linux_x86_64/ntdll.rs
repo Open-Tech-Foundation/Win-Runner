@@ -375,6 +375,51 @@ fn synchronous_pipe_handle(handle: u64) -> Option<u64> {
     (!pipe.overlapped).then_some(original)
 }
 
+/// The socket behind an overlapped pipe handle. Read or written through
+/// NtReadFile/NtWriteFile without an event or APC, such a handle completes
+/// before the call returns, as Windows does once the data is ready (callers
+/// such as Rust's std wait on the handle for a pending one).
+fn overlapped_pipe_fd(handle: u64) -> Option<i32> {
+    let process = process_ctx()?;
+    let original = process
+        .duplicate_handles
+        .lock()
+        .ok()
+        .and_then(|aliases| aliases.get(&handle).copied())
+        .unwrap_or(handle);
+    let pipes = process.named_pipes.lock().ok()?;
+    let pipe = pipes.handles.get(&original)?;
+    pipe.overlapped.then_some(pipe.endpoint.fd)
+}
+
+/// One transfer on an overlapped pipe's socket once it is ready: bytes, or
+/// STATUS_PIPE_BROKEN when the peer has gone.
+fn transfer_overlapped_pipe(fd: i32, buffer: *mut u8, length: u32, write: bool) -> Result<usize, u32> {
+    loop {
+        let count = unsafe {
+            if write {
+                libc::send(fd, buffer.cast(), length as usize, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL)
+            } else {
+                libc::recv(fd, buffer.cast(), length as usize, libc::MSG_DONTWAIT)
+            }
+        };
+        if count > 0 || (count == 0 && write) {
+            return Ok(count as usize);
+        }
+        if count == 0 {
+            return Err(0xC000_014B);
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EAGAIN) | Some(libc::EINTR) => {
+                let mut poll_fd = NativePollFd { fd, events: if write { 4 } else { 1 }, revents: 0 };
+                unsafe { poll(&mut poll_fd, 1, -1) };
+            }
+            Some(libc::EPIPE) | Some(libc::ECONNRESET) => return Err(0xC000_014B),
+            _ => return Err(0xC000_0001),
+        }
+    }
+}
+
 /// The NTSTATUS of a failed pipe transfer, from its Win32 error.
 fn pipe_error_status(error: u32) -> u32 {
     match error {
@@ -433,6 +478,12 @@ pub(super) extern "win64" fn native_nt_read_file(
             Some(value as u64)
         }
     };
+    if let Some(fd) = overlapped_pipe_fd(file) {
+        return match transfer_overlapped_pipe(fd, buffer, length, false) {
+            Ok(count) => finish(STATUS_SUCCESS, count),
+            Err(status) => finish(status, 0),
+        };
+    }
     if let Some(pipe) = synchronous_pipe_handle(file) {
         let mut count = 0u32;
         return if native_read_file(pipe, buffer, length, &mut count, 0) != 0 {
@@ -546,6 +597,12 @@ pub(super) extern "win64" fn native_nt_write_file(
             Some(value as u64)
         }
     };
+    if let Some(fd) = overlapped_pipe_fd(file) {
+        return match transfer_overlapped_pipe(fd, buffer.cast_mut(), length, true) {
+            Ok(count) => finish(STATUS_SUCCESS, count),
+            Err(status) => finish(status, 0),
+        };
+    }
     if let Some(pipe) = synchronous_pipe_handle(file) {
         let mut count = 0u32;
         return if native_write_file(pipe, buffer, length, &mut count, 0) != 0 {

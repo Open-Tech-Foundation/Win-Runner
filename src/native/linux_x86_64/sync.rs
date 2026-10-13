@@ -739,6 +739,9 @@ pub(super) extern "win64" fn native_register_wait_for_single_object(
     milliseconds: u32,
     flags: u32,
 ) -> i32 {
+    if native_diagnostic_enabled() {
+        eprintln!("native RegisterWaitForSingleObject object={object:#x} milliseconds={milliseconds:#x} flags={flags:#x}");
+    }
     if output.is_null() || callback == 0 || milliseconds != u32::MAX || flags & !0x3f != 0 {
         native_set_last_error(87);
         return 0;

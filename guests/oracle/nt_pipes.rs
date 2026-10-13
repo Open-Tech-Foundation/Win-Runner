@@ -158,6 +158,40 @@ fn unnamed_pipes() {
         out_str(if wrote && got { "ok\n" } else { "wrong\n" });
         unsafe { close(theirs) };
     }
+    // Our end again without FILE_SYNCHRONOUS_IO_NONALERT: an asynchronous
+    // handle that NtReadFile reads without an event (Rust's File::read).
+    let attributes = object(root, &empty, &mut unicode);
+    let mut asynchronous = 0usize;
+    let status = unsafe {
+        nt_create(&mut asynchronous, SYNCHRONIZE | GENERIC_READ, attributes.as_ptr(), io.as_mut_ptr(),
+            FILE_SHARE_WRITE, FILE_CREATE, 0, 0, 0, 0, 1, 4096, 4096, &timeout)
+    };
+    if status == 0 {
+        let attributes = object(asynchronous, &empty, &mut unicode);
+        let mut writer = 0usize;
+        let opened = unsafe {
+            nt_open(&mut writer, SYNCHRONIZE | GENERIC_WRITE | FILE_READ_ATTRIBUTES, attributes.as_ptr(),
+                io.as_mut_ptr(), FILE_SHARE_READ, FILE_SYNCHRONOUS_IO_NONALERT)
+        };
+        let read_api = ntdll(b"NtReadFile\0");
+        if opened == 0 && read_api != 0 {
+            let nt_read = unsafe { core::mem::transmute::<usize, NtTransferFn>(read_api) };
+            let mut count = 0u32;
+            unsafe { write(writer, b"async".as_ptr(), 5, &mut count, 0) };
+            let mut buffer = [0u8; 16];
+            io = [0; 2];
+            let status = unsafe {
+                nt_read(asynchronous, 0, 0, 0, io.as_mut_ptr(), buffer.as_mut_ptr(), 16, core::ptr::null(), core::ptr::null())
+            };
+            status_line("unnamed_pipe.async_read", status, &io, if &buffer[..5] == b"async" { " data=ok" } else { " data=wrong" });
+            unsafe { close(writer) };
+        } else {
+            unavailable("unnamed_pipe.async_read");
+        }
+        unsafe { close(asynchronous) };
+    } else {
+        unavailable("unnamed_pipe.async_read");
+    }
     unsafe {
         close(ours);
         close(root);

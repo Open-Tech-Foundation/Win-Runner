@@ -193,6 +193,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- `NtReadFile`/`NtWriteFile` without an event or APC on an overlapped pipe
+  handle complete before returning instead of failing with
+  `STATUS_INVALID_HANDLE`, so `std::fs::File` reads of a child's pipe (as
+  tokio's process I/O does) work; the nt_pipes oracle probe records it.
+
 - `VirtualAlloc(NULL, size, MEM_COMMIT, ...)` reserves and commits, as on
   Windows, instead of failing; `_stat64` writes `st_rdev` at its offset.
 
