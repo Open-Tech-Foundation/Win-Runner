@@ -165,6 +165,12 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Programs that import guest DLLs at load time (such as `python.exe`
+  linking `python314.dll` beside it) start with those DLLs loaded, bound and
+  initialized before their entry point, as the Windows loader does; before,
+  only `LoadLibrary` loaded guest DLLs and such imports failed when called.
+  The DLL-search oracle probe runs a program that imports a DLL chain this way.
+
 - `SHGetKnownFolderPath` returns `HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)`
   for an unknown folder, as the Windows oracle records.
 

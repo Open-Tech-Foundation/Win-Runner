@@ -1196,6 +1196,46 @@ mod guest_module_search_tests {
     }
 }
 
+/// Load the guest DLLs the program imports directly (a `python.exe` that
+/// links `python314.dll` beside it), as the Windows loader does before the
+/// program starts, and point its import slots at their exports. Call before
+/// the image's protections are applied; run [`initialize_static_imports`]
+/// on the guest thread before the program's entry point. An import whose
+/// DLL or export is missing keeps the stub that reports it if called.
+pub(super) fn bind_static_guest_imports(mapping: &Mapping, img: &PeImage) {
+    let mut loading = std::collections::HashSet::new();
+    let mut retained = std::collections::HashSet::new();
+    for import in img.imports.iter().chain(&img.unsupported) {
+        if super::registry::supports_import(&import.dll, &import.func) || native_system_module_name(&import.dll) {
+            continue;
+        }
+        let Some(module) = load_guest_module_inner(&import.dll, &mut loading, 0) else {
+            continue;
+        };
+        if is_synthetic_module(module) {
+            continue;
+        }
+        if retained.insert(module) {
+            retain_module_load_reference(module);
+        }
+        let Some(target) = resolve_module_export(module, &import.func, 0) else {
+            continue;
+        };
+        let offset = import.iat_rva as usize;
+        if offset.checked_add(8).is_some_and(|end| end <= mapping.len) {
+            // SAFETY: the import parser supplied the RVA, checked against
+            // the program's mapping, which is still writable here.
+            unsafe { ptr::write_unaligned(mapping.ptr.add(offset).cast::<u64>(), target) };
+        }
+    }
+}
+
+/// Run the statically loaded DLLs' TLS callbacks and DllMain in dependency
+/// order; false when one fails, as STATUS_DLL_INIT_FAILED on Windows.
+pub(super) fn initialize_static_imports() -> bool {
+    process_ctx().is_some_and(|process| initialize_pending_modules(&process))
+}
+
 fn load_guest_module(name: &str) -> Option<u64> {
     let outermost = GUEST_DLL_LOAD_DEPTH.with(|depth| {
         let current = depth.get();

@@ -676,6 +676,7 @@ fn run_rust_baseline_argv_with_fs_impl(
             }
             super::process_journal::start_publisher(&process)?;
             super::exceptions::install_guest_fault_signal_handlers()?;
+            bind_static_guest_imports(&mapping, img);
             protect_exec(&mapping, img)?;
             let guest_process = Arc::clone(&process);
             let code = std::thread::Builder::new()
@@ -694,6 +695,9 @@ fn run_rust_baseline_argv_with_fs_impl(
                     let teb = tls.teb.as_ptr() as u64;
                     drop(tls);
                     guest_process.gs_base.store(teb, Ordering::Release);
+                    if !initialize_static_imports() {
+                        return 0xC000_0142u32 as i32; // STATUS_DLL_INIT_FAILED
+                    }
                     super::thread_runtime::invoke_tls_callbacks(
                         guest_process.image_base,
                         &tls_callbacks,
@@ -793,6 +797,7 @@ fn run_rust_baseline_argv_with_fs_impl(
             process
                 .state_fd
                 .store(state_fds[1] as u32, Ordering::Release);
+            bind_static_guest_imports(&mapping, img);
             if protect_exec(&mapping, img).is_err() {
                 unsafe { _exit(127) };
             }
@@ -816,6 +821,9 @@ fn run_rust_baseline_argv_with_fs_impl(
                     let teb = tls.teb.as_ptr() as u64;
                     drop(tls);
                     guest_process.gs_base.store(teb, Ordering::Release);
+                    if !initialize_static_imports() {
+                        return 0xC000_0142u32 as i32; // STATUS_DLL_INIT_FAILED
+                    }
                     super::thread_runtime::invoke_tls_callbacks(
                         guest_process.image_base,
                         &tls_callbacks,

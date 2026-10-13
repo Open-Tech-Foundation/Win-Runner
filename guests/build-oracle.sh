@@ -63,6 +63,15 @@ for kind in middle parent; do
         "$OUT/dll_$kind.o" "$OUT/$dependency.lib" "$RLIB"/libcore-*.rlib "$RLIB"/libcompiler_builtins-*.rlib
 done
 
+# A program that imports oracle_search_parent.dll statically, embedded by the
+# DLL-search probe.
+rustc --target "$TARGET" --crate-type lib --emit obj -C panic=abort -C opt-level=2 --edition 2021 \
+    "$ROOT/guests/oracle/static_import_app_support.rs" -o "$OUT/static_import_app.o"
+"$LLD" -flavor link /ENTRY:static_import_entry /NODEFAULTLIB /SUBSYSTEM:CONSOLE /DYNAMICBASE \
+    "/OUT:$ROOT/tests/artifacts/dll/oracle_static_import_app.exe" \
+    "$OUT/static_import_app.o" "$OUT/oracle_search_parent.lib" "$OUT/oracle_kernel32.lib" \
+    "$RLIB"/libcore-*.rlib "$RLIB"/libcompiler_builtins-*.rlib
+
 for probe in "$ROOT"/guests/oracle/*.rs; do
     name="$(basename "$probe" .rs)"
     # Shared code, included by the probes.

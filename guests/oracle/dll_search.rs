@@ -38,6 +38,54 @@ fn value(module: usize, export: &[u8]) -> u32 {
     let call: unsafe extern "system" fn() -> u32 = unsafe { core::mem::transmute(address) };
     unsafe { call() }
 }
+/// A program beside parent, middle and the "user" value DLL (22) that imports
+/// the chain at load time: its exit code is the value.
+fn static_import(directory: &[u16]) {
+    type Open = unsafe extern "system" fn(*const u16, u32, u32, usize, u32, u32, usize) -> usize;
+    type Close = unsafe extern "system" fn(usize) -> i32;
+    type Create = unsafe extern "system" fn(
+        *const u16, *mut u16, usize, usize, i32, u32, usize, *const u16, *const u8, *mut usize,
+    ) -> i32;
+    type Wait = unsafe extern "system" fn(usize, u32) -> u32;
+    type ExitCode = unsafe extern "system" fn(usize, *mut u32) -> i32;
+    let open = api!("static_import.open_api", "CreateFileW", Open);
+    let close = api!("static_import.close_api", "CloseHandle", Close);
+    let create = api!("static_import.create_api", "CreateProcessW", Create);
+    let wait = api!("static_import.wait_api", "WaitForSingleObject", Wait);
+    let exit_code = api!("static_import.exit_api", "GetExitCodeProcess", ExitCode);
+    let program = join(directory, "static_import_app.exe");
+    let bytes = include_bytes!("../../tests/artifacts/dll/oracle_static_import_app.exe");
+    let file = unsafe { open(program.as_ptr(), 0x40000000, 7, 0, 2, 0, 0) };
+    let mut count = 0;
+    if file == usize::MAX || unsafe { WriteFile(file, bytes.as_ptr(), bytes.len() as u32, &mut count, 0) } == 0 {
+        boolean("static_import.fixture", false);
+        return;
+    }
+    unsafe { close(file) };
+    let mut startup = [0u8; 104];
+    startup[0] = 104;
+    let mut information = [0usize; 3];
+    let started = unsafe {
+        create(program.as_ptr(), core::ptr::null_mut(), 0, 0, 0, 0, 0, directory.as_ptr(), startup.as_ptr(), information.as_mut_ptr())
+    };
+    case("static_import.exit");
+    if started == 0 {
+        out_str("not started");
+        out_error();
+        out_byte(b'\n');
+        return;
+    }
+    let mut code = 0u32;
+    unsafe {
+        wait(information[0], 0xffff_ffff);
+        exit_code(information[0], &mut code);
+        close(information[0]);
+        close(information[1]);
+    }
+    out_dec(code as u64);
+    out_byte(b'\n');
+}
+
 fn probe() {
     type Load = unsafe extern "system" fn(*const u16, usize, u32) -> usize;
     type Add = unsafe extern "system" fn(*const u16) -> usize;
@@ -117,6 +165,7 @@ fn probe() {
             close(file);
         }
     }
+    static_import(&user);
     let name = wide_text("oracle_search_value.dll");
     let cwd_name = wide_text("oracle_only_cwd.dll");
     let export = b"OracleSearchValue\0";

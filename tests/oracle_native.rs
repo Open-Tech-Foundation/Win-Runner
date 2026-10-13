@@ -268,6 +268,7 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
                 "io.cancel_callback: ok",
             ],
             "dll_search" => &[
+                "static_import.exit: 22",
                 "module.loaded_paths: ok",
                 "module.truncated: ok",
                 "directory.missing: ok",
