@@ -13,29 +13,35 @@ fn exit(code: i32) -> ! {
     std::process::exit(code)
 }
 
+/// The usage summary for `--help` and for a missing target.
+fn usage_text() -> String {
+    [
+        "usage:",
+        "  winrun <app.exe> [args...]      run a Windows program from a host path",
+        "  winrun <script.ps1> [args...]   run a PowerShell script",
+        "  winrun --help | --version       show this help or the version",
+        "  winrun shell                    interactive ephemeral runner shell",
+        "  winrun runner                   run host-controlled job commands from stdin",
+        "  winrun --headless --control=127.0.0.1:0 shell  run a remotely controlled shell",
+        "  winrun --snapshot=os.disk shell|runner  boot an indexed C: disk image",
+        "  winrun --snapshot=os.disk --save shell|runner|app.exe  save changes to os.disk on exit",
+        "  winrun --save-snapshot=disk.winfs shell|runner|app.exe  save a new C: disk on exit",
+        "  winrun --snapshot=os.disk <app.exe> [args...]  run headless with streamed stdio",
+        "  winrun --mount=Z:/host/folder shell  mount a writable host folder",
+        "  winrun --mount-ro=Z:/host/folder shell  mount a read-only host folder",
+        "  winrun --memory=8G shell|app.exe  physical memory the guest reports (default 512M)",
+        "  winrun snapshot build <dir> <os.winfs>  build image from <dir>/C",
+        "  winrun instance boot <name> [--snapshot=os.snap]",
+        "  winrun instance status|destroy <name>",
+        "  winrun instance exec <name> -- <command> [args...]",
+        "  winrun inspect <app.exe>      report PE imports vs supported APIs",
+    ]
+    .join("\n")
+        + "\n"
+}
+
 fn usage() -> ! {
-    eprintln!("usage:");
-    eprintln!("  winrun <app.exe> [args...]      run a Windows program from a host path");
-    eprintln!("  winrun <script.ps1>             run a script (no args yet)");
-    eprintln!("  winrun shell                    interactive ephemeral runner shell");
-    eprintln!("  winrun runner                   run host-controlled job commands from stdin");
-    eprintln!("  winrun --headless --control=127.0.0.1:0 shell  run a remotely controlled shell");
-    eprintln!("  winrun --snapshot=os.disk shell|runner  boot an indexed C: disk image");
-    eprintln!(
-        "  winrun --snapshot=os.disk --save shell|runner|app.exe  save changes to os.disk on exit"
-    );
-    eprintln!(
-        "  winrun --save-snapshot=disk.winfs shell|runner|app.exe  save a new C: disk on exit"
-    );
-    eprintln!("  winrun --snapshot=os.disk <app.exe> [args...]  run headless with streamed stdio");
-    eprintln!("  winrun --mount=Z:/host/folder shell  mount a writable host folder");
-    eprintln!("  winrun --mount-ro=Z:/host/folder shell  mount a read-only host folder");
-    eprintln!("  winrun --memory=8G shell|app.exe  physical memory the guest reports (default 512M)");
-    eprintln!("  winrun snapshot build <dir> <os.winfs>  build image from <dir>/C");
-    eprintln!("  winrun instance boot <name> [--snapshot=os.snap]");
-    eprintln!("  winrun instance status|destroy <name>");
-    eprintln!("  winrun instance exec <name> -- <command> [args...]");
-    eprintln!("  winrun inspect <app.exe>      report PE imports vs supported APIs");
+    eprint!("{}", usage_text());
     exit(2);
 }
 
@@ -113,6 +119,17 @@ fn main() {
             exit(1);
         }
         return;
+    }
+    match args.get(1).map(String::as_str) {
+        Some("--help" | "-h" | "help") if args.len() == 2 => {
+            print!("{}", usage_text());
+            exit(0);
+        }
+        Some("--version" | "-V") if args.len() == 2 => {
+            println!("winrun {}", env!("CARGO_PKG_VERSION"));
+            exit(0);
+        }
+        _ => {}
     }
     let (options, args) = parse_runtime_options(&args);
     PROCESS_TABLE.get_or_init(winrun::native::process_table::begin_session);

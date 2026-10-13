@@ -6,6 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- `winrun --help` (`-h`) prints the usage and `winrun --version` (`-V`) the
+  version, both exiting 0.
+
 - PowerShell scripts take arguments (`winrun script.ps1 -Name x`, a script
   run in the shell, `& .\script.ps1 a b`): a leading `param(...)` block
   (after comments and attributes such as `[CmdletBinding()]`) binds them by

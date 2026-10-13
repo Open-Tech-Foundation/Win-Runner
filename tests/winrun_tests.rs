@@ -2588,3 +2588,15 @@ fn a_program_run_from_a_host_path_sees_a_windows_module_path() {
     assert!(stdout.ends_with("END\n"), "{stdout}");
     assert!(!stdout.contains("wrong") && !stdout.contains("PANIC"), "{stdout}");
 }
+
+#[test]
+fn help_and_version_print_and_succeed() {
+    let (code, stdout, _) = run_winrun_env(&["--help"], &[]);
+    assert_eq!(code, 0);
+    assert!(stdout.starts_with("usage:\n") && stdout.contains("winrun shell"), "{stdout}");
+    let (code, stdout, _) = run_winrun_env(&["--version"], &[]);
+    assert_eq!((code, stdout), (0, format!("winrun {}\n", env!("CARGO_PKG_VERSION"))));
+    let (code, _, stderr) = run_winrun_env(&[], &[]);
+    assert_eq!(code, 2);
+    assert!(stderr.starts_with("usage:\n"), "{stderr}");
+}
