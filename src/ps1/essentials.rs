@@ -56,6 +56,14 @@ const ALIASES: &[(&str, &str)] = &[
     ("where", "where-object"),
     ("?", "where-object"),
     ("select", "select-object"),
+    ("fl", "format-list"),
+    ("ft", "format-table"),
+    ("group", "group-object"),
+    ("ps", "get-process"),
+    ("gps", "get-process"),
+    ("start", "start-process"),
+    ("saps", "start-process"),
+    ("gpv", "get-itempropertyvalue"),
 ];
 
 pub(super) fn canonical_command(cmd: &str) -> &str {
@@ -301,21 +309,28 @@ impl Interpreter<'_> {
             .or_else(|| pos.first())
             .map(String::as_str)
             .unwrap_or("*");
+        // `Get-Command cmd,tar` names several commands.
+        let patterns: Vec<String> = split_top_commas(pattern)
+            .into_iter()
+            .map(|p| p.trim().trim_matches(['\'', '"']).to_string())
+            .filter(|p| !p.is_empty())
+            .collect();
+        let matches = |name: &str| patterns.iter().any(|p| wildcard(p, name));
         let mut found = Vec::new();
         if cmd == "get-alias" {
             for (alias, name) in ALIASES {
-                if wildcard(pattern, alias) {
+                if matches(alias) {
                     found.push(format!("{alias} -> {name}"));
                 }
             }
         } else {
             for name in COMMAND_NAMES {
-                if wildcard(pattern, name) {
+                if matches(name) {
                     found.push((*name).to_string());
                 }
             }
             for name in self.funcs.keys() {
-                if wildcard(pattern, name) {
+                if matches(name) {
                     found.push(name.clone());
                 }
             }
@@ -339,10 +354,10 @@ impl Interpreter<'_> {
                                 && extensions
                                     .iter()
                                     .any(|ext| name.to_lowercase().ends_with(ext))
-                                && (wildcard(pattern, &name)
+                                && (matches(&name)
                                     || name
                                         .rsplit_once('.')
-                                        .is_some_and(|(stem, _)| wildcard(pattern, stem)))
+                                        .is_some_and(|(stem, _)| matches(stem)))
                             {
                                 found.push(full);
                             }
@@ -356,6 +371,16 @@ impl Interpreter<'_> {
         if found.is_empty() {
             return Err(format!("{cmd}: no matching command: {pattern}"));
         }
+        // A plain name (no wildcard) that matched nothing is an error, after
+        // the commands that were found.
+        let missing = patterns.iter().find(|p| {
+            !p.contains(['*', '?'])
+                && !found.iter().any(|f| {
+                    let leaf = f.rsplit('\\').next().unwrap_or(f);
+                    let stem = leaf.rsplit_once('.').map_or(leaf, |(stem, _)| stem);
+                    leaf.eq_ignore_ascii_case(p) || stem.eq_ignore_ascii_case(p) || f.split(" -> ").next().is_some_and(|a| a.eq_ignore_ascii_case(p))
+                })
+        });
         if cmd == "get-help" {
             self.emit("Win-Runner PowerShell subset: guest filesystem commands and text pipelines. Get-Command lists implemented commands; unsupported parameters report errors.");
         }
@@ -380,6 +405,9 @@ impl Interpreter<'_> {
             } else {
                 self.emit(&name);
             }
+        }
+        if let Some(missing) = missing {
+            return Err(format!("{cmd}: no matching command: {missing}"));
         }
         Ok(())
     }

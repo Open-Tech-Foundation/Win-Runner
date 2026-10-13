@@ -49,6 +49,7 @@ mod dotnet;
 mod external;
 mod registry;
 mod expr;
+mod utility;
 
 pub use external::{ErrorStream, ProcessHost, ProcessOutput};
 
@@ -840,7 +841,7 @@ impl<'a> Interpreter<'a> {
             }
             let text = String::from_utf8_lossy(&buf);
             let lines: Vec<String> = text.lines().map(str::to_string).collect();
-            self.store_assign(&name, op, lines_value(lines))?;
+            self.store_assign(&name, op, captured_value(&pipeline, lines))?;
             return Ok(Flow::Next);
         }
         let mut input: Option<String> = None;
@@ -1152,6 +1153,9 @@ impl<'a> Interpreter<'a> {
             "sort-object" | "get-unique" | "measure-object" => {
                 self.cmd_text_pipeline(cmd, rest, pipe_in)
             }
+            "get-date" | "get-random" | "out-string" | "format-list" | "format-table" | "group-object"
+            | "convertto-json" | "convertfrom-json" | "read-host" | "get-process" | "start-process"
+            | "get-itempropertyvalue" => self.cmd_utility(cmd, rest, pipe_in),
             "clear-host" => {
                 if !rest.is_empty() {
                     return Err("Clear-Host takes no arguments".into());
@@ -1528,7 +1532,7 @@ impl<'a> Interpreter<'a> {
             }
             let text = String::from_utf8_lossy(&buf);
             let lines: Vec<String> = text.lines().map(str::to_string).collect();
-            return Ok((lines_value(lines), Flow::Next));
+            return Ok((captured_value(&source, lines), Flow::Next));
         }
         // `$t = app.exe ...` / `$t = & $path ...`: a program's output lines.
         if !vals.is_empty() && !vals[0].quoted {
@@ -1604,7 +1608,7 @@ impl<'a> Interpreter<'a> {
                 }
                 let text = String::from_utf8_lossy(&buf);
                 let lines: Vec<String> = text.lines().map(str::to_string).collect();
-                return Ok((lines_value(lines), Flow::Next));
+                return Ok((captured_value(&fname, lines), Flow::Next));
             }
         }
         // `X -join S`: X's elements joined by S.
@@ -3745,7 +3749,7 @@ impl<'a> Interpreter<'a> {
         }
         let text = String::from_utf8_lossy(&buf);
         let lines: Vec<String> = text.lines().map(str::to_string).collect();
-        Ok((lines_value(lines), Flow::Next))
+        Ok((captured_value(inner, lines), Flow::Next))
     }
 
     /// Apply a `.Member` / `.Method(args)` / `[index]` chain to a value
@@ -4291,6 +4295,25 @@ enum AssignOp {
 }
 
 /// Output lines to a value: 0 lines → `""`, 1 → string, N → array.
+/// Captured output lines as a value: objects when the code's last stage
+/// is `ConvertFrom-Json` (which outputs them as JSON lines), else text.
+fn captured_value(code: &str, lines: Vec<String>) -> Value {
+    let last_stage = split_pipeline(code)
+        .ok()
+        .and_then(|stages| stages.last().cloned())
+        .unwrap_or_default();
+    let head = last_stage.split_whitespace().next().unwrap_or_default();
+    if !head.eq_ignore_ascii_case("convertfrom-json") {
+        return lines_value(lines);
+    }
+    let values: Vec<Value> = lines.iter().map(|line| parse_json_line(line)).collect();
+    match values.len() {
+        1 => values.into_iter().next().unwrap_or(Value::Str(String::new())),
+        0 => Value::Str(String::new()),
+        _ => Value::Arr(values),
+    }
+}
+
 fn lines_value(lines: Vec<String>) -> Value {
     if lines.len() == 1 {
         Value::Str(lines.into_iter().next().unwrap())
@@ -4860,12 +4883,25 @@ impl RxMatcher {
 struct JsonParser {
     chars: Vec<char>,
     pos: usize,
+    /// Keep keys as written (for display) rather than lowercased (for
+    /// case-insensitive member lookup).
+    keep_case: bool,
 }
 
 fn parse_json(text: &str) -> Result<Value, String> {
+    parse_json_with(text, false)
+}
+
+/// JSON with object keys as written.
+fn parse_json_keeping_case(text: &str) -> Result<Value, String> {
+    parse_json_with(text, true)
+}
+
+fn parse_json_with(text: &str, keep_case: bool) -> Result<Value, String> {
     let mut p = JsonParser {
         chars: text.chars().collect(),
         pos: 0,
+        keep_case,
     };
     let v = p.parse_value(0)?;
     p.skip_ws();
@@ -4927,7 +4963,8 @@ impl JsonParser {
             if self.peek() != Some('"') {
                 return Err("expected string key in JSON object".to_string());
             }
-            let key = self.parse_string()?.to_lowercase();
+            let key = self.parse_string()?;
+            let key = if self.keep_case { key } else { key.to_lowercase() };
             self.skip_ws();
             if self.peek() != Some(':') {
                 return Err("expected ':' in JSON object".to_string());
@@ -5898,6 +5935,26 @@ pub const COMMAND_NAMES: &[&str] = &[
     "popd",
     "start-sleep",
     "sleep",
+    "get-date",
+    "get-random",
+    "out-string",
+    "format-list",
+    "fl",
+    "format-table",
+    "ft",
+    "group-object",
+    "group",
+    "convertto-json",
+    "convertfrom-json",
+    "read-host",
+    "get-process",
+    "ps",
+    "gps",
+    "start-process",
+    "start",
+    "saps",
+    "get-itempropertyvalue",
+    "gpv",
     "join-path",
     "write-host",
     "write-output",
@@ -6456,6 +6513,18 @@ fn parse_params(
                         | "character"
                         | "file"
                         | "directory"
+                        | "compress"
+                        | "asarray"
+                        | "ashashtable"
+                        | "stream"
+                        | "autosize"
+                        | "wrap"
+                        | "hidetableheaders"
+                        | "noelement"
+                        | "assecurestring"
+                        | "maskinput"
+                        | "wait"
+                        | "nonewwindow"
                 ) {
                     named.insert(key, "true".to_string());
                     i += 1;
@@ -7844,6 +7913,37 @@ $x
             assert!(r.is_ok(), "{cond}");
             assert_eq!(out, want.as_bytes(), "{cond}");
         }
+    }
+
+    #[test]
+    fn utility_cmdlets_format_group_and_convert() {
+        let (out, r) = run_session("@{b='two';a=1} | ConvertTo-Json -Compress\n@{a=1} | ConvertTo-Json");
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(out, b"{\"a\":1,\"b\":\"two\"}\n{\n  \"a\": 1\n}\n");
+        let (out, r) = run_session("$o = '{\"Ab\":1,\"c\":{\"d\":\"x\"}}' | ConvertFrom-Json\n$o.ab\n$o.c.d\n('[1,2,3]' | ConvertFrom-Json).Count");
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(out, b"1\nx\n3\n");
+        let (out, r) = run_session("'a','b','a' | Group-Object");
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(out, b"\nCount Name Group\n----- ---- -----\n    2 a    {a, a}\n    1 b    {b}\n\n");
+        let (out, r) = run_session("@{Name='n';Size=3} | Format-Table\n@{Name='n';Size=3} | Format-List");
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(out, b"\nName Size\n---- ----\nn    3\n\n\nName : n\nSize : 3\n\n");
+        let (out, r) = run_session("Get-Random -Minimum 5 -Maximum 6\n'x' | Get-Random\n(Get-Date -Format yyyy).Length");
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(out, b"5\nx\n4\n");
+        assert!(run_session("Get-Random -Minimum 6 -Maximum 6").1.unwrap_err().contains("cannot be greater than or equal"));
+        assert!(run_session("'{' | ConvertFrom-Json").1.is_err());
+    }
+
+    #[test]
+    fn get_command_takes_several_names() {
+        let (out, r) = run_session("Get-Command Get-Date,Get-Random");
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(out, b"get-date\nget-random\n");
+        let (out, r) = run_session("Get-Command Get-Date,Nope-Thing");
+        assert_eq!(out, b"get-date\n", "found commands print before the error");
+        assert!(r.unwrap_err().contains("Nope-Thing"));
     }
 
     #[test]

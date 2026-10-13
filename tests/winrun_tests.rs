@@ -1553,6 +1553,23 @@ fn ps1_scripts_take_arguments_by_param_block_or_args() {
 }
 
 #[test]
+fn ps1_scripts_evaluate_expressions_and_utility_cmdlets() {
+    let script = tmp_path("expressions.ps1");
+    std::fs::write(
+        &script,
+        "1+1\n$a = 1,2,3\n$a.Count\n$h = @{Name='n'; Size=3}\n$h.Name\n[math]::Max(3, 9)\n'x' * 3\n1,2,3 | where { $_ -gt 1 }\n$h | ConvertTo-Json -Compress\n'a','b','a' | Group-Object -NoElement\n",
+    )
+    .unwrap();
+    let (code, out, err) = run_winrun_env(&[script.to_str().unwrap()], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(
+        out,
+        "2\n3\nn\n9\nxxx\n2\n3\n{\"Name\":\"n\",\"Size\":3}\n\nCount Name\n----- ----\n    2 a\n    1 b\n\n"
+    );
+    std::fs::remove_file(script).ok();
+}
+
+#[test]
 fn test_art_exe_rust_fp() {
     // Real rustc-built FP guest (guests/fp.rs): scalar-double arithmetic,
     // CMPLTSD select lowering, UCOMISD branches incl. NaN.

@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- PowerShell utility cmdlets: `Get-Date` (with .NET `-Format` strings),
+  `Get-Random`, `Out-String`, `Format-Table`/`Format-List`,
+  `Group-Object`, `ConvertTo-Json` (`-Depth`, `-Compress`) and
+  `ConvertFrom-Json` (objects keep member access when assigned),
+  `Read-Host`, `Get-Process` (this session's guest processes),
+  `Start-Process` (runs to completion), and `Get-ItemPropertyValue`.
+  `Get-Command` accepts several names (`Get-Command cmd,tar`).
+
 - A PowerShell expression engine for statements and assignments:
   arithmetic (`1+1`, `7/2`, `%`, `kb`/`mb` suffixes, hex), string and array
   repetition and concatenation, arrays (`1,2,3`, `@(...)`, ranges
