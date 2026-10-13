@@ -1,4 +1,5 @@
-//! CryptoAPI certificate enumeration using the host's configured trust bundle.
+//! CryptoAPI certificate stores: the guest's system stores (read from its
+//! registry), memory stores, enumeration, and adding encoded certificates.
 //! This supplies data, not certificate-chain verification or private keys.
 use super::*;
 const NOT_FOUND: u32 = 0x8009_2004;
@@ -581,6 +582,71 @@ pub(super) extern "win64" fn native_cert_enum_certificates(store: u64, previous:
     lease.references += 1;
     pointer
 }
+/// `CertAddEncodedCertificateToStore`: add an X.509 certificate to an open
+/// store by disposition (`CERT_STORE_ADD_*`). A certificate matches another
+/// with identical encoded bytes. Additions stay with the open store.
+pub(super) extern "win64" fn native_cert_add_encoded_certificate_to_store(
+    store: u64,
+    encoding: u32,
+    encoded: *const u8,
+    length: u32,
+    disposition: u32,
+    context: *mut u64,
+) -> i32 {
+    const CRYPT_E_EXISTS: u32 = 0x8009_2005;
+    if !context.is_null() {
+        unsafe { context.write(0) };
+    }
+    if encoded.is_null() || length == 0 || encoding & 1 == 0 || !(1..=7).contains(&disposition) {
+        fail(INVALID_ARGUMENT);
+        return 0;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(encoded, length as usize) }.to_vec();
+    let added = match certificate(bytes.clone(), store) {
+        Ok(added) => added,
+        Err(error) => {
+            fail(error);
+            return 0;
+        }
+    };
+    let mut stores = STORES.lock().unwrap();
+    let Some(certificates) = stores.stores.get_mut(&store) else {
+        drop(stores);
+        fail(INVALID_ARGUMENT);
+        return 0;
+    };
+    let same = |certificate: &Arc<Certificate>| {
+        let context = &certificate.context;
+        let stored = unsafe { std::slice::from_raw_parts(context.encoded as *const u8, context.size as usize) };
+        stored == bytes.as_slice()
+    };
+    let existing = certificates.iter().position(same);
+    let index = match (disposition, existing) {
+        (4, _) | (_, None) => {
+            certificates.push(added);
+            certificates.len() - 1
+        }
+        (2, Some(index)) => index,
+        (3 | 5, Some(index)) => {
+            certificates[index] = added;
+            index
+        }
+        (_, Some(_)) => {
+            drop(stores);
+            fail(CRYPT_E_EXISTS);
+            return 0;
+        }
+    };
+    if !context.is_null() {
+        let certificate = Arc::clone(&stores.stores[&store][index]);
+        let pointer = &*certificate.context as *const CertContext as u64;
+        let lease = stores.contexts.entry(pointer).or_insert(Lease { certificate, references: 0, index });
+        lease.references += 1;
+        unsafe { context.write(pointer) };
+    }
+    1
+}
+
 pub(super) extern "win64" fn native_cert_duplicate_context(pointer: u64) -> u64 {
     if pointer == 0 {
         return 0;
@@ -652,6 +718,33 @@ mod tests {
             vec![b"1.3.6.1.5.5.7.3.1\0".to_vec()]
         );
         assert!(decode_usage(&[0x30, 1, 6]).is_err());
+    }
+    #[test]
+    fn encoded_certificates_add_to_memory_stores_by_disposition() {
+        let der = crate::trust_roots::bundled_roots()[0].clone();
+        let store = native_cert_open_store(2, 0, 0, 0, ptr::null());
+        assert_ne!(store, 0);
+        let mut first = 0u64;
+        assert_eq!(native_cert_add_encoded_certificate_to_store(store, 1, der.as_ptr(), der.len() as u32, 1, &mut first), 1);
+        assert_ne!(first, 0);
+        let mut again = 7u64;
+        assert_eq!(native_cert_add_encoded_certificate_to_store(store, 1, der.as_ptr(), der.len() as u32, 1, &mut again), 0);
+        assert_eq!((native_get_last_error(), again), (0x8009_2005, 0), "CERT_STORE_ADD_NEW: CRYPT_E_EXISTS");
+        let mut existing = 0u64;
+        assert_eq!(native_cert_add_encoded_certificate_to_store(store, 1, der.as_ptr(), der.len() as u32, 2, &mut existing), 1);
+        assert_eq!(existing, first, "CERT_STORE_ADD_USE_EXISTING returns the stored one");
+        assert_eq!(native_cert_add_encoded_certificate_to_store(store, 1, der.as_ptr(), der.len() as u32, 4, ptr::null_mut()), 1);
+        let mut count = 0;
+        let mut context = native_cert_enum_certificates(store, 0);
+        while context != 0 {
+            count += 1;
+            context = native_cert_enum_certificates(store, context);
+        }
+        assert_eq!(count, 2, "CERT_STORE_ADD_ALWAYS adds a second copy");
+        assert_eq!(native_cert_add_encoded_certificate_to_store(store, 1, [0x30u8, 0].as_ptr(), 2, 4, ptr::null_mut()), 0);
+        native_cert_free_context(first);
+        native_cert_free_context(existing);
+        assert_eq!(native_cert_close_store(store, 0), 1);
     }
     #[test]
     fn system_root_contexts_decode_and_remain_valid_after_store_close() {

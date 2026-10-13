@@ -427,7 +427,7 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                 | "EnumerateSecurityPackagesA"
                 | "EnumerateSecurityPackagesW"
         ),
-        "CRYPT32.DLL" => matches!(func, "CertOpenStore" | "CertOpenSystemStoreA" | "CertOpenSystemStoreW" | "CertGetIntendedKeyUsage" | "CertGetEnhancedKeyUsage" | "CertEnumCertificatesInStore" | "CertCloseStore" | "CertFreeCertificateContext" | "CertDuplicateCertificateContext"),
+        "CRYPT32.DLL" => matches!(func, "CertOpenStore" | "CertOpenSystemStoreA" | "CertOpenSystemStoreW" | "CertGetIntendedKeyUsage" | "CertGetEnhancedKeyUsage" | "CertEnumCertificatesInStore" | "CertCloseStore" | "CertFreeCertificateContext" | "CertDuplicateCertificateContext" | "CertAddEncodedCertificateToStore"),
         "PSAPI.DLL" => matches!(func, "GetProcessMemoryInfo" | "GetPerformanceInfo"),
         "WINMM.DLL" => func == "timeGetTime",
         "USERENV.DLL" => func == "GetUserProfileDirectoryW",
@@ -1365,6 +1365,9 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "CertOpenSystemStoreW" => Some(native_cert_open_system_store_w as *const () as usize as u64),
         "CertEnumCertificatesInStore" => Some(native_cert_enum_certificates as *const () as usize as u64),
         "CertCloseStore" => Some(native_cert_close_store as *const () as usize as u64),
+        "CertAddEncodedCertificateToStore" => {
+            Some(native_cert_add_encoded_certificate_to_store as *const () as usize as u64)
+        }
         "CertFreeCertificateContext" => Some(native_cert_free_context as *const () as usize as u64),
         "CertDuplicateCertificateContext" => Some(native_cert_duplicate_context as *const () as usize as u64),
         "CryptAcquireContextW" => Some(native_crypt_acquire_context_w as *const () as usize as u64),

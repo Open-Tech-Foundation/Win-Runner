@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- `CertAddEncodedCertificateToStore` with the `CERT_STORE_ADD_*`
+  dispositions, for memory and system stores (additions stay with the open
+  store; a certificate matches another with identical encoded bytes).
+
 - `WSADuplicateSocketW` for the calling process with `WSASocketW` from its
   protocol info (Rust's `TcpStream::try_clone`); closing one handle of a
   duplicated socket leaves the connection to the others. Sharing a socket
