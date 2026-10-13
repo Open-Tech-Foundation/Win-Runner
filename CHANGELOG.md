@@ -144,6 +144,12 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- The interactive shell runs any pipeline through PowerShell
+  (`app.exe | Select-Object -First 1` no longer passes `| Select-Object ...`
+  to the program), sets `$LASTEXITCODE` for programs and batch files it runs
+  itself, and expands `$variables`, `` ` `` escapes and subexpressions in
+  their arguments as PowerShell does.
+
 - Match the Windows oracle results: `CreateFileW` clears the last error on
   every successful open (keeping `ERROR_ALREADY_EXISTS` for existing files
   under `CREATE_ALWAYS`/`OPEN_ALWAYS`); `FileAllocationInfo` below the end of

@@ -773,15 +773,15 @@ impl Shell {
             return Ok(ShellFlow::Continue);
         }
         let command = argv[0].to_ascii_lowercase();
-        // PowerShell aliases with parameters or pipelines must reach the
+        // PowerShell aliases with parameters, and pipelines of any
+        // command (`app.exe | Select-Object -First 1`), must reach the
         // interpreter instead of the shell's simpler DOS-style handlers.
-        if ps1::is_builtin_command(&command)
-            && (command == "ren"
-                || !SHELL_COMMANDS.contains(&command.as_str())
-                || argv
-                    .iter()
-                    .skip(1)
-                    .any(|arg| arg.starts_with('-') || arg == "|"))
+        let pipeline = !command.starts_with('@') && ps1::is_pipeline(line);
+        if pipeline
+            || ps1::is_builtin_command(&command)
+                && (command == "ren"
+                    || !SHELL_COMMANDS.contains(&command.as_str())
+                    || argv.iter().skip(1).any(|arg| arg.starts_with('-')))
         {
             self.last_code = self.run_ps1(line, out)
                 .map_err(|error| format!("script error: {error}"))?;
@@ -958,7 +958,26 @@ impl Shell {
                 out.extend_from_slice(inspect::render(&report).as_bytes());
                 Ok(ShellFlow::Continue)
             }
-            _ => self.run_target_line(&argv, line, out, sink),
+            _ => {
+                let argv = self.program_arguments(argv, line);
+                self.run_target_line(&argv, line, out, sink)
+            }
+        }
+    }
+
+    /// A program line's words with PowerShell's expansion of `$variables`,
+    /// `` ` `` escapes and subexpressions, as PowerShell passes them; lines
+    /// that start with an expression keep their words for the interpreter.
+    fn program_arguments(&mut self, argv: Vec<String>, line: &str) -> Vec<String> {
+        if !line.contains(['$', '`']) || argv[0].starts_with(['$', '(', '[', '@', '&']) {
+            return argv;
+        }
+        match ps1::expand_arguments(&mut self.sess, &mut self.fs, line) {
+            Ok(mut expanded) if !expanded.is_empty() => {
+                expanded[0] = argv[0].clone();
+                expanded
+            }
+            _ => argv,
         }
     }
 
@@ -1119,7 +1138,7 @@ impl Shell {
             };
             crate::cmd::run_command_line(&mut host, &command_line, environment, cwd)
         };
-        self.last_code = code as i32;
+        self.set_program_exit_code(code as i32);
         Ok(ShellFlow::Continue)
     }
 
@@ -1187,7 +1206,7 @@ impl Shell {
             }
         };
         self.fs = result.fs;
-        self.last_code = result.code as i32;
+        self.set_program_exit_code(result.code as i32);
         if !streaming {
             out.extend_from_slice(&result.stdout);
         }
@@ -1264,6 +1283,15 @@ impl Shell {
 
     /// Run PowerShell text in this session; programs it calls run on the
     /// session's backend.
+    /// A program the shell ran itself finished: its code is the shell's
+    /// and, as in PowerShell, `$LASTEXITCODE`.
+    fn set_program_exit_code(&mut self, code: i32) {
+        self.last_code = code;
+        self.sess
+            .vars
+            .insert("lastexitcode".to_string(), ps1::Value::Str(code.to_string()));
+    }
+
     fn run_ps1(&mut self, script: &str, out: &mut Vec<u8>) -> Result<i32, String> {
         let mut host = ShellProcessHost {
             backend: self.backend.clone(),

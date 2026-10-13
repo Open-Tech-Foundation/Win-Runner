@@ -184,6 +184,26 @@ pub fn run_ps1_with_host(
     .run(script)
 }
 
+/// A command line's words as PowerShell passes them to a program:
+/// variables, escapes (`` `n ``), and subexpressions expanded, quotes
+/// removed. Nothing runs except what subexpressions name.
+pub fn expand_arguments(sess: &mut Session, fs: &mut WinFs, line: &str) -> Result<Vec<String>, String> {
+    let tokens = tokenize(line)?;
+    let mut out = Vec::new();
+    let mut interpreter = Interpreter {
+        fs,
+        out: &mut out,
+        depth: 0,
+        vars: &mut sess.vars,
+        funcs: &mut sess.funcs,
+        types: &mut sess.types,
+        dir_stack: &mut sess.dir_stack,
+        environment: &mut sess.environment,
+        host: None,
+    };
+    tokens.iter().map(|token| interpreter.expand_token(token)).collect()
+}
+
 /// Run a script with a caller-held [`Session`] (variables persist).
 pub fn run_ps1_session(
     sess: &mut Session,
@@ -5846,6 +5866,12 @@ pub const COMMAND_NAMES: &[&str] = &[
     "select",
 ];
 
+/// Whether a line is a pipeline (an unquoted `|` joins commands), which
+/// only the interpreter runs.
+pub fn is_pipeline(line: &str) -> bool {
+    split_pipeline(line).is_ok_and(|segments| segments.len() > 1)
+}
+
 pub fn is_builtin_command(cmd: &str) -> bool {
     COMMAND_NAMES.contains(&cmd.to_ascii_lowercase().as_str())
 }
@@ -6954,6 +6980,21 @@ $x
             out,
             b"C:\\Users\\runner C:\\Users\\runner\\AppData\\Local\n"
         );
+    }
+
+    #[test]
+    fn program_arguments_expand_like_powershell_passes_them() {
+        let mut fs = WinFs::new();
+        let mut session = Session::default();
+        let mut out = Vec::new();
+        run_ps1_session(&mut session, &mut fs, "$u = 'https://h/x'\n$n = 2", &mut out).unwrap();
+        assert_eq!(
+            expand_arguments(&mut session, &mut fs, "app.exe -w \"a`tb`n\" $u 'lit $u' \"n=$($n)\"").unwrap(),
+            vec!["app.exe", "-w", "a\tb\n", "https://h/x", "lit $u", "n=2"]
+        );
+        assert!(is_pipeline("app.exe -s x | Select-Object -First 1"));
+        assert!(!is_pipeline("app.exe 'a|b' \"c | d\""));
+        assert!(!is_pipeline("app.exe -s x"));
     }
 
     #[test]
