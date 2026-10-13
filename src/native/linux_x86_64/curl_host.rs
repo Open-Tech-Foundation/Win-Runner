@@ -34,7 +34,7 @@ pub(super) extern "win64" fn native_winrun_curl_main() -> u32 {
 
 struct NativeCurlHost;
 
-fn std_handle(index: usize) -> u64 {
+pub(super) fn curl_std_handle(index: usize) -> u64 {
     process_ctx()
         .map(|process| process.parameters.std_handles[index].load(Ordering::Acquire))
         .unwrap_or(STD_HANDLE_BASE + index as u64)
@@ -50,7 +50,7 @@ fn last_error_text() -> String {
     }
 }
 
-fn write_all(handle: u64, mut bytes: &[u8]) -> Result<(), String> {
+pub(super) fn write_all(handle: u64, mut bytes: &[u8]) -> Result<(), String> {
     while !bytes.is_empty() {
         let chunk = bytes.len().min(1 << 20);
         let mut written = 0u32;
@@ -62,7 +62,7 @@ fn write_all(handle: u64, mut bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn read_all(handle: u64) -> Result<Vec<u8>, String> {
+pub(super) fn read_all(handle: u64) -> Result<Vec<u8>, String> {
     let mut data = Vec::new();
     let mut buffer = vec![0u8; 64 * 1024];
     loop {
@@ -87,11 +87,11 @@ fn wide_z(text: &str) -> Vec<u16> {
 
 impl CurlHost for NativeCurlHost {
     fn stdout(&mut self, bytes: &[u8]) -> Result<(), String> {
-        write_all(std_handle(1), bytes)
+        write_all(curl_std_handle(1), bytes)
     }
 
     fn stderr(&mut self, bytes: &[u8]) {
-        let _ = write_all(std_handle(2), bytes);
+        let _ = write_all(curl_std_handle(2), bytes);
     }
 
     fn create(&mut self, path: &str, create_dirs: bool) -> Result<u64, String> {
@@ -129,7 +129,7 @@ impl CurlHost for NativeCurlHost {
     }
 
     fn read_stdin(&mut self) -> Result<Vec<u8>, String> {
-        read_all(std_handle(0))
+        read_all(curl_std_handle(0))
     }
 
     fn roots(&mut self) -> Vec<Vec<u8>> {

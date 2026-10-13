@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- `tar.exe` in System32, as Windows 10+ ships it (bsdtar's command line):
+  `-c`/`-x`/`-t` (also the bundled `tar xzf` form), `-f` (with `-` for
+  standard streams), `-C`, `-z`/`-j`/`-a`/`--format zip`, `-v`, `-k`, `-O`,
+  `--strip-components`, `--exclude` and member patterns. Reading detects
+  gzip, bzip2 and zip by content; members naming `..` are refused.
+
 - `curl.exe` in System32, as Windows 10+ ships it: curl's command line
   (`-o`/`-O`/`--output-dir`, `-L`, `-f`/`--fail-with-body`, `-s`/`-S`,
   `-I`/`-i`/`-D`, `-X`, `-H`, `-d`/`--data-*`/`--json`/`-G`, `-T`, `-u`,

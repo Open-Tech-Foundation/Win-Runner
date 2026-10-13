@@ -7,6 +7,8 @@ license = "Apache-2.0"
 
 [dependencies]
 base64 = "0.22"
+bzip2 = "0.6"
+flate2 = "1.1"
 libc = "0.2"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustyline = { version = "15", default-features = false }

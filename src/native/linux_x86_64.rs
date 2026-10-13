@@ -83,6 +83,9 @@ use cmd_host::*;
 #[path = "linux_x86_64/curl_host.rs"]
 mod curl_host;
 use curl_host::*;
+#[path = "linux_x86_64/tar_host.rs"]
+mod tar_host;
+use tar_host::*;
 #[path = "linux_x86_64/sockets.rs"]
 mod sockets;
 use sockets::*;

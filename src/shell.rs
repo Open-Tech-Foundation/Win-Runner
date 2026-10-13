@@ -429,6 +429,7 @@ impl Shell {
         seed_powershell_shell_link(&mut fs);
         crate::cmd::seed_cmd_exe(&mut fs);
         crate::curl_tool::seed_curl_exe(&mut fs);
+        crate::tar_tool::seed_tar_exe(&mut fs);
         // npm's standard Windows cache and global-prefix folders; npm
         // expects the cache's temp and log directories to exist.
         for directory in [
