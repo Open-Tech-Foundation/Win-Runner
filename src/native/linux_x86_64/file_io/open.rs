@@ -204,7 +204,11 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_create_file_w(
             _ => 87, // ERROR_INVALID_PARAMETER
         });
         if native_diagnostic_enabled() {
-            eprintln!("native CreateFileW failed path={path}");
+            eprintln!(
+                "native CreateFileW failed path={path} creation={creation} exists={exists} error={} cause={:?}",
+                native_get_last_error(),
+                ok.as_ref().err()
+            );
         }
         return u64::MAX;
     }

@@ -197,6 +197,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- On mounted host drives, a name removed within the directory's timestamp
+  granularity no longer lingers in the lookup index (creating the file again
+  failed with `ERROR_FILE_NOT_FOUND`).
+
 - Directory enumeration through `GetFileInformationByHandleEx` resumes after
   the last name returned, as NTFS does, so deleting entries between batches
   no longer skips the rest (Rust's `remove_dir_all` failed with

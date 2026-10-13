@@ -525,7 +525,25 @@ impl HostMount {
                     .join(", ")
             ));
         }
-        Ok(names.first().map(|entry| directory.join(entry)))
+        let found = names.first().map(|entry| directory.join(entry));
+        drop(directories);
+        // A name removed (or renamed) within the directory's timestamp
+        // granularity is still in the index: confirm it, and rescan if gone.
+        if let Some(path) = &found {
+            if !refresh && std::fs::symlink_metadata(path).is_err() {
+                self.refresh_directory_index(directory)?;
+                let directories = self
+                    .directories
+                    .lock()
+                    .map_err(|_| "mounted directory index lock is poisoned".to_string())?;
+                return Ok(directories
+                    .get(directory)
+                    .and_then(|index| index.names.get(&key))
+                    .and_then(|names| names.first())
+                    .map(|entry| directory.join(entry)));
+            }
+        }
+        Ok(found)
     }
 }
 
@@ -3313,6 +3331,28 @@ mod tests {
                 (r"C:\b.txt".to_string(), b"b".to_vec()),
             ]
         );
+    }
+
+    #[test]
+    fn mounted_host_drive_sees_names_removed_within_one_timestamp() {
+        let root = std::env::temp_dir().join(format!(
+            "winrun-mount-stale-{}-{}",
+            std::process::id(),
+            NEXT_DISK_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut fs = WinFs::ephemeral_runner();
+        fs.mount_host_dir('z', &root, false).unwrap();
+        fs.write_file(r"Z:\churn.txt", b"x".to_vec()).unwrap();
+        assert!(fs.is_file(r"Z:\churn.txt"));
+        // The removal leaves the directory's timestamp where the index saw it.
+        let seen = std::fs::metadata(&root).unwrap().modified().unwrap();
+        std::fs::remove_file(root.join("churn.txt")).unwrap();
+        std::fs::File::open(&root).unwrap().set_modified(seen).unwrap();
+        assert!(!fs.is_file(r"Z:\churn.txt"));
+        fs.write_file(r"Z:\churn.txt", b"again".to_vec()).unwrap();
+        assert_eq!(std::fs::read(root.join("churn.txt")).unwrap(), b"again");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
