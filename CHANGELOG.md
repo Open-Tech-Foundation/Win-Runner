@@ -243,6 +243,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- A program run from a host path (`winrun /path/app.exe`) runs from its
+  folder mounted as a drive (the last free letter, Z: down), so it sees a
+  Windows module path and finds the DLLs beside it; it ran under the Linux
+  path before, which programs that parse their own path failed on.
+
 - Guest files keep their times as Windows does: creating one sets its
   creation, last-access and last-write times, and writing it moves the
   last-write and last-access times (for every hard link to it); the times

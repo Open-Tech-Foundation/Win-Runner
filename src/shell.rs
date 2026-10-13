@@ -986,6 +986,31 @@ impl Shell {
         }
     }
 
+    /// A program run from a host path sees its folder as a drive, as a
+    /// Windows program sees the folder it was started from: mounted at the
+    /// last free letter (Z: down), so `GetModuleFileNameW` names a Windows
+    /// path and DLLs beside it load. Returns the program's guest path.
+    fn mount_program_folder(&mut self, host_path: &str) -> Result<String, String> {
+        let path = std::path::Path::new(host_path)
+            .canonicalize()
+            .map_err(|e| format!("cannot resolve {host_path}: {e}"))?;
+        let folder = path.parent().ok_or_else(|| format!("{host_path} has no folder"))?;
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| format!("{host_path} has no file name"))?;
+        let mounts = self.fs.host_mounts();
+        if let Some((letter, _, _)) = mounts.iter().find(|(_, root, _)| root == folder) {
+            return Ok(format!("{letter}:\\{name}"));
+        }
+        let letter = ('D'..='Z')
+            .rev()
+            .find(|letter| !mounts.iter().any(|(mounted, _, _)| mounted.eq_ignore_ascii_case(letter)))
+            .ok_or("no free drive letter for the program's folder")?;
+        self.fs.mount_host_dir(letter, folder, false)?;
+        Ok(format!("{letter}:\\{name}"))
+    }
+
     /// Host file, guest executable, or PS1 statement (in that order).
     fn run_target_line(
         &mut self,
@@ -1007,7 +1032,10 @@ impl Shell {
                 .unwrap_or("")
                 .to_lowercase();
             match ext.as_str() {
-                "exe" => return self.run_exe_file(target, target, &argv[1..], out, sink),
+                "exe" => {
+                    let program = self.mount_program_folder(target)?;
+                    return self.run_exe_file(target, &program, &argv[1..], out, sink);
+                }
                 "ps1" => {
                     let file_read_started = std::time::Instant::now();
                     let script = std::fs::read_to_string(target)

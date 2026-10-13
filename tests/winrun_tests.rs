@@ -525,8 +525,9 @@ fn native_backend_runs_rust_argv_guest() {
         .output()
         .expect("spawn native backend");
     assert_eq!(output.status.code(), Some(0));
-    let expected = format!("{exe} hello \"a b\" --version\n");
-    assert_eq!(output.stdout, expected.as_bytes());
+    // The program runs from its folder mounted as a drive.
+    let _ = exe;
+    assert_eq!(output.stdout, b"Z:\\rust_argv.exe hello \"a b\" --version\n");
     assert!(output.stderr.is_empty());
 }
 
@@ -1491,7 +1492,7 @@ fn test_argv_echo_cli() {
     let ps = p.to_string_lossy().to_string();
     let (code, stdout, stderr) = run_winrun_env(&[ps.as_str(), "hello", "a b", "--version"], &[]);
     assert_eq!(code, 0, "stderr: {stderr}");
-    assert_eq!(stdout, format!("{ps} hello \"a b\" --version\n"));
+    assert_eq!(stdout, "Z:\\rust_argv.exe hello \"a b\" --version\n");
 }
 
 #[test]
@@ -2560,4 +2561,23 @@ exit
         ),
         "{stdout}"
     );
+}
+
+#[test]
+fn a_program_run_from_a_host_path_sees_a_windows_module_path() {
+    // The DLL-search probe derives its folder from GetModuleFileNameW and
+    // writes DLLs beside itself, so it runs from a copy in its own folder.
+    let folder = tmp_path("direct-run");
+    std::fs::create_dir_all(&folder).unwrap();
+    let program = folder.join("oracle_dll_search.exe");
+    std::fs::copy(artifact("exe/oracle_dll_search.exe"), &program).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_winrun"))
+        .arg(&program)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    std::fs::remove_dir_all(&folder).ok();
+    assert_eq!(output.status.code(), Some(0), "{stdout}{}", String::from_utf8_lossy(&output.stderr));
+    assert!(stdout.ends_with("END\n"), "{stdout}");
+    assert!(!stdout.contains("wrong") && !stdout.contains("PANIC"), "{stdout}");
 }
