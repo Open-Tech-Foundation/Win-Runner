@@ -6,6 +6,29 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- What CPython 3.14 (`wpkg install python`) needs to run, asyncio included:
+  - CRT: `_wopen`/`_open`, `_lseek`, `_dup`/`_dup2`, `_commit`, `_chsize_s`,
+    `_umask`, `_chmod`/`_wchmod`, the `_stat64i32` family, `_wputenv_s`,
+    `__doserrno`, `_set_errno`, `_getpid`, `_set_abort_behavior`,
+    `_crt_at_quick_exit`, `clock`, `__daylight`, `__sys_errlist`/
+    `__sys_nerr`, `__fpe_flt_rounds`, `_dclass`, `copysign`, `fabs`, `hypot`,
+    `expm1`, `erf`, `erfc`; `_read`, `_write`, `_close`, `_open_osfhandle`
+    and `_get_osfhandle` under their api-ms-win-crt names. `_read` ends at a
+    broken pipe and failures set `errno` and `_doserrno` (`_dosmaperr`).
+  - `PathCchSkipRoot`, `PathCchCombineEx`, `PathCchCanonicalizeEx`,
+    `VerifyVersionInfoA`, `LCMapStringEx`, `inet_ntop`,
+    `WSAStringToAddressW`, and the `DisconnectEx` and `TransmitFile`
+    (WSAEOPNOTSUPP) extension functions.
+  - Overlapped `WSARecv`/`WSASend` that cannot finish at once pend (also on
+    non-blocking sockets) and complete through the completion port;
+    `CancelIoEx` and `closesocket` cancel them (and pending `AcceptEx`) with
+    `ERROR_OPERATION_ABORTED`; pending operations mark their OVERLAPPED
+    `STATUS_PENDING`; `GetOverlappedResult` reads socket results.
+  - `RegisterWaitForSingleObject` waits on any waitable object, and a
+    one-shot wait stays registered until `UnregisterWait(Ex)`.
+  The overlapped_sockets oracle probe records the proactor behavior on
+  Windows; native_startup records committing memory without a reservation.
+
 - `wpkg install` for Bun, Deno, uv, fd, bat, fzf and the GitHub CLI (`gh`),
   x64 and ARM64, pinned to each release's published SHA-256.
 
@@ -164,6 +187,9 @@ All notable changes to this project will be documented in this file.
   from the guest's machine and user hives instead of the host's CA files.
 
 ### Fixed
+
+- `VirtualAlloc(NULL, size, MEM_COMMIT, ...)` reserves and commits, as on
+  Windows, instead of failing; `_stat64` writes `st_rdev` at its offset.
 
 - Programs that import guest DLLs at load time (such as `python.exe`
   linking `python314.dll` beside it) start with those DLLs loaded, bound and

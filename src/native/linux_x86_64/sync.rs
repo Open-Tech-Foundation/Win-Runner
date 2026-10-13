@@ -751,8 +751,15 @@ pub(super) extern "win64" fn native_register_wait_for_single_object(
     } else if let Some(child) = child_process(&process, object) {
         NativeWaitTarget::Child(child)
     } else {
-        native_set_last_error(6);
-        return 0;
+        // A zero-timeout wait validates the handle; a signal it takes
+        // (an auto-reset event's) is remembered for the first check.
+        match native_wait_for_single_object(object, 0) {
+            u32::MAX => {
+                native_set_last_error(6);
+                return 0;
+            }
+            result => NativeWaitTarget::Object(object, AtomicBool::new(result == 0)),
+        }
     };
     let handle = process.completion_next.fetch_add(1, Ordering::AcqRel);
     let registration = Arc::new(NativeWaitRegistration {
@@ -782,6 +789,9 @@ pub(super) extern "win64" fn native_register_wait_for_single_object(
                         child.state.lock().is_ok_and(|state| state.is_some())
                     }
                     NativeWaitTarget::ConsoleInput => console_input_ready(0),
+                    NativeWaitTarget::Object(handle, taken) => {
+                        taken.swap(false, Ordering::AcqRel) || native_wait_for_single_object(*handle, 0) == 0
+                    }
                 };
                 if signaled {
                     let invocation = Box::new(NativeWaitCallbackInvocation {
@@ -810,11 +820,9 @@ pub(super) extern "win64" fn native_register_wait_for_single_object(
                 }
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
-            if registration.execute_once {
-                if let Ok(mut waits) = worker_process.wait_registrations.lock() {
-                    waits.remove(&handle);
-                }
-            }
+            // The wait handle stays registered until UnregisterWait(Ex),
+            // even after a WT_EXECUTEONLYONCE callback ran.
+            drop(worker_process);
         })
         .is_err()
     {

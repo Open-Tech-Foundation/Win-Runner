@@ -134,6 +134,104 @@ pub(super) extern "win64" fn native_select(
     total
 }
 
+/// `WSAStringToAddressW`: "a.b.c.d[:port]" (AF_INET 2) or "v6" /
+/// "[v6]:port" (AF_INET6 23, with an optional %scope) as a sockaddr.
+pub(super) extern "win64" fn native_wsa_string_to_address_w(
+    text: *const u16,
+    family: i32,
+    _protocol: u64,
+    address: *mut u8,
+    length: *mut i32,
+) -> i32 {
+    let fail = |code| {
+        native_wsa_set_last_error(code);
+        -1
+    };
+    if text.is_null() || length.is_null() {
+        return fail(10014);
+    }
+    let Some(text) = wide(text) else { return fail(10022) };
+    let parsed: Option<std::net::SocketAddr> = match family {
+        2 => text
+            .parse::<std::net::SocketAddrV4>()
+            .ok()
+            .map(Into::into)
+            .or_else(|| text.parse::<std::net::Ipv4Addr>().ok().map(|ip| (ip, 0).into())),
+        23 => text
+            .parse::<std::net::SocketAddrV6>()
+            .ok()
+            .map(Into::into)
+            .or_else(|| {
+                let (ip, scope) = match text.split_once('%') {
+                    Some((ip, scope)) => (ip, scope.parse::<u32>().ok()?),
+                    None => (text.as_str(), 0),
+                };
+                let ip = ip.parse::<std::net::Ipv6Addr>().ok()?;
+                Some(std::net::SocketAddrV6::new(ip, 0, 0, scope).into())
+            }),
+        _ => return fail(10047),
+    };
+    let Some(parsed) = parsed else { return fail(10022) };
+    let mut bytes = [0u8; 28];
+    let size = match parsed {
+        std::net::SocketAddr::V4(v4) => {
+            bytes[..2].copy_from_slice(&2u16.to_le_bytes());
+            bytes[2..4].copy_from_slice(&v4.port().to_be_bytes());
+            bytes[4..8].copy_from_slice(&v4.ip().octets());
+            16
+        }
+        std::net::SocketAddr::V6(v6) => {
+            bytes[..2].copy_from_slice(&23u16.to_le_bytes());
+            bytes[2..4].copy_from_slice(&v6.port().to_be_bytes());
+            bytes[4..8].copy_from_slice(&v6.flowinfo().to_be_bytes());
+            bytes[8..24].copy_from_slice(&v6.ip().octets());
+            bytes[24..28].copy_from_slice(&v6.scope_id().to_le_bytes());
+            28
+        }
+    };
+    let capacity = unsafe { length.read_unaligned() };
+    unsafe { length.write_unaligned(size as i32) };
+    if address.is_null() || capacity < size as i32 {
+        return fail(10014);
+    }
+    unsafe { address.copy_from_nonoverlapping(bytes.as_ptr(), size) };
+    0
+}
+
+/// `inet_ntop`: an IPv4 (AF_INET 2) or IPv6 (AF_INET6 23) address as text in
+/// `output`, or NULL with WSAEAFNOSUPPORT / WSA_INVALID_PARAMETER.
+pub(super) extern "win64" fn native_inet_ntop(family: i32, address: *const u8, output: *mut u8, size: usize) -> *const u8 {
+    if address.is_null() || output.is_null() {
+        native_wsa_set_last_error(87);
+        return ptr::null();
+    }
+    let text = match family {
+        2 => {
+            let mut octets = [0u8; 4];
+            unsafe { octets.as_mut_ptr().copy_from_nonoverlapping(address, 4) };
+            std::net::Ipv4Addr::from(octets).to_string()
+        }
+        23 => {
+            let mut octets = [0u8; 16];
+            unsafe { octets.as_mut_ptr().copy_from_nonoverlapping(address, 16) };
+            std::net::Ipv6Addr::from(octets).to_string()
+        }
+        _ => {
+            native_wsa_set_last_error(10047);
+            return ptr::null();
+        }
+    };
+    if text.len() + 1 > size {
+        native_wsa_set_last_error(87);
+        return ptr::null();
+    }
+    unsafe {
+        output.copy_from_nonoverlapping(text.as_ptr(), text.len());
+        output.add(text.len()).write(0);
+    }
+    output
+}
+
 pub(super) extern "win64" fn native_inet_pton(
     family: i32,
     text: *const u8,

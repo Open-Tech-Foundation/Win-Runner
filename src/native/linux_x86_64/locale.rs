@@ -167,6 +167,23 @@ pub(super) extern "win64" fn native_get_string_type_w(
     1
 }
 
+/// `LCMapStringEx`: LCMapStringW by locale name; the version, reserved and
+/// sort-handle arguments are unused.
+#[allow(clippy::too_many_arguments)]
+pub(super) extern "win64" fn native_lc_map_string_ex(
+    locale: *const u16,
+    flags: u32,
+    input: *const u16,
+    input_len: i32,
+    output: *mut u16,
+    output_len: i32,
+    _version: u64,
+    _reserved: u64,
+    _sort_handle: u64,
+) -> i32 {
+    native_lc_map_string_w(locale, flags, input, input_len, output, output_len)
+}
+
 pub(super) extern "win64" fn native_lc_map_string_w(
     _locale: *const u16,
     flags: u32,

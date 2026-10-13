@@ -247,6 +247,7 @@ pub(super) extern "win64" fn native_crt_localtime64_s(output: *mut i32, time: *c
 /// seconds west of UTC and the standard/daylight names.
 struct TimeZoneGlobals {
     timezone: std::cell::UnsafeCell<i32>,
+    daylight: std::cell::UnsafeCell<i32>,
     names: [std::cell::UnsafeCell<[u8; 64]>; 2],
     name_pointers: std::cell::UnsafeCell<[*const u8; 2]>,
 }
@@ -254,6 +255,7 @@ unsafe impl Sync for TimeZoneGlobals {}
 
 static TIME_ZONE: TimeZoneGlobals = TimeZoneGlobals {
     timezone: std::cell::UnsafeCell::new(0),
+    daylight: std::cell::UnsafeCell::new(0),
     names: [std::cell::UnsafeCell::new([0; 64]), std::cell::UnsafeCell::new([0; 64])],
     name_pointers: std::cell::UnsafeCell::new([ptr::null(); 2]),
 };
@@ -275,7 +277,11 @@ fn set_time_zone_globals() {
         // The standard offset: while daylight time is in effect it is an
         // hour ahead of standard time.
         let standard = offset - if daylight { 3600 } else { 0 };
+        // `_daylight`: whether the zone observes daylight time at all, seen
+        // as a different offset half a year away.
+        let later = host_local(now + 182 * 86400).map_or(offset, |local| local.offset);
         unsafe {
+            *TIME_ZONE.daylight.get() = i32::from(later != offset);
             *TIME_ZONE.timezone.get() = -(standard as i32);
             for (index, name) in [zone.as_str(), zone.as_str()].into_iter().enumerate() {
                 let buffer = &mut *TIME_ZONE.names[index].get();
@@ -295,6 +301,12 @@ pub(super) extern "win64" fn native_crt_tzset() {
 pub(super) extern "win64" fn native_crt_timezone() -> *mut i32 {
     set_time_zone_globals();
     TIME_ZONE.timezone.get()
+}
+
+/// `__daylight()`: the address of `_daylight`.
+pub(super) extern "win64" fn native_crt_daylight() -> *mut i32 {
+    set_time_zone_globals();
+    TIME_ZONE.daylight.get()
 }
 
 /// `__tzname()`: the address of `_tzname`, two C strings.

@@ -89,6 +89,15 @@ use tar_host::*;
 #[path = "linux_x86_64/resources.rs"]
 mod resources;
 use resources::*;
+#[path = "linux_x86_64/path_cch.rs"]
+mod path_cch;
+use path_cch::*;
+#[path = "linux_x86_64/crt_io.rs"]
+mod crt_io;
+use crt_io::*;
+#[path = "linux_x86_64/socket_pending.rs"]
+mod socket_pending;
+use socket_pending::*;
 #[path = "linux_x86_64/sockets.rs"]
 mod sockets;
 use sockets::*;

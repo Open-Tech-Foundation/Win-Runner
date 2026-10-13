@@ -1235,6 +1235,23 @@ fn system_info() {
         out_str(if path.is_null() { " path=null\n" } else { " path=set\n" });
     }
 
+    type VirtualAlloc = unsafe extern "system" fn(usize, usize, u32, u32) -> usize;
+    type VirtualFree = unsafe extern "system" fn(usize, usize, u32) -> i32;
+    let alloc = api!("virtual.alloc_api", "VirtualAlloc", VirtualAlloc);
+    let release = api!("virtual.free_api", "VirtualFree", VirtualFree);
+    // MEM_COMMIT without MEM_RESERVE and no address, PAGE_READWRITE.
+    let block = unsafe { alloc(0, 0xff8, 0x1000, 0x04) };
+    case("virtual.commit_without_reserve");
+    if block == 0 {
+        out_str("failed");
+        out_error();
+    } else {
+        unsafe { (block as *mut u8).write_volatile(7) };
+        out_str(if unsafe { (block as *const u8).read_volatile() } == 7 { "usable" } else { "wrong" });
+        unsafe { release(block, 0, 0x8000) };
+    }
+    out_byte(b'\n');
+
     let find = api!("resource.find_api", "FindResourceW", FindResource);
     case("resource.missing_manifest");
     // The probe links no resources: MAKEINTRESOURCE(1) of RT_MANIFEST (24).

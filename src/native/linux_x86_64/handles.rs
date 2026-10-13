@@ -40,7 +40,14 @@ pub(super) extern "win64" fn native_crt_open_osfhandle(handle: u64, _flags: i32)
     let Some(process) = process_ctx() else {
         return -1;
     };
-    let valid = host_standard_fd(handle).is_some()
+    // A DuplicateHandle copy stands for the handle it duplicates.
+    let original = process
+        .duplicate_handles
+        .lock()
+        .ok()
+        .and_then(|values| values.get(&handle).copied());
+    let valid = original.is_some()
+        || host_standard_fd(handle).is_some()
         || process
             .named_pipes
             .lock()
@@ -92,16 +99,26 @@ pub(super) extern "win64" fn native_crt_close(fd: i32) -> i32 {
 }
 pub(super) extern "win64" fn native_crt_read(fd: i32, buffer: *mut u8, length: u32) -> i32 {
     if fd < 0 {
-        native_set_last_error(9);
+        native_set_last_error(6);
+        THREAD_CRT_ERRNO.with(|errno| errno.set(9)); // EBADF
         return -1;
     }
     let handle = native_crt_get_osfhandle(fd);
     if handle == u64::MAX {
-        native_set_last_error(9);
+        native_set_last_error(6);
+        THREAD_CRT_ERRNO.with(|errno| errno.set(9)); // EBADF
         return -1;
     }
     let mut count = 0;
     if native_read_file(handle, buffer, length, &mut count, 0) == 0 {
+        // A pipe whose writer closed is the end of the input, as the UCRT
+        // reads it; other failures set errno and _doserrno.
+        let code = native_get_last_error();
+        if code == 109 {
+            return 0;
+        }
+        set_doserrno(code);
+        THREAD_CRT_ERRNO.with(|errno| errno.set(errno_for_win32(code)));
         -1
     } else {
         count.min(i32::MAX as u32) as i32
@@ -109,16 +126,21 @@ pub(super) extern "win64" fn native_crt_read(fd: i32, buffer: *mut u8, length: u
 }
 pub(super) extern "win64" fn native_crt_write(fd: i32, buffer: *const u8, length: u32) -> i32 {
     if fd < 0 {
-        native_set_last_error(9);
+        native_set_last_error(6);
+        THREAD_CRT_ERRNO.with(|errno| errno.set(9)); // EBADF
         return -1;
     }
     let handle = native_crt_get_osfhandle(fd);
     if handle == u64::MAX {
-        native_set_last_error(9);
+        native_set_last_error(6);
+        THREAD_CRT_ERRNO.with(|errno| errno.set(9)); // EBADF
         return -1;
     }
     let mut count = 0;
     if native_write_file(handle, buffer, length, &mut count, 0) == 0 {
+        let code = native_get_last_error();
+        set_doserrno(code);
+        THREAD_CRT_ERRNO.with(|errno| errno.set(errno_for_win32(code)));
         -1
     } else {
         count.min(i32::MAX as u32) as i32

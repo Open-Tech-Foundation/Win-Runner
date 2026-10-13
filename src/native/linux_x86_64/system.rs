@@ -359,6 +359,20 @@ pub(super) extern "win64" fn native_ver_set_condition_mask(
     mask | (((condition & 7) as u64) << shift)
 }
 
+/// `VerifyVersionInfoA`: OSVERSIONINFOEXA's fields moved to the W layout
+/// (its 128-byte CSD string puts the service pack at 148, not 276).
+pub(super) extern "win64" fn native_verify_version_info_a(info: *const u8, types: u32, mask: u64) -> i32 {
+    if info.is_null() {
+        return native_verify_version_info_w(info, types, mask);
+    }
+    let mut wide = [0u8; 284];
+    unsafe {
+        std::ptr::copy_nonoverlapping(info, wide.as_mut_ptr(), 20);
+        std::ptr::copy_nonoverlapping(info.add(148), wide.as_mut_ptr().add(276), 8);
+    }
+    native_verify_version_info_w(wide.as_ptr(), types, mask)
+}
+
 pub(super) extern "win64" fn native_verify_version_info_w(
     info: *const u8,
     types: u32,

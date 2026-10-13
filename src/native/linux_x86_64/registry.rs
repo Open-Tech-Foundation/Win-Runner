@@ -261,6 +261,40 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                     | "_byteswap_ulong"
                     | "_byteswap_uint64"
                     | "_difftime64"
+                    | "erfc"
+                    | "erf"
+                    | "expm1"
+                    | "hypot"
+                    | "fabs"
+                    | "copysign"
+                    | "_dclass"
+                    | "clock"
+                    | "_crt_at_quick_exit"
+                    | "_set_abort_behavior"
+                    | "_getpid"
+                    | "_set_errno"
+                    | "__doserrno"
+                    | "_open_osfhandle"
+                    | "_read"
+                    | "_close"
+                    | "_fstat64i32"
+                    | "_stat64i32"
+                    | "_wstat64i32"
+                    | "_wchmod"
+                    | "_chmod"
+                    | "_umask"
+                    | "_chsize_s"
+                    | "_commit"
+                    | "_dup2"
+                    | "_dup"
+                    | "_lseek"
+                    | "_open"
+                    | "_wopen"
+                    | "__daylight"
+                    | "__sys_nerr"
+                    | "__sys_errlist"
+                    | "_wputenv_s"
+                    | "__fpe_flt_rounds"
                     | "wcstoul"
                     | "_wcstoui64"
                     | "wcstoull"
@@ -454,6 +488,8 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
             "select"
                 | "__WSAFDIsSet"
                 | "inet_pton"
+                | "inet_ntop"
+                | "WSAStringToAddressW"
                 | "WSACreateEvent"
                 | "WSACloseEvent"
                 | "WSAResetEvent"
@@ -614,6 +650,8 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "#18" | "select" => Some(native_select as *const () as usize as u64),
         "#151" | "__WSAFDIsSet" => Some(native_wsa_fd_is_set as *const () as usize as u64),
         "inet_pton" => Some(native_inet_pton as *const () as usize as u64),
+        "inet_ntop" => Some(native_inet_ntop as *const () as usize as u64),
+        "WSAStringToAddressW" => Some(native_wsa_string_to_address_w as *const () as usize as u64),
         "WSAEventSelect" => Some(native_wsa_event_select as *const () as usize as u64),
         "WSAEnumNetworkEvents" => Some(native_wsa_enum_network_events as *const () as usize as u64),
         "WSACloseEvent" => Some(native_wsa_close_event as *const () as usize as u64),
@@ -717,6 +755,37 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "_byteswap_ulong" => Some(native_crt_byteswap_ulong as *const () as usize as u64),
         "_byteswap_uint64" => Some(native_crt_byteswap_uint64 as *const () as usize as u64),
         "_difftime64" => Some(native_crt_difftime64 as *const () as usize as u64),
+        "erfc" => Some(native_crt_erfc as *const () as usize as u64),
+        "erf" => Some(native_crt_erf as *const () as usize as u64),
+        "expm1" => Some(native_crt_expm1 as *const () as usize as u64),
+        "hypot" => Some(native_crt_hypot as *const () as usize as u64),
+        "fabs" => Some(native_crt_fabs as *const () as usize as u64),
+        "copysign" => Some(native_crt_copysign as *const () as usize as u64),
+        "_dclass" => Some(native_crt_dclass as *const () as usize as u64),
+        "clock" => Some(native_crt_clock as *const () as usize as u64),
+        "_crt_at_quick_exit" => Some(native_crt_at_quick_exit as *const () as usize as u64),
+        "_set_abort_behavior" => Some(native_crt_set_abort_behavior as *const () as usize as u64),
+        "_getpid" => Some(native_crt_getpid as *const () as usize as u64),
+        "_set_errno" => Some(native_crt_set_errno as *const () as usize as u64),
+        "__doserrno" => Some(native_crt_doserrno as *const () as usize as u64),
+        "_fstat64i32" => Some(native_crt_fstat64i32 as *const () as usize as u64),
+        "_stat64i32" => Some(native_crt_stat64i32 as *const () as usize as u64),
+        "_wstat64i32" => Some(native_crt_wstat64i32 as *const () as usize as u64),
+        "_wchmod" => Some(native_crt_wchmod as *const () as usize as u64),
+        "_chmod" => Some(native_crt_chmod as *const () as usize as u64),
+        "_umask" => Some(native_crt_umask as *const () as usize as u64),
+        "_chsize_s" => Some(native_crt_chsize_s as *const () as usize as u64),
+        "_commit" => Some(native_crt_commit as *const () as usize as u64),
+        "_dup2" => Some(native_crt_dup2 as *const () as usize as u64),
+        "_dup" => Some(native_crt_dup as *const () as usize as u64),
+        "_lseek" => Some(native_crt_lseek as *const () as usize as u64),
+        "_open" => Some(native_crt_open as *const () as usize as u64),
+        "_wopen" => Some(native_crt_wopen as *const () as usize as u64),
+        "__daylight" => Some(native_crt_daylight as *const () as usize as u64),
+        "__sys_nerr" => Some(native_crt_sys_nerr as *const () as usize as u64),
+        "__sys_errlist" => Some(native_crt_sys_errlist as *const () as usize as u64),
+        "_wputenv_s" => Some(native_crt_wputenv_s as *const () as usize as u64),
+        "__fpe_flt_rounds" => Some(native_crt_fpe_flt_rounds as *const () as usize as u64),
         "wcstoul" => Some(native_crt_wcstoul as *const () as usize as u64),
         "_wcstoui64" => Some(native_crt_wcstoui64 as *const () as usize as u64),
         "wcstoull" => Some(native_crt_wcstoui64 as *const () as usize as u64),
@@ -1421,6 +1490,10 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "SHGetFolderPathW" => Some(native_sh_get_folder_path_w as *const () as usize as u64),
         "SHGetKnownFolderPath" => Some(native_sh_get_known_folder_path as *const () as usize as u64),
         "FindResourceA" => Some(native_find_resource_a as *const () as usize as u64),
+        "VerifyVersionInfoA" => Some(native_verify_version_info_a as *const () as usize as u64),
+        "PathCchSkipRoot" => Some(native_path_cch_skip_root as *const () as usize as u64),
+        "PathCchCombineEx" => Some(native_path_cch_combine_ex as *const () as usize as u64),
+        "PathCchCanonicalizeEx" => Some(native_path_cch_canonicalize_ex as *const () as usize as u64),
         "FindResourceW" => Some(native_find_resource_w as *const () as usize as u64),
         "FindResourceExA" => Some(native_find_resource_ex_a as *const () as usize as u64),
         "FindResourceExW" => Some(native_find_resource_ex_w as *const () as usize as u64),
@@ -1620,6 +1693,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "MultiByteToWideChar" => Some(native_multi_byte_to_wide_char as *const () as usize as u64),
         "GetStringTypeW" => Some(native_get_string_type_w as *const () as usize as u64),
         "LCMapStringW" => Some(native_lc_map_string_w as *const () as usize as u64),
+        "LCMapStringEx" => Some(native_lc_map_string_ex as *const () as usize as u64),
         "WideCharToMultiByte" => Some(native_wide_char_to_multi_byte as *const () as usize as u64),
         "RtlGetActiveActivationContext" => Some(native_rtl_get_active_activation_context as *const () as usize as u64),
         "RtlAllocateHeap" => Some(native_rtl_allocate_heap as *const () as usize as u64),

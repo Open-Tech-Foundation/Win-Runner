@@ -218,6 +218,13 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
                 "fd.stat: ok",
                 "fd.missing: ok",
             ],
+            "overlapped_sockets" => &[
+                "accept_ex.start: ret=0 wsa=997", "accept_ex.before_connect: pending",
+                "accept_ex.completion: ok key=1", "accept_ex.peer: connected",
+                "wsa_recv.no_data: ret=4294967295 wsa=997", "wsa_recv.state: pending",
+                "wsa_recv.completion: ok bytes=3 data=ok", "wsa_recv.nonblocking: ret=4294967295 wsa=997",
+                "cancel.first: 1", "cancel.completion: ret=0 same err=995", "cancel.again: ret=0 err=1168",
+            ],
             "socket_events" => &[
                 "select.empty: ok",
                 "event.rearmed: ok",

@@ -254,6 +254,38 @@ pub(super) extern "win64" fn native_crt_wputenv(input: *const u16) -> i32 {
     -1
 }
 
+/// `_wputenv_s(name, value)`: `_wputenv("name=value")` returning an errno
+/// value (0 on success) instead of -1.
+pub(super) extern "win64" fn native_crt_wputenv_s(name: *const u16, value: *const u16) -> i32 {
+    let (Some(name), Some(value)) = (
+        (!name.is_null()).then(|| wide_units(name)).flatten(),
+        (!value.is_null()).then(|| wide_units(value)).flatten(),
+    ) else {
+        THREAD_CRT_ERRNO.with(|errno| errno.set(22));
+        return 22;
+    };
+    let mut assignment = name;
+    assignment.push(b'=' as u16);
+    assignment.extend(value);
+    if native_crt_putenv_wide_units(&assignment) == 0 {
+        0
+    } else {
+        22
+    }
+}
+
+fn wide_units(text: *const u16) -> Option<Vec<u16>> {
+    let mut units = Vec::new();
+    for index in 0..32768usize {
+        let unit = unsafe { text.add(index).read() };
+        if unit == 0 {
+            return Some(units);
+        }
+        units.push(unit);
+    }
+    None
+}
+
 pub(super) extern "win64" fn native_crt_putenv(input: *const u8) -> i32 {
     let Some(wide) = native_ansi_path(input) else {
         THREAD_CRT_ERRNO.with(|errno| errno.set(22));
@@ -1477,7 +1509,7 @@ fn native_crt_stat64_path(path: &str, output: *mut u8) -> i32 {
         output.add(4).cast::<u16>().write_unaligned(inode);
         output.add(6).cast::<u16>().write_unaligned(mode);
         output.add(8).cast::<u16>().write_unaligned(1);
-        output.add(14).cast::<u32>().write_unaligned(device);
+        output.add(16).cast::<u32>().write_unaligned(device); // st_rdev
         output.add(24).cast::<i64>().write_unaligned(if is_file {
             ctx.fs.file_len(path).unwrap_or_default() as i64
         } else {

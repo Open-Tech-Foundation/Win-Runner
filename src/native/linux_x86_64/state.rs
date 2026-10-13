@@ -362,6 +362,10 @@ pub(super) enum NativeWaitTarget {
     Child(Arc<NativeChildProcess>),
     /// The console input handle, signaled while input is available.
     ConsoleInput,
+    /// Any other waitable object (event, mutex, semaphore, thread...),
+    /// tested with a zero-timeout wait as Windows' wait thread does; set
+    /// when that test at registration already took the signal.
+    Object(u64, AtomicBool),
 }
 
 pub(super) struct NativeWaitRegistration {

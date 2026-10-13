@@ -647,8 +647,11 @@ pub(super) extern "win64" fn native_virtual_alloc(
     let Some(process) = process_ctx() else {
         return ptr::null_mut();
     };
+    // MEM_COMMIT alone with no address reserves and commits, as libffi's
+    // closure allocator expects; with an address it needs a reservation.
+    let allocation_type = if address.is_null() { allocation_type | MEM_RESERVE } else { allocation_type };
     if allocation_type & MEM_RESERVE == 0 {
-        if address.is_null() || (address as usize) & 4095 != 0 {
+        if (address as usize) & 4095 != 0 {
             native_set_last_error(487); // ERROR_INVALID_ADDRESS
             return ptr::null_mut();
         }

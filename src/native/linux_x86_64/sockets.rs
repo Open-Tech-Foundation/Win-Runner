@@ -323,6 +323,9 @@ pub(super) extern "win64" fn native_accept_ex(
         completed: AtomicBool::new(false),
         overlapped,
     });
+    // Pending until the thread completes it, as HasOverlappedIoCompleted
+    // reads it; set before the thread can finish it.
+    native_set_overlapped_status(overlapped, STATUS_PENDING, 0);
     let listener_state = pending_accepts_of(listen_socket);
     if let Ok(mut state) = listener_state.accepts.lock() {
         state.retain(|other| !other.completed.load(Ordering::Acquire));
@@ -471,6 +474,27 @@ fn write_accept_addresses(accepted: i32, output: usize, offsets: (usize, usize))
     }
 }
 
+/// `CancelIoEx` for one pending `AcceptEx` (or all, for 0): whether any was
+/// still pending.
+pub(super) fn cancel_pending_accept(listener: u64, overlapped: u64) -> bool {
+    let Some(state) = PENDING_ACCEPTS.lock().unwrap_or_else(|e| e.into_inner()).get(&listener).cloned() else {
+        return false;
+    };
+    let mut accepts = state.accepts.lock().unwrap_or_else(|e| e.into_inner());
+    let mut found = false;
+    accepts.retain(|pending| {
+        if overlapped != 0 && pending.overlapped != overlapped {
+            return true;
+        }
+        if !pending.completed.swap(true, Ordering::AcqRel) {
+            native_post_socket_failure(listener, pending.overlapped, STATUS_CANCELLED);
+            found = true;
+        }
+        false
+    });
+    found
+}
+
 /// Complete every pending `AcceptEx` on `listener` with `STATUS_CANCELLED`
 /// (`ERROR_OPERATION_ABORTED`), as closing a listening socket does on
 /// Windows, and wait for their threads to let go of the socket.
@@ -570,9 +594,11 @@ pub(super) fn native_socket_name(
         }
     };
     if result != 0 {
-        native_wsa_set_last_error(errno_to_wsa(
-            std::io::Error::last_os_error().raw_os_error().unwrap_or(22),
-        ));
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(22);
+        if native_diagnostic_enabled() {
+            eprintln!("native {} socket={socket:#x} failed errno={errno}", if peer { "getpeername" } else { "getsockname" });
+        }
+        native_wsa_set_last_error(errno_to_wsa(errno));
         return -1;
     }
     if host_length >= 2 {
@@ -749,18 +775,52 @@ pub(super) extern "win64" fn native_wsa_send(
         }
         let mut offset = 0usize;
         while offset < buf.length as usize {
+            let send_flags = if overlapped != 0 { 0x4000 | libc::MSG_DONTWAIT } else { 0x4000 };
             let count = unsafe {
                 send(
                     socket as i32,
                     buf.buffer.add(offset).cast(),
                     buf.length as usize - offset,
-                    0x4000,
+                    send_flags,
                 )
             };
             if count <= 0 {
-                native_wsa_set_last_error(errno_to_wsa(
-                    std::io::Error::last_os_error().raw_os_error().unwrap_or(9),
-                ));
+                let error = std::io::Error::last_os_error().raw_os_error().unwrap_or(9);
+                if overlapped != 0 && count < 0 && error == libc::EAGAIN {
+                    // The rest goes once the socket can take it; the
+                    // completion reports every byte sent.
+                    let rest: Vec<(usize, usize)> = std::iter::once((buf.buffer as usize + offset, buf.length as usize - offset))
+                        .chain((i + 1..buffer_count as usize).map(|index| {
+                            let buf = unsafe { buffers.add(index).read_unaligned() };
+                            (buf.buffer as usize, buf.length as usize)
+                        }))
+                        .collect();
+                    let progress = Mutex::new((0usize, 0usize, total));
+                    let fd = socket as i32;
+                    pend_socket_io(socket, overlapped, 4, move || {
+                        let mut progress = progress.lock().unwrap_or_else(|e| e.into_inner());
+                        while progress.0 < rest.len() {
+                            let (buffer, length) = rest[progress.0];
+                            if progress.1 == length {
+                                *progress = (progress.0 + 1, 0, progress.2);
+                                continue;
+                            }
+                            let count = unsafe {
+                                send(fd, (buffer + progress.1) as *const c_void, length - progress.1, 0x4000 | libc::MSG_DONTWAIT)
+                            };
+                            if count < 0 {
+                                return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(9));
+                            }
+                            progress.1 += count as usize;
+                            progress.2 = progress.2.saturating_add(count as u32);
+                        }
+                        Ok(progress.2)
+                    });
+                    native_wsa_set_last_error(997);
+                    native_set_last_error(997);
+                    return -1;
+                }
+                native_wsa_set_last_error(errno_to_wsa(error));
                 return -1;
             }
             offset += count as usize;
@@ -815,6 +875,7 @@ pub(super) extern "win64" fn native_wsa_recv(
             return -1;
         };
         let fd = socket as i32;
+        native_set_overlapped_status(overlapped, STATUS_PENDING, 0);
         std::thread::spawn(move || {
             let mut poll_fd = NativePollFd {
                 fd,
@@ -845,11 +906,39 @@ pub(super) extern "win64" fn native_wsa_recv(
     }
     let fd = socket as i32;
     let mut total = 0u32;
+    // An overlapped receive never blocks the caller: it pends instead.
+    let receive_flags = if overlapped != 0 { libc::MSG_DONTWAIT } else { 0 };
     for i in 0..buffer_count as usize {
         let buf = unsafe { buffers.add(i).read_unaligned() };
-        let count = unsafe { recv(fd, buf.buffer.cast(), buf.length as usize, 0) };
+        let count = unsafe { recv(fd, buf.buffer.cast(), buf.length as usize, receive_flags) };
         if count < 0 {
             let error = std::io::Error::last_os_error().raw_os_error().unwrap_or(9);
+            if overlapped != 0 && total == 0 && error == libc::EAGAIN {
+                let targets: Vec<(usize, usize)> = (0..buffer_count as usize)
+                    .map(|index| {
+                        let buf = unsafe { buffers.add(index).read_unaligned() };
+                        (buf.buffer as usize, buf.length as usize)
+                    })
+                    .collect();
+                pend_socket_io(socket, overlapped, 1, move || {
+                    let mut received = 0u32;
+                    for &(buffer, length) in &targets {
+                        let count = unsafe { recv(fd, buffer as *mut c_void, length, libc::MSG_DONTWAIT) };
+                        if count < 0 {
+                            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(9);
+                            return if received > 0 { Ok(received) } else { Err(errno) };
+                        }
+                        received += count as u32;
+                        if count == 0 || (count as usize) < length {
+                            break;
+                        }
+                    }
+                    Ok(received)
+                });
+                native_wsa_set_last_error(997); // WSA_IO_PENDING
+                native_set_last_error(997);
+                return -1;
+            }
             native_wsa_set_last_error(errno_to_wsa(error));
             return -1;
         }
@@ -894,6 +983,14 @@ pub(super) extern "win64" fn native_wsa_ioctl(
     ];
     const WSAID_GETACCEPTEXSOCKADDRS: [u8; 16] = [
         0xF2, 0x7D, 0x36, 0xB5, 0xAC, 0xCB, 0xCF, 0x11, 0x95, 0xCA, 0x00, 0x80, 0x5F, 0x48, 0xA1,
+        0x92,
+    ];
+    const WSAID_DISCONNECTEX: [u8; 16] = [
+        0x11, 0x2E, 0xDA, 0x7F, 0x30, 0x86, 0x6F, 0x43, 0xA0, 0x31, 0xF5, 0x36, 0xA6, 0xEE, 0xC1,
+        0x57,
+    ];
+    const WSAID_TRANSMITFILE: [u8; 16] = [
+        0xF0, 0x7D, 0x36, 0xB5, 0xAC, 0xCB, 0xCF, 0x11, 0x95, 0xCA, 0x00, 0x80, 0x5F, 0x48, 0xA1,
         0x92,
     ];
     if socket & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG {
@@ -971,6 +1068,10 @@ pub(super) extern "win64" fn native_wsa_ioctl(
             native_accept_ex as *const () as usize as u64
         } else if guid == WSAID_GETACCEPTEXSOCKADDRS {
             native_get_accept_ex_sockaddrs as *const () as usize as u64
+        } else if guid == WSAID_DISCONNECTEX {
+            native_disconnect_ex as *const () as usize as u64
+        } else if guid == WSAID_TRANSMITFILE {
+            native_transmit_file as *const () as usize as u64
         } else {
             0
         };
@@ -984,6 +1085,38 @@ pub(super) extern "win64" fn native_wsa_ioctl(
     }
     native_wsa_set_last_error(10022);
     -1
+}
+
+/// `DisconnectEx`: both directions shut down; it completes immediately.
+pub(super) extern "win64" fn native_disconnect_ex(socket: u64, _overlapped: u64, _flags: u32, _reserved: u32) -> i32 {
+    if socket & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG {
+        native_wsa_set_last_error(10038);
+        return 0;
+    }
+    if unsafe { libc::shutdown(socket as u32 as i32, libc::SHUT_RDWR) } != 0 {
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(22);
+        // An unconnected socket has nothing to disconnect.
+        if errno != libc::ENOTCONN {
+            native_wsa_set_last_error(errno_to_wsa(errno));
+            return 0;
+        }
+    }
+    1
+}
+
+/// `TransmitFile` is not implemented: WSAEOPNOTSUPP.
+#[allow(clippy::too_many_arguments)]
+pub(super) extern "win64" fn native_transmit_file(
+    _socket: u64,
+    _file: u64,
+    _bytes: u32,
+    _bytes_per_send: u32,
+    _overlapped: u64,
+    _buffers: u64,
+    _flags: u32,
+) -> i32 {
+    native_wsa_set_last_error(10045);
+    0
 }
 
 pub(super) extern "win64" fn native_connect_ex(
@@ -1367,9 +1500,13 @@ pub(super) extern "win64" fn native_close_socket(handle: u64) -> i32 {
         native_wsa_set_last_error(10038); // WSAENOTSOCK
         return -1;
     }
-    // Pending AcceptEx operations complete as aborted, through the
-    // completion port the socket is still associated with.
+    if native_diagnostic_enabled() {
+        eprintln!("native closesocket socket={handle:#x}");
+    }
+    // Pending AcceptEx, receive, and send operations complete as aborted,
+    // through the completion port the socket is still associated with.
     cancel_pending_accepts(handle);
+    cancel_pending_socket_io(handle, 0);
     if let Some(process) = process_ctx() {
         process.socket_exclusive.lock().unwrap().remove(&handle);
         if let Ok(mut sockets) = process.socket_handles.lock() {

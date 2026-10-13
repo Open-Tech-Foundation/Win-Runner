@@ -684,6 +684,12 @@ pub(super) fn native_file_error(status: u64) -> u32 {
         995 // ERROR_OPERATION_ABORTED
     } else if status == 0xc000_014b {
         109 // ERROR_BROKEN_PIPE
+    } else if status == 0xc000_020d {
+        64 // STATUS_CONNECTION_RESET: ERROR_NETNAME_DELETED
+    } else if status == 0xc000_0241 {
+        1236 // ERROR_CONNECTION_ABORTED
+    } else if status == 0xc000_0236 {
+        1225 // ERROR_CONNECTION_REFUSED
     } else {
         1
     }
@@ -1138,6 +1144,16 @@ pub(super) fn native_cancel_file_io(
             return 1;
         }
     }
+    if handle & 0xffff_ffff_0000_0000 == SOCKET_HANDLE_TAG {
+        // Both kinds run; either may hold the operation.
+        let accepts = cancel_pending_accept(handle, overlapped);
+        let transfers = cancel_pending_socket_io(handle, overlapped);
+        if accepts || transfers {
+            return 1;
+        }
+        native_set_last_error(1168); // ERROR_NOT_FOUND
+        return 0;
+    }
     if !process
         .fs
         .lock()
@@ -1347,10 +1363,12 @@ pub(super) extern "win64" fn native_get_overlapped_result(
     let Some(process) = process_ctx() else {
         return 0;
     };
+    // Pipes and sockets complete through the OVERLAPPED's status and count.
     let is_pipe = process
         .named_pipes
         .lock()
-        .is_ok_and(|pipes| pipes.handles.contains_key(&handle));
+        .is_ok_and(|pipes| pipes.handles.contains_key(&handle))
+        || handle & 0xffff_ffff_0000_0000 == SOCKET_HANDLE_TAG;
     if is_pipe {
         while native_overlapped_status(overlapped) == STATUS_PENDING {
             if wait == 0 {

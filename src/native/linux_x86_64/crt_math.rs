@@ -316,3 +316,51 @@ mod tests {
         assert!(native_crt_sqrt(-1.0).is_nan());
     }
 }
+
+/// `FLT_ROUNDS` for the current SSE rounding mode (MXCSR.RC): 0 toward
+/// zero, 1 to nearest, 2 upward, 3 downward.
+pub(super) extern "win64" fn native_crt_fpe_flt_rounds() -> i32 {
+    let mut mxcsr = 0u32;
+    unsafe { std::arch::asm!("stmxcsr [{}]", in(reg) &mut mxcsr, options(nostack)) };
+    match (mxcsr >> 13) & 3 {
+        0 => 1,
+        1 => 3,
+        2 => 2,
+        _ => 0,
+    }
+}
+
+/// `_dclass`: MSVC's FP_INFINITE 1, FP_NAN 2, FP_NORMAL -1,
+/// FP_SUBNORMAL -2, FP_ZERO 0.
+pub(super) extern "win64" fn native_crt_dclass(x: f64) -> i16 {
+    match x.classify() {
+        std::num::FpCategory::Infinite => 1,
+        std::num::FpCategory::Nan => 2,
+        std::num::FpCategory::Normal => -1,
+        std::num::FpCategory::Subnormal => -2,
+        std::num::FpCategory::Zero => 0,
+    }
+}
+pub(super) extern "win64" fn native_crt_copysign(x: f64, y: f64) -> f64 {
+    x.copysign(y)
+}
+pub(super) extern "win64" fn native_crt_fabs(x: f64) -> f64 {
+    x.abs()
+}
+pub(super) extern "win64" fn native_crt_hypot(x: f64, y: f64) -> f64 {
+    x.hypot(y)
+}
+pub(super) extern "win64" fn native_crt_expm1(x: f64) -> f64 {
+    x.exp_m1()
+}
+extern "C" {
+    // The C library's libm, which the libc crate does not bind.
+    fn erf(x: f64) -> f64;
+    fn erfc(x: f64) -> f64;
+}
+pub(super) extern "win64" fn native_crt_erf(x: f64) -> f64 {
+    unsafe { erf(x) }
+}
+pub(super) extern "win64" fn native_crt_erfc(x: f64) -> f64 {
+    unsafe { erfc(x) }
+}

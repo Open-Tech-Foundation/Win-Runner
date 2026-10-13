@@ -415,6 +415,27 @@ fn error_text(errnum: i32) -> &'static str {
     }
 }
 
+/// `_sys_errlist`: the texts for errno 0..=42 then "Unknown error"; the
+/// pointers and strings live for the process.
+struct ErrorList([usize; 44]);
+static SYS_ERRLIST: std::sync::LazyLock<ErrorList> = std::sync::LazyLock::new(|| {
+    let mut list = [0usize; 44];
+    for (index, slot) in list.iter_mut().enumerate() {
+        let text = if index < 43 { error_text(index as i32) } else { "Unknown error" };
+        let owned: &'static [u8] = Box::leak(format!("{text}\0").into_bytes().into_boxed_slice());
+        *slot = owned.as_ptr() as usize;
+    }
+    ErrorList(list)
+});
+static SYS_NERR: i32 = 43;
+
+pub(super) extern "win64" fn native_crt_sys_errlist() -> *const usize {
+    SYS_ERRLIST.0.as_ptr()
+}
+pub(super) extern "win64" fn native_crt_sys_nerr() -> *const i32 {
+    &SYS_NERR
+}
+
 thread_local! {
     static CRT_ERROR_TEXT: std::cell::RefCell<[u8; 128]> = const { std::cell::RefCell::new([0; 128]) };
 }
