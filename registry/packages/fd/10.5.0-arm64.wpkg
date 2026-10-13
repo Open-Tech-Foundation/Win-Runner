@@ -1,0 +1,6 @@
+name = "fd"
+version = "10.5.0"
+arch = "arm64"
+url = "https://github.com/sharkdp/fd/releases/download/v10.5.0/fd-v10.5.0-aarch64-pc-windows-msvc.zip"
+sha256 = "a2bcddcfd259b05357a77bbc6cd671fdb30f63fd266a0e748305890a8c5ceaa6"
+bin = ["fd-v10.5.0-aarch64-pc-windows-msvc/fd.exe"]

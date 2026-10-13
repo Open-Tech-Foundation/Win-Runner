@@ -2558,8 +2558,12 @@ mod tests {
         let names = repository_names(&repo).unwrap();
         assert_eq!(
             names,
-            ["7zip", "curl", "git", "micro", "nodejs", "python", "ripgrep"]
+            ["7zip", "bat", "bun", "curl", "deno", "fd", "fzf", "gh", "git", "micro", "nodejs", "python", "ripgrep", "uv"]
         );
+        let bun = resolve_version(&repo, "bun", None, "x64").unwrap();
+        assert_eq!(bun.bin, ["bun-windows-x64/bun.exe"]);
+        let bun = resolve_version(&repo, "bun", None, "arm64").unwrap();
+        assert_eq!(bun.bin, ["bun-windows-aarch64/bun.exe"]);
         let micro = resolve_version(&repo, "micro", None, "x64").unwrap();
         assert_eq!(micro.version, "2.0.15");
         assert_eq!(micro.bin, ["micro-2.0.15/micro.exe"]);

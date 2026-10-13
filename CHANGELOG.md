@@ -6,6 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- `wpkg install` for Bun, Deno, uv, fd, bat, fzf and the GitHub CLI (`gh`),
+  x64 and ARM64, pinned to each release's published SHA-256.
+
 - `GetHandleInformation`; PE resources (`FindResourceA/W`,
   `FindResourceExA/W`, `LoadResource`, `LockResource`, `SizeofResource`,
   `FreeResource`) read from the mapped image's resource directory;

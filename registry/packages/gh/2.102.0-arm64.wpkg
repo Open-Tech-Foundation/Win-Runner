@@ -1,0 +1,6 @@
+name = "gh"
+version = "2.102.0"
+arch = "arm64"
+url = "https://github.com/cli/cli/releases/download/v2.102.0/gh_2.102.0_windows_arm64.zip"
+sha256 = "5dcf12aa8525eabd0c46ec414f323ab6cf65229fc2cd46543cc705001bbaf223"
+bin = ["bin/gh.exe"]

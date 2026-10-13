@@ -1,0 +1,6 @@
+name = "bun"
+version = "1.4.3"
+arch = "arm64"
+url = "https://github.com/oven-sh/bun/releases/download/bun-v1.4.3/bun-windows-aarch64.zip"
+sha256 = "5e8f142ef722cbc9f67dc068a166e46ee72be8307b38cac7186589d2face668f"
+bin = ["bun-windows-aarch64/bun.exe"]

@@ -25,6 +25,8 @@ After editing registry data, run `python3 scripts/build-wpkg-registry.py` and
 include the updated `registry.zip` with the source change. The ZIP is embedded
 in the winrun binary; registry refreshes from GitHub Releases are planned later.
 
-The initial catalog contains Node.js (`nodejs`), Python's embeddable distribution,
-ripgrep, curl, MinGit, and the x64 standalone 7za CLI from the official 7-Zip
-Extra archive. ARM64 manifests are included where upstream provides them.
+The catalog contains Node.js (`nodejs`), Python's embeddable distribution,
+ripgrep, curl, MinGit, the x64 standalone 7za CLI from the official 7-Zip
+Extra archive, Bun, Deno, uv, fd, bat, fzf, and the GitHub CLI (`gh`). ARM64
+manifests are included where upstream provides them; checksums are the
+SHA-256 digests the projects publish with each release asset.

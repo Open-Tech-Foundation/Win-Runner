@@ -1,0 +1,6 @@
+name = "fzf"
+version = "0.74.5"
+arch = "arm64"
+url = "https://github.com/junegunn/fzf/releases/download/v0.74.5/fzf-0.74.5-windows_arm64.zip"
+sha256 = "45d8f69b7660ac0c59118c9ccaccdea305d56fdd74a3599aa357cbb374ebd61e"
+bin = ["fzf.exe"]
