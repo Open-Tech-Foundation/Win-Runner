@@ -1041,7 +1041,7 @@ impl Shell {
                     let script = std::fs::read_to_string(target)
                         .map_err(|e| format!("cannot read {target}: {e}"))?;
                     report_timing(target, "host_file_read", file_read_started);
-                    let code = self.run_ps1(&script, out)
+                    let code = self.run_ps1_args(&script, &argv[1..], out)
                         .map_err(|e| format!("script error: {e}"))?;
                     self.last_code = code;
                     return Ok(ShellFlow::Continue);
@@ -1057,16 +1057,13 @@ impl Shell {
             return self.run_batch(target, &argv[1..], out, sink);
         }
         if self.fs.is_file(target) && target.to_ascii_lowercase().ends_with(".ps1") {
-            if argv.len() != 1 {
-                return Err("script parameters are not supported for .ps1 files".into());
-            }
             let data = self
                 .fs
                 .read_file(target)
                 .map_err(|error| format!("cannot read {target}: {error}"))?;
             let script = String::from_utf8(data)
                 .map_err(|error| format!("cannot read {target}: {error}"))?;
-            self.last_code = self.run_ps1(&script, out)
+            self.last_code = self.run_ps1_args(&script, &argv[1..], out)
                 .map_err(|error| format!("script error: {error}"))?;
             return Ok(ShellFlow::Continue);
         }
@@ -1323,6 +1320,15 @@ impl Shell {
         self.sess
             .vars
             .insert("lastexitcode".to_string(), ps1::Value::Str(code.to_string()));
+    }
+
+    /// A script file run with arguments (bound to its `param()` block or
+    /// `$args`); without arguments it runs as before.
+    fn run_ps1_args(&mut self, script: &str, args: &[String], out: &mut Vec<u8>) -> Result<i32, String> {
+        let mut host = ShellProcessHost {
+            backend: self.backend.clone(),
+        };
+        ps1::run_ps1_args_with_host(&mut self.sess, &mut self.fs, script, args, out, &mut host)
     }
 
     fn run_ps1(&mut self, script: &str, out: &mut Vec<u8>) -> Result<i32, String> {

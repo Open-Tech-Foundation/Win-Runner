@@ -1533,16 +1533,23 @@ fn guest_arguments_that_match_winrun_options_are_preserved() {
 }
 
 #[test]
-fn test_ps1_with_args_rejected() {
-    let (code, _, stderr) = run_winrun_env(
-        &[artifact("ps1/fs_dots.ps1").to_str().unwrap(), "extra"],
-        &[],
-    );
-    assert_eq!(code, 2);
-    assert!(
-        stderr.contains("script args not supported"),
-        "stderr: {stderr}"
-    );
+fn ps1_scripts_take_arguments_by_param_block_or_args() {
+    let script = tmp_path("greet.ps1");
+    std::fs::write(
+        &script,
+        "# Greets someone.\n[CmdletBinding()]\nparam(\n    [string]$Name = \"world\",\n    [switch]$Loud\n)\n$text = \"hello $Name\"\nif ($Loud) { $text = $text.ToUpper() }\n$text\n",
+    )
+    .unwrap();
+    let plain = tmp_path("plain.ps1");
+    std::fs::write(&plain, "\"$args\"\n").unwrap();
+    let run = |args: &[&str]| run_winrun_env(args, &[]);
+    let path = script.to_str().unwrap();
+    assert_eq!(run(&[path]).1, "hello world\n");
+    assert_eq!(run(&[path, "-Name", "Ada", "-Loud"]).1, "HELLO ADA\n");
+    assert_eq!(run(&[path, "Grace"]).1, "hello Grace\n");
+    assert_eq!(run(&[plain.to_str().unwrap(), "a", "b"]).1, "a b\n");
+    std::fs::remove_file(script).ok();
+    std::fs::remove_file(plain).ok();
 }
 
 #[test]

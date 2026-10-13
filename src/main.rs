@@ -443,11 +443,10 @@ fn run_target(target: &str, guest_args: &[String]) {
                 exit(code);
             }
             "ps1" => {
-                if !guest_args.is_empty() {
-                    eprintln!("winrun: script args not supported yet");
-                    exit(2);
-                }
-                run_ps1_file(target);
+                // Arguments bind to the script's param() block or $args.
+                let (code, _) =
+                    winrun::shell::run_headless_program(WinFs::ephemeral_runner(), target, guest_args);
+                exit(code);
             }
             _ => {
                 eprintln!("winrun: unsupported file type (expected .exe or .ps1): {target}");
@@ -458,29 +457,6 @@ fn run_target(target: &str, guest_args: &[String]) {
     }
     eprintln!("winrun: nothing to run: {target} (no such host file; install packages inside `winrun shell`)");
     exit(1);
-}
-
-fn run_ps1_file(path: &str) {
-    let script = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("winrun: cannot read {path}: {e}");
-            exit(1);
-        }
-    };
-    let mut fs = WinFs::new();
-    let mut out = Vec::new();
-    match winrun::ps1::run_ps1(&mut fs, &script, &mut out) {
-        Ok(_) => {
-            let _ = std::io::stdout().write_all(&out);
-        }
-        Err(e) => {
-            // Flush partial output first (a real shell streams).
-            let _ = std::io::stdout().write_all(&out);
-            eprintln!("winrun: script error: {e}");
-            exit(1);
-        }
-    }
 }
 
 /// `winrun inspect <app.exe>`: print the compatibility report for a host file.

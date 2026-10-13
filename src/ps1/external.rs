@@ -109,6 +109,18 @@ impl Interpreter<'_> {
                 .read_file(path)
                 .map_err(|e| format!("cannot read {path}: {e}"))?;
             let script = String::from_utf8(data).map_err(|e| format!("cannot read {path}: {e}"))?;
+            if !args.is_empty() {
+                if self.depth + 1 > MAX_IEX_DEPTH {
+                    return Err("iex: max nesting depth exceeded".to_string());
+                }
+                self.depth += 1;
+                let result = self.run_script_with_args(&script, &args);
+                self.depth -= 1;
+                return result.map(|flow| match flow {
+                    Flow::Return => Flow::Next,
+                    flow => flow,
+                });
+            }
             return self.run_nested_script(&script);
         }
         if crate::shell::is_powershell_shell_link(self.fs, path) {

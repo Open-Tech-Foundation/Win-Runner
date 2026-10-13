@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- PowerShell scripts take arguments (`winrun script.ps1 -Name x`, a script
+  run in the shell, `& .\script.ps1 a b`): a leading `param(...)` block
+  (after comments and attributes such as `[CmdletBinding()]`) binds them by
+  name or position with its defaults; without one they are `$args`. A
+  script run from a host path runs in the shell, so it can start programs.
+
 - `taskkill.exe` in System32, as Windows ships it: `/PID` and `/IM` (with
   `*` wildcards), `/F`, and `/T` (descendants first), with Windows' messages
   and exit codes (128 when nothing matches). It finds guest processes in a

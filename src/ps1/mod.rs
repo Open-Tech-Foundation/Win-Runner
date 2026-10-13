@@ -204,6 +204,55 @@ pub fn expand_arguments(sess: &mut Session, fs: &mut WinFs, line: &str) -> Resul
     tokens.iter().map(|token| interpreter.expand_token(token)).collect()
 }
 
+/// Run a script file's text with arguments (`script.ps1 a -Name b`).
+pub fn run_ps1_args_with_host(
+    sess: &mut Session,
+    fs: &mut WinFs,
+    script: &str,
+    args: &[String],
+    out: &mut Vec<u8>,
+    host: &mut (dyn ProcessHost + 'static),
+) -> Result<i32, String> {
+    let mut interpreter = Interpreter {
+        fs,
+        out,
+        depth: 0,
+        vars: &mut sess.vars,
+        funcs: &mut sess.funcs,
+        types: &mut sess.types,
+        dir_stack: &mut sess.dir_stack,
+        environment: &mut sess.environment,
+        host: Some(host),
+    };
+    interpreter.run_script_with_args(script, args).map(|_| 0)
+}
+
+/// A script's leading `param(...)` block (after comments and attributes
+/// such as `[CmdletBinding()]`): its parameters and the rest of the script.
+fn script_param_block(script: &str) -> Result<Option<(Vec<Param>, String)>, String> {
+    let text = strip_block_comments(script)?;
+    let mut rest = text.as_str();
+    loop {
+        let trimmed = rest.trim_start();
+        if trimmed.starts_with('#') || (trimmed.starts_with('[') && !starts_kw(trimmed, "param")) {
+            // A comment or an attribute line: [CmdletBinding()], [OutputType(...)].
+            rest = trimmed.split_once('\n').map_or("", |(_, after)| after);
+        } else {
+            rest = trimmed;
+            break;
+        }
+    }
+    if !starts_kw(rest, "param") {
+        return Ok(None);
+    }
+    let after = rest["param".len()..].trim_start();
+    if !after.starts_with('(') {
+        return Ok(None);
+    }
+    let (inner, body) = take_wrapped(after, '(', ')')?;
+    Ok(Some((parse_param_list(&inner)?, body)))
+}
+
 /// Run a script with a caller-held [`Session`] (variables persist).
 pub fn run_ps1_session(
     sess: &mut Session,
@@ -239,6 +288,23 @@ struct Interpreter<'a> {
 }
 
 impl<'a> Interpreter<'a> {
+    /// Run a script with arguments, as PowerShell runs `script.ps1 a b`: a
+    /// leading `param(...)` block binds them like a function's parameters
+    /// (in the script's own scope); without one they are `$args`.
+    fn run_script_with_args(&mut self, script: &str, args: &[String]) -> Result<Flow, String> {
+        if let Some((params, body)) = script_param_block(script)? {
+            return self.call_function("script", &params, &body, args);
+        }
+        self.vars.insert(
+            "args".to_string(),
+            Value::Arr(args.iter().map(|arg| Value::Str(arg.clone())).collect()),
+        );
+        Ok(match self.run_code(script)? {
+            Flow::Return => Flow::Next,
+            flow => flow,
+        })
+    }
+
     fn run(mut self, script: &str) -> Result<i32, String> {
         // Stray top-level break/continue is ignored, like the real shell.
         match self.run_code(script)? {
