@@ -77,6 +77,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Matched against Windows: a comma list written in a native command's
+  arguments (`cmd /c echo a,b`) reaches the program as one argument with
+  its commas; only array variables pass their elements separately.
+  `more.com` adds its trailing empty line only for piped input.
+
 - Matched against Windows: cmd's `path` prints `PATH=(null)` when PATH is
   unset; `find.exe` exits 1 (not 2) when a file is missing; `more.com`
   ends its output with an empty line.

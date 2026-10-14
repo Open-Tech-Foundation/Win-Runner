@@ -167,11 +167,13 @@ pub fn sort(host: &mut dyn TextHost, arguments: &[String]) -> i32 {
 }
 
 /// `more [file...]` with output that is not a console: the text as CRLF
-/// lines, tabs expanded to eight columns, then an empty line.
+/// lines, tabs expanded to eight columns; input from a pipe ends with an
+/// extra empty line, a file's does not.
 pub fn more(host: &mut dyn TextHost, arguments: &[String]) -> i32 {
     let files: Vec<&String> = arguments.iter().filter(|argument| !argument.starts_with('/')).collect();
     let mut inputs = Vec::new();
-    if files.is_empty() {
+    let piped = files.is_empty();
+    if piped {
         inputs.push(host.read_stdin());
     } else {
         for file in files {
@@ -202,7 +204,9 @@ pub fn more(host: &mut dyn TextHost, arguments: &[String]) -> i32 {
         }
         host.stdout(out.as_bytes());
     }
-    host.stdout(b"\r\n");
+    if piped {
+        host.stdout(b"\r\n");
+    }
     0
 }
 
@@ -296,6 +300,10 @@ mod tests {
     fn more_copies_text_with_tabs_expanded() {
         let mut host = Fake { stdin: b"a\tb\nline".to_vec(), ..Default::default() };
         assert_eq!(more(&mut host, &[]), 0);
-        assert_eq!(host.out, b"a       b\r\nline\r\n\r\n");
+        assert_eq!(host.out, b"a       b\r\nline\r\n\r\n", "piped input ends with an empty line");
+        let mut host = Fake::default();
+        host.files.insert("t.txt".into(), b"x\n".to_vec());
+        assert_eq!(more(&mut host, &args(&["t.txt"])), 0);
+        assert_eq!(host.out, b"x\r\n", "a file's does not");
     }
 }

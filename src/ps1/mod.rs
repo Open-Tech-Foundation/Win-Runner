@@ -4242,6 +4242,13 @@ fn array_elements(arg: &str) -> Vec<String> {
     arg.split([LIST_SEP, ARRAY_SEP]).map(str::to_string).collect()
 }
 
+/// An argument as native programs get it, as PowerShell passes them: an
+/// array variable's elements separately, a written comma list (`a,b`)
+/// as one argument with its commas.
+fn native_arguments(arg: &str) -> Vec<String> {
+    arg.split(ARRAY_SEP).map(|part| part.replace(LIST_SEP, ",")).collect()
+}
+
 /// An argument as a single string.
 fn scalar_argument(arg: &str) -> String {
     arg.replace(LIST_SEP, ",").replace(ARRAY_SEP, " ")
@@ -8230,6 +8237,14 @@ $x
             String::from_utf8(out).unwrap(),
             "pear\nApple\nkiwi\nlime\na\nb\na b\nx\ny\nTrue\nFalse\nTrue\nTrue\nTrue\nFalse\ncount=3 last=c\n"
         );
+    }
+
+    #[test]
+    fn programs_get_array_variables_split_and_comma_lists_as_typed() {
+        let written = format!("a{LIST_SEP}b");
+        assert_eq!(native_arguments(&written), ["a,b"]);
+        let variable = format!("a{ARRAY_SEP}b");
+        assert_eq!(native_arguments(&variable), ["a", "b"]);
     }
 
     #[test]
