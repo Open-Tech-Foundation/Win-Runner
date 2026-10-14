@@ -2115,9 +2115,16 @@ mod tests {
         assert!(shell.exec_line("inspect", &mut out).is_err());
     }
 
+    /// The built-in registry as the guest's copy, so wpkg fetches nothing.
+    fn use_built_in_registry(shell: &mut Shell) {
+        shell.fs.mkdir(r"C:\ProgramData\wpkg").unwrap();
+        shell.fs.write_file(wpkg::LOCAL_REGISTRY, include_bytes!("../registry.zip").to_vec()).unwrap();
+    }
+
     #[test]
     fn wpkg_install_failure_has_failure_emoji() {
         let mut shell = Shell::new();
+        use_built_in_registry(&mut shell);
         let mut out = Vec::new();
         let error = shell
             .exec_line("wpkg install missing-package", &mut out)
@@ -2287,9 +2294,10 @@ mod tests {
     #[test]
     fn wpkg_uses_embedded_registry_without_network_for_search_and_info() {
         let mut shell = Shell::new();
+        use_built_in_registry(&mut shell);
         let mut out = Vec::new();
         shell.exec_line("wpkg search node", &mut out).unwrap();
-        assert_eq!(out, b"nodejs\n");
+        assert_eq!(out, b"nodejs - Node.js JavaScript runtime with npm\n");
         out.clear();
         shell.exec_line("wpkg info nodejs@24", &mut out).unwrap();
         assert!(String::from_utf8_lossy(&out)

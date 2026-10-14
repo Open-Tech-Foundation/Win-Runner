@@ -81,6 +81,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- wpkg's offline tests use the built-in registry instead of fetching the
+  published one, so they no longer depend on what was last pushed.
+
 - Instances no longer leave guest programs running. While a command runs,
   the instance still answers `status` and `destroy` (other commands are
   told it is busy); a cancelled `instance exec` (its client killed or timed

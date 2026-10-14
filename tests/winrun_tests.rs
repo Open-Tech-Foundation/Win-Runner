@@ -1897,14 +1897,11 @@ wpkg list
 wpkg cache
 exit
 ",
-        &[],
+        &[("WINRUN_WPKG_REGISTRY", "embedded")],
     );
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(
-        stdout.contains(
-            "nodejs
-"
-        ),
+        stdout.contains("nodejs - Node.js JavaScript runtime with npm\n"),
         "stdout: {stdout}"
     );
     assert!(stdout.contains("nodejs 24.21.0"), "stdout: {stdout}");
