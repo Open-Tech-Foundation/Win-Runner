@@ -35,6 +35,7 @@ fn usage_text() -> String {
         "  winrun instance status|destroy <name>",
         "  winrun instance exec <name> -- <command> [args...]",
         "  winrun inspect <app.exe>      report PE imports vs supported APIs",
+        "  winrun upgrade [--version TAG] [--check] [--dry-run]  self-update to the latest release",
     ]
     .join("\n")
         + "\n"
@@ -191,6 +192,18 @@ fn main() {
     if headless {
         eprintln!("winrun: --headless requires --control=<loopback-address> shell");
         exit(2);
+    }
+    if args.len() >= 2 && args[1] == "upgrade" {
+        if snapshot_path.is_some()
+            || save_snapshot_path.is_some()
+            || !mount_specs.is_empty()
+            || !read_only_mount_specs.is_empty()
+            || options.memory.is_some()
+        {
+            eprintln!("winrun: upgrade does not accept --snapshot/--save/--mount/--memory");
+            exit(2);
+        }
+        exit(winrun::upgrade::run(&args[2..]));
     }
     if args.len() == 3 && args[1] == "inspect" {
         inspect_target(&args[2]);

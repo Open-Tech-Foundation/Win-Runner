@@ -1350,6 +1350,45 @@ fn test_inspect_runnable_binary() {
     assert!(!stdout.contains("Missing:\n"));
 }
 
+fn run_upgrade(extra: &[&str]) -> (i32, String, String) {
+    let bin = env!("CARGO_BIN_EXE_winrun");
+    let output = std::process::Command::new(bin)
+        .arg("upgrade")
+        .args(extra)
+        .output()
+        .expect("spawn winrun upgrade");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+#[test]
+fn test_upgrade_help() {
+    let (code, stdout, _) = run_upgrade(&["--help"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("usage: winrun upgrade"));
+}
+
+#[test]
+fn test_upgrade_dry_run_pinned_needs_no_network() {
+    // A pinned --dry-run resolves nothing over the network: it only prints
+    // the plan against the running binary's own path.
+    let (code, stdout, _) = run_upgrade(&["--dry-run", "--version", "v0.2.0"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    assert!(stdout.contains("releases/download/v0.2.0/winrun-win-runner.tar.gz"));
+    assert!(stdout.contains("would verify sha256 and extract winrun"));
+    assert!(stdout.contains("would install "));
+}
+
+#[test]
+fn test_upgrade_rejects_unknown_options() {
+    let (code, _, stderr) = run_upgrade(&["--bogus"]);
+    assert_eq!(code, 2, "stderr: {stderr}");
+    assert!(stderr.contains("unknown option"));
+}
+
 #[test]
 fn test_inspect_missing_imports() {
     let (code, stdout, _) = run_inspect(&artifact("exe/bad_import.exe"));

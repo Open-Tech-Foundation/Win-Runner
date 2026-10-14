@@ -160,6 +160,23 @@ add the install directory to `PATH`, for example:
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
+### Upgrading
+
+```bash
+winrun upgrade                    # install the latest release over this binary
+winrun upgrade --check            # show latest vs current; change nothing
+winrun upgrade --dry-run          # show what would happen; change nothing
+winrun upgrade --version v0.2.0   # pin a tag (or set WINRUN_VERSION)
+```
+
+`upgrade` resolves the latest tag via the GitHub Releases API (or uses your
+pin), downloads the tarball and `checksums.txt` with the built-in HTTPS
+client — no `curl` needed — verifies the SHA-256, smoke-checks the new binary
+(`--version`), then atomically replaces the running one. It reports "up to
+date" and changes nothing when already current. It needs write permission on
+the binary's directory; otherwise rerun with `sudo` or reinstall with
+`scripts/install.sh --prefix`. Published releases are Linux x86-64 builds.
+
 ## Quickstart
 
 ```bash
@@ -196,6 +213,7 @@ winrun inspect app.exe
 |---|---|
 | Interactive shell | `winrun shell` |
 | Show help / version | `winrun --help`, `winrun --version` |
+| Self-update to latest release | `winrun upgrade [--version TAG] [--check] [--dry-run]` |
 | Run a Windows EXE from a host path | `winrun path/to/app.exe [args…]` |
 | Run a PowerShell-style script | `winrun path/to/script.ps1 [args…]` (binds to `param(...)` or `$args`) |
 | Inspect PE imports before running | `winrun inspect path/to/app.exe` |

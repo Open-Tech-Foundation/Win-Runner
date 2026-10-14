@@ -15,6 +15,11 @@ All notable changes to this project will be documented in this file.
   `docs/architecture.md` (PE loading, API shims, exec workers, WinFS), and
   example). Fixed stale claims (`.ps1` args, `--help`).
 
+- `winrun upgrade`: self-update to the latest GitHub release (or a pinned
+  `--version` / `WINRUN_VERSION` tag), with `--check` and `--dry-run` modes.
+  It downloads with the built-in HTTPS client, verifies the SHA-256 checksum,
+  smoke-checks the new binary, and atomically replaces the running one.
+
 ### Fixed
 
 - `scripts/install.sh` installs `v0.2.0` by default now that it is released;

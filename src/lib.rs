@@ -21,6 +21,7 @@ pub mod taskkill_tool;
 pub mod where_tool;
 pub mod text_tools;
 pub mod trust_roots;
+pub mod upgrade;
 pub mod winfs;
 pub mod winreg;
 pub mod wpkg;
