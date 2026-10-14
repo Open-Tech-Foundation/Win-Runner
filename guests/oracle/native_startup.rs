@@ -1289,14 +1289,17 @@ fn system_info() {
     }
 }
 
-/// CertGetCertificateChain on a trusted root and on a self-signed
-/// certificate in no store, with the base policy's verdict on each.
+/// CertGetCertificateChain on a self-signed certificate in no store, and
+/// on the same certificate under an engine whose exclusive root store holds
+/// it, with the base policy's verdict on each. (Machine ROOT stores differ,
+/// so no case depends on which roots a machine has.)
 /// Revocation-unknown bits (0x40, 0x1000000) are masked: they depend on
 /// network access, not on the chain.
 fn certificate_chains() {
     type Load = unsafe extern "system" fn(*const u8) -> usize;
     type Open = unsafe extern "system" fn(usize, u32, usize, u32, *const u16) -> usize;
-    type Next = unsafe extern "system" fn(usize, usize) -> usize;
+    type Engine = unsafe extern "system" fn(*const u8, *mut usize) -> i32;
+    type FreeEngine = unsafe extern "system" fn(usize);
     type Add = unsafe extern "system" fn(usize, u32, *const u8, u32, u32, *mut usize) -> i32;
     type Chain = unsafe extern "system" fn(usize, usize, usize, usize, *const u8, u32, usize, *mut usize) -> i32;
     type Policy = unsafe extern "system" fn(usize, usize, *const u8, *mut u8) -> i32;
@@ -1306,9 +1309,10 @@ fn certificate_chains() {
     let load = api!("chain.load", "LoadLibraryA", Load);
     let module = unsafe { load(b"CRYPT32.dll\0".as_ptr()) };
     let proc = |name: &[u8]| unsafe { GetProcAddress(module, name.as_ptr()) };
-    let (open, next, add, chain, policy, free_chain, free, close) = (
+    let (open, engine, free_engine, add, chain, policy, free_chain, free, close) = (
         proc(b"CertOpenStore\0"),
-        proc(b"CertEnumCertificatesInStore\0"),
+        proc(b"CertCreateCertificateChainEngine\0"),
+        proc(b"CertFreeCertificateChainEngine\0"),
         proc(b"CertAddEncodedCertificateToStore\0"),
         proc(b"CertGetCertificateChain\0"),
         proc(b"CertVerifyCertificateChainPolicy\0"),
@@ -1316,14 +1320,15 @@ fn certificate_chains() {
         proc(b"CertFreeCertificateContext\0"),
         proc(b"CertCloseStore\0"),
     );
-    if [open, next, add, chain, policy, free_chain, free, close].contains(&0) {
+    if [open, engine, free_engine, add, chain, policy, free_chain, free, close].contains(&0) {
         unavailable("chain.api");
         return;
     }
-    let (open, next, add, chain, policy, free_chain, free, close) = unsafe {
+    let (open, engine, free_engine, add, chain, policy, free_chain, free, close) = unsafe {
         (
             core::mem::transmute::<usize, Open>(open),
-            core::mem::transmute::<usize, Next>(next),
+            core::mem::transmute::<usize, Engine>(engine),
+            core::mem::transmute::<usize, FreeEngine>(free_engine),
             core::mem::transmute::<usize, Add>(add),
             core::mem::transmute::<usize, Chain>(chain),
             core::mem::transmute::<usize, Policy>(policy),
@@ -1334,9 +1339,9 @@ fn certificate_chains() {
     };
     let mut parameters = [0u8; 32];
     parameters[0] = 32;
-    let report = |name: &str, certificate: usize| {
+    let report = |name: &str, chain_engine: usize, certificate: usize| {
         let mut context = 0usize;
-        let built = unsafe { chain(0, certificate, 0, 0, parameters.as_ptr(), 0, 0, &mut context) };
+        let built = unsafe { chain(chain_engine, certificate, 0, 0, parameters.as_ptr(), 0, 0, &mut context) };
         case(name);
         if built == 0 || context == 0 {
             out_str("failed");
@@ -1360,24 +1365,26 @@ fn certificate_chains() {
         out_byte(b'\n');
         unsafe { free_chain(context) };
     };
-    let mut root_name = [0u16; 8];
-    let root_name = wide("ROOT", &mut root_name);
-    let roots = unsafe { open(10, 0, 0, 0x2_0000 | 0x8000, root_name.as_ptr()) };
-    let first = if roots == 0 { 0 } else { unsafe { next(roots, 0) } };
-    if first == 0 {
-        unavailable("chain.trusted_root");
-    } else {
-        report("chain.trusted_root", first);
-        unsafe { free(first) };
-    }
-    if roots != 0 {
-        unsafe { close(roots, 0) };
-    }
     let memory = unsafe { open(2, 0, 0, 0, core::ptr::null()) };
     let stranger = include_bytes!("self_signed.der");
     let mut context = 0usize;
     if memory != 0 && unsafe { add(memory, 1, stranger.as_ptr(), stranger.len() as u32, 4, &mut context) } != 0 {
-        report("chain.self_signed_stranger", context);
+        report("chain.self_signed_stranger", 0, context);
+        // CERT_CHAIN_ENGINE_CONFIG (88 bytes) with hExclusiveRoot (offset
+        // 64) the store holding the certificate itself.
+        let mut config = [0u8; 88];
+        config[0] = 88;
+        config[64..72].copy_from_slice(&(memory as u64).to_le_bytes());
+        let mut exclusive = 0usize;
+        if unsafe { engine(config.as_ptr(), &mut exclusive) } != 0 && exclusive != 0 {
+            report("chain.exclusive_root", exclusive, context);
+            unsafe { free_engine(exclusive) };
+        } else {
+            case("chain.exclusive_root");
+            out_str("engine failed");
+            out_error();
+            out_byte(b'\n');
+        }
         unsafe { free(context) };
     } else {
         unavailable("chain.self_signed_stranger");

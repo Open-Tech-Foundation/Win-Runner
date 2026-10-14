@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- The `native_startup` oracle checks a certificate chain under an engine
+  whose exclusive root store holds the certificate, replacing a case that
+  chained the machine's first ROOT certificate (which differs per machine:
+  the CI runner's is explicitly distrusted).
+
 - `GetMaximumProcessorGroupCount`, `GetActiveProcessorCount` and
   `GetMaximumProcessorCount` (one processor group), which the .NET 10
   CoreCLR calls at startup.
