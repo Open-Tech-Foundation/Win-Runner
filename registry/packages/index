@@ -5,6 +5,7 @@ biome
 bun
 curl
 deno
+dotnet
 esbuild
 fd
 fzf

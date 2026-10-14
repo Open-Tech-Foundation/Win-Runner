@@ -2618,8 +2618,8 @@ mod tests {
         assert_eq!(
             names,
             [
-                "7zip", "bat", "biome", "bun", "curl", "deno", "esbuild", "fd", "fzf", "gh", "git", "micro", "nodejs",
-                "opencode", "python", "ripgrep", "uv"
+                "7zip", "bat", "biome", "bun", "curl", "deno", "dotnet", "esbuild", "fd", "fzf", "gh", "git", "micro",
+                "nodejs", "opencode", "python", "ripgrep", "uv"
             ]
         );
         // npm platform packages: one executable in an npm tarball.

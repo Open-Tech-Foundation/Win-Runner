@@ -1,0 +1,6 @@
+name = "dotnet"
+version = "10.0.13"
+arch = "x64"
+url = "https://builds.dotnet.microsoft.com/dotnet/Runtime/10.0.13/dotnet-runtime-10.0.13-win-x64.zip"
+sha256 = "8db74a746baa450925d01325a2108ccf6ac39af4018047475292ae155c013d89"
+bin = ["dotnet.exe"]
