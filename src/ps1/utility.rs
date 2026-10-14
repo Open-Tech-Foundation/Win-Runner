@@ -182,7 +182,7 @@ fn render_pretty_json(value: &Value, indent: usize, depth: usize, compress: bool
                     format!(
                         "{}{}{separator}{}",
                         pad(indent + 1),
-                        render_json_string(k),
+                        render_json_string(&display_key(map, k)),
                         render_pretty_json(&map[*k], indent + 1, depth - 1, compress)
                     )
                 })

@@ -6,6 +6,28 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- `where.exe` in System32: finds files in the current directory and along
+  `PATH` with `PATHEXT` extensions (`/Q`, `/F`, `/R`), exiting 1 with
+  Windows' message when a pattern matches nothing.
+- `Get-ChildItem` on registry paths (`HKLM:\…`, `HKCU:\…`) lists subkeys
+  under a `Hive:` header and yields key objects with `Name` and
+  `PSChildName` in value position; `Get-Content` on a registry path
+  reports the provider's error instead of a bad file path.
+- `$_` in a `catch` block is an error record with `.Exception.Message`.
+- A Windows-oracle script, `tests/oracle/powershell_expressions.ps1`,
+  for the expression engine and the new cmdlets.
+
+### Fixed
+
+- `"$(...)"` joins multiple output objects with spaces, as PowerShell
+  does, instead of keeping line breaks.
+- Member access on an array enumerates its elements' members.
+- `Get-Command` with a plain name returns the command that would run (an
+  alias or built-in before a program, else the first program on `PATH`).
+- `1 + '1'` converts the string to the left operand's number type.
+- Objects from `ConvertFrom-Json` and hashtable literals keep their key
+  spellings in JSON and table output.
+
 - PowerShell utility cmdlets: `Get-Date` (with .NET `-Format` strings),
   `Get-Random`, `Out-String`, `Format-Table`/`Format-List`,
   `Group-Object`, `ConvertTo-Json` (`-Depth`, `-Compress`) and

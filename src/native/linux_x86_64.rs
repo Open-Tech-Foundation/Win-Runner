@@ -104,6 +104,9 @@ use cert_chain::*;
 #[path = "linux_x86_64/taskkill_host.rs"]
 mod taskkill_host;
 use taskkill_host::*;
+#[path = "linux_x86_64/where_host.rs"]
+mod where_host;
+use where_host::*;
 #[path = "linux_x86_64/sockets.rs"]
 mod sockets;
 use sockets::*;

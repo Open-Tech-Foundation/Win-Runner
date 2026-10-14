@@ -83,6 +83,12 @@ pub(super) fn validate_utf8_encoding(named: &HashMap<String, String>) -> Result<
     Ok(())
 }
 
+/// Whether a wildcard names a program path by its file name or stem.
+fn matches_one(pattern: &str, path: &str) -> bool {
+    let leaf = path.rsplit('\\').next().unwrap_or(path);
+    wildcard(pattern, leaf) || leaf.rsplit_once('.').is_some_and(|(stem, _)| wildcard(pattern, stem))
+}
+
 pub(super) fn wildcard(pattern: &str, value: &str) -> bool {
     let p: Vec<char> = pattern.to_lowercase().chars().collect();
     let v: Vec<char> = value.to_lowercase().chars().collect();
@@ -364,6 +370,29 @@ impl Interpreter<'_> {
                         }
                     }
                 }
+            }
+        }
+        // A plain name resolves to one command, as it would run: a
+        // function or built-in before any program, else the first program
+        // along PATH (wildcards still list every match).
+        if cmd == "get-command" {
+            let names_app = |path: &str, name: &str| {
+                let leaf = path.rsplit('\\').next().unwrap_or(path);
+                let stem = leaf.rsplit_once('.').map_or(leaf, |(stem, _)| stem);
+                leaf.eq_ignore_ascii_case(name) || stem.eq_ignore_ascii_case(name)
+            };
+            let wildcards: Vec<&String> = patterns.iter().filter(|p| p.contains(['*', '?'])).collect();
+            for plain in patterns.iter().filter(|p| !p.contains(['*', '?'])) {
+                let has_command = found.iter().any(|f| !f.contains('\\') && f.eq_ignore_ascii_case(plain));
+                let mut kept_program = has_command;
+                found.retain(|f| {
+                    if !f.contains('\\') || !names_app(f, plain) || wildcards.iter().any(|w| matches_one(w, f)) {
+                        return true;
+                    }
+                    let keep = !kept_program;
+                    kept_program = true;
+                    keep
+                });
             }
         }
         found.sort_by_key(|s| s.to_lowercase());

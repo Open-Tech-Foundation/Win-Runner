@@ -264,6 +264,69 @@ impl Interpreter<'_> {
         Ok(key_object(hive, &sub))
     }
 
+    /// `Get-ChildItem HKCU:\x`: the subkeys' key objects, each with its
+    /// `PSChildName`, in name order.
+    pub(super) fn registry_child_items(&mut self, path: &str) -> Result<Vec<Value>, String> {
+        let (hive, sub) = provider_path(path).ok_or_else(|| not_found(path))?;
+        let registry = self.registry()?;
+        let key = registry.key(hive, &sub).ok_or_else(|| not_found(path))?;
+        let mut names: Vec<String> = key.subkey_names().into_iter().map(str::to_string).collect();
+        names.sort_by_key(|n| n.to_lowercase());
+        Ok(names
+            .into_iter()
+            .map(|name| {
+                let child = if sub.is_empty() { name.clone() } else { format!(r"{sub}\{name}") };
+                let mut object = key_object(hive, &child);
+                if let Value::Map(map) = &mut object {
+                    map.insert("PSChildName".to_string(), Value::Str(name));
+                }
+                object
+            })
+            .collect())
+    }
+
+    /// `Get-ChildItem HKCU:\x` as a statement: the provider's listing, a
+    /// `Hive:` header and one row per subkey with its values.
+    pub(super) fn registry_list_children(&mut self, path: &str) -> Result<(), String> {
+        let (hive, sub) = provider_path(path).ok_or_else(|| not_found(path))?;
+        let children = self.registry_child_items(path)?;
+        if children.is_empty() {
+            return Ok(());
+        }
+        let registry = self.registry()?;
+        self.emit("");
+        self.emit(&format!("    Hive: {}", full_name(hive, &sub)));
+        self.emit("");
+        self.emit(&format!("{:<30} {}", "Name", "Property"));
+        self.emit(&format!("{:<30} {}", "----", "--------"));
+        for child in &children {
+            let Some((_, child_path)) = as_key(child) else { continue };
+            let name = child_path.rsplit('\\').next().unwrap_or(&child_path).to_string();
+            let values: Vec<String> = registry
+                .key(hive, &child_path)
+                .map(|key| {
+                    key.values()
+                        .into_iter()
+                        .map(|(value_name, value)| {
+                            format!("{value_name} : {}", value_string(&data_value(value, false, self.environment)))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            match values.split_first() {
+                None => self.emit(name.as_str()),
+                Some((first, rest)) => {
+                    self.emit(&format!("{name:<30} {first}"));
+                    for line in rest {
+                        self.emit(&format!("{:<30} {line}", ""));
+                    }
+                }
+            }
+        }
+        self.emit("");
+        Ok(())
+    }
+
     /// `Test-Path HKCU:\x`.
     pub(super) fn registry_exists(&self, path: &str) -> Result<bool, String> {
         let Some((hive, sub)) = provider_path(path) else {

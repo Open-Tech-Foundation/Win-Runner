@@ -485,7 +485,7 @@ impl<'a> Interpreter<'a> {
                     let cb = cb.clone();
                     // `$_` is the error inside the handler (its message, as
                     // an ErrorRecord reads in a string).
-                    let saved = self.vars.insert("_".to_string(), Value::Str(e.clone()));
+                    let saved = self.vars.insert("_".to_string(), error_record(&e));
                     let handled = self.run_code(&cb);
                     Self::restore_under(self.vars, saved);
                     match handled {
@@ -2184,7 +2184,8 @@ impl<'a> Interpreter<'a> {
             }
             if i + 1 < cs.len() && cs[i + 1].0 == '(' {
                 let (code, used) = take_balanced(&cs[i + 2..])?;
-                out.push_str(&self.eval_sub(&code)?);
+                // Output objects join with spaces, as `$OFS` does.
+                out.push_str(&self.sub_expression_text(&code)?);
                 i += 2 + used;
                 continue;
             }
@@ -2288,6 +2289,22 @@ impl<'a> Interpreter<'a> {
         }
         let s = String::from_utf8_lossy(&buf);
         Ok(s.trim_end_matches(['\n', '\r']).to_string())
+    }
+
+    /// `"$(code)"` in a string: the output as one string, its objects
+    /// joined by spaces.
+    fn sub_expression_text(&mut self, code: &str) -> Result<String, String> {
+        if self.depth + 1 > MAX_IEX_DEPTH {
+            return Err("iex: max nesting depth exceeded".to_string());
+        }
+        self.depth += 1;
+        let result = self.eval_paren_inner(code);
+        self.depth -= 1;
+        let (value, flow) = result?;
+        if !matches!(flow, Flow::Next) {
+            return Err("unexpected flow control in a subexpression".to_string());
+        }
+        Ok(value_string(&value))
     }
 
     /// Child interpreter sharing filesystem, variables, and functions.
@@ -2864,6 +2881,10 @@ impl<'a> Interpreter<'a> {
         )?;
         essentials::validate_utf8_encoding(&named)?;
         let path = essentials::path_arg(&named, &pos, "Get-Content")?;
+        // The registry provider has no item content.
+        if registry::provider_path(&path).is_some() {
+            return Err("Get-Content: Cannot use interface. The IContentCmdletProvider interface is not implemented by this provider.".into());
+        }
         if named.contains_key("raw")
             && ["totalcount", "head", "tail"]
                 .iter()
@@ -2923,6 +2944,11 @@ impl<'a> Interpreter<'a> {
         )?;
         if named.contains_key("file") && named.contains_key("directory") {
             return Err("Get-ChildItem: choose -File or -Directory".into());
+        }
+        if let Some(path) = named.get("literalpath").or_else(|| named.get("path")).or_else(|| pos.first()) {
+            if registry::provider_path(path).is_some() {
+                return self.registry_list_children(path);
+            }
         }
         let path =
             if named.contains_key("path") || named.contains_key("literalpath") || !pos.is_empty() {
@@ -3452,6 +3478,7 @@ impl<'a> Interpreter<'a> {
                 "get-filehash"
                     | "invoke-webrequest"
                     | "get-item"
+                    | "get-childitem"
                     | "new-item"
                     | "mkdir"
                     | "md"
@@ -3473,6 +3500,11 @@ impl<'a> Interpreter<'a> {
                 let path = item_path_arg(argvals)?;
                 registry::provider_path(&path)?;
                 Some(self.registry_get_item(&path))
+            }
+            "get-childitem" => {
+                let path = item_path_arg(argvals)?;
+                registry::provider_path(&path)?;
+                Some(self.registry_child_items(&path).map(Value::Arr))
             }
             "new-item" => {
                 let path = item_path_arg(argvals)?;
@@ -4953,6 +4985,9 @@ impl JsonParser {
     fn parse_object(&mut self, depth: usize) -> Result<Value, String> {
         self.pos += 1; // {
         let mut map = HashMap::new();
+        // Lowercased keys keep their spellings in a hidden member, for
+        // display and JSON output.
+        let mut spellings: Vec<Value> = Vec::new();
         self.skip_ws();
         if self.peek() == Some('}') {
             self.pos += 1;
@@ -4964,7 +4999,14 @@ impl JsonParser {
                 return Err("expected string key in JSON object".to_string());
             }
             let key = self.parse_string()?;
-            let key = if self.keep_case { key } else { key.to_lowercase() };
+            let key = if self.keep_case {
+                key
+            } else {
+                if key.chars().any(char::is_uppercase) {
+                    spellings.push(Value::Str(key.clone()));
+                }
+                key.to_lowercase()
+            };
             self.skip_ws();
             if self.peek() != Some(':') {
                 return Err("expected ':' in JSON object".to_string());
@@ -4979,6 +5021,9 @@ impl JsonParser {
                 }
                 Some('}') => {
                     self.pos += 1;
+                    if !spellings.is_empty() {
+                        map.insert(KEY_SPELLINGS.to_string(), Value::Arr(spellings));
+                    }
                     return Ok(Value::Map(map));
                 }
                 _ => return Err("expected ',' or '}' in JSON object".to_string()),
@@ -5138,6 +5183,23 @@ impl JsonParser {
 
 /// Canonical JSON text for a value (sorted object keys): the line form
 /// pipelines carry structured values in.
+/// The hidden member holding a map's original key spellings.
+const KEY_SPELLINGS: &str = "\0keys";
+
+/// How a map's key displays: its original spelling when one was kept.
+fn display_key(map: &HashMap<String, Value>, key: &str) -> String {
+    if let Some(Value::Arr(spellings)) = map.get(KEY_SPELLINGS) {
+        for spelling in spellings {
+            if let Value::Str(spelling) = spelling {
+                if spelling.eq_ignore_ascii_case(key) {
+                    return spelling.clone();
+                }
+            }
+        }
+    }
+    key.to_string()
+}
+
 fn render_json(v: &Value) -> String {
     match v {
         Value::Str(s) => render_json_string(s),
@@ -5153,7 +5215,7 @@ fn render_json(v: &Value) -> String {
             keys.sort();
             let parts: Vec<String> = keys
                 .iter()
-                .map(|k| format!("{}:{}", render_json_string(k), render_json(&map[*k])))
+                .map(|k| format!("{}:{}", render_json_string(&display_key(map, k)), render_json(&map[*k])))
                 .collect();
             format!("{{{}}}", parts.join(","))
         }
@@ -5359,6 +5421,29 @@ fn split_static_member(s: &str) -> Option<(String, String, String)> {
 /// Hidden map entry holding an object's `ToString()` text.
 const OBJECT_STRING: &str = "\0string";
 
+/// The ErrorRecord a `catch` block sees as `$_`: it reads as the error
+/// text, and `.Exception.Message` is the message without the leading
+/// `Command-Name: ` this interpreter's errors carry.
+fn error_record(error: &str) -> Value {
+    let message = match error.split_once(": ") {
+        Some((command, rest))
+            if command.contains('-') && command.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') =>
+        {
+            rest
+        }
+        _ => error,
+    };
+    let mut exception = HashMap::new();
+    exception.insert("message".to_string(), Value::Str(message.to_string()));
+    exception.insert(KEY_SPELLINGS.to_string(), Value::Arr(vec![Value::Str("Message".into())]));
+    exception.insert(OBJECT_STRING.to_string(), Value::Str(message.to_string()));
+    let mut record = HashMap::new();
+    record.insert("exception".to_string(), Value::Map(exception));
+    record.insert(KEY_SPELLINGS.to_string(), Value::Arr(vec![Value::Str("Exception".into())]));
+    record.insert(OBJECT_STRING.to_string(), Value::Str(error.to_string()));
+    Value::Map(record)
+}
+
 /// `[Environment]::OSVersion` for the guest's Windows build.
 fn os_version() -> Value {
     let build = crate::system_profile::OS_BUILD_NUMBER;
@@ -5391,9 +5476,13 @@ fn member_value(cur: Value, name: &str) -> Option<Value> {
             if name.eq_ignore_ascii_case("count") || name.eq_ignore_ascii_case("length") {
                 return Some(Value::Str(a.len().to_string()));
             }
-            let idx: i64 = name.trim().parse().ok()?;
-            let idx = if idx < 0 { a.len() as i64 + idx } else { idx };
-            a.into_iter().nth(idx as usize)
+            if let Ok(idx) = name.trim().parse::<i64>() {
+                let idx = if idx < 0 { a.len() as i64 + idx } else { idx };
+                return a.into_iter().nth(idx as usize);
+            }
+            // Member enumeration: each element's member, where it has one.
+            let values: Vec<Value> = a.into_iter().filter_map(|item| member_value(item, name)).collect();
+            (!values.is_empty()).then_some(Value::Arr(values))
         }
         Value::Str(s) => (name.eq_ignore_ascii_case("length"))
             .then(|| Value::Str(s.chars().count().to_string())),
@@ -7937,10 +8026,27 @@ $x
     }
 
     #[test]
+    fn registry_children_content_errors_and_caught_records() {
+        let script = "New-Item HKCU:\\Software\\T\\B -Force | Out-Null\nNew-Item HKCU:\\Software\\T\\A -Force | Out-Null\nNew-ItemProperty HKCU:\\Software\\T\\A -Name V -Value x | Out-Null\n\"$((Get-ChildItem HKCU:\\Software\\T).PSChildName)\"\n(Get-ChildItem HKCU:\\Software\\T).Count\nGet-ChildItem HKCU:\\Software\\T\ntry { Get-Content HKCU:\\Software\\T } catch { $_.Exception.Message; \"$_\" }";
+        let (out, r) = run_session(script);
+        assert!(r.is_ok(), "{r:?}");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.starts_with("A B\n2\n\n    Hive: HKEY_CURRENT_USER\\Software\\T\n\nName"), "{text}");
+        assert!(text.contains(&format!("{:<30} V : x\nB\n", "A")), "{text}");
+        assert!(text.ends_with("Cannot use interface. The IContentCmdletProvider interface is not implemented by this provider.\nGet-Content: Cannot use interface. The IContentCmdletProvider interface is not implemented by this provider.\n"), "{text}");
+        assert!(run_session("Get-ChildItem HKCU:\\Missing").1.unwrap_err().contains("does not exist"));
+    }
+
+    #[test]
     fn get_command_takes_several_names() {
         let (out, r) = run_session("Get-Command Get-Date,Get-Random");
         assert!(r.is_ok(), "{r:?}");
         assert_eq!(out, b"get-date\nget-random\n");
+        // A plain name is the one command it runs: an alias or built-in
+        // before a program of the same name.
+        let (out, r) = run_session("Get-Command where");
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(out, b"where\n");
         let (out, r) = run_session("Get-Command Get-Date,Nope-Thing");
         assert_eq!(out, b"get-date\n", "found commands print before the error");
         assert!(r.unwrap_err().contains("Nope-Thing"));

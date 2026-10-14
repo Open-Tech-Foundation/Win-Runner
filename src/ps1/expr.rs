@@ -315,8 +315,14 @@ impl V {
             Value::Str(s) => V::Auto(s.clone()),
             Value::Arr(items) => V::Arr(items.iter().map(V::from_value).collect()),
             Value::Map(map) => {
-                let mut entries: Vec<(String, V)> = map.iter().map(|(k, v)| (k.clone(), V::from_value(v))).collect();
-                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                // Keys as originally spelled; hidden members stay behind.
+                // An object's ToString() text rides along, hidden.
+                let mut entries: Vec<(String, V)> = map
+                    .iter()
+                    .filter(|(k, _)| !registry::is_hidden_member(k) || *k == OBJECT_STRING)
+                    .map(|(k, v)| (display_key(map, k), V::from_value(v)))
+                    .collect();
+                entries.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
                 V::Map(entries)
             }
         }
@@ -325,7 +331,22 @@ impl V {
     pub(super) fn into_value(self) -> Value {
         match self {
             V::Arr(items) => Value::Arr(items.into_iter().filter(|v| *v != V::Null).map(V::into_value).collect()),
-            V::Map(entries) => Value::Map(entries.into_iter().map(|(k, v)| (k, v.into_value())).collect()),
+            // Interpreter maps key by lowercase name and keep spellings
+            // hidden, as parsed JSON objects do.
+            V::Map(entries) => {
+                let mut map: HashMap<String, Value> = HashMap::new();
+                let mut spellings = Vec::new();
+                for (key, value) in entries {
+                    if key.chars().any(char::is_uppercase) {
+                        spellings.push(Value::Str(key.clone()));
+                    }
+                    map.insert(key.to_lowercase(), value.into_value());
+                }
+                if !spellings.is_empty() {
+                    map.insert(KEY_SPELLINGS.to_string(), Value::Arr(spellings));
+                }
+                Value::Map(map)
+            }
             other => Value::Str(other.text()),
         }
     }
@@ -338,7 +359,10 @@ impl V {
             V::Num(n) => format_double(*n),
             V::Text(s) | V::Auto(s) => s.clone(),
             V::Arr(items) => items.iter().map(V::text).collect::<Vec<_>>().join(" "),
-            V::Map(_) => "System.Collections.Hashtable".into(),
+            V::Map(entries) => entries
+                .iter()
+                .find(|(k, _)| k == OBJECT_STRING)
+                .map_or_else(|| "System.Collections.Hashtable".into(), |(_, v)| v.text()),
         }
     }
 
@@ -399,6 +423,11 @@ impl V {
             other => vec![other],
         }
     }
+}
+
+/// A map's entries without hidden members.
+fn visible(entries: &[(String, V)]) -> impl Iterator<Item = &(String, V)> {
+    entries.iter().filter(|(k, _)| !registry::is_hidden_member(k))
 }
 
 fn arithmetic(op: &str, left: &V, right: &V) -> Result<V, String> {
@@ -464,7 +493,9 @@ fn add(left: V, right: V) -> Result<V, String> {
         },
         V::Text(s) => Ok(V::Text(s + &right.text())),
         left if left.is_numeric() || left == V::Null => {
-            if right.is_numeric() || right == V::Null || matches!(right, V::Bool(_)) {
+            // The right side converts to the left's number type ('1' too).
+            let convertible = matches!(&right, V::Text(t) if !t.trim().is_empty() && right.number().is_some());
+            if right.is_numeric() || convertible || right == V::Null || matches!(right, V::Bool(_)) {
                 arithmetic("+", &left, &right)
             } else if left == V::Null {
                 Ok(right)
@@ -971,7 +1002,7 @@ impl Interpreter<'_> {
                 _ => V::Text(value.text().chars().next().map(String::from).unwrap_or_default()),
             },
             "array" | "object[]" | "string[]" | "int[]" => V::Arr(value.items()),
-            "hashtable" | "ordered" => match value {
+            "hashtable" | "ordered" | "pscustomobject" | "psobject" => match value {
                 V::Map(entries) => V::Map(entries),
                 _ => return Ok(Err(Unsupported)),
             },
@@ -1212,10 +1243,10 @@ impl Interpreter<'_> {
         let lower = name.to_ascii_lowercase();
         Ok(Ok(match (&value, lower.as_str()) {
             (V::Arr(items), "count" | "length") => V::Int(items.len() as i64),
-            (V::Map(entries), "count") => V::Int(entries.len() as i64),
-            (V::Map(entries), "keys") => V::Arr(entries.iter().map(|(k, _)| V::Text(k.clone())).collect()),
-            (V::Map(entries), "values") => V::Arr(entries.iter().map(|(_, v)| v.clone()).collect()),
-            (V::Map(entries), _) => entries.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map_or(V::Null, |(_, v)| v.clone()),
+            (V::Map(entries), "count") => V::Int(visible(entries).count() as i64),
+            (V::Map(entries), "keys") => V::Arr(visible(entries).map(|(k, _)| V::Text(k.clone())).collect()),
+            (V::Map(entries), "values") => V::Arr(visible(entries).map(|(_, v)| v.clone()).collect()),
+            (V::Map(entries), _) => visible(entries).find(|(k, _)| k.eq_ignore_ascii_case(name)).map_or(V::Null, |(_, v)| v.clone()),
             (V::Text(s) | V::Auto(s), "length") => V::Int(s.chars().count() as i64),
             (V::Null, "count") => V::Int(0),
             (V::Null, _) => V::Null,
@@ -1436,6 +1467,7 @@ mod tests {
         assert_eq!(eval("7 % 3").as_deref(), Some("1"));
         assert_eq!(eval("$n + 1").as_deref(), Some("3"), "a numeric variable adds");
         assert_eq!(eval("'1' + 1").as_deref(), Some("11"), "a string literal concatenates");
+        assert_eq!(eval("1 + '1'").as_deref(), Some("2"), "a string converts to the left number");
         assert_eq!(eval("'x' * 3").as_deref(), Some("xxx"));
         assert_eq!(eval("-3 + 1").as_deref(), Some("-2"));
         assert_eq!(eval("1kb").as_deref(), Some("1024"));
