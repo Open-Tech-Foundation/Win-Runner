@@ -1,0 +1,5 @@
+kind = "github"
+repo = "micro-editor/micro"
+tag = "v{version}"
+x64 = "micro-{version}-win64.zip"
+bin = ["micro-{version}/micro.exe"]

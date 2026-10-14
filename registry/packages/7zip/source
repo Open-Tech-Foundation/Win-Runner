@@ -1,0 +1,5 @@
+kind = "github"
+repo = "ip7z/7zip"
+tag = "{version}"
+x64 = "7z{version_nodot}-extra.7z"
+bin = ["x64/7za.exe"]

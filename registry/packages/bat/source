@@ -1,0 +1,6 @@
+kind = "github"
+repo = "sharkdp/bat"
+tag = "v{version}"
+x64 = "bat-v{version}-x86_64-pc-windows-msvc.zip"
+arm64 = "bat-v{version}-aarch64-pc-windows-msvc.zip"
+bin = ["{stem}/bat.exe"]

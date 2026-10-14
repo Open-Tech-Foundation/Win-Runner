@@ -1,0 +1,4 @@
+kind = "npm"
+x64 = "@esbuild/win32-x64"
+arm64 = "@esbuild/win32-arm64"
+bin = ["package/esbuild.exe"]

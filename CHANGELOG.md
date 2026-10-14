@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- `wpkg install dotnet`: Microsoft's .NET 10 runtime (x64 and arm64), with
+  `dotnet` on PATH.
+- `scripts/wpkg-registry.py` adds and refreshes registry packages from
+  where they are published (GitHub releases, npm platform packages, NuGet,
+  .NET release metadata, Node.js releases); each package's `source` file
+  records its origin. A `tasks.toml` exposes it and the usual commands to
+  `tsr` (`tsr registry-check`, `tsr registry-update`, `tsr registry-add`,
+  `tsr registry`, `tsr build`, `tsr test`, `tsr oracle`).
+
 - Documentation sweep: rewrote the README around generic platform backends
   (`native-linux-x64` today, more planned), with a quickstart, CLI reference
   with exit codes, and agent/CI recipes. New pages: `docs/compatibility.md`

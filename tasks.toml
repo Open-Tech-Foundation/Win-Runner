@@ -1,0 +1,34 @@
+# tasks.toml: tasks for `tsr` (https://tsr.opentechf.org/docs).
+#   tsr --list            show the tasks
+#   tsr <task> -- ARGS    run one, passing ARGS through
+
+# wpkg registry (registry/packages → the embedded registry.zip).
+[tasks.registry]
+run = "python3 scripts/build-wpkg-registry.py"
+
+# Refresh packages to their newest upstream releases: all, or the names
+# given (`tsr registry-update -- python dotnet`).
+[tasks.registry-update]
+run = "python3 scripts/wpkg-registry.py update"
+
+# Report which packages have newer releases, changing nothing.
+[tasks.registry-check]
+run = "python3 scripts/wpkg-registry.py update --check"
+
+# Record a package's source and fetch it:
+# `tsr registry-add -- NAME KIND KEY=VALUE ...` (see scripts/wpkg-registry.py).
+[tasks.registry-add]
+run = "python3 scripts/wpkg-registry.py add"
+
+[tasks.build]
+run = "cargo build && cargo build --release"
+
+[tasks.test]
+run = "cargo test"
+
+# The oracle probes, and the winrun side of the Windows comparison.
+[tasks.oracle-build]
+run = "bash guests/build-oracle.sh"
+
+[tasks.oracle]
+run = "bash tests/oracle/run-winrun.sh target/release/winrun oracle-winrun"

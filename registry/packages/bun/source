@@ -1,0 +1,6 @@
+kind = "github"
+repo = "oven-sh/bun"
+tag = "bun-v{version}"
+x64 = "bun-windows-x64.zip"
+arm64 = "bun-windows-aarch64.zip"
+bin = ["{stem}/bun.exe"]

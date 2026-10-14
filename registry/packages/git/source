@@ -1,0 +1,6 @@
+kind = "github"
+repo = "git-for-windows/git"
+x64 = "MinGit-{version}-64-bit.zip"
+arm64 = "MinGit-{version}-arm64.zip"
+bin = ["cmd/git.exe"]
+version = "v(\\d+)\\.(\\d+)\\.(\\d+)\\.windows\\.(\\d+)"

@@ -1,0 +1,6 @@
+kind = "github"
+repo = "cli/cli"
+tag = "v{version}"
+x64 = "gh_{version}_windows_amd64.zip"
+arm64 = "gh_{version}_windows_arm64.zip"
+bin = ["bin/gh.exe"]

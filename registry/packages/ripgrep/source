@@ -1,0 +1,6 @@
+kind = "github"
+repo = "BurntSushi/ripgrep"
+tag = "{version}"
+x64 = "ripgrep-{version}-x86_64-pc-windows-msvc.zip"
+arm64 = "ripgrep-{version}-aarch64-pc-windows-msvc.zip"
+bin = ["{stem}/rg.exe"]

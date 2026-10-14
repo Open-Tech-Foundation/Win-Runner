@@ -21,11 +21,26 @@ manifest with `name`, `version`, `arch` (`x64` or `arm64`), `url` (ZIP or 7z), `
 `bin`, and optional `dependencies`. `packages/index` contains one package name
 per line for `wpkg search`.
 
-After editing registry data, run `python3 scripts/build-wpkg-registry.py` and
-include the updated `registry.zip` with the source change. The ZIP is embedded
+Packages are added and refreshed with `scripts/wpkg-registry.py` (or the `tsr`
+tasks in `tasks.toml`). Each package's `source` file records where it is
+published (`github` releases, `npm` platform packages, `nuget`, Microsoft's
+`dotnet` release metadata, or `node` releases); the script finds the newest
+release, writes the manifests with their SHA-256, updates `latest`,
+`versions` and `index`, and rebuilds `registry.zip`:
+
+```text
+tsr registry-check                       # which packages have newer releases
+tsr registry-update                      # refresh all (or: -- NAME ...)
+tsr registry-add -- NAME github repo=OWNER/REPO tag=v{version} \
+    x64=ASSET arm64=ASSET bin={stem}/tool.exe
+tsr registry                             # rebuild registry.zip after hand edits
+```
+
+Packages without a `source` (curl) are maintained by hand. Include the updated
+`registry.zip` with the source change. The ZIP is embedded
 in the winrun binary; registry refreshes from GitHub Releases are planned later.
 
-The catalog contains Node.js (`nodejs`), Python's embeddable distribution,
+The catalog contains Node.js (`nodejs`), Python (python.org's NuGet package),
 ripgrep, curl, MinGit, the x64 standalone 7za CLI from the official 7-Zip
 Extra archive, Bun, Deno, uv, fd, bat, fzf, and the GitHub CLI (`gh`). ARM64
 manifests are included where upstream provides them; checksums are the
