@@ -76,7 +76,7 @@ find.nomatch: INVALID err=2
 find.missing_dir: INVALID err=3
 find.star_dot_star: "."/, ".."/, "One.txt":5, "Sub Dir"/ end err=18
 find.dot_star_no_ext: "Sub Dir"/ end err=18
-find.trailing_dot: "Sub Dir"/ end err=18
+find.trailing_dot: "."/, ".."/, "Sub Dir"/ end err=18
 long.case: path="Sub Dir\\two.txt"
 long.missing: fail err=2
 size.open: ok

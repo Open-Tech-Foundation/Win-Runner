@@ -83,7 +83,8 @@ All notable changes to this project will be documented in this file.
   `CERT_FIND_EXT_ONLY` (2) and `CERT_FIND_PROP_ONLY` (4) flags.
 
 - `FindFirstFileW` applies Windows' DOS pattern rules: `*.*` matches every
-  name (directories without a dot included) and `name.*` matches `name`, so
+  name (directories without a dot included), `name.*` matches `name`, and
+  `*.` matches names without an extension plus `.` and `..`, so
   programs listing with `*.*` (CPython's `os.listdir`) see every entry.
   The `fs_paths` oracle covers it.
 

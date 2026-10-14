@@ -81,14 +81,18 @@ fn native_find_parts(pattern: &str) -> (String, String) {
 /// Whether a file name matches a FindFirstFile pattern, with the DOS
 /// rules Windows applies: a trailing `.*` also matches a name without an
 /// extension (`*.*` matches everything, `foo.*` matches `foo`), and a
-/// trailing `.` matches only names without one.
+/// trailing `.` matches a period or the end of the name: names without an
+/// extension, and names ending in a period (`.` and `..` for `*.`).
 fn native_name_matches_pattern(pattern: &str, name: &str) -> bool {
     if let Some(stem) = pattern.strip_suffix(".*") {
         if !name.contains('.') && wildcard_matches(stem, name) {
             return true;
         }
     } else if let Some(stem) = pattern.strip_suffix('.').filter(|stem| !stem.is_empty() && !stem.ends_with('.')) {
-        return !name.contains('.') && wildcard_matches(stem, name);
+        return match name.strip_suffix('.') {
+            Some(before) => wildcard_matches(stem, before),
+            None => !name.contains('.') && wildcard_matches(stem, name),
+        };
     }
     wildcard_matches(pattern, name)
 }
@@ -391,6 +395,7 @@ mod pattern_tests {
         assert!(!matches("one.*", "onetwo"));
         assert!(matches("*.", "Makefile"), "a trailing dot matches names without one");
         assert!(!matches("*.", "one.txt"));
+        assert!(matches("*.", ".") && matches("*.", ".."), "and names ending in a period");
         assert!(matches("O?e.txt", "one.txt"));
         assert!(!matches("*.txt", "readme"));
     }
