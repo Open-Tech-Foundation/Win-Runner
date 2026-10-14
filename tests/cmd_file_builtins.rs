@@ -60,7 +60,7 @@ fn find_sort_and_more_filter_text_from_files_and_pipes() {
     );
     assert_eq!(
         out,
-        "\n---------- F.TXT\nbanana\n3\nApple\nbanana\npear\npear\nApple\nbanana\n\n---------- F.TXT\ncode=1\n",
+        "\n---------- F.TXT\nbanana\n3\nApple\nbanana\npear\npear\nApple\nbanana\n\n\n---------- F.TXT\ncode=1\n",
         "{err}"
     );
 }

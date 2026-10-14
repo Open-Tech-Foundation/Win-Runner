@@ -22,7 +22,8 @@ fn lines(bytes: &[u8]) -> Vec<String> {
 }
 
 /// `find [/V] [/C] [/N] [/I] "string" [files...]`: 0 when a line was
-/// found, 1 when none, 2 on bad usage or a missing file.
+/// found, 1 when none (a missing file is reported and finds nothing), 2 on
+/// bad usage.
 pub fn find(host: &mut dyn TextHost, arguments: &[String]) -> i32 {
     let (mut invert, mut count, mut numbers, mut ignore_case) = (false, false, false, false);
     let mut needle: Option<String> = None;
@@ -57,7 +58,6 @@ pub fn find(host: &mut dyn TextHost, arguments: &[String]) -> i32 {
         found != invert
     };
     let mut any = false;
-    let mut status = 0;
     let mut search = |host: &mut dyn TextHost, bytes: &[u8], header: Option<&str>| {
         let selected: Vec<(usize, String)> =
             lines(bytes).into_iter().enumerate().filter(|(_, line)| matches(line)).collect();
@@ -87,16 +87,11 @@ pub fn find(host: &mut dyn TextHost, arguments: &[String]) -> i32 {
         for file in &files {
             match host.read_file(file) {
                 Some(bytes) => search(host, &bytes, Some(file)),
-                None => {
-                    host.stderr(&format!("File not found - {}\r\n", file.to_uppercase()));
-                    status = 2;
-                }
+                None => host.stderr(&format!("File not found - {}\r\n", file.to_uppercase())),
             }
         }
     }
-    if status != 0 {
-        status
-    } else if any {
+    if any {
         0
     } else {
         1
@@ -172,7 +167,7 @@ pub fn sort(host: &mut dyn TextHost, arguments: &[String]) -> i32 {
 }
 
 /// `more [file...]` with output that is not a console: the text as CRLF
-/// lines, tabs expanded to eight columns.
+/// lines, tabs expanded to eight columns, then an empty line.
 pub fn more(host: &mut dyn TextHost, arguments: &[String]) -> i32 {
     let files: Vec<&String> = arguments.iter().filter(|argument| !argument.starts_with('/')).collect();
     let mut inputs = Vec::new();
@@ -207,6 +202,7 @@ pub fn more(host: &mut dyn TextHost, arguments: &[String]) -> i32 {
         }
         host.stdout(out.as_bytes());
     }
+    host.stdout(b"\r\n");
     0
 }
 
@@ -278,7 +274,7 @@ mod tests {
         assert_eq!(find(&mut host, &args(&["two", "a.txt"])), 0);
         assert_eq!(host.out, b"\r\n---------- A.TXT\r\ntwo\r\n");
         assert_eq!(find(&mut host, &args(&["zzz", "a.txt"])), 1);
-        assert_eq!(find(&mut host, &args(&["two", "missing.txt"])), 2);
+        assert_eq!(find(&mut host, &args(&["two", "missing.txt"])), 1, "a missing file finds nothing");
         assert!(host.err.contains("File not found - MISSING.TXT"));
         assert_eq!(find(&mut Fake::default(), &args(&[])), 2);
     }
@@ -300,6 +296,6 @@ mod tests {
     fn more_copies_text_with_tabs_expanded() {
         let mut host = Fake { stdin: b"a\tb\nline".to_vec(), ..Default::default() };
         assert_eq!(more(&mut host, &[]), 0);
-        assert_eq!(host.out, b"a       b\r\nline\r\n");
+        assert_eq!(host.out, b"a       b\r\nline\r\n\r\n");
     }
 }

@@ -17,6 +17,16 @@ use winrun::winfs::WinFs;
 
 // ---------- helpers ----------
 
+/// The next WebSocket message, retrying reads a signal interrupted.
+fn read_retrying<S: Read + Write>(socket: &mut tungstenite::WebSocket<S>) -> tungstenite::Message {
+    loop {
+        match socket.read() {
+            Err(tungstenite::Error::Io(error)) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => return result.unwrap(),
+        }
+    }
+}
+
 #[test]
 fn renamed_cli_uses_winrun_command_name() {
     let output = Command::new(env!("CARGO_BIN_EXE_winrun"))
@@ -2316,7 +2326,7 @@ fn headless_control_session_streams_shell_output_and_exits_cleanly() {
     assert!(started.elapsed() < std::time::Duration::from_secs(1));
     drop((idle, partial));
 
-    let connected: serde_json::Value = match socket.read().unwrap() {
+    let connected: serde_json::Value = match read_retrying(&mut socket) {
         tungstenite::Message::Text(message) => serde_json::from_str(&message).unwrap(),
         message => panic!("expected JSON control event, got {message:?}"),
     };
@@ -2329,7 +2339,7 @@ fn headless_control_session_streams_shell_output_and_exits_cleanly() {
         .unwrap();
     let mut saw_pwd = false;
     while !saw_pwd {
-        let event: serde_json::Value = match socket.read().unwrap() {
+        let event: serde_json::Value = match read_retrying(&mut socket) {
             tungstenite::Message::Text(message) => serde_json::from_str(&message).unwrap(),
             message => panic!("expected JSON control event, got {message:?}"),
         };
@@ -2348,7 +2358,7 @@ fn headless_control_session_streams_shell_output_and_exits_cleanly() {
         .unwrap();
     let mut saw_guest_stderr = false;
     while !saw_guest_stderr {
-        let event: serde_json::Value = match socket.read().unwrap() {
+        let event: serde_json::Value = match read_retrying(&mut socket) {
             tungstenite::Message::Text(message) => serde_json::from_str(&message).unwrap(),
             message => panic!("expected JSON control event, got {message:?}"),
         };
@@ -2368,7 +2378,7 @@ fn headless_control_session_streams_shell_output_and_exits_cleanly() {
         .unwrap();
     let mut saw_ready = false;
     while !saw_ready {
-        let event: serde_json::Value = match socket.read().unwrap() {
+        let event: serde_json::Value = match read_retrying(&mut socket) {
             tungstenite::Message::Text(message) => serde_json::from_str(&message).unwrap(),
             message => panic!("expected JSON control event, got {message:?}"),
         };
@@ -2384,7 +2394,7 @@ fn headless_control_session_streams_shell_output_and_exits_cleanly() {
         .unwrap();
     let mut saw_echo = false;
     while !saw_echo {
-        let event: serde_json::Value = match socket.read().unwrap() {
+        let event: serde_json::Value = match read_retrying(&mut socket) {
             tungstenite::Message::Text(message) => serde_json::from_str(&message).unwrap(),
             message => panic!("expected JSON control event, got {message:?}"),
         };
@@ -2399,7 +2409,7 @@ fn headless_control_session_streams_shell_output_and_exits_cleanly() {
         ))
         .unwrap();
     loop {
-        let event: serde_json::Value = match socket.read().unwrap() {
+        let event: serde_json::Value = match read_retrying(&mut socket) {
             tungstenite::Message::Text(message) => serde_json::from_str(&message).unwrap(),
             message => panic!("expected JSON control event, got {message:?}"),
         };

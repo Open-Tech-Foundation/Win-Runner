@@ -77,6 +77,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Matched against Windows: cmd's `path` prints `PATH=(null)` when PATH is
+  unset; `find.exe` exits 1 (not 2) when a file is missing; `more.com`
+  ends its output with an empty line.
+- The headless control test retries WebSocket reads a signal interrupts.
+
 - PowerShell command arguments understand arrays: comma lists (`a,b`,
   `"a", "b"`) and array variables are passed as arrays instead of one
   joined string. Path cmdlets (`Get-Content`, `Remove-Item`, `Test-Path`,

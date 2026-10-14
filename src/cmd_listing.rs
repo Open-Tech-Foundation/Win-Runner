@@ -418,14 +418,15 @@ impl<H: CmdHost> Cmd<'_, H> {
         }
     }
 
-    /// `path`: show `PATH=...` (or `No Path`), `path ;` clear it, or set it.
+    /// `path`: show `PATH=...` (`PATH=(null)` when unset), `path ;` clear
+    /// it, or set it.
     pub(super) fn builtin_path(&mut self, rest: &str, io: &Io) -> (u32, Flow) {
         let value = rest.trim();
         let value = value.strip_prefix('=').unwrap_or(value).trim();
         if value.is_empty() {
             match self.variable("PATH") {
                 Some(path) => self.print(io, &format!("PATH={path}")),
-                None => self.print(io, "No Path"),
+                None => self.print(io, "PATH=(null)"),
             }
         } else if value == ";" {
             self.set_variable("PATH", "");

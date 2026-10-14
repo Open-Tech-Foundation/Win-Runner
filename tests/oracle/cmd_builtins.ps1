@@ -57,3 +57,5 @@ cmd /c 'sort /+2 moved\fruits.bak'
 
 "more:"
 cmd /c 'type moved\fruits.bak | more'
+"more.file:"
+cmd /c 'more moved\fruits.bak'
