@@ -1,6 +1,0 @@
-name = "uv"
-version = "0.13.0"
-arch = "x64"
-url = "https://github.com/astral-sh/uv/releases/download/0.13.0/uv-x86_64-pc-windows-msvc.zip"
-sha256 = "088962f9e7b7bd9ea740c04c650b2a21c8928c345bd99ac24350dc924dba656c"
-bin = ["uv.exe", "uvx.exe", "uvw.exe"]

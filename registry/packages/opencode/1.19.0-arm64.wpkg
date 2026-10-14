@@ -1,6 +1,0 @@
-name = "opencode"
-version = "1.19.0"
-arch = "arm64"
-url = "https://registry.npmjs.org/opencode-windows-arm64/-/opencode-windows-arm64-1.19.0.tgz"
-sha256 = "3da4c4076924f930b5bfcfc76819ebc9a964ada2436a4abafc63652c1568c93e"
-bin = ["package/bin/opencode.exe"]

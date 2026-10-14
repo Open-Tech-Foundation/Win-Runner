@@ -2,3 +2,4 @@ kind = "nuget"
 x64 = "python"
 arm64 = "pythonarm64"
 bin = ["tools/python.exe", "tools/pythonw.exe"]
+description = "Python programming language (python.org)"

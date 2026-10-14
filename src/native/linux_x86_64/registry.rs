@@ -1396,6 +1396,8 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "WinrunTaskkillMain" => Some(native_winrun_taskkill_main as *const () as usize as u64),
         // Private entry point of the seeded where.exe.
         "WinrunWhereMain" => Some(native_winrun_where_main as *const () as usize as u64),
+        // Private entry point of the seeded wpkg.exe.
+        "WinrunWpkgMain" => Some(native_winrun_wpkg_main as *const () as usize as u64),
         // Private entry points of the seeded find.exe, sort.exe and more.com.
         "WinrunFindMain" => Some(native_winrun_find_main as *const () as usize as u64),
         "WinrunSortMain" => Some(native_winrun_sort_main as *const () as usize as u64),

@@ -711,6 +711,7 @@ dependencies = [
  "bzip2",
  "flate2",
  "libc",
+ "ring",
  "rustls",
  "rustls-webpki",
  "rustyline",

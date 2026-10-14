@@ -1,6 +1,8 @@
-kind = "github"
+name = "fd"
+upstream = "github"
 repo = "sharkdp/fd"
 tag = "v{version}"
 x64 = "fd-v{version}-x86_64-pc-windows-msvc.zip"
 arm64 = "fd-v{version}-aarch64-pc-windows-msvc.zip"
 bin = ["{stem}/fd.exe"]
+description = "A fast, user-friendly alternative to find"

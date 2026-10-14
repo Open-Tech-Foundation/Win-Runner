@@ -1,6 +1,0 @@
-name = "deno"
-version = "2.9.7"
-arch = "arm64"
-url = "https://github.com/denoland/deno/releases/download/v2.9.7/deno-aarch64-pc-windows-msvc.zip"
-sha256 = "c4c4ac8bfdaa37814bda5c05fc9cdf2154904e2ef8277673a30bdceaaa649807"
-bin = ["deno.exe"]

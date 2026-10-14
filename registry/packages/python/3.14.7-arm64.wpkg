@@ -4,3 +4,4 @@ arch = "arm64"
 url = "https://globalcdn.nuget.org/packages/pythonarm64.3.14.7.nupkg"
 sha256 = "9eddba7ee2f7ba6c5a1ed1699bd3a62c2e523bad81071d0dbbc8e803bd6c3410"
 bin = ["tools/python.exe", "tools/pythonw.exe"]
+description = "Python programming language (python.org)"

@@ -1,6 +1,8 @@
-kind = "github"
+name = "fzf"
+upstream = "github"
 repo = "junegunn/fzf"
 tag = "v{version}"
 x64 = "fzf-{version}-windows_amd64.zip"
 arm64 = "fzf-{version}-windows_arm64.zip"
 bin = ["fzf.exe"]
+description = "A command-line fuzzy finder"

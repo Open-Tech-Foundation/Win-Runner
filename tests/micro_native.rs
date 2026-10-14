@@ -21,6 +21,8 @@ fn wpkg_micro_edits_unicode_resizes_and_persists_a_snapshot() {
     let edited = directory.join("edited.snap");
     let mut setup = Command::new(env!("CARGO_BIN_EXE_winrun"))
         .env("WINRUN_CACHE_DIR", &directory)
+        // Offline: the package list built into winrun, not the published one.
+        .env("WINRUN_WPKG_REGISTRY", "embedded")
         .arg(format!("--save-snapshot={}", initial.display()))
         .arg("shell")
         .stdin(Stdio::piped())

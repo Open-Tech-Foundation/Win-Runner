@@ -6,6 +6,31 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- wpkg has two kinds of packages, decided by their `.wpkg` files. Pinned
+  packages (git, nodejs, python, dotnet, 7zip, curl, micro) install only
+  the versions listed in the registry. Upstream packages (opencode,
+  esbuild, biome, bun, deno, uv, fd, bat, fzf, gh, ripgrep, csharpier) have
+  one `upstream.wpkg` and resolve the newest release, or the one `@version`
+  names, from npm, NuGet, or GitHub at install time, verified against the
+  hash upstream publishes (SHA-512 for npm and NuGet, GitHub's SHA-256
+  asset digest).
+- wpkg package features: version dependencies (`dotnet@10` takes the newest
+  pinned 10.x, installed beside other versions), `run` launchers that turn a
+  file into a command (`csharpier` runs `dotnet CSharpier.dll`), `env`
+  settings for a package's commands, `bin` entries named `command=path`,
+  and one-line descriptions shown by `wpkg search` and `wpkg info`.
+  Removing a package others depend on says so.
+- `wpkg install csharpier`: the C# formatter from NuGet, with the .NET 10
+  runtime as its dependency.
+- The registry is fetched once from the repository into
+  `C:\ProgramData\wpkg\registry.zip` and replaced only by `wpkg refresh`,
+  which reports what changed; the copy built into winrun serves offline.
+  `WINRUN_WPKG_REGISTRY` names another URL or `embedded`.
+- `wpkg.exe` in System32, so PowerShell scripts, `cmd /c`, batch files and
+  programs can run wpkg.
+- `tsr registry-latest -- NAME [LINE]` prints a pinned package's newest
+  upstream release and `tsr registry-add -- NAME VERSION` pins it.
+
 - `wpkg install dotnet`: Microsoft's .NET 10 runtime (x64 and arm64), with
   `dotnet` on PATH.
 - `scripts/wpkg-registry.py` adds and refreshes registry packages from

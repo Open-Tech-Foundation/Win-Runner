@@ -1,3 +1,4 @@
 kind = "node"
 major = "24"
 bin = ["{stem}/node.exe", "{stem}/npm.cmd", "{stem}/npx.cmd", "{stem}/corepack.cmd"]
+description = "Node.js JavaScript runtime with npm"

@@ -19,12 +19,38 @@ def manifest_version(path: Path) -> str:
     raise SystemExit(f"manifest has no version: {path.relative_to(REGISTRY)}")
 
 
+def manifest_field(path: Path, field: str):
+    for line in path.read_text(encoding="utf-8").splitlines():
+        key, _, value = line.partition("=")
+        if key.strip() == field:
+            return value.strip()
+    return None
+
+
+def dependency_names(path: Path) -> list[str]:
+    value = manifest_field(path, "dependencies")
+    if not value:
+        return []
+    return [item.strip().strip('"').split("@")[0] for item in value.strip("[]").split(",") if item.strip()]
+
+
 def check_versions() -> None:
-    """Each package lists every manifest version once, including `latest`."""
-    for package in sorted((REGISTRY / "packages").iterdir()):
-        if not package.is_dir():
-            continue
+    """A package is upstream (one `upstream.wpkg`, nothing else) or pinned:
+    every manifest version listed once in `versions`, including `latest`.
+    Pinned packages may depend only on pinned packages."""
+    packages = sorted(p for p in (REGISTRY / "packages").iterdir() if p.is_dir())
+    upstream = {p.name for p in packages if (p / "upstream.wpkg").is_file()}
+    for package in packages:
         name = package.name
+        if name in upstream:
+            extra = [p.name for p in package.iterdir() if p.name not in ("upstream.wpkg",)]
+            if extra:
+                raise SystemExit(f"{name}: an upstream package has only upstream.wpkg, not {extra}")
+            continue
+        for manifest in package.glob("*.wpkg"):
+            for dependency in dependency_names(manifest):
+                if dependency in upstream:
+                    raise SystemExit(f"{name}: pinned packages may not depend on upstream {dependency}")
         manifests = {manifest_version(path) for path in package.glob("*.wpkg")}
         versions_file = package / "versions"
         if not versions_file.is_file():
@@ -41,7 +67,8 @@ def check_versions() -> None:
 
 
 def main() -> None:
-    files = sorted(path for path in REGISTRY.rglob("*") if path.is_file())
+    # `source` files are maintainer recipes for scripts/wpkg-registry.py.
+    files = sorted(path for path in REGISTRY.rglob("*") if path.is_file() and path.name != "source")
     if not files:
         raise SystemExit("registry is empty")
     check_versions()

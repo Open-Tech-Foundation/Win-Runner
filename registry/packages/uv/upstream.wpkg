@@ -1,6 +1,8 @@
-kind = "github"
+name = "uv"
+upstream = "github"
 repo = "astral-sh/uv"
 tag = "{version}"
 x64 = "uv-x86_64-pc-windows-msvc.zip"
 arm64 = "uv-aarch64-pc-windows-msvc.zip"
 bin = ["uv.exe", "uvx.exe", "uvw.exe"]
+description = "An extremely fast Python package and project manager"

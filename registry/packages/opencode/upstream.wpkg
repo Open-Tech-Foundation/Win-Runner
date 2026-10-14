@@ -1,4 +1,6 @@
-kind = "npm"
+name = "opencode"
+upstream = "npm"
 x64 = "opencode-windows-x64"
 arm64 = "opencode-windows-arm64"
 bin = ["package/bin/opencode.exe"]
+description = "The AI coding agent built for the terminal"

@@ -1,10 +1,17 @@
 //! Small manifest-driven installer for portable Windows ZIP, 7z, and
 //! tarball (npm `.tgz`) packages.
 //!
-//! Package state and extracted files live only in the guest WinFS. Repositories
-//! provide `packages/index`, per-package `latest` and `versions` files, and
-//! TOML `.wpkg` manifests; the package archive is fetched separately and never
-//! executed.
+//! Package state and extracted files live only in the guest WinFS. A
+//! registry provides `packages/index` and, per package, `.wpkg` files whose
+//! contents decide how it installs: a pinned package lists exact versions
+//! (`<version>.wpkg` with a URL and hash, plus `latest` and `versions`); an
+//! upstream package has one `upstream.wpkg` naming where it is published,
+//! and each install resolves the release there (see [`upstream`]). The
+//! package archive is fetched separately and never executed.
+//!
+//! The registry is fetched once into `C:\ProgramData\wpkg\registry.zip`
+//! from the project's repository and replaced only by `wpkg refresh`; the
+//! copy built into winrun serves when it cannot be fetched.
 //!
 //! Versions install side by side as `C:\Program Files\<name>\<version>`.
 //! The directory link `C:\Program Files\<name>\current` selects the default
@@ -13,6 +20,9 @@
 //! leaves a command pointing at removed files.
 
 use crate::{install, install::DownloadProgress, progress, winfs::WinFs};
+#[path = "wpkg_upstream.rs"]
+pub mod upstream;
+use upstream::Recipe;
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
@@ -56,15 +66,118 @@ pub trait Repository {
     }
 }
 
-/// Registry text files are bundled with winrun as a small ZIP resource.
-/// Package archives referenced by manifests are still fetched on demand.
+/// A registry ZIP: the copy built into winrun, or the one fetched into
+/// [`LOCAL_REGISTRY`]. Package archives referenced by manifests are still
+/// fetched on demand.
 pub struct EmbeddedRepository {
     files: HashMap<String, Vec<u8>>,
 }
 
+/// Where the published registry is fetched from.
+pub const REGISTRY_URL: &str = "https://raw.githubusercontent.com/Open-Tech-Foundation/Win-CLI/main/registry.zip";
+/// The guest's copy of the registry, replaced only by `wpkg refresh`.
+pub const LOCAL_REGISTRY: &str = r"C:\ProgramData\wpkg\registry.zip";
+
+/// Put `wpkg.exe` in System32 (unless the disk already has one), so
+/// scripts and programs can run wpkg as the shell does.
+pub fn seed_wpkg_exe(fs: &mut WinFs) {
+    let path = format!(r"{}\wpkg.exe", crate::system_profile::SYSTEM32);
+    if fs.is_file(&path) || fs.mkdir(crate::system_profile::SYSTEM32).is_err() {
+        return;
+    }
+    let _ = fs.write_file(&path, crate::cmd::stub_image("WinrunWpkgMain"));
+}
+
+/// The registry URL: `WINRUN_WPKG_REGISTRY` may name another one, or
+/// `embedded` to use only the copy built into winrun.
+fn registry_url() -> Option<String> {
+    match std::env::var("WINRUN_WPKG_REGISTRY") {
+        Ok(value) if value.eq_ignore_ascii_case("embedded") => None,
+        Ok(value) if !value.is_empty() => Some(value),
+        _ => Some(REGISTRY_URL.to_string()),
+    }
+}
+
+/// The registry wpkg works from: the guest's copy, fetched on first use
+/// (the built-in copy when that fails, with a note through `progress`).
+pub fn open_registry(fs: &mut WinFs, progress: &mut dyn FnMut(&str)) -> Result<EmbeddedRepository, String> {
+    if fs.is_file(LOCAL_REGISTRY) {
+        let bytes = fs.read_file(LOCAL_REGISTRY).map_err(|error| format!("wpkg: cannot read {LOCAL_REGISTRY}: {error}"))?;
+        return EmbeddedRepository::from_zip(&bytes)
+            .map_err(|error| format!("{error}; run `wpkg refresh` to fetch it again"));
+    }
+    let Some(url) = registry_url() else {
+        return EmbeddedRepository::new();
+    };
+    match fetch_registry(&url) {
+        Ok((bytes, repository)) => {
+            fs.mkdir(STATE)
+                .and_then(|_| fs.write_file(LOCAL_REGISTRY, bytes))
+                .map_err(|error| format!("wpkg: cannot keep the registry: {error}"))?;
+            Ok(repository)
+        }
+        Err(error) => {
+            progress(&format!("⚠️ Using the built-in package list ({error}); run `wpkg refresh` later\n"));
+            EmbeddedRepository::new()
+        }
+    }
+}
+
+/// Download and validate a registry ZIP.
+fn fetch_registry(url: &str) -> Result<(Vec<u8>, EmbeddedRepository), String> {
+    let bytes = install::fetch_url(url, 300).map_err(|error| format!("cannot fetch the registry: {error}"))?;
+    let repository = EmbeddedRepository::from_zip(&bytes)?;
+    repository_names(&repository)?;
+    Ok((bytes, repository))
+}
+
+/// `wpkg refresh`: replace the guest's registry with the published one,
+/// reporting what changed.
+fn refresh_registry(fs: &mut WinFs, current: &dyn Repository) -> Result<String, String> {
+    let url = registry_url().ok_or("wpkg: refresh is off (WINRUN_WPKG_REGISTRY=embedded)")?;
+    let bytes = current.fetch(&url)?;
+    let fresh = EmbeddedRepository::from_zip(&bytes)?;
+    let summary = |repository: &dyn Repository| -> Result<HashMap<String, String>, String> {
+        let mut map = HashMap::new();
+        for name in repository_names(repository)? {
+            let label = if repository.fetch(&format!("packages/{name}/upstream.wpkg")).is_ok() {
+                "upstream".to_string()
+            } else {
+                registry_versions(repository, &name)?.join(", ")
+            };
+            map.insert(name, label);
+        }
+        Ok(map)
+    };
+    let (before, after) = (summary(current).unwrap_or_default(), summary(&fresh)?);
+    fs.mkdir(STATE)
+        .and_then(|_| fs.write_file(LOCAL_REGISTRY, bytes))
+        .map_err(|error| format!("wpkg: cannot keep the registry: {error}"))?;
+    let mut names: Vec<&String> = before.keys().chain(after.keys()).collect();
+    names.sort();
+    names.dedup();
+    let mut changes = String::new();
+    for name in names {
+        match (before.get(name), after.get(name)) {
+            (None, Some(now)) => changes.push_str(&format!("  + {name} ({now})\n")),
+            (Some(_), None) => changes.push_str(&format!("  - {name}\n")),
+            (Some(was), Some(now)) if was != now => changes.push_str(&format!("  ~ {name}: {was} -> {now}\n")),
+            _ => {}
+        }
+    }
+    Ok(if changes.is_empty() {
+        "✅ Package list is up to date\n".to_string()
+    } else {
+        format!("✅ Package list refreshed:\n{changes}")
+    })
+}
+
 impl EmbeddedRepository {
     pub fn new() -> Result<Self, String> {
-        let archive = include_bytes!("../registry.zip");
+        Self::from_zip(include_bytes!("../registry.zip"))
+    }
+
+    pub fn from_zip(archive: &[u8]) -> Result<Self, String> {
         let mut files = HashMap::new();
         for entry in install::zip_entries(archive)? {
             if entry.is_dir {
@@ -157,9 +270,63 @@ pub struct Manifest {
     pub version: String,
     pub arch: String,
     pub url: String,
-    pub sha256: String,
+    pub checksum: Checksum,
     pub bin: Vec<String>,
+    /// A program that runs each command's file (`dotnet`, `node`): the
+    /// command becomes a shim that runs `<run> <file> %*`.
+    pub run: Option<String>,
+    /// `NAME=VALUE` set for the package's commands (`{dir}` is the
+    /// package's directory).
+    pub env: Vec<String>,
+    /// `name` or `name@version` (a version line like `10` matches its
+    /// newest pinned `10.x`).
     pub dependencies: Vec<String>,
+    pub description: Option<String>,
+    /// Resolved from where the package is published rather than pinned.
+    pub upstream: bool,
+}
+
+/// An archive's expected hash: a pinned manifest's SHA-256, or the
+/// SHA-512 npm and NuGet publish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Checksum {
+    pub algorithm: &'static str,
+    pub hex: String,
+}
+
+impl Checksum {
+    fn new(algorithm: &'static str, hex: &str, digits: usize) -> Result<Self, String> {
+        let hex = hex.to_ascii_lowercase();
+        if hex.len() != digits || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(format!("wpkg: {algorithm} must contain exactly {digits} hexadecimal digits"));
+        }
+        Ok(Self { algorithm, hex })
+    }
+
+    pub fn sha256(hex: &str) -> Result<Self, String> {
+        Self::new("sha256", hex, 64)
+    }
+
+    pub fn sha512(hex: &str) -> Result<Self, String> {
+        Self::new("sha512", hex, 128)
+    }
+
+    fn of(&self, bytes: &[u8]) -> String {
+        if self.algorithm == "sha256" {
+            install::sha256_hex(bytes)
+        } else {
+            ring::digest::digest(&ring::digest::SHA512, bytes).as_ref().iter().map(|b| format!("{b:02x}")).collect()
+        }
+    }
+
+    fn matches(&self, bytes: &[u8]) -> bool {
+        self.of(bytes) == self.hex
+    }
+
+    /// The host cache's file name (SHA-256 hashes keep their old names).
+    fn cache_key(&self) -> String {
+        if self.algorithm == "sha256" { self.hex.clone() } else { format!("sha512-{}", self.hex) }
+    }
 }
 
 /// One extracted version under `C:\Program Files\<name>\<version>`.
@@ -169,6 +336,8 @@ pub struct InstalledVersion {
     pub arch: String,
     pub install_path: String,
     pub bin: Vec<String>,
+    pub run: Option<String>,
+    pub env: Vec<String>,
     pub dependencies: Vec<String>,
 }
 
@@ -218,9 +387,10 @@ enum Command {
     Default(String, Option<String>),
     CacheList,
     CacheClean(Option<String>),
+    Refresh,
 }
 
-const USAGE: &str = "usage: wpkg search <query> | info <package[@version]> | install <package[@version]> | list [package] | default <package> [version] | upgrade [package] | remove <package[@version]> | cache [clean [package]]";
+const USAGE: &str = "usage: wpkg search <query> | info <package[@version]> | install <package[@version]> | list [package] | default <package> [version] | upgrade [package] | remove <package[@version]> | cache [clean [package]] | refresh";
 
 fn parse_command(args: &[String]) -> Result<Command, String> {
     match args.first().map(|arg| arg.to_ascii_lowercase()).as_deref() {
@@ -234,6 +404,7 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
             Ok(Command::Default(args[1].clone(), args.get(2).cloned()))
         }
         Some("cache") if args.len() == 1 => Ok(Command::CacheList),
+        Some("refresh") if args.len() == 1 => Ok(Command::Refresh),
         Some("cache") if args[1].eq_ignore_ascii_case("clean") && args.len() <= 3 => {
             Ok(Command::CacheClean(args.get(2).cloned()))
         }
@@ -272,7 +443,11 @@ pub fn execute_with_progress(
                 output.extend_from_slice(b"No matching packages.\n");
             } else {
                 for name in matches {
-                    output.extend_from_slice(format!("{name}\n").as_bytes());
+                    let line = match package_description(repository, &name) {
+                        Some(description) => format!("{name} - {description}\n"),
+                        None => format!("{name}\n"),
+                    };
+                    output.extend_from_slice(line.as_bytes());
                 }
             }
         }
@@ -281,10 +456,12 @@ pub fn execute_with_progress(
             let manifest = resolve_version(repository, &name, version.as_deref(), &architecture)?;
             output.extend_from_slice(
                 format!(
-                    "{} {} ({})\nArchive: {}\nBinaries: {}\nDependencies: {}\n",
+                    "{} {} ({}){}\n{}Archive: {}\nBinaries: {}\nDependencies: {}\n",
                     manifest.name,
                     manifest.version,
                     manifest.arch,
+                    if manifest.upstream { ", newest upstream release" } else { "" },
+                    manifest.description.as_deref().map(|text| format!("{text}\n")).unwrap_or_default(),
                     manifest.url,
                     manifest.bin.join(", "),
                     if manifest.dependencies.is_empty() {
@@ -401,8 +578,27 @@ pub fn execute_with_progress(
         }
         Command::Remove(spec) => {
             let (name, version) = split_package_spec(&spec)?;
+            // Other packages' commands may need this one.
+            let dependents: Vec<String> = load_database(fs)?
+                .into_iter()
+                .filter(|package| package.name != name)
+                .filter(|package| {
+                    package.versions.iter().any(|entry| {
+                        entry.dependencies.iter().any(|dependency| dependency.split('@').next() == Some(name.as_str()))
+                    })
+                })
+                .map(|package| package.name)
+                .collect();
             let removed = remove_package(fs, &name, version.as_deref())?;
             output.extend_from_slice(format!("Removed {removed}\n").as_bytes());
+            if !dependents.is_empty() {
+                output.extend_from_slice(
+                    format!("⚠️ {} depend on {name}\n", dependents.join(", ")).as_bytes(),
+                );
+            }
+        }
+        Command::Refresh => {
+            output.extend_from_slice(refresh_registry(fs, repository)?.as_bytes());
         }
         Command::CacheList => {
             let archives = cached_archives(fs, None)?;
@@ -481,7 +677,7 @@ fn upgrade_package(
         .into_iter()
         .find(|package| package.name == name)
         .ok_or_else(|| format!("wpkg: package is not installed: {name}"))?;
-    let latest = latest_version(repository, name)?;
+    let latest = resolve_version(repository, name, None, arch)?.version;
     if installed
         .version(&latest)
         .is_some_and(|entry| entry.arch == arch)
@@ -531,14 +727,16 @@ fn install_recursive(
     }
     let manifest = resolve_version(repository, &name, requested_version, arch)?;
 
-    // Any installed version satisfies a dependency; installing a dependent
-    // never moves another package's default.
+    // A dependency names a package, or a version (line) of it: an
+    // installed match satisfies it, else the match installs beside the
+    // installed versions. Installing a dependent never moves another
+    // package's default.
     for dependency in &manifest.dependencies {
-        let dependency = normalize_name(dependency)?;
-        if load_database(fs)?
-            .iter()
-            .any(|package| package.name == dependency)
-        {
+        let (dependency, spec) = split_package_spec(dependency)?;
+        let satisfied = load_database(fs)?.iter().any(|package| {
+            package.name == dependency && spec.as_deref().is_none_or(|spec| !package.matching(spec).is_empty())
+        });
+        if satisfied {
             continue;
         }
         install_recursive(
@@ -546,11 +744,12 @@ fn install_recursive(
             repository,
             arch,
             &dependency,
-            None,
+            spec.as_deref(),
             visiting,
             output,
             progress,
-        )?;
+        )
+        .map_err(|error| format!("{error} (needed by {name})"))?;
     }
 
     let installed = load_database(fs)?;
@@ -609,11 +808,14 @@ fn download_archive(
         "🔎 Verifying {} {}...\n",
         manifest.name, manifest.version
     ));
-    let actual = install::sha256_hex(&archive);
-    if !actual.eq_ignore_ascii_case(&manifest.sha256) {
+    let actual = manifest.checksum.of(&archive);
+    if actual != manifest.checksum.hex {
         return Err(format!(
-            "wpkg: SHA-256 mismatch for {} {} (expected {}, got {actual})",
-            manifest.name, manifest.version, manifest.sha256
+            "wpkg: {} mismatch for {} {} (expected {}, got {actual})",
+            if manifest.checksum.algorithm == "sha256" { "SHA-256" } else { "SHA-512" },
+            manifest.name,
+            manifest.version,
+            manifest.checksum.hex
         ));
     }
     Ok(archive)
@@ -653,26 +855,19 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-fn host_cache_key(sha256: &str) -> Option<String> {
-    (sha256.len() == 64 && sha256.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .then(|| sha256.to_ascii_lowercase())
-}
-
-/// The cached archive with this SHA-256, re-verified.
-fn read_host_cache(sha256: &str) -> Option<Vec<u8>> {
-    let path = host_cache_dir()?.join(host_cache_key(sha256)?);
-    std::fs::read(path)
-        .ok()
-        .filter(|bytes| install::sha256_hex(bytes).eq_ignore_ascii_case(sha256))
+/// The cached archive with this hash, re-verified.
+fn read_host_cache(checksum: &Checksum) -> Option<Vec<u8>> {
+    let path = host_cache_dir()?.join(checksum.cache_key());
+    std::fs::read(path).ok().filter(|bytes| checksum.matches(bytes))
 }
 
 /// Keep a verified archive; written to a temporary name, then renamed, so a
 /// reader never sees a partial file.
-fn write_host_cache(sha256: &str, archive: &[u8]) -> Result<(), String> {
+fn write_host_cache(checksum: &Checksum, archive: &[u8]) -> Result<(), String> {
     let Some(dir) = host_cache_dir() else {
         return Ok(());
     };
-    let key = host_cache_key(sha256).ok_or("invalid SHA-256")?;
+    let key = checksum.cache_key();
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let partial = dir.join(format!(".{key}.{}.part", std::process::id()));
     std::fs::write(&partial, archive)
@@ -696,7 +891,7 @@ fn install_version(
     let cached = fs
         .read_file(&cache_path)
         .ok()
-        .filter(|bytes| install::sha256_hex(bytes).eq_ignore_ascii_case(&manifest.sha256));
+        .filter(|bytes| manifest.checksum.matches(bytes));
     let archive = match cached {
         Some(archive) => {
             progress(&format!(
@@ -706,7 +901,7 @@ fn install_version(
             archive
         }
         None => {
-            let archive = match read_host_cache(&manifest.sha256) {
+            let archive = match read_host_cache(&manifest.checksum) {
                 Some(archive) => {
                     progress(&format!(
                         "📦 Using downloaded {} {} from {}\n",
@@ -718,7 +913,7 @@ fn install_version(
                 }
                 None => {
                     let archive = download_archive(repository, manifest, progress)?;
-                    if let Err(error) = write_host_cache(&manifest.sha256, &archive) {
+                    if let Err(error) = write_host_cache(&manifest.checksum, &archive) {
                         progress(&format!("⚠️ Not kept for later installs: {error}\n"));
                     }
                     archive
@@ -742,7 +937,7 @@ fn install_version(
     // Only the default version is linked into BIN, so only a first
     // install can collide with another package's commands.
     if first_version {
-        check_bin_conflicts(fs, &manifest.name, &manifest.bin)?;
+        check_bin_conflicts(fs, &manifest.name, &manifest.bin, manifest.run.as_deref(), &manifest.env)?;
     }
 
     let final_path = version_path(&manifest.name, &manifest.version);
@@ -784,7 +979,8 @@ fn install_version(
                     .map_err(|error| format!("wpkg: cannot write {guest_path}: {error}"))?;
             }
         }
-        for executable in &manifest.bin {
+        for entry in &manifest.bin {
+            let (_, executable) = bin_parts(entry);
             let staged = format!(r"{}\{}", staging_path, executable.replace('/', "\\"));
             if !fs.is_file(&staged) {
                 return Err(format!(
@@ -815,6 +1011,8 @@ fn install_version(
         arch: manifest.arch.clone(),
         install_path: final_path.clone(),
         bin: manifest.bin.clone(),
+        run: manifest.run.clone(),
+        env: manifest.env.clone(),
         dependencies: manifest.dependencies.clone(),
     };
     let previous_default = match packages
@@ -1180,7 +1378,7 @@ fn set_default(
         .version(version)
         .cloned()
         .ok_or_else(|| format!("wpkg: {name} {version} is not installed"))?;
-    check_bin_conflicts(fs, name, &entry.bin)?;
+    check_bin_conflicts(fs, name, &entry.bin, entry.run.as_deref(), &entry.env)?;
     let current = current_link(name);
     if fs.exists(&current) && !fs.is_symlink(&current) {
         return Err(format!("wpkg: {current} exists and is not a link"));
@@ -1195,17 +1393,19 @@ fn set_default(
         .map_err(|error| format!("wpkg: cannot link {current}: {error}"))?;
     fs.mkdir(BIN)
         .map_err(|error| format!("wpkg: cannot create command directory: {error}"))?;
-    for executable in &entry.bin {
-        let exposed = expose_path(executable)?;
-        let target = format!(r"{}\{}", current, executable.replace('/', "\\"));
+    for bin in &entry.bin {
+        let Exposure { exposed, target, shim } = exposure(bin, entry.run.as_deref(), &entry.env)?;
+        let target = format!(r"{}\{}", current, target.replace('/', "\\"));
         // A batch file finds its own files through `%~dp0`, which names the
-        // link's directory, so batch commands get a forwarding shim instead.
-        let exposed_result = if is_batch(executable) {
-            fs.write_file(&exposed, shim_contents(&target))
+        // link's directory, so batch commands, launched files, and commands
+        // with environment settings get a forwarding shim instead.
+        let exposed_result = if shim {
+            let env: Vec<String> = entry.env.iter().map(|setting| setting.replace("{dir}", &current)).collect();
+            fs.write_file(&exposed, shim_contents(&target, entry.run.as_deref(), &env))
         } else {
             fs.create_symlink(&exposed, &target, false)
         };
-        exposed_result.map_err(|error| format!("wpkg: cannot expose {executable}: {error}"))?;
+        exposed_result.map_err(|error| format!("wpkg: cannot expose {bin}: {error}"))?;
     }
     package.default = version.to_string();
     Ok(())
@@ -1230,23 +1430,40 @@ fn is_batch(path: &str) -> bool {
     lower.ends_with(".cmd") || lower.ends_with(".bat")
 }
 
-/// A one-line batch file that runs `target` with the same arguments. Control
-/// passes to `target` without `call`, so its exit code is the shim's.
-fn shim_contents(target: &str) -> Vec<u8> {
-    format!("@\"{target}\" %*\r\n").into_bytes()
+/// A batch file that runs `target` (through `run`, with `env` set) with
+/// the same arguments. Control passes to `target` without `call`, so its
+/// exit code is the shim's. A plain forward is one line; a launcher names
+/// its target in a first `@rem wpkg-target` line.
+fn shim_contents(target: &str, run: Option<&str>, env: &[String]) -> Vec<u8> {
+    if run.is_none() && env.is_empty() {
+        return format!("@\"{target}\" %*\r\n").into_bytes();
+    }
+    let mut text = format!("@rem wpkg-target \"{target}\"\r\n@setlocal\r\n");
+    for setting in env {
+        text.push_str(&format!("@set \"{setting}\"\r\n"));
+    }
+    match run {
+        Some(run) => text.push_str(&format!("@{run} \"{target}\" %*\r\n")),
+        None => text.push_str(&format!("@\"{target}\" %*\r\n")),
+    }
+    text.into_bytes()
 }
 
 /// The target of a shim written by [`shim_contents`].
 fn shim_target(data: &[u8]) -> Option<String> {
-    let line = std::str::from_utf8(data).ok()?.trim_end();
-    let target = line.strip_prefix("@\"")?.strip_suffix("\" %*")?;
+    let text = std::str::from_utf8(data).ok()?;
+    let line = text.lines().next()?.trim_end();
+    let target = match line.strip_prefix("@rem wpkg-target \"") {
+        Some(rest) => rest.strip_suffix('"')?,
+        None => line.strip_prefix("@\"")?.strip_suffix("\" %*")?,
+    };
     (!target.contains('"') && !target.contains('\n')).then(|| target.to_string())
 }
 
-fn check_bin_conflicts(fs: &WinFs, name: &str, bins: &[String]) -> Result<(), String> {
+fn check_bin_conflicts(fs: &WinFs, name: &str, bins: &[String], run: Option<&str>, env: &[String]) -> Result<(), String> {
     let mut seen = HashSet::new();
-    for executable in bins {
-        let exposed = expose_path(executable)?;
+    for entry in bins {
+        let exposed = exposure(entry, run, env)?.exposed;
         if !seen.insert(exposed.to_ascii_lowercase()) {
             return Err(format!("wpkg: {name} exposes {exposed} more than once"));
         }
@@ -1281,7 +1498,9 @@ fn remove_owned_links(fs: &mut WinFs, name: &str) -> Result<(), String> {
 }
 
 fn latest_version(repository: &dyn Repository, name: &str) -> Result<String, String> {
-    let bytes = repository.fetch(&format!("packages/{name}/latest"))?;
+    let bytes = repository
+        .fetch(&format!("packages/{name}/latest"))
+        .map_err(|_| format!("wpkg: no package named {name} (see `wpkg search`)"))?;
     let version = std::str::from_utf8(&bytes)
         .map_err(|_| format!("wpkg: invalid latest version for {name}"))?
         .trim();
@@ -1317,6 +1536,20 @@ fn resolve_manifest(
         ));
     }
     Ok(manifest)
+}
+
+/// A package's one-line description, from its upstream `.wpkg` or its
+/// latest pinned one.
+fn package_description(repository: &dyn Repository, name: &str) -> Option<String> {
+    if let Ok(bytes) = repository.fetch(&format!("packages/{name}/upstream.wpkg")) {
+        return Recipe::parse(&bytes).ok()?.description;
+    }
+    let version = latest_version(repository, name).ok()?;
+    let bytes = repository
+        .fetch(&format!("packages/{name}/{version}.wpkg"))
+        .or_else(|_| repository.fetch(&format!("packages/{name}/{version}-{}.wpkg", host_architecture())))
+        .ok()?;
+    Manifest::parse(&bytes).ok()?.description
 }
 
 fn repository_names(repository: &dyn Repository) -> Result<Vec<String>, String> {
@@ -1363,6 +1596,14 @@ fn resolve_version(
     spec: Option<&str>,
     arch: &str,
 ) -> Result<Manifest, String> {
+    // An upstream package resolves its release where it is published.
+    if let Ok(bytes) = repository.fetch(&format!("packages/{name}/upstream.wpkg")) {
+        let recipe = Recipe::parse(&bytes)?;
+        if recipe.name != name {
+            return Err(format!("wpkg: upstream manifest identity mismatch for {name}"));
+        }
+        return upstream::resolve(repository, &recipe, spec, arch);
+    }
     let Some(spec) = spec else {
         let version = latest_version(repository, name)?;
         return resolve_manifest(repository, name, &version, arch);
@@ -1474,6 +1715,8 @@ fn load_database(fs: &WinFs) -> Result<Vec<InstalledPackage>, String> {
                         arch: string(entry, "arch")?,
                         install_path: string(entry, "install_path")?,
                         bin: strings(entry, "bin")?,
+                        run: entry.get("run").and_then(Value::as_str).map(str::to_string),
+                        env: if entry.get("env").is_some() { strings(entry, "env")? } else { Vec::new() },
                         dependencies: strings(entry, "dependencies")?,
                     })
                 })
@@ -1499,6 +1742,8 @@ fn save_database(fs: &mut WinFs, packages: &[InstalledPackage]) -> Result<(), St
                     "arch": entry.arch,
                     "install_path": entry.install_path,
                     "bin": entry.bin,
+                    "run": entry.run,
+                    "env": entry.env,
                     "dependencies": entry.dependencies,
                 })).collect::<Vec<_>>(),
             })
@@ -1522,12 +1767,6 @@ fn version_path(name: &str, version: &str) -> String {
 
 fn current_link(name: &str) -> String {
     format!(r"{ROOT}\{name}\{CURRENT}")
-}
-
-fn expose_path(executable: &str) -> Result<String, String> {
-    let basename = executable.rsplit('/').next().unwrap_or(executable);
-    validate_bin(basename)?;
-    Ok(format!(r"{}\{}", BIN, basename))
 }
 
 fn split_package_spec(spec: &str) -> Result<(String, Option<String>), String> {
@@ -1594,7 +1833,23 @@ pub fn host_architecture() -> &'static str {
     }
 }
 
-fn validate_bin(path: &str) -> Result<(), String> {
+/// A `bin` entry's command name (when given as `name=path`) and path.
+fn bin_parts(entry: &str) -> (Option<&str>, &str) {
+    match entry.split_once('=') {
+        Some((command, path)) => (Some(command), path),
+        None => (None, entry),
+    }
+}
+
+/// A `bin` entry: `path` or `command=path`, the path inside the package
+/// and, unless a `run` program opens it, an `.exe` or batch file.
+fn validate_bin(entry: &str, launched: bool) -> Result<(), String> {
+    let (command, path) = bin_parts(entry);
+    if let Some(command) = command {
+        if command.is_empty() || !command.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')) {
+            return Err(format!("wpkg: invalid command name in bin: {entry}"));
+        }
+    }
     let normalized = path.replace('\\', "/");
     if normalized.is_empty()
         || normalized.starts_with('/')
@@ -1602,11 +1857,36 @@ fn validate_bin(path: &str) -> Result<(), String> {
         || normalized
             .split('/')
             .any(|part| part.is_empty() || part == "." || part == ".." || part.trim().is_empty())
-        || !(normalized.to_ascii_lowercase().ends_with(".exe") || is_batch(&normalized))
+        || !(launched || normalized.to_ascii_lowercase().ends_with(".exe") || is_batch(&normalized))
     {
         return Err(format!("wpkg: unsafe or non-executable bin path: {path}"));
     }
     Ok(())
+}
+
+/// How one `bin` entry appears in [`BIN`]: its file there, its path inside
+/// the package, and whether it is a batch shim (launched files, packages
+/// with `env`, and batch files) rather than a link.
+struct Exposure {
+    exposed: String,
+    target: String,
+    shim: bool,
+}
+
+fn exposure(entry: &str, run: Option<&str>, env: &[String]) -> Result<Exposure, String> {
+    let (command, path) = bin_parts(entry);
+    let file = path.rsplit('/').next().unwrap_or(path);
+    let shim = run.is_some() || !env.is_empty() || is_batch(path);
+    let name = match (command, shim) {
+        (Some(command), true) if is_batch(command) => command.to_string(),
+        (Some(command), true) => format!("{command}.cmd"),
+        (None, true) if is_batch(file) => file.to_string(),
+        (None, true) => format!("{}.cmd", file.rsplit_once('.').map_or(file, |(stem, _)| stem)),
+        (Some(command), false) if command.to_ascii_lowercase().ends_with(".exe") => command.to_string(),
+        (Some(command), false) => format!("{command}.exe"),
+        (None, false) => file.to_string(),
+    };
+    Ok(Exposure { exposed: format!(r"{BIN}\{name}"), target: path.to_string(), shim })
 }
 
 fn safe_member(path: &str) -> Result<String, String> {
@@ -1625,38 +1905,84 @@ fn safe_member(path: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
-impl Manifest {
-    pub fn parse(bytes: &[u8]) -> Result<Self, String> {
-        let source = std::str::from_utf8(bytes).map_err(|_| "wpkg: manifest is not UTF-8")?;
-        let mut values: HashMap<String, String> = HashMap::new();
-        for (line_number, line) in source.lines().enumerate() {
-            let line = strip_comment(line).trim();
-            if line.is_empty() {
-                continue;
-            }
-            let (key, value) = line
-                .split_once('=')
-                .ok_or_else(|| format!("wpkg: malformed manifest line {}", line_number + 1))?;
-            let key = key.trim().to_ascii_lowercase();
-            if !matches!(
-                key.as_str(),
-                "name" | "version" | "arch" | "url" | "sha256" | "bin" | "dependencies"
-            ) {
-                return Err(format!("wpkg: unsupported manifest key: {key}"));
-            }
-            if values
-                .insert(key.clone(), value.trim().to_string())
-                .is_some()
-            {
-                return Err(format!("wpkg: duplicate manifest key: {key}"));
+/// A `.wpkg` file's `key = value` lines (values still in TOML form).
+pub(crate) fn parse_fields(bytes: &[u8], allowed: &[&str]) -> Result<HashMap<String, String>, String> {
+    let source = std::str::from_utf8(bytes).map_err(|_| "wpkg: manifest is not UTF-8")?;
+    let mut values: HashMap<String, String> = HashMap::new();
+    for (line_number, line) in source.lines().enumerate() {
+        let line = strip_comment(line).trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (key, value) = line
+            .split_once('=')
+            .ok_or_else(|| format!("wpkg: malformed manifest line {}", line_number + 1))?;
+        let key = key.trim().to_ascii_lowercase();
+        if !allowed.contains(&key.as_str()) {
+            return Err(format!("wpkg: unsupported manifest key: {key}"));
+        }
+        if values.insert(key.clone(), value.trim().to_string()).is_some() {
+            return Err(format!("wpkg: duplicate manifest key: {key}"));
+        }
+    }
+    Ok(values)
+}
+
+/// The keys pinned and upstream `.wpkg` files share.
+pub(crate) struct CommonFields {
+    pub bin: Vec<String>,
+    pub run: Option<String>,
+    pub env: Vec<String>,
+    pub dependencies: Vec<String>,
+    pub description: Option<String>,
+}
+
+impl CommonFields {
+    pub(crate) fn parse(values: &HashMap<String, String>) -> Result<Self, String> {
+        let array = |key: &str| values.get(key).map(|value| parse_string_array(value)).transpose().map(Option::unwrap_or_default);
+        let run = values.get("run").map(|value| parse_string(value)).transpose()?;
+        if let Some(run) = &run {
+            if run.is_empty() || !run.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')) {
+                return Err(format!("wpkg: run must name a command: {run}"));
             }
         }
+        let bin = array("bin")?;
+        if bin.is_empty() {
+            return Err("wpkg: manifest bin must not be empty".to_string());
+        }
+        for entry in &bin {
+            validate_bin(entry, run.is_some())?;
+        }
+        let env = array("env")?;
+        for entry in &env {
+            let (name, _) = entry.split_once('=').ok_or_else(|| format!("wpkg: env entries are NAME=VALUE: {entry}"))?;
+            if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') || entry.contains(['"', '\r', '\n']) {
+                return Err(format!("wpkg: invalid env entry: {entry}"));
+            }
+        }
+        let dependencies = array("dependencies")?
+            .into_iter()
+            .map(|dependency| {
+                let (name, version) = split_package_spec(&dependency)?;
+                Ok(match version {
+                    Some(version) => format!("{name}@{version}"),
+                    None => name,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let description = values.get("description").map(|value| parse_string(value)).transpose()?;
+        Ok(Self { bin, run, env, dependencies, description })
+    }
+}
+
+impl Manifest {
+    pub fn parse(bytes: &[u8]) -> Result<Self, String> {
+        let values = parse_fields(
+            bytes,
+            &["name", "version", "arch", "url", "sha256", "sha512", "bin", "run", "env", "dependencies", "description"],
+        )?;
         let string = |key: &str| -> Result<String, String> {
-            parse_string(
-                values
-                    .get(key)
-                    .ok_or_else(|| format!("wpkg: manifest missing {key}"))?,
-            )
+            parse_string(values.get(key).ok_or_else(|| format!("wpkg: manifest missing {key}"))?)
         };
         let name = normalize_name(&string("name")?)?;
         let version = normalize_version(&string("version")?)?;
@@ -1665,41 +1991,24 @@ impl Manifest {
         if !url.starts_with("https://") {
             return Err("wpkg: package archive URL must use HTTPS".to_string());
         }
-        let sha256 = string("sha256")?.to_ascii_lowercase();
-        if sha256.len() != 64
-            || !sha256
-                .chars()
-                .all(|character| character.is_ascii_hexdigit())
-        {
-            return Err("wpkg: sha256 must contain exactly 64 hexadecimal digits".to_string());
-        }
-        let bin = parse_string_array(
-            values
-                .get("bin")
-                .ok_or_else(|| "wpkg: manifest missing bin".to_string())?,
-        )?;
-        if bin.is_empty() {
-            return Err("wpkg: manifest bin must not be empty".to_string());
-        }
-        for executable in &bin {
-            validate_bin(executable)?;
-        }
-        let dependencies = values
-            .get("dependencies")
-            .map(|value| parse_string_array(value))
-            .transpose()?
-            .unwrap_or_default()
-            .into_iter()
-            .map(|dependency| normalize_name(&dependency))
-            .collect::<Result<Vec<_>, _>>()?;
+        let checksum = match (values.contains_key("sha256"), values.contains_key("sha512")) {
+            (true, false) => Checksum::sha256(&string("sha256")?)?,
+            (false, true) => Checksum::sha512(&string("sha512")?)?,
+            _ => return Err("wpkg: manifest needs exactly one of sha256 and sha512".to_string()),
+        };
+        let common = CommonFields::parse(&values)?;
         Ok(Self {
             name,
             version,
             arch,
             url,
-            sha256,
-            bin,
-            dependencies,
+            checksum,
+            bin: common.bin,
+            run: common.run,
+            env: common.env,
+            dependencies: common.dependencies,
+            description: common.description,
+            upstream: false,
         })
     }
 }
@@ -1916,6 +2225,169 @@ mod tests {
         encoder.finish().unwrap()
     }
 
+    fn sha512_base64(bytes: &[u8]) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(ring::digest::digest(&ring::digest::SHA512, bytes).as_ref())
+    }
+
+    /// An npm-published tool: the registry has only its upstream `.wpkg`.
+    fn npm_tool(repo: &mut MemoryRepo, versions: &[&str], integrity: bool) {
+        repo.add("packages/index", "tool\n");
+        repo.add(
+            "packages/tool/upstream.wpkg",
+            "name = \"tool\"\nupstream = \"npm\"\nx64 = \"tool-windows-x64\"\nbin = [\"package/bin/tool.exe\"]\ndescription = \"A tool\"\n",
+        );
+        let mut documents = serde_json::Map::new();
+        for version in versions {
+            let archive = npm_tarball("package/bin/tool.exe", format!("MZ {version}").as_bytes());
+            let url = format!("https://registry.npmjs.org/tool-windows-x64/-/tool-windows-x64-{version}.tgz");
+            let mut dist = serde_json::json!({ "tarball": url });
+            if integrity {
+                dist["integrity"] = format!("sha512-{}", sha512_base64(&archive)).into();
+            }
+            documents.insert(version.to_string(), serde_json::json!({ "version": version, "dist": dist }));
+            repo.add(url.as_str(), archive);
+        }
+        let newest = versions.last().unwrap();
+        repo.add("https://registry.npmjs.org/tool-windows-x64/latest", serde_json::to_vec(&documents[*newest]).unwrap());
+        repo.add(
+            "https://registry.npmjs.org/tool-windows-x64",
+            serde_json::to_vec(&serde_json::json!({ "versions": documents })).unwrap(),
+        );
+    }
+
+    #[test]
+    fn upstream_packages_install_the_newest_or_asked_release_verified_by_sha512() {
+        let mut repo = MemoryRepo::default();
+        npm_tool(&mut repo, &["1.0.0", "1.1.0", "2.0.0"], true);
+        let mut fs = WinFs::ephemeral_runner();
+        let output = run(&mut fs, &repo, &["install", "tool"]);
+        assert!(output.contains("Installed tool 2.0.0"), "{output}");
+        assert_eq!(fs.read_file(r"C:\ProgramData\wpkg\bin\tool.exe").unwrap(), b"MZ 2.0.0");
+        let output = run(&mut fs, &repo, &["install", "tool@1"]);
+        assert!(output.contains("Installed tool 1.1.0"), "a version line picks its newest: {output}");
+        assert!(run(&mut fs, &repo, &["info", "tool"]).contains("2.0.0 (x64), newest upstream release\nA tool\n"));
+        assert_eq!(run(&mut fs, &repo, &["search", "to"]), "tool - A tool\n");
+        // A release npm publishes no SHA-512 for is refused.
+        let mut repo = MemoryRepo::default();
+        npm_tool(&mut repo, &["1.0.0"], false);
+        let error = execute(&mut WinFs::ephemeral_runner(), &repo, "x64", &args(&["install", "tool"])).unwrap_err();
+        assert!(error.contains("npm publishes no SHA-512"), "{error}");
+        // A tampered archive fails verification.
+        let mut repo = MemoryRepo::default();
+        npm_tool(&mut repo, &["1.0.0"], true);
+        repo.add("https://registry.npmjs.org/tool-windows-x64/-/tool-windows-x64-1.0.0.tgz", b"not it".to_vec());
+        let error = execute(&mut WinFs::ephemeral_runner(), &repo, "x64", &args(&["install", "tool"])).unwrap_err();
+        assert!(error.contains("SHA-512 mismatch"), "{error}");
+    }
+
+    #[test]
+    fn nuget_and_github_upstreams_resolve_with_published_hashes() {
+        let mut repo = MemoryRepo::default();
+        repo.add("packages/index", "fmt\ncli\n");
+        repo.add(
+            "packages/fmt/upstream.wpkg",
+            "name = \"fmt\"\nupstream = \"nuget\"\nx64 = \"Fmt\"\nbin = [\"fmt=tools/any/Fmt.dll\"]\nrun = \"dotnet\"\n",
+        );
+        let nupkg = zip_stored(vec![("tools/any/Fmt.dll", b"MZ dll")]);
+        repo.add("https://api.nuget.org/v3-flatcontainer/fmt/index.json", br#"{"versions":["1.0.0","1.2.0","2.0.0-beta"]}"#.to_vec());
+        repo.add(
+            "https://api.nuget.org/v3/registration5-semver1/fmt/1.2.0.json",
+            br#"{"catalogEntry":"https://api.nuget.org/v3/catalog0/data/fmt.1.2.0.json"}"#.to_vec(),
+        );
+        repo.add(
+            "https://api.nuget.org/v3/catalog0/data/fmt.1.2.0.json",
+            serde_json::to_vec(&serde_json::json!({"packageHash": sha512_base64(&nupkg), "packageHashAlgorithm": "SHA512"})).unwrap(),
+        );
+        repo.add("https://api.nuget.org/v3-flatcontainer/fmt/1.2.0/fmt.1.2.0.nupkg", nupkg);
+        let mut fs = WinFs::ephemeral_runner();
+        let output = run(&mut fs, &repo, &["install", "fmt"]);
+        assert!(output.contains("Installed fmt 1.2.0"), "prereleases are skipped: {output}");
+        // A launched file is exposed as a shim that runs it through `run`.
+        let shim = String::from_utf8(fs.read_file(r"C:\ProgramData\wpkg\bin\fmt.cmd").unwrap()).unwrap();
+        assert_eq!(
+            shim,
+            "@rem wpkg-target \"C:\\Program Files\\fmt\\current\\tools\\any\\Fmt.dll\"\r\n@setlocal\r\n@dotnet \"C:\\Program Files\\fmt\\current\\tools\\any\\Fmt.dll\" %*\r\n"
+        );
+
+        repo.add(
+            "packages/cli/upstream.wpkg",
+            "name = \"cli\"\nupstream = \"github\"\nrepo = \"o/cli\"\nx64 = \"cli-{version}-win64.zip\"\nbin = [\"{stem}/cli.exe\"]\nenv = [\"CLI_HOME={dir}\"]\n",
+        );
+        let zip = zip_stored(vec![("cli-3.1-win64/cli.exe", b"MZ cli")]);
+        let release = |digest: Option<String>| {
+            let mut asset = serde_json::json!({"name": "cli-3.1-win64.zip", "browser_download_url": "https://github.com/o/cli/releases/download/v3.1/cli-3.1-win64.zip"});
+            if let Some(digest) = digest {
+                asset["digest"] = digest.into();
+            }
+            serde_json::to_vec(&serde_json::json!({"tag_name": "v3.1", "assets": [asset]})).unwrap()
+        };
+        repo.add("https://api.github.com/repos/o/cli/releases/latest", release(None));
+        let error = execute(&mut fs, &repo, "x64", &args(&["install", "cli"])).unwrap_err();
+        assert!(error.contains("GitHub publishes no SHA-256"), "{error}");
+        repo.add("https://api.github.com/repos/o/cli/releases/latest", release(Some(format!("sha256:{}", install::sha256_hex(&zip)))));
+        repo.add("https://github.com/o/cli/releases/download/v3.1/cli-3.1-win64.zip", zip);
+        let output = run(&mut fs, &repo, &["install", "cli"]);
+        assert!(output.contains("Installed cli 3.1"), "{output}");
+        let shim = String::from_utf8(fs.read_file(r"C:\ProgramData\wpkg\bin\cli.cmd").unwrap()).unwrap();
+        assert!(shim.contains("@set \"CLI_HOME=C:\\Program Files\\cli\\current\"\r\n"), "{shim}");
+        assert!(shim.ends_with("@\"C:\\Program Files\\cli\\current\\cli-3.1-win64\\cli.exe\" %*\r\n"), "{shim}");
+        // Removing the package removes its shims.
+        run(&mut fs, &repo, &["remove", "cli"]);
+        assert!(!fs.exists(r"C:\ProgramData\wpkg\bin\cli.cmd"));
+    }
+
+    #[test]
+    fn dependencies_pick_pinned_version_lines_side_by_side() {
+        let mut repo = MemoryRepo::default();
+        repo.package("dotnet", "8.0.5", "x64", &["dotnet.exe"], &[]);
+        repo.package("dotnet", "10.0.1", "x64", &["dotnet.exe"], &[]);
+        repo.package("dotnet", "10.0.3", "x64", &["dotnet.exe"], &[]);
+        repo.package("app", "1.0", "x64", &["app.exe"], &["dotnet@10"]);
+        repo.package("old", "1.0", "x64", &["old.exe"], &["dotnet@6"]);
+        repo.add("packages/index", "app\ndotnet\nold\n");
+        let mut fs = WinFs::ephemeral_runner();
+        run(&mut fs, &repo, &["install", "dotnet@8"]);
+        let output = run(&mut fs, &repo, &["install", "app"]);
+        assert!(output.contains("Installed dotnet 10.0.3"), "the newest pinned 10.x: {output}");
+        assert_eq!(installed_versions(&fs, "dotnet"), ["8.0.5", "10.0.3"], "beside the installed 8");
+        assert_eq!(default_version(&fs, "dotnet"), "8.0.5", "a dependency never moves the default");
+        let output = run(&mut fs, &repo, &["install", "app"]);
+        assert!(!output.contains("Installed dotnet"), "an installed match is reused: {output}");
+        let error = execute(&mut fs, &repo, "x64", &args(&["install", "nope"])).unwrap_err();
+        assert_eq!(error, "wpkg: no package named nope (see `wpkg search`)");
+        let error = execute(&mut fs, &repo, "x64", &args(&["install", "old"])).unwrap_err();
+        assert!(error.contains("no dotnet version matches 6") && error.contains("needed by old"), "{error}");
+        // Removing a package others need says so.
+        let output = run(&mut fs, &repo, &["remove", "dotnet@10.0.3"]);
+        assert!(output.contains("⚠️ app depend on dotnet"), "{output}");
+    }
+
+    #[test]
+    fn refresh_replaces_the_registry_copy_and_reports_changes() {
+        let mut published = MemoryRepo::default();
+        published.add("packages/index", "tool\n");
+        published.add("packages/tool/upstream.wpkg", "name = \"tool\"\nupstream = \"npm\"\nx64 = \"t\"\nbin = [\"t.exe\"]\n");
+        let mut entries: Vec<(&str, &[u8])> = published.files.iter().map(|(path, bytes)| (path.as_str(), bytes.as_slice())).collect();
+        entries.sort();
+        let zip = zip_stored(entries);
+        let mut repo = MemoryRepo::default();
+        repo.package("old", "1.0", "x64", &["old.exe"], &[]);
+        repo.add("packages/index", "old\n");
+        repo.add(REGISTRY_URL, zip.clone());
+        let mut fs = WinFs::ephemeral_runner();
+        let output = run(&mut fs, &repo, &["refresh"]);
+        assert_eq!(output, "✅ Package list refreshed:\n  - old\n  + tool (upstream)\n");
+        assert_eq!(fs.read_file(LOCAL_REGISTRY).unwrap(), zip);
+        // The guest's copy is what wpkg works from afterwards.
+        let local = open_registry(&mut fs, &mut |_| {}).unwrap();
+        assert_eq!(repository_names(&local).unwrap(), ["tool"]);
+        // A download that is not a registry leaves the copy alone.
+        repo.add(REGISTRY_URL, b"not a zip".to_vec());
+        assert!(execute(&mut fs, &repo, "x64", &args(&["refresh"])).is_err());
+        assert_eq!(fs.read_file(LOCAL_REGISTRY).unwrap(), zip);
+    }
+
     #[test]
     fn npm_tarballs_install_like_zip_packages() {
         let mut repo = MemoryRepo::default();
@@ -2018,12 +2490,12 @@ mod tests {
     #[test]
     fn shim_targets_round_trip_and_reject_other_batch_files() {
         let target = r"C:\Program Files\nodejs\current\npm.cmd";
-        assert_eq!(super::shim_target(&super::shim_contents(target)).as_deref(), Some(target));
+        assert_eq!(super::shim_target(&super::shim_contents(target, None, &[])).as_deref(), Some(target));
         assert_eq!(super::shim_target(b"@echo off\r\nnode %*\r\n"), None);
         assert_eq!(super::shim_target(b"@\"a\" b\" %*"), None);
-        assert!(super::validate_bin("bin/tool.cmd").is_ok());
-        assert!(super::validate_bin("bin/tool.BAT").is_ok());
-        assert!(super::validate_bin("bin/tool.ps1").is_err());
+        assert!(super::validate_bin("bin/tool.cmd", false).is_ok());
+        assert!(super::validate_bin("bin/tool.BAT", false).is_ok());
+        assert!(super::validate_bin("bin/tool.ps1", false).is_err());
     }
 
     #[test]
@@ -2618,24 +3090,29 @@ mod tests {
         assert_eq!(
             names,
             [
-                "7zip", "bat", "biome", "bun", "curl", "deno", "dotnet", "esbuild", "fd", "fzf", "gh", "git", "micro",
-                "nodejs", "opencode", "python", "ripgrep", "uv"
+                "7zip", "bat", "biome", "bun", "csharpier", "curl", "deno", "dotnet", "esbuild", "fd", "fzf", "gh",
+                "git", "micro", "nodejs", "opencode", "python", "ripgrep", "uv"
             ]
         );
-        // npm platform packages: one executable in an npm tarball.
-        let opencode = resolve_version(&repo, "opencode", None, "x64").unwrap();
+        // Upstream packages carry recipes, resolved where they are published.
+        let recipe = |name: &str| Recipe::parse(&repo.fetch(&format!("packages/{name}/upstream.wpkg")).unwrap()).unwrap();
+        let opencode = recipe("opencode");
+        assert_eq!((opencode.upstream, opencode.x64.as_deref()), (upstream::Upstream::Npm, Some("opencode-windows-x64")));
         assert_eq!(opencode.bin, ["package/bin/opencode.exe"]);
-        assert_eq!(archive_kind(&opencode.url), "tgz");
-        assert!(resolve_version(&repo, "esbuild", None, "arm64").unwrap().url.contains("@esbuild/win32-arm64"));
-        let bun = resolve_version(&repo, "bun", None, "x64").unwrap();
-        assert_eq!(bun.bin, ["bun-windows-x64/bun.exe"]);
-        let bun = resolve_version(&repo, "bun", None, "arm64").unwrap();
-        assert_eq!(bun.bin, ["bun-windows-aarch64/bun.exe"]);
+        let bun = recipe("bun");
+        assert_eq!((bun.repo.as_deref(), bun.tag.as_str()), (Some("oven-sh/bun"), "bun-v{version}"));
+        let csharpier = recipe("csharpier");
+        assert_eq!((csharpier.run.as_deref(), csharpier.dependencies.as_slice()), (Some("dotnet"), &["dotnet@10".to_string()][..]));
+        for name in &names {
+            if repo.fetch(&format!("packages/{name}/upstream.wpkg")).is_ok() {
+                assert!(recipe(name).description.is_some(), "{name} has a description");
+            }
+        }
         let micro = resolve_version(&repo, "micro", None, "x64").unwrap();
         assert_eq!(micro.version, "2.0.15");
         assert_eq!(micro.bin, ["micro-2.0.15/micro.exe"]);
         assert_eq!(
-            micro.sha256,
+            micro.checksum.hex,
             "90635c53c11aa2a0d997f5e3ed43528877740725500207640b29551cef18479b"
         );
         assert!(resolve_manifest(&repo, "micro", "2.0.15", "arm64").is_err());
@@ -2649,6 +3126,9 @@ mod tests {
         let node = resolve_version(&repo, "nodejs", Some("24"), "x64").unwrap();
         assert_eq!(node.version, "24.21.0");
         for name in names {
+            if repo.fetch(&format!("packages/{name}/upstream.wpkg")).is_ok() {
+                continue;
+            }
             let latest = latest_version(&repo, &name).unwrap();
             assert!(registry_versions(&repo, &name).unwrap().contains(&latest));
         }

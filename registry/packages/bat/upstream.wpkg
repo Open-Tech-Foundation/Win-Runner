@@ -1,6 +1,8 @@
-kind = "github"
+name = "bat"
+upstream = "github"
 repo = "sharkdp/bat"
 tag = "v{version}"
 x64 = "bat-v{version}-x86_64-pc-windows-msvc.zip"
 arm64 = "bat-v{version}-aarch64-pc-windows-msvc.zip"
 bin = ["{stem}/bat.exe"]
+description = "A cat clone with syntax highlighting and Git integration"

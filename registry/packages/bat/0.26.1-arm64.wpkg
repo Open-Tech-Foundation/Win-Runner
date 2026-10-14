@@ -1,6 +1,0 @@
-name = "bat"
-version = "0.26.1"
-arch = "arm64"
-url = "https://github.com/sharkdp/bat/releases/download/v0.26.1/bat-v0.26.1-aarch64-pc-windows-msvc.zip"
-sha256 = "af07dd1939e99f7f5892d197fc5653cb8cb6c5999552731135ad156eca7e38a5"
-bin = ["bat-v0.26.1-aarch64-pc-windows-msvc/bat.exe"]

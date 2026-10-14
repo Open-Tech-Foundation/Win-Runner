@@ -1,6 +1,8 @@
-kind = "github"
+name = "deno"
+upstream = "github"
 repo = "denoland/deno"
 tag = "v{version}"
 x64 = "deno-x86_64-pc-windows-msvc.zip"
 arm64 = "deno-aarch64-pc-windows-msvc.zip"
 bin = ["deno.exe"]
+description = "JavaScript and TypeScript runtime"

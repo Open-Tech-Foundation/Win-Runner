@@ -1,6 +1,0 @@
-name = "biome"
-version = "2.5.15"
-arch = "x64"
-url = "https://registry.npmjs.org/@biomejs/cli-win32-x64/-/cli-win32-x64-2.5.15.tgz"
-sha256 = "91fe1e1e7a104c7758581bf6786154e9aaf84e3ec85da1878e2fc7a2c270443c"
-bin = ["package/biome.exe"]

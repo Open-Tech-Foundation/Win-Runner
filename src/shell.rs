@@ -433,6 +433,7 @@ impl Shell {
         crate::taskkill_tool::seed_taskkill_exe(&mut fs);
         crate::where_tool::seed_where_exe(&mut fs);
         crate::text_tools::seed_text_tools(&mut fs);
+        crate::wpkg::seed_wpkg_exe(&mut fs);
         if let Err(error) = crate::trust_roots::seed_root_store(&mut fs) {
             eprintln!("winrun: cannot add trusted root certificates: {error}");
         }
@@ -1289,7 +1290,6 @@ impl Shell {
         out: &mut Vec<u8>,
         sink: Option<&backend::OutputSink>,
     ) -> Result<(), String> {
-        let repository = wpkg::EmbeddedRepository::new()?;
         // Live output to a terminal redraws the download bar in place;
         // captured or piped output keeps only the finished lines.
         let terminal = sink.is_some() && std::io::IsTerminal::is_terminal(&std::io::stdout());
@@ -1303,6 +1303,11 @@ impl Shell {
             } else {
                 out.extend_from_slice(text.as_bytes());
             }
+        };
+        // The guest's registry copy, fetched on first use.
+        let repository = {
+            let mut report = |message: &str| emit(message, out);
+            wpkg::open_registry(&mut self.fs, &mut report)?
         };
         let result = {
             let mut report = |message: &str| emit(&status.render(message), out);

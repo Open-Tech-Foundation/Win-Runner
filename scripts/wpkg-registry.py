@@ -1,30 +1,31 @@
 #!/usr/bin/env python3
-"""Add and update wpkg registry packages from where projects publish them.
+"""Pin package versions in the wpkg registry.
 
-Each package records its origin in `registry/packages/<name>/source`
-(TOML). `update` reads it, finds the newest release, writes the `.wpkg`
-manifests (x64 and arm64) with their SHA-256, updates `latest`,
-`versions` and `index`, and rebuilds `registry.zip`.
+Pinned packages (the ones whose versions we choose and test, like git,
+nodejs, python, dotnet) keep a maintainer recipe in
+`registry/packages/<name>/source`: where releases are published and how
+their files are named. Upstream packages need nothing here; their
+`upstream.wpkg` is resolved by wpkg itself at install time.
 
-  scripts/wpkg-registry.py update [NAME ...]        refresh (all by default)
-  scripts/wpkg-registry.py update --check           report, change nothing
-  scripts/wpkg-registry.py add NAME KIND KEY=VALUE ...  record a source, then update
+  scripts/wpkg-registry.py latest NAME [LINE]   newest release (in LINE, e.g. 24)
+  scripts/wpkg-registry.py add NAME VERSION     pin VERSION: write its manifests
 
-Kinds and their keys (`x64`/`arm64` name what to fetch per architecture;
-leave one out when upstream has no such build):
+`add` writes `<version>.wpkg` (x64) and `<version>-arm64.wpkg` with each
+archive's SHA-256 (taken from upstream when published, else computed from
+a download), lists the version in `versions`, moves `latest` when it is
+the highest, and rebuilds `registry.zip`.
 
-  github  repo, tag ("v{version}"), x64, arm64: asset names
-  npm     x64, arm64: npm package names (the platform packages)
+Recipe kinds and keys (`x64`/`arm64` name the file per architecture):
+
+  github  repo, tag ("v{version}"), x64, arm64: asset names; `version` is a
+          regex with one group per version part when the tag needs it
   nuget   x64, arm64: NuGet package ids
   dotnet  channel ("10.0"), product ("runtime")
-  node    major ("24")
+  node    (none)
 
-Every kind takes `bin` (paths inside the archive; a list), optional
-`dependencies`, `prerelease = true` to allow prereleases, and `version`
-(a regex with one group per version part) when the tag needs more than
-the `tag` pattern. Templates may use {version}, {version_nodot},
-{major}, {arch} (x64|arm64), and in `bin` also {stem}: the archive's file
-name without its extension.
+Every recipe has `bin`, and may have `dependencies`, `run`, `env`, and
+`description`. Templates may use {version}, {version_nodot}, {arch}, and in
+`bin` also {stem}: the archive's file name without its extension.
 
 Set GITHUB_TOKEN to raise GitHub's API rate limit.
 """
@@ -46,10 +47,8 @@ PACKAGES = ROOT / "registry" / "packages"
 ARCHES = ("x64", "arm64")
 
 
-def fetch(url: str, accept: str | None = None) -> bytes:
+def fetch(url: str) -> bytes:
     request = urllib.request.Request(url, headers={"User-Agent": "wpkg-registry"})
-    if accept:
-        request.add_header("Accept", accept)
     if "api.github.com" in url and os.environ.get("GITHUB_TOKEN"):
         request.add_header("Authorization", f"Bearer {os.environ['GITHUB_TOKEN']}")
     with urllib.request.urlopen(request, timeout=120) as response:
@@ -57,225 +56,197 @@ def fetch(url: str, accept: str | None = None) -> bytes:
 
 
 def fetch_json(url: str):
-    return json.loads(fetch(url, "application/json"))
-
-
-def sha256_of(url: str) -> str:
-    print(f"  downloading {url}", file=sys.stderr)
-    return hashlib.sha256(fetch(url)).hexdigest()
+    return json.loads(fetch(url))
 
 
 def version_key(version: str):
     return [int(part) if part.isdigit() else part for part in re.split(r"[.\-+]", version)]
 
 
+def stable(version: str) -> bool:
+    return not re.search(r"[-+]", version)
+
+
+def in_line(version: str, line: str | None) -> bool:
+    return line is None or version == line or version.startswith(line + ".")
+
+
 def fill(template: str, version: str, arch: str, stem: str = "") -> str:
-    return template.format(
-        version=version,
-        version_nodot=version.replace(".", ""),
-        major=version.split(".")[0],
-        arch=arch,
-        stem=stem,
+    return (
+        template.replace("{version}", version)
+        .replace("{version_nodot}", version.replace(".", ""))
+        .replace("{arch}", arch)
+        .replace("{stem}", stem)
     )
 
 
-def tag_regex(source: dict) -> re.Pattern:
+def tag_version(source: dict, tag: str) -> str | None:
     if "version" in source:
-        return re.compile(f"^{source['version']}$")
-    pattern = re.escape(source.get("tag", "v{version}")).replace(r"\{version\}", r"(\d[\w.\-+]*)")
-    return re.compile(f"^{pattern}$")
+        match = re.fullmatch(source["version"], tag)
+        return ".".join(match.groups()) if match else None
+    prefix, _, suffix = source.get("tag", "v{version}").partition("{version}")
+    if tag.startswith(prefix) and tag.endswith(suffix):
+        version = tag[len(prefix) : len(tag) - len(suffix) or None]
+        return version if version[:1].isdigit() else None
+    return None
 
 
-# Each resolver returns (version, {arch: (url, sha256 or None)}).
+# Each kind: (versions on offer, files of one version as {arch: (url, sha256 or None)}).
 
 
-def resolve_github(source: dict):
-    repo = source["repo"]
-    releases = fetch_json(f"https://api.github.com/repos/{repo}/releases?per_page=30")
-    pattern = tag_regex(source)
-    for release in releases:
-        if release.get("draft") or (release.get("prerelease") and not source.get("prerelease")):
-            continue
-        match = pattern.match(release["tag_name"])
-        if not match:
-            continue
-        version = ".".join(match.groups())
-        assets = {asset["name"]: asset for asset in release["assets"]}
-        found = {}
-        for arch in ARCHES:
-            if arch not in source:
-                continue
-            name = fill(source[arch], version, arch)
-            asset = assets.get(name)
-            if asset is None:
-                break
-            digest = asset.get("digest") or ""
-            found[arch] = (asset["browser_download_url"], digest.removeprefix("sha256:") or None)
-        else:
-            return version, found
-    raise SystemExit(f"{repo}: no release matches tag pattern and assets")
+def github_releases(source: dict) -> dict[str, dict]:
+    releases = {}
+    for page in range(1, 4):
+        batch = fetch_json(f"https://api.github.com/repos/{source['repo']}/releases?per_page=100&page={page}")
+        for release in batch:
+            version = tag_version(source, release["tag_name"])
+            if version and not release.get("draft"):
+                releases[version] = release
+        if len(batch) < 100:
+            break
+    return releases
 
 
-def resolve_npm(source: dict):
-    first = source.get("x64") or source["arm64"]
-    meta = fetch_json(f"https://registry.npmjs.org/{first.replace('/', '%2F')}/latest")
-    version = meta["version"]
+def github_versions(source: dict, line: str | None) -> list[str]:
+    return list(github_releases(source))
+
+
+def github_files(source: dict, version: str) -> dict:
+    release = github_releases(source).get(version)
+    if release is None:
+        raise SystemExit(f"{source['repo']}: no release {version}")
+    assets = {asset["name"]: asset for asset in release["assets"]}
     found = {}
     for arch in ARCHES:
-        if arch in source:
-            package = source[arch].replace("/", "%2F")
-            info = fetch_json(f"https://registry.npmjs.org/{package}/{version}")
-            found[arch] = (info["dist"]["tarball"], None)
-    return version, found
+        asset = assets.get(fill(source[arch], version, arch)) if arch in source else None
+        if asset:
+            found[arch] = (asset["browser_download_url"], (asset.get("digest") or "").removeprefix("sha256:") or None)
+    return found
 
 
-def resolve_nuget(source: dict):
-    first = (source.get("x64") or source["arm64"]).lower()
-    versions = fetch_json(f"https://api.nuget.org/v3-flatcontainer/{first}/index.json")["versions"]
-    stable = [v for v in versions if source.get("prerelease") or "-" not in v]
-    version = max(stable, key=version_key)
-    found = {}
-    for arch in ARCHES:
-        if arch in source:
-            package = source[arch].lower()
-            found[arch] = (f"https://globalcdn.nuget.org/packages/{package}.{version}.nupkg", None)
-    return version, found
+def nuget_versions(source: dict, line: str | None) -> list[str]:
+    package = (source.get("x64") or source["arm64"]).lower()
+    return fetch_json(f"https://api.nuget.org/v3-flatcontainer/{package}/index.json")["versions"]
 
 
-def resolve_dotnet(source: dict):
-    channel = source.get("channel", "10.0")
+def nuget_files(source: dict, version: str) -> dict:
+    return {
+        arch: (f"https://globalcdn.nuget.org/packages/{source[arch].lower()}.{version}.nupkg", None)
+        for arch in ARCHES
+        if arch in source
+    }
+
+
+def dotnet_meta(source: dict, channel: str | None):
+    return fetch_json(
+        f"https://builds.dotnet.microsoft.com/dotnet/release-metadata/{channel or source.get('channel', '10.0')}/releases.json"
+    )
+
+
+def dotnet_versions(source: dict, line: str | None) -> list[str]:
     product = source.get("product", "runtime")
-    meta = fetch_json(f"https://builds.dotnet.microsoft.com/dotnet/release-metadata/{channel}/releases.json")
-    version = meta[f"latest-{product}"]
-    release = next(r for r in meta["releases"] if r.get(product, {}).get("version") == version)
+    return [r[product]["version"] for r in dotnet_meta(source, line)["releases"] if r.get(product, {}).get("version")]
+
+
+def dotnet_files(source: dict, version: str) -> dict:
+    product = source.get("product", "runtime")
     prefix = {"runtime": "dotnet-runtime", "aspnetcore-runtime": "aspnetcore-runtime", "sdk": "dotnet-sdk"}[product]
-    found = {}
-    for arch in ARCHES:
-        for file in release[product]["files"]:
-            if file["rid"] == f"win-{arch}" and file["name"] == f"{prefix}-win-{arch}.zip":
-                found[arch] = (file["url"], None)
-    return version, found
+    channel = ".".join(version.split(".")[:2])
+    release = next(r for r in dotnet_meta(source, channel)["releases"] if r.get(product, {}).get("version") == version)
+    return {
+        arch: (file["url"], None)
+        for arch in ARCHES
+        for file in release[product]["files"]
+        if file["rid"] == f"win-{arch}" and file["name"] == f"{prefix}-win-{arch}.zip"
+    }
 
 
-def resolve_node(source: dict):
-    major = str(source["major"])
-    releases = fetch_json("https://nodejs.org/dist/index.json")
-    version = next(r["version"] for r in releases if r["version"].startswith(f"v{major}.")).lstrip("v")
+def node_versions(source: dict, line: str | None) -> list[str]:
+    return [r["version"].lstrip("v") for r in fetch_json("https://nodejs.org/dist/index.json")]
+
+
+def node_files(source: dict, version: str) -> dict:
     sums = fetch(f"https://nodejs.org/dist/v{version}/SHASUMS256.txt").decode()
     found = {}
     for arch in ARCHES:
         name = f"node-v{version}-win-{arch}.zip"
         digest = next((line.split()[0] for line in sums.splitlines() if line.endswith(name)), None)
-        found[arch] = (f"https://nodejs.org/download/release/v{version}/{name}", digest)
-    return version, found
+        if digest:
+            found[arch] = (f"https://nodejs.org/download/release/v{version}/{name}", digest)
+    return found
 
 
-RESOLVERS = {
-    "github": resolve_github,
-    "npm": resolve_npm,
-    "nuget": resolve_nuget,
-    "dotnet": resolve_dotnet,
-    "node": resolve_node,
+KINDS = {
+    "github": (github_versions, github_files),
+    "nuget": (nuget_versions, nuget_files),
+    "dotnet": (dotnet_versions, dotnet_files),
+    "node": (node_versions, node_files),
 }
+
+
+def recipe(name: str) -> dict:
+    path = PACKAGES / name / "source"
+    if not path.is_file():
+        raise SystemExit(f"{name}: no maintainer recipe (registry/packages/{name}/source)")
+    return tomllib.loads(path.read_text(encoding="utf-8"))
+
+
+def latest(name: str, line: str | None) -> str:
+    source = recipe(name)
+    versions = [v for v in KINDS[source["kind"]][0](source, line) if stable(v) and in_line(v, line)]
+    if not versions:
+        raise SystemExit(f"{name}: no release{' in ' + line if line else ''}")
+    return max(versions, key=version_key)
 
 
 def quoted(items) -> str:
     return "[" + ", ".join(json.dumps(item) for item in items) + "]"
 
 
-def manifest(name: str, version: str, arch: str, url: str, sha: str, source: dict) -> str:
-    stem = re.sub(r"(\.tar\.gz|\.tgz|\.zip|\.7z|\.nupkg)$", "", url.rsplit("/", 1)[-1])
-    bins = [fill(entry, version, arch, stem) for entry in source["bin"]]
-    text = (
-        f'name = "{name}"\nversion = "{version}"\narch = "{arch}"\n'
-        f'url = "{url}"\nsha256 = "{sha}"\nbin = {quoted(bins)}\n'
-    )
-    if source.get("dependencies"):
-        text += f"dependencies = {quoted(source['dependencies'])}\n"
-    return text
-
-
-def update(name: str, check: bool) -> bool:
-    directory = PACKAGES / name
-    source = tomllib.loads((directory / "source").read_text(encoding="utf-8"))
-    version, found = RESOLVERS[source["kind"]](source)
+def add(name: str, version: str) -> None:
+    source = recipe(name)
+    found = KINDS[source["kind"]][1](source, version)
     if not found:
-        raise SystemExit(f"{name}: no Windows archives found for {version}")
+        raise SystemExit(f"{name}: release {version} has no Windows archives")
+    directory = PACKAGES / name
+    for arch, (url, sha) in found.items():
+        if not sha:
+            print(f"  downloading {url}", file=sys.stderr)
+            sha = hashlib.sha256(fetch(url)).hexdigest()
+        stem = re.sub(r"(\.tar\.gz|\.tgz|\.zip|\.7z|\.nupkg)$", "", url.rsplit("/", 1)[-1])
+        lines = [
+            f'name = "{name}"',
+            f'version = "{version}"',
+            f'arch = "{arch}"',
+            f'url = "{url}"',
+            f'sha256 = "{sha}"',
+            f"bin = {quoted(fill(entry, version, arch, stem) for entry in source['bin'])}",
+        ]
+        for key in ("run", "description"):
+            if source.get(key):
+                lines.append(f"{key} = {json.dumps(source[key])}")
+        for key in ("env", "dependencies"):
+            if source.get(key):
+                lines.append(f"{key} = {quoted(source[key])}")
+        file = directory / (f"{version}.wpkg" if arch == "x64" else f"{version}-{arch}.wpkg")
+        file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        print(f"{name}: wrote {file.name}")
     versions_file = directory / "versions"
     versions = [v for v in versions_file.read_text().split() if v] if versions_file.exists() else []
-    current = (directory / "latest").read_text().strip() if (directory / "latest").exists() else None
-    if version in versions and current == version:
-        print(f"{name}: {version} is current")
-        return False
-    print(f"{name}: {current or '(new)'} -> {version}")
-    if check:
-        return True
-    for arch, (url, sha) in found.items():
-        sha = sha or sha256_of(url)
-        file = directory / (f"{version}.wpkg" if arch == "x64" else f"{version}-{arch}.wpkg")
-        file.write_text(manifest(name, version, arch, url, sha, source), encoding="utf-8")
     if version not in versions:
         versions.append(version)
     versions_file.write_text("\n".join(sorted(versions, key=version_key)) + "\n")
-    newest = max(versions, key=version_key)
-    (directory / "latest").write_text(newest + "\n")
-    add_to_index(name)
-    return True
-
-
-def add_to_index(name: str) -> None:
-    index = PACKAGES / "index"
-    lines = index.read_text().splitlines()
-    header = [line for line in lines if line.startswith("#")]
-    names = sorted({line for line in lines if line and not line.startswith("#")} | {name})
-    index.write_text("\n".join(header + names) + "\n")
-
-
-def parse_value(text: str):
-    """`a,b` lists for bin/dependencies, true/false, else a string."""
-    if text in ("true", "false"):
-        return text == "true"
-    return text
-
-
-def add(name: str, kind: str, pairs: list[str]) -> None:
-    if kind not in RESOLVERS:
-        raise SystemExit(f"unknown kind {kind}; one of {', '.join(RESOLVERS)}")
-    fields: dict = {"kind": kind}
-    for pair in pairs:
-        key, _, value = pair.partition("=")
-        if key in ("bin", "dependencies"):
-            fields[key] = [item for item in value.split(",") if item]
-        else:
-            fields[key] = parse_value(value)
-    if "bin" not in fields:
-        raise SystemExit("bin=... is required")
-    directory = PACKAGES / name
-    directory.mkdir(parents=True, exist_ok=True)
-    lines = []
-    for key, value in fields.items():
-        lines.append(f"{key} = {json.dumps(value)}")
-    (directory / "source").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (directory / "latest").write_text(max(versions, key=version_key) + "\n")
+    subprocess.run([sys.executable, str(ROOT / "scripts" / "build-wpkg-registry.py")], check=True)
 
 
 def main(argv: list[str]) -> None:
-    if len(argv) < 2 or argv[1] not in ("add", "update"):
-        raise SystemExit(__doc__)
-    if argv[1] == "add":
-        if len(argv) < 4:
-            raise SystemExit("usage: add NAME KIND KEY=VALUE ...")
-        add(argv[2], argv[3], argv[4:])
-        names, check = [argv[2]], False
+    if len(argv) >= 3 and argv[1] == "latest":
+        print(latest(argv[2], argv[3] if len(argv) > 3 else None))
+    elif len(argv) == 4 and argv[1] == "add":
+        add(argv[2], argv[3])
     else:
-        check = "--check" in argv
-        names = [a for a in argv[2:] if not a.startswith("--")] or sorted(
-            p.parent.name for p in PACKAGES.glob("*/source")
-        )
-    changed = False
-    for name in names:
-        changed |= update(name, check)
-    if changed and not check:
-        subprocess.run([sys.executable, str(ROOT / "scripts" / "build-wpkg-registry.py")], check=True)
+        raise SystemExit(__doc__)
 
 
 if __name__ == "__main__":

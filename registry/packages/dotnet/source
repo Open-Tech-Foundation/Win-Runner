@@ -2,3 +2,4 @@ kind = "dotnet"
 channel = "10.0"
 product = "runtime"
 bin = ["dotnet.exe"]
+description = "The .NET runtime"
