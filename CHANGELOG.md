@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Documentation sweep: rewrote the README around generic platform backends
+  (`native-linux-x64` today, more planned), with a quickstart, CLI reference
+  with exit codes, and agent/CI recipes. New pages: `docs/compatibility.md`
+  (tested tools with pinned versions and evidence), `docs/threat-model.md`
+  (threat model plus `bwrap`/container recipes until the sandbox lands),
+  `docs/differences-from-windows.md` (intentional behavior differences),
+  `docs/architecture.md` (PE loading, API shims, exec workers, WinFS), and
+  example). Fixed stale claims (`.ps1` args, `--help`).
+
+### Fixed
+
+- `scripts/install.sh` installs `v0.2.0` by default now that it is released;
+  README install examples updated to match.
+
 ## [0.2.0] - 2026-10-14
 
 ### Added

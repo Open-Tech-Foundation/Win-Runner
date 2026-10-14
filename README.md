@@ -12,14 +12,22 @@
 
 </div>
 
-> Win-Runner (`winrun`) runs Windows x86-64 programs on Linux through native Windows API shims, with a disposable C: drive, snapshots, a scriptable shell, package installs, host folder mounts, and a WebSocket control API. No Wine or VM is required.
+> Win-Runner (`winrun`) runs Windows x86-64 command-line programs outside
+> Windows through platform backends and Windows API shims, with a disposable
+> C: drive, snapshots, a scriptable shell, package installs, host folder
+> mounts, and a WebSocket control API. No Wine or VM is required.
 
-- ✅ **Supported today:** Linux x86-64 native execution.
-- ⏳ **Planned:** Additional platform backends.
-- ⏳ **In progress:** Built-in security sandbox.
+| | |
+|---|---|
+| **Supported today** | `native-linux-x64`: Linux x86-64, guest code runs directly on the host CPU |
+| **Planned** | Additional platform backends (see [Architecture](docs/architecture.md)) |
+| **In progress** | Built-in security sandbox — not done, see [Threat model](docs/threat-model.md) |
 
 > [!WARNING]
-> Win-Runner is a compatibility runtime, not a security sandbox. Native guest programs can make Linux system calls with Win-Runner's privileges. The built-in sandbox is a work in progress; use an OS sandbox for untrusted programs.
+> Win-Runner is a compatibility runtime, not a security sandbox. Guest
+> programs run natively with Win-Runner's OS privileges and can issue host
+> system calls. Do not run untrusted binaries without OS-level isolation;
+> see [Threat model](docs/threat-model.md) for container/`bwrap` recipes.
 
 ## Why Win-Runner?
 
@@ -32,32 +40,32 @@ programs**, driven by people, CI pipelines, and coding agents.
 
 - **Instant, clean state:** every run starts from a fresh in-memory C: drive or a
   saved snapshot. There is no prefix to create, copy, or clean up.
-- **Native speed:** x86-64 code runs directly on the host CPU; only Windows API calls
-  go through compatibility shims.
+- **Native speed:** on the Linux x86-64 backend, x86-64 code runs directly on the
+  host CPU; only Windows API calls go through compatibility shims.
 - **Honest failures:** unsupported APIs are reported by name, and `winrun inspect`
   shows what a program needs before it runs. A missing feature fails loudly
   instead of silently changing behavior.
-- **Built for automation:** the headless WebSocket control API streams output,
-  accepts input, key, and resize events, and reports exit codes, so an agent can
-  build, run, and check Windows programs without a Windows machine.
-- **One small binary:** a single Rust executable with a shell, PowerShell-style
+- **Built for automation:** `runner` (stdin jobs), the headless WebSocket control
+  API (streams output, accepts input/key/resize, reports exit codes), and
+  long-lived `instance`s let an agent build, run, and check Windows programs
+  without a Windows machine.
+- **One small binary:** a single executable with a shell, PowerShell-style
   scripts, and a manifest-based portable package manager.
 
 Win-Runner does not aim to replace Wine. It targets command-line programs, not GUI
-apps, games, or drivers. For those, use Wine or a real Windows machine.
+apps, games, drivers, or services. For those, use Wine or a real Windows machine.
 
 ## Requirements
 
 | | |
 |---|---|
-| **OS** | Linux |
-| **CPU** | x86-64 (guest PE code runs natively on the host CPU) |
+| **Host (today)** | Linux x86-64 (the only backend shipped in releases so far) |
+| **Guest** | Windows x86-64 (PE32+) console programs |
 | **Privileges** | None beyond normal user access to the paths you mount |
 | **Not required** | Wine, Windows, a VM, or a separate package manager |
 
-Win-Runner is a single native binary. It does not need a prefix install, a
-system-wide service, or host Windows tools. Network access is only needed when
-you download packages with `wpkg` or call out to HTTP from the guest.
+Network access is only needed when you download packages with `wpkg` or call out
+to HTTP from the guest.
 
 ## Installation
 
@@ -80,7 +88,7 @@ Installs `winrun` onto your `PATH` (no service; no admin step unless the prefix 
 
 ```bash
 # Pin a version and choose where it goes
-./scripts/install.sh --version v0.1.0 --prefix "$HOME/.local/bin"
+./scripts/install.sh --version v0.2.0 --prefix "$HOME/.local/bin"
 ```
 
 ```bash
@@ -90,7 +98,7 @@ Installs `winrun` onto your `PATH` (no service; no admin step unless the prefix 
 
 | Flag / env | Meaning |
 |---|---|
-| `--version TAG` / `WINRUN_VERSION` | Release tag (default `v0.1.0`) |
+| `--version TAG` / `WINRUN_VERSION` | Release tag (default `v0.2.0`) |
 | `--prefix DIR` / `WINRUN_PREFIX` | Install directory (default `/usr/local/bin` if writable, else `~/.local/bin`) |
 | `--dry-run` | Print the plan only |
 
@@ -101,7 +109,7 @@ page. Each release ships a Linux x86-64 `winrun` binary in a tarball plus a
 `checksums.txt` file.
 
 ```bash
-VERSION=v0.1.0
+VERSION=v0.2.0
 curl -fsSLO "https://github.com/Open-Tech-Foundation/Win-Runner/releases/download/${VERSION}/winrun-win-runner.tar.gz"
 curl -fsSLO "https://github.com/Open-Tech-Foundation/Win-Runner/releases/download/${VERSION}/checksums.txt"
 sha256sum -c checksums.txt
@@ -140,16 +148,46 @@ Offline builds work with a warm Cargo cache: `cargo build --release --offline`.
 
 ```bash
 which winrun
-winrun
+winrun --version
 winrun inspect path/to/app.exe
 winrun shell
 ```
 
-`winrun` with no arguments prints usage and exits 2 (there is no `--help` flag).
-If `winrun` is not found, add the install directory to `PATH`, for example:
+`winrun` with no arguments prints usage and exits 2. If `winrun` is not found,
+add the install directory to `PATH`, for example:
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
+```
+
+## Quickstart
+
+```bash
+# 1. Open a clean, disposable Windows-like shell
+winrun shell
+```
+
+```powershell
+# Inside the shell: install Node.js and run it — no Windows machine needed
+wpkg install nodejs
+node -v
+node -e "console.log('hello from Windows node')"
+exit
+```
+
+```bash
+# 2. Keep your tools between runs with a snapshot
+winrun --snapshot=tools.winfs --save shell
+```
+
+```bash
+# 3. Run one guest command headlessly (CI / agent style)
+winrun --snapshot=tools.winfs "C:\Program Files\nodejs\current\node.exe" -e "console.log(1+1)"
+```
+
+```bash
+# 4. Check compatibility before running
+winrun inspect app.exe
 ```
 
 ## How to use
@@ -157,10 +195,12 @@ export PATH="$HOME/.local/bin:$PATH"
 | Goal | Command |
 |---|---|
 | Interactive shell | `winrun shell` |
+| Show help / version | `winrun --help`, `winrun --version` |
 | Run a Windows EXE from a host path | `winrun path/to/app.exe [args…]` |
-| Run a PowerShell-style script | `winrun path/to/script.ps1` (script args not supported yet) |
+| Run a PowerShell-style script | `winrun path/to/script.ps1 [args…]` (binds to `param(...)` or `$args`) |
 | Inspect PE imports before running | `winrun inspect path/to/app.exe` |
 | Persistent C: between runs | `winrun --snapshot=tools.winfs --save shell` |
+| Save to a new snapshot file | `winrun --save-snapshot=new.winfs shell` |
 | Mount a host folder as guest `Z:` | `winrun --mount=Z:/path/to/folder shell` |
 | Read-only mount | `winrun --mount-ro=Z:/path/to/folder shell` |
 | Guest memory (default 512M) | `winrun --memory=8G shell` (or `WINRUN_MEMORY=8G`) |
@@ -170,56 +210,60 @@ export PATH="$HOME/.local/bin:$PATH"
 
 Runtime flags (`--snapshot`, `--mount`, `--headless`, …) must appear **before**
 the program target. Everything after the target is passed to the guest program,
-even if it looks like a Win-Runner option.
-
-Minimal examples:
+even if it looks like a Win-Runner option. Use `--` to separate unambiguously:
 
 ```bash
-# Clean ephemeral session
-winrun shell
-
-# Keep tools you installed with wpkg
-winrun --snapshot=tools.winfs --save shell
-
-# One-shot guest program with streamed stdio
-winrun --snapshot=tools.winfs "C:\Program Files\nodejs\current\node.exe" -e "console.log(1)"
-
-# Inspect without running
-winrun inspect app.exe
+winrun --snapshot=tools.winfs -- "C:\Program Files\nodejs\current\node.exe" --mount=not-a-flag
 ```
 
-Inside the shell, install packages and run Windows tools by name:
+Exit codes: `0` success; `2` usage error; `1` runtime error (including
+`inspect` reporting missing imports and "nothing to run"); otherwise the guest
+program's own exit code. A crashing guest exits with its Windows exception code
+(e.g. `0xC0000005` for an access violation) and a note on stderr.
+
+### Automation for agents and CI
+
+Three surfaces, pick by lifetime:
+
+```bash
+# Short jobs: pipe commands, read output, check exit code.
+# Prefer single-quoted literals and ConvertTo-Json for machine-readable output.
+printf '%s\n' "Write-Output '{\"ok\":true}'" 'exit' | winrun runner
+printf '%s\n' '$o = @{a=1}; $o | ConvertTo-Json -Compress' 'exit' | winrun runner
+```
+
+Per-command status inside `runner` is explicit — emit it yourself:
 
 ```powershell
-wpkg install nodejs
-wpkg install python
-node -v
-python --version
-Get-Command
+npm test
+Write-Output "__EXIT:$LASTEXITCODE"
 exit
 ```
 
-See [Guest state](#guest-state) for the disposable C: layout, registry, and
-snapshots; [Shell and packages](#shell-and-packages) for the PowerShell subset
-and `wpkg`; and [Headless control](#headless-control) / [Mount host folders](#mount-host-folders)
-for automation.
+```bash
+# Interactive agents: headless shell with a WebSocket control endpoint.
+winrun --headless --control=127.0.0.1:0 shell
+# Prints one JSON line: {"event":"ready","protocol":1,"url":"ws://127.0.0.1:PORT/control/<token>"}
+# See docs/control-protocol.md for input ops (write, key, resize) and output events.
+```
 
-### Not installed / not supported yet
+```bash
+# Long-lived state across many commands:
+winrun instance boot ci
+winrun instance exec ci -- Write-Output 'hello-from-instance'
+winrun instance status ci
+winrun instance destroy ci
+```
 
-Call these out so first-time setup does not look like a broken install:
+Agent tips:
 
-- **No `--help` / `--version` flags.** Run `winrun` with no arguments for usage.
-- **`.ps1` arguments** are not accepted on the command line yet (`winrun s.ps1 arg` fails).
-- **Only host `.exe` and `.ps1` targets.** Other extensions must be installed
-  inside the shell (for example via `wpkg`) or run as guest `PATH` commands.
-- **Linux x86-64 only** in published releases today (no Windows/macOS/arm64
-  host builds; guest packages may still include arm64 manifests for future hosts).
-- **Not a security sandbox.** Do not point it at untrusted binaries without an
-  OS-level sandbox.
-- **PowerShell subset, not full Windows PowerShell.** Missing common cmdlets
-  (for example `Get-Date`, `Get-Process`) fail loudly rather than half-working;
-  `Get-Command` / `Get-Help` list what the shell implements.
-- **Desktop clipboard and GUI** are out of scope; Micro uses an internal clipboard.
+- Prefer `runner` / headless / `instance` over bare interactive `shell`, which
+  can block on prompts (e.g. installers asking questions).
+- Use `winrun inspect` first for unknown binaries; missing `DLL!API` names tell
+  you exactly what is unsupported.
+- Mounts are silent on boot — confirm with `dir Z:`.
+- `--save` writes back only on clean exit; run `snapshot save` inside the shell
+  to checkpoint sooner. A killed session can lose trailing changes.
 
 ## Guest state
 
@@ -252,7 +296,7 @@ Run `reload` to apply saved environment changes, including PATH, immediately:
 
 ```text
 reload
-tsr --version
+node --version
 ```
 
 `reload` rebuilds the environment from the guest registry and restores the active
@@ -284,29 +328,27 @@ Everyday file commands include `New-Item`, `Get-Item`, `Get-ChildItem`,
 `-Force` never replaces a destination during rename. Use `Resolve-Path`,
 `Split-Path`, `Join-Path`, and the location commands for navigation.
 
-Text pipelines support `Select-String`, `Sort-Object`, `Get-Unique`,
-`Measure-Object`, `Out-File`, `Tee-Object`, and the existing
-`Where-Object`, `ForEach-Object`, and `Select-Object -First` operations.
-`Get-Content` supports `-Raw`, `-TotalCount`/`-Head`, and `-Tail`;
-`Get-ChildItem` supports `-Recurse`, `-File`, `-Directory`, `-Filter`,
-and filename `*`/`?` patterns. File output uses UTF-8 without a BOM.
-Scripts can declare `param(...)` blocks and functions, `return`, use
-`try`/`catch`, here-strings, backtick escapes, casts, and the
-`HKLM:`/`HKCU:` registry provider (`Get-ItemProperty`, `New-ItemProperty`,
-`RegistryKey` methods) over the guest hives. They run programs with
+Utility cmdlets include `Get-Date` (with .NET `-Format` strings), `Get-Random`,
+`Out-String`, `Format-Table`/`Format-List`, `Group-Object`, `ConvertTo-Json`
+(`-Depth`, `-Compress`), `ConvertFrom-Json`, `Read-Host`, `Get-Process` (this
+session's guest processes), `Start-Process` (runs to completion),
+`Get-ItemPropertyValue`, `Select-String`, `Sort-Object`, `Get-Unique`,
+`Measure-Object`, `Out-File`, and `Tee-Object`.
+
+Scripts support `param(...)` blocks (bound by name or position, with defaults;
+remaining args land in `$args`), functions, `return`, `try`/`catch` (with `$_`
+as an error record), here-strings, backtick escapes, casts, and the
+`HKLM:`/`HKCU:` registry provider. They run programs with
 `& "C:\path\app.exe" args` or by name on the `PATH`, read `$LASTEXITCODE`,
 and capture program output with `$(...)`. `Add-Type` accepts
-`[DllImport]` declarations for the Win32 calls installers make
-(`IsProcessorFeaturePresent`, `SendMessageTimeout`). Official one-liners
-such as `powershell -c "irm bun.sh/install.ps1|iex"` run unchanged once
-the programs they call are installed (Bun's needs `wpkg install curl`).
-Pipelines carry text rather than full PowerShell objects. Advanced
+`[DllImport]` declarations for the Win32 calls installers make.
+Pipelines carry text rather than full PowerShell objects; advanced
 providers, administration cmdlets, and unimplemented parameters remain
-unsupported; this shell is not a complete PowerShell distribution.
+unsupported. This shell is not a complete PowerShell distribution.
 
 The shell includes `wpkg`, which installs SHA-256-verified ZIP and 7z packages into the guest C: drive without running installers or package scripts. Its text registry is bundled in the binary; package archives download only when installed.
 
-For a terminal text editor on Linux x86-64, install the Windows build of Micro:
+For a terminal text editor, install the Windows build of Micro:
 
 ```powershell
 wpkg install micro
@@ -316,7 +358,6 @@ micro -clipboard internal notes.txt
 Use Ctrl-S to save and Ctrl-Q to quit. Micro edits files in the guest drive,
 including files restored from snapshots. The `internal` clipboard setting
 keeps copy and paste inside the editor; the guest has no desktop clipboard.
-Micro 2.0.15 is pinned in the registry and runs through the native PE backend.
 
 ```text
 wpkg search <query> | info <package[@version]>
@@ -339,29 +380,68 @@ wpkg remove nodejs@24        # one version; `remove nodejs` removes all
 
 The shell you type into is PowerShell-style, but many programs start `%ComSpec%` themselves: Node's `child_process` with `shell: true`, `npm run`, Python's `subprocess(shell=True)`, and the `.cmd` launchers that npm and pip install. For those, the disk has `C:\Windows\System32\cmd.exe`, a narrow command processor that runs as a real child process. It supports `cmd /c` and `/d /s /c`, `&`, `&&`, `||`, `( )` blocks, `>`, `>>`, `2>&1`, `<` and `nul` redirection, `%VAR%` expansion (including `:a=b` and `:~n,m`), and batch files with `%1`, `%*`, `%~dp0`, labels, `goto`, `call`, `exit /b`, `setlocal`, `if`, `for`, and `for /f` over command output. It also handles `set /a` arithmetic, `set /p` from redirected or piped input, pipes (the left side runs to completion first, then feeds the right side), and delayed `!var!` expansion with `setlocal enabledelayedexpansion` or `cmd /v:on`. There is no interactive cmd prompt. As on Windows, starting a `.bat` or `.cmd` file with `CreateProcess` runs it through cmd.exe, and typing a command in the shell looks it up through `PATH` and `PATHEXT`, so `tsc` runs npm's `tsc.cmd` launcher.
 
-## Headless control
-
-Start a persistent shell with a loopback WebSocket endpoint; any WebSocket client can send input and read streamed output events.
-
-```bash
-winrun --headless --control=127.0.0.1:0 shell
-```
-
-The process prints a JSON `ready` event containing the connection URL and session token. The control protocol supports text, key, and resize input.
-
-## Mount host folders
-
-Mounting explicitly exposes a host directory as a guest drive; writable mounts write through to the host.
-
-```bash
-winrun --mount=Z:/path/to/folder shell
-winrun --mount-ro=Z:/path/to/folder shell
-```
-
 ## Compatibility
 
-Win-Runner implements Windows APIs needed by supported programs incrementally; unsupported imports are reported with the executable, DLL, and API name when called. Missing-import, worker-startup, and child-crash errors reach the launcher even when child processes redirect stderr or discard it with `stdio: "ignore"`.
-`winrun inspect app.exe` reports static imports, and `WINRUN_NATIVE_STRICT_IMPORTS=1` rejects missing imports before execution.
+Win-Runner implements the Windows APIs its supported programs need, incrementally.
+`winrun inspect app.exe` reports static imports with supported/missing verdicts
+(exit `0` = runnable, `1` = missing), and `WINRUN_NATIVE_STRICT_IMPORTS=1`
+rejects missing imports before execution. At runtime, an unsupported API call
+fails loudly naming the executable, DLL, and API — including through nested
+child processes and redirected output.
+
+What runs today, with pinned versions and evidence, lives in
+[docs/compatibility.md](docs/compatibility.md):
+
+| Tool | Pinned version | Status |
+|---|---|---|
+| Node.js (+ npm, npx, corepack) | 24.21.0 / npm 11.19.0 | E2E covered (`node_native`, incl. `npm install`, create-vite dev/build) |
+| Python | 3.14.7 | E2E covered (`venv`, `pip`, asyncio, pyrepl REPL) |
+| Micro editor | 2.0.15 | E2E covered (Unicode editing, resize, save, snapshots) |
+| curl (official Windows build) | 8.22.0 | E2E covered (HTTPS via guest ROOT store) |
+| opencode (Bun executable) | 1.19.0 | E2E covered (`opencode_native`) |
+| ripgrep | 15.2.0 | E2E covered (`rg_native`, fixture) |
+| .NET / CoreCLR | fixture via `scripts/fetch-dotnet-fixture.sh` | E2E covered (`dotnet_native`, fixture) |
+| Bun / Deno / esbuild / biome / uv / fd / bat / fzf / gh / 7zip / git | see table | Packaged in `wpkg` (SHA-256 pinned); Bun+Deno+esbuild+biome exercised via installer paths |
+
+Out of scope by design: GUI apps, games, drivers, services, and .NET Framework
+executables. See [docs/compatibility.md](docs/compatibility.md) for the full
+table, and [docs/differences-from-windows.md](docs/differences-from-windows.md)
+for intentional behavior differences.
+
+## Security
+
+Win-Runner is **not** a sandbox. See [docs/threat-model.md](docs/threat-model.md) for:
+
+- the threat model (what the runtime does and does not protect),
+- supply-chain notes (`wpkg` SHA-256 verification, pinned Mozilla roots),
+- copy-paste `bwrap` and container recipes for running untrusted binaries,
+- control-listener notes (loopback-only, per-session token).
+
+## Differences from real Windows
+
+Short version: CLI surface only; PowerShell and `cmd.exe` subsets (text
+pipelines, no GUI/admin/service cmdlets); guest C: is case-insensitive;
+network goes through the host stack verified against the guest ROOT store;
+memory size, CPU identity, and clock come from the host (memory size is
+configurable). Details: [docs/differences-from-windows.md](docs/differences-from-windows.md).
+
+## Architecture
+
+How a PE gets from disk to exit code: PE parsing and mapping at the preferred
+base, import resolution to native trampolines, TEB/PEB and exception handling,
+exec-worker child processes, and the WinFS snapshot filesystem. Start at
+[docs/architecture.md](docs/architecture.md) — it names the modules so
+contributors and reviewers can judge soundness.
+
+## Further docs
+
+| Doc | Contents |
+|---|---|
+| [docs/compatibility.md](docs/compatibility.md) | Tested tools and versions, API coverage, out-of-scope list |
+| [docs/threat-model.md](docs/threat-model.md) | Threat model + `bwrap`/container recipes until the sandbox lands |
+| [docs/differences-from-windows.md](docs/differences-from-windows.md) | Intentional behavior differences vs real Windows |
+| [docs/architecture.md](docs/architecture.md) | PE loading, API shims, child processes, WinFS |
+| [docs/control-protocol.md](docs/control-protocol.md) | Headless WebSocket protocol for agents |
 
 ## Development
 

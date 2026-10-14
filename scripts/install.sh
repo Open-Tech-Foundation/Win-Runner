@@ -5,13 +5,13 @@
 #   scripts/install.sh [--version vX.Y.Z] [--prefix DIR] [--dry-run]
 #
 # Environment:
-#   WINRUN_VERSION   Release tag (default: v0.1.0)
+#   WINRUN_VERSION   Release tag (default: v0.2.0)
 #   WINRUN_PREFIX    Install directory (default: $HOME/.local/bin, or
 #                    /usr/local/bin when writable and not overridden)
 set -euo pipefail
 
 REPO="${WINRUN_REPO:-Open-Tech-Foundation/Win-Runner}"
-VERSION="${WINRUN_VERSION:-v0.1.0}"
+VERSION="${WINRUN_VERSION:-v0.2.0}"
 ARCHIVE="winrun-win-runner.tar.gz"
 CHECKSUMS="checksums.txt"
 DRY_RUN=0
