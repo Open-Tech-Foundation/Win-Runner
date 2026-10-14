@@ -1984,7 +1984,9 @@ impl WinFs {
             .drives
             .get_mut(&p.drive)
             .ok_or_else(|| format!("unsupported drive: {}", p.drive))?;
-        for part in &p.parts {
+        // The directories this call creates, to give them times.
+        let mut created = Vec::new();
+        for (depth, part) in p.parts.iter().enumerate() {
             let key = windows_name_key(part);
             let next = node;
             match next {
@@ -1994,6 +1996,7 @@ impl WinFs {
                             return Err(format!("path component is a file: {part}"));
                         }
                     } else {
+                        created.push(WinPath { drive: p.drive, parts: p.parts[..=depth].to_vec() });
                         children.insert(
                             key.clone(),
                             Node::Dir {
@@ -2006,6 +2009,9 @@ impl WinFs {
                 }
                 Node::File { .. } => return Err("parent is a file".to_string()),
             }
+        }
+        for directory in &created {
+            self.stamp_times(directory, true);
         }
         if self.record_changes {
             self.changes.push(FsChange::Mkdir(p.display()));
@@ -2043,6 +2049,7 @@ impl WinFs {
                         children: HashMap::new(),
                     },
                 );
+                self.stamp_times(&p, true);
                 if self.record_changes {
                     self.changes.push(FsChange::Mkdir(p.display()));
                 }

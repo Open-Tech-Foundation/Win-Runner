@@ -432,6 +432,7 @@ impl Shell {
         crate::tar_tool::seed_tar_exe(&mut fs);
         crate::taskkill_tool::seed_taskkill_exe(&mut fs);
         crate::where_tool::seed_where_exe(&mut fs);
+        crate::text_tools::seed_text_tools(&mut fs);
         if let Err(error) = crate::trust_roots::seed_root_store(&mut fs) {
             eprintln!("winrun: cannot add trusted root certificates: {error}");
         }
@@ -1201,6 +1202,15 @@ impl Shell {
         out: &mut Vec<u8>,
         sink: Option<backend::OutputSink>,
     ) -> Result<ShellFlow, String> {
+        // PowerShell passes cmd.exe and script hosts their arguments the
+        // legacy way (embedded quotes as typed).
+        let legacy: Vec<String>;
+        let guest_args = if crate::ps1::legacy_argument_passing(prog) {
+            legacy = guest_args.iter().map(|arg| crate::ps1::legacy_argument(arg)).collect();
+            &legacy[..]
+        } else {
+            guest_args
+        };
         let pe_load_started = std::time::Instant::now();
         let img = pe::load_lenient(data).map_err(|e| format!("failed to load {prog}: {e}"))?;
         if std::env::var_os("WINRUN_TIMINGS").is_some() {

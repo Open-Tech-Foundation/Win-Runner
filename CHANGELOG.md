@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- cmd.exe built-ins `dir` (`/b`, `/s`, `/a[:attributes]`, `/o[:order]`,
+  with Windows' listing layout and summaries), `ren`/`rename` (wildcard
+  templates such as `ren *.txt *.bak`), `move`, and `path`.
+- `find.exe` (`/V /C /N /I`, files or standard input), `sort.exe` (`/R`,
+  `/+n`, `/O`), and `more.com` in System32, so `cmd /c "dir | find ..."`
+  and friends work. A new `cmd_builtins` Windows oracle covers them.
+
 - The npm-packaged tools run: `CommandLineToArgvW`, `combase.dll`'s COM
   memory and GUID functions (biome), and for opencode (a Bun executable)
   `timeBeginPeriod`/`timeEndPeriod`, `RtlGetFullPathName_U`,
@@ -69,6 +76,13 @@ All notable changes to this project will be documented in this file.
   for the expression engine and the new cmdlets.
 
 ### Fixed
+
+- PowerShell passes `cmd.exe`, `cscript.exe`, `wscript.exe`, `find.exe`,
+  `sqlcmd.exe` and batch/script files their arguments the legacy way, as
+  its default `$PSNativeCommandArgumentPassing` (`Windows`) does: embedded
+  quotes as typed, so `cmd /c 'find "x" file'` reaches cmd intact.
+- Directories created in the guest get creation and write times (`dir`
+  showed 01/01/1970).
 
 - Socket handles fit in 32 bits, as Windows guarantees: OpenSSL keeps
   sockets as `int`, so TLS in Python failed with `WSAEFAULT`.

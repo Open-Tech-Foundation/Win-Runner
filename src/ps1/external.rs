@@ -138,6 +138,11 @@ impl Interpreter<'_> {
         let Some(host) = self.host.as_deref_mut() else {
             return Err(format!("programs cannot run from this script: {path}"));
         };
+        let args = if legacy_argument_passing(path) {
+            args.iter().map(|arg| legacy_argument(arg)).collect()
+        } else {
+            args
+        };
         let output = host.run(self.fs, self.environment, path, &args, errors)?;
         self.out.extend_from_slice(&output.stdout);
         if !output.stdout.is_empty() && !output.stdout.ends_with(b"\n") {
@@ -165,8 +170,45 @@ impl Interpreter<'_> {
     }
 }
 
+/// Programs PowerShell's default `$PSNativeCommandArgumentPassing`
+/// (`Windows`) passes arguments to the legacy way, because they parse
+/// their command lines themselves (cmd.exe does not understand `\"`).
+pub(crate) fn legacy_argument_passing(path: &str) -> bool {
+    let name = path.rsplit(['\\', '/']).next().unwrap_or(path).to_ascii_lowercase();
+    matches!(name.as_str(), "cmd.exe" | "cscript.exe" | "wscript.exe" | "find.exe" | "sqlcmd.exe")
+        || [".bat", ".cmd", ".js", ".vbs", ".wsf", ".wsh"].iter().any(|ext| name.ends_with(ext))
+}
+
+/// An argument as legacy passing writes it: wrapped in quotes when it has
+/// whitespace (unless already wrapped), embedded quotes left as they are.
+pub(crate) fn legacy_argument(arg: &str) -> String {
+    let wrapped = arg.len() >= 2 && arg.starts_with('"') && arg.ends_with('"');
+    let text = if arg.is_empty() {
+        "\"\"".to_string()
+    } else if arg.contains([' ', '\t']) && !wrapped {
+        format!("\"{arg}\"")
+    } else {
+        arg.to_string()
+    };
+    format!("{}{text}", crate::native::VERBATIM_ARGUMENT)
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::native::VERBATIM_ARGUMENT;
+
+    #[test]
+    fn cmd_gets_arguments_the_legacy_way() {
+        assert!(legacy_argument_passing(r"C:\Windows\System32\cmd.exe"));
+        assert!(legacy_argument_passing(r"C:\tools\build.CMD"));
+        assert!(!legacy_argument_passing(r"C:\tools\node.exe"));
+        let verbatim = |text: &str| format!("{VERBATIM_ARGUMENT}{text}");
+        assert_eq!(legacy_argument(r#"find "an" f.txt"#), verbatim(r#""find "an" f.txt""#), "quotes stay as typed");
+        assert_eq!(legacy_argument("/c"), verbatim("/c"));
+        assert_eq!(legacy_argument(r#""already quoted""#), verbatim(r#""already quoted""#));
+        assert_eq!(legacy_argument(""), verbatim(r#""""#));
+    }
+
     use super::*;
 
     struct Recorder(Vec<(String, Vec<String>)>);

@@ -107,6 +107,9 @@ use taskkill_host::*;
 #[path = "linux_x86_64/sddl.rs"]
 mod sddl;
 use sddl::*;
+#[path = "linux_x86_64/text_tools_host.rs"]
+mod text_tools_host;
+use text_tools_host::*;
 #[path = "linux_x86_64/where_host.rs"]
 mod where_host;
 use where_host::*;

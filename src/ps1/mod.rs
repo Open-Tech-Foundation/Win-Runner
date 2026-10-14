@@ -52,6 +52,7 @@ mod expr;
 mod utility;
 
 pub use external::{ErrorStream, ProcessHost, ProcessOutput};
+pub(crate) use external::{legacy_argument, legacy_argument_passing};
 
 use crate::winfs::WinFs;
 use std::collections::HashMap;

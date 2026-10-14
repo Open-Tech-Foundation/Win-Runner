@@ -46,6 +46,7 @@ through cargo-xwin; their `.exe` files are committed. A probe:
 | `rust_unwind` | Rust panics on `x86_64-pc-windows-msvc`: drops while unwinding, `catch_unwind`, `resume_unwind`, nested catches, thread panics seen by `join` (Rust source in `guests/oracle-msvc`) |
 | `powershell_essentials.ps1` | everyday item, content and text-pipeline cmdlets (a script, run by real PowerShell and the guest shell) |
 | `powershell_scripting.ps1` | `param` blocks, named/switch/positional binding, `return`, the `HKLM:`/`HKCU:` registry provider and `RegistryKey` methods |
+| `cmd_builtins.ps1` | cmd.exe's `dir` (bare, attribute and order switches, summaries), `ren` templates, `move`, `path`, and the System32 `find.exe`, `sort.exe` and `more.com` |
 | `powershell_expressions.ps1` | expression operators, arrays, hashtables, casts and static members, string methods, utility cmdlet output (`Group-Object`, JSON, `Format-*`), registry `Get-ChildItem`/`Get-Content`, `where.exe`, `Get-Command` precedence |
 
 `thread_queries` exercises threads in the active guest process. Opening

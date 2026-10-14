@@ -363,6 +363,9 @@ enum RedirectKind {
     Read(String),
 }
 
+#[path = "cmd_listing.rs"]
+mod listing;
+
 const SYNTAX_ERROR: &str = "The syntax of the command is incorrect.";
 
 struct Parser {
@@ -1513,6 +1516,10 @@ impl<H: CmdHost> Cmd<'_, H> {
             "rmdir" | "rd" => self.builtin_rmdir(rest, io),
             "del" | "erase" => self.builtin_del(rest, io),
             "copy" => self.builtin_copy(rest, io),
+            "dir" => self.builtin_dir(rest, io),
+            "ren" | "rename" => self.builtin_rename(rest, io),
+            "move" => self.builtin_move(rest, io),
+            "path" => self.builtin_path(rest, io),
             _ => self.run_external(&name, text, io, called),
         }
     }

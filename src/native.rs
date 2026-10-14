@@ -30,7 +30,15 @@ pub struct NativeExecutionFailure {
     pub fs: crate::winfs::WinFs,
 }
 
+/// An argument starting with this (private-use) character goes into the
+/// command line as written after it, unquoted: the caller has already
+/// quoted it its own way (PowerShell's legacy rules for cmd.exe).
+pub const VERBATIM_ARGUMENT: char = '\u{E000}';
+
 fn quote_arg(arg: &str) -> String {
+    if let Some(verbatim) = arg.strip_prefix(VERBATIM_ARGUMENT) {
+        return verbatim.to_string();
+    }
     if arg.is_empty() {
         return "\"\"".to_string();
     }
