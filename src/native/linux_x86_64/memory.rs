@@ -602,6 +602,11 @@ pub(super) extern "win64" fn native_virtual_protect(
             0x40
         }
     };
+    if native_diagnostic_enabled() {
+        eprintln!(
+            "native VirtualProtect address={address:p} size={size:#x} protection={page_protection:#x} old={old_protection:#x}"
+        );
+    }
     if !old_page_protection.is_null() {
         unsafe { old_page_protection.write(old_protection) };
     }

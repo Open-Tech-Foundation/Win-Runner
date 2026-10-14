@@ -6,6 +6,22 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Guest threads can be suspended while running: `SuspendThread` stops the
+  thread with its registers saved, `GetThreadContext` reads them by
+  `ContextFlags`, and `SetThreadContext` changes where it continues once
+  `ResumeThread` releases it, as .NET's garbage collector expects.
+  `ExitThread` is exported.
+- DLLs load as data with `LOAD_LIBRARY_AS_DATAFILE`,
+  `LOAD_LIBRARY_AS_IMAGE_RESOURCE` and `LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE`
+  (for their resources only, nothing runs), and `LoadStringW` reads string
+  tables, so .NET can load its error messages.
+- `OpenProcess` on the calling process, PSAPI's module queries
+  (`EnumProcessModules(Ex)`, `GetModuleBaseNameW`, `GetModuleFileNameExW`,
+  `GetModuleInformation`, also as `K32*`) and
+  `QueryFullProcessImageNameA/W`.
+- Oracle probes `thread_context`, `data_modules` and `process_modules` pin
+  these behaviors down against Windows.
+
 - wpkg has two kinds of packages, decided by their `.wpkg` files. Pinned
   packages (git, nodejs, python, dotnet, 7zip, curl, micro) install only
   the versions listed in the registry. Upstream packages (opencode,

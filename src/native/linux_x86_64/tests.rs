@@ -9212,8 +9212,6 @@ mod editor_runtime_tests {
             .load(Ordering::Acquire));
         assert_eq!(native_set_process_priority_boost(42, 0), 0);
         assert_eq!(native_get_last_error(), 6);
-        assert_eq!(native_suspend_thread(native_get_current_thread()), u32::MAX);
-        assert_eq!(native_get_last_error(), 50);
     }
 
     #[test]

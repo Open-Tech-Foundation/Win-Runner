@@ -7,7 +7,6 @@ use super::*;
 
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 const ERROR_NOT_LOCKED: u32 = 158;
-const ERROR_RESOURCE_NAME_NOT_FOUND: u32 = 1814;
 const CONTEXT_SIZE: u32 = 0x4d0;
 const LOCALE_EN_US: u32 = 0x0409;
 
@@ -804,15 +803,6 @@ pub(super) extern "win64" fn native_string_from_guid2(guid: *const u8, output: *
     }
     unsafe { output.copy_from_nonoverlapping(text.as_ptr(), text.len()) };
     text.len() as i32
-}
-
-/// `LoadStringW`: guest modules' string resources are not read yet.
-pub(super) extern "win64" fn native_load_string_w(_instance: u64, _id: u32, output: *mut u16, capacity: i32) -> i32 {
-    if !output.is_null() && capacity > 0 {
-        unsafe { output.write(0) };
-    }
-    native_set_last_error(ERROR_RESOURCE_NAME_NOT_FOUND);
-    0
 }
 
 // ---- UCRT -------------------------------------------------------------------------

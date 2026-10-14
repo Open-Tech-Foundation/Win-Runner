@@ -19,6 +19,9 @@ pub(super) struct NativeThreadInfo {
     pub(super) creation: AtomicU64,
     pub(super) suspension: Arc<(Mutex<u32>, Condvar)>,
     pub(super) status: Mutex<NativeThreadStatus>,
+    /// Past its start gate: suspending it must stop it (see
+    /// [`native_suspend_thread`]).
+    pub(super) running: std::sync::atomic::AtomicBool,
 }
 impl Default for NativeThreadInfo {
     fn default() -> Self {
@@ -28,6 +31,7 @@ impl Default for NativeThreadInfo {
             creation: AtomicU64::new(process_filetime_now()),
             suspension: Arc::new((Mutex::new(0), Condvar::new())),
             status: Mutex::new(NativeThreadStatus::default()),
+            running: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }

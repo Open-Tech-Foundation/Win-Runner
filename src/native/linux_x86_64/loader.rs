@@ -1000,6 +1000,19 @@ pub(super) extern "win64" fn native_load_library_ex_w(
         native_set_last_error(87);
         return 0;
     }
+    // LOAD_LIBRARY_AS_DATAFILE (0x2), _AS_IMAGE_RESOURCE (0x20), and
+    // _AS_DATAFILE_EXCLUSIVE (0x40): map the file for its resources only.
+    if flags & (0x2 | 0x20 | 0x40) != 0 {
+        let bytes = fs_ctx().and_then(|context| context.lock().ok().and_then(|ctx| ctx.fs.read_file(&path).ok()));
+        let module = bytes.and_then(|bytes| load_data_module(&bytes, flags & 0x20 != 0)).unwrap_or_else(|| {
+            native_set_last_error(126); // ERROR_MOD_NOT_FOUND
+            0
+        });
+        if native_diagnostic_enabled() {
+            eprintln!("native LoadLibraryExW data path={path} flags={flags:#x} module={module:#x}");
+        }
+        return module;
+    }
     let plan = match dll_search_plan(&path, flags) {
         Ok(plan) => plan,
         Err(error) => {
@@ -1763,6 +1776,9 @@ fn resolve_module_export(module: u64, selector: &str, depth: usize) -> Option<u6
 // translation exists, return a real NT failure code to callers instead
 // of pretending that the operation succeeded.
 pub(super) extern "win64" fn native_free_library(module: u64) -> i32 {
+    if let Some(result) = free_data_module(module) {
+        return result;
+    }
     if is_synthetic_module(module) {
         return 1;
     }

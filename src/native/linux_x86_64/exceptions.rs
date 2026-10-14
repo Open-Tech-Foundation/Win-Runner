@@ -364,7 +364,7 @@ extern "C" fn native_guest_fault_trampoline(slot: *const NativeFaultSlot) -> ! {
     unsafe { siglongjmp(slot.jump_buffer(), 1) }
 }
 
-unsafe fn linux_current_thread_id() -> i32 {
+pub(super) unsafe fn linux_current_thread_id() -> i32 {
     let thread_id: i64;
     unsafe {
         core::arch::asm!(

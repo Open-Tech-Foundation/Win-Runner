@@ -44,6 +44,9 @@ through cargo-xwin; their `.exe` files are committed. A probe:
 | `sync_crypto` | mutex ownership, recursion, names and non-owner release; `CompareFileTime`/`GetFileTime`; `BCryptGenRandom`; `CertGetIntendedKeyUsage` and `CertOpenSystemStoreA`; CRT `strtoll`, `_byteswap_*`, `isxdigit`, `_difftime64` |
 | `cxx_eh` | MSVC C++ exceptions through VCRUNTIME140: catch by type, value, reference and `...`, rethrow, throws from catch blocks, destructor unwinding; SEH `__except`/`__finally` around divide-by-zero, access violations and `RaiseException`; `dynamic_cast` (down, cross, `void*`, virtual bases, `bad_cast`) and `typeid` (`bad_typeid`) (C++ source in `guests/oracle-msvc`) |
 | `rust_unwind` | Rust panics on `x86_64-pc-windows-msvc`: drops while unwinding, `catch_unwind`, `resume_unwind`, nested catches, thread panics seen by `join` (Rust source in `guests/oracle-msvc`) |
+| `thread_context` | `SuspendThread`/`ResumeThread` counts on running, blocked, created-suspended and exited threads, the suspend limit, `GetThreadContext` parts by `ContextFlags`, redirecting a suspended thread with `SetThreadContext`, and the rights each needs |
+| `data_modules` | DLLs loaded with `LOAD_LIBRARY_AS_DATAFILE`, `_AS_IMAGE_RESOURCE` and `_AS_DATAFILE_EXCLUSIVE`: handle tags, `LoadStringW` (truncation, pointer mode, empty and missing strings), resource lookups, module queries and `FreeLibrary` on them; the probe writes its own resource-only DLL |
+| `process_modules` | the process's own module list through PSAPI's `K32*` exports, `QueryFullProcessImageNameW` forms and buffer sizes, `OpenProcess` on itself and on ids naming no process |
 | `powershell_essentials.ps1` | everyday item, content and text-pipeline cmdlets (a script, run by real PowerShell and the guest shell) |
 | `powershell_scripting.ps1` | `param` blocks, named/switch/positional binding, `return`, the `HKLM:`/`HKCU:` registry provider and `RegistryKey` methods |
 | `cmd_builtins.ps1` | cmd.exe's `dir` (bare, attribute and order switches, summaries), `ren` templates, `move`, `path`, and the System32 `find.exe`, `sort.exe` and `more.com` |
@@ -121,8 +124,8 @@ detached and separately allocated consoles are outside this probe.
 fixtures. The runners place its executable in an application subdirectory,
 separate from the current directory and added user directory. It checks search
 order with two different implementations of the same DLL and a parent/middle
-import chain. Resource-only loading and signed-image policy flags are not
-implemented and return an explicit unsupported error locally.
+import chain. Signed-image policy flags are not implemented and return an
+explicit unsupported error locally; resource-only loading is `data_modules`'.
 
 `crt_runtime` checks global/thread-local invalid-parameter handlers, callback
 metadata and recovery through public `mbstowcs_s` validation (without relying
@@ -138,8 +141,8 @@ jobs. The existing `links` and `pool_console` probes cover the recent reparse
 buffer and non-console error fixes. Application behavior such as `reload`,
 PowerShell installers, and npm launchers remains covered by their shell and
 real-binary E2E tests; `reload` is a Win-Runner command with no Windows API
-equivalent. Unsupported desktop clipboard/provider catalog services and
-asynchronous thread suspension are tested locally for explicit failure.
+equivalent. Unsupported desktop clipboard/provider catalog services are
+tested locally for explicit failure.
 No Windows golden is recorded for a new probe until Windows CI produces it.
 
 `powershell_essentials.ps1` additionally runs unchanged in real PowerShell

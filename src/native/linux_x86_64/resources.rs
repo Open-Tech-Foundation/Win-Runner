@@ -41,8 +41,75 @@ fn wide_key(pointer: u64) -> Option<Key> {
     key_from(text, pointer)
 }
 
-/// A mapped image this process loaded (the program or one of its DLLs).
+/// Modules loaded as data (`LOAD_LIBRARY_AS_DATAFILE`): base and mapped
+/// length. Their handles are the base with a low-bit tag, as on Windows.
+static DATA_MODULES: std::sync::Mutex<Vec<(u64, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// Map `bytes`' headers and sections for reading their resources; nothing
+/// runs and no imports resolve. The handle is `base | 2` for
+/// `LOAD_LIBRARY_AS_IMAGE_RESOURCE`, else `base | 1`.
+pub(super) fn load_data_module(bytes: &[u8], image_resource: bool) -> Option<u64> {
+    let read_u32 = |offset: usize| bytes.get(offset..offset + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    let read_u16 = |offset: usize| bytes.get(offset..offset + 2).map(|b| u16::from_le_bytes(b.try_into().unwrap()));
+    if bytes.get(..2) != Some(b"MZ") {
+        return None;
+    }
+    let headers = read_u32(0x3c)? as usize;
+    if bytes.get(headers..headers + 4) != Some(b"PE\0\0") {
+        return None;
+    }
+    let sections = read_u16(headers + 6)? as usize;
+    let optional = read_u16(headers + 20)? as usize;
+    let image_size = read_u32(headers + 24 + 56)? as usize;
+    let header_size = (read_u32(headers + 24 + 60)? as usize).min(bytes.len());
+    let length = image_size.div_ceil(4096) * 4096;
+    if length == 0 || length > 1 << 30 {
+        return None;
+    }
+    let base = unsafe {
+        libc::mmap(ptr::null_mut(), length, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+    };
+    if base == libc::MAP_FAILED {
+        return None;
+    }
+    let base = base as u64;
+    let copy = |rva: usize, from: usize, count: usize| {
+        if rva.saturating_add(count) <= length && from.saturating_add(count) <= bytes.len() {
+            unsafe { ptr::copy_nonoverlapping(bytes.as_ptr().add(from), (base as *mut u8).add(rva), count) };
+        }
+    };
+    copy(0, 0, header_size);
+    let table = headers + 24 + optional;
+    for index in 0..sections {
+        let entry = table + index * 40;
+        let (virtual_size, rva, raw_size, raw_offset) =
+            (read_u32(entry + 8)? as usize, read_u32(entry + 12)? as usize, read_u32(entry + 16)? as usize, read_u32(entry + 20)? as usize);
+        copy(rva, raw_offset, raw_size.min(virtual_size.max(raw_size)));
+    }
+    unsafe { libc::mprotect(base as *mut libc::c_void, length, libc::PROT_READ) };
+    DATA_MODULES.lock().ok()?.push((base, length));
+    Some(base | if image_resource { 2 } else { 1 })
+}
+
+/// `FreeLibrary` on a data module: unmap it; `None` for other handles.
+pub(super) fn free_data_module(module: u64) -> Option<i32> {
+    if module & 3 == 0 {
+        return None;
+    }
+    let mut modules = DATA_MODULES.lock().ok()?;
+    let index = modules.iter().position(|(base, _)| *base == module & !3)?;
+    let (base, length) = modules.remove(index);
+    unsafe { libc::munmap(base as *mut libc::c_void, length) };
+    Some(1)
+}
+
+/// A mapped image this process loaded (the program or one of its DLLs), or
+/// a module loaded as data.
 fn image_base(module: u64) -> Option<u64> {
+    if module & 3 != 0 {
+        let base = module & !3;
+        return DATA_MODULES.lock().ok()?.iter().any(|(start, _)| *start == base).then_some(base);
+    }
     let process = process_ctx()?;
     if module == 0 || module == process.image_base {
         return Some(process.image_base);
@@ -196,6 +263,51 @@ pub(super) extern "win64" fn native_sizeof_resource(module: u64, resource: u64) 
         return 0;
     }
     unsafe { read_u32(resource + 4) }
+}
+
+/// `LoadStringW(module, id, buffer, size)`: string `id` from the module's
+/// `RT_STRING` table (block `id / 16 + 1`, sixteen counted UTF-16 strings
+/// each). It copies at most `size - 1` characters and a terminator and
+/// returns the count; with `size` 0 it stores a pointer to the read-only
+/// string and returns its length. A missing string returns 0.
+pub(super) extern "win64" fn native_load_string_w(module: u64, id: u32, output: *mut u16, size: i32) -> i32 {
+    const RT_STRING: u16 = 6;
+    if output.is_null() {
+        native_set_last_error(87);
+        return 0;
+    }
+    let found = image_base(module).and_then(|base| {
+        let entry = locate(base, &Key::Id(RT_STRING), &Key::Id(((id >> 4) + 1) as u16), None).ok()?;
+        let (offset, length) = unsafe { (read_u32(entry), read_u32(entry + 4)) };
+        let mut cursor = base + u64::from(offset);
+        let end = cursor + u64::from(length);
+        for _ in 0..(id & 15) {
+            let count = unsafe { read_u16(cursor) };
+            cursor += 2 + u64::from(count) * 2;
+            if cursor >= end {
+                return None;
+            }
+        }
+        let count = unsafe { read_u16(cursor) } as usize;
+        (count > 0).then_some((cursor + 2, count))
+    });
+    let Some((text, count)) = found else {
+        if size > 0 {
+            unsafe { output.write(0) };
+        }
+        native_set_last_error(ERROR_RESOURCE_NAME_NOT_FOUND);
+        return 0;
+    };
+    if size == 0 {
+        unsafe { output.cast::<u64>().write_unaligned(text) };
+        return count as i32;
+    }
+    let copied = count.min(size as usize - 1);
+    unsafe {
+        output.copy_from_nonoverlapping(text as *const u16, copied);
+        output.add(copied).write(0);
+    }
+    copied as i32
 }
 
 /// Obsolete on 32- and 64-bit Windows: resources stay mapped with the image.

@@ -110,6 +110,12 @@ use sddl::*;
 #[path = "linux_x86_64/text_tools_host.rs"]
 mod text_tools_host;
 use text_tools_host::*;
+#[path = "linux_x86_64/thread_suspend.rs"]
+mod thread_suspend;
+use thread_suspend::*;
+#[path = "linux_x86_64/process_modules.rs"]
+mod process_modules;
+use process_modules::*;
 #[path = "linux_x86_64/wpkg_host.rs"]
 mod wpkg_host;
 use wpkg_host::*;

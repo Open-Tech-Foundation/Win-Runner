@@ -131,6 +131,8 @@ pub(super) fn current_apc_queue() -> Option<Arc<NativeApcQueue>> {
                 .thread
                 .host_tid
                 .store(unsafe { libc::gettid() }, Ordering::Release);
+            // A thread met here is already running.
+            queue.thread.running.store(true, Ordering::Release);
             queue
         })
         .clone();

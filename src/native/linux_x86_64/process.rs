@@ -487,6 +487,7 @@ pub(super) extern "win64" fn native_create_thread(
                 Err(_) => return 1,
             };
         }
+        thread_apc.thread.running.store(true, Ordering::Release);
         drop(count);
         let Ok(mut tls) = thread_tls.lock() else {
             return 1;
@@ -598,6 +599,8 @@ pub(super) extern "win64" fn native_resume_thread(handle: u64) -> u32 {
         *count -= 1;
         if *count == 0 {
             ready.notify_one();
+            drop(count);
+            resume_running_thread(&thread.queue.thread);
         }
     }
     previous
@@ -727,6 +730,43 @@ pub(super) fn child_process(
         .get(&handle)
         .or_else(|| table.primary_threads.get(&handle))
         .cloned()
+}
+
+/// `OpenProcess(access, inherit, pid)`: a new handle to this process or to
+/// one of its children, as DuplicateHandle makes from their handles. A PID
+/// that names no process (or 0) is ERROR_INVALID_PARAMETER; other guest
+/// processes cannot be opened here and get ERROR_ACCESS_DENIED.
+pub(super) extern "win64" fn native_open_process(access: u32, inherit: i32, pid: u32) -> u64 {
+    if native_diagnostic_enabled() {
+        eprintln!("native OpenProcess pid={pid} access={access:#x}");
+    }
+    let Some(process) = process_ctx() else {
+        native_set_last_error(87);
+        return 0;
+    };
+    let source = if pid == process.process_id {
+        Some(process.process_handle)
+    } else {
+        process.children.lock().ok().and_then(|table| {
+            table
+                .children
+                .iter()
+                .find(|(_, child)| child.process_id.load(Ordering::Acquire) == pid)
+                .map(|(handle, _)| *handle)
+        })
+    };
+    let Some(source) = source else {
+        let exists = pid != 0
+            && crate::native::process_table::list().iter().any(|guest| guest.pid == pid);
+        native_set_last_error(if exists { 5 } else { 87 });
+        return 0;
+    };
+    let mut handle = 0u64;
+    let current = process.process_handle;
+    if native_duplicate_handle(current, source, current, &mut handle, access, inherit, 0) == 0 {
+        return 0;
+    }
+    handle
 }
 
 /// `GetProcessId`: the id of the current process (pseudo handle) or of a
@@ -2631,6 +2671,11 @@ pub(super) extern "win64" fn native_get_startup_info_a(startup_info: *mut u8) {
     native_get_startup_info_w(startup_info);
 }
 
+/// `ExitThread(code)`: end the calling thread with `code`.
+pub(super) extern "win64" fn native_exit_thread(code: u32) -> ! {
+    native_free_library_and_exit_thread(0, code)
+}
+
 pub(super) extern "win64" fn native_free_library_and_exit_thread(_module: u64, _code: u32) -> ! {
     if native_diagnostic_enabled() {
         eprintln!("native FreeLibraryAndExitThread");
@@ -2710,9 +2755,4 @@ pub(super) extern "win64" fn native_set_process_priority_boost(handle: u64, disa
     1
 }
 
-/// Running host threads cannot yet be safely suspended for context injection.
-/// Report the unsupported operation so Go can use cooperative preemption.
-pub(super) extern "win64" fn native_suspend_thread(_handle: u64) -> u32 {
-    native_set_last_error(50); // ERROR_NOT_SUPPORTED
-    u32::MAX
-}
+

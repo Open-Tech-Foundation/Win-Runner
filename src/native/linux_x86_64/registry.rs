@@ -435,7 +435,16 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
             | "CertVerifyCertificateChainPolicy" | "CertCreateCertificateChainEngine"
             | "CertFreeCertificateChainEngine" | "CertSetCertificateContextProperty"
             | "CertCreateCertificateContext" | "CertAddStoreToCollection"),
-        "PSAPI.DLL" => matches!(func, "GetProcessMemoryInfo" | "GetPerformanceInfo"),
+        "PSAPI.DLL" => matches!(
+            func,
+            "GetProcessMemoryInfo"
+                | "GetPerformanceInfo"
+                | "EnumProcessModules"
+                | "EnumProcessModulesEx"
+                | "GetModuleBaseNameW"
+                | "GetModuleFileNameExW"
+                | "GetModuleInformation"
+        ),
         "WINMM.DLL" => matches!(func, "timeGetTime" | "timeBeginPeriod" | "timeEndPeriod"),
         "USERENV.DLL" => func == "GetUserProfileDirectoryW",
         "BCRYPTPRIMITIVES.DLL" => func == "ProcessPrng",
@@ -1326,6 +1335,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "FreeLibraryAndExitThread" => {
             Some(native_free_library_and_exit_thread as *const () as usize as u64)
         }
+        "ExitThread" => Some(native_exit_thread as *const () as usize as u64),
         "ReadConsoleW" => Some(native_read_console_w as *const () as usize as u64),
         "WriteConsoleInputW" => {
             Some(native_write_console_input_w as *const () as usize as u64)
@@ -1346,6 +1356,11 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "CreatePipe" => Some(native_create_pipe as *const () as usize as u64),
         "GetProcessTimes" => Some(native_get_process_times as *const () as usize as u64),
         "K32GetProcessMemoryInfo" | "GetProcessMemoryInfo" => Some(native_get_process_memory_info as *const () as usize as u64),
+        "K32EnumProcessModules" | "EnumProcessModules" => Some(native_enum_process_modules as *const () as usize as u64),
+        "K32EnumProcessModulesEx" | "EnumProcessModulesEx" => Some(native_enum_process_modules_ex as *const () as usize as u64),
+        "K32GetModuleBaseNameW" | "GetModuleBaseNameW" => Some(native_get_module_base_name_w as *const () as usize as u64),
+        "K32GetModuleFileNameExW" | "GetModuleFileNameExW" => Some(native_get_module_file_name_ex_w as *const () as usize as u64),
+        "K32GetModuleInformation" | "GetModuleInformation" => Some(native_get_module_information as *const () as usize as u64),
         "GetProcessIoCounters" => Some(native_get_process_io_counters as *const () as usize as u64),
         "InitializeProcThreadAttributeList" => {
             Some(native_initialize_proc_thread_attribute_list as *const () as usize as u64)
@@ -1596,6 +1611,9 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "GetCurrentThreadId" => Some(native_get_current_thread_id as *const () as usize as u64),
         "GetCurrentProcessId" => Some(native_get_current_process_id as *const () as usize as u64),
         "GetCurrentProcess" => Some(native_get_current_process as *const () as usize as u64),
+        "OpenProcess" => Some(native_open_process as *const () as usize as u64),
+        "QueryFullProcessImageNameW" => Some(native_query_full_process_image_name_w as *const () as usize as u64),
+        "QueryFullProcessImageNameA" => Some(native_query_full_process_image_name_a as *const () as usize as u64),
         "OpenProcessToken" => Some(native_open_process_token as *const () as usize as u64),
         "GetUserNameW" => Some(native_get_user_name_w as *const () as usize as u64),
         "GetExitCodeProcess" => Some(native_get_exit_code_process as *const () as usize as u64),
@@ -1911,6 +1929,8 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
             Some(native_queue_user_work_item as *const () as usize as u64)
         }
         "SuspendThread" => Some(native_suspend_thread as *const () as usize as u64),
+        "GetThreadContext" => Some(native_get_thread_context as *const () as usize as u64),
+        "SetThreadContext" => Some(native_set_thread_context as *const () as usize as u64),
         "ResumeThread" => Some(native_resume_thread as *const () as usize as u64),
         "WaitForSingleObject" => Some(native_wait_for_single_object as *const () as usize as u64),
         "CreateEventW" => Some(native_create_event_w as *const () as usize as u64),
