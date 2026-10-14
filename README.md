@@ -38,19 +38,11 @@ prefix to set up and reset, noisy logs, and quiet workarounds that can hide bugs
 Win-Runner is built for one job: **fast, repeatable, scriptable runs of Windows CLI
 programs**, driven by people, CI pipelines, and coding agents.
 
-- **Instant, clean state:** every run starts from a fresh in-memory C: drive or a
-  saved snapshot. There is no prefix to create, copy, or clean up.
-- **Native speed:** on the Linux x86-64 backend, x86-64 code runs directly on the
-  host CPU; only Windows API calls go through compatibility shims.
-- **Honest failures:** unsupported APIs are reported by name, and `winrun inspect`
-  shows what a program needs before it runs. A missing feature fails loudly
-  instead of silently changing behavior.
-- **Built for automation:** `runner` (stdin jobs), the headless WebSocket control
-  API (streams output, accepts input/key/resize, reports exit codes), and
-  long-lived `instance`s let an agent build, run, and check Windows programs
-  without a Windows machine.
-- **One small binary:** a single executable with a shell, PowerShell-style
-  scripts, and a manifest-based portable package manager.
+- **Instant, clean state:** fresh in-memory C: or saved snapshot per run. No prefix to manage.
+- **Native speed:** guest code runs on the host CPU; only API calls hit shims.
+- **Honest failures:** missing APIs fail loudly by name; `winrun inspect` lists them upfront.
+- **Built for automation:** `runner` jobs, headless WebSocket control, and `instance`s for agents.
+- **One small binary:** shell, PowerShell-style scripts, and package manager included.
 
 Win-Runner does not aim to replace Wine. It targets command-line programs, not GUI
 apps, games, drivers, or services. For those, use Wine or a real Windows machine.
@@ -169,13 +161,9 @@ winrun upgrade --dry-run          # show what would happen; change nothing
 winrun upgrade --version v0.2.0   # pin a tag (or set WINRUN_VERSION)
 ```
 
-`upgrade` resolves the latest tag via the GitHub Releases API (or uses your
-pin), downloads the tarball and `checksums.txt` with the built-in HTTPS
-client — no `curl` needed — verifies the SHA-256, smoke-checks the new binary
-(`--version`), then atomically replaces the running one. It reports "up to
-date" and changes nothing when already current. It needs write permission on
-the binary's directory; otherwise rerun with `sudo` or reinstall with
-`scripts/install.sh --prefix`. Published releases are Linux x86-64 builds.
+`upgrade` fetches the latest tag (or your pin), verifies the SHA-256, smoke-checks
+the new binary, and atomically replaces the running one. Needs write access to the
+binary's directory (else `sudo`, or `install.sh --prefix`). Linux x86-64 releases only.
 
 ## Quickstart
 
@@ -275,17 +263,15 @@ winrun instance destroy ci
 
 Agent tips:
 
-- Prefer `runner` / headless / `instance` over bare interactive `shell`, which
-  can block on prompts (e.g. installers asking questions).
-- Use `winrun inspect` first for unknown binaries; missing `DLL!API` names tell
-  you exactly what is unsupported.
+- Prefer `runner` / headless / `instance` — bare `shell` can block on prompts.
+- `inspect` unknown binaries first; missing `DLL!API` names are the full answer.
 - Mounts are silent on boot — confirm with `dir Z:`.
-- `--save` writes back only on clean exit; run `snapshot save` inside the shell
-  to checkpoint sooner. A killed session can lose trailing changes.
+- `--save` writes back only on clean exit; `snapshot save` checkpoints sooner.
 
 ## Guest state
 
-Each new run gets a disposable C: drive laid out like a stock Windows installation, signed in as the user `runner` on the computer `WINRUNNER`. The shell starts in the profile directory `C:\Users\runner`.
+Each run gets a disposable C: like a stock Windows install, as user `runner` on `WINRUNNER`.
+The shell starts in `C:\Users\runner`.
 
 | Folder | Path |
 |---|---|
@@ -295,9 +281,11 @@ Each new run gets a disposable C: drive laid out like a stock Windows installati
 | `%ProgramFiles%` / `%ProgramData%` | `C:\Program Files` / `C:\ProgramData` |
 | `%SystemRoot%` | `C:\Windows` |
 
-The standard Windows environment variables (`PATH`, `PATHEXT`, `ComSpec`, `COMPUTERNAME`, `ProgramFiles(x86)`, and so on) are set, and the Windows folder APIs (`SHGetFolderPath`, `GetUserProfileDirectory`, `GetTempPath`, `GetComputerName`) report the same locations, so tools such as npm find their usual folders. `$env:` and `[Environment]` in PowerShell read and change this guest environment, never the host's.
+Standard variables (`PATH`, `PATHEXT`, `ComSpec`, …) and folder APIs report guest locations,
+so tools like npm find their folders. `$env:` / `[Environment]` touch the guest env only.
 
-Each disk also has a Windows registry, stored in WinFS so snapshots keep it (`HKLM` in `C:\Windows\System32\config\machine.json`, `HKCU` in `C:\Users\runner\NTUSER.json`). As on Windows, a new session builds its environment from the registry's machine and user `Environment` keys, and programs can use the `Reg*` APIs.
+Each disk has a registry (`HKLM` → `C:\Windows\System32\config\machine.json`,
+`HKCU` → `C:\Users\runner\NTUSER.json`); sessions build their env from it, like Windows.
 
 ```text
 setx EDITOR vim                    # user variable for sessions started later
@@ -308,74 +296,50 @@ reg add HKCU\Software\Vendor /v Mode /t REG_DWORD /d 3
 reg delete HKCU\Software\Vendor /f
 ```
 
-`set` and `$env:NAME = value` change only the current session; `setx`, `reg`, and the `User`/`Machine` targets persist and apply from the next session, as on Windows. Where Windows `reg` would prompt before overwriting or deleting, add `/f`.
+`set` / `$env:` affect this session only; `setx`, `reg`, and `User`/`Machine` targets persist
+for later sessions. Add `/f` where Windows `reg` would prompt.
 
-Run `reload` to apply saved environment changes, including PATH, immediately:
+`reload` applies saved env changes (incl. PATH) now, keeping shell state and files:
 
 ```text
 reload
 node --version
 ```
 
-`reload` rebuilds the environment from the guest registry and restores the active
-Node/npm command paths. It replaces temporary environment overrides while keeping
-shell variables, functions, the current directory, and files.
-
-Use a WinFS snapshot to keep files and installed programs between runs.
+Keep files and programs between runs with a snapshot:
 
 ```bash
 winrun --snapshot=tools.winfs --save shell
 ```
 
-`--save` writes changes back to the loaded snapshot when the shell exits; run `snapshot save` inside the shell to save sooner.
-Snapshots are indexed, seekable WinFS disks and contain C: only.
-While a session runs, each file a program writes lives in its own file in a session directory under the temp directory (`$TMPDIR`, default `/tmp`), shared by all of the session's guest processes. A write costs only what it writes, and deleting a file frees its space. The session directory is removed when `winrun` exits; one left by a killed instance is removed the next time `winrun` starts.
-Explicitly mounted host directories appear as separate guest drives (for example, Z:).
+`--save` writes back on exit (`snapshot save` checkpoints sooner). Snapshots hold C: only.
+Session writes live as one host file each under `$TMPDIR` (default `/tmp`), shared by all guest
+processes; the dir is removed on exit (leftovers from kills are swept at next start).
+Host mounts appear as extra drives (e.g. Z:).
 
 ## Shell and packages
 
-The interactive shell implements a PowerShell subset. `Get-Command` lists
-implemented commands and guest programs on PATH; `Get-Alias` lists aliases,
-and `Get-Help Rename-Item` shows the supported syntax. These commands also
-appear in tab completion.
+The interactive shell is a PowerShell subset. `Get-Command` / `Get-Alias` / `Get-Help`
+list what's implemented (also in tab completion) — they are authoritative for your build.
 
-Everyday file commands include `New-Item`, `Get-Item`, `Get-ChildItem`,
-`Copy-Item`, `Move-Item`, `Rename-Item`, `Remove-Item`, `Test-Path`,
-`Get-Content`, `Set-Content`, `Add-Content`, and `Clear-Content`.
-`Rename-Item test.js test.mjs` renames a file in its existing directory;
-`-Force` never replaces a destination during rename. Use `Resolve-Path`,
-`Split-Path`, `Join-Path`, and the location commands for navigation.
+| Group | Covered |
+|---|---|
+| Files | Item + ChildItem (`-Recurse`, `-Filter`) + Content (`-Raw`, `-Head`, `-Tail`); path + location helpers |
+| Text pipeline | Select-String, Sort, Unique, Measure, Out-File, Tee, Where/ForEach/Select |
+| Utilities | Date (`-Format`), Random, Format/Table/List, Group, Json convert, Read-Host, Process |
+| System | Registry (`HKLM:`/`HKCU:`), `Add-Type [DllImport]`, web requests, archives |
 
-Utility cmdlets include `Get-Date` (with .NET `-Format` strings), `Get-Random`,
-`Out-String`, `Format-Table`/`Format-List`, `Group-Object`, `ConvertTo-Json`
-(`-Depth`, `-Compress`), `ConvertFrom-Json`, `Read-Host`, `Get-Process` (this
-session's guest processes), `Start-Process` (runs to completion),
-`Get-ItemPropertyValue`, `Select-String`, `Sort-Object`, `Get-Unique`,
-`Measure-Object`, `Out-File`, and `Tee-Object`.
+Scripts take `param(...)` (by name/position, rest in `$args`), with functions, `return`,
+`try`/`catch` (`$_` is the error), `& exe` runs, `$LASTEXITCODE`, and `$(...)` capture.
+Pipelines carry text, not .NET objects; admin cmdlets and unimplemented flags stay out.
 
-Scripts support `param(...)` blocks (bound by name or position, with defaults;
-remaining args land in `$args`), functions, `return`, `try`/`catch` (with `$_`
-as an error record), here-strings, backtick escapes, casts, and the
-`HKLM:`/`HKCU:` registry provider. They run programs with
-`& "C:\path\app.exe" args` or by name on the `PATH`, read `$LASTEXITCODE`,
-and capture program output with `$(...)`. `Add-Type` accepts
-`[DllImport]` declarations for the Win32 calls installers make.
-Pipelines carry text rather than full PowerShell objects; advanced
-providers, administration cmdlets, and unimplemented parameters remain
-unsupported. This shell is not a complete PowerShell distribution.
-
-The shell includes `wpkg`, which installs SHA-256-verified ZIP and 7z packages into the guest C: drive without running installers or package scripts. Its text registry is bundled in the binary; package archives download only when installed.
-
-For a terminal text editor, install the Windows build of Micro:
+`wpkg` installs SHA-256-verified ZIP/7z packages into C: without running installers.
+Its registry ships in the binary; archives download on demand.
 
 ```powershell
 wpkg install micro
-micro -clipboard internal notes.txt
+micro -clipboard internal notes.txt   # Ctrl-S saves, Ctrl-Q quits; no desktop clipboard
 ```
-
-Use Ctrl-S to save and Ctrl-Q to quit. Micro edits files in the guest drive,
-including files restored from snapshots. The `internal` clipboard setting
-keeps copy and paste inside the editor; the guest has no desktop clipboard.
 
 ```text
 wpkg search <query> | info <package[@version]>
@@ -460,6 +424,7 @@ contributors and reviewers can judge soundness.
 | [docs/differences-from-windows.md](docs/differences-from-windows.md) | Intentional behavior differences vs real Windows |
 | [docs/architecture.md](docs/architecture.md) | PE loading, API shims, child processes, WinFS |
 | [docs/control-protocol.md](docs/control-protocol.md) | Headless WebSocket protocol for agents |
+| [docs/registry.md](docs/registry.md) | `wpkg` package list with versions and install commands |
 
 ## Development
 

@@ -16,7 +16,8 @@ Status levels:
 ## Tested tools and versions
 
 These are the `latest` pins in `registry/packages/*/latest` at the time of
-writing. Install with `wpkg install <name>` (or `wpkg install <name>@<major>`).
+writing. Install with `wpkg install <name>` (or `wpkg install <name>@<major>`);
+see [registry.md](registry.md) for the full package list.
 
 | Tool | Pinned version | Status | Notes / evidence |
 |---|---|---|---|
@@ -58,36 +59,32 @@ Shipped on every guest C: drive, tested against real-Windows oracles:
 
 ## Shell coverage (PowerShell subset)
 
-File cmdlets (`New/Get/Copy/Move/Rename/Remove/Test-Item`, `Get-ChildItem`
-with `-Recurse/-Filter`, `Get/Set/Add/Clear-Content` with `-Raw/-Head/-Tail`),
-text pipeline (`Select-String`, `Sort-Object`, `Get-Unique`, `Measure-Object`,
-`Out-File`, `Tee-Object`, `Where/ForEach/Select-Object`), utilities
-(`Get-Date`, `Get-Random`, `Out-String`, `Format-Table/List`, `Group-Object`,
-`ConvertTo/From-Json`, `Read-Host`, `Get-Process`, `Start-Process`,
-`Get-ItemPropertyValue`), registry provider (`HKLM:`/`HKCU:`), `Add-Type`
-`[DllImport]`, `Invoke-RestMethod`/`Invoke-WebRequest`, `Expand-Archive`.
-`Get-Command` / `Get-Help` inside the shell are authoritative for the build
-you run. Oracle scripts in `tests/oracle/*.ps1` compare behavior against real
-Windows PowerShell.
+| Group | Covered |
+|---|---|
+| Files | Item + ChildItem (`-Recurse`, `-Filter`) + Content (`-Raw`, `-Head`, `-Tail`) |
+| Text pipeline | Select-String, Sort, Unique, Measure, Out-File, Tee, Where/ForEach/Select |
+| Utilities | Date, Random, Format/Table/List, Group, Json convert, Read-Host, Process |
+| System | Registry (`HKLM:`/`HKCU:`), `Add-Type [DllImport]`, web requests, archives |
+
+`Get-Command` / `Get-Help` in the shell are authoritative for your build;
+`tests/oracle/*.ps1` checks behavior against real PowerShell.
 
 ## API areas implemented
 
-Kernel/process/threads (incl. `taskkill` process table, thread descriptions,
-APCs, alertable waits), file I/O (incl. overlapped I/O, completion ports,
-locks, reparse points, pipes), memory/virtual memory, synchronization (mutexes,
-SRW, InitOnce, condition variables), CRT/UCRT surface CPython and MSVC programs
-need, C++ EH/RTTI (`__CxxFrameHandler3`, `dynamic_cast`), Winsock (blocking,
-non-blocking, overlapped, events, multicast/TTL options), CryptoAPI/Cert chain
-building against the guest ROOT store, NLS/locale, console (code pages, raw
-mode, scroll regions), clipboard (session-local formats), messages/queues,
-`GetVersionEx` manifest-aware versioning, PE resources, known folders.
+| Area | Covered |
+|---|---|
+| Processes/threads | Job table (`taskkill`), descriptions, APCs, alertable waits |
+| Files/pipes | Overlapped I/O, completion ports, locks, reparse points |
+| Memory/sync | Virtual memory, mutexes, SRW/InitOnce, condition variables |
+| Runtimes | UCRT surface, C++ EH/RTTI (`__CxxFrameHandler3`, `dynamic_cast`) |
+| Network/crypto | Winsock (sync/async/events), cert chains vs guest ROOT store |
+| Console/locale | Code pages, raw mode, NLS, manifest-aware versioning |
+| Misc | Registry, resources, known folders, session clipboard/messages |
 
 ## Out of scope (by design)
 
-GUI apps and windows, games, drivers, Windows services, remote desktop,
-interactive `cmd` prompt, desktop clipboard, Windows Update / Defender,
-domain-join / Group Policy, Hyper-V / WSL-in-guest, and **.NET Framework**
-executables (reported as a loader limitation by `winrun inspect`).
+GUI, games, drivers, services, remote desktop, desktop clipboard,
+Update/Defender, domains, Hyper-V/WSL-in-guest, and **.NET Framework** exes.
 
 ## How to check a new binary
 
@@ -96,7 +93,5 @@ winrun inspect app.exe        # exit 0 = runnable, 1 = missing imports
 WINRUN_NATIVE_STRICT_IMPORTS=1 winrun app.exe   # refuse before executing
 ```
 
-Missing imports print as `DLL!API` (executable, DLL, and API name), including
-through nested child processes and redirected output. File an issue with the
-missing names — that list is the compatibility roadmap. Tracked work lives in
-`COMPATIBILITY_BACKLOG.md`.
+Missing imports print as `DLL!API`, even through nested children and
+redirected output. File an issue with those names — that list is the roadmap.
