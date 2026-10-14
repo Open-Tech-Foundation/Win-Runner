@@ -347,27 +347,35 @@ fn probe() {
             && data == *b"test"
             && record.owner == self_id,
     );
+    // A read at end of file either fails at once with ERROR_HANDLE_EOF
+    // (no callback), or is queued and its callback gets ERROR_HANDLE_EOF:
+    // Windows documents both, and which one happens depends on the cache.
     ov[2] = 4;
-    boolean(
-        "io.eof_queued",
-        unsafe {
-            read(
-                file,
-                data.as_mut_ptr(),
-                4,
-                ov.as_mut_ptr(),
-                complete as *const () as usize,
-            )
-        } != 0,
-    );
+    let before = record.calls;
+    let queued = unsafe {
+        read(
+            file,
+            data.as_mut_ptr(),
+            4,
+            ov.as_mut_ptr(),
+            complete as *const () as usize,
+        )
+    } != 0;
+    let immediate = !queued && last_error() == 38;
+    boolean("io.eof_queued", queued || immediate);
     boolean(
         "io.eof_callback",
-        unsafe { sleep(3000, 1) } == 192
-            && record.calls == 3
-            && record.error == 38
-            && record.bytes == 0,
+        if queued {
+            (unsafe { sleep(3000, 1) }) == 192
+                && record.calls == before + 1
+                && record.error == 38
+                && record.bytes == 0
+        } else {
+            (unsafe { sleep(0, 1) }) == 0 && record.calls == before
+        },
     );
     ov[2] = 128;
+    let before = record.calls;
     boolean(
         "io.zero_write",
         unsafe {
@@ -380,7 +388,7 @@ fn probe() {
             )
         } != 0
             && unsafe { sleep(3000, 1) } == 192
-            && record.calls == 4
+            && record.calls == before + 1
             && record.error == 0
             && record.bytes == 0,
     );
@@ -392,6 +400,7 @@ fn probe() {
         unsafe { size(file, &mut length) } != 0 && length == 4,
     );
     ov[2] = usize::MAX;
+    let before = record.calls;
     boolean(
         "io.append",
         unsafe {
@@ -404,7 +413,7 @@ fn probe() {
             )
         } != 0
             && unsafe { sleep(3000, 1) } == 192
-            && record.calls == 5
+            && record.calls == before + 1
             && record.error == 0
             && record.bytes == 1
             && unsafe { size(file, &mut length) } != 0
@@ -495,6 +504,7 @@ fn probe() {
             && last_error() == 995,
     );
     pipe_ov[3] = 0xdeadbeef;
+    let before = record.calls;
     boolean(
         "pipe.read_queued",
         unsafe {
@@ -514,14 +524,14 @@ fn probe() {
     boolean(
         "io.cancel_callback",
         unsafe { sleep(3000, 1) } == 192
-            && record.calls == 6
+            && record.calls == before + 1
             && record.error == 995
             && record.bytes == 0
             && record.owner == self_id,
     );
     boolean(
         "io.no_duplicate",
-        unsafe { sleep(0, 1) } == 0 && record.calls == 6,
+        unsafe { sleep(0, 1) } == 0 && record.calls == before + 1,
     );
     let associated = unsafe { port(file, completion_port, 0, 0) };
     boolean(

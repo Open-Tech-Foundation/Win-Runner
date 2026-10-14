@@ -28,6 +28,12 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- The `apc_io` oracle accepts both outcomes Windows documents for an
+  overlapped read at end of file (an immediate `ERROR_HANDLE_EOF`, or a
+  queued completion carrying it), and counts each callback relative to the
+  calls before it, so one cache-dependent result no longer fails later
+  cases on Windows.
+
 - `Group-Object` tables use PowerShell's GroupInfo layout (Count 5 wide,
   Name 25, longer names end in `…`); `Format-Table` aligns number columns
   right; `Out-String` makes one string ending in a newline (a blank line in
