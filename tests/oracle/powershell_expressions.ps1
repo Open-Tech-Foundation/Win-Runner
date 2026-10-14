@@ -53,18 +53,22 @@ $n
 5 -band 3
 [string]::Join('-', @('a','b'))
 
-'a','b','a' | Group-Object
-'a','b','a' | Group-Object -NoElement
-@{Name='n'; Size=3} | ConvertTo-Json
-@{Name='n'; Size=3} | ConvertTo-Json -Compress
+# Each formatted block is captured alone with Out-String: how one script's
+# consecutive outputs share a table is the host's whole-stream formatting,
+# not the cmdlets'. Hashtable key order is hash order, so JSON input uses
+# [ordered] and pscustomobject.
+"group: [$('a','b','a' | Group-Object | Out-String)]"
+"group.noelement: [$('a','b','a' | Group-Object -NoElement | Out-String)]"
+[ordered]@{Name='n'; Size=3} | ConvertTo-Json
+[ordered]@{Name='n'; Size=3} | ConvertTo-Json -Compress
 $o = '{"Ab":1,"c":{"d":"x"},"l":[1,2]}' | ConvertFrom-Json
 $o.ab
 $o.c.d
 $o.l.Count
 $o | ConvertTo-Json -Compress
-[pscustomobject]@{Name='n'; Size=3} | Format-Table
-[pscustomobject]@{Name='n'; Size=3} | Format-List
-'x','y' | Out-String
+"table: [$([pscustomobject]@{Name='n'; Size=3} | Format-Table | Out-String)]"
+"list: [$([pscustomobject]@{Name='n'; Size=3} | Format-List | Out-String)]"
+"string: [$('x','y' | Out-String)]"
 
 $key = 'HKCU:\Software\WinRunOracleExpr'
 if (Test-Path $key) { Remove-Item $key -Recurse }

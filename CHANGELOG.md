@@ -28,6 +28,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- `Group-Object` tables use PowerShell's GroupInfo layout (Count 5 wide,
+  Name 25, longer names end in `…`); `Format-Table` aligns number columns
+  right; `Out-String` makes one string ending in a newline (a blank line in
+  output, one string when assigned or used in `"$(...)"`).
+- The `powershell_expressions` oracle captures each formatted block alone
+  and avoids hashtable key order, which is hash order on Windows.
+
 - `"$(...)"` joins multiple output objects with spaces, as PowerShell
   does, instead of keeping line breaks.
 - Member access on an array enumerates its elements' members.

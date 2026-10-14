@@ -193,18 +193,31 @@ fn render_pretty_json(value: &Value, indent: usize, depth: usize, compress: bool
 }
 
 /// Lay rows out as PowerShell's table: headers, dashes, and padded columns
-/// (the last column unpadded).
-fn table(headers: &[String], rows: &[Vec<String>], right_aligned: &[bool]) -> Vec<String> {
+/// (the last column unpadded). A column has a fixed width where `fixed`
+/// gives one (longer cells end in `…`), else its widest cell's.
+fn table(headers: &[String], rows: &[Vec<String>], right_aligned: &[bool], fixed: &[Option<usize>]) -> Vec<String> {
     let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
     for row in rows {
         for (index, cell) in row.iter().enumerate() {
             widths[index] = widths[index].max(cell.chars().count());
         }
     }
+    for (index, width) in fixed.iter().enumerate() {
+        if let Some(width) = width {
+            widths[index] = *width;
+        }
+    }
     let line = |cells: &[String]| -> String {
         let last = cells.len() - 1;
         let mut text = String::new();
         for (index, cell) in cells.iter().enumerate() {
+            let truncated: String;
+            let cell = if index != last && cell.chars().count() > widths[index] {
+                truncated = cell.chars().take(widths[index].saturating_sub(1)).chain(std::iter::once('…')).collect();
+                &truncated
+            } else {
+                cell
+            };
             let pad = widths[index].saturating_sub(cell.chars().count());
             if right_aligned.get(index) == Some(&true) {
                 text.push_str(&" ".repeat(pad));
@@ -284,10 +297,13 @@ impl Interpreter<'_> {
                         self.emit(line);
                     }
                 } else {
+                    // One string ending in a newline, which output then
+                    // ends with a line break of its own: a blank line.
                     self.out.extend_from_slice(text.as_bytes());
                     if !text.ends_with('\n') {
                         self.out.push(b'\n');
                     }
+                    self.out.push(b'\n');
                 }
             }
             "format-list" | "format-table" => {
@@ -346,7 +362,14 @@ impl Interpreter<'_> {
                 } else {
                     let rows: Vec<Vec<String>> =
                         objects.iter().map(|object| columns.iter().map(|c| cell(object, c)).collect()).collect();
-                    for line in table(&columns, &rows, &[]) {
+                    // Number columns align right, headers included.
+                    let numeric: Vec<bool> = (0..columns.len())
+                        .map(|index| {
+                            let mut cells = rows.iter().map(|row| row[index].as_str()).filter(|c| !c.is_empty()).peekable();
+                            cells.peek().is_some() && cells.all(|c| c.parse::<f64>().is_ok())
+                        })
+                        .collect();
+                    for line in table(&columns, &rows, &numeric, &[]) {
                         self.emit(&line);
                     }
                 }
@@ -381,7 +404,8 @@ impl Interpreter<'_> {
                 } else {
                     (headers.to_vec(), rows)
                 };
-                for line in table(&headers, &rows, &[true]) {
+                // GroupInfo's table view: Count 5 wide, Name 25.
+                for line in table(&headers, &rows, &[true], &[Some(5), Some(25)]) {
                     self.emit(&line);
                 }
             }
@@ -461,7 +485,7 @@ impl Interpreter<'_> {
                         vec![pid.to_string(), base.to_string()]
                     })
                     .collect();
-                for line in table(&headers, &rows, &[true]) {
+                for line in table(&headers, &rows, &[true], &[]) {
                     self.emit(&line);
                 }
             }
@@ -540,8 +564,12 @@ mod tests {
     #[test]
     fn tables_pad_columns_and_align_counts() {
         let rows = vec![vec!["2".to_string(), "b".to_string()], vec!["10".to_string(), "a".to_string()]];
-        let lines = table(&["Count".into(), "Name".into()], &rows, &[true]);
+        let lines = table(&["Count".into(), "Name".into()], &rows, &[true], &[]);
         assert_eq!(lines, vec!["", "Count Name", "----- ----", "    2 b", "   10 a", ""]);
+        let rows = vec![vec!["1".to_string(), "abcdef".to_string(), "x".to_string()]];
+        let lines = table(&["N".into(), "Name".into(), "G".into()], &rows, &[true], &[Some(3), Some(4)]);
+        assert_eq!(lines[1], "  N Name G");
+        assert_eq!(lines[3], "  1 abc… x", "a fixed column truncates with an ellipsis");
     }
 
     #[test]

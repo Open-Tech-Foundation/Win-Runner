@@ -4334,7 +4334,13 @@ fn captured_value(code: &str, lines: Vec<String>) -> Value {
         .ok()
         .and_then(|stages| stages.last().cloned())
         .unwrap_or_default();
-    let head = last_stage.split_whitespace().next().unwrap_or_default();
+    let mut words = last_stage.split_whitespace();
+    let head = words.next().unwrap_or_default();
+    // `Out-String` makes one string; its output ends with a blank line
+    // (the string's own final newline), so the lines rejoin exactly.
+    if head.eq_ignore_ascii_case("out-string") && !words.any(|w| w.eq_ignore_ascii_case("-stream")) {
+        return Value::Str(lines.join("\n"));
+    }
     if !head.eq_ignore_ascii_case("convertfrom-json") {
         return lines_value(lines);
     }
@@ -8014,10 +8020,19 @@ $x
         assert_eq!(out, b"1\nx\n3\n");
         let (out, r) = run_session("'a','b','a' | Group-Object");
         assert!(r.is_ok(), "{r:?}");
-        assert_eq!(out, b"\nCount Name Group\n----- ---- -----\n    2 a    {a, a}\n    1 b    {b}\n\n");
+        // GroupInfo's view as Windows shows it: Count 5 wide, Name 25.
+        let expected = format!(
+            "\nCount {:<25} Group\n----- {:<25} -----\n    2 {:<25} {{a, a}}\n    1 {:<25} {{b}}\n\n",
+            "Name", "----", "a", "b"
+        );
+        assert_eq!(String::from_utf8(out).unwrap(), expected);
         let (out, r) = run_session("@{Name='n';Size=3} | Format-Table\n@{Name='n';Size=3} | Format-List");
         assert!(r.is_ok(), "{r:?}");
-        assert_eq!(out, b"\nName Size\n---- ----\nn    3\n\n\nName : n\nSize : 3\n\n");
+        // Number columns align right.
+        assert_eq!(out, b"\nName Size\n---- ----\nn       3\n\n\nName : n\nSize : 3\n\n");
+        let (out, r) = run_session("$t = 'x','y' | Out-String\n\"[$t]\"\n'z' | Out-String");
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(out, b"[x\ny\n]\nz\n\n", "Out-String makes one string ending in a newline");
         let (out, r) = run_session("Get-Random -Minimum 5 -Maximum 6\n'x' | Get-Random\n(Get-Date -Format yyyy).Length");
         assert!(r.is_ok(), "{r:?}");
         assert_eq!(out, b"5\nx\n4\n");
