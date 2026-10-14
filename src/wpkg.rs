@@ -1,4 +1,5 @@
-//! Small manifest-driven installer for portable Windows ZIP and 7z packages.
+//! Small manifest-driven installer for portable Windows ZIP, 7z, and
+//! tarball (npm `.tgz`) packages.
 //!
 //! Package state and extracted files live only in the guest WinFS. Repositories
 //! provide `packages/index`, per-package `latest` and `versions` files, and
@@ -849,16 +850,34 @@ fn install_version(
     Ok(previous_default.filter(|default| default != &manifest.version))
 }
 
-/// Whether a manifest URL names a 7z archive (anything else is ZIP).
+/// The archive format a manifest URL names by its extension: `7z`,
+/// `tgz` (`.tgz`/`.tar.gz`, as npm publishes packages), or `zip`.
+fn archive_kind(url: &str) -> &'static str {
+    let path = url.split(['?', '#']).next().unwrap_or(url).to_ascii_lowercase();
+    if path.ends_with(".7z") {
+        "7z"
+    } else if path.ends_with(".tgz") || path.ends_with(".tar.gz") {
+        "tgz"
+    } else {
+        "zip"
+    }
+}
+
 fn archive_is_7z(url: &str) -> bool {
-    url.split(['?', '#'])
-        .next()
-        .unwrap_or(url)
-        .to_ascii_lowercase()
-        .ends_with(".7z")
+    archive_kind(url) == "7z"
 }
 
 fn package_entries(archive: &[u8], url: &str) -> Result<Vec<PackageEntry>, String> {
+    if archive_kind(url) == "tgz" {
+        return crate::tar_tool::archive_files(archive)
+            .map_err(|error| format!("wpkg: cannot unpack tarball: {error}"))
+            .map(|files| {
+                files
+                    .into_iter()
+                    .map(|(name, is_dir, bytes)| PackageEntry { name, is_dir, bytes })
+                    .collect()
+            });
+    }
     if !archive_is_7z(url) {
         return install::zip_entries(archive)?
             .into_iter()
@@ -1018,11 +1037,7 @@ fn remove_package(fs: &mut WinFs, name: &str, spec: Option<&str>) -> Result<Stri
 /// `<package>#<version>#<arch>.<zip|7z>`: `#` cannot occur in package
 /// names or versions, so a file name maps back to exactly one package.
 fn cache_path(manifest: &Manifest) -> String {
-    let extension = if archive_is_7z(&manifest.url) {
-        "7z"
-    } else {
-        "zip"
-    };
+    let extension = archive_kind(&manifest.url);
     format!(
         r"{CACHE}\{}#{}#{}.{extension}",
         manifest.name, manifest.version, manifest.arch
@@ -1051,6 +1066,7 @@ fn cached_archives(fs: &WinFs, package: Option<&str>) -> Result<Vec<CachedArchiv
         let Some(stem) = file
             .strip_suffix(".zip")
             .or_else(|| file.strip_suffix(".7z"))
+            .or_else(|| file.strip_suffix(".tgz"))
         else {
             continue;
         };
@@ -1879,6 +1895,49 @@ mod tests {
         package(&load_database(fs).unwrap(), name).default.clone()
     }
 
+    /// A gzipped tarball with one file, laid out as npm publishes packages.
+    fn npm_tarball(name: &str, data: &[u8]) -> Vec<u8> {
+        let mut header = [0u8; 512];
+        header[..name.len()].copy_from_slice(name.as_bytes());
+        header[100..107].copy_from_slice(b"0000644");
+        header[124..135].copy_from_slice(format!("{:011o}", data.len()).as_bytes());
+        header[136..147].copy_from_slice(b"00000000000");
+        header[156] = b'0';
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+        header[148..156].copy_from_slice(b"        ");
+        let checksum: u32 = header.iter().map(|byte| u32::from(*byte)).sum();
+        header[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
+        let mut tar = header.to_vec();
+        tar.extend_from_slice(data);
+        tar.resize(tar.len().div_ceil(512) * 512 + 1024, 0);
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut encoder, &tar).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn npm_tarballs_install_like_zip_packages() {
+        let mut repo = MemoryRepo::default();
+        repo.package("tool", "1.0", "x64", &["package/bin/tool.exe"], &[]);
+        let archive = npm_tarball("package/bin/tool.exe", b"MZ npm");
+        let url = "https://registry.invalid/tool/-/tool-windows-x64-1.0.tgz";
+        let checksum = install::sha256_hex(&archive);
+        repo.add(url, archive);
+        repo.add(
+            "packages/tool/1.0.wpkg",
+            format!("name = \"tool\"\nversion = \"1.0\"\narch = \"x64\"\nurl = \"{url}\"\nsha256 = \"{checksum}\"\nbin = [\"package/bin/tool.exe\"]\n"),
+        );
+        let mut fs = WinFs::ephemeral_runner();
+        let output = run(&mut fs, &repo, &["install", "tool"]);
+        assert!(output.contains("Installed tool 1.0"), "{output}");
+        assert_eq!(fs.read_file(r"C:\ProgramData\wpkg\bin\tool.exe").unwrap(), b"MZ npm");
+        assert!(fs.is_file(r"C:\ProgramData\wpkg\cache\tool#1.0#x64.tgz"), "cached as a tarball");
+        assert_eq!(archive_kind("https://x/a.tar.gz?download=1"), "tgz");
+        assert_eq!(archive_kind("https://x/a.7z"), "7z");
+        assert_eq!(archive_kind("https://x/a.nupkg"), "zip");
+    }
+
     #[test]
     fn versions_install_side_by_side_and_the_first_one_is_the_default() {
         let mut repo = MemoryRepo::default();
@@ -2558,8 +2617,16 @@ mod tests {
         let names = repository_names(&repo).unwrap();
         assert_eq!(
             names,
-            ["7zip", "bat", "bun", "curl", "deno", "fd", "fzf", "gh", "git", "micro", "nodejs", "python", "ripgrep", "uv"]
+            [
+                "7zip", "bat", "biome", "bun", "curl", "deno", "esbuild", "fd", "fzf", "gh", "git", "micro", "nodejs",
+                "opencode", "python", "ripgrep", "uv"
+            ]
         );
+        // npm platform packages: one executable in an npm tarball.
+        let opencode = resolve_version(&repo, "opencode", None, "x64").unwrap();
+        assert_eq!(opencode.bin, ["package/bin/opencode.exe"]);
+        assert_eq!(archive_kind(&opencode.url), "tgz");
+        assert!(resolve_version(&repo, "esbuild", None, "arm64").unwrap().url.contains("@esbuild/win32-arm64"));
         let bun = resolve_version(&repo, "bun", None, "x64").unwrap();
         assert_eq!(bun.bin, ["bun-windows-x64/bun.exe"]);
         let bun = resolve_version(&repo, "bun", None, "arm64").unwrap();

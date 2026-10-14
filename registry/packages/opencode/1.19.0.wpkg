@@ -1,0 +1,6 @@
+name = "opencode"
+version = "1.19.0"
+arch = "x64"
+url = "https://registry.npmjs.org/opencode-windows-x64/-/opencode-windows-x64-1.19.0.tgz"
+sha256 = "1d484abbde6ee3db4b0a34a22e469824410d0e274b92856f428673e7d915adb1"
+bin = ["package/bin/opencode.exe"]

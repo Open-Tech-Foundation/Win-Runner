@@ -427,6 +427,19 @@ fn read_archive(data: &[u8]) -> Result<Vec<Entry>, String> {
     read_tar(data)
 }
 
+/// The files and directories of a (possibly gzip- or bzip2-compressed)
+/// tarball, as `(name, is_directory, data)`; links are left out.
+pub(crate) fn archive_files(data: &[u8]) -> Result<Vec<(String, bool, Vec<u8>)>, String> {
+    Ok(read_archive(data)?
+        .into_iter()
+        .filter_map(|entry| match entry.kind {
+            Kind::File => Some((entry.name, false, entry.data)),
+            Kind::Directory => Some((entry.name, true, Vec::new())),
+            _ => None,
+        })
+        .collect())
+}
+
 fn write_octal(field: &mut [u8], value: u64) {
     let digits = field.len() - 1;
     let text = format!("{value:0digits$o}");

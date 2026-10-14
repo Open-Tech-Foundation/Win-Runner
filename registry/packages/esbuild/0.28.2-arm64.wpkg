@@ -1,0 +1,6 @@
+name = "esbuild"
+version = "0.28.2"
+arch = "arm64"
+url = "https://registry.npmjs.org/@esbuild/win32-arm64/-/win32-arm64-0.28.2.tgz"
+sha256 = "b3cffeaa165134f7da679c8619266953afd5f41641a254615a57e757f67c7336"
+bin = ["package/esbuild.exe"]

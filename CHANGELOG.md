@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- wpkg installs npm tarballs (`.tgz`/`.tar.gz` package URLs), so tools
+  npm ships as prebuilt Windows binaries install without npm:
+  `wpkg install opencode`, `wpkg install esbuild`, `wpkg install biome`
+  (x64 and arm64, from their npm platform packages).
+
 - `wpkg install python` installs python.org's full NuGet distribution
   instead of the embeddable one, so `site`, `exit()`, `venv`, and `pip`
   work. Running it needed:
