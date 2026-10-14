@@ -2,7 +2,8 @@
 //! creation disposition (on new and existing files; the probe sets it to
 //! 1234 first so "left unchanged" shows), and how `SetFileInformationByHandle`
 //! changes a file's size through `FileAllocationInfo` and
-//! `FileEndOfFileInfo`. Works on `oracle-fileinfo.tmp` in the current
+//! `FileEndOfFileInfo`, and its times and attributes through
+//! `FileBasicInfo`. Works on `oracle-fileinfo.tmp` in the current
 //! directory.
 
 #![no_std]
@@ -144,7 +145,59 @@ fn run() {
         set_size(&api, name, handle, class, value);
         close(&api, handle);
     }
+    basic_info(&api);
     delete(&api);
+}
+
+/// FileBasicInfo: zero fields leave a value alone; a write time and
+/// READONLY|ARCHIVE are set and read back, then the attributes cleared.
+fn basic_info(api: &Api) {
+    type FileTimeFn = unsafe extern "system" fn(usize, *mut u64, *mut u64, *mut u64) -> i32;
+    type AttributesFn = unsafe extern "system" fn(*const u16) -> u32;
+    let file_time = api!("basic.time_api", "GetFileTime", FileTimeFn);
+    let attributes = api!("basic.attributes_api", "GetFileAttributesW", AttributesFn);
+    let handle = ten_bytes(api);
+    if handle == 0 {
+        unavailable("basic.set");
+        return;
+    }
+    let mut buffer = [0u16; 32];
+    let path = file_name(&mut buffer);
+    let set = |write_time: i64, value: u32| {
+        let mut info = [0u8; 40];
+        info[16..24].copy_from_slice(&write_time.to_le_bytes());
+        info[32..36].copy_from_slice(&value.to_le_bytes());
+        clear_error();
+        let result = unsafe { (api.set_info)(handle, 0, info.as_ptr(), 40) };
+        (result, last_error())
+    };
+    const WRITE_TIME: i64 = 132_000_000_000_000_000;
+    let (result, error) = set(WRITE_TIME, 0x21);
+    case("basic.set");
+    out_str("ret=");
+    out_dec(result as u64);
+    if result == 0 {
+        out_str(" err=");
+        out_dec(error as u64);
+    }
+    out_byte(b'\n');
+    let (mut created, mut accessed, mut written) = (0u64, 0u64, 0u64);
+    unsafe { file_time(handle, &mut created, &mut accessed, &mut written) };
+    case("basic.write_time");
+    out_str(if written == WRITE_TIME as u64 { "set" } else { "other" });
+    out_str(if created != 0 && created != WRITE_TIME as u64 { " creation_kept" } else { " creation_changed" });
+    out_byte(b'\n');
+    case("basic.attributes");
+    out_hex(unsafe { attributes(path.as_ptr()) } as u64 & 0x21);
+    out_byte(b'\n');
+    let (result, _) = set(0, 0x80);
+    case("basic.clear");
+    out_str("ret=");
+    out_dec(result as u64);
+    out_str(" attributes=");
+    out_hex(unsafe { attributes(path.as_ptr()) } as u64);
+    out_byte(b'\n');
+    close(api, handle);
 }
 
 /// `a` + `b` + `c` as a `&str` in `buffer`.

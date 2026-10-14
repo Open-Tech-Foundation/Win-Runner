@@ -322,7 +322,12 @@ pub(super) extern "win64" fn native_cert_get_enhanced_key_usage(
     output: *mut u8,
     size: *mut u32,
 ) -> i32 {
-    if size.is_null() || flags > 2 {
+    // CERT_FIND_EXT_ONLY_ENHKEY_USAGE_FLAG (2) reads the extension only,
+    // CERT_FIND_PROP_ONLY_ENHKEY_USAGE_FLAG (4) the context property only;
+    // CERT_FIND_OPTIONAL_ENHKEY_USAGE_FLAG (1) changes nothing here.
+    const EXT_ONLY: u32 = 2;
+    const PROP_ONLY: u32 = 4;
+    if size.is_null() || flags & !7 != 0 || flags & (EXT_ONLY | PROP_ONLY) == EXT_ONLY | PROP_ONLY {
         fail(INVALID_ARGUMENT);
         return 0;
     }
@@ -334,7 +339,9 @@ pub(super) extern "win64" fn native_cert_get_enhanced_key_usage(
         };
         Arc::clone(&lease.certificate)
     };
-    let usage = if flags == 2 {
+    // No context here carries an enhanced-usage property, so a
+    // property-only query finds nothing; otherwise the extension decides.
+    let usage = if flags & PROP_ONLY != 0 {
         Ok(None)
     } else {
         enhanced_usage(&certificate)
@@ -346,7 +353,7 @@ pub(super) extern "win64" fn native_cert_get_enhanced_key_usage(
             return 0;
         }
     };
-    if usage.is_none() && flags != 0 {
+    if usage.is_none() && flags & (EXT_ONLY | PROP_ONLY) != 0 {
         fail(NOT_FOUND);
         return 0;
     }
@@ -410,6 +417,19 @@ pub(super) extern "win64" fn native_cert_open_store(
     if crypt != 0 {
         return fail(INVALID_ARGUMENT);
     }
+    // A provider is an ID, or (above 0xFFFF) a pointer to its ANSI name:
+    // sz_CERT_STORE_PROV_MEMORY "Memory", _COLLECTION "Collection", and
+    // _SYSTEM "System" (the Unicode system store).
+    let provider = if provider > 0xFFFF {
+        match unsafe { ascii_z(provider as *const u8) }.map(|name| name.to_ascii_lowercase()).as_deref() {
+            Some("memory") => 2,
+            Some("collection") => 11,
+            Some("system") => 10,
+            _ => return fail(50),
+        }
+    } else {
+        provider
+    };
     // CERT_STORE_NO_CRYPT_RELEASE (0x1), DEFER_CLOSE_UNTIL_LAST_FREE (0x4:
     // contexts here keep their certificate alive anyway), OPEN_EXISTING
     // (0x4000), READONLY (0x8000), and the current-user/local-machine
@@ -421,7 +441,8 @@ pub(super) extern "win64" fn native_cert_open_store(
     stores.next += 1;
     let handle = 0x4345_5254_0000_0000 | stores.next;
     let certificates = match provider {
-        2 if flags & 0xffff_0000 == 0 => Vec::new(),
+        // Memory and collection stores start empty.
+        2 | 11 if flags & 0xffff_0000 == 0 => Vec::new(),
         9 | 10 => {
             if !matches!(flags & 0xffff_0000, 0x10000 | 0x20000) {
                 return fail(INVALID_ARGUMENT);
@@ -444,6 +465,34 @@ pub(super) extern "win64" fn native_cert_open_store(
     stores.stores.insert(handle, certificates);
     handle
 }
+/// `CertAddStoreToCollection`: the collection gains the sibling's
+/// certificates (the same certificates, not copies). It takes them as they
+/// are when added; later changes to the sibling are not followed.
+pub(super) extern "win64" fn native_cert_add_store_to_collection(
+    collection: u64,
+    sibling: u64,
+    _flags: u32,
+    _priority: u32,
+) -> i32 {
+    let mut stores = STORES.lock().unwrap();
+    let Some(members) = stores.stores.get(&sibling).cloned() else {
+        drop(stores);
+        fail(INVALID_ARGUMENT);
+        return 0;
+    };
+    let Some(certificates) = stores.stores.get_mut(&collection) else {
+        drop(stores);
+        fail(INVALID_ARGUMENT);
+        return 0;
+    };
+    for certificate in members {
+        if !certificates.iter().any(|known| Arc::ptr_eq(known, &certificate)) {
+            certificates.push(certificate);
+        }
+    }
+    1
+}
+
 fn release(stores: &mut Stores, pointer: u64) -> bool {
     let Some(lease) = stores.contexts.get_mut(&pointer) else {
         return false;
@@ -556,11 +605,17 @@ pub(super) extern "win64" fn native_cert_enum_certificates(store: u64, previous:
     let index = if previous == 0 {
         0
     } else {
-        let next = stores
-            .contexts
-            .get(&previous)
-            .filter(|lease| lease.certificate.context.store == store)
-            .map(|lease| lease.index + 1);
+        // Continue after the previous context's place in this store (a
+        // collection shares its members' certificates, which belong to the
+        // member stores).
+        let next = stores.contexts.get(&previous).and_then(|lease| {
+            stores
+                .stores
+                .get(&store)?
+                .iter()
+                .position(|certificate| Arc::ptr_eq(certificate, &lease.certificate))
+                .map(|index| index + 1)
+        });
         release(&mut stores, previous);
         let Some(next) = next else {
             return fail(INVALID_ARGUMENT);
@@ -645,6 +700,28 @@ pub(super) extern "win64" fn native_cert_add_encoded_certificate_to_store(
         unsafe { context.write(pointer) };
     }
     1
+}
+
+/// `CertCreateCertificateContext`: a context for an encoded certificate in
+/// no caller-visible store (an implicit memory store, as on Windows), freed
+/// with `CertFreeCertificateContext`.
+pub(super) extern "win64" fn native_cert_create_certificate_context(encoding: u32, encoded: *const u8, length: u32) -> u64 {
+    const CERT_STORE_PROV_MEMORY: u64 = 2;
+    const CERT_STORE_ADD_ALWAYS: u32 = 4;
+    let store = native_cert_open_store(CERT_STORE_PROV_MEMORY, 0, 0, 0, ptr::null());
+    if store == 0 {
+        return 0;
+    }
+    let mut context = 0u64;
+    let added = native_cert_add_encoded_certificate_to_store(store, encoding, encoded, length, CERT_STORE_ADD_ALWAYS, &mut context);
+    // The context keeps its certificate after the store closes.
+    let error = native_get_last_error();
+    native_cert_close_store(store, 0);
+    if added == 0 {
+        native_set_last_error(error);
+        return 0;
+    }
+    context
 }
 
 /// The encoded certificate of a context this process holds.
@@ -751,6 +828,83 @@ mod tests {
         );
         assert!(decode_usage(&[0x30, 1, 6]).is_err());
     }
+    #[test]
+    fn enhanced_usage_flags_pick_extension_or_property() {
+        let der = crate::trust_roots::bundled_roots()[0].clone();
+        let context = native_cert_create_certificate_context(1, der.as_ptr(), der.len() as u32);
+        let mut size = 0u32;
+        // No context property: a property-only query finds nothing.
+        assert_eq!(native_cert_get_enhanced_key_usage(context, 4, ptr::null_mut(), &mut size), 0);
+        assert_eq!(native_get_last_error(), NOT_FOUND);
+        // Both "only" flags at once, or an unknown flag, are invalid.
+        assert_eq!(native_cert_get_enhanced_key_usage(context, 6, ptr::null_mut(), &mut size), 0);
+        assert_eq!(native_get_last_error(), INVALID_ARGUMENT);
+        assert_eq!(native_cert_get_enhanced_key_usage(context, 8, ptr::null_mut(), &mut size), 0);
+        // The plain query always answers (empty usage: good for anything).
+        assert_eq!(native_cert_get_enhanced_key_usage(context, 0, ptr::null_mut(), &mut size), 1);
+        native_cert_free_context(context);
+    }
+
+    #[test]
+    fn stores_open_by_provider_name() {
+        let memory = native_cert_open_store(b"Memory\0".as_ptr() as u64, 0, 0, 0, ptr::null());
+        assert_ne!(memory, 0, "sz_CERT_STORE_PROV_MEMORY");
+        let collection = native_cert_open_store(b"COLLECTION\0".as_ptr() as u64, 0, 0, 0, ptr::null());
+        assert_ne!(collection, 0, "names match without case");
+        assert_eq!(native_cert_open_store(b"LDAP\0".as_ptr() as u64, 0, 0, 0, ptr::null()), 0);
+        native_cert_close_store(memory, 0);
+        native_cert_close_store(collection, 0);
+    }
+
+    #[test]
+    fn collections_gather_their_member_stores() {
+        let der = crate::trust_roots::bundled_roots()[0].clone();
+        let member = native_cert_open_store(2, 0, 0, 0, ptr::null());
+        assert_eq!(native_cert_add_encoded_certificate_to_store(member, 1, der.as_ptr(), der.len() as u32, 4, ptr::null_mut()), 1);
+        let collection = native_cert_open_store(11, 0, 0, 0, ptr::null());
+        assert_ne!(collection, 0, "CERT_STORE_PROV_COLLECTION");
+        assert_eq!(native_cert_add_store_to_collection(collection, member, 1, 0), 1);
+        assert_eq!(native_cert_add_store_to_collection(collection, member, 1, 0), 1, "adding twice is harmless");
+        assert_eq!(native_cert_close_store(member, 0), 1);
+        let first = native_cert_enum_certificates(collection, 0);
+        assert_eq!(context_der(first), Some(der));
+        assert_eq!(native_cert_enum_certificates(collection, first), 0, "one certificate");
+        assert_eq!(native_get_last_error(), NOT_FOUND, "the end, not a bad context");
+        // Enumeration walks every member's certificates.
+        let roots = crate::trust_roots::bundled_roots();
+        let (a, b) = (native_cert_open_store(2, 0, 0, 0, ptr::null()), native_cert_open_store(2, 0, 0, 0, ptr::null()));
+        for (store, der) in [(a, &roots[0]), (a, &roots[1]), (b, &roots[2])] {
+            assert_eq!(native_cert_add_encoded_certificate_to_store(store, 1, der.as_ptr(), der.len() as u32, 4, ptr::null_mut()), 1);
+        }
+        let both = native_cert_open_store(11, 0, 0, 0, ptr::null());
+        assert_eq!(native_cert_add_store_to_collection(both, a, 1, 0), 1);
+        assert_eq!(native_cert_add_store_to_collection(both, b, 1, 0), 1);
+        let mut count = 0;
+        let mut context = native_cert_enum_certificates(both, 0);
+        while context != 0 {
+            count += 1;
+            context = native_cert_enum_certificates(both, context);
+        }
+        assert_eq!(count, 3);
+        for store in [a, b, both] {
+            native_cert_close_store(store, 0);
+        }
+        assert_eq!(native_cert_add_store_to_collection(collection, 0x1234, 1, 0), 0);
+        assert_eq!(native_cert_close_store(collection, 0), 1);
+    }
+
+    #[test]
+    fn created_contexts_stand_alone_until_freed() {
+        let der = crate::trust_roots::bundled_roots()[0].clone();
+        let context = native_cert_create_certificate_context(1, der.as_ptr(), der.len() as u32);
+        assert_ne!(context, 0);
+        assert_eq!(context_der(context), Some(der.clone()), "the context keeps its certificate");
+        assert_eq!(native_cert_create_certificate_context(1, [0x30u8, 0].as_ptr(), 2), 0, "bad DER fails");
+        assert_eq!(native_cert_create_certificate_context(2, der.as_ptr(), der.len() as u32), 0, "not X.509 encoding");
+        native_cert_free_context(context);
+        assert_eq!(context_der(context), None, "freed");
+    }
+
     #[test]
     fn encoded_certificates_add_to_memory_stores_by_disposition() {
         let der = crate::trust_roots::bundled_roots()[0].clone();

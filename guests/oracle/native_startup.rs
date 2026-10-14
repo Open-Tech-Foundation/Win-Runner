@@ -1240,6 +1240,32 @@ fn system_info() {
     report_ex("version.ex_a", ex_a, 148, 1);
     report_ex("version.ex_bad_size", ex_w, 0, 2);
 
+    // SHLWAPI substring search; offsets, never addresses.
+    type StrStr = unsafe extern "system" fn(*const u16, *const u16) -> *const u16;
+    let str_str_i = proc(b"shlwapi.dll\0", b"StrStrIW\0");
+    if str_str_i == 0 {
+        unavailable("shlwapi.strstri");
+    } else {
+        let search = unsafe { core::mem::transmute::<usize, StrStr>(str_str_i) };
+        let mut text = [0u16; 16];
+        let text = wide("Hello World", &mut text);
+        let report = |name: &str, pattern: &str| {
+            let mut buffer = [0u16; 16];
+            let pattern = wide(pattern, &mut buffer);
+            let found = unsafe { search(text.as_ptr(), pattern.as_ptr()) };
+            case(name);
+            if found.is_null() {
+                out_str("null\n");
+            } else {
+                out_dec(unsafe { found.offset_from(text.as_ptr()) } as u64);
+                out_byte(b'\n');
+            }
+        };
+        report("shlwapi.strstri", "WORLD");
+        report("shlwapi.strstri_missing", "planet");
+        report("shlwapi.strstri_empty", "");
+    }
+
     let performance = api!("perf.info_api", "K32GetPerformanceInfo", Performance);
     let mut info = [0u64; 13];
     let ok = unsafe { performance(info.as_mut_ptr().cast(), 104) } != 0;

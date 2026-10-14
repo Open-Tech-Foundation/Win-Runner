@@ -577,6 +577,181 @@ pub(super) extern "win64" fn native_co_create_guid(guid: *mut u8) -> i32 {
     0
 }
 
+/// A NUL-terminated UTF-16 string's units (without the terminator).
+fn wide_units<'a>(text: *const u16) -> &'a [u16] {
+    let mut length = 0;
+    while unsafe { text.add(length).read() } != 0 {
+        length += 1;
+    }
+    unsafe { std::slice::from_raw_parts(text, length) }
+}
+
+/// One UTF-16 unit folded to lower case where it maps to a single unit.
+fn fold_unit(unit: u16) -> u16 {
+    char::from_u32(u32::from(unit))
+        .map(|c| {
+            let mut lower = c.to_lowercase();
+            match (lower.next(), lower.next()) {
+                (Some(l), None) if (l as u32) <= 0xFFFF => l as u32 as u16,
+                _ => unit,
+            }
+        })
+        .unwrap_or(unit)
+}
+
+fn str_str(text: *const u16, search: *const u16, ignore_case: bool) -> *const u16 {
+    if text.is_null() || search.is_null() {
+        return ptr::null();
+    }
+    let (haystack, needle) = (wide_units(text), wide_units(search));
+    if needle.is_empty() {
+        return ptr::null();
+    }
+    let same = |a: u16, b: u16| if ignore_case { fold_unit(a) == fold_unit(b) } else { a == b };
+    haystack
+        .windows(needle.len())
+        .position(|window| window.iter().zip(needle).all(|(a, b)| same(*a, *b)))
+        .map_or(ptr::null(), |index| unsafe { text.add(index) })
+}
+
+/// `StrStrW`: the first occurrence of `search` in `text`, or NULL.
+pub(super) extern "win64" fn native_str_str_w(text: *const u16, search: *const u16) -> *const u16 {
+    str_str(text, search, false)
+}
+
+/// `StrStrIW`: `StrStrW` ignoring case.
+pub(super) extern "win64" fn native_str_str_i_w(text: *const u16, search: *const u16) -> *const u16 {
+    str_str(text, search, true)
+}
+
+/// `UuidCreate`: a random (version 4) UUID, `RPC_S_OK`.
+pub(super) extern "win64" fn native_uuid_create(uuid: *mut u8) -> i32 {
+    match native_co_create_guid(uuid) {
+        0 => 0,
+        _ => 1775, // RPC_S_INVALID_ARG
+    }
+}
+
+/// The 100 ns intervals since 1582-10-15 (the UUID epoch), never twice the
+/// same within this process.
+fn uuid_timestamp() -> u64 {
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let ticks = (now.as_nanos() / 100) as u64 + 0x01B2_1DD2_1381_4000;
+    let mut previous = LAST.load(std::sync::atomic::Ordering::Relaxed);
+    loop {
+        let next = ticks.max(previous + 1);
+        match LAST.compare_exchange(previous, next, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(current) => previous = current,
+        }
+    }
+}
+
+/// `UuidCreateSequential`: a time-based (version 1) UUID. The guest has no
+/// network card address, so the node is random with the multicast bit set
+/// (RFC 4122 4.5) and the result is `RPC_S_UUID_LOCAL_ONLY`, as Windows
+/// reports without one.
+pub(super) extern "win64" fn native_uuid_create_sequential(uuid: *mut u8) -> i32 {
+    const RPC_S_UUID_LOCAL_ONLY: i32 = 1824;
+    if uuid.is_null() {
+        return 1775; // RPC_S_INVALID_ARG
+    }
+    static NODE_AND_SEQUENCE: std::sync::OnceLock<[u8; 8]> = std::sync::OnceLock::new();
+    let random = *NODE_AND_SEQUENCE.get_or_init(|| {
+        let mut bytes = [0u8; 8];
+        unsafe { getrandom(bytes.as_mut_ptr().cast(), 8, 0) };
+        bytes[2] |= 0x01; // multicast: not a real card address
+        bytes
+    });
+    let ticks = uuid_timestamp();
+    let mut out = [0u8; 16];
+    out[..4].copy_from_slice(&(ticks as u32).to_le_bytes());
+    out[4..6].copy_from_slice(&((ticks >> 32) as u16).to_le_bytes());
+    out[6..8].copy_from_slice(&(((ticks >> 48) as u16 & 0x0fff) | 0x1000).to_le_bytes());
+    out[8] = (random[0] & 0x3f) | 0x80; // clock sequence high, RFC 4122 variant
+    out[9] = random[1];
+    out[10..].copy_from_slice(&random[2..]);
+    unsafe { uuid.copy_from_nonoverlapping(out.as_ptr(), 16) };
+    RPC_S_UUID_LOCAL_ONLY
+}
+
+/// A GUID's 16 bytes from `{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}`.
+fn parse_guid(text: &str) -> Option<[u8; 16]> {
+    let body = text.strip_prefix('{')?.strip_suffix('}')?;
+    let groups: Vec<&str> = body.split('-').collect();
+    let lengths = [8, 4, 4, 4, 12];
+    if groups.len() != 5
+        || groups.iter().zip(lengths).any(|(group, length)| group.len() != length || !group.chars().all(|c| c.is_ascii_hexdigit()))
+    {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    out[..4].copy_from_slice(&u32::from_str_radix(groups[0], 16).ok()?.to_le_bytes());
+    out[4..6].copy_from_slice(&u16::from_str_radix(groups[1], 16).ok()?.to_le_bytes());
+    out[6..8].copy_from_slice(&u16::from_str_radix(groups[2], 16).ok()?.to_le_bytes());
+    let tail = format!("{}{}", groups[3], groups[4]);
+    for index in 0..8 {
+        out[8 + index] = u8::from_str_radix(&tail[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// `{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}` for a GUID's bytes.
+fn format_guid(bytes: &[u8; 16]) -> String {
+    let data1 = u32::from_le_bytes(bytes[..4].try_into().unwrap_or_default());
+    let data2 = u16::from_le_bytes([bytes[4], bytes[5]]);
+    let data3 = u16::from_le_bytes([bytes[6], bytes[7]]);
+    let tail: String = bytes[10..].iter().map(|b| format!("{b:02X}")).collect();
+    format!("{{{data1:08X}-{data2:04X}-{data3:04X}-{:02X}{:02X}-{tail}}}", bytes[8], bytes[9])
+}
+
+fn guid_from_string(text: *const u16, guid: *mut u8, invalid: i32) -> i32 {
+    if guid.is_null() {
+        return 0x8007_0057u32 as i32; // E_INVALIDARG
+    }
+    // A null string is the null GUID.
+    let bytes = if text.is_null() {
+        [0u8; 16]
+    } else {
+        match wide(text).as_deref().and_then(parse_guid) {
+            Some(bytes) => bytes,
+            None => return invalid,
+        }
+    };
+    unsafe { guid.copy_from_nonoverlapping(bytes.as_ptr(), 16) };
+    0
+}
+
+/// `CLSIDFromString`: the brace form; anything else (a ProgID this guest
+/// does not register) is `CO_E_CLASSSTRING`.
+pub(super) extern "win64" fn native_clsid_from_string(text: *const u16, clsid: *mut u8) -> i32 {
+    guid_from_string(text, clsid, 0x8004_01F3u32 as i32)
+}
+
+/// `IIDFromString`: the brace form only; anything else is `E_INVALIDARG`.
+pub(super) extern "win64" fn native_iid_from_string(text: *const u16, iid: *mut u8) -> i32 {
+    guid_from_string(text, iid, 0x8007_0057u32 as i32)
+}
+
+/// `StringFromGUID2`: the characters written with the terminator (39), or
+/// 0 when the buffer is too small.
+pub(super) extern "win64" fn native_string_from_guid2(guid: *const u8, output: *mut u16, capacity: i32) -> i32 {
+    if guid.is_null() || output.is_null() {
+        return 0;
+    }
+    let mut bytes = [0u8; 16];
+    unsafe { bytes.as_mut_ptr().copy_from_nonoverlapping(guid, 16) };
+    let text: Vec<u16> = format_guid(&bytes).encode_utf16().chain(std::iter::once(0)).collect();
+    if capacity < text.len() as i32 {
+        return 0;
+    }
+    unsafe { output.copy_from_nonoverlapping(text.as_ptr(), text.len()) };
+    text.len() as i32
+}
+
 /// `LoadStringW`: guest modules' string resources are not read yet.
 pub(super) extern "win64" fn native_load_string_w(_instance: u64, _id: u32, output: *mut u16, capacity: i32) -> i32 {
     if !output.is_null() && capacity > 0 {
@@ -688,6 +863,57 @@ pub(super) extern "win64" fn native_crt_invalid_parameter_noinfo_noreturn() -> !
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn substring_search_with_and_without_case() {
+        let w = |t: &str| t.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+        let (text, upper, missing) = (w("Hello World"), w("WORLD"), w("planet"));
+        let found = native_str_str_i_w(text.as_ptr(), upper.as_ptr());
+        assert_eq!(unsafe { found.offset_from(text.as_ptr()) }, 6);
+        assert!(native_str_str_w(text.as_ptr(), upper.as_ptr()).is_null(), "case matters to StrStrW");
+        assert!(native_str_str_i_w(text.as_ptr(), missing.as_ptr()).is_null());
+        assert!(native_str_str_i_w(ptr::null(), upper.as_ptr()).is_null());
+    }
+
+    #[test]
+    fn sequential_uuids_are_version_1_and_increase() {
+        let (mut a, mut b) = ([0u8; 16], [0u8; 16]);
+        assert_eq!(native_uuid_create_sequential(a.as_mut_ptr()), 1824);
+        assert_eq!(native_uuid_create_sequential(b.as_mut_ptr()), 1824);
+        assert_eq!(a[7] >> 4, 1, "version 1");
+        assert_eq!(a[8] & 0xc0, 0x80, "RFC 4122 variant");
+        assert_eq!(a[10..], b[10..], "one node per process");
+        let time = |u: &[u8; 16]| {
+            (u64::from(u16::from_le_bytes([u[6], u[7]]) & 0x0fff) << 48)
+                | (u64::from(u16::from_le_bytes([u[4], u[5]])) << 32)
+                | u64::from(u32::from_le_bytes(u[..4].try_into().unwrap()))
+        };
+        assert!(time(&b) > time(&a));
+        let mut random = [0u8; 16];
+        assert_eq!(native_uuid_create(random.as_mut_ptr()), 0);
+        assert_eq!(random[7] >> 4, 4);
+    }
+
+    #[test]
+    fn guids_parse_and_format_in_registry_order() {
+        let text = "{F38BF404-1D43-42F2-9305-67DE0B28FC23}";
+        let bytes = parse_guid(text).unwrap();
+        assert_eq!(&bytes[..4], &[0x04, 0xF4, 0x8B, 0xF3], "Data1 little-endian");
+        assert_eq!(&bytes[8..10], &[0x93, 0x05], "Data4 in order");
+        assert_eq!(format_guid(&bytes), text);
+        assert_eq!(parse_guid("{f38bf404-1d43-42f2-9305-67de0b28fc23}"), Some(bytes), "either case");
+        assert_eq!(parse_guid("F38BF404-1D43-42F2-9305-67DE0B28FC23"), None, "braces required");
+        assert_eq!(parse_guid("{F38BF404-1D43-42F2-9305-67DE0B28FC2}"), None);
+        let wide: Vec<u16> = "not a guid".encode_utf16().chain(Some(0)).collect();
+        let mut out = [0u8; 16];
+        assert_eq!(native_clsid_from_string(wide.as_ptr(), out.as_mut_ptr()), 0x8004_01F3u32 as i32);
+        assert_eq!(native_clsid_from_string(std::ptr::null(), out.as_mut_ptr()), 0);
+        assert_eq!(out, [0; 16]);
+        let mut text_out = [0u16; 39];
+        assert_eq!(native_string_from_guid2(bytes.as_ptr(), text_out.as_mut_ptr(), 39), 39);
+        assert_eq!(native_string_from_guid2(bytes.as_ptr(), text_out.as_mut_ptr(), 38), 0);
+    }
+
     use super::*;
 
     thread_local! { static INVALID_CALLS: std::cell::RefCell<Vec<(u32, [u64; 5])>> = const { std::cell::RefCell::new(Vec::new()) }; }

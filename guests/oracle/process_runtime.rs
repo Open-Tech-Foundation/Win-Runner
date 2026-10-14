@@ -472,6 +472,18 @@ fn extended_process() {
     ok_or_error("startup.initialize", unsafe {
         initialize(attributes.as_mut_ptr().cast(), 1, 0, &mut size)
     });
+    // An empty list (no attributes), as CPython's CreateProcess builds.
+    let mut empty_size = 0;
+    clear_error();
+    ok_or_error("startup.empty_size_query", unsafe {
+        initialize(core::ptr::null_mut(), 0, 0, &mut empty_size)
+    });
+    let mut empty = [0u64; 64];
+    clear_error();
+    ok_or_error("startup.empty_initialize", unsafe {
+        initialize(empty.as_mut_ptr().cast(), 0, 0, &mut empty_size)
+    });
+    unsafe { delete(empty.as_mut_ptr().cast()) };
     let mut reader = 0;
     let mut writer = 0;
     let mut inherited = 0;

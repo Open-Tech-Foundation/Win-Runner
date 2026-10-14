@@ -342,6 +342,58 @@ pub(super) extern "win64" fn native_crt_fstat64i32(fd: i32, output: *mut u8) -> 
     narrow_stat(&wide, output)
 }
 
+/// The current directory into `buffer` (`count` characters, terminator
+/// included) for `_getcwd`/`_wgetcwd`: a null `buffer` gets a `malloc`ed
+/// one of at least `count` characters; too small a buffer is `ERANGE`.
+fn getcwd_into(buffer: *mut u8, count: i32, char_size: usize) -> *mut u8 {
+    const ERANGE: i32 = 34;
+    let cwd = fs_ctx()
+        .and_then(|context| context.lock().ok().map(|ctx| ctx.fs.cwd()))
+        .unwrap_or_else(|| "C:\\".to_string());
+    let units: Vec<u16> = if char_size == 2 {
+        cwd.encode_utf16().chain(std::iter::once(0)).collect()
+    } else {
+        cwd.bytes().map(u16::from).chain(std::iter::once(0)).collect()
+    };
+    let output = if buffer.is_null() {
+        let capacity = units.len().max(count.max(0) as usize);
+        let allocated = native_crt_malloc(capacity * char_size).cast::<u8>();
+        if allocated.is_null() {
+            set_errno(12); // ENOMEM
+            return ptr::null_mut();
+        }
+        allocated
+    } else {
+        if count <= 0 {
+            set_errno(EINVAL);
+            return ptr::null_mut();
+        }
+        if (count as usize) < units.len() {
+            set_errno(ERANGE);
+            return ptr::null_mut();
+        }
+        buffer
+    };
+    unsafe {
+        for (index, unit) in units.iter().enumerate() {
+            if char_size == 2 {
+                output.cast::<u16>().add(index).write_unaligned(*unit);
+            } else {
+                output.add(index).write(*unit as u8);
+            }
+        }
+    }
+    output
+}
+
+pub(super) extern "win64" fn native_crt_wgetcwd(buffer: *mut u16, count: i32) -> *mut u16 {
+    getcwd_into(buffer.cast(), count, 2).cast()
+}
+
+pub(super) extern "win64" fn native_crt_getcwd(buffer: *mut u8, count: i32) -> *mut u8 {
+    getcwd_into(buffer, count, 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

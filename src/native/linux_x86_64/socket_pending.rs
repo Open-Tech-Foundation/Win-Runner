@@ -35,7 +35,7 @@ pub(super) fn pend_socket_io(
         finished: Arc::clone(&finished),
     });
     std::thread::spawn(move || {
-        let fd = socket as u32 as i32;
+        let fd = socket_fd(socket);
         let status = loop {
             if finished.load(Ordering::Acquire) {
                 return; // cancelled; the canceller posted the completion

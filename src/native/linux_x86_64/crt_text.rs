@@ -581,6 +581,50 @@ pub(super) extern "win64" fn native_crt_isxdigit(value: i32) -> i32 {
 pub(super) extern "win64" fn native_crt_isspace(value: i32) -> i32 {
     i32::from(matches!(value, 0x20 | 0x09..=0x0d))
 }
+/// The UCRT ctype bits of a wide character: `_UPPER` 1, `_LOWER` 2,
+/// `_DIGIT` 4, `_SPACE` 8, `_PUNCT` 0x10, `_CONTROL` 0x20, `_BLANK` 0x40,
+/// `_HEX` 0x80 and `_ALPHA` 0x100 (`WEOF` has none).
+fn wide_ctype(value: u16) -> i32 {
+    let Some(c) = char::from_u32(u32::from(value)).filter(|_| value != 0xFFFF) else {
+        return 0;
+    };
+    let digit = if c.is_ascii() { c.is_ascii_digit() } else { c.is_numeric() && !c.is_alphabetic() };
+    let mut mask = 0;
+    if c.is_uppercase() {
+        mask |= 0x1;
+    }
+    if c.is_lowercase() {
+        mask |= 0x2;
+    }
+    if digit {
+        mask |= 0x4;
+    }
+    if c.is_whitespace() {
+        mask |= 0x8;
+    }
+    if c.is_control() {
+        mask |= 0x20;
+    }
+    if c == ' ' || c == '\t' {
+        mask |= 0x40;
+    }
+    if c.is_ascii_hexdigit() {
+        mask |= 0x80;
+    }
+    if c.is_alphabetic() {
+        mask |= 0x100;
+    }
+    if !c.is_alphanumeric() && !c.is_whitespace() && !c.is_control() {
+        mask |= 0x10;
+    }
+    mask
+}
+
+/// `iswctype(c, type)`: the character's ctype bits within `type`.
+pub(super) extern "win64" fn native_crt_iswctype(value: u16, kind: u16) -> i32 {
+    wide_ctype(value) & i32::from(kind)
+}
+
 pub(super) extern "win64" fn native_crt_iswspace(value: u16) -> i32 {
     i32::from(char::from_u32(u32::from(value)).is_some_and(char::is_whitespace))
 }
@@ -611,6 +655,19 @@ pub(super) extern "win64" fn native_crt_towupper(value: u16) -> u16 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn iswctype_reports_ucrt_classes() {
+        assert_eq!(native_crt_iswctype(b'A' as u16, 0x1FF), 0x1 | 0x80 | 0x100, "upper, hex, alpha");
+        assert_eq!(native_crt_iswctype(b'7' as u16, 0x1FF), 0x4 | 0x80);
+        assert_eq!(native_crt_iswctype(b' ' as u16, 0x1FF), 0x8 | 0x40);
+        assert_eq!(native_crt_iswctype(b'!' as u16, 0x1FF), 0x10);
+        assert_eq!(native_crt_iswctype(0x0a, 0x1FF), 0x8 | 0x20);
+        assert_eq!(native_crt_iswctype(0x00e9, 0x2), 0x2, "é is lower case");
+        assert_eq!(native_crt_iswctype(b'A' as u16, 0x2), 0, "masked by the class asked");
+        assert_eq!(native_crt_iswctype(0xFFFF, 0x1FF), 0, "WEOF");
+    }
+
     use super::*;
 
     fn wide(text: &str) -> Vec<u16> {

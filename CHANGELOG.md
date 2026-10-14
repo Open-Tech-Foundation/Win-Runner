@@ -6,6 +6,27 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- `wpkg install python` installs python.org's full NuGet distribution
+  instead of the embeddable one, so `site`, `exit()`, `venv`, and `pip`
+  work. Running it needed:
+  - CRT `_wgetcwd`/`_getcwd` and `iswctype`; `PathCchRemoveFileSpec`;
+    `SetHandleCount`; `SetWaitableTimerEx`.
+  - `ConvertStringSecurityDescriptorToSecurityDescriptorW` (SDDL owner,
+    group and DACL), which CPython uses for private directories.
+  - `CLSIDFromString`, `IIDFromString`, `StringFromGUID2`, `UuidCreate`,
+    `UuidCreateSequential`, and `SHLWAPI!StrStrW`/`StrStrIW`.
+  - `CertCreateCertificateContext`, collection stores
+    (`CERT_STORE_PROV_COLLECTION`, `CertAddStoreToCollection`) and store
+    providers named by string (`"Memory"`), as pip's truststore and
+    CPython's `ssl` use them.
+  - A real `FormatMessageA/W`: system messages for common Win32, Winsock
+    and certificate codes, `FROM_STRING` with `%1` inserts, and
+    `FORMAT_MESSAGE_ALLOCATE_BUFFER` (Python's `WinError` text was garbage).
+  - `SetFileInformationByHandle(FileBasicInfo)` for times and attributes
+    (CPython's `os.chmod` on a descriptor).
+  Oracle cases cover the new version, string-search, attribute-list and
+  FileBasicInfo behavior.
+
 - `GetVersionExA/W`, and `GetVersion`/`GetVersionEx` report the version a
   program's manifest asks for, as Windows does: 10.0 to a program declaring
   Windows 10 support (Python's interactive prompt now starts), 6.3 build
@@ -36,6 +57,18 @@ All notable changes to this project will be documented in this file.
   for the expression engine and the new cmdlets.
 
 ### Fixed
+
+- Socket handles fit in 32 bits, as Windows guarantees: OpenSSL keeps
+  sockets as `int`, so TLS in Python failed with `WSAEFAULT`.
+- `InitializeProcThreadAttributeList` accepts an empty list, which
+  CPython's `subprocess` always builds.
+- `_open_osfhandle` gives descriptors to device handles, so `open("nul")`
+  works instead of failing with `EMFILE`.
+- `CreateFileMappingW` and `SetFileInformationByHandle` follow
+  `DuplicateHandle` copies to their file (CPython's `mmap`).
+- Enumerating a collection store walks every member store's
+  certificates; `CertGetEnhancedKeyUsage` uses the real
+  `CERT_FIND_EXT_ONLY` (2) and `CERT_FIND_PROP_ONLY` (4) flags.
 
 - `FindFirstFileW` applies Windows' DOS pattern rules: `*.*` matches every
   name (directories without a dot included) and `name.*` matches `name`, so

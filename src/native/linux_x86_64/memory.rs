@@ -872,6 +872,10 @@ pub(super) extern "win64" fn native_create_file_mapping_w(
         }
         (None, requested_size as usize)
     } else {
+        // A DuplicateHandle copy maps its original file (CPython's mmap
+        // duplicates the handle it is given). Resolved before the
+        // filesystem lock is taken.
+        let original = original_handle(file);
         let Some(context) = fs_ctx() else {
             native_set_last_error(6);
             return 0;
@@ -880,7 +884,7 @@ pub(super) extern "win64" fn native_create_file_mapping_w(
             native_set_last_error(6);
             return 0;
         };
-        let Some(native_file) = ctx.handles.get(&file) else {
+        let Some(native_file) = ctx.handles.get(&original) else {
             native_set_last_error(6);
             return 0;
         };

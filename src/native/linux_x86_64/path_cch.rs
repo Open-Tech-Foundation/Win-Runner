@@ -1,5 +1,5 @@
-//! `PathCchSkipRoot`, `PathCchCombineEx` and `PathCchCanonicalizeEx`
-//! (api-ms-win-core-path-l1-1-0).
+//! `PathCchSkipRoot`, `PathCchCombineEx`, `PathCchCanonicalizeEx` and
+//! `PathCchRemoveFileSpec` (api-ms-win-core-path-l1-1-0).
 
 const S_OK: i32 = 0;
 const E_INVALIDARG: i32 = 0x8007_0057u32 as i32;
@@ -181,6 +181,34 @@ pub(super) extern "win64" fn native_path_cch_combine_ex(
     write_out(out, capacity, flags, &canonicalize(&combined))
 }
 
+/// `PathCchRemoveFileSpec(path, cch)`: drop the last element (and the
+/// separator before it), never the root. `S_FALSE` when nothing is left
+/// to remove.
+pub(super) extern "win64" fn native_path_cch_remove_file_spec(path: *mut u16, capacity: usize) -> i32 {
+    const S_FALSE: i32 = 1;
+    const PATHCCH_MAX_CCH: usize = 32768;
+    if path.is_null() || capacity == 0 || capacity > PATHCCH_MAX_CCH {
+        return E_INVALIDARG;
+    }
+    let Some(text) = units(path) else {
+        return E_INVALIDARG;
+    };
+    if text.len() >= capacity {
+        return E_INVALIDARG;
+    }
+    let root = root_length(&text).unwrap_or(0).min(text.len());
+    if text.len() == root {
+        return S_FALSE;
+    }
+    let last_separator = text[root..]
+        .iter()
+        .rposition(|unit| *unit == u16::from(b'\\') || *unit == u16::from(b'/'))
+        .map(|offset| root + offset);
+    let end = last_separator.unwrap_or(root);
+    unsafe { path.add(end).write(0) };
+    S_OK
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,6 +239,20 @@ mod tests {
         assert_eq!(combine(r"C:\a\b", r"\z"), r"C:\z");
         assert_eq!(combine(r"C:\a", r"..\..\.."), r"C:\");
         assert_eq!(combine(r"C:\a\", "b"), r"C:\a\b");
+        let remove = |path: &str| {
+            let mut buffer = [0u16; 64];
+            let text = w(path);
+            buffer[..text.len()].copy_from_slice(&text);
+            let result = native_path_cch_remove_file_spec(buffer.as_mut_ptr(), 64);
+            (result, String::from_utf16_lossy(&buffer[..buffer.iter().position(|u| *u == 0).unwrap()]))
+        };
+        assert_eq!(remove(r"C:\venv\Scripts\python.exe"), (0, r"C:\venv\Scripts".to_string()));
+        assert_eq!(remove(r"C:\a"), (0, r"C:\".to_string()));
+        assert_eq!(remove(r"C:\"), (1, r"C:\".to_string()), "the root stays");
+        assert_eq!(remove(r"C:\a\"), (0, r"C:\a".to_string()));
+        assert_eq!(remove(r"\\srv\share\x"), (0, r"\\srv\share\".to_string()));
+        assert_eq!(remove("name"), (0, String::new()));
+        assert_eq!(native_path_cch_remove_file_spec(std::ptr::null_mut(), 10), E_INVALIDARG);
         let mut small = [0u16; 4];
         assert_eq!(
             native_path_cch_combine_ex(small.as_mut_ptr(), 4, w(r"C:\abc").as_ptr(), w("d").as_ptr(), 0),

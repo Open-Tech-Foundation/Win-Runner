@@ -221,7 +221,7 @@ pub(super) fn afd_device_io_control(
             input.add(24).cast::<u32>().read_unaligned(),
         )
     };
-    if count != 1 || socket & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG {
+    if count != 1 || !is_socket_handle(socket) {
         return STATUS_INVALID_PARAMETER;
     }
     let cancel = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
@@ -251,7 +251,7 @@ pub(super) fn afd_device_io_control(
     let (io_status, output) = (io_status as usize, output as usize);
     let process = process_ctx();
     std::thread::spawn(move || {
-        let fd = socket as u32 as i32;
+        let fd = socket_fd(socket);
         let (events, status) = loop {
             let wait_ms = deadline.map_or(-1, |deadline| {
                 deadline.saturating_duration_since(std::time::Instant::now()).as_millis().min(i32::MAX as u128) as i32
@@ -374,7 +374,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         drop(listener);
         let socket = native_socket(2, 1, 6);
-        let fd = socket as i32;
+        let fd = socket_fd(socket);
         assert_eq!(
             unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) },
             0
@@ -421,7 +421,7 @@ mod tests {
 
         let mut pair = [0i32; 2];
         assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, pair.as_mut_ptr()) }, 0);
-        let socket = SOCKET_HANDLE_TAG | pair[0] as u64;
+        let socket = socket_handle(pair[0] as i32);
 
         // Writable at once: completes with AFD_POLL_SEND.
         let mut info = poll_info(socket, AFD_POLL_SEND | AFD_POLL_ABORT);

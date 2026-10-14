@@ -79,7 +79,7 @@ pub(super) extern "win64" fn native_select(
     let mut polls = handles
         .iter()
         .map(|handle| libc::pollfd {
-            fd: *handle as i32,
+            fd: socket_fd(*handle),
             events: (if values[0].contains(handle) {
                 libc::POLLIN
             } else {
@@ -300,7 +300,7 @@ pub(super) extern "win64" fn native_wsa_event_select(socket: u64, event: u64, ma
         native_wsa_set_last_error(10022);
         return -1;
     }
-    let fd = socket as i32;
+    let fd = socket_fd(socket);
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
         native_wsa_set_last_error(10038);
@@ -353,7 +353,7 @@ pub(super) fn refresh_socket_event(process: &NativeProcessContext, handle: u64) 
         .filter(|(_, selection)| selection.event == handle)
     {
         let mut poll = libc::pollfd {
-            fd: *socket as i32,
+            fd: socket_fd(*socket),
             events: 0,
             revents: 0,
         };
@@ -388,7 +388,7 @@ pub(super) fn refresh_socket_event(process: &NativeProcessContext, handle: u64) 
             let mut size = 4;
             unsafe {
                 libc::getsockopt(
-                    *socket as i32,
+                    socket_fd(*socket),
                     libc::SOL_SOCKET,
                     libc::SO_ERROR,
                     (&mut error as *mut i32).cast(),

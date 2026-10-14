@@ -224,6 +224,11 @@ pub(super) extern "win64" fn native_get_version_ex_a(info: *mut u8) -> i32 {
     get_version_ex(info, 1)
 }
 pub(super) extern "win64" fn native_set_file_apis_to_oem() {}
+/// `SetHandleCount`: obsolete since 32-bit Windows, which returns the count
+/// it is given.
+pub(super) extern "win64" fn native_set_handle_count(count: u32) -> u32 {
+    count
+}
 pub(super) extern "win64" fn native_co_initialize(_reserved: *mut u8) -> i32 {
     0 // S_OK
 }

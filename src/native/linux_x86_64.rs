@@ -104,6 +104,9 @@ use cert_chain::*;
 #[path = "linux_x86_64/taskkill_host.rs"]
 mod taskkill_host;
 use taskkill_host::*;
+#[path = "linux_x86_64/sddl.rs"]
+mod sddl;
+use sddl::*;
 #[path = "linux_x86_64/where_host.rs"]
 mod where_host;
 use where_host::*;
@@ -208,9 +211,9 @@ pub(super) fn test_socket_handle_inheritability() -> bool {
         return false;
     }
     let result = native_set_handle_information(socket, 1, 1) == 1
-        && unsafe { fcntl(socket as i32, 1) } & 1 == 0
+        && unsafe { fcntl(socket_fd(socket), 1) } & 1 == 0
         && native_set_handle_information(socket, 1, 0) == 1
-        && unsafe { fcntl(socket as i32, 1) } & 1 != 0;
+        && unsafe { fcntl(socket_fd(socket), 1) } & 1 != 0;
     let _ = native_close_socket(socket);
     result
 }

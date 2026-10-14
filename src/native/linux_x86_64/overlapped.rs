@@ -87,7 +87,7 @@ pub(super) extern "win64" fn native_create_io_completion_port(
         }
         return handle;
     }
-    if file & 0xffff_ffff_0000_0000 == SOCKET_HANDLE_TAG {
+    if is_socket_handle(file) {
         let (handle, port) = if existing_port != 0 {
             let Some(port) = process
                 .completion_ports
@@ -197,7 +197,7 @@ pub(super) extern "win64" fn native_set_file_completion_notification_modes(
             }
         }
     }
-    if handle & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG || unsafe { fcntl(handle as i32, 3) } < 0
+    if !is_socket_handle(handle) || unsafe { fcntl(socket_fd(handle), 3) } < 0
     {
         native_set_last_error(6);
         return 0;
@@ -1144,7 +1144,7 @@ pub(super) fn native_cancel_file_io(
             return 1;
         }
     }
-    if handle & 0xffff_ffff_0000_0000 == SOCKET_HANDLE_TAG {
+    if is_socket_handle(handle) {
         // Both kinds run; either may hold the operation.
         let accepts = cancel_pending_accept(handle, overlapped);
         let transfers = cancel_pending_socket_io(handle, overlapped);
@@ -1368,7 +1368,7 @@ pub(super) extern "win64" fn native_get_overlapped_result(
         .named_pipes
         .lock()
         .is_ok_and(|pipes| pipes.handles.contains_key(&handle))
-        || handle & 0xffff_ffff_0000_0000 == SOCKET_HANDLE_TAG;
+        || is_socket_handle(handle);
     if is_pipe {
         while native_overlapped_status(overlapped) == STATUS_PENDING {
             if wait == 0 {

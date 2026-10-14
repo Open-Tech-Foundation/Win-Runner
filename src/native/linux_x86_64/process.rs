@@ -880,8 +880,8 @@ fn worker_stdio_for_handle(
             | NativeDevice::ConsoleOut(_) => Ok(Stdio::inherit()),
         };
     }
-    if handle & 0xffff_ffff_0000_0000 == SOCKET_HANDLE_TAG {
-        let fd = unsafe { dup(handle as i32) };
+    if is_socket_handle(handle) {
+        let fd = unsafe { dup(socket_fd(handle)) };
         if fd < 0 {
             return Err(6);
         }
@@ -1129,8 +1129,8 @@ fn restore_worker_socket_handles(
             .get("handle")
             .and_then(serde_json::Value::as_u64)
             .ok_or("worker socket has invalid handle")?;
-        if handle & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG
-            || unsafe { fcntl(handle as i32, 1) } < 0
+        if !is_socket_handle(handle)
+            || unsafe { fcntl(socket_fd(handle), 1) } < 0
         {
             return Err("worker socket descriptor was not inherited".to_string());
         }
@@ -1727,7 +1727,7 @@ mod worker_native_fs_tests {
         use std::os::fd::IntoRawFd;
 
         let (socket, peer) = std::os::unix::net::UnixStream::pair().unwrap();
-        let handle = SOCKET_HANDLE_TAG | socket.into_raw_fd() as u64;
+        let handle = socket_handle(socket.into_raw_fd() as i32);
         let process = Arc::clone(&super::TEST_PROCESS);
         let port_id = 0x9876;
         let port = Arc::new(NativeCompletionPort::new());
@@ -1760,7 +1760,7 @@ mod worker_native_fs_tests {
             .lock()
             .unwrap()
             .remove(&handle);
-        unsafe { close(handle as i32) };
+        unsafe { close(socket_fd(handle)) };
         drop(peer);
     }
 
@@ -1769,13 +1769,13 @@ mod worker_native_fs_tests {
         let parent = Arc::clone(&super::TEST_PROCESS);
         let handle = native_socket(2, 1, 0);
         assert_ne!(handle, u64::MAX);
-        let flags = unsafe { fcntl(handle as i32, 1) };
+        let flags = unsafe { fcntl(socket_fd(handle), 1) };
         assert!(flags >= 0 && flags & 1 != 0, "SOCK_CLOEXEC should be set");
         assert!(parent.socket_handles.lock().unwrap().contains(&handle));
         assert_eq!(native_set_handle_information(handle, 1, 1), 1);
-        assert_eq!(unsafe { fcntl(handle as i32, 1) } & 1, 0);
+        assert_eq!(unsafe { fcntl(socket_fd(handle), 1) } & 1, 0);
         assert_eq!(native_set_handle_information(handle, 1, 0), 1);
-        assert_eq!(unsafe { fcntl(handle as i32, 1) } & 1, 1);
+        assert_eq!(unsafe { fcntl(socket_fd(handle), 1) } & 1, 1);
         assert_eq!(native_close_socket(handle), 0);
         assert!(!parent.socket_handles.lock().unwrap().contains(&handle));
     }
@@ -1868,7 +1868,7 @@ fn create_exec_worker_child(
         .iter()
         .copied()
         .filter(|handle| {
-            let flags = unsafe { fcntl(*handle as i32, 1) };
+            let flags = unsafe { fcntl(socket_fd(*handle), 1) };
             inherit_handles
                 && flags >= 0
                 && flags & 1 == 0
@@ -1879,10 +1879,10 @@ fn create_exec_worker_child(
         .iter()
         .copied()
         .filter(|handle| {
-            let flags = unsafe { fcntl(*handle as i32, 1) };
+            let flags = unsafe { fcntl(socket_fd(*handle), 1) };
             !inherited_socket_handles.contains(handle) && flags >= 0 && flags & 1 == 0
         })
-        .map(|handle| handle as i32)
+        .map(|handle| socket_fd(handle))
         .collect::<Vec<_>>();
     let mut completion_port_ids = HashMap::<usize, u64>::new();
     let mut completion_port_objects = HashMap::<u64, Arc<NativeCompletionPort>>::new();
@@ -1942,7 +1942,7 @@ fn create_exec_worker_child(
         .collect::<Vec<_>>();
     let worker_std_handles: [u64; 3] = std::array::from_fn(|index| {
         let handle = child_std_handles[index];
-        if handle & 0xffff_ffff_0000_0000 == SOCKET_HANDLE_TAG {
+        if is_socket_handle(handle) {
             STD_HANDLE_BASE + index as u64
         } else {
             handle

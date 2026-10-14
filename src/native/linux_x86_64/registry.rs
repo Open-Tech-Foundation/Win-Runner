@@ -261,6 +261,8 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                     | "_byteswap_ulong"
                     | "_byteswap_uint64"
                     | "_difftime64"
+                    | "_wgetcwd"
+                    | "_getcwd"
                     | "erfc"
                     | "erf"
                     | "expm1"
@@ -321,6 +323,7 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                     | "isdigit"
                     | "isspace"
                     | "iswspace"
+                    | "iswctype"
                     | "iswupper"
                     | "iswascii"
                     | "towlower"
@@ -430,7 +433,8 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
         "CRYPT32.DLL" => matches!(func, "CertOpenStore" | "CertOpenSystemStoreA" | "CertOpenSystemStoreW" | "CertGetIntendedKeyUsage" | "CertGetEnhancedKeyUsage" | "CertEnumCertificatesInStore" | "CertCloseStore" | "CertFreeCertificateContext" | "CertDuplicateCertificateContext" | "CertAddEncodedCertificateToStore"
             | "CertGetCertificateChain" | "CertFreeCertificateChain" | "CertDuplicateCertificateChain"
             | "CertVerifyCertificateChainPolicy" | "CertCreateCertificateChainEngine"
-            | "CertFreeCertificateChainEngine" | "CertSetCertificateContextProperty"),
+            | "CertFreeCertificateChainEngine" | "CertSetCertificateContextProperty"
+            | "CertCreateCertificateContext" | "CertAddStoreToCollection"),
         "PSAPI.DLL" => matches!(func, "GetProcessMemoryInfo" | "GetPerformanceInfo"),
         "WINMM.DLL" => func == "timeGetTime",
         "USERENV.DLL" => func == "GetUserProfileDirectoryW",
@@ -445,12 +449,18 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                 | "CoTaskMemFree"
                 | "CoCreateGuid"
                 | "CoGetContextToken"
+                | "CLSIDFromString"
+                | "IIDFromString"
+                | "StringFromGUID2"
         ),
         "SHELL32.DLL" => matches!(func, "SHGetFolderPathW" | "SHGetKnownFolderPath"),
         "OLEAUT32.DLL" => matches!(func, "GetErrorInfo" | "SetErrorInfo"),
+        "RPCRT4.DLL" => matches!(func, "UuidCreate" | "UuidCreateSequential"),
+        "SHLWAPI.DLL" => matches!(func, "StrStrW" | "StrStrIW"),
         "ADVAPI32.DLL" => matches!(
             func,
-            "CryptAcquireContextW"
+            "ConvertStringSecurityDescriptorToSecurityDescriptorW"
+                | "CryptAcquireContextW"
                 | "CryptGenRandom"
                 | "CryptReleaseContext"
                 | "SystemFunction036"
@@ -790,6 +800,8 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "__sys_nerr" => Some(native_crt_sys_nerr as *const () as usize as u64),
         "__sys_errlist" => Some(native_crt_sys_errlist as *const () as usize as u64),
         "_wputenv_s" => Some(native_crt_wputenv_s as *const () as usize as u64),
+        "_wgetcwd" => Some(native_crt_wgetcwd as *const () as usize as u64),
+        "_getcwd" => Some(native_crt_getcwd as *const () as usize as u64),
         "__fpe_flt_rounds" => Some(native_crt_fpe_flt_rounds as *const () as usize as u64),
         "wcstoul" => Some(native_crt_wcstoul as *const () as usize as u64),
         "_wcstoui64" => Some(native_crt_wcstoui64 as *const () as usize as u64),
@@ -817,6 +829,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "isdigit" => Some(native_crt_isdigit as *const () as usize as u64),
         "isspace" => Some(native_crt_isspace as *const () as usize as u64),
         "iswspace" => Some(native_crt_iswspace as *const () as usize as u64),
+        "iswctype" => Some(native_crt_iswctype as *const () as usize as u64),
         "iswupper" => Some(native_crt_iswupper as *const () as usize as u64),
         "iswascii" => Some(native_crt_iswascii as *const () as usize as u64),
         "towlower" => Some(native_crt_towlower as *const () as usize as u64),
@@ -946,6 +959,13 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "CoTaskMemAlloc" => Some(native_co_task_mem_alloc as *const () as usize as u64),
         "CoTaskMemFree" => Some(native_co_task_mem_free as *const () as usize as u64),
         "CoCreateGuid" => Some(native_co_create_guid as *const () as usize as u64),
+        "CLSIDFromString" => Some(native_clsid_from_string as *const () as usize as u64),
+        "UuidCreate" => Some(native_uuid_create as *const () as usize as u64),
+        "StrStrW" => Some(native_str_str_w as *const () as usize as u64),
+        "StrStrIW" => Some(native_str_str_i_w as *const () as usize as u64),
+        "UuidCreateSequential" => Some(native_uuid_create_sequential as *const () as usize as u64),
+        "IIDFromString" => Some(native_iid_from_string as *const () as usize as u64),
+        "StringFromGUID2" => Some(native_string_from_guid2 as *const () as usize as u64),
         "LoadStringW" => Some(native_load_string_w as *const () as usize as u64),
         "_controlfp_s" => Some(native_crt_controlfp_s as *const () as usize as u64),
         "_callnewh" => Some(native_crt_callnewh as *const () as usize as u64),
@@ -1283,6 +1303,9 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         }
         "AreFileApisANSI" => Some(native_are_file_apis_ansi as *const () as usize as u64),
         "LocalFree" => Some(native_local_free as *const () as usize as u64),
+        "ConvertStringSecurityDescriptorToSecurityDescriptorW" => Some(
+            native_convert_string_security_descriptor_to_security_descriptor_w as *const () as usize as u64,
+        ),
         "FreeLibraryAndExitThread" => {
             Some(native_free_library_and_exit_thread as *const () as usize as u64)
         }
@@ -1391,6 +1414,12 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         }
         "CertSetCertificateContextProperty" => {
             Some(native_cert_set_certificate_context_property as *const () as usize as u64)
+        }
+        "CertAddStoreToCollection" => {
+            Some(native_cert_add_store_to_collection as *const () as usize as u64)
+        }
+        "CertCreateCertificateContext" => {
+            Some(native_cert_create_certificate_context as *const () as usize as u64)
         }
         "CertAddEncodedCertificateToStore" => {
             Some(native_cert_add_encoded_certificate_to_store as *const () as usize as u64)
@@ -1508,6 +1537,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "GetStartupInfoA" => Some(native_get_startup_info_a as *const () as usize as u64),
         "GetVersion" => Some(native_get_version as *const () as usize as u64),
         "GetVersionExW" => Some(native_get_version_ex_w as *const () as usize as u64),
+        "SetHandleCount" => Some(native_set_handle_count as *const () as usize as u64),
         "GetVersionExA" => Some(native_get_version_ex_a as *const () as usize as u64),
         "GetSystemDirectoryW" => Some(native_get_system_directory_w as *const () as usize as u64),
         "lstrlenW" => Some(native_lstrlen_w as *const () as usize as u64),
@@ -1529,6 +1559,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "FindResourceA" => Some(native_find_resource_a as *const () as usize as u64),
         "VerifyVersionInfoA" => Some(native_verify_version_info_a as *const () as usize as u64),
         "PathCchSkipRoot" => Some(native_path_cch_skip_root as *const () as usize as u64),
+        "PathCchRemoveFileSpec" => Some(native_path_cch_remove_file_spec as *const () as usize as u64),
         "PathCchCombineEx" => Some(native_path_cch_combine_ex as *const () as usize as u64),
         "PathCchCanonicalizeEx" => Some(native_path_cch_canonicalize_ex as *const () as usize as u64),
         "FindResourceW" => Some(native_find_resource_w as *const () as usize as u64),
@@ -1873,6 +1904,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
             Some(native_create_waitable_timer_ex_w as *const () as usize as u64)
         }
         "SetWaitableTimer" => Some(native_set_waitable_timer as *const () as usize as u64),
+        "SetWaitableTimerEx" => Some(native_set_waitable_timer_ex as *const () as usize as u64),
         "ReadFile" => Some(native_read_file as *const () as usize as u64),
         "CloseHandle" => Some(native_close_handle as *const () as usize as u64),
         "CreateDirectoryW" => Some(native_create_directory_w as *const () as usize as u64),

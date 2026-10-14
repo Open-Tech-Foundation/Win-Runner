@@ -115,7 +115,7 @@ pub(super) extern "win64" fn native_connect_socket(
     address: *const u8,
     length: i32,
 ) -> i32 {
-    if socket & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG {
+    if !is_socket_handle(socket) {
         native_wsa_set_last_error(10038); // WSAENOTSOCK
         return -1;
     }
@@ -134,7 +134,7 @@ pub(super) extern "win64" fn native_connect_socket(
             return -1;
         }
     }
-    if unsafe { connect(socket as i32, translated.as_ptr(), length as u32) } == 0 {
+    if unsafe { connect(socket_fd(socket), translated.as_ptr(), length as u32) } == 0 {
         socket_event_connect(socket);
         return 0;
     }
@@ -163,7 +163,7 @@ pub(super) extern "win64" fn native_bind_socket(
     address: *const u8,
     length: i32,
 ) -> i32 {
-    if socket & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG
+    if !is_socket_handle(socket)
         || address.is_null()
         || length < 2
         || length > 128
@@ -182,7 +182,7 @@ pub(super) extern "win64" fn native_bind_socket(
             return -1;
         }
     }
-    if unsafe { bind(socket as i32, translated.as_ptr(), length as u32) } == 0 {
+    if unsafe { bind(socket_fd(socket), translated.as_ptr(), length as u32) } == 0 {
         0
     } else {
         native_wsa_set_last_error(errno_to_wsa(
@@ -196,11 +196,11 @@ pub(super) extern "win64" fn native_listen_socket(socket: u64, backlog: i32) -> 
     if native_diagnostic_enabled() {
         eprintln!("native listen socket={socket:#x} backlog={backlog}");
     }
-    if socket & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG {
+    if !is_socket_handle(socket) {
         native_wsa_set_last_error(10038); // WSAENOTSOCK
         return -1;
     }
-    if unsafe { listen(socket as i32, backlog.max(1)) } == 0 {
+    if unsafe { listen(socket_fd(socket), backlog.max(1)) } == 0 {
         0
     } else {
         native_wsa_set_last_error(errno_to_wsa(
@@ -216,14 +216,14 @@ pub(super) extern "win64" fn native_send_socket(
     length: i32,
     flags: i32,
 ) -> i32 {
-    if socket & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG
+    if !is_socket_handle(socket)
         || (buffer.is_null() && length != 0)
         || length < 0
     {
         native_wsa_set_last_error(10014); // WSAEFAULT
         return -1;
     }
-    let result = unsafe { send(socket as i32, buffer.cast(), length as usize, flags) };
+    let result = unsafe { send(socket_fd(socket), buffer.cast(), length as usize, flags) };
     if result < 0 {
         let error = std::io::Error::last_os_error().raw_os_error().unwrap_or(9);
         if error == libc::EAGAIN && timed_out(socket) {
@@ -257,15 +257,15 @@ pub(super) extern "win64" fn native_send_socket(
 }
 
 pub(super) extern "win64" fn native_shutdown_socket(socket: u64, how: i32) -> i32 {
-    if socket & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG || !(0..=2).contains(&how) {
-        native_wsa_set_last_error(if socket & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG {
+    if !is_socket_handle(socket) || !(0..=2).contains(&how) {
+        native_wsa_set_last_error(if !is_socket_handle(socket) {
             10038 // WSAENOTSOCK
         } else {
             10022 // WSAEINVAL
         });
         return -1;
     }
-    if unsafe { shutdown(socket as i32, how) } == 0 {
+    if unsafe { shutdown(socket_fd(socket), how) } == 0 {
         0
     } else {
         native_wsa_set_last_error(errno_to_wsa(
@@ -285,8 +285,8 @@ pub(super) extern "win64" fn native_accept_ex(
     bytes_received: *mut u32,
     overlapped: u64,
 ) -> i32 {
-    if listen_socket & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG
-        || accept_socket & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG
+    if !is_socket_handle(listen_socket)
+        || !is_socket_handle(accept_socket)
         || output.is_null()
         || overlapped == 0
         || local_address_length < 16
@@ -302,8 +302,8 @@ pub(super) extern "win64" fn native_accept_ex(
         native_wsa_set_last_error(10022);
         return 0;
     };
-    let listener = listen_socket as i32;
-    let accepted = accept_socket as i32;
+    let listener = socket_fd(listen_socket);
+    let accepted = socket_fd(accept_socket);
     let output = output as usize;
     let address_offsets = (
         receive_data_length as usize + local_address_length as usize - 16,
@@ -518,7 +518,7 @@ fn cancel_pending_accepts(listener: u64) {
     }
     // Wake the threads (their poll reports the shutdown), so the port is
     // free once closesocket returns.
-    unsafe { shutdown(listener as i32, 2) };
+    unsafe { shutdown(socket_fd(listener), 2) };
     let threads = state.threads.lock().unwrap_or_else(|e| e.into_inner());
     let _ = state
         .exited
@@ -580,7 +580,7 @@ pub(super) fn native_socket_name(
     length: *mut i32,
     peer: bool,
 ) -> i32 {
-    if socket & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG {
+    if !is_socket_handle(socket) {
         native_wsa_set_last_error(10038);
         return -1;
     }
@@ -592,9 +592,9 @@ pub(super) fn native_socket_name(
     let result = unsafe {
         let length_ptr = (&mut host_length) as *mut u32;
         if peer {
-            getpeername(socket as i32, address, length_ptr)
+            getpeername(socket_fd(socket), address, length_ptr)
         } else {
-            getsockname(socket as i32, address, length_ptr)
+            getsockname(socket_fd(socket), address, length_ptr)
         }
     };
     if result != 0 {
@@ -624,7 +624,7 @@ pub(super) extern "win64" fn native_setsockopt(
     value: *const u8,
     length: i32,
 ) -> i32 {
-    if socket & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG {
+    if !is_socket_handle(socket) {
         native_wsa_set_last_error(10038);
         return -1;
     }
@@ -653,7 +653,7 @@ pub(super) extern "win64" fn native_setsockopt(
         let host = if option == 0x1005 { libc::SO_SNDTIMEO } else { libc::SO_RCVTIMEO };
         let set = unsafe {
             libc::setsockopt(
-                socket as u32 as i32,
+                socket_fd(socket),
                 libc::SOL_SOCKET,
                 host,
                 (&timeval as *const libc::timeval).cast(),
@@ -684,13 +684,13 @@ pub(super) extern "win64" fn native_setsockopt(
         if option == -5 {
             let mut address = [0u8; 128];
             let mut address_length = 128u32;
-            if unsafe { getsockname(socket as i32, address.as_mut_ptr().cast(), &mut address_length) } != 0 {
+            if unsafe { getsockname(socket_fd(socket), address.as_mut_ptr().cast(), &mut address_length) } != 0 {
                 set_wsa_error_from_errno();
                 return -1;
             }
             let mut reuse = 0i32;
             let mut size = 4u32;
-            if unsafe { getsockopt(socket as i32, libc::SOL_SOCKET, libc::SO_REUSEADDR, (&mut reuse as *mut i32).cast(), &mut size) } != 0 {
+            if unsafe { getsockopt(socket_fd(socket), libc::SOL_SOCKET, libc::SO_REUSEADDR, (&mut reuse as *mut i32).cast(), &mut size) } != 0 {
                 set_wsa_error_from_errno();
                 return -1;
             }
@@ -710,7 +710,7 @@ pub(super) extern "win64" fn native_setsockopt(
     };
     let result = unsafe {
         setsockopt(
-            socket as i32,
+            socket_fd(socket),
             host_level,
             host_option,
             value.cast(),
@@ -792,7 +792,7 @@ pub(super) extern "win64" fn native_wsa_send(
     overlapped: u64,
     _completion: u64,
 ) -> i32 {
-    if socket & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG
+    if !is_socket_handle(socket)
         || (buffers.is_null() && buffer_count != 0)
     {
         native_wsa_set_last_error(10014);
@@ -810,7 +810,7 @@ pub(super) extern "win64" fn native_wsa_send(
             let send_flags = if overlapped != 0 { 0x4000 | libc::MSG_DONTWAIT } else { 0x4000 };
             let count = unsafe {
                 send(
-                    socket as i32,
+                    socket_fd(socket),
                     buf.buffer.add(offset).cast(),
                     buf.length as usize - offset,
                     send_flags,
@@ -828,7 +828,7 @@ pub(super) extern "win64" fn native_wsa_send(
                         }))
                         .collect();
                     let progress = Mutex::new((0usize, 0usize, total));
-                    let fd = socket as i32;
+                    let fd = socket_fd(socket);
                     pend_socket_io(socket, overlapped, 4, move || {
                         let mut progress = progress.lock().unwrap_or_else(|e| e.into_inner());
                         while progress.0 < rest.len() {
@@ -877,7 +877,7 @@ pub(super) extern "win64" fn native_wsa_recv(
     overlapped: u64,
     _completion: u64,
 ) -> i32 {
-    if socket & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG
+    if !is_socket_handle(socket)
         || (buffers.is_null() && buffer_count != 0)
     {
         native_wsa_set_last_error(10014);
@@ -906,7 +906,7 @@ pub(super) extern "win64" fn native_wsa_recv(
             native_wsa_set_last_error(10022);
             return -1;
         };
-        let fd = socket as i32;
+        let fd = socket_fd(socket);
         native_set_overlapped_status(overlapped, STATUS_PENDING, 0);
         std::thread::spawn(move || {
             let mut poll_fd = NativePollFd {
@@ -936,7 +936,7 @@ pub(super) extern "win64" fn native_wsa_recv(
         native_set_last_error(997); // libuv checks GetLastError for ERROR_IO_PENDING
         return -1;
     }
-    let fd = socket as i32;
+    let fd = socket_fd(socket);
     let mut total = 0u32;
     // An overlapped receive never blocks the caller: it pends instead.
     let receive_flags = if overlapped != 0 { libc::MSG_DONTWAIT } else { 0 };
@@ -1025,7 +1025,7 @@ pub(super) extern "win64" fn native_wsa_ioctl(
         0xF0, 0x7D, 0x36, 0xB5, 0xAC, 0xCB, 0xCF, 0x11, 0x95, 0xCA, 0x00, 0x80, 0x5F, 0x48, 0xA1,
         0x92,
     ];
-    if socket & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG {
+    if !is_socket_handle(socket) {
         native_wsa_set_last_error(10038);
         return -1;
     }
@@ -1052,7 +1052,7 @@ pub(super) extern "win64" fn native_wsa_ioctl(
             return -1;
         }
         let field = |index: usize| unsafe { input.add(index * 4).cast::<u32>().read_unaligned() };
-        let fd = socket as u32 as i32;
+        let fd = socket_fd(socket);
         let set = |level: i32, name: i32, value: i32| unsafe {
             libc::setsockopt(fd, level, name, (&value as *const i32).cast(), 4) == 0
         };
@@ -1121,11 +1121,11 @@ pub(super) extern "win64" fn native_wsa_ioctl(
 
 /// `DisconnectEx`: both directions shut down; it completes immediately.
 pub(super) extern "win64" fn native_disconnect_ex(socket: u64, _overlapped: u64, _flags: u32, _reserved: u32) -> i32 {
-    if socket & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG {
+    if !is_socket_handle(socket) {
         native_wsa_set_last_error(10038);
         return 0;
     }
-    if unsafe { libc::shutdown(socket as u32 as i32, libc::SHUT_RDWR) } != 0 {
+    if unsafe { libc::shutdown(socket_fd(socket), libc::SHUT_RDWR) } != 0 {
         let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(22);
         // An unconnected socket has nothing to disconnect.
         if errno != libc::ENOTCONN {
@@ -1160,7 +1160,7 @@ pub(super) extern "win64" fn native_connect_ex(
     bytes_sent: *mut u32,
     overlapped: u64,
 ) -> i32 {
-    if socket & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG
+    if !is_socket_handle(socket)
         || address.is_null()
         || length < 2
         || length > 128
@@ -1168,7 +1168,7 @@ pub(super) extern "win64" fn native_connect_ex(
         native_wsa_set_last_error(10014);
         return 0;
     }
-    let fd = socket as i32;
+    let fd = socket_fd(socket);
     let old_flags = unsafe { fcntl(fd, 3) };
     if old_flags < 0 {
         native_wsa_set_last_error(errno_to_wsa(9));
@@ -1244,7 +1244,7 @@ pub(super) extern "win64" fn native_ioctlsocket(
     command: i32,
     argument: *mut u32,
 ) -> i32 {
-    if socket & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG {
+    if !is_socket_handle(socket) {
         native_wsa_set_last_error(10038); // WSAENOTSOCK
         return -1;
     }
@@ -1260,7 +1260,7 @@ pub(super) extern "win64" fn native_ioctlsocket(
             return -1;
         }
     };
-    if unsafe { ioctl(socket as i32, host_command, argument.cast()) } == 0 {
+    if unsafe { ioctl(socket_fd(socket), host_command, argument.cast()) } == 0 {
         0
     } else {
         native_wsa_set_last_error(10022);
@@ -1517,7 +1517,7 @@ pub(super) extern "win64" fn native_socket(domain: i32, kind: i32, protocol: i32
         native_wsa_set_last_error(10047);
         u64::MAX
     } else {
-        let handle = SOCKET_HANDLE_TAG | fd as u64;
+        let handle = socket_handle(fd as i32);
         if let Some(process) = process_ctx() {
             if let Ok(mut sockets) = process.socket_handles.lock() {
                 sockets.insert(handle);
@@ -1528,7 +1528,7 @@ pub(super) extern "win64" fn native_socket(domain: i32, kind: i32, protocol: i32
 }
 
 pub(super) extern "win64" fn native_close_socket(handle: u64) -> i32 {
-    if handle & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG {
+    if !is_socket_handle(handle) {
         native_wsa_set_last_error(10038); // WSAENOTSOCK
         return -1;
     }
@@ -1557,12 +1557,12 @@ pub(super) extern "win64" fn native_close_socket(handle: u64) -> i32 {
             modes.remove(&handle);
         }
     }
-    if release_socket_share(handle as i32) {
+    if release_socket_share(socket_fd(handle)) {
         unsafe {
-            shutdown(handle as i32, 2);
+            shutdown(socket_fd(handle), 2);
         }
     }
-    if unsafe { close(handle as i32) } == 0 {
+    if unsafe { close(socket_fd(handle)) } == 0 {
         0
     } else {
         native_wsa_set_last_error(10038);
@@ -1580,7 +1580,7 @@ pub(super) extern "win64" fn native_getsockopt(
     if native_diagnostic_enabled() {
         eprintln!("native getsockopt level={level:#x} option={option:#x}");
     }
-    if handle & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG || value.is_null() || length.is_null() {
+    if !is_socket_handle(handle) || value.is_null() || length.is_null() {
         native_wsa_set_last_error(10014); // WSAEFAULT
         return -1;
     }
@@ -1592,7 +1592,7 @@ pub(super) extern "win64" fn native_getsockopt(
         let mut timeval = libc::timeval { tv_sec: 0, tv_usec: 0 };
         let mut size = std::mem::size_of::<libc::timeval>() as u32;
         let host = if option == 0x1005 { libc::SO_SNDTIMEO } else { libc::SO_RCVTIMEO };
-        if unsafe { getsockopt(handle as i32, libc::SOL_SOCKET, host, (&mut timeval as *mut libc::timeval).cast(), &mut size) } != 0 {
+        if unsafe { getsockopt(socket_fd(handle), libc::SOL_SOCKET, host, (&mut timeval as *mut libc::timeval).cast(), &mut size) } != 0 {
             native_wsa_set_last_error(errno_to_wsa(std::io::Error::last_os_error().raw_os_error().unwrap_or(22)));
             return -1;
         }
@@ -1610,7 +1610,7 @@ pub(super) extern "win64" fn native_getsockopt(
         }
         let mut kind = 0i32;
         let mut size = 4u32;
-        if unsafe { getsockopt(handle as i32, libc::SOL_SOCKET, libc::SO_TYPE, (&mut kind as *mut i32).cast(), &mut size) } != 0 {
+        if unsafe { getsockopt(socket_fd(handle), libc::SOL_SOCKET, libc::SO_TYPE, (&mut kind as *mut i32).cast(), &mut size) } != 0 {
             set_wsa_error_from_errno();
             return -1;
         }
@@ -1652,7 +1652,7 @@ pub(super) extern "win64" fn native_getsockopt(
             return 0;
         }
     }
-    let result = unsafe { getsockopt(handle as i32, host_level, host_option, value, length) };
+    let result = unsafe { getsockopt(socket_fd(handle), host_level, host_option, value, length) };
     if result == 0 && level == 0xffff && option == 0x1007 {
         let error = unsafe { value.cast::<i32>().read_unaligned() };
         if error != 0 {
@@ -1688,7 +1688,7 @@ pub(super) extern "win64" fn native_network_u32(value: u32) -> u32 {
 }
 
 fn is_socket(handle: u64) -> bool {
-    handle & 0xffff_ffff_0000_0000 == SOCKET_HANDLE_TAG
+    is_socket_handle(handle)
 }
 
 fn set_wsa_error_from_errno() {
@@ -1721,7 +1721,7 @@ fn guest_sockaddr_family(address: *mut u8, length: u32) {
 }
 
 fn register_socket(fd: i32) -> u64 {
-    let handle = SOCKET_HANDLE_TAG | fd as u64;
+    let handle = socket_handle(fd as i32);
     if let Some(process) = process_ctx() {
         if let Ok(mut sockets) = process.socket_handles.lock() {
             sockets.insert(handle);
@@ -1738,14 +1738,14 @@ pub(super) extern "win64" fn native_accept_socket(socket: u64, address: *mut u8,
         return u64::MAX;
     }
     let mut host_length = if length.is_null() { 0 } else { unsafe { length.read_unaligned() }.max(0) as u32 };
-    let listener_flags = unsafe { libc::fcntl(socket as i32, libc::F_GETFL) };
+    let listener_flags = unsafe { libc::fcntl(socket_fd(socket), libc::F_GETFL) };
     if listener_flags < 0 {
         set_wsa_error_from_errno();
         return u64::MAX;
     }
     let fd = unsafe {
         libc::accept4(
-            socket as i32,
+            socket_fd(socket),
             if address.is_null() { ptr::null_mut() } else { address.cast() },
             if length.is_null() { ptr::null_mut() } else { &mut host_length },
             libc::SOCK_CLOEXEC | if listener_flags & libc::O_NONBLOCK != 0 { libc::SOCK_NONBLOCK } else { 0 },
@@ -1768,7 +1768,7 @@ pub(super) extern "win64" fn native_accept_socket(socket: u64, address: *mut u8,
 /// WSAETIMEDOUT; a non-blocking socket's EAGAIN stays WSAEWOULDBLOCK.
 fn timed_out(socket: u64) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN)
-        && unsafe { libc::fcntl(socket as u32 as i32, libc::F_GETFL) } & libc::O_NONBLOCK == 0
+        && unsafe { libc::fcntl(socket_fd(socket), libc::F_GETFL) } & libc::O_NONBLOCK == 0
 }
 
 pub(super) extern "win64" fn native_recv_socket(socket: u64, buffer: *mut u8, length: i32, flags: i32) -> i32 {
@@ -1802,8 +1802,8 @@ pub(super) extern "win64" fn native_recvfrom_socket(
     if flags & 0x8 != 0 {
         let mut kind = 0i32;
         let mut size = 4u32;
-        let options = unsafe { libc::fcntl(socket as i32, libc::F_GETFL) };
-        if options < 0 || unsafe { getsockopt(socket as i32, libc::SOL_SOCKET, libc::SO_TYPE, (&mut kind as *mut i32).cast(), &mut size) } != 0 {
+        let options = unsafe { libc::fcntl(socket_fd(socket), libc::F_GETFL) };
+        if options < 0 || unsafe { getsockopt(socket_fd(socket), libc::SOL_SOCKET, libc::SO_TYPE, (&mut kind as *mut i32).cast(), &mut size) } != 0 {
             set_wsa_error_from_errno();
             return -1;
         }
@@ -1820,7 +1820,7 @@ pub(super) extern "win64" fn native_recvfrom_socket(
     let mut host_length = if from_length.is_null() { 0 } else { unsafe { from_length.read_unaligned() }.max(0) as u32 };
     let received = unsafe {
         libc::recvfrom(
-            socket as i32,
+            socket_fd(socket),
             buffer.cast(),
             length as usize,
             flags,
@@ -1870,7 +1870,7 @@ pub(super) extern "win64" fn native_sendto_socket(
         }
     };
     let sent = unsafe {
-        libc::sendto(socket as i32, buffer.cast(), length as usize, flags, address.as_ptr().cast(), to_length as u32)
+        libc::sendto(socket_fd(socket), buffer.cast(), length as usize, flags, address.as_ptr().cast(), to_length as u32)
     };
     if sent < 0 {
         set_wsa_error_from_errno();
@@ -1926,7 +1926,7 @@ const INFO_NAME: usize = 116;
 /// protocol info for `WSASocketW`. Sharing a socket with another process
 /// is not supported (WSAEINVAL).
 pub(super) extern "win64" fn native_wsa_duplicate_socket_w(socket: u64, process_id: u32, info: *mut u8) -> i32 {
-    if socket & 0xffff_ffff_0000_0000 != SOCKET_HANDLE_TAG {
+    if !is_socket_handle(socket) {
         native_wsa_set_last_error(10038); // WSAENOTSOCK
         return -1;
     }
@@ -1938,7 +1938,7 @@ pub(super) extern "win64" fn native_wsa_duplicate_socket_w(socket: u64, process_
         native_wsa_set_last_error(10022);
         return -1;
     }
-    let fd = socket as u32 as i32;
+    let fd = socket_fd(socket);
     let option = |level: i32, name: i32| {
         let mut value = 0i32;
         let mut length = 4u32;
@@ -2020,7 +2020,7 @@ pub(super) extern "win64" fn native_wsa_socket_w(
         native_wsa_set_last_error(10022);
         return u64::MAX;
     };
-    let handle = SOCKET_HANDLE_TAG | fd as u64;
+    let handle = socket_handle(fd as i32);
     if let Some(process) = process_ctx() {
         if let Ok(mut sockets) = process.socket_handles.lock() {
             sockets.insert(handle);
@@ -2136,7 +2136,7 @@ mod named_socket_tests {
         assert_eq!(native_connect_socket(client, address.as_ptr(), 16), 0);
         let server = native_accept_socket(listener, ptr::null_mut(), ptr::null_mut());
         assert_ne!(server, u64::MAX);
-        assert_ne!(unsafe { libc::fcntl(server as i32, libc::F_GETFL) } & libc::O_NONBLOCK, 0);
+        assert_ne!(unsafe { libc::fcntl(socket_fd(server), libc::F_GETFL) } & libc::O_NONBLOCK, 0);
         assert_eq!(native_recv_socket(server, buffer.as_mut_ptr(), 4, 8), -1);
         assert_eq!(native_wsa_get_last_error(), 10045);
         assert_eq!(native_recv_socket(server, buffer.as_mut_ptr(), 4, 0), -1);
@@ -2215,7 +2215,7 @@ mod named_socket_tests {
         );
         let (mut idle, mut size) = (0i32, 4u32);
         unsafe {
-            libc::getsockopt(socket as u32 as i32, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, (&mut idle as *mut i32).cast(), &mut size)
+            libc::getsockopt(socket_fd(socket), libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, (&mut idle as *mut i32).cast(), &mut size)
         };
         assert_eq!(idle, 30);
         native_close_socket(socket);

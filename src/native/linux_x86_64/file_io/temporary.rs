@@ -411,6 +411,7 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_set_file_informatio
         native_set_last_error(87);
         return 0;
     }
+    let handle = original_handle(handle);
     let Some(context) = fs_ctx() else {
         native_set_last_error(6);
         return 0;
@@ -424,6 +425,34 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_set_file_informatio
         return 0;
     };
     match class {
+        // FileBasicInfo: creation, access, write and change times (0 leaves
+        // one alone; -1 and -2 stop and resume automatic updates) and the
+        // attributes (0 leaves them alone; bits that cannot be set, such
+        // as FILE_ATTRIBUTE_DIRECTORY, are ignored).
+        0 if size >= 40 => {
+            let field = |offset: usize| unsafe { information.add(offset).cast::<i64>().read_unaligned() };
+            let attributes = unsafe { information.add(32).cast::<u32>().read_unaligned() };
+            let mut metadata = ctx.fs.file_metadata(&path);
+            let mut set_time = |slot: &mut u64, value: i64| {
+                if value > 0 {
+                    *slot = value as u64;
+                }
+            };
+            set_time(&mut metadata.creation_time, field(0));
+            set_time(&mut metadata.access_time, field(8));
+            set_time(&mut metadata.write_time, field(16));
+            if attributes != 0 {
+                const SETTABLE: u32 = 0x1 | 0x2 | 0x4 | 0x20 | 0x80 | 0x100 | 0x1000 | 0x2000;
+                metadata.attributes = attributes & SETTABLE;
+            }
+            match ctx.fs.set_file_metadata(&path, metadata) {
+                Ok(()) => 1,
+                Err(_) => {
+                    native_set_last_error(5);
+                    0
+                }
+            }
+        }
         3 if size >= 20 => {
             let name_length = unsafe { information.add(16).cast::<u32>().read_unaligned() };
             if name_length % 2 != 0 || name_length > size - 20 {

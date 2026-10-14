@@ -12,7 +12,9 @@ pub(super) extern "win64" fn native_initialize_proc_thread_attribute_list(
     flags: u32,
     size: *mut usize,
 ) -> i32 {
-    if size.is_null() || flags != 0 || count == 0 || count > 128 {
+    // An empty list (count 0) is valid: CPython's CreateProcess always
+    // builds one, with no attributes when there is nothing to pass.
+    if size.is_null() || flags != 0 || count > 128 {
         native_set_last_error(87);
         return 0;
     }
@@ -41,7 +43,7 @@ fn list_count(list: *const u8) -> Result<(usize, usize), u32> {
         }
         let capacity = list.add(8).cast::<u64>().read_unaligned() as usize;
         let used = list.add(16).cast::<u64>().read_unaligned() as usize;
-        if capacity == 0 || capacity > 128 || used > capacity {
+        if capacity > 128 || used > capacity {
             return Err(87);
         }
         Ok((capacity, used))

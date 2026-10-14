@@ -1044,6 +1044,21 @@ pub(super) extern "win64" fn native_create_waitable_timer_a(
         0x1f0003,
     )
 }
+/// `SetWaitableTimerEx`: `SetWaitableTimer` with a wake context (no
+/// power management here) and a tolerable delay (coalescing is optional);
+/// neither changes when the timer fires.
+pub(super) extern "win64" fn native_set_waitable_timer_ex(
+    handle: u64,
+    due_time: *const i64,
+    period: i32,
+    completion: u64,
+    arg: u64,
+    _wake_context: u64,
+    _tolerable_delay: u32,
+) -> i32 {
+    native_set_waitable_timer(handle, due_time, period, completion, arg, 0)
+}
+
 pub(super) extern "win64" fn native_set_waitable_timer(
     handle: u64,
     due_time: *const i64,

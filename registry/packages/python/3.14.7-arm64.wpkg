@@ -1,6 +1,6 @@
 name = "python"
 version = "3.14.7"
 arch = "arm64"
-url = "https://www.python.org/ftp/python/3.14.7/python-3.14.7-embeddable-arm64.zip"
-sha256 = "b777fa08b68a177e350f8730c3e97a2b216d81e3eb5d183b039c65d43a6a2b3e"
-bin = ["python.exe"]
+url = "https://globalcdn.nuget.org/packages/pythonarm64.3.14.7.nupkg"
+sha256 = "9eddba7ee2f7ba6c5a1ed1699bd3a62c2e523bad81071d0dbbc8e803bd6c3410"
+bin = ["tools/python.exe", "tools/pythonw.exe"]

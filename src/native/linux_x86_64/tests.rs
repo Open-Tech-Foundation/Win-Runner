@@ -7458,11 +7458,15 @@ mod protection_tests {
     #[test]
     fn formats_a_native_system_error_message() {
         let mut output = [0; 32];
-        let count = native_format_message_w(0, 0, 5, 0, output.as_mut_ptr(), 32, 0);
+        // FORMAT_MESSAGE_FROM_SYSTEM: Windows' text for ERROR_ACCESS_DENIED.
+        let count = native_format_message_w(0x1000, 0, 5, 0, output.as_mut_ptr(), 32, 0);
         assert_eq!(
             String::from_utf16_lossy(&output[..count as usize]),
-            "Win-Runner native error.\r\n"
+            "Access is denied.\r\n"
         );
+        // No message source: invalid.
+        assert_eq!(native_format_message_w(0, 0, 5, 0, output.as_mut_ptr(), 32, 0), 0);
+        assert_eq!(native_get_last_error(), 87);
     }
 
     #[test]
@@ -7474,7 +7478,7 @@ mod protection_tests {
         );
         let mut output = [0u8; 64];
         let count = native_format_message_a(0x1000, 0, 5, 0, output.as_mut_ptr(), 64, 0);
-        assert_eq!(&output[..count as usize], b"Win-Runner native error.\r\n");
+        assert_eq!(&output[..count as usize], b"Access is denied.\r\n");
         assert_eq!(output[count as usize], 0);
     }
 
@@ -7604,7 +7608,7 @@ mod protection_tests {
 
     #[test]
     fn ioctlsocket_and_connect_validate_handles_and_arguments() {
-        let socket = 0x534f_434b_0000_0003;
+        let socket = crate::native::linux_x86_64::socket_handle(3);
         let mut argument = 1u32;
         assert_eq!(
             native_ioctlsocket(3, 0x8004_667e_u32 as i32, &mut argument),

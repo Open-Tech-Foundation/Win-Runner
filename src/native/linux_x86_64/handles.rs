@@ -56,7 +56,9 @@ pub(super) extern "win64" fn native_crt_open_osfhandle(handle: u64, _flags: i32)
             .fs
             .lock()
             .is_ok_and(|fs| fs.handles.contains_key(&handle))
-        || handle & 0xffff_ffff_0000_0000 == SOCKET_HANDLE_TAG;
+        || is_socket_handle(handle)
+        // Devices (NUL, CON, CONIN$, CONOUT$) take descriptors too.
+        || native_device(handle).is_some();
     if !valid {
         native_set_last_error(6);
         return -1;
@@ -190,8 +192,8 @@ pub(super) extern "win64" fn native_get_handle_information(handle: u64, flags: *
                 return Some(u32::from(pipe.inheritable));
             }
         }
-        if handle & 0xffff_ffff_0000_0000 == SOCKET_HANDLE_TAG {
-            let descriptor_flags = unsafe { fcntl(handle as i32, 1) }; // F_GETFD
+        if is_socket_handle(handle) {
+            let descriptor_flags = unsafe { fcntl(socket_fd(handle), 1) }; // F_GETFD
             return (descriptor_flags >= 0).then_some(u32::from(descriptor_flags & 1 == 0));
         }
         let open = host_standard_fd(handle).is_some()
@@ -239,8 +241,8 @@ pub(super) extern "win64" fn native_set_handle_information(
             }
         }
     }
-    if handle & 0xffff_ffff_0000_0000 == SOCKET_HANDLE_TAG {
-        let fd = handle as i32;
+    if is_socket_handle(handle) {
+        let fd = socket_fd(handle);
         let descriptor_flags = unsafe { fcntl(fd, 1) }; // F_GETFD
         if descriptor_flags < 0 {
             native_set_last_error(6);
@@ -303,6 +305,14 @@ pub(super) extern "win64" fn native_duplicate_handle(
         native_set_last_error(error);
     }
     result
+}
+
+/// The handle a `DuplicateHandle` copy stands for (the handle itself when
+/// it is not such a copy).
+pub(super) fn original_handle(handle: u64) -> u64 {
+    process_ctx()
+        .and_then(|process| process.duplicate_handles.lock().ok().and_then(|values| values.get(&handle).copied()))
+        .unwrap_or(handle)
 }
 
 fn native_duplicate_handle_impl(
