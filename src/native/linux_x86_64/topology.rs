@@ -34,6 +34,30 @@ pub(super) extern "win64" fn native_get_active_processor_group_count() -> u16 {
     1
 }
 
+pub(super) extern "win64" fn native_get_maximum_processor_group_count() -> u16 {
+    1
+}
+
+/// Processors in `group`, or in all groups for `ALL_PROCESSOR_GROUPS`;
+/// a group that does not exist is `ERROR_INVALID_PARAMETER` and 0.
+fn group_processor_count(group: u16) -> u32 {
+    const ALL_PROCESSOR_GROUPS: u16 = 0xffff;
+    if group == 0 || group == ALL_PROCESSOR_GROUPS {
+        processor_count()
+    } else {
+        native_set_last_error(87);
+        0
+    }
+}
+
+pub(super) extern "win64" fn native_get_active_processor_count(group: u16) -> u32 {
+    group_processor_count(group)
+}
+
+pub(super) extern "win64" fn native_get_maximum_processor_count(group: u16) -> u32 {
+    group_processor_count(group)
+}
+
 pub(super) extern "win64" fn native_get_process_group_affinity(
     _process: u64,
     count: *mut u16,
@@ -264,6 +288,10 @@ mod tests {
         assert_eq!(node, 0);
         assert_eq!(native_set_thread_affinity_mask(0, 0), 0);
         assert_eq!(native_set_thread_affinity_mask(0, 1), all_processors_mask());
+        assert_eq!(native_get_maximum_processor_group_count(), 1);
+        assert_eq!(native_get_active_processor_count(0), processor_count());
+        assert_eq!(native_get_maximum_processor_count(0xffff), processor_count());
+        assert_eq!(native_get_active_processor_count(1), 0, "no second group");
     }
 
     #[test]

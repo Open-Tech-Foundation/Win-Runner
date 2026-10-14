@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- `GetMaximumProcessorGroupCount`, `GetActiveProcessorCount` and
+  `GetMaximumProcessorCount` (one processor group), which the .NET 10
+  CoreCLR calls at startup.
+
 - `where.exe` in System32: finds files in the current directory and along
   `PATH` with `PATHEXT` extensions (`/Q`, `/F`, `/R`), exiting 1 with
   Windows' message when a pattern matches nothing.
