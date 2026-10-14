@@ -101,7 +101,8 @@ impl Interpreter<'_> {
                 None => kept.push(arg.clone()),
             }
         }
-        let args = kept;
+        // An array argument passes each element as an argument of its own.
+        let args: Vec<String> = kept.iter().flat_map(|arg| array_elements(arg)).collect();
         let lower = path.to_ascii_lowercase();
         if lower.ends_with(".ps1") {
             let data = self

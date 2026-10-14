@@ -77,6 +77,15 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- PowerShell command arguments understand arrays: comma lists (`a,b`,
+  `"a", "b"`) and array variables are passed as arrays instead of one
+  joined string. Path cmdlets (`Get-Content`, `Remove-Item`, `Test-Path`,
+  `New-Item`, `Copy-Item`, …) act on each path; `Set-Content`/`Add-Content`
+  write each element as a line; `Write-Output` (and `echo`) output each
+  argument and element on its own line, `Write-Host` separates them with
+  spaces; script parameters receive arrays; programs get each element as
+  an argument. Other cmdlets see the joined text as before.
+
 - PowerShell passes `cmd.exe`, `cscript.exe`, `wscript.exe`, `find.exe`,
   `sqlcmd.exe` and batch/script files their arguments the legacy way, as
   its default `$PSNativeCommandArgumentPassing` (`Windows`) does: embedded

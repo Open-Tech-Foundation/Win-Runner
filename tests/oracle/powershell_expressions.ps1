@@ -85,3 +85,20 @@ where.exe cmd
 where.exe winrun-no-such-program 2>$null
 "where.missing: $LASTEXITCODE"
 (Get-Command cmd,where).Count
+
+# Array arguments: comma lists and array variables.
+Set-Content arr.txt "pear","Apple"
+Add-Content arr.txt "kiwi", "lime"
+Get-Content arr.txt
+Write-Output a,b
+Write-Output x y
+"arr.test: $(Test-Path arr.txt, nope.txt)"
+$names = "x.txt","y.txt"
+New-Item $names -ItemType File | Out-Null
+"arr.created: $(Test-Path $names)"
+Remove-Item x.txt, y.txt
+"arr.removed: $(Test-Path x.txt)"
+function Show-Items { param($Items) "arr.param: count=$($Items.Count) last=$($Items[-1])" }
+Show-Items -Items a,b,c
+cmd /c echo a,b
+Remove-Item arr.txt

@@ -1076,10 +1076,8 @@ impl<'a> Interpreter<'a> {
             return Ok(Flow::Next);
         }
         // Expand variables per token; single-quoted spans stay verbatim.
-        let mut args = Vec::with_capacity(toks.len());
-        for tok in &toks {
-            args.push(self.expand_token(tok)?);
-        }
+        // Comma lists and array variables become array arguments.
+        let args = self.expand_arguments(&toks)?;
         // `& target args`: the call operator runs a command, function, or
         // program named by a (possibly quoted or computed) value.
         let call = args[0] == "&" && args.len() > 1;
@@ -1124,6 +1122,64 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// Command arguments: each token expanded, tokens joined by commas
+    /// (`"a", "b"`) taken as one array argument, and a bare array variable
+    /// kept as an array (see [`LIST_SEP`] and [`ARRAY_SEP`]).
+    fn expand_arguments(&mut self, toks: &[Token]) -> Result<Vec<String>, String> {
+        // Merge tokens a comma joins: `a,` + `b`, or `a` + `,b`.
+        let mut groups: Vec<Token> = Vec::new();
+        let mut joining = false;
+        for tok in toks {
+            let starts_with_comma = tok.commas.first() == Some(&0);
+            match groups.last_mut() {
+                Some(last) if joining || starts_with_comma => {
+                    let offset = last.chars.len();
+                    last.commas.extend(tok.commas.iter().map(|position| position + offset));
+                    last.chars.extend(tok.chars.iter().copied());
+                    last.quoted |= tok.quoted;
+                }
+                _ => groups.push(tok.clone()),
+            }
+            let last = groups.last().unwrap();
+            joining = !last.chars.is_empty() && last.commas.last() == Some(&(last.chars.len() - 1));
+        }
+        let mut args = Vec::with_capacity(groups.len());
+        for group in &groups {
+            if group.commas.is_empty() {
+                args.push(self.expand_single_argument(group)?);
+                continue;
+            }
+            let mut elements = Vec::new();
+            let mut start = 0;
+            for end in group.commas.iter().copied().chain(std::iter::once(group.chars.len())) {
+                let chars = group.chars[start..end].to_vec();
+                start = end + 1;
+                if chars.is_empty() {
+                    continue;
+                }
+                let element = Token { chars, quoted: group.quoted, commas: Vec::new() };
+                elements.push(self.expand_single_argument(&element)?);
+            }
+            args.push(elements.join(&LIST_SEP.to_string()));
+        }
+        Ok(args)
+    }
+
+    /// One argument: a bare variable holding an array stays an array.
+    fn expand_single_argument(&mut self, tok: &Token) -> Result<String, String> {
+        let text = tok.text();
+        let bare_variable = text.len() > 1
+            && text.starts_with('$')
+            && tok.chars.iter().all(|(_, expandable)| *expandable)
+            && text[1..].chars().all(|c| c.is_alphanumeric() || c == '_');
+        if bare_variable {
+            if let Some(Value::Arr(items)) = self.lookup_value(&text[1..]) {
+                return Ok(items.iter().map(value_string).collect::<Vec<_>>().join(&ARRAY_SEP.to_string()));
+            }
+        }
+        self.expand_token(tok)
+    }
+
     /// Plain builtins shared by statement position and value capture
     /// (`$x = Join-Path ...`). `break`/`continue`/`iex` flow through.
     /// `out-null` sinks its input (pipeline or argument position).
@@ -1143,6 +1199,41 @@ impl<'a> Interpreter<'a> {
             return self.cmd_iex(rest, pipe_in);
         }
         let cmd = essentials::canonical_command(cmd);
+        // Array arguments: path cmdlets run once per path, content values
+        // become lines, and Write-Output writes one element per line.
+        if rest.iter().any(|arg| is_array_argument(arg)) {
+            if let Some(index) = path_argument(cmd, rest).filter(|index| is_array_argument(&rest[*index])) {
+                for path in array_elements(&rest[index]) {
+                    let mut one = rest.to_vec();
+                    one[index] = path;
+                    match self.exec_builtin(cmd, &one, pipe_in)? {
+                        Flow::Next => {}
+                        flow => return Ok(flow),
+                    }
+                }
+                return Ok(Flow::Next);
+            }
+            if matches!(cmd, "set-content" | "add-content") {
+                let joined: Vec<String> = rest.iter().map(|arg| array_elements(arg).join("\n")).collect();
+                return self.exec_builtin(cmd, &joined, pipe_in);
+            }
+            // Write-Host shows an array's elements separated by spaces.
+            if cmd == "write-host" {
+                let spaced: Vec<String> = rest.iter().map(|arg| array_elements(arg).join(" ")).collect();
+                return self.exec_builtin(cmd, &spaced, pipe_in);
+            }
+            if cmd == "write-output" {
+                let (_, positional) = parse_params(rest, &["noenumerate"])?;
+                for arg in positional {
+                    for element in array_elements(&arg) {
+                        self.emit(&element);
+                    }
+                }
+                return Ok(Flow::Next);
+            }
+        }
+        let flattened: Vec<String> = rest.iter().map(|arg| scalar_argument(arg)).collect();
+        let rest = &flattened[..];
         match cmd {
             "rename-item" => self.cmd_rename_item(rest),
             "clear-content" => self.cmd_clear_content(rest),
@@ -1197,9 +1288,17 @@ impl<'a> Interpreter<'a> {
             "invoke-webrequest" | "iwr" | "wget" => self.cmd_invoke_webrequest(rest),
             "expand-archive" => self.cmd_expand_archive(rest),
             "get-filehash" => self.cmd_get_filehash(rest),
-            "write-host" | "write-output" | "echo" => {
+            "write-host" => {
                 let (_, positional) = parse_params(rest, &[])?;
                 self.emit(&positional.join(" "));
+                Ok(())
+            }
+            // Each argument is an object of its own, on its own line.
+            "write-output" | "echo" => {
+                let (_, positional) = parse_params(rest, &["noenumerate"])?;
+                for argument in positional {
+                    self.emit(&argument);
+                }
                 Ok(())
             }
             // Warnings and non-terminating errors go to the console's error
@@ -2034,7 +2133,7 @@ impl<'a> Interpreter<'a> {
     ) -> Result<(), String> {
         for p in params {
             let v = match bound.remove(&p.name) {
-                Some(v) => Value::Str(v),
+                Some(v) => argument_value(&v),
                 None => match &p.default {
                     Some(text) => {
                         let toks = tokenize(text)?;
@@ -4124,6 +4223,54 @@ fn starts_like_expression(text: &str) -> bool {
         Some('-') | Some('.') => chars.next().is_some_and(|c| c.is_ascii_digit()),
         _ => false,
     }
+}
+
+/// Joins the elements of an array argument written with commas
+/// (`a,b`); a cmdlet that takes a single string sees them joined by `,`.
+const LIST_SEP: char = '\u{1E}';
+/// Joins the elements of an array variable passed as an argument; a cmdlet
+/// that takes a single string sees them joined by spaces, as PowerShell
+/// converts an array to a string.
+const ARRAY_SEP: char = '\u{1F}';
+
+fn is_array_argument(arg: &str) -> bool {
+    arg.contains([LIST_SEP, ARRAY_SEP])
+}
+
+/// An argument's elements (itself when it is not an array).
+fn array_elements(arg: &str) -> Vec<String> {
+    arg.split([LIST_SEP, ARRAY_SEP]).map(str::to_string).collect()
+}
+
+/// An argument as a single string.
+fn scalar_argument(arg: &str) -> String {
+    arg.replace(LIST_SEP, ",").replace(ARRAY_SEP, " ")
+}
+
+/// An argument as a script variable's value: arrays stay arrays.
+fn argument_value(arg: &str) -> Value {
+    if is_array_argument(arg) {
+        Value::Arr(array_elements(arg).into_iter().map(Value::Str).collect())
+    } else {
+        Value::Str(arg.to_string())
+    }
+}
+
+/// The index of a path cmdlet's `-Path`/`-LiteralPath` value, else of its
+/// first argument when that is the positional path.
+fn path_argument(cmd: &str, args: &[String]) -> Option<usize> {
+    if !matches!(
+        cmd,
+        "get-content" | "remove-item" | "test-path" | "get-childitem" | "get-item" | "copy-item" | "move-item"
+            | "new-item" | "resolve-path" | "clear-content" | "set-content" | "add-content" | "get-filehash"
+            | "get-itemproperty" | "split-path"
+    ) {
+        return None;
+    }
+    if let Some(index) = args.iter().position(|arg| arg.eq_ignore_ascii_case("-path") || arg.eq_ignore_ascii_case("-literalpath")) {
+        return (index + 1 < args.len()).then_some(index + 1);
+    }
+    args.first().filter(|first| !first.starts_with('-')).map(|_| 0)
 }
 
 fn starts_kw(s: &str, kw: &str) -> bool {
@@ -7020,7 +7167,7 @@ $x
         assert_eq!(out, b"hi\n");
         let (out, r) = run_session("$t = (echo a; echo b)\necho $t");
         assert!(r.is_ok());
-        assert_eq!(out, b"a b\n");
+        assert_eq!(out, b"a\nb\n");
         // Trailing junk and unbalanced groups fail clearly.
         assert!(run_session("(echo hi) extra")
             .1
@@ -7229,14 +7376,14 @@ $x
     fn undefined_var_expands_empty() {
         let (out, r) = run_session("echo a$Nope_XYZ_123 b");
         assert!(r.is_ok());
-        assert_eq!(out, b"a b\n");
+        assert_eq!(out, b"a\nb\n");
     }
 
     #[test]
     fn null_and_home() {
         let (out, r) = run_session("echo x$null y");
         assert!(r.is_ok());
-        assert_eq!(out, b"x y\n");
+        assert_eq!(out, b"x\ny\n");
         let (out, r) = run_session("echo $HOME");
         assert!(r.is_ok());
         assert_eq!(out, b"C:\\Users\\runner\n");
@@ -7253,7 +7400,7 @@ $x
         assert!(r.is_ok());
         assert_eq!(
             out,
-            b"C:\\Users\\runner C:\\Users\\runner\\AppData\\Local\n"
+            b"C:\\Users\\runner\nC:\\Users\\runner\\AppData\\Local\n"
         );
     }
 
@@ -7938,7 +8085,7 @@ $x
     fn switch_multi_output_is_array() {
         let (out, r) = run_session("$v = switch ('x') { 'x' { echo a; echo b } }\necho $v");
         assert!(r.is_ok());
-        assert_eq!(out, b"a b\n");
+        assert_eq!(out, b"a\nb\n");
     }
 
     #[test]
@@ -7979,7 +8126,8 @@ $x
     fn arrays_literal_count_and_join() {
         let (out, r) = run_session("$Bins = @('esrun', 'esdev')\necho $Bins");
         assert!(r.is_ok());
-        assert_eq!(out, b"esrun esdev\n");
+        // Each element is an object of its own line, as in PowerShell.
+        assert_eq!(out, b"esrun\nesdev\n");
         let (out, r) =
             run_session("$Bins = @('esrun', 'esdev')\nif ($Bins.Count -eq 2) { echo c }");
         assert!(r.is_ok());
@@ -8069,6 +8217,22 @@ $x
     }
 
     #[test]
+    fn comma_lists_and_array_variables_are_array_arguments() {
+        let script = "Set-Content f.txt \"pear\",\"Apple\"\nAdd-Content f.txt \"kiwi\", \"lime\"\nGet-Content f.txt\n\
+                      Write-Output a,b\nWrite-Host a,b\nWrite-Output x y\n\
+                      Set-Content g.txt one\nTest-Path f.txt, nope.txt, g.txt\n\
+                      $names = \"x.txt\",\"y.txt\"\nNew-Item $names -ItemType File | Out-Null\nTest-Path $names\n\
+                      Remove-Item x.txt, y.txt\nTest-Path x.txt\n\
+                      function Show { param($Items) \"count=$($Items.Count) last=$($Items[-1])\" }\nShow -Items a,b,c";
+        let (out, r) = run_session(script);
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "pear\nApple\nkiwi\nlime\na\nb\na b\nx\ny\nTrue\nFalse\nTrue\nTrue\nTrue\nFalse\ncount=3 last=c\n"
+        );
+    }
+
+    #[test]
     fn append_grows_arrays() {
         // null + scalar stays scalar.
         let (out, r) = run_session("$u += \"b\"\necho $u");
@@ -8085,7 +8249,7 @@ $x
         // array extends.
         let (out, r) = run_session("$a = @('x')\n$a += 'y'\necho $a");
         assert!(r.is_ok());
-        assert_eq!(out, b"x y\n");
+        assert_eq!(out, b"x\ny\n");
     }
 
     #[test]
