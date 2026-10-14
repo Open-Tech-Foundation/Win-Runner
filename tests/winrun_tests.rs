@@ -2462,6 +2462,68 @@ fn headless_control_session_streams_shell_output_and_exits_cleanly() {
     std::fs::remove_file(snapshot).ok();
 }
 
+/// Host processes whose command line contains `needle` (read from /proc,
+/// so this test's own processes never match by accident).
+fn processes_with(needle: &str) -> Vec<u32> {
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .filter_map(|entry| {
+            let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
+            let cmdline = std::fs::read(entry.path().join("cmdline")).ok()?;
+            String::from_utf8_lossy(&cmdline).replace('\0', " ").contains(needle).then_some(pid)
+        })
+        .collect()
+}
+
+#[test]
+fn instance_commands_end_their_guest_programs_when_cancelled_or_destroyed() {
+    let state = tmp_path("instances-cancel");
+    let name = format!("cancel-{}", counter());
+    let bin = env!("CARGO_BIN_EXE_winrun");
+    let instance = |args: &[&str]| {
+        Command::new(bin).arg("instance").args(args).env("WINRUN_INSTANCE_DIR", &state).output().unwrap()
+    };
+    assert_eq!(instance(&["boot", &name]).status.code(), Some(0));
+    let daemon = processes_with(&format!("__instance-daemon {name} "));
+    assert_eq!(daemon.len(), 1, "one daemon");
+    let workers = || processes_with(&format!("winrun-worker-{}-", daemon[0]));
+    // A guest program that never ends, run by a client that gives up.
+    let sleeper = artifact("exe/oracle_native_startup.exe");
+    let start_sleeper = || {
+        Command::new(bin)
+            .args(["instance", "exec", &name, "--", sleeper.to_str().unwrap(), "--sleep-child"])
+            .env("WINRUN_INSTANCE_DIR", &state)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    };
+    let wait_until = |condition: &dyn Fn() -> bool| {
+        for _ in 0..100 {
+            if condition() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        false
+    };
+    let mut client = start_sleeper();
+    assert!(wait_until(&|| !workers().is_empty()), "the guest program starts");
+    assert_eq!(instance(&["status", &name]).status.code(), Some(0), "a busy instance still answers");
+    client.kill().unwrap();
+    client.wait().unwrap();
+    assert!(wait_until(&|| workers().is_empty()), "a cancelled command's guest program ends");
+    assert_eq!(instance(&["status", &name]).status.code(), Some(0), "and the instance takes requests again");
+    // Destroying a busy instance ends its guest programs too.
+    let mut client = start_sleeper();
+    assert!(wait_until(&|| !workers().is_empty()));
+    assert_eq!(instance(&["destroy", &name]).status.code(), Some(0));
+    assert!(wait_until(&|| workers().is_empty() && processes_with(&format!("__instance-daemon {name} ")).is_empty()));
+    client.wait().unwrap();
+    std::fs::remove_dir_all(&state).ok();
+}
+
 #[test]
 fn test_named_instance_boot_status_and_destroy() {
     let state = tmp_path("instances");

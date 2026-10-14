@@ -65,6 +65,14 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Instances no longer leave guest programs running. While a command runs,
+  the instance still answers `status` and `destroy` (other commands are
+  told it is busy); a cancelled `instance exec` (its client killed or timed
+  out) ends the command's guest programs; `destroy` and stop signals
+  (SIGTERM, SIGINT, SIGHUP) end every guest program before the daemon
+  exits. Each daemon keeps its own guest process table instead of the one
+  belonging to the short-lived `instance boot`.
+
 - `scripts/install.sh` installs `v0.2.0` by default now that it is released;
   README install examples updated to match.
 

@@ -114,12 +114,16 @@ fn main() {
         std::env::set_var("WINRUN_NATIVE_WORKER_EXE", executable);
     }
     if (args.len() == 4 || args.len() == 5) && args[1] == "__instance-daemon" {
+        // The daemon outlives the `instance boot` that started it, so it
+        // keeps its own guest process table instead of inheriting boot's.
+        std::env::remove_var("WINRUN_PROCESS_TABLE");
+        PROCESS_TABLE.get_or_init(winrun::native::process_table::begin_session);
         let snapshot = args.get(4).map(String::as_str);
         if let Err(e) = instance::run_daemon(&args[2], &args[3], snapshot) {
             eprintln!("winrun: instance daemon failed: {e}");
             exit(1);
         }
-        return;
+        exit(0);
     }
     match args.get(1).map(String::as_str) {
         Some("--help" | "-h" | "help") if args.len() == 2 => {

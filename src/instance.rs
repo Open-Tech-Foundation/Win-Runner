@@ -13,6 +13,7 @@ use crate::{
 };
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const SOCKET_SUFFIX: &str = ".sock";
 
@@ -240,10 +241,15 @@ pub fn run_daemon(name: &str, dir: &str, snapshot_path: Option<&str>) -> Result<
             .map_err(|e| format!("cannot bind instance socket {}: {e}", socket.display()))?;
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
             .map_err(|e| format!("cannot protect instance socket {}: {e}", socket.display()))?;
-        for connection in listener.incoming() {
-            let mut stream = match connection {
-                Ok(stream) => stream,
-                Err(_) => continue,
+        install_stop_signals();
+        loop {
+            if STOP.load(Ordering::Acquire) {
+                terminate_guests();
+                break;
+            }
+            let mut stream = match accept_waiting(&listener) {
+                Some(stream) => stream,
+                None => continue,
             };
             let mut request = Vec::new();
             let count = match stream.read_to_end(&mut request) {
@@ -331,7 +337,17 @@ pub fn run_daemon(name: &str, dir: &str, snapshot_path: Option<&str>) -> Result<
                             );
                         }
                     });
-                let code = match shell.exec_line_streaming(command, &mut output, sink) {
+                // While the command runs, a watcher answers status and
+                // destroy requests, and ends the command's guest programs if
+                // its client goes away (a killed or timed-out `exec`).
+                let busy = BusyWatcher::start(name, &listener, &stream);
+                let result = shell.exec_line_streaming(command, &mut output, sink);
+                let destroyed = busy.finish();
+                if destroyed {
+                    let _ = std::fs::remove_file(&socket);
+                    return Ok(());
+                }
+                let code = match result {
                     Ok(ShellFlow::Continue) => shell.last_code(),
                     Ok(ShellFlow::Exit(code)) => code,
                     Err(error) => {
@@ -383,6 +399,7 @@ pub fn run_daemon(name: &str, dir: &str, snapshot_path: Option<&str>) -> Result<
                     let _ = stream.write_all(format!("OK {name}\n").as_bytes());
                 }
                 b"DESTROY\n" => {
+                    terminate_guests();
                     let _ = stream.write_all(b"OK\n");
                     let _ = std::fs::remove_file(&socket);
                     return Ok(());
@@ -414,6 +431,118 @@ pub fn run_daemon(name: &str, dir: &str, snapshot_path: Option<&str>) -> Result<
         }
         let _ = std::fs::remove_file(&socket);
         Ok(())
+    }
+}
+
+/// Set by SIGTERM, SIGINT, or SIGHUP: the daemon ends its guest programs
+/// and stops.
+static STOP: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+fn install_stop_signals() {
+    extern "C" fn on_stop(_: libc::c_int) {
+        STOP.store(true, Ordering::Release);
+    }
+    for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+        unsafe { libc::signal(signal, on_stop as *const () as libc::sighandler_t) };
+    }
+}
+
+/// End every guest program this instance started (its process table).
+fn terminate_guests() {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    for process in crate::native::process_table::list() {
+        let _ = crate::native::process_table::terminate(&process);
+    }
+}
+
+/// The next connection, waiting up to 200 ms (so stop signals are noticed).
+#[cfg(unix)]
+fn accept_waiting(listener: &std::os::unix::net::UnixListener) -> Option<std::os::unix::net::UnixStream> {
+    use std::os::fd::AsRawFd;
+    let mut poll = libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+    if unsafe { libc::poll(&mut poll, 1, 200) } <= 0 {
+        return None;
+    }
+    let (stream, _) = listener.accept().ok()?;
+    Some(stream)
+}
+
+/// Watches the daemon while one command runs: answers `PING`, refuses other
+/// commands as busy, and on `DESTROY`, a stop signal, or the command's
+/// client hanging up, ends the command's guest programs.
+#[cfg(unix)]
+struct BusyWatcher {
+    done: std::sync::Arc<AtomicBool>,
+    destroyed: std::sync::Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl BusyWatcher {
+    fn start(name: &str, listener: &std::os::unix::net::UnixListener, client: &std::os::unix::net::UnixStream) -> Self {
+        use std::os::fd::AsRawFd;
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let destroyed = std::sync::Arc::new(AtomicBool::new(false));
+        let (Ok(listener), Ok(client)) = (listener.try_clone(), client.try_clone()) else {
+            return Self { done, destroyed, thread: None };
+        };
+        let (thread_done, thread_destroyed, name) = (done.clone(), destroyed.clone(), name.to_string());
+        let thread = std::thread::spawn(move || {
+            let mut ended = false;
+            let mut end = || {
+                if !ended {
+                    ended = true;
+                    terminate_guests();
+                }
+            };
+            while !thread_done.load(Ordering::Acquire) {
+                // The client closed its end: nobody waits for this command.
+                let mut hangup = libc::pollfd { fd: client.as_raw_fd(), events: 0, revents: 0 };
+                if unsafe { libc::poll(&mut hangup, 1, 0) } > 0 && hangup.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+                    end();
+                }
+                if STOP.load(Ordering::Acquire) {
+                    thread_destroyed.store(true, Ordering::Release);
+                    end();
+                }
+                let Some(mut stream) = accept_waiting(&listener) else { continue };
+                let mut request = Vec::new();
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                if stream.read_to_end(&mut request).is_err() {
+                    continue;
+                }
+                match request.as_slice() {
+                    b"PING\n" => {
+                        let _ = stream.write_all(format!("OK {name} busy\n").as_bytes());
+                    }
+                    b"DESTROY\n" => {
+                        thread_destroyed.store(true, Ordering::Release);
+                        end();
+                        let _ = stream.write_all(b"OK\n");
+                    }
+                    request if request.starts_with(b"WCLI") => {
+                        let _ = write_frame(
+                            &mut stream,
+                            &Frame { stream: 1, kind: Kind::Failure, flags: 1, payload: b"instance is busy running another command".to_vec() },
+                        );
+                    }
+                    _ => {
+                        let _ = stream.write_all(b"ERR instance is busy\n");
+                    }
+                }
+            }
+        });
+        Self { done, destroyed, thread: Some(thread) }
+    }
+
+    /// Stop watching; whether the instance was destroyed meanwhile.
+    fn finish(mut self) -> bool {
+        self.done.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        self.destroyed.load(Ordering::Acquire)
     }
 }
 
