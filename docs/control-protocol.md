@@ -1,9 +1,7 @@
 # Headless control protocol (for agents)
 
-Persistent, scriptable control of one shell over a loopback WebSocket.
-This is the interface automation should use for interactive sessions; for
-one-shot jobs prefer `winrun runner`, for long-lived state prefer
-`winrun instance exec`.
+Scriptable control of one shell over loopback WebSocket. Interactive sessions here;
+one-shot jobs → `runner`, long-lived state → `instance exec`.
 
 ## Start
 
@@ -13,13 +11,10 @@ winrun --headless --control=127.0.0.1:0 shell
 {"event":"ready","protocol":1,"url":"ws://127.0.0.1:PORT/control/<token>"}
 ```
 
-- Binds **loopback only** (non-loopback is refused). Port `0` picks a free port.
-- `<token>` is a random 32-hex-char session secret. **Anyone holding the URL
-  controls the shell — do not log it.** Token comparison is constant-time;
-  wrong paths get HTTP 401.
-- `--control` requires `--headless` and the `shell` target.
-- Idle/partial unauthenticated handshakes expire after 2s (max 64 pending) so
-  scanners can't wedge the listener.
+- **Loopback only** (non-loopback refused). Port `0` picks a free port.
+- `<token>` is a 32-hex-char secret. **URL = shell access — do not log it.** Wrong paths → 401.
+- `--control` needs `--headless` + the `shell` target.
+- Idle handshakes expire after 2s (max 64 pending); scanners can't wedge it.
 
 ## Events (server → client, JSON text frames)
 

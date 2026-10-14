@@ -20,8 +20,14 @@ All notable changes to this project will be documented in this file.
   It downloads with the built-in HTTPS client, verifies the SHA-256 checksum,
   smoke-checks the new binary, and atomically replaces the running one.
 
-- `docs/registry.md`: every `wpkg` package with its pinned version and
-  install command, generated from `registry/packages/*/latest`.
+- `docs/registry.md`: every `wpkg` package with its pinned version,
+  generated from `registry/packages/*/latest`.
+
+### Changed
+
+- Docs rewritten in short form: no long paragraphs, tables over inline
+  item dumps (README, compatibility, threat-model, differences,
+  architecture, control-protocol, registry).
 
 ### Fixed
 

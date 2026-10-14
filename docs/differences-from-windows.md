@@ -1,84 +1,50 @@
 # Differences from real Windows
 
-Win-Runner targets **command-line program compatibility**, not Windows
-fidelity. This page lists intentional differences so test results are read
-correctly. Anything here is by design; anything else that differs is a bug —
-check it against real Windows with the oracle scripts in `tests/oracle/` and
-report it.
+CLI compatibility, not Windows fidelity. Listed = by design; anything else
+that differs is a bug — check `tests/oracle/` against real Windows and report it.
 
-## Scope differences
+## Scope
 
-- **CLI only.** No GUI windows, games, drivers, services, tray, notifications,
-  remote desktop, or interactive `cmd` prompt.
-- **No .NET Framework.** Framework executables are rejected with a loader
-  limitation. Modern CoreCLR / self-contained binaries are covered via E2E
-  fixtures instead.
-- **Single user, single machine.** Every session is user `runner` on computer
-  `WINRUNNER`. No UAC/elevation, logon sessions, Terminal Services, or domain.
-- **PowerShell subset, not full PowerShell.** Missing cmdlets/parameters fail
-  loudly. `Get-Command` / `Get-Help` in the shell list what exists.
-- **`cmd.exe` subset.** Covers what programs that shell out need (`cmd /c`,
-  batch files, pipes, redirection, `for`/`if`/`set`, delayed expansion). No
-  interactive prompt, no `cmd /k` persistence.
+- **CLI only.** No GUI, games, drivers, services, tray, RDP, or interactive `cmd`.
+- **No .NET Framework.** Rejected at load; modern CoreCLR via E2E fixtures instead.
+- **One user, one machine.** `runner` on `WINRUNNER`. No UAC, logons, TS, or domain.
+- **PowerShell subset.** Missing cmdlets fail loudly; `Get-Command` lists what exists.
+- **`cmd.exe` subset.** `cmd /c`, batch, pipes, redirection, `for`/`if`/`set`. No `/k`.
 
 ## Object model
 
-- **Pipelines carry text, not .NET objects.** `... | Select-Object -First 1`,
-  `Where-Object`, `ForEach-Object` work on lines. Property access on
-  structured output (e.g. `(Get-Process)[0].Id`) mostly does not apply.
-- **No desktop clipboard.** Micro and console tools use an internal clipboard;
-  session-local clipboard formats exist for API compatibility only.
-- **No real windows/messages desktop.** Window/message-queue APIs that GUI
-  scaffolding calls are stubbed sufficiently for CLI tools; visible behavior
-  is limited to console title updates (OSC 0).
+- **Pipelines carry text, not .NET objects.** Line-based filtering; no property paths.
+- **No desktop clipboard.** Internal clipboard only (API formats stubbed per-session).
+- **No window desktop.** GUI scaffolding APIs stubbed for CLI tools; only title updates show.
 
 ## Filesystem and registry
 
-- **Guest C: is case-insensitive** (original casing preserved in listings),
-  like NTFS. `TEST.JS` and `test.js` are the same file.
-- **No short (8.3) names**, no per-file security descriptors visible to
-  guests (SDDL parsing exists where APIs require it, e.g. private dirs).
-- **Timestamps** follow Windows semantics (create/access/write moved on
-  create/write); host-mounted files report host times.
-- **Registry** is a JSON-backed `HKLM`/`HKCU` sufficient for environment,
-  uninstall entries, certificates, and installer probes — not the full
-  Windows hive set.
+- **C: is case-insensitive** (casing preserved), like NTFS.
+- **No 8.3 names**, no visible file ACLs (SDDL parsed where APIs need it).
+- **Windows timestamps** on C:; host times on mounted drives.
+- **Registry** is JSON-backed `HKLM`/`HKCU` for env, uninstall, certs, installers.
 
-## Process, console, and hardware
+## Process, console, hardware
 
-- **CPU is the host CPU.** `IsProcessorFeaturePresent` answers from host
-  CPUID; cycle/perf counters follow the host clock.
-- **Memory size is configurable, default 512 MiB** (`--memory=8G` /
-  `WINRUN_MEMORY`). It changes what the guest *reports*, not a real cap.
-- **Clock is the host clock.** No virtualized time; sleeps/timers use host
-  waits.
-- **Console is the host terminal** (or pipes). Window size defaults to 80×25
-  and follows resizes in controlled sessions. `GetConsoleMode`/`SetConsoleMode`
-  fail with `ERROR_INVALID_HANDLE` on redirected handles, as on Windows.
-- **Crash exit codes** surface the Windows exception code (e.g. `0xC0000005`)
-  with a stderr note, so nested crashes (node under cmd under npm) are visible.
+- **Host CPU, host clock.** CPUID/timers answer from the host; no virtual time.
+- **Memory size is reported, not enforced.** Default 512 MiB (`--memory=8G`).
+- **Host terminal** (or pipes), 80×25 default. Console-mode calls fail on
+  redirected handles, as on Windows.
+- **Crashes exit with the Windows exception code** (`0xC0000005`) + stderr note.
 
 ## Networking and crypto
 
-- **Traffic goes through the host stack.** There is no virtual NIC; Winsock
-  maps onto host sockets with Winsock error semantics.
-- **Trust comes from the guest ROOT store** (seeded from the pinned Mozilla
-  bundle), not the host CA files. Revocation is not checked.
-- Hostname, interface list, and proxy env visible to the guest reflect the host.
+- **Host stack, no virtual NIC.** Winsock maps to host sockets with Winsock errors.
+- **Guest ROOT store** (pinned Mozilla bundle), not host CAs. No revocation checks.
+- Hostname, interfaces, and proxy env leak through from the host.
 
-## Error behavior (deliberately strict)
+## Errors (deliberately strict)
 
-- Unknown programs: `winrun` exits `1` ("nothing to run …"); unsupported file
-  types: exit `2`.
-- Unsupported guest APIs fail loudly with `executable: DLL!API` naming —
-  Windows would run them, Win-Runner stops at them. That list is the roadmap
-  (see `docs/compatibility.md`).
-- `WINRUN_NATIVE_STRICT_IMPORTS=1` turns missing imports into a pre-execution
-  error instead of failing at first call.
+- Unknown target → exit `1`; unsupported file type → exit `2`.
+- Unsupported APIs fail as `executable: DLL!API` — that list is the roadmap.
+- `WINRUN_NATIVE_STRICT_IMPORTS=1` refuses upfront instead of at first call.
 
 ## Reading test results
 
-A passing Win-Runner run means "behaves like Windows *for the APIs this
-program uses*". For fidelity disputes, the oracle suite (`tests/oracle/`,
-`tests/oracle_native.rs`) records real-Windows behavior probe by probe and
-compares field by field — start there before assuming either side is right.
+Passing = "like Windows *for the APIs this program uses*". For disputes, the oracle
+suite records real-Windows behavior probe by probe — start there.
