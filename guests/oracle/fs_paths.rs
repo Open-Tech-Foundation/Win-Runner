@@ -144,6 +144,9 @@ fn run() {
     find("find.question", "O?e.txt");
     find("find.nomatch", "nomatch*");
     find("find.missing_dir", "missing\\*");
+    find("find.star_dot_star", "*.*");
+    find("find.dot_star_no_ext", "Sub Dir.*");
+    find("find.trailing_dot", "*.");
 
     // ---- other queries ----
     long_path("long.case", "sub dir\\TWO.TXT");

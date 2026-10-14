@@ -63,7 +63,22 @@ fn native_find_parts(pattern: &str) -> (String, String) {
     };
     (parent, leaf.to_string())
 }
+/// Whether a file name matches a FindFirstFile pattern, with the DOS
+/// rules Windows applies: a trailing `.*` also matches a name without an
+/// extension (`*.*` matches everything, `foo.*` matches `foo`), and a
+/// trailing `.` matches only names without one.
 fn native_name_matches_pattern(pattern: &str, name: &str) -> bool {
+    if let Some(stem) = pattern.strip_suffix(".*") {
+        if !name.contains('.') && wildcard_matches(stem, name) {
+            return true;
+        }
+    } else if let Some(stem) = pattern.strip_suffix('.').filter(|stem| !stem.is_empty() && !stem.ends_with('.')) {
+        return !name.contains('.') && wildcard_matches(stem, name);
+    }
+    wildcard_matches(pattern, name)
+}
+
+fn wildcard_matches(pattern: &str, name: &str) -> bool {
     let pattern = pattern.to_lowercase().chars().collect::<Vec<_>>();
     let name = name.to_lowercase().chars().collect::<Vec<_>>();
     let mut previous = vec![false; name.len() + 1];
@@ -332,5 +347,23 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_set_file_time(
             native_set_last_error(5);
             0
         }
+    }
+}
+
+#[cfg(test)]
+mod pattern_tests {
+    use super::native_name_matches_pattern as matches;
+
+    #[test]
+    fn dos_patterns_match_names_without_extensions() {
+        assert!(matches("*.*", "encodings"), "*.* matches every name");
+        assert!(matches("*.*", "one.txt"));
+        assert!(matches("Sub Dir.*", "sub dir"));
+        assert!(matches("one.*", "one.txt"));
+        assert!(!matches("one.*", "onetwo"));
+        assert!(matches("*.", "Makefile"), "a trailing dot matches names without one");
+        assert!(!matches("*.", "one.txt"));
+        assert!(matches("O?e.txt", "one.txt"));
+        assert!(!matches("*.txt", "readme"));
     }
 }

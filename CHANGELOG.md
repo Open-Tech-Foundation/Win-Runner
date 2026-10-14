@@ -37,6 +37,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- `FindFirstFileW` applies Windows' DOS pattern rules: `*.*` matches every
+  name (directories without a dot included) and `name.*` matches `name`, so
+  programs listing with `*.*` (CPython's `os.listdir`) see every entry.
+  The `fs_paths` oracle covers it.
+
 - The `apc_io` oracle accepts both outcomes Windows documents for an
   overlapped read at end of file (an immediate `ERROR_HANDLE_EOF`, or a
   queued completion carrying it), and counts each callback relative to the
