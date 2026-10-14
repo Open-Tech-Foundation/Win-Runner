@@ -1499,11 +1499,16 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "FillConsoleOutputCharacterW" => {
             Some(native_fill_console_output_character_w as *const () as usize as u64)
         }
+        "ScrollConsoleScreenBufferW" => {
+            Some(native_scroll_console_screen_buffer_w as *const () as usize as u64)
+        }
         "GetErrorMode" => Some(native_get_error_mode as *const () as usize as u64),
         "SetErrorMode" => Some(native_set_error_mode as *const () as usize as u64),
         "GetStartupInfoW" => Some(native_get_startup_info_w as *const () as usize as u64),
         "GetStartupInfoA" => Some(native_get_startup_info_a as *const () as usize as u64),
         "GetVersion" => Some(native_get_version as *const () as usize as u64),
+        "GetVersionExW" => Some(native_get_version_ex_w as *const () as usize as u64),
+        "GetVersionExA" => Some(native_get_version_ex_a as *const () as usize as u64),
         "GetSystemDirectoryW" => Some(native_get_system_directory_w as *const () as usize as u64),
         "lstrlenW" => Some(native_lstrlen_w as *const () as usize as u64),
         "lstrcpyW" => Some(native_lstrcpy_w as *const () as usize as u64),

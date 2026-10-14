@@ -162,9 +162,66 @@ pub(super) extern "win64" fn native_get_adapters_addresses(
     0
 }
 
+/// The version `GetVersion`/`GetVersionEx` report for a program with this
+/// manifest: the real one only to a program declaring Windows 10 support,
+/// 6.3 (build 9600) to one declaring 8.1, and 6.2 (build 9200) otherwise.
+fn version_for_manifest(manifest: Option<&str>) -> (u32, u32, u32) {
+    const WINDOWS_10: &str = "8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a";
+    const WINDOWS_8_1: &str = "1f676c76-80e1-4239-95bb-83d0f6d0da78";
+    let manifest = manifest.unwrap_or_default().to_ascii_lowercase();
+    if manifest.contains(WINDOWS_10) {
+        (10, 0, system_profile::OS_BUILD_NUMBER)
+    } else if manifest.contains(WINDOWS_8_1) {
+        (6, 3, 9600)
+    } else {
+        (6, 2, 9200)
+    }
+}
+
+/// The program's reported version, from its manifest (read once).
+fn reported_version() -> (u32, u32, u32) {
+    static VERSION: std::sync::OnceLock<(u32, u32, u32)> = std::sync::OnceLock::new();
+    *VERSION.get_or_init(|| version_for_manifest(main_manifest().as_deref()))
+}
+
 pub(super) extern "win64" fn native_get_version() -> u32 {
-    // Windows 10.0, build 19045, encoded using the legacy GetVersion layout.
-    (system_profile::OS_BUILD_NUMBER << 16) | 0x0a00
+    // The legacy layout: build in the high word, minor then major below.
+    let (major, minor, build) = reported_version();
+    (build << 16) | (minor << 8) | major
+}
+
+/// `GetVersionExA/W` into OSVERSIONINFO(EX)A/W. `char_size` is 1 or 2;
+/// the CSD string (128 characters) is empty, as on current Windows.
+fn get_version_ex(info: *mut u8, char_size: usize) -> i32 {
+    let basic = 20 + 128 * char_size;
+    let extended = basic + 8;
+    let size = if info.is_null() { 0 } else { (unsafe { (info as *const u32).read_unaligned() }) as usize };
+    if size != basic && size != extended {
+        native_set_last_error(122); // ERROR_INSUFFICIENT_BUFFER
+        return 0;
+    }
+    let (major, minor, build) = reported_version();
+    unsafe {
+        std::ptr::write_bytes(info.add(4), 0, size - 4);
+        (info.add(4) as *mut u32).write_unaligned(major);
+        (info.add(8) as *mut u32).write_unaligned(minor);
+        (info.add(12) as *mut u32).write_unaligned(build);
+        (info.add(16) as *mut u32).write_unaligned(2); // VER_PLATFORM_WIN32_NT
+        if size == extended {
+            // No service pack; a single-user workstation (Windows 10 Pro).
+            (info.add(basic + 4) as *mut u16).write_unaligned(0x100); // VER_SUITE_SINGLEUSERTS
+            info.add(basic + 6).write(1); // VER_NT_WORKSTATION
+        }
+    }
+    1
+}
+
+pub(super) extern "win64" fn native_get_version_ex_w(info: *mut u8) -> i32 {
+    get_version_ex(info, 2)
+}
+
+pub(super) extern "win64" fn native_get_version_ex_a(info: *mut u8) -> i32 {
+    get_version_ex(info, 1)
 }
 pub(super) extern "win64" fn native_set_file_apis_to_oem() {}
 pub(super) extern "win64" fn native_co_initialize(_reserved: *mut u8) -> i32 {
@@ -504,3 +561,18 @@ pub(super) extern "win64" fn native_is_debugger_present() -> i32 {
 
 /// Debug output goes to an attached debugger; there is none.
 pub(super) extern "win64" fn native_output_debug_string(_text: u64) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_manifest_decides_the_reported_version() {
+        let ten = r#"<compatibility><application><supportedOS Id="{8E0F7A12-BFB3-4FE8-B9A5-48FD50A15A9A}"/></application></compatibility>"#;
+        assert_eq!(version_for_manifest(Some(ten)), (10, 0, system_profile::OS_BUILD_NUMBER));
+        let eight_one = r#"<supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}"/>"#;
+        assert_eq!(version_for_manifest(Some(eight_one)), (6, 3, 9600));
+        assert_eq!(version_for_manifest(Some("<assembly/>")), (6, 2, 9200));
+        assert_eq!(version_for_manifest(None), (6, 2, 9200));
+    }
+}

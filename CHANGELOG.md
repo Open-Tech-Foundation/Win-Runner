@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- `GetVersionExA/W`, and `GetVersion`/`GetVersionEx` report the version a
+  program's manifest asks for, as Windows does: 10.0 to a program declaring
+  Windows 10 support (Python's interactive prompt now starts), 6.3 build
+  9600 for Windows 8.1, and 6.2 build 9200 otherwise. The `native_startup`
+  oracle checks the unmanifested case.
+- `ScrollConsoleScreenBufferW` for full-width vertical moves (mapped to the
+  terminal's scroll region), so Python 3.14's new REPL (pyrepl) runs; other
+  moves report `ERROR_NOT_SUPPORTED`.
+
 - The `native_startup` oracle checks a certificate chain under an engine
   whose exclusive root store holds the certificate, replacing a case that
   chained the machine's first ROOT certificate (which differs per machine:

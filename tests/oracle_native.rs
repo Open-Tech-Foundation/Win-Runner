@@ -183,7 +183,7 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
                 "cert.pending_close: ok", "cert.copy_survives_close: ok", "cert.free: ok",
                 "live.before_exit: ok", "live.parent_remove: ok", "live.no_final_replay: ok",
                 // Recorded from Windows by the oracle CI.
-                "rtl.nt_version: 10.0 high=0xf", "perf.info: cb=104 page=4096 consistent",
+                "rtl.nt_version: 10.0 high=0xf", "version.legacy: 6.2 build=9200", "version.ex_w: 6.2.9200 platform=2 csd=empty sp=0.0", "version.ex_a: 6.2.9200 platform=2 csd=empty", "perf.info: cb=104 page=4096 consistent",
                 "perf.info_small: ret=0 err=24", "known_folder.local_app_data: hr=0x0 path=profile\\AppData\\Local",
                 "known_folder.unknown: hr=0x80070002 path=null", "resource.missing_manifest: ret=0 err=1812",
                 "handle_info.inherited: flags=1", "taskkill.tree: exit=0 child=ended code=1", "taskkill.again: exit=128",

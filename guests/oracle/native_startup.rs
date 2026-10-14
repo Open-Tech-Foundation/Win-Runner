@@ -1183,6 +1183,63 @@ fn system_info() {
         out_byte(b'\n');
     }
 
+    // This probe has no manifest, so the version APIs that honor one
+    // report Windows 8 (6.2, build 9200) whatever the machine runs.
+    type Version = unsafe extern "system" fn() -> u32;
+    type VersionEx = unsafe extern "system" fn(*mut u8) -> i32;
+    let legacy = proc(b"kernel32.dll\0", b"GetVersion\0");
+    let ex_w = proc(b"kernel32.dll\0", b"GetVersionExW\0");
+    let ex_a = proc(b"kernel32.dll\0", b"GetVersionExA\0");
+    if legacy == 0 {
+        unavailable("version.legacy");
+    } else {
+        let packed = unsafe { core::mem::transmute::<usize, Version>(legacy)() };
+        case("version.legacy");
+        out_dec((packed & 0xff) as u64);
+        out_byte(b'.');
+        out_dec((packed >> 8 & 0xff) as u64);
+        out_str(" build=");
+        out_dec((packed >> 16) as u64);
+        out_byte(b'\n');
+    }
+    let report_ex = |name: &str, function: usize, size: u32, csd: usize| {
+        if function == 0 {
+            unavailable(name);
+            return;
+        }
+        let mut info = [0xccu8; 284];
+        info[..4].copy_from_slice(&size.to_le_bytes());
+        clear_error();
+        let ok = unsafe { core::mem::transmute::<usize, VersionEx>(function)(info.as_mut_ptr()) };
+        case(name);
+        if ok == 0 {
+            out_str("failed");
+            out_error();
+            out_byte(b'\n');
+            return;
+        }
+        let field = |offset: usize| u32::from_le_bytes([info[offset], info[offset + 1], info[offset + 2], info[offset + 3]]);
+        out_dec(field(4) as u64);
+        out_byte(b'.');
+        out_dec(field(8) as u64);
+        out_byte(b'.');
+        out_dec(field(12) as u64);
+        out_str(" platform=");
+        out_dec(field(16) as u64);
+        out_str(if info[20] == 0 && info[20 + csd - 1] == 0 { " csd=empty" } else { " csd=set" });
+        if size as usize > 20 + 128 * csd {
+            let extra = 20 + 128 * csd;
+            out_str(" sp=");
+            out_dec(info[extra] as u64);
+            out_byte(b'.');
+            out_dec(info[extra + 2] as u64);
+        }
+        out_byte(b'\n');
+    };
+    report_ex("version.ex_w", ex_w, 284, 2);
+    report_ex("version.ex_a", ex_a, 148, 1);
+    report_ex("version.ex_bad_size", ex_w, 0, 2);
+
     let performance = api!("perf.info_api", "K32GetPerformanceInfo", Performance);
     let mut info = [0u64; 13];
     let ok = unsafe { performance(info.as_mut_ptr().cast(), 104) } != 0;

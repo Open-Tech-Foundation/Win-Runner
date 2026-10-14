@@ -1266,6 +1266,118 @@ pub(super) extern "win64" fn native_fill_console_output_character_w(
     1
 }
 
+/// How a `ScrollConsoleScreenBuffer` move maps onto the terminal: the
+/// rows of a VT scroll region (0-based, inclusive) and the lines to scroll
+/// them up (`true`) or down. `Ok(None)` when nothing moves. A full-width
+/// region moving vertically is a scroll; anything else would need the
+/// buffer's contents, which the terminal does not give back.
+fn scroll_plan(
+    (columns, rows): (i32, i32),
+    (left, top, right, bottom): (i32, i32, i32, i32),
+    clip: Option<(i32, i32, i32, i32)>,
+    (x, y): (i32, i32),
+) -> Result<Option<(i32, i32, bool, i32)>, u32> {
+    const ERROR_NOT_SUPPORTED: u32 = 50;
+    let top = top.max(0);
+    let bottom = bottom.min(rows - 1);
+    if top > bottom || left > right {
+        return Err(87);
+    }
+    let (clip_top, clip_bottom) = match clip {
+        Some((clip_left, clip_top, clip_right, clip_bottom)) => {
+            if clip_left > 0 || clip_right < columns - 1 {
+                return Err(ERROR_NOT_SUPPORTED);
+            }
+            (clip_top.max(0), clip_bottom.min(rows - 1))
+        }
+        None => (0, rows - 1),
+    };
+    if left > 0 || right < columns - 1 || x != 0 {
+        return Err(ERROR_NOT_SUPPORTED);
+    }
+    let height = bottom - top + 1;
+    if y == top {
+        return Ok(None);
+    }
+    let plan = if y < top {
+        // Up: rows y..bottom shift up by top - y; the source's tail blanks.
+        (y.max(0), bottom, true, top - y)
+    } else {
+        // Down: rows top..y+height-1 shift down; the source's head blanks.
+        (top, (y + height - 1).min(rows - 1), false, y - top)
+    };
+    let (start, end) = (plan.0.max(clip_top), plan.1.min(clip_bottom));
+    if start > end {
+        return Ok(None);
+    }
+    Ok(Some((start, end, plan.2, plan.3.min(end - start + 1))))
+}
+
+/// `ScrollConsoleScreenBufferW`: move a block of the screen, filling what
+/// it uncovers with the fill character (a full-width vertical move; see
+/// [`scroll_plan`]). The cursor stays where it was.
+pub(super) extern "win64" fn native_scroll_console_screen_buffer_w(
+    handle: u64,
+    scroll: *const i16,
+    clip: *const i16,
+    destination: u32,
+    fill: *const u16,
+) -> i32 {
+    let Some(fd @ (1 | 2)) = console_fd(handle) else {
+        native_set_last_error(6);
+        return 0;
+    };
+    if scroll.is_null() || fill.is_null() {
+        native_set_last_error(998);
+        return 0;
+    }
+    let rect = |pointer: *const i16| unsafe {
+        (
+            i32::from(pointer.read_unaligned()),
+            i32::from(pointer.add(1).read_unaligned()),
+            i32::from(pointer.add(2).read_unaligned()),
+            i32::from(pointer.add(3).read_unaligned()),
+        )
+    };
+    let (columns, rows) = crate::control::terminal_size();
+    let size = (columns.min(i16::MAX as usize) as i32, rows.min(i16::MAX as usize) as i32);
+    let target = (i32::from(destination as u16 as i16), i32::from((destination >> 16) as u16 as i16));
+    let clip = (!clip.is_null()).then(|| rect(clip));
+    let plan = match scroll_plan(size, rect(scroll), clip, target) {
+        Ok(Some(plan)) => plan,
+        Ok(None) => return 1,
+        Err(code) => {
+            native_set_last_error(code);
+            return 0;
+        }
+    };
+    let (start, end, up, lines) = plan;
+    let sequence = format!(
+        "\x1b7\x1b[{};{}r\x1b[{lines}{}\x1b[r\x1b8",
+        start + 1,
+        end + 1,
+        if up { 'S' } else { 'T' }
+    );
+    if unsafe { write(fd, sequence.as_ptr().cast(), sequence.len()) } != sequence.len() as isize {
+        native_set_last_error(5);
+        return 0;
+    }
+    // The terminal blanks the uncovered rows; another fill character is
+    // written over them.
+    let character = unsafe { fill.read_unaligned() };
+    if character != u16::from(b' ') {
+        let first = if up { end - lines + 1 } else { start };
+        native_fill_console_output_character_w(
+            handle,
+            character,
+            (lines * size.0) as u32,
+            (first as u32) << 16,
+            std::ptr::null_mut(),
+        );
+    }
+    1
+}
+
 pub(super) extern "win64" fn native_set_console_text_attribute(
     handle: u64,
     attributes: u16,
@@ -1283,6 +1395,22 @@ pub(super) extern "win64" fn native_set_console_text_attribute(
 
 #[cfg(test)]
 mod flush_tests {
+
+    #[test]
+    fn full_width_vertical_moves_become_terminal_scrolls() {
+        let screen = (80, 25);
+        // pyrepl's scroll: rows 3..24 to the top (scroll up 3).
+        assert_eq!(scroll_plan(screen, (0, 3, 79, 24), None, (0, 0)), Ok(Some((0, 24, true, 3))));
+        // Down by 2 within rows 5..10 (rows 5..12 take part).
+        assert_eq!(scroll_plan(screen, (0, 5, 79, 10), None, (0, 7)), Ok(Some((5, 12, false, 2))));
+        // A clip rectangle bounds the rows that change.
+        assert_eq!(scroll_plan(screen, (0, 3, 79, 24), Some((0, 0, 79, 9)), (0, 0)), Ok(Some((0, 9, true, 3))));
+        assert_eq!(scroll_plan(screen, (0, 4, 79, 8), None, (0, 4)), Ok(None), "no movement");
+        assert_eq!(scroll_plan(screen, (2, 0, 10, 5), None, (0, 0)), Err(50), "part of a row");
+        assert_eq!(scroll_plan(screen, (0, 0, 79, 5), None, (3, 0)), Err(50), "sideways");
+        assert_eq!(scroll_plan(screen, (0, 9, 79, 2), None, (0, 0)), Err(87), "empty rectangle");
+    }
+
     use super::*;
     #[test]
     fn flush_discards_pending_input_without_changing_console_mode() {

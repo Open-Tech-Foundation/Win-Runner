@@ -107,16 +107,24 @@ fn entries(root: u64, directory: u64) -> Vec<(Key, u32)> {
 }
 
 fn find(module: u64, kind: Option<Key>, name: Option<Key>, language: Option<u16>) -> u64 {
-    let fail = |code| {
-        native_set_last_error(code);
-        0
-    };
     let Some(base) = image_base(module) else {
-        return fail(ERROR_RESOURCE_DATA_NOT_FOUND);
+        native_set_last_error(ERROR_RESOURCE_DATA_NOT_FOUND);
+        return 0;
     };
     let (Some(kind), Some(name)) = (kind, name) else {
-        return fail(87);
+        native_set_last_error(87);
+        return 0;
     };
+    locate(base, &kind, &name, language).unwrap_or_else(|code| {
+        native_set_last_error(code);
+        0
+    })
+}
+
+/// The data entry of a resource in the image at `base`, or the error
+/// FindResource reports.
+fn locate(base: u64, kind: &Key, name: &Key, language: Option<u16>) -> Result<u64, u32> {
+    let fail = Err;
     let root = resource_root(base);
     if root == 0 {
         return fail(ERROR_RESOURCE_DATA_NOT_FOUND);
@@ -127,10 +135,10 @@ fn find(module: u64, kind: Option<Key>, name: Option<Key>, language: Option<u16>
             .find(|(entry, offset)| entry == key && offset & 0x8000_0000 != 0)
             .map(|(_, offset)| root + u64::from(offset & 0x7fff_ffff))
     };
-    let Some(types) = subdirectory(root, &kind) else {
+    let Some(types) = subdirectory(root, kind) else {
         return fail(ERROR_RESOURCE_TYPE_NOT_FOUND);
     };
-    let Some(names) = subdirectory(types, &name) else {
+    let Some(names) = subdirectory(types, name) else {
         return fail(ERROR_RESOURCE_NAME_NOT_FOUND);
     };
     let languages = entries(root, names);
@@ -139,9 +147,19 @@ fn find(module: u64, kind: Option<Key>, name: Option<Key>, language: Option<u16>
         None => languages.first(),
     };
     match chosen {
-        Some((_, offset)) if offset & 0x8000_0000 == 0 => root + u64::from(*offset),
+        Some((_, offset)) if offset & 0x8000_0000 == 0 => Ok(root + u64::from(*offset)),
         _ => fail(ERROR_RESOURCE_LANG_NOT_FOUND),
     }
+}
+
+/// The main program's application manifest (`RT_MANIFEST`, ID 1), as text.
+pub(super) fn main_manifest() -> Option<String> {
+    const RT_MANIFEST: u16 = 24;
+    let base = process_ctx()?.image_base;
+    let entry = locate(base, &Key::Id(RT_MANIFEST), &Key::Id(1), None).ok()?;
+    let (offset, size) = unsafe { (read_u32(entry), read_u32(entry + 4)) };
+    let bytes = unsafe { std::slice::from_raw_parts((base + u64::from(offset)) as *const u8, size as usize) };
+    Some(String::from_utf8_lossy(bytes).into_owned())
 }
 
 pub(super) extern "win64" fn native_find_resource_a(module: u64, name: u64, kind: u64) -> u64 {
