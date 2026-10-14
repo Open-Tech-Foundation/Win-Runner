@@ -433,7 +433,7 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_set_file_informatio
             let field = |offset: usize| unsafe { information.add(offset).cast::<i64>().read_unaligned() };
             let attributes = unsafe { information.add(32).cast::<u32>().read_unaligned() };
             let mut metadata = ctx.fs.file_metadata(&path);
-            let mut set_time = |slot: &mut u64, value: i64| {
+            let set_time = |slot: &mut u64, value: i64| {
                 if value > 0 {
                     *slot = value as u64;
                 }

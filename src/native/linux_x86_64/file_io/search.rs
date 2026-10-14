@@ -48,6 +48,21 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_get_full_path_name_
     }
     (encoded.len() - 1) as u32
 }
+/// `RtlGetFullPathName_U(name, size_in_bytes, buffer, file_part)`:
+/// `GetFullPathNameW` in bytes. The result is the path's length in bytes
+/// without the terminator, or, when the buffer is too small, the bytes
+/// needed with it; 0 on failure.
+pub(in crate::native::linux_x86_64) extern "win64" fn native_rtl_get_full_path_name_u(
+    name: *const u16,
+    size: u32,
+    buffer: *mut u16,
+    file_part: *mut *mut u16,
+) -> u32 {
+    // GetFullPathNameW already counts the terminator only when the buffer
+    // is too small.
+    native_get_full_path_name_w(name, size / 2, buffer, file_part) * 2
+}
+
 fn native_find_parts(pattern: &str) -> (String, String) {
     let path = pattern
         .strip_prefix(r"\\?\")
@@ -353,6 +368,19 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_set_file_time(
 #[cfg(test)]
 mod pattern_tests {
     use super::native_name_matches_pattern as matches;
+
+    #[test]
+    fn rtl_full_path_names_count_bytes() {
+        let name: Vec<u16> = r"C:\dir\file.txt".encode_utf16().chain(Some(0)).collect();
+        let mut buffer = [0u16; 64];
+        let mut part = std::ptr::null_mut();
+        let bytes = super::native_rtl_get_full_path_name_u(name.as_ptr(), 128, buffer.as_mut_ptr(), &mut part);
+        assert_eq!(bytes, 30, "15 characters, no terminator");
+        assert_eq!(String::from_utf16_lossy(&buffer[..15]), r"C:\dir\file.txt");
+        assert_eq!(unsafe { part.offset_from(buffer.as_ptr()) }, 7, "the file part");
+        let mut small = [0u16; 4];
+        assert_eq!(super::native_rtl_get_full_path_name_u(name.as_ptr(), 8, small.as_mut_ptr(), &mut part), 32, "bytes needed, terminator included");
+    }
 
     #[test]
     fn dos_patterns_match_names_without_extensions() {

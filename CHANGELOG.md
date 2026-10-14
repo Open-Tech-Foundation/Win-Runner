@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- The npm-packaged tools run: `CommandLineToArgvW`, `combase.dll`'s COM
+  memory and GUID functions (biome), and for opencode (a Bun executable)
+  `timeBeginPeriod`/`timeEndPeriod`, `RtlGetFullPathName_U`,
+  `NtQueryObject` (`ObjectBasicInformation`, and `ObjectNameInformation`
+  giving a file's NT path), and `GetConsoleTitleA/W`. `SetConsoleTitleW`
+  now keeps the title and shows it in the terminal (OSC 0).
+
 - wpkg installs npm tarballs (`.tgz`/`.tar.gz` package URLs), so tools
   npm ships as prebuilt Windows binaries install without npm:
   `wpkg install opencode`, `wpkg install esbuild`, `wpkg install biome`

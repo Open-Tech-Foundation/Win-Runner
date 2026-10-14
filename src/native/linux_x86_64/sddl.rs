@@ -215,7 +215,7 @@ pub(super) fn security_descriptor(text: &str) -> Result<Vec<u8>, u32> {
     }
     let mut out = vec![0u8; 20];
     out[0] = 1;
-    let mut place = |out: &mut Vec<u8>, data: Option<Vec<u8>>, offset_at: usize| {
+    let place = |out: &mut Vec<u8>, data: Option<Vec<u8>>, offset_at: usize| {
         if let Some(data) = data {
             let offset = out.len() as u32;
             out.extend_from_slice(&data);

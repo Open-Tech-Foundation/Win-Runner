@@ -436,7 +436,7 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
             | "CertFreeCertificateChainEngine" | "CertSetCertificateContextProperty"
             | "CertCreateCertificateContext" | "CertAddStoreToCollection"),
         "PSAPI.DLL" => matches!(func, "GetProcessMemoryInfo" | "GetPerformanceInfo"),
-        "WINMM.DLL" => func == "timeGetTime",
+        "WINMM.DLL" => matches!(func, "timeGetTime" | "timeBeginPeriod" | "timeEndPeriod"),
         "USERENV.DLL" => func == "GetUserProfileDirectoryW",
         "BCRYPTPRIMITIVES.DLL" => func == "ProcessPrng",
         "BCRYPT.DLL" => func == "BCryptGenRandom",
@@ -453,7 +453,21 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                 | "IIDFromString"
                 | "StringFromGUID2"
         ),
-        "SHELL32.DLL" => matches!(func, "SHGetFolderPathW" | "SHGetKnownFolderPath"),
+        "SHELL32.DLL" => matches!(func, "SHGetFolderPathW" | "SHGetKnownFolderPath" | "CommandLineToArgvW"),
+        // combase.dll exports the COM runtime that ole32 forwards to.
+        "COMBASE.DLL" => matches!(
+            func,
+            "CoInitialize"
+                | "CoInitializeEx"
+                | "CoUninitialize"
+                | "CoTaskMemAlloc"
+                | "CoTaskMemFree"
+                | "CoCreateGuid"
+                | "CoGetContextToken"
+                | "CLSIDFromString"
+                | "IIDFromString"
+                | "StringFromGUID2"
+        ),
         "OLEAUT32.DLL" => matches!(func, "GetErrorInfo" | "SetErrorInfo"),
         "RPCRT4.DLL" => matches!(func, "UuidCreate" | "UuidCreateSequential"),
         "SHLWAPI.DLL" => matches!(func, "StrStrW" | "StrStrIW"),
@@ -585,7 +599,9 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
         "IPHLPAPI.DLL" => func == "GetAdaptersAddresses",
         "NTDLL.DLL" => matches!(
             func,
-            "RtlAddFunctionTable"
+            "RtlGetFullPathName_U"
+                | "NtQueryObject"
+                | "RtlAddFunctionTable"
                 | "__C_specific_handler"
                 | "RtlCaptureContext"
                 | "RtlDeleteFunctionTable"
@@ -962,6 +978,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "CLSIDFromString" => Some(native_clsid_from_string as *const () as usize as u64),
         "UuidCreate" => Some(native_uuid_create as *const () as usize as u64),
         "StrStrW" => Some(native_str_str_w as *const () as usize as u64),
+        "CommandLineToArgvW" => Some(native_command_line_to_argv_w as *const () as usize as u64),
         "StrStrIW" => Some(native_str_str_i_w as *const () as usize as u64),
         "UuidCreateSequential" => Some(native_uuid_create_sequential as *const () as usize as u64),
         "IIDFromString" => Some(native_iid_from_string as *const () as usize as u64),
@@ -1622,6 +1639,8 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
             Some(native_get_dynamic_time_zone_information as *const () as usize as u64)
         }
         "timeGetTime" => Some(native_time_get_time as *const () as usize as u64),
+        "timeBeginPeriod" => Some(native_time_begin_period as *const () as usize as u64),
+        "timeEndPeriod" => Some(native_time_end_period as *const () as usize as u64),
         "GlobalMemoryStatusEx" => Some(native_global_memory_status_ex as *const () as usize as u64),
         "GetPerformanceInfo" | "K32GetPerformanceInfo" => {
             Some(native_get_performance_info as *const () as usize as u64)
@@ -1682,6 +1701,8 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         }
         "RtlGetVersion" => Some(native_rtl_get_version as *const () as usize as u64),
         "RtlGetNtVersionNumbers" => Some(native_rtl_get_nt_version_numbers as *const () as usize as u64),
+        "RtlGetFullPathName_U" => Some(native_rtl_get_full_path_name_u as *const () as usize as u64),
+        "NtQueryObject" => Some(native_nt_query_object as *const () as usize as u64),
         "NtReadFile" => Some(native_nt_read_file as *const () as usize as u64),
         "NtWriteFile" => Some(native_nt_write_file as *const () as usize as u64),
         "RtlNtStatusToDosError" => {
@@ -1799,6 +1820,8 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         }
         "SetConsoleMode" => Some(native_set_console_mode as *const () as usize as u64),
         "SetConsoleTitleW" => Some(native_set_console_title_w as *const () as usize as u64),
+        "GetConsoleTitleW" => Some(native_get_console_title_w as *const () as usize as u64),
+        "GetConsoleTitleA" => Some(native_get_console_title_a as *const () as usize as u64),
         "GetLogicalProcessorInformation" => {
             Some(native_get_logical_processor_information as *const () as usize as u64)
         }

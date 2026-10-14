@@ -176,12 +176,64 @@ pub(super) extern "win64" fn native_set_console_active_screen_buffer(handle: u64
         0
     }
 }
+/// The console title, once a program sets one.
+static CONSOLE_TITLE: Mutex<Option<Vec<u16>>> = Mutex::new(None);
+
+/// The title: the one last set, else the program's path (the title Windows
+/// gives a console it creates for a program).
+fn console_title() -> Vec<u16> {
+    if let Some(title) = CONSOLE_TITLE.lock().ok().and_then(|title| title.clone()) {
+        return title;
+    }
+    let mut path = [0u16; 1024];
+    let length = native_get_module_file_name_w(0, path.as_mut_ptr(), path.len() as u32) as usize;
+    path[..length].to_vec()
+}
+
 pub(super) extern "win64" fn native_set_console_title_w(title: *const u16) -> i32 {
-    if title.is_null() {
+    let Some(text) = wide(title) else {
+        native_set_last_error(87);
+        return 0;
+    };
+    if let Ok(mut stored) = CONSOLE_TITLE.lock() {
+        *stored = Some(text.encode_utf16().collect());
+    }
+    // A console window shows its title; a terminal shows it through OSC 0.
+    if unsafe { libc::isatty(1) } == 1 {
+        let sequence = format!("\x1b]0;{}\x07", text.replace(['\x07', '\x1b'], ""));
+        unsafe { write(1, sequence.as_ptr().cast(), sequence.len()) };
+    }
+    1
+}
+
+/// `GetConsoleTitleW`: the title's length in characters, copied (cut to
+/// fit, NUL-terminated) into the buffer.
+pub(super) extern "win64" fn native_get_console_title_w(output: *mut u16, size: u32) -> u32 {
+    if output.is_null() || size == 0 {
         native_set_last_error(87);
         return 0;
     }
-    1
+    let title = console_title();
+    let copied = title.len().min(size as usize - 1);
+    unsafe {
+        output.copy_from_nonoverlapping(title.as_ptr(), copied);
+        output.add(copied).write(0);
+    }
+    title.len() as u32
+}
+
+pub(super) extern "win64" fn native_get_console_title_a(output: *mut u8, size: u32) -> u32 {
+    if output.is_null() || size == 0 {
+        native_set_last_error(87);
+        return 0;
+    }
+    let title: Vec<u8> = String::from_utf16_lossy(&console_title()).bytes().collect();
+    let copied = title.len().min(size as usize - 1);
+    unsafe {
+        output.copy_from_nonoverlapping(title.as_ptr(), copied);
+        output.add(copied).write(0);
+    }
+    title.len() as u32
 }
 
 pub(super) extern "win64" fn native_write_console_w(

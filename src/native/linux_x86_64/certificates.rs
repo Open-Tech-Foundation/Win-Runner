@@ -23,7 +23,6 @@ struct Certificate {
 struct Lease {
     certificate: Arc<Certificate>,
     references: usize,
-    index: usize,
 }
 #[derive(Default)]
 struct Stores {
@@ -632,7 +631,6 @@ pub(super) extern "win64" fn native_cert_enum_certificates(store: u64, previous:
     let lease = stores.contexts.entry(pointer).or_insert(Lease {
         certificate,
         references: 0,
-        index,
     });
     lease.references += 1;
     pointer
@@ -695,7 +693,7 @@ pub(super) extern "win64" fn native_cert_add_encoded_certificate_to_store(
     if !context.is_null() {
         let certificate = Arc::clone(&stores.stores[&store][index]);
         let pointer = &*certificate.context as *const CertContext as u64;
-        let lease = stores.contexts.entry(pointer).or_insert(Lease { certificate, references: 0, index });
+        let lease = stores.contexts.entry(pointer).or_insert(Lease { certificate, references: 0 });
         lease.references += 1;
         unsafe { context.write(pointer) };
     }

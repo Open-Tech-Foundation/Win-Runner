@@ -1450,3 +1450,4 @@ mod nt_object_wait_tests {
         native_close_handle(event);
     }
 }
+

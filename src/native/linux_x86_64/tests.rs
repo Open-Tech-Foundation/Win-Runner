@@ -7456,6 +7456,28 @@ mod protection_tests {
     }
 
     #[test]
+    fn console_titles_read_back_what_was_set() {
+        let title: Vec<u16> = "winrun test title".encode_utf16().chain(Some(0)).collect();
+        assert_eq!(crate::native::linux_x86_64::native_set_console_title_w(title.as_ptr()), 1);
+        let mut output = [0u16; 64];
+        assert_eq!(crate::native::linux_x86_64::native_get_console_title_w(output.as_mut_ptr(), 64), 17);
+        assert_eq!(String::from_utf16_lossy(&output[..17]), "winrun test title");
+        let mut short = [0u16; 6];
+        assert_eq!(crate::native::linux_x86_64::native_get_console_title_w(short.as_mut_ptr(), 6), 17, "the full length, cut to fit");
+        assert_eq!(String::from_utf16_lossy(&short[..5]), "winru");
+        assert_eq!(short[5], 0);
+        let mut ansi = [0u8; 64];
+        assert_eq!(crate::native::linux_x86_64::native_get_console_title_a(ansi.as_mut_ptr(), 64), 17);
+    }
+
+    #[test]
+    fn nt_query_object_rejects_unknown_handles_and_classes() {
+        let mut info = [0u8; 64];
+        let mut returned = 0u32;
+        assert_eq!(crate::native::linux_x86_64::native_nt_query_object(0xdead_0000, 1, info.as_mut_ptr(), 64, &mut returned), 0xC000_0008);
+    }
+
+    #[test]
     fn formats_a_native_system_error_message() {
         let mut output = [0; 32];
         // FORMAT_MESSAGE_FROM_SYSTEM: Windows' text for ERROR_ACCESS_DENIED.

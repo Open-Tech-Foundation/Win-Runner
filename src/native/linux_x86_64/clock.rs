@@ -129,6 +129,16 @@ fn native_monotonic_milliseconds() -> u64 {
     time.seconds as u64 * 1000 + time.nanoseconds as u64 / 1_000_000
 }
 
+/// `timeBeginPeriod`/`timeEndPeriod`: the host timer is already fine
+/// grained, so a request only needs a valid period (0 is TIMERR_NOCANDO).
+pub(super) extern "win64" fn native_time_begin_period(period: u32) -> u32 {
+    if period == 0 { 97 } else { 0 }
+}
+
+pub(super) extern "win64" fn native_time_end_period(period: u32) -> u32 {
+    if period == 0 { 97 } else { 0 }
+}
+
 pub(super) extern "win64" fn native_time_get_time() -> u32 {
     native_monotonic_milliseconds() as u32
 }

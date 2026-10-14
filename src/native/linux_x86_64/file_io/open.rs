@@ -969,6 +969,77 @@ fn final_path_form(path: &str, volume: u32) -> String {
     }
 }
 
+/// `NtQueryObject`: `ObjectBasicInformation` (one handle, one reference)
+/// and `ObjectNameInformation` (a file's NT path, `\Device\HarddiskVolumeN\…`;
+/// an empty name for other objects). Short buffers get the size needed and
+/// STATUS_INFO_LENGTH_MISMATCH.
+pub(in crate::native::linux_x86_64) extern "win64" fn native_nt_query_object(
+    handle: u64,
+    class: u32,
+    info: *mut u8,
+    length: u32,
+    returned: *mut u32,
+) -> u32 {
+    const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
+    const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
+    const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+    let handle = original_handle(handle);
+    let file_path = fs_ctx().and_then(|context| {
+        context.lock().ok().and_then(|ctx| ctx.handles.get(&handle).map(|file| final_path_form(&file.path, 2)))
+    });
+    let mut flags = 0u32;
+    let known = file_path.is_some()
+        || native_get_handle_information(handle, &mut flags) != 0
+        || host_standard_fd(handle).is_some();
+    if !known {
+        return STATUS_INVALID_HANDLE;
+    }
+    let report = |size: u32| {
+        if !returned.is_null() {
+            unsafe { returned.write(size) };
+        }
+    };
+    match class {
+        // OBJECT_BASIC_INFORMATION: 56 bytes; HandleCount and PointerCount
+        // at 8 and 12.
+        0 => {
+            report(56);
+            if length < 56 || info.is_null() {
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+            unsafe {
+                ptr::write_bytes(info, 0, 56);
+                info.add(8).cast::<u32>().write_unaligned(1);
+                info.add(12).cast::<u32>().write_unaligned(1);
+            }
+            0
+        }
+        // OBJECT_NAME_INFORMATION: a UNICODE_STRING, then its characters.
+        1 => {
+            let name: Vec<u16> = file_path.unwrap_or_default().encode_utf16().collect();
+            let needed = 16 + if name.is_empty() { 0 } else { (name.len() as u32 + 1) * 2 };
+            report(needed);
+            if length < needed || info.is_null() {
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+            unsafe {
+                ptr::write_bytes(info, 0, 16);
+                if !name.is_empty() {
+                    let bytes = (name.len() * 2) as u16;
+                    info.cast::<u16>().write_unaligned(bytes);
+                    info.add(2).cast::<u16>().write_unaligned(bytes + 2);
+                    let text = info.add(16).cast::<u16>();
+                    info.add(8).cast::<u64>().write_unaligned(text as u64);
+                    text.copy_from_nonoverlapping(name.as_ptr(), name.len());
+                    text.add(name.len()).write_unaligned(0);
+                }
+            }
+            0
+        }
+        _ => STATUS_INVALID_INFO_CLASS,
+    }
+}
+
 pub(in crate::native::linux_x86_64) extern "win64" fn native_get_final_path_name_by_handle_w(
     handle: u64,
     output: *mut u16,

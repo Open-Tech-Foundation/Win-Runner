@@ -614,6 +614,60 @@ fn str_str(text: *const u16, search: *const u16, ignore_case: bool) -> *const u1
         .map_or(ptr::null(), |index| unsafe { text.add(index) })
 }
 
+/// Split a command line as `CommandLineToArgvW` does: the program name
+/// first (a leading quote runs to the next quote, otherwise it ends at a
+/// space or tab; backslashes are literal), then the MSVC argument rules.
+fn command_line_arguments(line: &str) -> Vec<String> {
+    let line = line.trim_start_matches([' ', '\t']);
+    let (program, rest) = if let Some(quoted) = line.strip_prefix('"') {
+        match quoted.find('"') {
+            Some(end) => (&quoted[..end], &quoted[end + 1..]),
+            None => (quoted, ""),
+        }
+    } else {
+        let end = line.find([' ', '\t']).unwrap_or(line.len());
+        (&line[..end], &line[end..])
+    };
+    let mut arguments = vec![program.to_string()];
+    arguments.extend(crate::cmd::split_windows_command_line(rest));
+    arguments
+}
+
+/// `CommandLineToArgvW`: one `LocalAlloc` block holding the argument
+/// pointers (NULL-terminated) and then the strings. An empty command line
+/// gives the program's own path.
+pub(super) extern "win64" fn native_command_line_to_argv_w(line: *const u16, count: *mut i32) -> u64 {
+    if count.is_null() {
+        native_set_last_error(87);
+        return 0;
+    }
+    let text = if line.is_null() { String::new() } else { wide(line).unwrap_or_default() };
+    let arguments = if text.trim_matches([' ', '\t']).is_empty() {
+        let mut path = [0u16; 32768];
+        let length = native_get_module_file_name_w(0, path.as_mut_ptr(), path.len() as u32) as usize;
+        vec![String::from_utf16_lossy(&path[..length])]
+    } else {
+        command_line_arguments(&text)
+    };
+    let encoded: Vec<Vec<u16>> = arguments.iter().map(|a| a.encode_utf16().chain(Some(0)).collect()).collect();
+    let pointers = (arguments.len() + 1) * 8;
+    let total = pointers + encoded.iter().map(|units| units.len() * 2).sum::<usize>();
+    let block = native_heap_alloc(PROCESS_HEAP_HANDLE, 0x8, total);
+    if block == 0 {
+        return 0;
+    }
+    let mut offset = pointers;
+    for (index, units) in encoded.iter().enumerate() {
+        unsafe {
+            ((block + index as u64 * 8) as *mut u64).write_unaligned(block + offset as u64);
+            ((block + offset as u64) as *mut u16).copy_from_nonoverlapping(units.as_ptr(), units.len());
+        }
+        offset += units.len() * 2;
+    }
+    unsafe { count.write(arguments.len() as i32) };
+    block
+}
+
 /// `StrStrW`: the first occurrence of `search` in `text`, or NULL.
 pub(super) extern "win64" fn native_str_str_w(text: *const u16, search: *const u16) -> *const u16 {
     str_str(text, search, false)
@@ -863,6 +917,16 @@ pub(super) extern "win64" fn native_crt_invalid_parameter_noinfo_noreturn() -> !
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn command_lines_split_with_a_literal_program_name() {
+        assert_eq!(
+            command_line_arguments(r#""C:\Program Files\a.exe" one "two words" three\\"x"#),
+            [r"C:\Program Files\a.exe", "one", "two words", r#"three\x"#]
+        );
+        assert_eq!(command_line_arguments(r#"C:\dir\b.exe"#), [r"C:\dir\b.exe"]);
+        assert_eq!(command_line_arguments(r#"C:\a\"b.exe x"#), [r#"C:\a\"b.exe"#, "x"], "no quote handling in the name");
+    }
 
     #[test]
     fn substring_search_with_and_without_case() {
