@@ -32,7 +32,7 @@ fn transcript(probe: &Path) -> String {
         .spawn()
         .expect("start the winrun shell");
     let stem = probe.file_stem().and_then(|name| name.to_str()).unwrap();
-    let executable = if matches!(stem, "oracle_process_runtime" | "oracle_console_runtime" | "oracle_native_startup" | "oracle_desktop_clipboard") {
+    let executable = if matches!(stem, "oracle_process_runtime" | "oracle_console_runtime" | "oracle_native_startup" | "oracle_desktop_clipboard" | "oracle_process_files") {
         let name = stem.trim_start_matches("oracle_");
         format!(
             "@seed \"{}\" C:\\oracle-run\\{name}.exe\nC:\\oracle-run\\{name}.exe",

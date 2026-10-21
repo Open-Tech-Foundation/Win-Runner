@@ -102,3 +102,15 @@ function Show-Items { param($Items) "arr.param: count=$($Items.Count) last=$($It
 Show-Items -Items a,b,c
 cmd /c echo a,b
 Remove-Item arr.txt
+# Start-Process: a waited, passed-through process and its exit code.
+$p = Start-Process -FilePath cmd.exe -ArgumentList '/c', 'exit 3' -PassThru -Wait -NoNewWindow
+"start.exit: $($p.ExitCode)"
+"start.has_exited: $($p.HasExited)"
+$q = Start-Process cmd.exe -ArgumentList '/c exit 0' -PassThru -Wait -NoNewWindow
+"start.positional: $($q.ExitCode)"
+# Backtick escapes in double-quoted strings.
+"escape.tab: [a`tb]"
+"escape.quote: [`"q`"]"
+"escape.newline: [x`ny]"
+"escape.dollar: [`$HOME]"
+'escape.single: [a`tb]'

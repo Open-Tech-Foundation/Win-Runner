@@ -31,6 +31,10 @@ All notable changes to this project will be documented in this file.
   `QueryFullProcessImageNameA/W`.
 - Oracle probes `thread_context`, `data_modules` and `process_modules` pin
   these behaviors down against Windows.
+- Oracle probes `process_files` (open-file renames, locks and data of
+  killed processes, change notifications) and `legacy_runtime` (msvcrt,
+  SHLWAPI and SID calls), and `Start-Process` and backtick-escape cases in
+  `powershell_expressions.ps1`.
 
 - wpkg has two kinds of packages, decided by their `.wpkg` files. Pinned
   packages (git, nodejs, python, dotnet, 7zip, curl, micro) install only
