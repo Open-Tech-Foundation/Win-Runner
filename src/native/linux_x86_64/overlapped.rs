@@ -352,13 +352,13 @@ pub(super) fn native_complete_pipe_io(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct NativeDirectoryEntry {
+pub(super) struct NativeDirectoryEntry {
     is_directory: bool,
     size: usize,
     content_hash: u64,
 }
 
-fn native_directory_snapshot(
+pub(super) fn native_directory_snapshot(
     fs: &WinFs,
     directory: &str,
     subtree: bool,
@@ -409,7 +409,7 @@ fn native_directory_snapshot(
     entries
 }
 
-fn native_directory_changes(
+pub(super) fn native_directory_changes(
     before: &HashMap<String, NativeDirectoryEntry>,
     after: &HashMap<String, NativeDirectoryEntry>,
     filter: u32,
@@ -596,7 +596,8 @@ pub(super) extern "win64" fn native_read_directory_changes_w(
     if !bytes_returned.is_null() {
         unsafe { bytes_returned.write(0) };
     }
-    native_set_last_error(997); // ERROR_IO_PENDING
+    // A queued request returns TRUE; unlike ReadFile it leaves the last
+    // error alone rather than reporting ERROR_IO_PENDING.
     std::thread::spawn(move || {
         let mut previous = baseline;
         loop {

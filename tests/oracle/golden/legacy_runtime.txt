@@ -1,0 +1,32 @@
+probe legacy_runtime
+vsnprintf.short: ret=0x5 buffer="abcde\x0x0"
+vsnprintf.exact: ret=0x5 buffer="abcde#"
+vsnprintf.long: ret=0xffffffff buffer="abc###"
+vscprintf: 4
+swprintf: ret=3 text="7-w"
+rand.seed1: 41 18467 6334 
+ctype: 0x81 0x82 0x2 0x84 0x48 0x28 0x28 0x10 0x20 0x0 0x0 
+ctype.classes: -gp --- c-- 
+localeconv: "." "" "" frac=127
+mktime64.normalized: ok 1 1 101 4 31
+gmtime64: 1 1 1 1 0 71 5 0 0 
+gmtime64.negative: value
+gmtime64.half_day: value
+gmtime64.past_half_day: null
+gmtime64.year_before: null
+strtoui64: 18446744073709551615
+wcsspn: 3
+path.remove_file_spec: "C:\\dir\\file.exe" -> "C:\\dir" ret=1
+path.remove_file_spec: "C:\\file.exe" -> "C:\\" ret=1
+path.remove_file_spec: "C:\\" -> "C:\\" ret=0
+path.remove_file_spec: "file.exe" -> "" ret=1
+path.remove_file_spec: "\\file" -> "\\" ret=1
+path.remove_file_spec: "\\\\server\\share" -> "\\\\server" ret=1
+path.remove_file_spec: "dir\\" -> "dir" ret=1
+path.remove_file_spec: "C:file" -> "C:" ret=1
+owner.file: ret=0 owner=creator dacl valid
+owner.missing: 2
+sid.administrators: "S-1-5-32-544" length=16 well_known=1 as_users=0
+membership.users: 1 member=1
+membership.user: 1 member=1
+END

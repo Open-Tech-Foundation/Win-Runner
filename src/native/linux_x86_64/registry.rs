@@ -1217,6 +1217,9 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "_fstat" => Some(native_crt_fstat32 as *const () as usize as u64),
         "fgetpos" => Some(native_crt_fgetpos as *const () as usize as u64),
         "isleadbyte" => Some(native_crt_isleadbyte as *const () as usize as u64),
+        "FindFirstChangeNotificationW" => Some(native_find_first_change_notification_w as *const () as usize as u64),
+        "FindNextChangeNotification" => Some(native_find_next_change_notification as *const () as usize as u64),
+        "FindCloseChangeNotification" => Some(native_find_close_change_notification as *const () as usize as u64),
         "TryEnterCriticalSection" => Some(native_try_enter_critical_section as *const () as usize as u64),
         "GetLocaleInfoA" => Some(native_get_locale_info_a as *const () as usize as u64),
         "_register_onexit_function" => {

@@ -1,0 +1,20 @@
+probe process_files
+rename.share_delete: 1 err=0
+rename.read_old_handle: 1 count=9
+rename.new_name: "open data"
+delete.share_delete: 1 err=0
+delete.name_while_open: gone err=2
+delete.name_after_close: gone
+rename.no_share_delete: 0 err=32
+kill.ready: ok
+kill.data: "persisted"
+lock.ready: ok
+lock.while_held: 0 err=33
+lock.read_locked_range: 0 err=33
+lock.after_kill: 1 err=0
+lock.after_exit: 1 err=0
+notify.child_create: 0
+changes.start: 1 err=0
+changes.wait: 0
+changes.first: action=1 name="changed.txt"
+END

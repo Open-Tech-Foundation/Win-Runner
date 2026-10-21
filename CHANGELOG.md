@@ -95,6 +95,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- `FindFirstChangeNotificationW`, `FindNextChangeNotification` and
+  `FindCloseChangeNotification` watch a directory for changes from any
+  process (or a mounted host folder), and `ReadDirectoryChangesW` no
+  longer reports `ERROR_IO_PENDING` for a queued request.
 - Byte-range locks hold across guest processes, and a process's locks are
   released when it is killed (they were neither, so a second process
   could take a lock another held, and a killed holder's lock stayed).
