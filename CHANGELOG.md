@@ -91,6 +91,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- `winrun script.ps1` prints each statement's output as it runs instead of
+  when the script ends, so a hang no longer hides earlier results.
 - msvcrt programs find the standard streams: `__iob_func` and `_iob` use
   msvcrt's 48-byte `FILE` layout, so `&__iob_func()[1]` is stdout (Git's
   output was lost before).

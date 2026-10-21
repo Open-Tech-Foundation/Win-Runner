@@ -64,6 +64,29 @@ const MAX_IEX_DEPTH: usize = 32;
 /// Session variables (`$name = value`). Held by the caller (e.g. the
 /// interactive shell) so assignments persist across lines; one-shot
 /// `run_ps1` uses a throwaway session.
+std::thread_local! {
+    /// The top-level output buffer of a script whose output streams as it
+    /// is produced (by address), and where it goes.
+    static STREAM: std::cell::RefCell<Option<(usize, crate::backend::OutputSink)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Stream a script's output: text written to `out` is passed to `sink`
+/// statement by statement while `run` runs, instead of when it ends.
+pub fn streaming<R>(out: &mut Vec<u8>, sink: Option<crate::backend::OutputSink>, run: impl FnOnce(&mut Vec<u8>) -> R) -> R {
+    let Some(sink) = sink else {
+        return run(out);
+    };
+    STREAM.with(|stream| *stream.borrow_mut() = Some((out as *const Vec<u8> as usize, sink.clone())));
+    let result = run(out);
+    STREAM.with(|stream| *stream.borrow_mut() = None);
+    if !out.is_empty() {
+        sink(crate::backend::OutputChannel::Stdout, out);
+        out.clear();
+    }
+    result
+}
+
 pub struct Session {
     pub vars: HashMap<String, Value>,
     pub funcs: HashMap<String, FuncDef>,
@@ -336,6 +359,7 @@ impl<'a> Interpreter<'a> {
         let chunks = split_chunks(&code);
         let mut i = 0;
         while i < chunks.len() {
+            self.flush_stream();
             let t = chunks[i].trim();
             if t.is_empty() {
                 i += 1;
@@ -2408,6 +2432,18 @@ impl<'a> Interpreter<'a> {
     }
 
     /// Child interpreter sharing filesystem, variables, and functions.
+    /// Pass what the streamed top-level buffer holds to its sink.
+    fn flush_stream(&mut self) {
+        let address = &*self.out as *const Vec<u8> as usize;
+        let sink = STREAM.with(|stream| stream.borrow().as_ref().filter(|(top, _)| *top == address).map(|(_, sink)| sink.clone()));
+        if let Some(sink) = sink {
+            if !self.out.is_empty() {
+                sink(crate::backend::OutputChannel::Stdout, self.out);
+                self.out.clear();
+            }
+        }
+    }
+
     fn sub<'b>(&'b mut self, out: &'b mut Vec<u8>) -> Interpreter<'b> {
         Interpreter {
             fs: &mut *self.fs,

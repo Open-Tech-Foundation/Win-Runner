@@ -1044,7 +1044,7 @@ impl Shell {
                     let script = std::fs::read_to_string(target)
                         .map_err(|e| format!("cannot read {target}: {e}"))?;
                     report_timing(target, "host_file_read", file_read_started);
-                    let code = self.run_ps1_args(&script, &argv[1..], out)
+                    let code = ps1::streaming(out, sink.clone(), |out| self.run_ps1_args(&script, &argv[1..], out))
                         .map_err(|e| format!("script error: {e}"))?;
                     self.last_code = code;
                     return Ok(ShellFlow::Continue);
@@ -1066,7 +1066,7 @@ impl Shell {
                 .map_err(|error| format!("cannot read {target}: {error}"))?;
             let script = String::from_utf8(data)
                 .map_err(|error| format!("cannot read {target}: {error}"))?;
-            self.last_code = self.run_ps1_args(&script, &argv[1..], out)
+            self.last_code = ps1::streaming(out, sink.clone(), |out| self.run_ps1_args(&script, &argv[1..], out))
                 .map_err(|error| format!("script error: {error}"))?;
             return Ok(ShellFlow::Continue);
         }

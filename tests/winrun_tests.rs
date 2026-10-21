@@ -2725,3 +2725,22 @@ fn help_and_version_print_and_succeed() {
     assert_eq!(code, 2);
     assert!(stderr.starts_with("usage:\n"), "{stderr}");
 }
+
+#[test]
+fn script_output_streams_before_the_script_ends() {
+    use std::io::BufRead;
+    let script = tmp_path("streamed-output.ps1");
+    std::fs::write(&script, "Write-Output \"first\"\n$kept = Write-Output \"captured\"\nStart-Sleep -Seconds 3\n\"last $kept\"\n").unwrap();
+    let started = std::time::Instant::now();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_winrun"))
+        .arg(&script)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
+    assert_eq!(lines.next().unwrap().unwrap(), "first");
+    assert!(started.elapsed() < std::time::Duration::from_secs(2), "the first line waited for the script");
+    assert_eq!(lines.next().unwrap().unwrap(), "last captured");
+    assert!(child.wait().unwrap().success());
+    let _ = std::fs::remove_file(script);
+}
