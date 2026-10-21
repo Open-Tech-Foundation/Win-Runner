@@ -6,6 +6,16 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Git for Windows (MinGit, `wpkg install git`) runs: init, add, commit,
+  status, log, diff and branch work. This adds msvcrt.dll's legacy
+  exports MinGW programs import (`__wgetmainargs`, `_vsnprintf` with
+  msvcrt's truncation, the count-less `swprintf`, `_lock`, `_fstat`,
+  `rand`, `localeconv` and others), `PathRemoveFileSpecW`, `LocalAlloc`,
+  `TryEnterCriticalSection`, `GetLocaleInfoA`, and SIDs and file ownership
+  (`GetNamedSecurityInfoW`, `EqualSid`, `CheckTokenMembership` and
+  friends): guest files belong to the token's user, so Git's
+  `safe.directory` check accepts them.
+
 - Guest threads can be suspended while running: `SuspendThread` stops the
   thread with its registers saved, `GetThreadContext` reads them by
   `ContextFlags`, and `SetThreadContext` changes where it continues once
@@ -81,6 +91,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- msvcrt programs find the standard streams: `__iob_func` and `_iob` use
+  msvcrt's 48-byte `FILE` layout, so `&__iob_func()[1]` is stdout (Git's
+  output was lost before).
+- `OpenProcess` and `DuplicateHandle` on a child process give handles
+  that wait for it and read its exit code, as Git's `waitpid` needs.
 - Thread and module calls now match Windows' oracle transcripts:
   `GetThreadContext` reads a running thread (stopping it briefly), a
   thread created suspended (its start routine and parameter), and fails

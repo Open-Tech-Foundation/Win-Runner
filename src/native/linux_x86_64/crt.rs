@@ -22,7 +22,20 @@ pub(super) static NATIVE_CRT_INITENV: AtomicU64 = AtomicU64::new(0);
 pub(super) static NATIVE_CRT_WINITENV: AtomicU64 = AtomicU64::new(0);
 pub(super) static NATIVE_CRT_PGMPTR: AtomicU64 = AtomicU64::new(0);
 pub(super) static NATIVE_CRT_WPGMPTR: AtomicU64 = AtomicU64::new(0);
-pub(super) static NATIVE_CRT_IOB: [AtomicU64; 24] = [const { AtomicU64::new(0) }; 24];
+/// The standard streams as msvcrt's `_iob` array of 48-byte `FILE`s
+/// (`_ptr`, `_cnt`, `_base`, `_flag`, `_file`, `_charbuf`, `_bufsiz`,
+/// `_tmpfname`): programs index it as `&__iob_func()[n]` and may read
+/// `_file` (offset 28) directly. The UCRT's `__acrt_iob_func` hands out the
+/// same addresses, whose layout UCRT programs do not read.
+pub(super) static NATIVE_CRT_IOB: [AtomicU64; 18] = {
+    let mut words = [const { AtomicU64::new(0) }; 18];
+    // Word 3 of each FILE: `_flag` (_IOREAD 0x1, _IOWRT 0x2) and `_file`.
+    words[3] = AtomicU64::new(0x1);
+    words[9] = AtomicU64::new(0x2 | 1 << 32);
+    words[15] = AtomicU64::new(0x2 | 2 << 32);
+    words
+};
+const NATIVE_CRT_FILE_STRIDE: usize = 48;
 const NATIVE_CRT_FILE_SIGNATURE: u64 = 0x5749_4e52_554e_4649;
 
 #[repr(C)]
@@ -54,7 +67,7 @@ pub(super) extern "win64" fn native_crt_acrt_iob_func(index: u32) -> *mut u8 {
             .as_ptr()
             .cast_mut()
             .cast::<u8>()
-            .add(index as usize * 64)
+            .add(index as usize * NATIVE_CRT_FILE_STRIDE)
     }
 }
 fn native_crt_standard_stream_index(stream: *mut u8) -> Option<usize> {
@@ -64,7 +77,8 @@ fn native_crt_standard_stream_index(stream: *mut u8) -> Option<usize> {
     let base = NATIVE_CRT_IOB.as_ptr() as usize;
     let address = stream as usize;
     let offset = address.checked_sub(base)?;
-    (offset < 192 && offset % 64 == 0).then_some(offset / 64)
+    (offset < 3 * NATIVE_CRT_FILE_STRIDE && offset % NATIVE_CRT_FILE_STRIDE == 0)
+        .then_some(offset / NATIVE_CRT_FILE_STRIDE)
 }
 pub(super) extern "win64" fn native_crt_errno() -> *mut i32 {
     THREAD_CRT_ERRNO.with(std::cell::Cell::as_ptr)
@@ -1942,7 +1956,7 @@ fn crt_read_argument_string(pointer: u64) -> Vec<u8> {
     output
 }
 
-fn crt_format_narrow(format: *const u8, arguments: *mut c_void) -> Option<Vec<u8>> {
+pub(super) fn crt_format_narrow(format: *const u8, arguments: *mut c_void) -> Option<Vec<u8>> {
     crt_format_narrow_limited(format, arguments, 256)
 }
 
@@ -2215,7 +2229,7 @@ fn crt_read_argument_wide_string(pointer: u64, limit: usize) -> Option<Vec<u16>>
     None
 }
 
-fn crt_format_wide(format: *const u16, arguments: *mut c_void) -> Option<Vec<u16>> {
+pub(super) fn crt_format_wide(format: *const u16, arguments: *mut c_void) -> Option<Vec<u16>> {
     const MAX_FORMAT_UNITS: usize = 1_048_576;
     const MAX_OUTPUT_UNITS: usize = 1_048_576;
     if format.is_null() {

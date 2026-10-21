@@ -3279,8 +3279,11 @@ mod protection_tests {
         for index in 0..3 {
             assert_eq!(
                 super::native_crt_acrt_iob_func(index) as usize,
-                base + index as usize * 64
+                base + index as usize * 48
             );
+            // msvcrt's FILE layout: `_file` at offset 28.
+            let file = unsafe { (super::native_crt_acrt_iob_func(index).add(28) as *const i32).read() };
+            assert_eq!(file, index as i32);
         }
         assert!(super::native_crt_acrt_iob_func(3).is_null());
         assert!(super::supports_import("UCRTBASE.DLL", "__acrt_iob_func"));

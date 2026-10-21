@@ -78,6 +78,47 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
                     | "__p__environ"
                     | "__p__wenviron"
                     | "_crt_atexit"
+                    | "atexit"
+                    | "__wgetmainargs"
+                    | "_XcptFilter"
+                    | "_amsg_exit"
+                    | "_assert"
+                    | "_endthreadex"
+                    | "_gmtime64"
+                    | "_localtime64"
+                    | "_mktime64"
+                    | "_isctype"
+                    | "iscntrl"
+                    | "isgraph"
+                    | "islower"
+                    | "isupper"
+                    | "ispunct"
+                    | "_rmdir"
+                    | "_wrmdir"
+                    | "_wmkdir"
+                    | "_wchdir"
+                    | "_strtoui64"
+                    | "_telli64"
+                    | "_flushall"
+                    | "_vscprintf"
+                    | "_vsnprintf"
+                    | "_vsnwprintf"
+                    | "vfprintf"
+                    | "fwprintf"
+                    | "swprintf"
+                    | "wcsspn"
+                    | "perror"
+                    | "putc"
+                    | "raise"
+                    | "rand"
+                    | "srand"
+                    | "localeconv"
+                    | "_wpgmptr"
+                    | "_lock"
+                    | "_unlock"
+                    | "_fstat"
+                    | "fgetpos"
+                    | "isleadbyte"
                     | "_register_onexit_function"
                     | "_initialize_onexit_table"
                     | "_execute_onexit_table"
@@ -479,10 +520,21 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
         ),
         "OLEAUT32.DLL" => matches!(func, "GetErrorInfo" | "SetErrorInfo"),
         "RPCRT4.DLL" => matches!(func, "UuidCreate" | "UuidCreateSequential"),
-        "SHLWAPI.DLL" => matches!(func, "StrStrW" | "StrStrIW"),
+        "SHLWAPI.DLL" => matches!(func, "StrStrW" | "StrStrIW" | "PathRemoveFileSpecW"),
         "ADVAPI32.DLL" => matches!(
             func,
             "ConvertStringSecurityDescriptorToSecurityDescriptorW"
+                | "GetNamedSecurityInfoW"
+                | "IsValidSid"
+                | "GetLengthSid"
+                | "EqualSid"
+                | "CopySid"
+                | "AllocateAndInitializeSid"
+                | "FreeSid"
+                | "IsWellKnownSid"
+                | "CheckTokenMembership"
+                | "ConvertSidToStringSidA"
+                | "LookupAccountSidA"
                 | "CryptAcquireContextW"
                 | "CryptGenRandom"
                 | "CryptReleaseContext"
@@ -987,6 +1039,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "CLSIDFromString" => Some(native_clsid_from_string as *const () as usize as u64),
         "UuidCreate" => Some(native_uuid_create as *const () as usize as u64),
         "StrStrW" => Some(native_str_str_w as *const () as usize as u64),
+        "PathRemoveFileSpecW" => Some(native_path_remove_file_spec_w as *const () as usize as u64),
         "CommandLineToArgvW" => Some(native_command_line_to_argv_w as *const () as usize as u64),
         "StrStrIW" => Some(native_str_str_i_w as *const () as usize as u64),
         "UuidCreateSequential" => Some(native_uuid_create_sequential as *const () as usize as u64),
@@ -1033,6 +1086,17 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "RevertToSelf" => Some(native_revert_to_self as *const () as usize as u64),
         "SetThreadToken" => Some(native_set_thread_token as *const () as usize as u64),
         "GetTokenInformation" => Some(native_get_token_information as *const () as usize as u64),
+        "GetNamedSecurityInfoW" => Some(native_get_named_security_info_w as *const () as usize as u64),
+        "IsValidSid" => Some(native_is_valid_sid as *const () as usize as u64),
+        "GetLengthSid" => Some(native_get_length_sid as *const () as usize as u64),
+        "EqualSid" => Some(native_equal_sid as *const () as usize as u64),
+        "CopySid" => Some(native_copy_sid as *const () as usize as u64),
+        "AllocateAndInitializeSid" => Some(native_allocate_and_initialize_sid as *const () as usize as u64),
+        "FreeSid" => Some(native_free_sid as *const () as usize as u64),
+        "IsWellKnownSid" => Some(native_is_well_known_sid as *const () as usize as u64),
+        "CheckTokenMembership" => Some(native_check_token_membership as *const () as usize as u64),
+        "ConvertSidToStringSidA" => Some(native_convert_sid_to_string_sid_a as *const () as usize as u64),
+        "LookupAccountSidA" => Some(native_lookup_account_sid_a as *const () as usize as u64),
         "GetSidSubAuthorityCount" => Some(native_get_sid_sub_authority_count as *const () as usize as u64),
         "GetSidSubAuthority" => Some(native_get_sid_sub_authority as *const () as usize as u64),
         "WaitForMultipleObjects" => {
@@ -1110,7 +1174,51 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         }
         "__p__environ" => Some(native_crt_p_environ as *const () as usize as u64),
         "__p__wenviron" => Some(native_crt_p_wenviron as *const () as usize as u64),
-        "_crt_atexit" => Some(native_crt_atexit as *const () as usize as u64),
+        "_crt_atexit" | "atexit" => Some(native_crt_atexit as *const () as usize as u64),
+        "__wgetmainargs" => Some(native_crt_wgetmainargs as *const () as usize as u64),
+        "_XcptFilter" => Some(native_crt_seh_filter_exe as *const () as usize as u64),
+        "_amsg_exit" => Some(native_crt_amsg_exit as *const () as usize as u64),
+        "_assert" => Some(native_crt_assert as *const () as usize as u64),
+        "_endthreadex" => Some(native_crt_endthreadex as *const () as usize as u64),
+        "_gmtime64" => Some(native_crt_gmtime64 as *const () as usize as u64),
+        "_localtime64" => Some(native_crt_localtime64 as *const () as usize as u64),
+        "_mktime64" => Some(native_crt_mktime64 as *const () as usize as u64),
+        "_isctype" => Some(native_crt_isctype as *const () as usize as u64),
+        "iscntrl" => Some(native_crt_iscntrl as *const () as usize as u64),
+        "isgraph" => Some(native_crt_isgraph as *const () as usize as u64),
+        "islower" => Some(native_crt_islower as *const () as usize as u64),
+        "isupper" => Some(native_crt_isupper as *const () as usize as u64),
+        "ispunct" => Some(native_crt_ispunct as *const () as usize as u64),
+        "_rmdir" => Some(native_crt_rmdir as *const () as usize as u64),
+        "_wrmdir" => Some(native_crt_wrmdir as *const () as usize as u64),
+        "_wmkdir" => Some(native_crt_wmkdir as *const () as usize as u64),
+        "_wchdir" => Some(native_crt_wchdir as *const () as usize as u64),
+        "_strtoui64" => Some(native_crt_strtoull as *const () as usize as u64),
+        "_telli64" => Some(native_crt_telli64 as *const () as usize as u64),
+        "_flushall" => Some(native_crt_flushall as *const () as usize as u64),
+        "_vscprintf" => Some(native_crt_vscprintf as *const () as usize as u64),
+        "_vsnprintf" => Some(native_crt_vsnprintf as *const () as usize as u64),
+        "_vsnwprintf" => Some(native_crt_vsnwprintf as *const () as usize as u64),
+        "vfprintf" => Some(native_crt_vfprintf as *const () as usize as u64),
+        "fwprintf" => Some(native_crt_fwprintf as *const () as usize as u64),
+        "swprintf" => Some(native_crt_swprintf as *const () as usize as u64),
+        "wcsspn" => Some(native_crt_wcsspn as *const () as usize as u64),
+        "perror" => Some(native_crt_perror as *const () as usize as u64),
+        "putc" => Some(native_crt_fputc as *const () as usize as u64),
+        "raise" => Some(native_crt_raise as *const () as usize as u64),
+        "rand" => Some(native_crt_rand as *const () as usize as u64),
+        "srand" => Some(native_crt_srand as *const () as usize as u64),
+        "localeconv" => Some(native_crt_localeconv as *const () as usize as u64),
+        // A data export: the address of the program-path pointer.
+        "_wpgmptr" => Some(native_crt_p_wpgmptr() as u64),
+        "LocalAlloc" => Some(native_local_alloc as *const () as usize as u64),
+        "_lock" => Some(native_crt_lock as *const () as usize as u64),
+        "_unlock" => Some(native_crt_unlock as *const () as usize as u64),
+        "_fstat" => Some(native_crt_fstat32 as *const () as usize as u64),
+        "fgetpos" => Some(native_crt_fgetpos as *const () as usize as u64),
+        "isleadbyte" => Some(native_crt_isleadbyte as *const () as usize as u64),
+        "TryEnterCriticalSection" => Some(native_try_enter_critical_section as *const () as usize as u64),
+        "GetLocaleInfoA" => Some(native_get_locale_info_a as *const () as usize as u64),
         "_register_onexit_function" => {
             Some(native_crt_register_onexit_function as *const () as usize as u64)
         }

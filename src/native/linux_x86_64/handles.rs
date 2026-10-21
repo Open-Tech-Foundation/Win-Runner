@@ -374,6 +374,10 @@ fn native_duplicate_handle_impl(
             .completion_ports
             .lock()
             .is_ok_and(|values| values.contains_key(&original))
+        || process
+            .children
+            .lock()
+            .is_ok_and(|table| table.children.contains_key(&original))
         || fs_ctx().is_some_and(|context| {
             context
                 .lock()

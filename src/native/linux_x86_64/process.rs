@@ -721,15 +721,18 @@ pub(super) extern "win64" fn native_get_current_process() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+/// The child a process or primary-thread handle names, also through a
+/// duplicate of one (`DuplicateHandle`, `OpenProcess`).
 pub(super) fn child_process(
     process: &NativeProcessContext,
     handle: u64,
 ) -> Option<Arc<NativeChildProcess>> {
+    let original = process.duplicate_handles.lock().ok().and_then(|values| values.get(&handle).copied());
     let table = process.children.lock().ok()?;
-    table
-        .children
-        .get(&handle)
-        .or_else(|| table.primary_threads.get(&handle))
+    [Some(handle), original]
+        .into_iter()
+        .flatten()
+        .find_map(|handle| table.children.get(&handle).or_else(|| table.primary_threads.get(&handle)))
         .cloned()
 }
 

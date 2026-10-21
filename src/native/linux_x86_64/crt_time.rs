@@ -412,3 +412,70 @@ mod tests {
         assert_eq!(native_crt_wcsftime(small.as_mut_ptr(), 4, format.as_ptr(), tm.as_ptr()), 0);
     }
 }
+
+unsafe extern "C" {
+    fn mktime(tm: *mut HostTm) -> i64;
+}
+
+std::thread_local! {
+    /// The per-thread `struct tm` msvcrt's `_gmtime64` and `_localtime64`
+    /// return.
+    static THREAD_TM: std::cell::UnsafeCell<[i32; 9]> = const { std::cell::UnsafeCell::new([0; 9]) };
+}
+
+/// msvcrt's `_gmtime64(time)`: the per-thread `struct tm`, or null for a
+/// time outside 1970-3000.
+pub(super) extern "win64" fn native_crt_gmtime64(time: *const i64) -> *mut i32 {
+    THREAD_TM.with(|tm| {
+        let output = tm.get().cast::<i32>();
+        if native_crt_gmtime64_s(output, time) == 0 { output } else { ptr::null_mut() }
+    })
+}
+
+/// msvcrt's `_localtime64(time)`, in the local zone.
+pub(super) extern "win64" fn native_crt_localtime64(time: *const i64) -> *mut i32 {
+    THREAD_TM.with(|tm| {
+        let output = tm.get().cast::<i32>();
+        if native_crt_localtime64_s(output, time) == 0 { output } else { ptr::null_mut() }
+    })
+}
+
+/// `_mktime64(tm)`: seconds since 1970 for a local broken-down time, with
+/// `tm` normalized (weekday, day of the year and daylight time filled in);
+/// -1 outside 1970-3000.
+pub(super) extern "win64" fn native_crt_mktime64(tm: *mut i32) -> i64 {
+    if tm.is_null() {
+        return -1;
+    }
+    let given = unsafe { read_tm(tm) };
+    let mut host = HostTm {
+        second: given.second,
+        minute: given.minute,
+        hour: given.hour,
+        day: given.day,
+        month: given.month,
+        year: given.year,
+        weekday: given.weekday,
+        year_day: given.year_day,
+        daylight: given.daylight,
+        offset: 0,
+        zone: ptr::null(),
+    };
+    let seconds = unsafe { mktime(&mut host) };
+    if !(0..=32_535_215_999).contains(&seconds) {
+        return -1;
+    }
+    let normalized = Tm {
+        second: host.second,
+        minute: host.minute,
+        hour: host.hour,
+        day: host.day,
+        month: host.month,
+        year: host.year,
+        weekday: host.weekday,
+        year_day: host.year_day,
+        daylight: i32::from(host.daylight > 0),
+    };
+    unsafe { write_tm(tm, normalized) };
+    seconds
+}

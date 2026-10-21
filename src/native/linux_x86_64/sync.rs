@@ -1200,6 +1200,24 @@ pub(super) extern "win64" fn native_enter_critical_section(section: *mut u8) {
     state.1 = state.1.saturating_add(1);
 }
 
+/// `TryEnterCriticalSection`: enter when the section is free or already
+/// the caller's (TRUE); FALSE without waiting when another thread holds it.
+pub(super) extern "win64" fn native_try_enter_critical_section(section: *mut u8) -> i32 {
+    let Some(section) = native_critical_section(section) else {
+        return 0;
+    };
+    let owner = native_critical_section_owner();
+    let Ok(mut state) = section.owner_and_recursion.lock() else {
+        return 0;
+    };
+    if state.0.is_some_and(|current| current != owner) {
+        return 0;
+    }
+    state.0 = Some(owner);
+    state.1 = state.1.saturating_add(1);
+    1
+}
+
 pub(super) extern "win64" fn native_leave_critical_section(section: *mut u8) {
     let Some(section) = native_critical_section(section) else {
         return;

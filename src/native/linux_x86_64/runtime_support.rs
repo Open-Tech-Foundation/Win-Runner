@@ -337,7 +337,7 @@ const ERROR_NO_TOKEN: u32 = 1008;
 
 /// A binary SID (`S-1-<authority>-<sub>...`): revision, count, 48-bit
 /// big-endian authority, then little-endian sub-authorities.
-fn binary_sid(text: &str) -> Vec<u8> {
+pub(super) fn binary_sid(text: &str) -> Vec<u8> {
     let parts: Vec<u64> = text
         .trim_start_matches("S-")
         .split('-')

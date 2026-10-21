@@ -110,6 +110,12 @@ use sddl::*;
 #[path = "linux_x86_64/text_tools_host.rs"]
 mod text_tools_host;
 use text_tools_host::*;
+#[path = "linux_x86_64/security.rs"]
+mod security;
+use security::*;
+#[path = "linux_x86_64/crt_msvcrt.rs"]
+mod crt_msvcrt;
+use crt_msvcrt::*;
 #[path = "linux_x86_64/thread_suspend.rs"]
 mod thread_suspend;
 use thread_suspend::*;
