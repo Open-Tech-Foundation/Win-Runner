@@ -26,6 +26,11 @@ impl GuestProcess {
     }
 }
 
+/// This session's private directory, shared by all its guest processes.
+pub fn session_directory() -> Option<PathBuf> {
+    table()
+}
+
 fn table() -> Option<PathBuf> {
     std::env::var_os(TABLE_VARIABLE).map(PathBuf::from)
 }

@@ -171,9 +171,10 @@ fn probe() {
         out_byte(b' ');
     }
     out_byte(b'\n');
-    let negative = -1i64;
-    case("gmtime64.negative");
-    out_str(if unsafe { gmtime(&negative) }.is_null() { "null\n" } else { "value\n" });
+    for (label, seconds) in [("gmtime64.negative", -1i64), ("gmtime64.half_day", -43_200), ("gmtime64.past_half_day", -43_201), ("gmtime64.year_before", -31_536_000)] {
+        case(label);
+        out_str(if unsafe { gmtime(&seconds) }.is_null() { "null\n" } else { "value\n" });
+    }
     let mut end = core::ptr::null();
     case("strtoui64");
     out_dec(unsafe { strtoui64(b"18446744073709551615x\0".as_ptr(), &mut end, 10) });
@@ -232,13 +233,11 @@ fn probe() {
         out_str("ret=");
         out_dec(result as u64);
         if result == 0 {
-            out_str(if equal(owner, user_sid) != 0 {
-                " owner=user"
-            } else if well_known(owner, 26) != 0 {
-                " owner=administrators"
-            } else {
-                " owner=other"
-            });
+            // The creator owns the file: the user, or for an elevated
+            // administrator the Administrators group the token holds.
+            let mut admin = 0;
+            let admin_owner = well_known(owner, 26) != 0 && membership(0, owner, &mut admin) != 0 && admin != 0;
+            out_str(if equal(owner, user_sid) != 0 || admin_owner { " owner=creator" } else { " owner=other" });
             out_str(if dacl != 0 { " dacl" } else { " no_dacl" });
             out_str(if valid(owner) != 0 { " valid" } else { " invalid" });
         }

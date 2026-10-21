@@ -120,6 +120,22 @@ fn copy_text(text: &str, output: *mut u16, size: u32) -> u32 {
     copied as u32
 }
 
+/// PSAPI's copy: a short buffer gets what fits and a terminator, and the
+/// call returns the buffer's size, leaving the last error alone.
+fn truncating_copy(text: &str, output: *mut u16, size: u32) -> u32 {
+    let units: Vec<u16> = text.encode_utf16().collect();
+    if output.is_null() || size == 0 {
+        native_set_last_error(122);
+        return 0;
+    }
+    let copied = units.len().min(size as usize - 1);
+    unsafe {
+        output.copy_from_nonoverlapping(units.as_ptr(), copied);
+        output.add(copied).write(0);
+    }
+    if copied < units.len() { size } else { copied as u32 }
+}
+
 pub(super) extern "win64" fn native_get_module_base_name_w(process: u64, handle: u64, output: *mut u16, size: u32) -> u32 {
     if !check_process(process) {
         return 0;
@@ -152,7 +168,7 @@ pub(super) extern "win64" fn native_get_module_file_name_ex_w(process: u64, hand
         return 0;
     }
     match module(handle) {
-        Ok((_, _, path)) => copy_text(&path, output, size),
+        Ok((_, _, path)) => truncating_copy(&path, output, size),
         Err(code) => {
             native_set_last_error(code);
             0

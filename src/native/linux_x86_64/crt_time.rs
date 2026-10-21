@@ -424,11 +424,20 @@ std::thread_local! {
 }
 
 /// msvcrt's `_gmtime64(time)`: the per-thread `struct tm`, or null for a
-/// time outside 1970-3000.
+/// time outside its range, which reaches 12 hours before 1970 (the margin
+/// msvcrt keeps for time zones).
 pub(super) extern "win64" fn native_crt_gmtime64(time: *const i64) -> *mut i32 {
+    if time.is_null() {
+        return ptr::null_mut();
+    }
+    let seconds = unsafe { time.read_unaligned() };
+    if !(-43_200..=32_535_215_999).contains(&seconds) {
+        return ptr::null_mut();
+    }
     THREAD_TM.with(|tm| {
         let output = tm.get().cast::<i32>();
-        if native_crt_gmtime64_s(output, time) == 0 { output } else { ptr::null_mut() }
+        unsafe { write_tm(output, utc_from_epoch(seconds)) };
+        output
     })
 }
 

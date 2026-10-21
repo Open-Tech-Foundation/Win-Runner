@@ -490,27 +490,7 @@ impl Interpreter<'_> {
                 }
             }
             "start-process" => {
-                let (named, pos) = parse_params(
-                    args,
-                    &["filepath", "argumentlist", "args", "wait", "nonewwindow", "passthru", "workingdirectory", "windowstyle"],
-                )?;
-                let file = named
-                    .get("filepath")
-                    .or_else(|| pos.first())
-                    .cloned()
-                    .ok_or("Start-Process: missing -FilePath")?;
-                let arguments: Vec<String> = named
-                    .get("argumentlist")
-                    .or_else(|| named.get("args"))
-                    .or_else(|| pos.get(1))
-                    .map(|list| split_top_commas(list).into_iter().map(|a| a.trim().trim_matches(['"', '\'']).to_string()).collect())
-                    .unwrap_or_default();
-                let path = self
-                    .resolve_program(&file)
-                    .ok_or_else(|| format!("Start-Process: This command cannot be run because \"{file}\" was not found."))?;
-                // The program runs to completion here: winrun has no
-                // detached guest processes yet, so -Wait is implied.
-                self.run_program(&path, &arguments)?;
+                self.start_process(args)?;
             }
             "get-itempropertyvalue" | "gpv" => {
                 let (named, pos) = parse_params(args, &["path", "literalpath", "name"])?;
@@ -530,6 +510,56 @@ impl Interpreter<'_> {
             _ => return Err(format!("unknown command: {cmd}")),
         }
         Ok(())
+    }
+}
+
+impl Interpreter<'_> {
+    /// `Start-Process`: run the program and return it as the object
+    /// `-PassThru` gives (`ExitCode`, `HasExited`, `ProcessName`, `Id`).
+    /// The program runs to completion here: winrun has no detached guest
+    /// processes yet, so `-Wait` is implied.
+    pub(super) fn start_process(&mut self, args: &[String]) -> Result<Value, String> {
+        let (named, pos) = parse_params(
+            args,
+            &["filepath", "argumentlist", "args", "wait", "nonewwindow", "passthru", "workingdirectory", "windowstyle"],
+        )?;
+        let file = named
+            .get("filepath")
+            .or_else(|| pos.first())
+            .cloned()
+            .ok_or("Start-Process: missing -FilePath")?;
+        let arguments: Vec<String> = named
+            .get("argumentlist")
+            .or_else(|| named.get("args"))
+            .or_else(|| pos.get(1))
+            .map(|list| {
+                crate::ps1::native_arguments(list)
+                    .into_iter()
+                    .flat_map(|item| split_top_commas(&item).into_iter().map(|a| a.trim().trim_matches(['"', '\'']).to_string()).collect::<Vec<_>>())
+                    .collect()
+            })
+            .unwrap_or_default();
+        // A single argument string is a command line, split on spaces.
+        let arguments = if arguments.len() == 1 && arguments[0].contains(' ') {
+            arguments[0].split_whitespace().map(str::to_string).collect()
+        } else {
+            arguments
+        };
+        let path = self
+            .resolve_program(&file)
+            .ok_or_else(|| format!("Start-Process: This command cannot be run because \"{file}\" was not found."))?;
+        self.run_program(&path, &arguments)?;
+        let code = match self.vars.get("lastexitcode") {
+            Some(Value::Str(code)) => code.clone(),
+            _ => "0".to_string(),
+        };
+        let name = path.rsplit(['\\', '/']).next().unwrap_or(&path);
+        let name = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
+        let mut process = HashMap::new();
+        process.insert("exitcode".to_string(), Value::Str(code));
+        process.insert("hasexited".to_string(), Value::Str("True".to_string()));
+        process.insert("processname".to_string(), Value::Str(name.to_string()));
+        Ok(Value::Map(process))
     }
 }
 

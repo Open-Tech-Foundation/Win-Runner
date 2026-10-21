@@ -65,8 +65,8 @@ const MAX_IEX_DEPTH: usize = 32;
 /// interactive shell) so assignments persist across lines; one-shot
 /// `run_ps1` uses a throwaway session.
 std::thread_local! {
-    /// The top-level output buffer of a script whose output streams as it
-    /// is produced (by address), and where it goes.
+    // The top-level output buffer of a script whose output streams as it
+    // is produced (by address), and where it goes.
     static STREAM: std::cell::RefCell<Option<(usize, crate::backend::OutputSink)>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -1708,10 +1708,7 @@ impl<'a> Interpreter<'a> {
                 return Ok((lines_value(lines), Flow::Next));
             }
             if is_builtin_command(&fname) {
-                let mut argvals = Vec::with_capacity(vals.len().saturating_sub(1));
-                for tok in vals.iter().skip(1) {
-                    argvals.push(self.expand_token(tok)?);
-                }
+                let argvals = self.expand_arguments(&vals[1..])?;
                 // Preserve command response objects for member access in
                 // value position rather than capturing their display text.
                 if let Some(v) = self.object_command(&fname, &argvals) {
@@ -3620,6 +3617,7 @@ impl<'a> Interpreter<'a> {
                     | "md"
                     | "get-itemproperty"
                     | "gp"
+                    | "start-process"
             )
     }
 
@@ -3654,6 +3652,11 @@ impl<'a> Interpreter<'a> {
                 args.extend_from_slice(argvals);
                 Some(self.new_item_value(&args))
             }
+            // Only `-PassThru` makes Start-Process return its process.
+            "start-process" => argvals
+                .iter()
+                .any(|arg| arg.eq_ignore_ascii_case("-passthru"))
+                .then(|| self.start_process(argvals)),
             _ => Some(self.get_item_property_args(argvals)),
         }
     }
@@ -3897,10 +3900,8 @@ impl<'a> Interpreter<'a> {
         if !toks.is_empty() && !toks[0].verbatim() {
             let cmd = toks[0].text().to_lowercase();
             if self.is_object_command(&cmd) {
-                let mut argvals = Vec::with_capacity(toks.len().saturating_sub(1));
-                for tok in toks.iter().skip(1) {
-                    argvals.push(self.expand_token(tok)?);
-                }
+                // As a statement expands them: comma lists stay one argument.
+                let argvals = self.expand_arguments(&toks[1..])?;
                 if let Some(v) = self.object_command(&cmd, &argvals) {
                     return Ok((v?, Flow::Next));
                 }

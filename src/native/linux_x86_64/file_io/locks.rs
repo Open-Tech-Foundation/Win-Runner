@@ -1,6 +1,84 @@
 //! Windows byte-range locks over the guest filesystem.
 use super::*;
 
+/// Locks between guest processes. Each process keeps its own lock table,
+/// so the session also holds one host lock file per locked guest path, and
+/// every handle that locks takes Linux open-file-description locks on it at
+/// the same offsets: they conflict across processes and handles, and the
+/// kernel drops them when a process ends, killed or not, as Windows does.
+static HOST_LOCK_FILES: std::sync::Mutex<Option<std::collections::HashMap<u64, i32>>> = std::sync::Mutex::new(None);
+
+fn host_lock_path(path: &str) -> Option<std::path::PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let directory = crate::native::process_table::session_directory()?.join("locks");
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.to_lowercase().hash(&mut hasher);
+    Some(directory.join(format!("{:016x}", hasher.finish())))
+}
+
+/// The handle's descriptor on the path's lock file; `create` makes the
+/// file, otherwise a path nobody has locked has none.
+fn host_lock_file(handle: u64, path: &str, create: bool) -> Option<i32> {
+    let mut files = HOST_LOCK_FILES.lock().ok()?;
+    let files = files.get_or_insert_with(Default::default);
+    if let Some(fd) = files.get(&handle) {
+        return Some(*fd);
+    }
+    let lock_path = host_lock_path(path)?;
+    if create {
+        let _ = std::fs::create_dir_all(lock_path.parent()?);
+    }
+    let name = std::ffi::CString::new(lock_path.as_os_str().as_encoded_bytes()).ok()?;
+    let flags = libc::O_RDWR | libc::O_CLOEXEC | if create { libc::O_CREAT } else { 0 };
+    let fd = unsafe { libc::open(name.as_ptr(), flags, 0o600) };
+    if fd < 0 {
+        return None;
+    }
+    files.insert(handle, fd);
+    Some(fd)
+}
+
+/// Close a handle's lock-file descriptor, releasing its locks.
+pub(in crate::native::linux_x86_64) fn native_release_host_locks(handle: u64) {
+    let fd = HOST_LOCK_FILES.lock().ok().and_then(|mut files| files.as_mut()?.remove(&handle));
+    if let Some(fd) = fd {
+        unsafe { libc::close(fd) };
+    }
+}
+
+/// A Windows range as a `flock`: offsets past `off_t` are left out, and a
+/// range reaching past it runs to the end (`l_len` 0).
+fn host_range(kind: i32, start: u64, length: u64) -> Option<libc::flock> {
+    let start = i64::try_from(start).ok()?;
+    let mut range: libc::flock = unsafe { std::mem::zeroed() };
+    range.l_type = kind as i16;
+    range.l_whence = libc::SEEK_SET as i16;
+    range.l_start = start;
+    range.l_len = i64::try_from(length).ok().filter(|length| start.checked_add(*length).is_some()).unwrap_or(0);
+    Some(range)
+}
+
+fn host_lock(handle: u64, path: &str, start: u64, length: u64, kind: i32) -> Result<(), u32> {
+    let (Some(fd), Some(mut range)) = (host_lock_file(handle, path, kind != libc::F_UNLCK), host_range(kind, start, length)) else {
+        return Ok(());
+    };
+    if unsafe { libc::fcntl(fd, libc::F_OFD_SETLK, &mut range) } == 0 {
+        Ok(())
+    } else {
+        Err(33) // ERROR_LOCK_VIOLATION
+    }
+}
+
+/// Whether another process's (or handle's) lock forbids this access.
+fn host_lock_blocks(handle: u64, path: &str, start: u64, length: u64, write: bool) -> bool {
+    let kind = if write { libc::F_WRLCK } else { libc::F_RDLCK };
+    let (Some(fd), Some(mut range)) = (host_lock_file(handle, path, false), host_range(kind, start, length)) else {
+        return false;
+    };
+    let queried = unsafe { libc::fcntl(fd, libc::F_OFD_GETLK, &mut range) };
+    queried == 0 && range.l_type != libc::F_UNLCK as i16
+}
+
 fn overlaps(start: u64, length: u64, other: u64, other_length: u64) -> bool {
     length != 0
         && other_length != 0
@@ -37,6 +115,7 @@ pub(in crate::native::linux_x86_64) fn native_try_file_lock(
     {
         return Err(33);
     }
+    host_lock(handle, &file.path, start, length, if exclusive { libc::F_WRLCK } else { libc::F_RDLCK })?;
     fs.file_locks
         .push((file.path.clone(), start, length, handle, exclusive));
     Ok(file)
@@ -57,6 +136,7 @@ pub(in crate::native::linux_x86_64) fn native_file_lock_allows(
                 && overlaps(start, length, *offset, *size)
                 && if *exclusive { *owner != handle } else { write }
         })
+        && !host_lock_blocks(handle, path, start, length, write)
 }
 
 pub(in crate::native::linux_x86_64) extern "win64" fn native_lock_file(
@@ -101,6 +181,7 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_unlock_file(
             })
             .ok_or(158u32)?; // ERROR_NOT_LOCKED: exact range and owner required.
         fs.file_locks.remove(index);
+        let _ = host_lock(handle, &path, start, length, libc::F_UNLCK);
         Ok(())
     });
     match result {

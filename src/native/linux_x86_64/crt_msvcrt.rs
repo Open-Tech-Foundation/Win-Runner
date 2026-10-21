@@ -72,18 +72,17 @@ pub(super) extern "win64" fn native_crt_endthreadex(code: u32) -> ! {
 
 /// The "C" locale's character classes, as msvcrt's `_ctype` table holds
 /// them: `_UPPER` 0x1, `_LOWER` 0x2, `_DIGIT` 0x4, `_SPACE` 0x8, `_PUNCT`
-/// 0x10, `_CONTROL` 0x20, `_BLANK` 0x40, `_HEX` 0x80, alphabetic 0x100.
+/// 0x10, `_CONTROL` 0x20, `_BLANK` 0x40 (the space only), `_HEX` 0x80.
 fn character_class(value: i32) -> i32 {
     match value {
-        0x09 => 0x68,
-        0x0a..=0x0d => 0x28,
+        0x09..=0x0d => 0x28,
         0x00..=0x1f | 0x7f => 0x20,
         0x20 => 0x48,
         0x30..=0x39 => 0x84,
-        0x41..=0x46 => 0x181,
-        0x47..=0x5a => 0x101,
-        0x61..=0x66 => 0x182,
-        0x67..=0x7a => 0x102,
+        0x41..=0x46 => 0x81,
+        0x47..=0x5a => 0x01,
+        0x61..=0x66 => 0x82,
+        0x67..=0x7a => 0x02,
         0x21..=0x7e => 0x10,
         _ => 0,
     }
@@ -96,7 +95,7 @@ pub(super) extern "win64" fn native_crt_iscntrl(value: i32) -> i32 {
     character_class(value) & 0x20
 }
 pub(super) extern "win64" fn native_crt_isgraph(value: i32) -> i32 {
-    character_class(value) & (0x10 | 0x100 | 0x4)
+    character_class(value) & (0x10 | 0x1 | 0x2 | 0x4)
 }
 pub(super) extern "win64" fn native_crt_islower(value: i32) -> i32 {
     character_class(value) & 0x2
@@ -542,7 +541,8 @@ mod tests {
     fn character_classes_match_the_c_locale() {
         assert_eq!(native_crt_isctype(b'A' as i32, 0x1), 0x1);
         assert_eq!(native_crt_isctype(b'a' as i32, 0x80), 0x80);
-        assert_eq!(native_crt_isctype(b'\t' as i32, 0x40), 0x40);
+        assert_eq!(native_crt_isctype(b'\t' as i32, 0xffff), 0x28);
+        assert_eq!(native_crt_isctype(b'z' as i32, 0xffff), 0x2);
         assert_ne!(native_crt_iscntrl(0x7f), 0);
         assert_eq!(native_crt_isgraph(b' ' as i32), 0);
         assert_ne!(native_crt_isgraph(b'~' as i32), 0);

@@ -2010,6 +2010,19 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_move_file_ex_w(
         (ctx.fs.normalize(&source), ctx.fs.normalize(&destination)),
         (Ok(a), Ok(b)) if a.key() == b.key()
     );
+    // Renaming needs delete access, which an open handle that did not
+    // share delete refuses (ERROR_SHARING_VIOLATION).
+    let source_key = ctx.fs.normalize(&source).ok().map(|path| path.key());
+    let opened_on_source: Vec<u64> = ctx
+        .handles
+        .iter()
+        .filter(|(_, file)| ctx.fs.normalize(&file.path).ok().map(|path| path.key()) == source_key)
+        .map(|(handle, _)| *handle)
+        .collect();
+    if opened_on_source.iter().any(|handle| ctx.file_shares.get(handle).is_some_and(|share| share & 0x4 == 0)) {
+        native_set_last_error(32);
+        return 0;
+    }
     if ctx.fs.exists(&destination) && !same_entry {
         if flags & 0x01 == 0 {
             native_set_last_error(183);
@@ -2021,6 +2034,12 @@ pub(in crate::native::linux_x86_64) extern "win64" fn native_move_file_ex_w(
         }
     }
     if ctx.fs.move_path(&source, &destination).is_ok() {
+        // Open handles follow the file to its new name.
+        for handle in opened_on_source {
+            if let Some(file) = ctx.handles.get_mut(&handle) {
+                file.path = destination.clone();
+            }
+        }
         1
     } else {
         native_set_last_error(2);

@@ -304,10 +304,26 @@ fn every_oracle_probe_runs_and_matches_its_windows_golden() {
             "process_modules" => &[
                 "base_name.truncated: 5 err=0 text=\"orac\"",
                 "base_name.not_a_module: 0 err=6",
+                "file_name_ex.truncated: 5 err=0 terminated",
                 "info.small: fail err=122",
                 "image_name.small: 0 err=122 size=4",
                 "open.limited_enum: fail err=5",
                 "open.no_such_pid: 0 err=87",
+            ],
+            "process_files" => &[
+                "rename.read_old_handle: 1 count=9",
+                "rename.no_share_delete: 0 err=32",
+                "kill.data: \"persisted\"",
+                "lock.while_held: 0 err=33",
+                "lock.read_locked_range: 0 err=33",
+                "lock.after_kill: 1 err=0",
+                "lock.after_exit: 1 err=0",
+            ],
+            "legacy_runtime" => &[
+                "ctype: 0x81 0x82 0x2 0x84 0x48 0x28 0x28 0x10 0x20 0x0 0x0 ",
+                "gmtime64.negative: value",
+                "swprintf: ret=3 text=\"7-w\"",
+                "rand.seed1: 41 18467 6334 ",
             ],
             "links" => &[
                 "reparse.dirlink_small: fail err=122",

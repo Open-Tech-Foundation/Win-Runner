@@ -630,6 +630,7 @@ pub(super) extern "win64" fn native_close_handle(h: u64) -> i32 {
         .and_then(|context| {
             context.lock().ok().map(|mut c| {
                 c.file_locks.retain(|(_, _, _, owner, _)| *owner != h);
+                native_release_host_locks(h);
                 c.file_completion_modes.remove(&h);
                 c.file_access.remove(&h);
                 c.file_shares.remove(&h);

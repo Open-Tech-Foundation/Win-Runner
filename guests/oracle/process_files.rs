@@ -290,9 +290,9 @@ fn probe() {
         (api.close)(file);
 
         // Change notifications for another process's changes.
-        let mut directory = [0u16; 64];
+        let mut directory = [0u16; 600];
         let cwd: unsafe extern "system" fn(u32, *mut u16) -> u32 = core::mem::transmute(kernel32(b"GetCurrentDirectoryW\0"));
-        cwd(64, directory.as_mut_ptr());
+        cwd(600, directory.as_mut_ptr());
         if notify == 0 || changes == 0 {
             unavailable("notify.api");
             out_str("END\n");

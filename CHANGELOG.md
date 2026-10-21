@@ -95,6 +95,18 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Byte-range locks hold across guest processes, and a process's locks are
+  released when it is killed (they were neither, so a second process
+  could take a lock another held, and a killed holder's lock stayed).
+  Reads and writes in another process's locked range fail with
+  `ERROR_LOCK_VIOLATION`.
+- Renaming a file keeps its open handles working under the new name, and
+  fails with `ERROR_SHARING_VIOLATION` when a handle did not share delete.
+- `$p = Start-Process ... -PassThru` gives a process object (`ExitCode`,
+  `HasExited`, `ProcessName`), and command objects in value position take
+  comma-list arguments as statements do.
+- msvcrt's character classes, `_gmtime64` before 1970 and
+  `GetModuleFileNameExW` truncation match Windows' oracle transcripts.
 - `winrun script.ps1` prints each statement's output as it runs instead of
   when the script ends, so a hang no longer hides earlier results.
 - msvcrt programs find the standard streams: `__iob_func` and `_iob` use
