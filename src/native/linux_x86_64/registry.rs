@@ -489,7 +489,7 @@ pub(in crate::native) fn supports_import(dll: &str, func: &str) -> bool {
         "WINMM.DLL" => matches!(func, "timeGetTime" | "timeBeginPeriod" | "timeEndPeriod"),
         "USERENV.DLL" => func == "GetUserProfileDirectoryW",
         "BCRYPTPRIMITIVES.DLL" => func == "ProcessPrng",
-        "BCRYPT.DLL" => func == "BCryptGenRandom",
+        "BCRYPT.DLL" => matches!(func, "BCryptGenRandom" | "BCryptOpenAlgorithmProvider"),
         "OLE32.DLL" => matches!(
             func,
             "CoInitialize"
@@ -1930,6 +1930,7 @@ pub(super) fn baseline_trampoline(name: &str) -> Option<u64> {
         "HeapFree" => Some(native_heap_free as *const () as usize as u64),
         "ProcessPrng" => Some(native_process_prng as *const () as usize as u64),
         "BCryptGenRandom" => Some(native_bcrypt_gen_random as *const () as usize as u64),
+        "BCryptOpenAlgorithmProvider" => Some(native_bcrypt_open_algorithm_provider as *const () as usize as u64),
         "GetConsoleMode" => Some(native_get_console_mode as *const () as usize as u64),
         "GetConsoleCP" => Some(native_get_console_cp as *const () as usize as u64),
         "SetConsoleCP" => Some(native_set_console_cp as *const () as usize as u64),

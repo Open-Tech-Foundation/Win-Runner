@@ -16,6 +16,10 @@
 > backends and API shims — disposable C:, snapshots, scriptable shell, packages,
 > mounts, WebSocket control. No Wine or VM.
 
+<div align="center">
+<img alt="Win-Runner demo: a real wpkg install progress bar fills, Node.js reports win32, Python reports Windows 10, uv runs Python, dotnet lists runtimes, and micro edits a PowerShell script inside one winrun shell" src="assets/demo.gif" width="900px">
+</div>
+
 | | |
 |---|---|
 | **Supported today** | `native-linux-x64`: Linux x86-64, guest code runs directly on the host CPU |

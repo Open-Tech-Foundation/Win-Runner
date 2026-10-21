@@ -917,6 +917,8 @@ fn native_system_module_name(name: &str) -> bool {
                 | "psapi"
                 | "dbghelp"
                 | "iphlpapi"
+                | "wldap32"
+                | "normaliz"
                 | "mswsock"
                 | "netapi32"
                 | "wintrust"

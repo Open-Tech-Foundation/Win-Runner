@@ -316,6 +316,15 @@ pub(super) extern "win64" fn native_get_named_security_info_w(
     0
 }
 
+/// `BCryptOpenAlgorithmProvider`: no CNG algorithm providers are available
+/// yet (`STATUS_NOT_FOUND`); `BCryptGenRandom` takes a null provider.
+pub(super) extern "win64" fn native_bcrypt_open_algorithm_provider(provider: *mut u64, _algorithm: *const u16, _implementation: *const u16, _flags: u32) -> u32 {
+    if !provider.is_null() {
+        unsafe { provider.write_unaligned(0) };
+    }
+    0xC000_0225 // STATUS_NOT_FOUND
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

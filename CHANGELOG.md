@@ -97,6 +97,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Handles stay below 2^31, as Windows guarantees, so programs that pass
+  them through a 32-bit `int` keep them valid (Git's pipes to its remote
+  helpers failed with "Invalid argument").
+- DLLs that import `WLDAP32.dll` or `normaliz.dll` load (Git's libcurl).
 - `scripts/install.sh` installs the latest release by default (it was
   pinned to v0.2.0); `--version` or `WINRUN_VERSION` still pins a tag.
 - `FindFirstChangeNotificationW`, `FindNextChangeNotification` and

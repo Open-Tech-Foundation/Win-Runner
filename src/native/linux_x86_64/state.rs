@@ -54,7 +54,10 @@ impl NativeNamedPipeTable {
             handles: HashMap::new(),
             pending_clients: HashMap::new(),
             pending_io: HashMap::new(),
-            next: 0xb000_0000,
+            // Kernel handles stay below 2^31: Windows promises a handle
+            // survives truncation to 32 bits and sign extension back, and
+            // programs rely on it (Git passes them through `int`).
+            next: 0x7800_0000,
         }
     }
 }
