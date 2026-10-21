@@ -2744,3 +2744,22 @@ fn script_output_streams_before_the_script_ends() {
     assert!(child.wait().unwrap().success());
     let _ = std::fs::remove_file(script);
 }
+
+#[test]
+fn install_script_installs_the_latest_release_unless_a_tag_is_given() {
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/install.sh");
+    let run = |args: &[&str]| {
+        let output = std::process::Command::new("bash")
+            .arg(script)
+            .args(args)
+            .env_remove("WINRUN_VERSION")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    let latest = run(&["--dry-run", "--prefix", "/nonexistent"]);
+    assert!(latest.contains("/releases/latest/download/winrun-win-runner.tar.gz"), "{latest}");
+    let pinned = run(&["--dry-run", "--prefix", "/nonexistent", "--version", "v0.1.0"]);
+    assert!(pinned.contains("/releases/download/v0.1.0/winrun-win-runner.tar.gz"), "{pinned}");
+}

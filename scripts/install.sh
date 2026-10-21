@@ -5,13 +5,13 @@
 #   scripts/install.sh [--version vX.Y.Z] [--prefix DIR] [--dry-run]
 #
 # Environment:
-#   WINRUN_VERSION   Release tag (default: v0.2.0)
+#   WINRUN_VERSION   Release tag (default: latest, the newest release)
 #   WINRUN_PREFIX    Install directory (default: $HOME/.local/bin, or
 #                    /usr/local/bin when writable and not overridden)
 set -euo pipefail
 
 REPO="${WINRUN_REPO:-Open-Tech-Foundation/Win-Runner}"
-VERSION="${WINRUN_VERSION:-v0.2.0}"
+VERSION="${WINRUN_VERSION:-latest}"
 ARCHIVE="winrun-win-runner.tar.gz"
 CHECKSUMS="checksums.txt"
 DRY_RUN=0
@@ -82,7 +82,12 @@ if [ -z "$PREFIX" ]; then
   fi
 fi
 
-base_url="https://github.com/${REPO}/releases/download/${VERSION}"
+# GitHub serves the newest release's files under releases/latest/download.
+if [ "$VERSION" = "latest" ]; then
+  base_url="https://github.com/${REPO}/releases/latest/download"
+else
+  base_url="https://github.com/${REPO}/releases/download/${VERSION}"
+fi
 workdir="$(mktemp -d "${TMPDIR:-/tmp}/winrun-install.XXXXXX")"
 cleanup() { rm -rf "$workdir"; }
 trap cleanup EXIT
@@ -126,7 +131,7 @@ else
   sudo install -m 755 winrun "${PREFIX}/winrun"
 fi
 
-echo "Installed: ${PREFIX}/winrun"
+echo "Installed: ${PREFIX}/winrun ($("${PREFIX}/winrun" --version 2>/dev/null || echo "version unknown"))"
 if ! command -v winrun >/dev/null 2>&1; then
   case ":$PATH:" in
     *":${PREFIX}:"*) ;;

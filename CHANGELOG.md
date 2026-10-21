@@ -97,6 +97,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- `scripts/install.sh` installs the latest release by default (it was
+  pinned to v0.2.0); `--version` or `WINRUN_VERSION` still pins a tag.
 - `FindFirstChangeNotificationW`, `FindNextChangeNotification` and
   `FindCloseChangeNotification` watch a directory for changes from any
   process (or a mounted host folder), and `ReadDirectoryChangesW` no

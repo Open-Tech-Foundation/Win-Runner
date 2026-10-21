@@ -83,7 +83,7 @@ Installs `winrun` onto your `PATH` (no service; no admin step unless the prefix 
 
 | Flag / env | Meaning |
 |---|---|
-| `--version TAG` / `WINRUN_VERSION` | Release tag (default `v0.2.0`) |
+| `--version TAG` / `WINRUN_VERSION` | Release tag (default: the latest release) |
 | `--prefix DIR` / `WINRUN_PREFIX` | Install directory (default `/usr/local/bin` if writable, else `~/.local/bin`) |
 | `--dry-run` | Print the plan only |
 
@@ -93,9 +93,9 @@ Prebuilt Linux x86-64 binaries are on [GitHub Releases](https://github.com/Open-
 Each ships the `winrun` tarball plus `checksums.txt`.
 
 ```bash
-VERSION=v0.2.0
-curl -fsSLO "https://github.com/Open-Tech-Foundation/Win-Runner/releases/download/${VERSION}/winrun-win-runner.tar.gz"
-curl -fsSLO "https://github.com/Open-Tech-Foundation/Win-Runner/releases/download/${VERSION}/checksums.txt"
+BASE=https://github.com/Open-Tech-Foundation/Win-Runner/releases/latest/download
+curl -fsSLO "$BASE/winrun-win-runner.tar.gz"
+curl -fsSLO "$BASE/checksums.txt"
 sha256sum -c checksums.txt
 tar -xzf winrun-win-runner.tar.gz
 sudo install -m 755 winrun /usr/local/bin/winrun
