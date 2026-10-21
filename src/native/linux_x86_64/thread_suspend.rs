@@ -187,10 +187,21 @@ pub(super) extern "win64" fn native_suspend_thread(handle: u64) -> u32 {
     *count += 1;
     if previous == 0 && info.running.load(Ordering::Acquire) {
         let tid = info.host_tid.load(Ordering::Acquire);
-        drop(count);
+        // Another thread stops under the count's lock, so GetThreadContext
+        // and ResumeThread see it parked or running, never in between. A
+        // thread suspending itself releases the lock first: it parks here.
+        let mut held = Some(count);
+        if tid == unsafe { libc::gettid() } {
+            held = None;
+        }
         if let Err(error) = stop_thread(tid) {
-            if let Ok(mut count) = info.suspension.0.lock() {
-                *count -= 1;
+            match held.as_mut() {
+                Some(count) => **count -= 1,
+                None => {
+                    if let Ok(mut count) = info.suspension.0.lock() {
+                        *count -= 1;
+                    }
+                }
             }
             native_set_last_error(error);
             return u32::MAX;
@@ -206,11 +217,29 @@ pub(super) fn resume_running_thread(info: &NativeThreadInfo) {
     }
 }
 
-/// The thread a handle names, or the calling thread.
-fn context_thread(handle: u64) -> Result<Option<i32>, u32> {
-    let thread = require_thread_handle(handle, 0x8)?; // THREAD_GET_CONTEXT
-    let tid = thread.queue.thread.host_tid.load(Ordering::Acquire);
-    Ok((tid != unsafe { libc::gettid() }).then_some(tid))
+/// Which thread a handle names, for its registers.
+enum Target {
+    Current,
+    Exited,
+    /// Created suspended and not started: its start routine and parameter.
+    Unstarted(u64, u64),
+    Other(NativeApcHandle, i32),
+}
+
+fn context_thread(handle: u64, access: u32) -> Result<Target, u32> {
+    let thread = require_thread_handle(handle, access)?;
+    let info = &thread.queue.thread;
+    if info.status.lock().map_or(true, |status| status.exit_code.is_some()) {
+        return Ok(Target::Exited);
+    }
+    if !info.running.load(Ordering::Acquire) {
+        return Ok(Target::Unstarted(info.start.load(Ordering::Acquire), info.parameter.load(Ordering::Acquire)));
+    }
+    let tid = info.host_tid.load(Ordering::Acquire);
+    if tid == unsafe { libc::gettid() } {
+        return Ok(Target::Current);
+    }
+    Ok(Target::Other(thread, tid))
 }
 
 /// Copy the parts of `source` that `flags` asks for into `destination`.
@@ -247,19 +276,49 @@ pub(super) extern "win64" fn native_get_thread_context(handle: u64, context: *mu
     if native_diagnostic_enabled() {
         eprintln!("native GetThreadContext handle={handle:#x} flags={flags:#x}");
     }
-    match context_thread(handle) {
-        Ok(Some(tid)) => {
+    match context_thread(handle, 0x8) { // THREAD_GET_CONTEXT
+        Ok(Target::Other(thread, tid)) => {
+            // A suspended thread is parked with its registers saved; a
+            // running one stops just long enough to read them.
+            let Ok(count) = thread.queue.thread.suspension.0.lock() else {
+                native_set_last_error(31);
+                return 0;
+            };
+            let parked = stopped_context(tid).is_some();
+            if !parked {
+                if let Err(error) = stop_thread(tid) {
+                    native_set_last_error(if error == 5 { 31 } else { error });
+                    return 0;
+                }
+            }
             let Some(slot) = stopped_context(tid) else {
-                native_set_last_error(5); // a running thread's registers move
+                native_set_last_error(31);
                 return 0;
             };
             copy_context(unsafe { &(*slot.context.get()).bytes }, destination, flags, true);
+            if !parked {
+                release_thread(tid);
+            }
+            drop(count);
         }
-        Ok(None) => {
+        Ok(Target::Current) => {
             // The calling thread: its registers here, as RtlCaptureContext.
             let mut captured = NativeExceptionContext { bytes: [0; 1232] };
             unsafe { winrun_native_rtl_capture_context(captured.bytes.as_mut_ptr()) };
             copy_context(&captured.bytes, destination, flags, true);
+        }
+        Ok(Target::Unstarted(start, parameter)) => {
+            // The registers it starts with: the start routine's address and
+            // its parameter in the first two argument registers.
+            let mut initial = NativeExceptionContext::software_exception();
+            context_set_register(&mut initial, 1, start);
+            context_set_register(&mut initial, 2, parameter);
+            context_set_register(&mut initial, 16, start);
+            copy_context(&initial.bytes, destination, flags, true);
+        }
+        Ok(Target::Exited) => {
+            native_set_last_error(31); // ERROR_GEN_FAILURE
+            return 0;
         }
         Err(error) => {
             native_set_last_error(error);
@@ -284,8 +343,8 @@ pub(super) extern "win64" fn native_set_thread_context(handle: u64, context: *co
         let rsp = u64::from_le_bytes(source[152..160].try_into().unwrap());
         eprintln!("native SetThreadContext handle={handle:#x} flags={flags:#x} rip={rip:#x} rsp={rsp:#x}");
     }
-    match context_thread(handle) {
-        Ok(Some(tid)) => {
+    match context_thread(handle, 0x10) { // THREAD_SET_CONTEXT
+        Ok(Target::Other(_, tid)) => {
             let Some(slot) = stopped_context(tid) else {
                 native_set_last_error(5);
                 return 0;
@@ -294,8 +353,12 @@ pub(super) extern "win64" fn native_set_thread_context(handle: u64, context: *co
             slot.modified.store(true, Ordering::Release);
             1
         }
-        Ok(None) => {
-            native_set_last_error(50); // the calling thread's own registers
+        Ok(Target::Exited) => {
+            native_set_last_error(31);
+            0
+        }
+        Ok(Target::Current | Target::Unstarted(..)) => {
+            native_set_last_error(50);
             0
         }
         Err(error) => {

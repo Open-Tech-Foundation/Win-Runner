@@ -81,6 +81,17 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Thread and module calls now match Windows' oracle transcripts:
+  `GetThreadContext` reads a running thread (stopping it briefly), a
+  thread created suspended (its start routine and parameter), and fails
+  with `ERROR_GEN_FAILURE` on an exited one; `LoadStringW` leaves the last
+  error alone for an empty string and reports `ERROR_RESOURCE_DATA_NOT_FOUND`
+  for a module without resources; data-file loads report a missing file
+  and a non-PE file as Windows does, and `GetProcAddress` on them fails
+  with `ERROR_MOD_NOT_FOUND`; `GetModuleBaseNameW` returns the buffer size
+  when it truncates; module queries reject an unknown module with
+  `ERROR_INVALID_HANDLE` and need `PROCESS_QUERY_INFORMATION` and
+  `PROCESS_VM_READ`.
 - wpkg's offline tests use the built-in registry instead of fetching the
   published one, so they no longer depend on what was last pushed.
 

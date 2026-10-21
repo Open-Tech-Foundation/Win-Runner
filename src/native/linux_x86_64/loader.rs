@@ -1004,10 +1004,17 @@ pub(super) extern "win64" fn native_load_library_ex_w(
     // _AS_DATAFILE_EXCLUSIVE (0x40): map the file for its resources only.
     if flags & (0x2 | 0x20 | 0x40) != 0 {
         let bytes = fs_ctx().and_then(|context| context.lock().ok().and_then(|ctx| ctx.fs.read_file(&path).ok()));
-        let module = bytes.and_then(|bytes| load_data_module(&bytes, flags & 0x20 != 0)).unwrap_or_else(|| {
-            native_set_last_error(126); // ERROR_MOD_NOT_FOUND
-            0
-        });
+        let module = match bytes {
+            // ERROR_BAD_EXE_FORMAT for a file that is not a PE image.
+            Some(bytes) => load_data_module(&bytes, flags & 0x20 != 0).unwrap_or_else(|| {
+                native_set_last_error(193);
+                0
+            }),
+            None => {
+                native_set_last_error(2); // ERROR_FILE_NOT_FOUND
+                0
+            }
+        };
         if native_diagnostic_enabled() {
             eprintln!("native LoadLibraryExW data path={path} flags={flags:#x} module={module:#x}");
         }
@@ -1673,6 +1680,11 @@ pub(super) extern "win64" fn native_get_proc_address(module: u64, name: *const u
         native_set_last_error(127);
         return 0;
     };
+    // A module loaded as data has no exports to resolve.
+    if is_data_module(module) {
+        native_set_last_error(126);
+        return 0;
+    }
     if !is_synthetic_module(module) {
         return resolve_module_export(module, &selector, 0).unwrap_or_else(|| {
             native_set_last_error(127); // ERROR_PROC_NOT_FOUND

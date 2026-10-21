@@ -554,6 +554,7 @@ pub(super) extern "win64" fn native_close_handle(h: u64) -> i32 {
             .lock()
             .is_ok_and(|mut values| values.remove(&h).is_some())
     }) {
+        forget_process_access(h);
         return 1;
     }
     if process.as_ref().is_some_and(|process| {

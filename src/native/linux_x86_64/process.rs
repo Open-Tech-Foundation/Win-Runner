@@ -459,6 +459,8 @@ pub(super) extern "win64" fn native_create_thread(
     *apc.thread.suspension.0.lock().unwrap() = (flags & 4 != 0) as u32;
     let thread_suspension = apc.thread.suspension.clone();
     apc.thread.id.store(handle as u32, Ordering::Release);
+    apc.thread.start.store(start, Ordering::Release);
+    apc.thread.parameter.store(parameter, Ordering::Release);
     register_thread_object(&process, &apc);
     let thread_apc = apc.clone();
     let spawned = builder.spawn(move || {
@@ -599,7 +601,6 @@ pub(super) extern "win64" fn native_resume_thread(handle: u64) -> u32 {
         *count -= 1;
         if *count == 0 {
             ready.notify_one();
-            drop(count);
             resume_running_thread(&thread.queue.thread);
         }
     }
@@ -766,6 +767,7 @@ pub(super) extern "win64" fn native_open_process(access: u32, inherit: i32, pid:
     if native_duplicate_handle(current, source, current, &mut handle, access, inherit, 0) == 0 {
         return 0;
     }
+    remember_process_access(handle, access);
     handle
 }
 

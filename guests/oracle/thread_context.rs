@@ -137,6 +137,8 @@ fn probe() {
         }
         clear_error();
         ret_case("running.suspend", suspend(worker));
+        // SuspendThread may return before the thread stops; let it settle.
+        sleep(20);
         case("running.suspended");
         out_str(moving(sleep, 50));
         out_byte(b'\n');
@@ -272,6 +274,8 @@ fn probe() {
         let mut gone = WindowsContext::new(CONTEXT_CONTROL, 0);
         clear_error();
         bool_case("exited.get_context", get(worker, gone.0.as_mut_ptr()));
+        clear_error();
+        bool_case("exited.set_context", set(worker, context.0.as_mut_ptr()));
         close(worker);
 
         // A thread blocked in a wait stays held after the wait is satisfied.
@@ -294,11 +298,20 @@ fn probe() {
         close(signal);
 
         // A thread created suspended counts from one.
-        let created = thread(0, 0, quick as usize, 0, 4, &mut id);
+        let created = thread(0, 0, quick as usize, 0x1234, 4, &mut id);
         ret_case("created.suspend", suspend(created));
-        let mut start = WindowsContext::new(CONTEXT_CONTROL, 0);
+        let mut start = WindowsContext::new(CONTEXT_FULL, 0);
         clear_error();
         bool_case("created.get_context", get(created, start.0.as_mut_ptr()));
+        case("created.registers");
+        let entry = quick as usize as u64;
+        let rip = start.get(RIP) as usize;
+        out_str(if start.get(RIP) == entry { "rip=start" } else if rip >= image && rip < image_end { "rip=in_image" } else { "rip=outside" });
+        out_str(if start.get(128) == entry { " rcx=start" } else { " rcx=other" });
+        out_str(if start.get(136) == 0x1234 { " rdx=parameter" } else { " rdx=other" });
+        out_byte(b'\n');
+        clear_error();
+        bool_case("created.set_context", set(created, start.0.as_mut_ptr()));
         ret_case("created.resume_to_one", resume(created));
         ret_case("created.waits", wait(created, 50));
         ret_case("created.resume_to_zero", resume(created));

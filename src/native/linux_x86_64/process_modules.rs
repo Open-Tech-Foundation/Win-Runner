@@ -6,6 +6,34 @@
 //! `QueryFullProcessImageNameA/W`.
 
 use super::*;
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+/// The access `OpenProcess` granted each handle it returned.
+static OPENED_ACCESS: Mutex<Option<HashMap<u64, u32>>> = Mutex::new(None);
+
+pub(super) fn remember_process_access(handle: u64, access: u32) {
+    if let Ok(mut opened) = OPENED_ACCESS.lock() {
+        opened.get_or_insert_with(HashMap::new).insert(handle, access);
+    }
+}
+
+pub(super) fn forget_process_access(handle: u64) {
+    if let Ok(mut opened) = OPENED_ACCESS.lock() {
+        if let Some(opened) = opened.as_mut() {
+            opened.remove(&handle);
+        }
+    }
+}
+
+/// Whether `handle` grants every right in `needed`; handles not made by
+/// `OpenProcess` (the pseudo handle, the process's own) grant all.
+fn grants(handle: u64, needed: u32) -> bool {
+    const PROCESS_ALL_ACCESS: u32 = 0x1f_ffff;
+    let access = OPENED_ACCESS.lock().ok().and_then(|opened| opened.as_ref()?.get(&handle).copied());
+    let access = access.map_or(PROCESS_ALL_ACCESS, |access| if access & 0x1000_0000 != 0 { PROCESS_ALL_ACCESS } else { access });
+    access & needed == needed
+}
 
 /// The current process's modules as (base, size, path), main image first.
 fn modules() -> Option<Vec<(u64, u32, String)>> {
@@ -30,11 +58,13 @@ fn is_current_process(handle: u64) -> bool {
 fn module(handle: u64) -> Result<(u64, u32, String), u32> {
     let modules = modules().ok_or(6u32)?;
     let wanted = if handle == 0 { modules[0].0 } else { handle };
-    modules.into_iter().find(|(base, _, _)| *base == wanted).ok_or(126) // ERROR_MOD_NOT_FOUND
+    modules.into_iter().find(|(base, _, _)| *base == wanted).ok_or(6) // ERROR_INVALID_HANDLE
 }
 
+/// Module queries read the process's memory: PROCESS_QUERY_INFORMATION
+/// and PROCESS_VM_READ.
 fn check_process(process: u64) -> bool {
-    if is_current_process(process) {
+    if is_current_process(process) && grants(process, 0x400 | 0x10) {
         return true;
     }
     native_set_last_error(5); // ERROR_ACCESS_DENIED
@@ -95,7 +125,21 @@ pub(super) extern "win64" fn native_get_module_base_name_w(process: u64, handle:
         return 0;
     }
     match module(handle) {
-        Ok((_, _, path)) => copy_text(path.rsplit(['\\', '/']).next().unwrap_or(&path), output, size),
+        Ok((_, _, path)) => {
+            let name: Vec<u16> = path.rsplit(['\\', '/']).next().unwrap_or(&path).encode_utf16().collect();
+            if output.is_null() || size == 0 {
+                native_set_last_error(122);
+                return 0;
+            }
+            // A short buffer gets what fits and a terminator, and the call
+            // returns the buffer's size, leaving the last error alone.
+            let copied = name.len().min(size as usize - 1);
+            unsafe {
+                output.copy_from_nonoverlapping(name.as_ptr(), copied);
+                output.add(copied).write(0);
+            }
+            if copied < name.len() { size } else { copied as u32 }
+        }
         Err(code) => {
             native_set_last_error(code);
             0

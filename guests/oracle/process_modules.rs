@@ -117,6 +117,24 @@ fn probe() {
         out_error();
         out_byte(b'\n');
         clear_error();
+        text_case("base_name.ntdll", base_name(me, GetModuleHandleW(wide("ntdll.dll", &mut name).as_ptr()), text.as_mut_ptr(), 600), &text);
+        clear_error();
+        text_case("base_name.user32", base_name(me, GetModuleHandleW(wide("user32.dll", &mut name).as_ptr()), text.as_mut_ptr(), 600), &text);
+        text.fill(0x2a);
+        clear_error();
+        let written = file_name_ex(me, image, text.as_mut_ptr(), 5);
+        case("file_name_ex.truncated");
+        out_dec(written as u64);
+        out_error();
+        out_str(if text[4] == 0 { " terminated" } else { " unterminated" });
+        out_byte(b'\n');
+        clear_error();
+        let written = file_name_ex(me, image + 0x10, text.as_mut_ptr(), 600);
+        case("file_name_ex.not_a_module");
+        out_dec(written as u64);
+        out_error();
+        out_byte(b'\n');
+        clear_error();
         let written = file_name_ex(me, 0, text.as_mut_ptr(), 600);
         case("file_name_ex.main");
         if written == 0 {
@@ -139,6 +157,12 @@ fn probe() {
             out_str(if info[1] as u32 as usize == size { " size=ok" } else { " size=wrong" });
             out_str(if info[2] == image + entry { " entry=ok\n" } else { " entry=wrong\n" });
         }
+        clear_error();
+        let ok = information(me, image + 0x10, info.as_mut_ptr(), 24);
+        case("info.not_a_module");
+        out_dec(ok as u64);
+        out_error();
+        out_byte(b'\n');
         clear_error();
         let ok = information(me, image, info.as_mut_ptr(), 16);
         case("info.small");

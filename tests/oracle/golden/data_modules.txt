@@ -1,0 +1,31 @@
+probe data_modules
+setup.write: ok
+datafile.load: tag=1
+string.one: ret=3 text="one"
+string.empty: ret=0 err=0 first=0x0
+string.truncated: ret=3 text="thr"
+string.size_one: ret=0 err=0 first=0x0
+string.last_in_block: ret=7 text="fifteen"
+string.second_block: ret=7 text="sixteen"
+string.empty_in_second_block: ret=0 err=0 first=0x0
+string.missing_block: ret=0 err=1814 first=0x0
+string.id_zero: ret=0 err=0 first=0x0
+string.pointer: ret=11 in_module text="three words"
+resource.find: size=74 first_counts=0,3
+resource.find_missing: 0 err=1814
+module.proc_address: 0 err=126
+module.handle_by_path: none err=126
+module.file_name: fail err=126
+datafile.second_load: tag=1
+datafile.second_same: distinct
+image_resource.load: tag=2
+image_resource.string: ret=3 text="one"
+image_resource.free: 1
+datafile_and_image_resource.load: tag=2
+exclusive.load: tag=1
+exclusive.string: ret=7 text="fifteen"
+datafile.free: 1 err=0
+datafile.missing: fail err=2
+datafile.not_pe: fail err=193
+string.no_resources: ret=0 err=1812 first=0x0
+END

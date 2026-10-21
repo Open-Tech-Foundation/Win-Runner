@@ -91,6 +91,11 @@ pub(super) fn load_data_module(bytes: &[u8], image_resource: bool) -> Option<u64
     Some(base | if image_resource { 2 } else { 1 })
 }
 
+/// Whether `module` is a handle `load_data_module` returned.
+pub(super) fn is_data_module(module: u64) -> bool {
+    module & 3 != 0 && DATA_MODULES.lock().is_ok_and(|modules| modules.iter().any(|(base, _)| *base == module & !3))
+}
+
 /// `FreeLibrary` on a data module: unmap it; `None` for other handles.
 pub(super) fn free_data_module(module: u64) -> Option<i32> {
     if module & 3 == 0 {
@@ -276,8 +281,10 @@ pub(super) extern "win64" fn native_load_string_w(module: u64, id: u32, output: 
         native_set_last_error(87);
         return 0;
     }
-    let found = image_base(module).and_then(|base| {
-        let entry = locate(base, &Key::Id(RT_STRING), &Key::Id(((id >> 4) + 1) as u16), None).ok()?;
+    // Ok(None): the block exists but the string is empty, which leaves the
+    // last error alone (as Windows does); Err: the block's lookup failed.
+    let found = image_base(module).ok_or(ERROR_RESOURCE_DATA_NOT_FOUND).and_then(|base| {
+        let entry = locate(base, &Key::Id(RT_STRING), &Key::Id(((id >> 4) + 1) as u16), None)?;
         let (offset, length) = unsafe { (read_u32(entry), read_u32(entry + 4)) };
         let mut cursor = base + u64::from(offset);
         let end = cursor + u64::from(length);
@@ -285,17 +292,19 @@ pub(super) extern "win64" fn native_load_string_w(module: u64, id: u32, output: 
             let count = unsafe { read_u16(cursor) };
             cursor += 2 + u64::from(count) * 2;
             if cursor >= end {
-                return None;
+                return Ok(None);
             }
         }
         let count = unsafe { read_u16(cursor) } as usize;
-        (count > 0).then_some((cursor + 2, count))
+        Ok((count > 0).then_some((cursor + 2, count)))
     });
-    let Some((text, count)) = found else {
+    let Ok(Some((text, count))) = found else {
         if size > 0 {
             unsafe { output.write(0) };
         }
-        native_set_last_error(ERROR_RESOURCE_NAME_NOT_FOUND);
+        if let Err(error) = found {
+            native_set_last_error(error);
+        }
         return 0;
     };
     if size == 0 {

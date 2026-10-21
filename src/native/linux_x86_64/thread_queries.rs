@@ -22,6 +22,10 @@ pub(super) struct NativeThreadInfo {
     /// Past its start gate: suspending it must stop it (see
     /// [`native_suspend_thread`]).
     pub(super) running: std::sync::atomic::AtomicBool,
+    /// `CreateThread`'s start routine and parameter, the registers of a
+    /// thread that has not started yet.
+    pub(super) start: AtomicU64,
+    pub(super) parameter: AtomicU64,
 }
 impl Default for NativeThreadInfo {
     fn default() -> Self {
@@ -32,6 +36,8 @@ impl Default for NativeThreadInfo {
             suspension: Arc::new((Mutex::new(0), Condvar::new())),
             status: Mutex::new(NativeThreadStatus::default()),
             running: std::sync::atomic::AtomicBool::new(false),
+            start: AtomicU64::new(0),
+            parameter: AtomicU64::new(0),
         }
     }
 }
